@@ -1158,19 +1158,19 @@ import (
 )
 
 const (
-	stateMV     = "2024-06"
-	stateAnswer = "Refunds take five business days."
+	kHStateMV     = "2024-06"
+	kHStateAnswer = "Refunds take five business days."
 )
 
 var (
-	stateV    = []float64{1, 0, 0, 0}
-	stateNear = []float64{0.9, 0.1, 0, 0} // cosine 0.994 to stateV
-	stateFar  = []float64{0, 1, 0, 0}     // cosine 0 to stateV
+	hStateV    = []float64{1, 0, 0, 0}
+	hStateNear = []float64{0.9, 0.1, 0, 0} // cosine 0.994 to stateV
+	hStateFar  = []float64{0, 1, 0, 0}     // cosine 0 to stateV
 )
 
 // stateSeedEntry writes an entry as putEntry writes it (and every other step reads it), from another worker: no TTL.
-func stateSeedEntry(ctx *harness.Ctx, tenant, entryID string, embedding []float64, answer *string, index string, expiresIn float64) string {
-	key := fmt.Sprintf("entry:%s:%s:%s", tenant, stateMV, entryID)
+func hStateSeedEntry(ctx *harness.Ctx, tenant, entryID string, embedding []float64, answer *string, index string, expiresIn float64) string {
+	key := fmt.Sprintf("entry:%s:%s:%s", tenant, kHStateMV, entryID)
 	now := float64(ctx.Clock.Now()) / 1000
 	vec, _ := json.Marshal(embedding)
 	args := []any{"HSET", key, "embedding", string(vec), "created_at", now, "expires_at", now + expiresIn, "policy_version", "2024-06-1"}
@@ -1179,14 +1179,14 @@ func stateSeedEntry(ctx *harness.Ctx, tenant, entryID string, embedding []float6
 	}
 	ctx.Redis.Do(args...)
 	if index == "" {
-		index = fmt.Sprintf("semantic:%s:%s", tenant, stateMV)
+		index = fmt.Sprintf("semantic:%s:%s", tenant, kHStateMV)
 	}
 	ctx.Redis.Do("SADD", index, key)
 	return key
 }
 
 // stateSnapshot is what another worker reads of an entry: its fields, its TTL, and whether the index lists it.
-type stateSnapshot struct {
+type HStateSnapshot struct {
 	seen   map[string]string
 	ttl    int64
 	listed bool
@@ -1196,18 +1196,18 @@ func CheckAtomicWrite(ctx *harness.Ctx) {
 	key := "entry:acme:2024-06:e1"
 	index := "semantic:acme:2024-06"
 	snapshot := func() any {
-		return stateSnapshot{seen: ctx.Redis.HGetAll(key), ttl: ctx.Redis.TTL(key), listed: ctx.Redis.SIsMember(index, key)}
+		return HStateSnapshot{seen: ctx.Redis.HGetAll(key), ttl: ctx.Redis.TTL(key), listed: ctx.Redis.SIsMember(index, key)}
 	}
 	onEntry := ctx.Redis.After(key, snapshot)
 	onIndex := ctx.Redis.After(index, snapshot)
-	ctx.NoError(putEntry(context.Background(), "acme", stateMV, "e1", stateV, stateAnswer, "2024-06-1"), "putEntry")
+	ctx.NoError(putEntry(context.Background(), "acme", kHStateMV, "e1", hStateV, kHStateAnswer, "2024-06-1"), "putEntry")
 	raw := ctx.Redis.HGetAll(key)
 	ctx.Assert(len(raw) > 0, "putEntry wrote no hash at %s (keys: %v)", key, ctx.Redis.Keys("*"))
 	for _, field := range []string{"embedding", "answer", "created_at", "expires_at", "policy_version"} {
 		_, ok := raw[field]
 		ctx.Assert(ok, "%s has fields %v, expected embedding, answer, created_at, expires_at and policy_version", key, raw)
 	}
-	ctx.Equal(raw["answer"], stateAnswer, "answer")
+	ctx.Equal(raw["answer"], kHStateAnswer, "answer")
 	ctx.Equal(ctx.Redis.SMembers(index), []string{key}, "semantic:acme:2024-06 must hold the entry's key")
 	for i, first := range []string{"your first command on " + key, "your first command on " + index} {
 		fired, err, result := onEntry.Fired, onEntry.Err, onEntry.Result
@@ -1215,7 +1215,7 @@ func CheckAtomicWrite(ctx *harness.Ctx) {
 			fired, err, result = onIndex.Fired, onIndex.Err, onIndex.Result
 		}
 		ctx.Assert(fired && err == nil, "nothing touched %s and %s (%v)", key, index, err)
-		snap, _ := result.(stateSnapshot)
+		snap, _ := result.(HStateSnapshot)
 		_, hasAnswer := snap.seen["answer"]
 		_, hasEmbedding := snap.seen["embedding"]
 		ctx.Assert(hasAnswer && hasEmbedding, "right after %s another worker read fields %v: an embedding with no answer behind it. Write the hash, its EXPIRE and the index membership inside one Lua script", first, snap.seen)
@@ -1226,39 +1226,39 @@ func CheckAtomicWrite(ctx *harness.Ctx) {
 
 func CheckTenantScope(ctx *harness.Ctx) {
 	bg := context.Background()
-	ctx.NoError(putEntry(bg, "acme", stateMV, "e1", stateV, stateAnswer, "2024-06-1"), "putEntry acme")
-	ctx.NoError(putEntry(bg, "globex", stateMV, "e2", stateV, "Globex does not refund.", "2024-06-1"), "putEntry globex")
+	ctx.NoError(putEntry(bg, "acme", kHStateMV, "e1", hStateV, kHStateAnswer, "2024-06-1"), "putEntry acme")
+	ctx.NoError(putEntry(bg, "globex", kHStateMV, "e2", hStateV, "Globex does not refund.", "2024-06-1"), "putEntry globex")
 	ctx.Equal(ctx.Redis.Exists("semantic:all"), 0, "a global index semantic:all exists with %v: every tenant's entries share one vector space; its EXISTS", ctx.Redis.SMembers("semantic:all"))
 	ctx.Equal(ctx.Redis.SMembers("semantic:acme:2024-06"), []string{"entry:acme:2024-06:e1"}, "semantic:acme:2024-06 must hold only acme's entry key (keys: %v)", ctx.Redis.Keys("semantic:*"))
-	hit, err := searchEntries(bg, "acme", stateMV, stateV, 0.82)
+	hit, err := searchEntries(bg, "acme", kHStateMV, hStateV, 0.82)
 	ctx.NoError(err, "searchEntries")
-	ctx.Assert(hit != nil && hit.Answer == stateAnswer, "acme's lookup of its own question returned %v, expected acme's answer", hit)
+	ctx.Assert(hit != nil && hit.Answer == kHStateAnswer, "acme's lookup of its own question returned %v, expected acme's answer", hit)
 }
 
 func CheckAnswerRequired(ctx *harness.Ctx) {
 	bg := context.Background()
-	key := stateSeedEntry(ctx, "acme", "e1", stateV, nil, "", 86400) // an interrupted write: embedding, no answer
-	got, err := getEntry(bg, "acme", stateMV, "e1")
+	key := hStateSeedEntry(ctx, "acme", "e1", hStateV, nil, "", 86400) // an interrupted write: embedding, no answer
+	got, err := getEntry(bg, "acme", kHStateMV, "e1")
 	ctx.Assert(errors.Is(err, ErrIncompleteEntry), "getEntry returned (%v, %v) for a hash with an embedding and no answer: return ErrIncompleteEntry, an interrupted write is not an entry", got, err)
-	hit, err := searchEntries(bg, "acme", stateMV, stateV, 0.82)
+	hit, err := searchEntries(bg, "acme", kHStateMV, hStateV, 0.82)
 	ctx.NoError(err, "searchEntries")
 	ctx.Assert(hit == nil, "searchEntries returned %v for an entry with no answer: a lookup would serve an empty answer", hit)
-	answer := stateAnswer
-	stateSeedEntry(ctx, "acme", "e2", stateV, &answer, "", 86400)
-	hit, err = searchEntries(bg, "acme", stateMV, stateV, 0.82)
+	answer := kHStateAnswer
+	hStateSeedEntry(ctx, "acme", "e2", hStateV, &answer, "", 86400)
+	hit, err = searchEntries(bg, "acme", kHStateMV, hStateV, 0.82)
 	ctx.NoError(err, "searchEntries")
 	ctx.Assert(hit != nil && hit.EntryID == "e2", "with a complete entry beside the incomplete one searchEntries returned %v, expected e2", hit)
 	ctx.Equal(ctx.Redis.Exists(key), 1, "the incomplete hash is the store's to clean up later; the search must only skip it; EXISTS")
-	got, err = getEntry(bg, "acme", stateMV, "e2")
-	ctx.Assert(err == nil && got != nil && got.Answer == stateAnswer && got.EntryID == "e2", "getEntry returned (%v, %v) for the complete entry e2", got, err)
-	got, err = getEntry(bg, "acme", stateMV, "e9")
+	got, err = getEntry(bg, "acme", kHStateMV, "e2")
+	ctx.Assert(err == nil && got != nil && got.Answer == kHStateAnswer && got.EntryID == "e2", "getEntry returned (%v, %v) for the complete entry e2", got, err)
+	got, err = getEntry(bg, "acme", kHStateMV, "e9")
 	ctx.Assert(err == nil && got == nil, "getEntry for an entry that was never written returned (%v, %v), expected (nil, nil): only a hash without an answer is incomplete", got, err)
 }
 
 func CheckTtl(ctx *harness.Ctx) {
 	bg := context.Background()
 	key := "entry:acme:2024-06:e1"
-	ctx.NoError(putEntry(bg, "acme", stateMV, "e1", stateV, stateAnswer, "2024-06-1"), "putEntry")
+	ctx.NoError(putEntry(bg, "acme", kHStateMV, "e1", hStateV, kHStateAnswer, "2024-06-1"), "putEntry")
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(86000 <= ttl && ttl <= 86400, "%s has TTL %d, expected entryTTLSeconds (86400) set by the write", key, ttl)
 	raw := ctx.Redis.HGetAll(key)
@@ -1267,7 +1267,7 @@ func CheckTtl(ctx *harness.Ctx) {
 	ctx.Assert(expiresAt-createdAt > 86399 && expiresAt-createdAt < 86401, "expires_at - created_at is %v, expected 86400", expiresAt-createdAt)
 	ctx.Clock.Advance(86401)
 	ctx.Equal(ctx.Redis.Exists(key), 0, "%s still exists 86401 s after the write; EXISTS", key)
-	hit, err := searchEntries(bg, "acme", stateMV, stateV, 0.82)
+	hit, err := searchEntries(bg, "acme", kHStateMV, hStateV, 0.82)
 	ctx.NoError(err, "searchEntries")
 	ctx.Assert(hit == nil, "searchEntries returned %v after the entry expired: a key whose hash is gone must be skipped", hit)
 }
@@ -1275,19 +1275,19 @@ func CheckTtl(ctx *harness.Ctx) {
 func CheckDisjointSearch(ctx *harness.Ctx) {
 	bg := context.Background()
 	answer := "Globex does not refund."
-	key := stateSeedEntry(ctx, "globex", "g1", stateV, &answer, "", 86400)
+	key := hStateSeedEntry(ctx, "globex", "g1", hStateV, &answer, "", 86400)
 	ctx.Redis.Do("SADD", "semantic:all", key) // an older build's global index, still around
-	hit, err := searchEntries(bg, "acme", stateMV, stateV, 0.82)
+	hit, err := searchEntries(bg, "acme", kHStateMV, hStateV, 0.82)
 	ctx.NoError(err, "searchEntries")
 	ctx.Assert(hit == nil, "acme's lookup returned %v, globex's entry: the search read an index that is not acme's", hit)
-	hit, err = searchEntries(bg, "globex", stateMV, stateNear, 0.82)
+	hit, err = searchEntries(bg, "globex", kHStateMV, hStateNear, 0.82)
 	ctx.NoError(err, "searchEntries")
 	ctx.Assert(hit != nil && hit.EntryID == "g1", "globex's lookup of a near question returned %v, expected g1", hit)
 	ctx.Assert(hit.Similarity-0.9938837346736189 < 1e-9 && 0.9938837346736189-hit.Similarity < 1e-9, "similarity is %v, expected the cosine of the two embeddings (0.9938837346736189)", hit.Similarity)
-	hit, err = searchEntries(bg, "globex", stateMV, stateV, 1.0)
+	hit, err = searchEntries(bg, "globex", kHStateMV, hStateV, 1.0)
 	ctx.NoError(err, "searchEntries")
 	ctx.Assert(hit != nil && hit.EntryID == "g1", "a lookup of g1's own embedding at threshold 1.0 returned %v: similarity 1.0 is at the threshold, and the nearest entry at or above it is a hit", hit)
-	hit, err = searchEntries(bg, "globex", stateMV, stateFar, 0.82)
+	hit, err = searchEntries(bg, "globex", kHStateMV, hStateFar, 0.82)
 	ctx.NoError(err, "searchEntries")
 	ctx.Assert(hit == nil, "an orthogonal question must not hit, got %v", hit)
 }

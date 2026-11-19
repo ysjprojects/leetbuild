@@ -822,11 +822,11 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "audit.appended"
+const kHEventsTopic = "audit.appended"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func eventRecord(ctx *harness.Ctx, n int, model string) *ledger.Decision {
+func hEventRecord(ctx *harness.Ctx, n int, model string) *ledger.Decision {
 	fields := map[string]any{
 		"model_version":   model,
 		"policy_id":       "refunds-2026-10",
@@ -834,20 +834,20 @@ func eventRecord(ctx *harness.Ctx, n int, model string) *ledger.Decision {
 		"decision_digest": digest.Sha256Hex(fmt.Sprintf("out-%d", n)),
 		"recorded_at":     fmt.Sprint(1700000000000 + n),
 	}
-	record, err := ledger.Insert(eventsBg, "t1", fields)
+	record, err := ledger.Insert(hEventsBg, "t1", fields)
 	ctx.NoError(err, "the ledger insert failed")
 	return record
 }
 
-func mustAppendAndPublish(ctx *harness.Ctx, recordID string) map[string]any {
-	event, err := appendAndPublish(eventsBg, recordID)
+func hMustAppendAndPublish(ctx *harness.Ctx, recordID string) map[string]any {
+	event, err := appendAndPublish(hEventsBg, recordID)
 	ctx.NoError(err, "appendAndPublish(%s) failed", recordID)
 	return event
 }
 
-func eventPayloads(ctx *harness.Ctx) []map[string]any {
+func hEventPayloads(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
-	for _, r := range ctx.Kafka.Records(eventsTopic) {
+	for _, r := range ctx.Kafka.Records(kHEventsTopic) {
 		var p map[string]any
 		ctx.NoError(json.Unmarshal(r.Value, &p), "the event is not JSON: %s", r.Value)
 		out = append(out, p)
@@ -855,7 +855,7 @@ func eventPayloads(ctx *harness.Ctx) []map[string]any {
 	return out
 }
 
-func outboxRows(ctx *harness.Ctx) []map[string]any {
+func hOutboxRows(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
 	for _, row := range ctx.Redis.LRange("audit:outbox", 0, -1) {
 		var p map[string]any
@@ -867,20 +867,20 @@ func outboxRows(ctx *harness.Ctx) []map[string]any {
 
 func CheckTenantKey(ctx *harness.Ctx) {
 	for n, model := range []string{"risk-v7", "risk-v8", "fraud-v2"} {
-		mustAppendAndPublish(ctx, eventRecord(ctx, n+1, model).ID)
+		hMustAppendAndPublish(ctx, hEventRecord(ctx, n+1, model).ID)
 	}
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 3, "three chained records; the events on %s", eventsTopic)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"t1", "t1", "t1"}, "events must be keyed by the tenant (keyed by model version, one tenant's chain scatters across partitions); the keys")
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 3, "three chained records; the events on %s", kHEventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"t1", "t1", "t1"}, "events must be keyed by the tenant (keyed by model version, one tenant's chain scatters across partitions); the keys")
 	ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition, "one tenant's events must land on one partition so a mirror reads the chain in order")
 }
 
 func CheckIdsOnly(ctx *harness.Ctx) {
-	record := eventRecord(ctx, 1, "risk-v7")
-	mustAppendAndPublish(ctx, record.ID)
+	record := hEventRecord(ctx, 1, "risk-v7")
+	hMustAppendAndPublish(ctx, record.ID)
 	ctx.Settle()
-	all := eventPayloads(ctx)
+	all := hEventPayloads(ctx)
 	ctx.Equal(len(all), 1, "one chained record; the events")
 	var names []string
 	for name := range all[0] {
@@ -888,64 +888,64 @@ func CheckIdsOnly(ctx *harness.Ctx) {
 	}
 	sort.Strings(names)
 	ctx.Equal(names, []string{"digest", "position", "record_id", "tenant"}, "the event's fields (the ledger record stays in the ledger)")
-	raw := string(ctx.Kafka.Records(eventsTopic)[0].Value)
+	raw := string(ctx.Kafka.Records(kHEventsTopic)[0].Value)
 	for _, value := range []string{record.InputDigest, record.DecisionDigest, record.PolicyID, record.ModelVersion} {
 		ctx.Assert(!strings.Contains(raw, value), "the event carries a field of the record (%s): %s", value, raw)
 	}
 }
 
 func CheckCommittedEvent(ctx *harness.Ctx) {
-	record := eventRecord(ctx, 1, "risk-v7")
+	record := hEventRecord(ctx, 1, "risk-v7")
 	// Another auditd replica chains a record of t1 right after this append looks at the chain.
 	rival := ctx.Redis.After("audit:chain:t1", func() any {
-		_, err := chain.AppendEntry(eventsBg, "t1", "d-rival", digest.Sha256Hex("rival"))
+		_, err := chain.AppendEntry(hEventsBg, "t1", "d-rival", digest.Sha256Hex("rival"))
 		ctx.NoError(err, "the rival append failed")
 		return nil
 	})
-	event := mustAppendAndPublish(ctx, record.ID)
+	event := hMustAppendAndPublish(ctx, record.ID)
 	ctx.Assert(rival.Fired, "nothing touched audit:chain:t1")
 	ctx.Settle()
-	stored := ledger.Get(eventsBg, record.ID)
-	entry, err := chain.EntryAt(eventsBg, "t1", stored.Position)
+	stored := ledger.Get(hEventsBg, record.ID)
+	entry, err := chain.EntryAt(hEventsBg, "t1", stored.Position)
 	ctx.NoError(err, "EntryAt failed")
 	ctx.Assert(stored.Position == 2 && entry != nil && entry.RecordID == record.ID, "the record must be chained at position 2 behind the rival, the ledger says %d and the chain holds %+v", stored.Position, entry)
-	all := eventPayloads(ctx)
+	all := hEventPayloads(ctx)
 	ctx.Equal(len(all), 1, "one chained record; the events")
 	ctx.Equal(all[0]["position"], 2, "the event must announce the position the chain holds the record at (it was published before the append, at a position another replica took); the position")
 	ctx.Equal(all[0]["digest"], entry.Digest, "the event's digest must be the link the chain holds at position 2")
 	ctx.Equal(event["digest"], entry.Digest, "appendAndPublish must answer the event it published; its digest")
 	// Another replica chains right after this append's own write: the event still names what appendEntry returned.
-	second := eventRecord(ctx, 2, "risk-v7")
+	second := hEventRecord(ctx, 2, "risk-v7")
 	ctx.Redis.After("audit:chain:t1", func() any {
 		ctx.Redis.After("audit:chain:t1", func() any {
-			_, err := chain.AppendEntry(eventsBg, "t1", "d-late", digest.Sha256Hex("late"))
+			_, err := chain.AppendEntry(hEventsBg, "t1", "d-late", digest.Sha256Hex("late"))
 			ctx.NoError(err, "the late rival append failed")
 			return nil
 		})
 		return nil
 	})
-	answer := mustAppendAndPublish(ctx, second.ID)
+	answer := hMustAppendAndPublish(ctx, second.ID)
 	ctx.Settle()
-	at := ledger.Get(eventsBg, second.ID).Position
-	placed, err := chain.EntryAt(eventsBg, "t1", at)
+	at := ledger.Get(hEventsBg, second.ID).Position
+	placed, err := chain.EntryAt(hEventsBg, "t1", at)
 	ctx.NoError(err, "EntryAt failed")
-	head, _ := chain.Head(eventsBg, "t1")
+	head, _ := chain.Head(hEventsBg, "t1")
 	ctx.Assert(placed != nil && placed.RecordID == second.ID && head.Position == 4, "the second record must be chained next to the late rival, the ledger says %d, the chain holds %+v and ends at %d", at, placed, head.Position)
-	all = eventPayloads(ctx)
+	all = hEventPayloads(ctx)
 	published := all[len(all)-1]
 	ctx.Assert(published["position"] == float64(at) && published["digest"] == placed.Digest, "another replica chained position %d right after this append wrote position %d, and the event announces position %v: it names the position and link appendEntry returned, not the head read afterwards", head.Position, at, published["position"])
 	ctx.Equal(answer["digest"], placed.Digest, "appendAndPublish must answer the event it published; its digest")
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	record := eventRecord(ctx, 1, "risk-v7")
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	_, err := appendAndPublish(eventsBg, record.ID)
+	record := hEventRecord(ctx, 1, "risk-v7")
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	_, err := appendAndPublish(hEventsBg, record.ID)
 	ctx.NoError(err, "appendAndPublish failed when the broker refused the produce: the event goes to the outbox, the append stands")
 	ctx.Settle()
-	rows := outboxRows(ctx)
+	rows := hOutboxRows(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused one produce: without an outbox row the event is lost for every mirror; the outbox rows")
-	ctx.Assert(rows[0]["topic"] == eventsTopic && rows[0]["key"] == "t1", "the outbox row is %v, expected topic %s and key t1", rows[0], eventsTopic)
+	ctx.Assert(rows[0]["topic"] == kHEventsTopic && rows[0]["key"] == "t1", "the outbox row is %v, expected topic %s and key t1", rows[0], kHEventsTopic)
 	payload, _ := rows[0]["payload"].(map[string]any)
 	ctx.Assert(payload != nil && payload["record_id"] == record.ID && payload["position"] == float64(1), "the outbox row must carry the event, got %v", rows[0])
 	var fields []string
@@ -953,14 +953,14 @@ func CheckOutbox(ctx *harness.Ctx) {
 		fields = append(fields, name)
 	}
 	sort.Strings(fields)
-	first, _ := chain.EntryAt(eventsBg, "t1", 1)
+	first, _ := chain.EntryAt(hEventsBg, "t1", 1)
 	ctx.Assert(strings.Join(fields, ",") == "digest,position,record_id,tenant" && first != nil && payload["digest"] == first.Digest, "the outbox row's payload is %v, expected the event itself: exactly digest, position, record_id and tenant, with the link the chain holds at position 1", payload)
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "nothing may reach the topic for the refused produce; the events")
-	head, _ := chain.Head(eventsBg, "t1")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 0, "nothing may reach the topic for the refused produce; the events")
+	head, _ := chain.Head(hEventsBg, "t1")
 	ctx.Equal(head.Position, int64(1), "the append must stand when only the produce failed; the chain's last position")
-	mustAppendAndPublish(ctx, eventRecord(ctx, 2, "risk-v7").ID)
+	hMustAppendAndPublish(ctx, hEventRecord(ctx, 2, "risk-v7").ID)
 	ctx.Settle()
-	ctx.Assert(len(ctx.Kafka.Records(eventsTopic)) == 1 && len(outboxRows(ctx)) == 1, "a healthy produce after the failure reaches the topic and adds no outbox row")
+	ctx.Assert(len(ctx.Kafka.Records(kHEventsTopic)) == 1 && len(hOutboxRows(ctx)) == 1, "a healthy produce after the failure reaches the topic and adds no outbox row")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -974,9 +974,9 @@ func CheckOutbox(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "audit.appended";
+const std::string kHEventsTopic = "audit.appended";
 
-ledger::Decision eventRecord(int n, const std::string& model) {
+ledger::Decision hEventRecord(int n, const std::string& model) {
   return ledger::insert("t1", {{"model_version", model},
                                {"policy_id", "refunds-2026-10"},
                                {"input_digest", sha256_hex("in-" + std::to_string(n))},
@@ -984,19 +984,19 @@ ledger::Decision eventRecord(int n, const std::string& model) {
                                {"recorded_at", std::to_string(1700000000000LL + n)}});
 }
 
-std::vector<json> eventPayloads(harness::Ctx& ctx) {
+std::vector<json> hEventPayloads(harness::Ctx& ctx) {
   std::vector<json> out;
-  for (const auto& r : ctx.Kafka.Records(kEventsTopic)) out.push_back(json::parse(r.Value.value_or("null"), nullptr, false));
+  for (const auto& r : ctx.Kafka.Records(kHEventsTopic)) out.push_back(json::parse(r.Value.value_or("null"), nullptr, false));
   return out;
 }
 
-std::vector<json> outboxRows(harness::Ctx& ctx) {
+std::vector<json> hOutboxRows(harness::Ctx& ctx) {
   std::vector<json> out;
   for (const auto& row : ctx.Redis.LRange("audit:outbox", 0, -1)) out.push_back(json::parse(row, nullptr, false));
   return out;
 }
 
-void settle(harness::Ctx& ctx) {
+void hSettle(harness::Ctx& ctx) {
   ctx.Settle();
   producer->poll(0);
 }
@@ -1005,31 +1005,31 @@ void settle(harness::Ctx& ctx) {
 
 void CheckTenantKey(harness::Ctx& ctx) {
   int n = 0;
-  for (const std::string model : {"risk-v7", "risk-v8", "fraud-v2"}) appendAndPublish(eventRecord(++n, model).id);
-  settle(ctx);
-  const auto records = ctx.Kafka.Records(kEventsTopic);
-  ctx.Equal(records.size(), 3, "three chained records; the events on %s", kEventsTopic);
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"t1", "t1", "t1"}, "events must be keyed by the tenant (keyed by model version, one tenant's chain scatters across partitions); the keys");
+  for (const std::string model : {"risk-v7", "risk-v8", "fraud-v2"}) appendAndPublish(hEventRecord(++n, model).id);
+  hSettle(ctx);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
+  ctx.Equal(records.size(), 3, "three chained records; the events on %s", kHEventsTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"t1", "t1", "t1"}, "events must be keyed by the tenant (keyed by model version, one tenant's chain scatters across partitions); the keys");
   ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition, "one tenant's events must land on one partition so a mirror reads the chain in order");
 }
 
 void CheckIdsOnly(harness::Ctx& ctx) {
-  const ledger::Decision record = eventRecord(1, "risk-v7");
+  const ledger::Decision record = hEventRecord(1, "risk-v7");
   appendAndPublish(record.id);
-  settle(ctx);
-  const auto all = eventPayloads(ctx);
+  hSettle(ctx);
+  const auto all = hEventPayloads(ctx);
   ctx.Equal(all.size(), 1, "one chained record; the events");
   std::vector<std::string> names;
   for (const auto& [name, value] : all[0].items()) names.push_back(name);
   ctx.Equal(names, {"digest", "position", "record_id", "tenant"}, "the event's fields (the ledger record stays in the ledger)");
-  const std::string raw = ctx.Kafka.Values(kEventsTopic)[0];
+  const std::string raw = ctx.Kafka.Values(kHEventsTopic)[0];
   for (const std::string& value : {record.input_digest, record.decision_digest, record.policy_id, record.model_version}) {
     ctx.Assert(raw.find(value) == std::string::npos, "the event carries a field of the record (%s): %s", value, raw);
   }
 }
 
 void CheckCommittedEvent(harness::Ctx& ctx) {
-  const ledger::Decision record = eventRecord(1, "risk-v7");
+  const ledger::Decision record = hEventRecord(1, "risk-v7");
   // Another auditd replica chains a record of t1 right after this append looks at the chain.
   auto fired = std::make_shared<bool>(false);
   ctx.Redis.After("audit:chain:t1", [fired] {
@@ -1038,42 +1038,42 @@ void CheckCommittedEvent(harness::Ctx& ctx) {
   });
   const json event = appendAndPublish(record.id);
   ctx.Assert(*fired, "nothing touched audit:chain:t1");
-  settle(ctx);
+  hSettle(ctx);
   const auto stored = ledger::get(record.id);
   const auto entry = chain::entryAt("t1", stored->position);
   ctx.Assert(stored->position == 2 && entry && entry->record_id == record.id, "the record must be chained at position 2 behind the rival, the ledger says %d", stored->position);
-  const auto all = eventPayloads(ctx);
+  const auto all = hEventPayloads(ctx);
   ctx.Equal(all.size(), 1, "one chained record; the events");
   ctx.Equal(all[0].value("position", 0L), 2, "the event must announce the position the chain holds the record at (it was published before the append, at a position another replica took); the position");
   ctx.Equal(all[0].value("digest", ""), entry->digest, "the event's digest must be the link the chain holds at position 2");
   ctx.Equal(event.value("digest", ""), entry->digest, "appendAndPublish must answer the event it published; its digest");
   // Another replica chains right after this append's own write: the event still names what appendEntry returned.
-  const ledger::Decision second = eventRecord(2, "risk-v7");
+  const ledger::Decision second = hEventRecord(2, "risk-v7");
   ctx.Redis.After("audit:chain:t1", [&ctx] { ctx.Redis.After("audit:chain:t1", [] { chain::appendEntry("t1", "d-late", sha256_hex("late")); }); });
   const json answer = appendAndPublish(second.id);
-  settle(ctx);
+  hSettle(ctx);
   const long at = ledger::get(second.id)->position;
   const auto placed = chain::entryAt("t1", at);
   const long head = chain::head("t1").position;
   ctx.Assert(placed && placed->record_id == second.id && head == 4, "the second record must be chained next to the late rival, the ledger says %d and the chain ends at %d", at, head);
-  const auto later = eventPayloads(ctx);
+  const auto later = hEventPayloads(ctx);
   const json published = later.empty() ? json::object() : later.back();
   ctx.Assert(published.value("position", 0L) == at && placed && published.value("digest", "") == placed->digest, "another replica chained position %d right after this append wrote position %d, and the event announces position %d: it names the position and link appendEntry returned, not the head read afterwards", head, at, published.value("position", 0L));
   ctx.Equal(answer.value("digest", ""), placed ? placed->digest : "", "appendAndPublish must answer the event it published; its digest");
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  const ledger::Decision record = eventRecord(1, "risk-v7");
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  const ledger::Decision record = hEventRecord(1, "risk-v7");
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   try {
     appendAndPublish(record.id);
   } catch (const std::exception& e) {
     ctx.Fatalf("appendAndPublish threw when the broker refused the produce: %s; the event goes to the outbox, the append stands", e.what());
   }
-  settle(ctx);
-  const auto rows = outboxRows(ctx);
+  hSettle(ctx);
+  const auto rows = hOutboxRows(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused one produce: without an outbox row the event is lost for every mirror; the outbox rows");
-  ctx.Assert(rows[0].value("topic", "") == kEventsTopic && rows[0].value("key", "") == "t1", "the outbox row is %s, expected topic %s and key t1", rows[0].dump(), kEventsTopic);
+  ctx.Assert(rows[0].value("topic", "") == kHEventsTopic && rows[0].value("key", "") == "t1", "the outbox row is %s, expected topic %s and key t1", rows[0].dump(), kHEventsTopic);
   ctx.Assert(rows[0].contains("payload") && rows[0]["payload"].value("record_id", "") == record.id && rows[0]["payload"].value("position", 0L) == 1, "the outbox row must carry the event, got %s", rows[0].dump());
   std::vector<std::string> fields;
   if (rows[0].contains("payload") && rows[0]["payload"].is_object()) {
@@ -1081,11 +1081,11 @@ void CheckOutbox(harness::Ctx& ctx) {
   }
   const auto first = chain::entryAt("t1", 1);
   ctx.Assert(fields == std::vector<std::string>{"digest", "position", "record_id", "tenant"} && first && rows[0]["payload"].value("digest", "") == first->digest, "the outbox row's payload is %s, expected the event itself: exactly digest, position, record_id and tenant, with the link the chain holds at position 1", rows[0].dump());
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "nothing may reach the topic for the refused produce; the events");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 0, "nothing may reach the topic for the refused produce; the events");
   ctx.Equal(chain::head("t1").position, 1, "the append must stand when only the produce failed; the chain's last position");
-  appendAndPublish(eventRecord(2, "risk-v7").id);
-  settle(ctx);
-  ctx.Assert(ctx.Kafka.Records(kEventsTopic).size() == 1 && outboxRows(ctx).size() == 1, "a healthy produce after the failure reaches the topic and adds no outbox row");
+  appendAndPublish(hEventRecord(2, "risk-v7").id);
+  hSettle(ctx);
+  ctx.Assert(ctx.Kafka.Records(kHEventsTopic).size() == 1 && hOutboxRows(ctx).size() == 1, "a healthy produce after the failure reaches the topic and adds no outbox row");
 }
 `,
   },

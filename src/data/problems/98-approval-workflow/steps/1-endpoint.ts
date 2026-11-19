@@ -977,34 +977,34 @@ import (
 	"leetbuild/harness"
 )
 
-var apiBg = context.Background()
+var hApiBg = context.Background()
 
-var apiBody = map[string]any{"chain_id": "spend", "why": "new laptop", "amount_cents": 420000}
+var hApiBody = map[string]any{"chain_id": "spend", "why": "new laptop", "amount_cents": 420000}
 
-type apiAnswer struct {
+type HApiAnswer struct {
 	RequestID    string   \`json:"request_id"\`
 	ChainVersion int      \`json:"chain_version"\`
 	Approvers    []string \`json:"approvers"\`
 	Replayed     bool     \`json:"replayed"\`
 }
 
-func apiServe(ctx *harness.Ctx) *harness.HTTP {
-	ctx.NoError(policy.DefineChain(apiBg, "spend", 3, []string{"u-mgr", "u-dir"}), "defining the spend chain")
+func hApiServe(ctx *harness.Ctx) *harness.HTTP {
+	ctx.NoError(policy.DefineChain(hApiBg, "spend", 3, []string{"u-mgr", "u-dir"}), "defining the spend chain")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiWith(field string, value any) map[string]any {
+func hApiWith(field string, value any) map[string]any {
 	out := map[string]any{}
-	for k, v := range apiBody {
+	for k, v := range hApiBody {
 		out[k] = v
 	}
 	out[field] = value
 	return out
 }
 
-func apiSubmit(c *harness.HTTP, body map[string]any, user, tenant, key string) *harness.Response {
+func hApiSubmit(c *harness.HTTP, body map[string]any, user, tenant, key string) *harness.Response {
 	header := []string{"X-Tenant-Id", tenant, "X-User-Id", user}
 	if key != "" {
 		header = append(header, "Idempotency-Key", key)
@@ -1012,91 +1012,91 @@ func apiSubmit(c *harness.HTTP, body map[string]any, user, tenant, key string) *
 	return c.Post("/v1/requests", body, header...)
 }
 
-func apiDecode(r *harness.Response) apiAnswer {
-	var a apiAnswer
+func hApiDecode(r *harness.Response) HApiAnswer {
+	var a HApiAnswer
 	r.Decode(&a)
 	return a
 }
 
-func apiLoad(ctx *harness.Ctx, requestID string) *store.Request {
-	record, err := store.Load(apiBg, requestID)
+func hApiLoad(ctx *harness.Ctx, requestID string) *store.Request {
+	record, err := store.Load(hApiBg, requestID)
 	ctx.NoError(err, "store.Load(%s)", requestID)
 	return record
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiServe(ctx)
-	r := apiSubmit(c, apiBody, "u-req", "t-acme", "k-1")
+	c := hApiServe(ctx)
+	r := hApiSubmit(c, hApiBody, "u-req", "t-acme", "k-1")
 	ctx.Equal(r.Status, 201, "POST /v1/requests (%s)", r.Text())
-	requestID := apiDecode(r).RequestID
-	record := apiLoad(ctx, requestID)
+	requestID := hApiDecode(r).RequestID
+	record := hApiLoad(ctx, requestID)
 	ctx.Assert(record != nil, "the submit answered %s but no request %q is in the store", r.Text(), requestID)
 	ctx.Assert(record.Tenant == "t-acme" && record.Requester == "u-req" && record.Why == "new laptop", "the stored request is %+v", record)
 	current, _ := ctx.Redis.HGet("approval:"+requestID+":state", "current_approver")
 	ctx.Equal(current, "u-mgr", "the chain of %s must wait on its first approver; current_approver", requestID)
-	anonymous := c.Post("/v1/requests", apiBody, "Idempotency-Key", "k-2")
+	anonymous := c.Post("/v1/requests", hApiBody, "Idempotency-Key", "k-2")
 	ctx.Equal(anonymous.Status, 401, "a submit without X-Tenant-Id and X-User-Id")
 }
 
 func CheckPolicyApprovers(ctx *harness.Ctx) {
-	c := apiServe(ctx)
-	r := apiSubmit(c, apiWith("approvers", []string{"u-friend"}), "u-req", "t-acme", "k-1")
+	c := hApiServe(ctx)
+	r := hApiSubmit(c, hApiWith("approvers", []string{"u-friend"}), "u-req", "t-acme", "k-1")
 	ctx.Equal(r.Status, 201, "a submit naming its own approvers (%s)", r.Text())
-	answered := apiDecode(r)
+	answered := hApiDecode(r)
 	ctx.Assert(answered.ChainVersion == 3 && strings.Join(answered.Approvers, ",") == "u-mgr,u-dir", "the submit answered %s, expected the policy's approvers [u-mgr, u-dir] and chain_version 3", r.Text())
-	record := apiLoad(ctx, apiDecode(r).RequestID)
+	record := hApiLoad(ctx, hApiDecode(r).RequestID)
 	ctx.Assert(record != nil, "no request stored for %s", r.Text())
 	ctx.Equal(record.Approvers, []string{"u-mgr", "u-dir"}, "the requester named the chain; the approvers come from the policy. The stored approvers")
 	ctx.Equal(record.ChainVersion, 3, "the stored chain_version must be the policy's version 3")
 	current, _ := ctx.Redis.HGet("approval:"+record.RequestID+":state", "current_approver")
 	ctx.Equal(current, "u-mgr", "the chain must wait on the policy's first approver; current_approver")
-	named := apiSubmit(c, apiWith("approvers", []string{"u-req"}), "u-req", "t-acme", "k-3")
+	named := hApiSubmit(c, hApiWith("approvers", []string{"u-req"}), "u-req", "t-acme", "k-3")
 	ctx.Equal(named.Status, 201, "u-req naming themselves in the body's approvers: the body's approvers is never read, and u-req is not on the policy's chain")
-	ctx.NoError(policy.DefineChain(apiBg, "spend", 4, []string{"u-mgr", "u-cfo"}), "redefining the spend chain")
-	ctx.Equal(apiLoad(ctx, record.RequestID).ChainVersion, 3, "a policy edit after the submit must not change the pinned request; chain_version")
-	unknown := apiSubmit(c, apiWith("chain_id", "travel"), "u-req", "t-acme", "k-2")
+	ctx.NoError(policy.DefineChain(hApiBg, "spend", 4, []string{"u-mgr", "u-cfo"}), "redefining the spend chain")
+	ctx.Equal(hApiLoad(ctx, record.RequestID).ChainVersion, 3, "a policy edit after the submit must not change the pinned request; chain_version")
+	unknown := hApiSubmit(c, hApiWith("chain_id", "travel"), "u-req", "t-acme", "k-2")
 	ctx.Equal(unknown.Status, 404, "a submit on an unknown chain")
 }
 
 func CheckSelfApproval(ctx *harness.Ctx) {
-	c := apiServe(ctx)
-	r := apiSubmit(c, apiBody, "u-dir", "t-acme", "k-1")
+	c := hApiServe(ctx)
+	r := hApiSubmit(c, hApiBody, "u-dir", "t-acme", "k-1")
 	ctx.Equal(r.Status, 409, "the director submitted a request on a chain they approve")
 	ctx.Assert(strings.Contains(r.Text(), "requester_cannot_approve"), "the 409 must say requester_cannot_approve, got %s", r.Text())
 	ctx.Assert(len(ctx.Redis.Keys("request:r-*")) == 0 && len(ctx.Redis.Keys("approval:*")) == 0, "a refused submit stored %q %q", ctx.Redis.Keys("request:r-*"), ctx.Redis.Keys("approval:*"))
-	ctx.Equal(apiSubmit(c, apiBody, "u-mgr", "t-acme", "k-4").Status, 409, "the manager, the chain's first approver, submitted a request")
-	r = apiSubmit(c, apiWith("approvers", []string{"u-friend"}), "u-dir", "t-acme", "k-2")
+	ctx.Equal(hApiSubmit(c, hApiBody, "u-mgr", "t-acme", "k-4").Status, 409, "the manager, the chain's first approver, submitted a request")
+	r = hApiSubmit(c, hApiWith("approvers", []string{"u-friend"}), "u-dir", "t-acme", "k-2")
 	ctx.Equal(r.Status, 409, "the director naming u-friend as approver: the policy's chain still holds the director")
-	ok := apiSubmit(c, apiBody, "u-req", "t-acme", "k-3")
+	ok := hApiSubmit(c, hApiBody, "u-req", "t-acme", "k-3")
 	ctx.Equal(ok.Status, 201, "a requester who is not on the chain (%s)", ok.Text())
 }
 
 func CheckWhyCap(ctx *harness.Ctx) {
-	c := apiServe(ctx)
-	ctx.Equal(apiSubmit(c, apiWith("why", strings.Repeat("x", 4096)), "u-req", "t-acme", "k-1").Status, 201, "a why of exactly 4096 bytes")
-	ctx.Equal(apiSubmit(c, apiWith("why", strings.Repeat("x", 4097)), "u-req", "t-acme", "k-2").Status, 413, "a why of 4097 bytes")
-	ctx.Equal(apiSubmit(c, apiWith("why", strings.Repeat("é", 2049)), "u-req", "t-acme", "k-3").Status, 413, "a why of 2049 two-byte characters (4098 bytes): measure UTF-8 bytes, not characters")
-	ctx.Equal(apiSubmit(c, apiWith("why", ""), "u-req", "t-acme", "k-4").Status, 400, "an empty why")
+	c := hApiServe(ctx)
+	ctx.Equal(hApiSubmit(c, hApiWith("why", strings.Repeat("x", 4096)), "u-req", "t-acme", "k-1").Status, 201, "a why of exactly 4096 bytes")
+	ctx.Equal(hApiSubmit(c, hApiWith("why", strings.Repeat("x", 4097)), "u-req", "t-acme", "k-2").Status, 413, "a why of 4097 bytes")
+	ctx.Equal(hApiSubmit(c, hApiWith("why", strings.Repeat("é", 2049)), "u-req", "t-acme", "k-3").Status, 413, "a why of 2049 two-byte characters (4098 bytes): measure UTF-8 bytes, not characters")
+	ctx.Equal(hApiSubmit(c, hApiWith("why", ""), "u-req", "t-acme", "k-4").Status, 400, "an empty why")
 	ctx.Equal(len(ctx.Redis.Keys("request:r-*")), 1, "only the 4096-byte request may be stored; the stored requests")
 }
 
 func CheckIdempotency(ctx *harness.Ctx) {
-	c := apiServe(ctx)
-	first := apiSubmit(c, apiBody, "u-req", "t-acme", "k-1")
+	c := hApiServe(ctx)
+	first := hApiSubmit(c, hApiBody, "u-req", "t-acme", "k-1")
 	ctx.Equal(first.Status, 201, "the first submit (%s)", first.Text())
-	replay := apiSubmit(c, apiBody, "u-req", "t-acme", "k-1")
+	replay := hApiSubmit(c, hApiBody, "u-req", "t-acme", "k-1")
 	ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1")
-	answer := apiDecode(replay)
-	ctx.Assert(answer.RequestID == apiDecode(first).RequestID && answer.Replayed, "the replay answered %s, expected the original request_id %s with replayed true", replay.Text(), apiDecode(first).RequestID)
+	answer := hApiDecode(replay)
+	ctx.Assert(answer.RequestID == hApiDecode(first).RequestID && answer.Replayed, "the replay answered %s, expected the original request_id %s with replayed true", replay.Text(), hApiDecode(first).RequestID)
 	ctx.Equal(len(ctx.Redis.Keys("request:r-*")), 1, "two submits with one Idempotency-Key must store one request (a retry opened a second chain); the stored requests")
-	other := apiSubmit(c, apiBody, "u-req", "t-globex", "k-1")
-	ctx.Assert(other.Status == 201 && apiDecode(other).RequestID != apiDecode(first).RequestID, "the same key from another tenant answered %d %s: keys are per tenant", other.Status, other.Text())
-	ctx.NoError(policy.DefineChain(apiBg, "spend", 4, []string{"u-req", "u-cfo"}), "putting u-req on the spend chain")
-	late := apiSubmit(c, apiBody, "u-req", "t-acme", "k-1")
+	other := hApiSubmit(c, hApiBody, "u-req", "t-globex", "k-1")
+	ctx.Assert(other.Status == 201 && hApiDecode(other).RequestID != hApiDecode(first).RequestID, "the same key from another tenant answered %d %s: keys are per tenant", other.Status, other.Text())
+	ctx.NoError(policy.DefineChain(hApiBg, "spend", 4, []string{"u-req", "u-cfo"}), "putting u-req on the spend chain")
+	late := hApiSubmit(c, hApiBody, "u-req", "t-acme", "k-1")
 	ctx.Equal(late.Status, 200, "a replay of k-1 after the policy put u-req on the chain: the key is looked up before the chain is resolved (%s)", late.Text())
-	again := apiDecode(late)
-	ctx.Assert(again.RequestID == apiDecode(first).RequestID && again.ChainVersion == 3 && strings.Join(again.Approvers, ",") == "u-mgr,u-dir", "the replay after a policy edit answered %s, expected the stored request (chain_version 3, approvers [u-mgr, u-dir])", late.Text())
-	missing := apiSubmit(c, apiBody, "u-req", "t-acme", "")
+	again := hApiDecode(late)
+	ctx.Assert(again.RequestID == hApiDecode(first).RequestID && again.ChainVersion == 3 && strings.Join(again.Approvers, ",") == "u-mgr,u-dir", "the replay after a policy edit answered %s, expected the stored request (chain_version 3, approvers [u-mgr, u-dir])", late.Text())
+	missing := hApiSubmit(c, hApiBody, "u-req", "t-acme", "")
 	ctx.Equal(missing.Status, 400, "a submit without Idempotency-Key")
 }
 `,
@@ -1112,9 +1112,9 @@ func CheckIdempotency(ctx *harness.Ctx) {
 
 namespace {
 
-const nlohmann::json kApiBody = {{"chain_id", "spend"}, {"why", "new laptop"}, {"amount_cents", 420000}};
+const nlohmann::json kHApiBody = {{"chain_id", "spend"}, {"why", "new laptop"}, {"amount_cents", 420000}};
 
-harness::HTTP apiServe(harness::Ctx& ctx) {
+harness::HTTP hApiServe(harness::Ctx& ctx) {
   policy::defineChain("spend", 3, {"u-mgr", "u-dir"});
   static httplib::Server* svr = nullptr;
   delete svr;
@@ -1123,30 +1123,30 @@ harness::HTTP apiServe(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json apiWith(const std::string& field, const nlohmann::json& value) {
-  nlohmann::json out = kApiBody;
+nlohmann::json hApiWith(const std::string& field, const nlohmann::json& value) {
+  nlohmann::json out = kHApiBody;
   out[field] = value;
   return out;
 }
 
-harness::Response apiSubmit(harness::HTTP& c, const nlohmann::json& body, const std::string& user, const std::string& tenant, const std::string& key) {
+harness::Response hApiSubmit(harness::HTTP& c, const nlohmann::json& body, const std::string& user, const std::string& tenant, const std::string& key) {
   if (key.empty()) return c.Post("/v1/requests", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant, "X-User-Id", user);
   return c.Post("/v1/requests", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant, "X-User-Id", user, "Idempotency-Key", key);
 }
 
-std::string apiRequestId(const harness::Response& r) {
+std::string hApiRequestId(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body.value("request_id", "") : "";
 }
 
-std::string apiRepeat(const std::string& unit, int n) {
+std::string hApiRepeat(const std::string& unit, int n) {
   std::string out;
   for (int i = 0; i < n; i++) out += unit;
   return out;
 }
 
 // The answer carries the chain pinned at the first submit: version 3, approvers u-mgr then u-dir.
-bool apiPinned(const harness::Response& r) {
+bool hApiPinned(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() && body.value("chain_version", 0) == 3 && body.value("approvers", nlohmann::json::array()) == nlohmann::json::array({"u-mgr", "u-dir"});
 }
@@ -1154,74 +1154,74 @@ bool apiPinned(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = apiServe(ctx);
-  const auto r = apiSubmit(c, kApiBody, "u-req", "t-acme", "k-1");
+  auto c = hApiServe(ctx);
+  const auto r = hApiSubmit(c, kHApiBody, "u-req", "t-acme", "k-1");
   ctx.Equal(r.Status, 201, "POST /v1/requests (%s)", r.Text());
-  const std::string request_id = apiRequestId(r);
+  const std::string request_id = hApiRequestId(r);
   const auto record = store::load(request_id);
   ctx.Assert(record.has_value(), "the submit answered %s but no request %q is in the store", r.Text(), request_id);
   ctx.Assert(record->tenant == "t-acme" && record->requester == "u-req" && record->why == "new laptop", "the stored request is tenant %q requester %q why %q", record->tenant, record->requester, record->why);
   ctx.Equal(ctx.Redis.HGet("approval:" + request_id + ":state", "current_approver"), std::optional<std::string>("u-mgr"), "the chain of %s must wait on its first approver; current_approver", request_id);
-  const auto anonymous = c.Post("/v1/requests", kApiBody.dump(), "Content-Type", "application/json", "Idempotency-Key", "k-2");
+  const auto anonymous = c.Post("/v1/requests", kHApiBody.dump(), "Content-Type", "application/json", "Idempotency-Key", "k-2");
   ctx.Equal(anonymous.Status, 401, "a submit without X-Tenant-Id and X-User-Id");
 }
 
 void CheckPolicyApprovers(harness::Ctx& ctx) {
-  auto c = apiServe(ctx);
-  const auto r = apiSubmit(c, apiWith("approvers", {"u-friend"}), "u-req", "t-acme", "k-1");
+  auto c = hApiServe(ctx);
+  const auto r = hApiSubmit(c, hApiWith("approvers", {"u-friend"}), "u-req", "t-acme", "k-1");
   ctx.Equal(r.Status, 201, "a submit naming its own approvers (%s)", r.Text());
-  ctx.Assert(apiPinned(r), "the submit answered %s, expected the policy's approvers [u-mgr, u-dir] and chain_version 3", r.Text());
-  const auto record = store::load(apiRequestId(r));
+  ctx.Assert(hApiPinned(r), "the submit answered %s, expected the policy's approvers [u-mgr, u-dir] and chain_version 3", r.Text());
+  const auto record = store::load(hApiRequestId(r));
   ctx.Assert(record.has_value(), "no request stored for %s", r.Text());
   ctx.Equal(record->approvers, std::vector<std::string>{"u-mgr", "u-dir"}, "the requester named the chain; the approvers come from the policy. The stored approvers");
   ctx.Equal(record->chain_version, 3, "the stored chain_version must be the policy's version 3");
   ctx.Equal(ctx.Redis.HGet("approval:" + record->request_id + ":state", "current_approver"), std::optional<std::string>("u-mgr"), "the chain must wait on the policy's first approver; current_approver");
-  ctx.Equal(apiSubmit(c, apiWith("approvers", {"u-req"}), "u-req", "t-acme", "k-3").Status, 201, "u-req naming themselves in the body's approvers: the body's approvers is never read, and u-req is not on the policy's chain");
+  ctx.Equal(hApiSubmit(c, hApiWith("approvers", {"u-req"}), "u-req", "t-acme", "k-3").Status, 201, "u-req naming themselves in the body's approvers: the body's approvers is never read, and u-req is not on the policy's chain");
   policy::defineChain("spend", 4, {"u-mgr", "u-cfo"});
   ctx.Equal(store::load(record->request_id)->chain_version, 3, "a policy edit after the submit must not change the pinned request; chain_version");
-  const auto unknown = apiSubmit(c, apiWith("chain_id", "travel"), "u-req", "t-acme", "k-2");
+  const auto unknown = hApiSubmit(c, hApiWith("chain_id", "travel"), "u-req", "t-acme", "k-2");
   ctx.Equal(unknown.Status, 404, "a submit on an unknown chain");
 }
 
 void CheckSelfApproval(harness::Ctx& ctx) {
-  auto c = apiServe(ctx);
-  auto r = apiSubmit(c, kApiBody, "u-dir", "t-acme", "k-1");
+  auto c = hApiServe(ctx);
+  auto r = hApiSubmit(c, kHApiBody, "u-dir", "t-acme", "k-1");
   ctx.Equal(r.Status, 409, "the director submitted a request on a chain they approve");
   ctx.Assert(r.Text().find("requester_cannot_approve") != std::string::npos, "the 409 must say requester_cannot_approve, got %s", r.Text());
   ctx.Assert(ctx.Redis.Keys("request:r-*").empty() && ctx.Redis.Keys("approval:*").empty(), "a refused submit stored %q %q", ctx.Redis.Keys("request:r-*"), ctx.Redis.Keys("approval:*"));
-  ctx.Equal(apiSubmit(c, kApiBody, "u-mgr", "t-acme", "k-4").Status, 409, "the manager, the chain's first approver, submitted a request");
-  r = apiSubmit(c, apiWith("approvers", {"u-friend"}), "u-dir", "t-acme", "k-2");
+  ctx.Equal(hApiSubmit(c, kHApiBody, "u-mgr", "t-acme", "k-4").Status, 409, "the manager, the chain's first approver, submitted a request");
+  r = hApiSubmit(c, hApiWith("approvers", {"u-friend"}), "u-dir", "t-acme", "k-2");
   ctx.Equal(r.Status, 409, "the director naming u-friend as approver: the policy's chain still holds the director");
-  const auto ok = apiSubmit(c, kApiBody, "u-req", "t-acme", "k-3");
+  const auto ok = hApiSubmit(c, kHApiBody, "u-req", "t-acme", "k-3");
   ctx.Equal(ok.Status, 201, "a requester who is not on the chain (%s)", ok.Text());
 }
 
 void CheckWhyCap(harness::Ctx& ctx) {
-  auto c = apiServe(ctx);
-  ctx.Equal(apiSubmit(c, apiWith("why", apiRepeat("x", 4096)), "u-req", "t-acme", "k-1").Status, 201, "a why of exactly 4096 bytes");
-  ctx.Equal(apiSubmit(c, apiWith("why", apiRepeat("x", 4097)), "u-req", "t-acme", "k-2").Status, 413, "a why of 4097 bytes");
-  ctx.Equal(apiSubmit(c, apiWith("why", apiRepeat("\\u00e9", 2049)), "u-req", "t-acme", "k-3").Status, 413, "a why of 2049 two-byte characters (4098 bytes): measure UTF-8 bytes, not characters");
-  ctx.Equal(apiSubmit(c, apiWith("why", ""), "u-req", "t-acme", "k-4").Status, 400, "an empty why");
+  auto c = hApiServe(ctx);
+  ctx.Equal(hApiSubmit(c, hApiWith("why", hApiRepeat("x", 4096)), "u-req", "t-acme", "k-1").Status, 201, "a why of exactly 4096 bytes");
+  ctx.Equal(hApiSubmit(c, hApiWith("why", hApiRepeat("x", 4097)), "u-req", "t-acme", "k-2").Status, 413, "a why of 4097 bytes");
+  ctx.Equal(hApiSubmit(c, hApiWith("why", hApiRepeat("\\u00e9", 2049)), "u-req", "t-acme", "k-3").Status, 413, "a why of 2049 two-byte characters (4098 bytes): measure UTF-8 bytes, not characters");
+  ctx.Equal(hApiSubmit(c, hApiWith("why", ""), "u-req", "t-acme", "k-4").Status, 400, "an empty why");
   ctx.Equal(ctx.Redis.Keys("request:r-*").size(), 1, "only the 4096-byte request may be stored; the stored requests");
 }
 
 void CheckIdempotency(harness::Ctx& ctx) {
-  auto c = apiServe(ctx);
-  const auto first = apiSubmit(c, kApiBody, "u-req", "t-acme", "k-1");
+  auto c = hApiServe(ctx);
+  const auto first = hApiSubmit(c, kHApiBody, "u-req", "t-acme", "k-1");
   ctx.Equal(first.Status, 201, "the first submit (%s)", first.Text());
-  const auto replay = apiSubmit(c, kApiBody, "u-req", "t-acme", "k-1");
+  const auto replay = hApiSubmit(c, kHApiBody, "u-req", "t-acme", "k-1");
   ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1");
   const auto body = nlohmann::json::parse(replay.Text(), nullptr, false);
-  ctx.Assert(apiRequestId(replay) == apiRequestId(first) && body.is_object() && body.value("replayed", false),
-             "the replay answered %s, expected the original request_id %s with replayed true", replay.Text(), apiRequestId(first));
+  ctx.Assert(hApiRequestId(replay) == hApiRequestId(first) && body.is_object() && body.value("replayed", false),
+             "the replay answered %s, expected the original request_id %s with replayed true", replay.Text(), hApiRequestId(first));
   ctx.Equal(ctx.Redis.Keys("request:r-*").size(), 1, "two submits with one Idempotency-Key must store one request (a retry opened a second chain); the stored requests");
-  const auto other = apiSubmit(c, kApiBody, "u-req", "t-globex", "k-1");
-  ctx.Assert(other.Status == 201 && apiRequestId(other) != apiRequestId(first), "the same key from another tenant answered %d %s: keys are per tenant", other.Status, other.Text());
+  const auto other = hApiSubmit(c, kHApiBody, "u-req", "t-globex", "k-1");
+  ctx.Assert(other.Status == 201 && hApiRequestId(other) != hApiRequestId(first), "the same key from another tenant answered %d %s: keys are per tenant", other.Status, other.Text());
   policy::defineChain("spend", 4, {"u-req", "u-cfo"});
-  const auto late = apiSubmit(c, kApiBody, "u-req", "t-acme", "k-1");
+  const auto late = hApiSubmit(c, kHApiBody, "u-req", "t-acme", "k-1");
   ctx.Equal(late.Status, 200, "a replay of k-1 after the policy put u-req on the chain: the key is looked up before the chain is resolved (%s)", late.Text());
-  ctx.Assert(apiRequestId(late) == apiRequestId(first) && apiPinned(late), "the replay after a policy edit answered %s, expected the stored request (chain_version 3, approvers [u-mgr, u-dir])", late.Text());
-  ctx.Equal(apiSubmit(c, kApiBody, "u-req", "t-acme", "").Status, 400, "a submit without Idempotency-Key");
+  ctx.Assert(hApiRequestId(late) == hApiRequestId(first) && hApiPinned(late), "the replay after a policy edit answered %s, expected the stored request (chain_version 3, approvers [u-mgr, u-dir])", late.Text());
+  ctx.Equal(hApiSubmit(c, kHApiBody, "u-req", "t-acme", "").Status, 400, "a submit without Idempotency-Key");
 }
 `,
   },

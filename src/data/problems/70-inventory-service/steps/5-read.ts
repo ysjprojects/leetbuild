@@ -760,7 +760,7 @@ import (
 	"inventory/stock"
 )
 
-func readWorld(ctx *harness.Ctx) *harness.HTTP {
+func hReadWorld(ctx *harness.Ctx) *harness.HTTP {
 	now := ctx.Clock.Now() / 1000
 	ctx.Redis.Do("HSET", "sku:sku-1", "tenant", "t1", "synced_at", now)
 	ctx.Redis.Do("HSET", "sku:sku-2", "tenant", "t1") // the warehouse sync never wrote it
@@ -773,7 +773,7 @@ func readWorld(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-type readStockBody struct {
+type HReadStockBody struct {
 	Available int  \`json:"available"\`
 	Reserved  int  \`json:"reserved"\`
 	OnHand    int  \`json:"on_hand"\`
@@ -781,77 +781,77 @@ type readStockBody struct {
 	Stale     bool \`json:"stale"\`
 }
 
-func readStockOf(ctx *harness.Ctx, c *harness.HTTP, sku, tenant string) (*harness.Response, readStockBody) {
+func hReadStockOf(ctx *harness.Ctx, c *harness.HTTP, sku, tenant string) (*harness.Response, HReadStockBody) {
 	r := c.Get("/v1/skus/"+sku+"/stock", "X-Tenant-Id", tenant)
-	var body readStockBody
+	var body HReadStockBody
 	if r.Status == 200 {
 		r.Decode(&body)
 	}
 	return r, body
 }
 
-func readReserve(ctx *harness.Ctx, quantity int, reservationID string) {
+func hReadReserve(ctx *harness.Ctx, quantity int, reservationID string) {
 	ok, err := stock.Reserve(context.Background(), "sku-1", quantity, reservationID)
 	ctx.NoError(err, "reserving through inventory/stock")
 	ctx.Assert(ok, "reserving %d units of sku-1 was refused", quantity)
 }
 
 // readBuyer is another buyer's reserve of 1 unit: the counter goes down and a live hold appears, in one step.
-func readBuyer(ctx *harness.Ctx, reservationID string) {
+func hReadBuyer(ctx *harness.Ctx, reservationID string) {
 	ctx.Redis.Do("DECRBY", "stock:sku-1", 1)
 	ctx.Redis.Do("HSET", "holds:sku-1", reservationID, 1)
 	ctx.Redis.Set("hold:"+reservationID, 1, "EX", 900)
 }
 
 func CheckLiveCounter(ctx *harness.Ctx) {
-	c := readWorld(ctx)
-	r, before := readStockOf(ctx, c, "sku-1", "t1")
+	c := hReadWorld(ctx)
+	r, before := hReadStockOf(ctx, c, "sku-1", "t1")
 	ctx.Equal(r.Status, 200, "GET /v1/skus/sku-1/stock (%s)", r.Text())
 	ctx.Equal(before.Available, 10, "the available units of a sku with 10")
-	readReserve(ctx, 4, "r-1")
-	_, after := readStockOf(ctx, c, "sku-1", "t1")
+	hReadReserve(ctx, 4, "r-1")
+	_, after := hReadStockOf(ctx, c, "sku-1", "t1")
 	ctx.Equal(after.Available, 6, "the available units after a reservation of 4 (the storefront must not promise units the counter already gave away: read stock:sku-1, not a cache)")
 }
 
 func CheckReservedHolds(ctx *harness.Ctx) {
-	c := readWorld(ctx)
-	readReserve(ctx, 3, "r-1")
+	c := hReadWorld(ctx)
+	hReadReserve(ctx, 3, "r-1")
 	ctx.Clock.Advance(600)
-	readReserve(ctx, 2, "r-2")
+	hReadReserve(ctx, 2, "r-2")
 	ctx.Clock.Advance(400) // r-1's hold expired, r-2's is live
-	_, body := readStockOf(ctx, c, "sku-1", "t1")
+	_, body := hReadStockOf(ctx, c, "sku-1", "t1")
 	ctx.Equal([]int{body.Available, body.Reserved, body.OnHand}, []int{8, 2, 10}, "available, reserved, on_hand with a live hold of 2 and an expired hold of 3 on 10 units (an expired hold is available again, a live one is reserved)")
 	// Another buyer reserves right after the read's first command on the counter, then on the hold map.
 	for n, key := range []string{"stock:sku-1", "holds:sku-1"} {
 		buyer := fmt.Sprintf("r-buyer-%d", n)
 		probe := ctx.Redis.After(key, func() any {
-			readBuyer(ctx, buyer)
+			hReadBuyer(ctx, buyer)
 			return nil
 		})
-		_, snap := readStockOf(ctx, c, "sku-1", "t1")
+		_, snap := hReadStockOf(ctx, c, "sku-1", "t1")
 		ctx.Assert(probe.Fired, "the read never touched %s", key)
 		ctx.Assert(snap.OnHand == 10 && snap.Available+snap.Reserved == 10, "a reserve that landed between the read's commands made it answer available, reserved, on_hand = %d, %d, %d: a reserve moves units from available to reserved and on_hand stays 10, so read the counter and the hold map in one script", snap.Available, snap.Reserved, snap.OnHand)
 	}
 }
 
 func CheckTenant404(ctx *harness.Ctx) {
-	c := readWorld(ctx)
-	other, _ := readStockOf(ctx, c, "sku-9", "t1")
-	unknown, _ := readStockOf(ctx, c, "sku-404", "t1")
-	own, _ := readStockOf(ctx, c, "sku-9", "t2")
+	c := hReadWorld(ctx)
+	other, _ := hReadStockOf(ctx, c, "sku-9", "t1")
+	unknown, _ := hReadStockOf(ctx, c, "sku-404", "t1")
+	own, _ := hReadStockOf(ctx, c, "sku-9", "t2")
 	ctx.Equal(other.Status, 404, "tenant t1 reading t2's sku-9")
 	ctx.Equal(unknown.Status, 404, "a sku the catalogue does not know")
 	ctx.Equal(own.Status, 200, "tenant t2 reading its own sku-9")
 }
 
 func CheckStale(ctx *harness.Ctx) {
-	c := readWorld(ctx)
-	_, fresh := readStockOf(ctx, c, "sku-1", "t1")
+	c := hReadWorld(ctx)
+	_, fresh := hReadStockOf(ctx, c, "sku-1", "t1")
 	ctx.Clock.Advance(58)
-	_, recent := readStockOf(ctx, c, "sku-1", "t1")
+	_, recent := hReadStockOf(ctx, c, "sku-1", "t1")
 	ctx.Clock.Advance(3) // the warehouse sync stopped writing a minute ago
-	_, late := readStockOf(ctx, c, "sku-1", "t1")
-	never, neverBody := readStockOf(ctx, c, "sku-2", "t1")
+	_, late := hReadStockOf(ctx, c, "sku-1", "t1")
+	never, neverBody := hReadStockOf(ctx, c, "sku-2", "t1")
 	ctx.Equal(fresh.Stale, false, "stale for a sync written just now")
 	ctx.Assert(fresh.SyncedAt != nil, "the read must carry synced_at")
 	ctx.Equal(recent.Stale, false, "stale 58 s after the last warehouse sync (SYNC_STALE_AFTER_S = 60)")
@@ -870,7 +870,7 @@ func CheckStale(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP readWorld(harness::Ctx& ctx) {
+harness::HTTP hReadWorld(harness::Ctx& ctx) {
   const long long now = ctx.Clock.Now() / 1000;
   ctx.Redis.Do("HSET", "sku:sku-1", "tenant", "t1", "synced_at", now);
   ctx.Redis.Do("HSET", "sku:sku-2", "tenant", "t1");  // the warehouse sync never wrote it
@@ -885,21 +885,21 @@ harness::HTTP readWorld(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response readStockOf(harness::HTTP& c, const std::string& sku, const std::string& tenant) {
+harness::Response hReadStockOf(harness::HTTP& c, const std::string& sku, const std::string& tenant) {
   return c.Get("/v1/skus/" + sku + "/stock", "X-Tenant-Id", tenant);
 }
 
-nlohmann::json readStockJson(const harness::Response& r) {
+nlohmann::json hReadStockJson(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : nlohmann::json::object();
 }
 
-void readReserve(harness::Ctx& ctx, int quantity, const std::string& reservation_id) {
+void hReadReserve(harness::Ctx& ctx, int quantity, const std::string& reservation_id) {
   ctx.Assert(inventory::stock::Reserve("sku-1", quantity, reservation_id), "reserving %d units of sku-1 was refused", quantity);
 }
 
 // Another buyer's reserve of 1 unit: the counter goes down and a live hold appears, in one step.
-void readBuyer(harness::Ctx& ctx, const std::string& reservation_id) {
+void hReadBuyer(harness::Ctx& ctx, const std::string& reservation_id) {
   ctx.Redis.Do("DECRBY", "stock:sku-1", 1);
   ctx.Redis.Do("HSET", "holds:sku-1", reservation_id, 1);
   ctx.Redis.Do("SET", "hold:" + reservation_id, 1, "EX", 900);
@@ -908,23 +908,23 @@ void readBuyer(harness::Ctx& ctx, const std::string& reservation_id) {
 }  // namespace
 
 void CheckLiveCounter(harness::Ctx& ctx) {
-  auto c = readWorld(ctx);
-  const auto r = readStockOf(c, "sku-1", "t1");
+  auto c = hReadWorld(ctx);
+  const auto r = hReadStockOf(c, "sku-1", "t1");
   ctx.Equal(r.Status, 200, "GET /v1/skus/sku-1/stock (%s)", r.Text());
-  ctx.Equal(readStockJson(r).value("available", -1LL), 10, "the available units of a sku with 10");
-  readReserve(ctx, 4, "r-1");
-  ctx.Equal(readStockJson(readStockOf(c, "sku-1", "t1")).value("available", -1LL), 6,
+  ctx.Equal(hReadStockJson(r).value("available", -1LL), 10, "the available units of a sku with 10");
+  hReadReserve(ctx, 4, "r-1");
+  ctx.Equal(hReadStockJson(hReadStockOf(c, "sku-1", "t1")).value("available", -1LL), 6,
             "the available units after a reservation of 4 (the storefront must not promise units the counter already gave away: "
             "read stock:sku-1, not a cache)");
 }
 
 void CheckReservedHolds(harness::Ctx& ctx) {
-  auto c = readWorld(ctx);
-  readReserve(ctx, 3, "r-1");
+  auto c = hReadWorld(ctx);
+  hReadReserve(ctx, 3, "r-1");
   ctx.Clock.Advance(600);
-  readReserve(ctx, 2, "r-2");
+  hReadReserve(ctx, 2, "r-2");
   ctx.Clock.Advance(400);  // r-1's hold expired, r-2's is live
-  const auto body = readStockJson(readStockOf(c, "sku-1", "t1"));
+  const auto body = hReadStockJson(hReadStockOf(c, "sku-1", "t1"));
   const std::vector<long long> got = {body.value("available", -1LL), body.value("reserved", -1LL), body.value("on_hand", -1LL)};
   ctx.Equal(got, {8, 2, 10},
             "available, reserved, on_hand with a live hold of 2 and an expired hold of 3 on 10 units (an expired hold is "
@@ -936,9 +936,9 @@ void CheckReservedHolds(harness::Ctx& ctx) {
     const std::string buyer = "r-buyer-" + std::to_string(n++);
     ctx.Redis.After(key, [&ctx, &fired, buyer] {
       fired = true;
-      readBuyer(ctx, buyer);
+      hReadBuyer(ctx, buyer);
     });
-    const auto snap = readStockJson(readStockOf(c, "sku-1", "t1"));
+    const auto snap = hReadStockJson(hReadStockOf(c, "sku-1", "t1"));
     ctx.Assert(fired, "the read never touched %s", key);
     const long long available = snap.value("available", -1LL), reserved = snap.value("reserved", -1LL), on_hand = snap.value("on_hand", -1LL);
     ctx.Assert(on_hand == 10 && available + reserved == 10,
@@ -949,25 +949,25 @@ void CheckReservedHolds(harness::Ctx& ctx) {
 }
 
 void CheckTenant404(harness::Ctx& ctx) {
-  auto c = readWorld(ctx);
-  ctx.Equal(readStockOf(c, "sku-9", "t1").Status, 404, "tenant t1 reading t2's sku-9");
-  ctx.Equal(readStockOf(c, "sku-404", "t1").Status, 404, "a sku the catalogue does not know");
-  ctx.Equal(readStockOf(c, "sku-9", "t2").Status, 200, "tenant t2 reading its own sku-9");
+  auto c = hReadWorld(ctx);
+  ctx.Equal(hReadStockOf(c, "sku-9", "t1").Status, 404, "tenant t1 reading t2's sku-9");
+  ctx.Equal(hReadStockOf(c, "sku-404", "t1").Status, 404, "a sku the catalogue does not know");
+  ctx.Equal(hReadStockOf(c, "sku-9", "t2").Status, 200, "tenant t2 reading its own sku-9");
 }
 
 void CheckStale(harness::Ctx& ctx) {
-  auto c = readWorld(ctx);
-  const auto fresh = readStockJson(readStockOf(c, "sku-1", "t1"));
+  auto c = hReadWorld(ctx);
+  const auto fresh = hReadStockJson(hReadStockOf(c, "sku-1", "t1"));
   ctx.Clock.Advance(58);
-  const auto recent = readStockJson(readStockOf(c, "sku-1", "t1"));
+  const auto recent = hReadStockJson(hReadStockOf(c, "sku-1", "t1"));
   ctx.Clock.Advance(3);  // the warehouse sync stopped writing a minute ago
-  const auto late = readStockJson(readStockOf(c, "sku-1", "t1"));
-  const auto never = readStockOf(c, "sku-2", "t1");
+  const auto late = hReadStockJson(hReadStockOf(c, "sku-1", "t1"));
+  const auto never = hReadStockOf(c, "sku-2", "t1");
   ctx.Equal(fresh.value("stale", true), false, "stale for a sync written just now");
   ctx.Assert(fresh.contains("synced_at") && !fresh["synced_at"].is_null(), "the read must carry synced_at, got %s", fresh.dump());
   ctx.Equal(recent.value("stale", true), false, "stale 58 s after the last warehouse sync (SYNC_STALE_AFTER_S = 60)");
   ctx.Equal(late.value("stale", false), true, "stale 61 s after the last warehouse sync (SYNC_STALE_AFTER_S = 60)");
-  ctx.Assert(never.Status == 200 && readStockJson(never).value("stale", false),
+  ctx.Assert(never.Status == 200 && hReadStockJson(never).value("stale", false),
              "a sku the warehouse sync never wrote reads %d %s, expected stale true: no sync time is the stalest of all", never.Status, never.Text());
 }
 `,

@@ -885,12 +885,12 @@ type hPoint = map[string]float64
 
 var (
 	hBg      = context.Background()
-	sf       = hPoint{"lat": 37.77412, "lng": -122.41942}
-	oakland  = hPoint{"lat": 37.80418, "lng": -122.27112}
-	berkeley = hPoint{"lat": 37.87159, "lng": -122.27275}
-	alcatraz = hPoint{"lat": 37.82667, "lng": -122.42306}
-	la       = hPoint{"lat": 34.05223, "lng": -118.24368}
-	pasadena = hPoint{"lat": 34.14778, "lng": -118.14452}
+	hSf       = hPoint{"lat": 37.77412, "lng": -122.41942}
+	hOakland  = hPoint{"lat": 37.80418, "lng": -122.27112}
+	hBerkeley = hPoint{"lat": 37.87159, "lng": -122.27275}
+	hAlcatraz = hPoint{"lat": 37.82667, "lng": -122.42306}
+	hLa       = hPoint{"lat": 34.05223, "lng": -118.24368}
+	hPasadena = hPoint{"lat": 34.14778, "lng": -118.14452}
 )
 
 // hEngine: a road route is 1.3 times the great-circle legs; no road reaches Alcatraz.
@@ -903,7 +903,7 @@ func (hEngine) ComputeRoute(_ context.Context, req *pb.ComputeRouteRequest) (*pb
 	points = append(points, req.GetDestination())
 	distance := 0.0
 	for i, p := range points {
-		if math.Abs(p.GetLat()-alcatraz["lat"]) < 0.001 && math.Abs(p.GetLng()-alcatraz["lng"]) < 0.001 {
+		if math.Abs(p.GetLat()-hAlcatraz["lat"]) < 0.001 && math.Abs(p.GetLng()-hAlcatraz["lng"]) < 0.001 {
 			return nil, status.Error(codes.NotFound, "no road reaches Alcatraz")
 		}
 		if i > 0 {
@@ -934,7 +934,7 @@ func hSolves(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("ComputeRoute",
 
 func CheckRoutes(ctx *harness.Ctx) {
 	c := hAPI(ctx)
-	r := c.Post("/v1/routes", hTrip(sf, oakland, berkeley), "X-Tenant-Id", "acme")
+	r := c.Post("/v1/routes", hTrip(hSf, hOakland, hBerkeley), "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 201, "a covered trip (%s)", r.Text())
 	var body struct {
 		RouteID   string  \`json:"route_id"\`
@@ -945,15 +945,15 @@ func CheckRoutes(ctx *harness.Ctx) {
 	ctx.Assert(!body.Degraded && body.DistanceM > 0, "the answer must carry the engine's route, got %s", r.Text())
 	stored := routes.LoadRoute(hBg, body.RouteID)
 	ctx.Assert(stored != nil && stored.Tenant == "acme", "route %s must be stored under tenant acme, the store holds %+v", body.RouteID, stored)
-	r = c.Post("/v1/routes", hTrip(sf, alcatraz), "X-Tenant-Id", "acme")
+	r = c.Post("/v1/routes", hTrip(hSf, hAlcatraz), "X-Tenant-Id", "acme")
 	ctx.Assert(r.Status == 422 && strings.Contains(r.Text(), "NO_ROUTE"), "a trip no road connects answered %d %s, expected 422 NO_ROUTE", r.Status, r.Text())
 }
 
 func CheckTenant(ctx *harness.Ctx) {
 	c := hAPI(ctx)
-	r := c.Post("/v1/routes", hTrip(sf, oakland))
+	r := c.Post("/v1/routes", hTrip(hSf, hOakland))
 	ctx.Equal(r.Status, 401, "a route request without X-Tenant-Id")
-	r = c.Post("/v1/routes", hTrip(sf, oakland), "X-Tenant-Id", "")
+	r = c.Post("/v1/routes", hTrip(hSf, hOakland), "X-Tenant-Id", "")
 	ctx.Equal(r.Status, 401, "a route request with an empty X-Tenant-Id")
 	ctx.Equal(hSolves(ctx), 0, "the engine solved a trip for a request with no tenant; the solves")
 	ctx.Equal(len(ctx.Redis.Keys("routes:r-*")), 0, "a route was stored for nobody; the stored routes")
@@ -965,10 +965,10 @@ func CheckCoordinates(ctx *harness.Ctx) {
 		body map[string]any
 		what string
 	}{
-		{hTrip(hPoint{"lat": 91.0, "lng": sf["lng"]}, oakland), "an origin at lat 91"},
-		{hTrip(sf, hPoint{"lat": oakland["lat"], "lng": -190.0}), "a destination at lng -190"},
-		{hTrip(sf, oakland, hPoint{"lat": -95.0, "lng": berkeley["lng"]}), "a waypoint at lat -95"},
-		{hTrip(sf, oakland, berkeley, hPoint{"lat": berkeley["lat"], "lng": 200.0}), "a second waypoint at lng 200"},
+		{hTrip(hPoint{"lat": 91.0, "lng": hSf["lng"]}, hOakland), "an origin at lat 91"},
+		{hTrip(hSf, hPoint{"lat": hOakland["lat"], "lng": -190.0}), "a destination at lng -190"},
+		{hTrip(hSf, hOakland, hPoint{"lat": -95.0, "lng": hBerkeley["lng"]}), "a waypoint at lat -95"},
+		{hTrip(hSf, hOakland, hBerkeley, hPoint{"lat": hBerkeley["lat"], "lng": 200.0}), "a second waypoint at lng 200"},
 	}
 	for _, b := range bad {
 		r := c.Post("/v1/routes", b.body, "X-Tenant-Id", "acme")
@@ -979,9 +979,9 @@ func CheckCoordinates(ctx *harness.Ctx) {
 		body map[string]any
 		what string
 	}{
-		{hTrip(hPoint{"lat": 90.0, "lng": sf["lng"]}, oakland), "an origin at lat 90"},
-		{hTrip(sf, hPoint{"lat": oakland["lat"], "lng": -180.0}), "a destination at lng -180"},
-		{hTrip(sf, oakland, hPoint{"lat": -90.0, "lng": 180.0}), "a waypoint at lat -90, lng 180"},
+		{hTrip(hPoint{"lat": 90.0, "lng": hSf["lng"]}, hOakland), "an origin at lat 90"},
+		{hTrip(hSf, hPoint{"lat": hOakland["lat"], "lng": -180.0}), "a destination at lng -180"},
+		{hTrip(hSf, hOakland, hPoint{"lat": -90.0, "lng": 180.0}), "a waypoint at lat -90, lng 180"},
 	}
 	for _, b := range edges {
 		r := c.Post("/v1/routes", b.body, "X-Tenant-Id", "acme")
@@ -996,23 +996,23 @@ func CheckWaypoints(ctx *harness.Ctx) {
 	for i := range stops {
 		stops[i] = hPoint{"lat": 37.78 + float64(i)*0.002, "lng": -122.4}
 	}
-	r := c.Post("/v1/routes", hTrip(sf, oakland, stops...), "X-Tenant-Id", "acme")
+	r := c.Post("/v1/routes", hTrip(hSf, hOakland, stops...), "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 422, "a trip with 26 waypoints (MAX_WAYPOINTS is 25)")
 	ctx.Equal(hSolves(ctx), 0, "a trip with 26 waypoints reached the solver; the solves")
-	r = c.Post("/v1/routes", hTrip(sf, oakland, stops[:25]...), "X-Tenant-Id", "acme")
+	r = c.Post("/v1/routes", hTrip(hSf, hOakland, stops[:25]...), "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 201, "a trip with 25 waypoints (%s)", r.Text())
 }
 
 func CheckCoverage(ctx *harness.Ctx) {
 	c := hAPI(ctx)
-	r := c.Post("/v1/routes", hTrip(sf, la), "X-Tenant-Id", "acme")
+	r := c.Post("/v1/routes", hTrip(hSf, hLa), "X-Tenant-Id", "acme")
 	ctx.Assert(r.Status == 403 && strings.Contains(r.Text(), "OUT_OF_COVERAGE"), "a Bay Area tenant asking for Los Angeles answered %d %s, expected 403 OUT_OF_COVERAGE", r.Status, r.Text())
-	r = c.Post("/v1/routes", hTrip(sf, oakland, pasadena), "X-Tenant-Id", "acme")
+	r = c.Post("/v1/routes", hTrip(hSf, hOakland, hPasadena), "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 403, "a waypoint outside the tenant's coverage")
-	r = c.Post("/v1/routes", hTrip(sf, oakland), "X-Tenant-Id", "nobody")
+	r = c.Post("/v1/routes", hTrip(hSf, hOakland), "X-Tenant-Id", "nobody")
 	ctx.Equal(r.Status, 403, "a tenant with no coverage")
 	ctx.Equal(hSolves(ctx), 0, "the engine solved trips outside the tenant's coverage; the solves")
-	r = c.Post("/v1/routes", hTrip(la, pasadena), "X-Tenant-Id", "south")
+	r = c.Post("/v1/routes", hTrip(hLa, hPasadena), "X-Tenant-Id", "south")
 	ctx.Equal(r.Status, 201, "a Los Angeles trip for the Los Angeles tenant (%s)", r.Text())
 }
 `,
@@ -1033,12 +1033,12 @@ using json = nlohmann::json;
 
 namespace {
 
-const json kSf = {{"lat", 37.77412}, {"lng", -122.41942}};
-const json kOakland = {{"lat", 37.80418}, {"lng", -122.27112}};
-const json kBerkeley = {{"lat", 37.87159}, {"lng", -122.27275}};
-const json kAlcatraz = {{"lat", 37.82667}, {"lng", -122.42306}};
-const json kLa = {{"lat", 34.05223}, {"lng", -118.24368}};
-const json kPasadena = {{"lat", 34.14778}, {"lng", -118.14452}};
+const json kHSf = {{"lat", 37.77412}, {"lng", -122.41942}};
+const json kHOakland = {{"lat", 37.80418}, {"lng", -122.27112}};
+const json kHBerkeley = {{"lat", 37.87159}, {"lng", -122.27275}};
+const json kHAlcatraz = {{"lat", 37.82667}, {"lng", -122.42306}};
+const json kHLa = {{"lat", 34.05223}, {"lng", -118.24368}};
+const json kHPasadena = {{"lat", 34.14778}, {"lng", -118.14452}};
 
 // A road route is 1.3 times the great-circle legs; no road reaches Alcatraz.
 class HEnginePeer final : public mapsrouting::RoutingEngine::Service {
@@ -1093,22 +1093,22 @@ bool hHas(const std::string& text, const std::string& part) { return text.find(p
 
 void CheckRoutes(harness::Ctx& ctx) {
   auto c = hApi(ctx);
-  auto r = hPost(c, hTrip(kSf, kOakland, json::array({kBerkeley})), "acme");
+  auto r = hPost(c, hTrip(kHSf, kHOakland, json::array({kHBerkeley})), "acme");
   ctx.Equal(r.Status, 201, "a covered trip (%s)", r.Text());
   const json body = json::parse(r.Text());
   ctx.Assert(!body.value("degraded", true) && body.value("distance_m", 0.0) > 0, "the answer must carry the engine's route, got %s", r.Text());
   const std::string route_id = body.value("route_id", "");
   const auto stored = routes::loadRoute(route_id);
   ctx.Assert(stored && stored->tenant == "acme", "route %s must be stored under tenant acme, the store holds tenant %q", route_id, stored ? stored->tenant : "(none)");
-  r = hPost(c, hTrip(kSf, kAlcatraz), "acme");
+  r = hPost(c, hTrip(kHSf, kHAlcatraz), "acme");
   ctx.Assert(r.Status == 422 && hHas(r.Text(), "NO_ROUTE"), "a trip no road connects answered %d %s, expected 422 NO_ROUTE", r.Status, r.Text());
 }
 
 void CheckTenant(harness::Ctx& ctx) {
   auto c = hApi(ctx);
-  auto r = c.Post("/v1/routes", hTrip(kSf, kOakland), "Content-Type", "application/json");
+  auto r = c.Post("/v1/routes", hTrip(kHSf, kHOakland), "Content-Type", "application/json");
   ctx.Equal(r.Status, 401, "a route request without X-Tenant-Id");
-  r = hPost(c, hTrip(kSf, kOakland), "");
+  r = hPost(c, hTrip(kHSf, kHOakland), "");
   ctx.Equal(r.Status, 401, "a route request with an empty X-Tenant-Id");
   ctx.Equal(hSolves(ctx), 0, "the engine solved a trip for a request with no tenant; the solves");
   ctx.Equal(ctx.Redis.Keys("routes:r-*").size(), 0, "a route was stored for nobody; the stored routes");
@@ -1117,10 +1117,10 @@ void CheckTenant(harness::Ctx& ctx) {
 void CheckCoordinates(harness::Ctx& ctx) {
   auto c = hApi(ctx);
   const std::vector<std::pair<std::string, std::string>> bad = {
-      {hTrip({{"lat", 91.0}, {"lng", -122.41942}}, kOakland), "an origin at lat 91"},
-      {hTrip(kSf, {{"lat", 37.80418}, {"lng", -190.0}}), "a destination at lng -190"},
-      {hTrip(kSf, kOakland, json::array({{{"lat", -95.0}, {"lng", -122.27275}}})), "a waypoint at lat -95"},
-      {hTrip(kSf, kOakland, json::array({kBerkeley, json{{"lat", 37.87159}, {"lng", 200.0}}})), "a second waypoint at lng 200"},
+      {hTrip({{"lat", 91.0}, {"lng", -122.41942}}, kHOakland), "an origin at lat 91"},
+      {hTrip(kHSf, {{"lat", 37.80418}, {"lng", -190.0}}), "a destination at lng -190"},
+      {hTrip(kHSf, kHOakland, json::array({{{"lat", -95.0}, {"lng", -122.27275}}})), "a waypoint at lat -95"},
+      {hTrip(kHSf, kHOakland, json::array({kHBerkeley, json{{"lat", 37.87159}, {"lng", 200.0}}})), "a second waypoint at lng 200"},
   };
   for (const auto& [body, what] : bad) {
     const auto r = hPost(c, body, "acme");
@@ -1128,9 +1128,9 @@ void CheckCoordinates(harness::Ctx& ctx) {
   }
   // The edges of the planet are coordinates: outside this tenant's map, so 403, not 422.
   const std::vector<std::pair<std::string, std::string>> edges = {
-      {hTrip({{"lat", 90.0}, {"lng", -122.41942}}, kOakland), "an origin at lat 90"},
-      {hTrip(kSf, {{"lat", 37.80418}, {"lng", -180.0}}), "a destination at lng -180"},
-      {hTrip(kSf, kOakland, json::array({json{{"lat", -90.0}, {"lng", 180.0}}})), "a waypoint at lat -90, lng 180"},
+      {hTrip({{"lat", 90.0}, {"lng", -122.41942}}, kHOakland), "an origin at lat 90"},
+      {hTrip(kHSf, {{"lat", 37.80418}, {"lng", -180.0}}), "a destination at lng -180"},
+      {hTrip(kHSf, kHOakland, json::array({json{{"lat", -90.0}, {"lng", 180.0}}})), "a waypoint at lat -90, lng 180"},
   };
   for (const auto& [body, what] : edges) {
     const auto r = hPost(c, body, "acme");
@@ -1143,24 +1143,24 @@ void CheckWaypoints(harness::Ctx& ctx) {
   auto c = hApi(ctx);
   json stops = json::array();
   for (int i = 0; i < 26; i++) stops.push_back({{"lat", 37.78 + i * 0.002}, {"lng", -122.4}});
-  auto r = hPost(c, hTrip(kSf, kOakland, stops), "acme");
+  auto r = hPost(c, hTrip(kHSf, kHOakland, stops), "acme");
   ctx.Equal(r.Status, 422, "a trip with 26 waypoints (MAX_WAYPOINTS is 25)");
   ctx.Equal(hSolves(ctx), 0, "a trip with 26 waypoints reached the solver; the solves");
   stops.erase(stops.end() - 1);
-  r = hPost(c, hTrip(kSf, kOakland, stops), "acme");
+  r = hPost(c, hTrip(kHSf, kHOakland, stops), "acme");
   ctx.Equal(r.Status, 201, "a trip with 25 waypoints (%s)", r.Text());
 }
 
 void CheckCoverage(harness::Ctx& ctx) {
   auto c = hApi(ctx);
-  auto r = hPost(c, hTrip(kSf, kLa), "acme");
+  auto r = hPost(c, hTrip(kHSf, kHLa), "acme");
   ctx.Assert(r.Status == 403 && hHas(r.Text(), "OUT_OF_COVERAGE"), "a Bay Area tenant asking for Los Angeles answered %d %s, expected 403 OUT_OF_COVERAGE", r.Status, r.Text());
-  r = hPost(c, hTrip(kSf, kOakland, json::array({kPasadena})), "acme");
+  r = hPost(c, hTrip(kHSf, kHOakland, json::array({kHPasadena})), "acme");
   ctx.Equal(r.Status, 403, "a waypoint outside the tenant's coverage");
-  r = hPost(c, hTrip(kSf, kOakland), "nobody");
+  r = hPost(c, hTrip(kHSf, kHOakland), "nobody");
   ctx.Equal(r.Status, 403, "a tenant with no coverage");
   ctx.Equal(hSolves(ctx), 0, "the engine solved trips outside the tenant's coverage; the solves");
-  r = hPost(c, hTrip(kLa, kPasadena), "south");
+  r = hPost(c, hTrip(kHLa, kHPasadena), "south");
   ctx.Equal(r.Status, 201, "a Los Angeles trip for the Los Angeles tenant (%s)", r.Text());
 }
 `,

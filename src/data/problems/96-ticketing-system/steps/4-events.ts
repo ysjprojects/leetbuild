@@ -777,56 +777,56 @@ import (
 )
 
 const (
-	eventsTopic   = "ticket.event"
-	eventsSubject = "Invoice 4471 charged twice"
+	kHEventsTopic   = "ticket.event"
+	kHEventsSubject = "Invoice 4471 charged twice"
 )
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func eventsTicket() string { return store.CreateTicket(eventsBg, "R-1", eventsSubject).ID }
+func hEventsTicket() string { return store.CreateTicket(hEventsBg, "R-1", kHEventsSubject).ID }
 
-func eventsPublish(ctx *harness.Ctx, t, fromState, toState, actor, role string) map[string]any {
-	event, err := publishTransition(eventsBg, t, fromState, toState, actor, role)
+func hEventsPublish(ctx *harness.Ctx, t, fromState, toState, actor, role string) map[string]any {
+	event, err := publishTransition(hEventsBg, t, fromState, toState, actor, role)
 	ctx.NoError(err, "moving %s from %s to %s failed", t, fromState, toState)
 	ctx.Assert(event != nil, "moving %s from %s to %s must commit and answer the event", t, fromState, toState)
 	ctx.Settle()
 	return event
 }
 
-func eventsPayload(ctx *harness.Ctx, value []byte) map[string]any {
+func hEventsPayload(ctx *harness.Ctx, value []byte) map[string]any {
 	var p map[string]any
 	ctx.Assert(json.Unmarshal(value, &p) == nil, "the record's value is not JSON: %s", value)
 	return p
 }
 
 func CheckTicketKey(ctx *harness.Ctx) {
-	t := eventsTicket()
-	eventsPublish(ctx, t, "open", "pending", "A-7", "agent")
-	eventsPublish(ctx, t, "pending", "open", "R-1", "requester")
-	eventsPublish(ctx, t, "open", "resolved", "A-9", "agent")
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 3, "three transitions must produce three records on %s; the records", eventsTopic)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{t, t, t}, "records must be keyed by the ticket id (keyed by the actor, one ticket's events land on several partitions and its timeline is read out of order)")
+	t := hEventsTicket()
+	hEventsPublish(ctx, t, "open", "pending", "A-7", "agent")
+	hEventsPublish(ctx, t, "pending", "open", "R-1", "requester")
+	hEventsPublish(ctx, t, "open", "resolved", "A-9", "agent")
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 3, "three transitions must produce three records on %s; the records", kHEventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{t, t, t}, "records must be keyed by the ticket id (keyed by the actor, one ticket's events land on several partitions and its timeline is read out of order)")
 	ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition, "%s's events landed on partitions %d, %d, %d: one ticket's history must stay on one partition", t, records[0].Partition, records[1].Partition, records[2].Partition)
 }
 
 func CheckNoCustomerText(ctx *harness.Ctx) {
-	t := eventsTicket()
-	eventsPublish(ctx, t, "open", "pending", "A-7", "agent")
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Assert(len(records) > 0, "the transition produced nothing on %s", eventsTopic)
+	t := hEventsTicket()
+	hEventsPublish(ctx, t, "open", "pending", "A-7", "agent")
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Assert(len(records) > 0, "the transition produced nothing on %s", kHEventsTopic)
 	text := string(records[0].Value)
-	for _, words := range []string{eventsSubject, "4471", "charged"} {
-		ctx.Assert(!strings.Contains(text, words), "the event carries the ticket's subject (%q): %s. %s is retained and replicated; carry ids and the transition", words, text, eventsTopic)
+	for _, words := range []string{kHEventsSubject, "4471", "charged"} {
+		ctx.Assert(!strings.Contains(text, words), "the event carries the ticket's subject (%q): %s. %s is retained and replicated; carry ids and the transition", words, text, kHEventsTopic)
 	}
-	_, has := eventsPayload(ctx, records[0].Value)["subject"]
+	_, has := hEventsPayload(ctx, records[0].Value)["subject"]
 	ctx.Assert(!has, "the event has a subject field: %s", text)
 }
 
 func CheckEventFields(ctx *harness.Ctx) {
-	t := eventsTicket()
-	eventsPublish(ctx, t, "open", "pending", "R-1", "requester")
-	p := eventsPayload(ctx, ctx.Kafka.Records(eventsTopic)[0].Value)
+	t := hEventsTicket()
+	hEventsPublish(ctx, t, "open", "pending", "R-1", "requester")
+	p := hEventsPayload(ctx, ctx.Kafka.Records(kHEventsTopic)[0].Value)
 	expected := map[string]string{"type": "ticket.transition", "ticket_id": t, "requester_id": "R-1", "actor_id": "R-1", "actor_role": "requester", "from": "open", "to": "pending"}
 	for _, name := range []string{"type", "ticket_id", "requester_id", "actor_id", "actor_role", "from", "to"} {
 		ctx.Equal(p[name], expected[name], "a consumer renders the timeline entry from the event alone (%v); the event's %s", p, name)
@@ -834,27 +834,27 @@ func CheckEventFields(ctx *harness.Ctx) {
 }
 
 func CheckCommitBeforeProduce(ctx *harness.Ctx) {
-	t := eventsTicket()
-	stale, err := publishTransition(eventsBg, t, "pending", "resolved", "A-7", "agent")
+	t := hEventsTicket()
+	stale, err := publishTransition(hEventsBg, t, "pending", "resolved", "A-7", "agent")
 	ctx.NoError(err, "a refused transition must not fail")
 	ctx.Settle()
 	ctx.Assert(stale == nil, "%s is open, so a move from pending must not commit and must answer nil, got %v", t, stale)
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Assert(len(records) == 0, "a transition the store refused produced %d record(s): consumers now believe %s is resolved while it is open. Commit first, produce after", len(records), t)
-	ctx.Equal(store.GetTicket(eventsBg, t).State, "open", "the refused move must leave the ticket; its state")
-	eventsPublish(ctx, t, "open", "pending", "A-7", "agent")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "a committed transition must produce one record; the records")
-	ctx.Equal(store.GetTicket(eventsBg, t).State, "pending", "the committed state")
+	ctx.Equal(store.GetTicket(hEventsBg, t).State, "open", "the refused move must leave the ticket; its state")
+	hEventsPublish(ctx, t, "open", "pending", "A-7", "agent")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "a committed transition must produce one record; the records")
+	ctx.Equal(store.GetTicket(hEventsBg, t).State, "pending", "the committed state")
 	// Another agent resolves the next ticket the instant this call first touches it.
-	t2 := eventsTicket()
+	t2 := hEventsTicket()
 	rival := ctx.Redis.After("ticket:"+t2, func() any { return ctx.Redis.Do("HSET", "ticket:"+t2, "state", "resolved") })
-	event, err := publishTransition(eventsBg, t2, "open", "pending", "A-7", "agent")
+	event, err := publishTransition(hEventsBg, t2, "open", "pending", "A-7", "agent")
 	ctx.NoError(err, "publishTransition(%s) failed", t2)
 	ctx.Settle()
 	ctx.Assert(rival.Fired, "publishTransition never touched ticket:%s", t2)
 	produced := 0
-	for _, r := range ctx.Kafka.Records(eventsTopic) {
-		if eventsPayload(ctx, r.Value)["ticket_id"] == t2 {
+	for _, r := range ctx.Kafka.Records(kHEventsTopic) {
+		if hEventsPayload(ctx, r.Value)["ticket_id"] == t2 {
 			produced++
 		}
 	}
@@ -866,13 +866,13 @@ func CheckCommitBeforeProduce(ctx *harness.Ctx) {
 }
 
 func CheckDurableProducer(ctx *harness.Ctx) {
-	t := eventsTicket()
-	ctx.Kafka.LoseAcks(eventsTopic, 1)
-	eventsPublish(ctx, t, "open", "pending", "A-7", "agent")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "one transition whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records")
-	eventsPublish(ctx, t, "pending", "resolved", "A-7", "agent")
-	lost := ctx.Kafka.Failover(eventsTopic)
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records", lost)
+	t := hEventsTicket()
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1)
+	hEventsPublish(ctx, t, "open", "pending", "A-7", "agent")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "one transition whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records")
+	hEventsPublish(ctx, t, "pending", "resolved", "A-7", "agent")
+	lost := ctx.Kafka.Failover(kHEventsTopic)
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records", lost)
 }
 `,
     cpp: `#include <leetbuild/harness.h>

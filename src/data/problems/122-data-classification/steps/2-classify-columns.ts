@@ -928,11 +928,11 @@ import (
 	"leetbuild/harness"
 )
 
-const classifyGateway = "llm-gateway:9000"
+const kHClassifyGateway = "llm-gateway:9000"
 
-var classifyTable = []string{"customer_name", "customer_email", "salary_band", "remarks", "pickup_geohash", "nric"}
+var hClassifyTable = []string{"customer_name", "customer_email", "salary_band", "remarks", "pickup_geohash", "nric"}
 
-func classifyTagOf(column string) string {
+func hClassifyTagOf(column string) string {
 	switch {
 	case strings.Contains(column, "passport") || strings.Contains(column, "nric"):
 		return "Personal.ID"
@@ -951,13 +951,13 @@ func classifyTagOf(column string) string {
 // gatewayPeer is the LLM gateway stand-in: refuses prompts over the context window, answers like the
 // model would, with a row for a column nobody asked about. Entity "flaky" answers each batch's first
 // call UNAVAILABLE; "garbled" and "object" answer content that is not a JSON array.
-type gatewayPeer struct {
+type HGatewayPeer struct {
 	pb.UnimplementedClassifierServer
 	mu      sync.Mutex
 	refused map[string]bool
 }
 
-func (g *gatewayPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
+func (g *HGatewayPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
 	columns := req.GetColumns()
 	if len(columns) > 150 {
 		return nil, status.Errorf(codes.InvalidArgument, "%d columns exceed the model's context window", len(columns))
@@ -981,7 +981,7 @@ func (g *gatewayPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.
 	rows := []map[string]string{}
 	for _, c := range columns {
 		if !strings.Contains(c, "remarks") {
-			rows = append(rows, map[string]string{"column_name": c, "assigned_tag": classifyTagOf(c)})
+			rows = append(rows, map[string]string{"column_name": c, "assigned_tag": hClassifyTagOf(c)})
 		}
 	}
 	rows = append(rows, map[string]string{"column_name": "internal_note", "assigned_tag": "Personal.ID"}) // a column nobody asked about
@@ -989,11 +989,11 @@ func (g *gatewayPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.
 	return &pb.ClassifyReply{Content: string(raw), Model: "stand-in"}, nil
 }
 
-func classifyWorld(ctx *harness.Ctx) {
-	pb.RegisterClassifierServer(ctx.GRPC.Server(classifyGateway), &gatewayPeer{refused: map[string]bool{}})
+func hClassifyWorld(ctx *harness.Ctx) {
+	pb.RegisterClassifierServer(ctx.GRPC.Server(kHClassifyGateway), &HGatewayPeer{refused: map[string]bool{}})
 }
 
-func classifyWide(n int) []string {
+func hClassifyWide(n int) []string {
 	columns := make([]string, n)
 	for i := range columns {
 		columns[i] = fmt.Sprintf("col_%03d", i)
@@ -1001,28 +1001,28 @@ func classifyWide(n int) []string {
 	return columns
 }
 
-func classifyCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Classify", "") }
+func hClassifyCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Classify", "") }
 
-func classifyOK(ctx *harness.Ctx, entity string, columns []string) map[string]string {
+func hClassifyOK(ctx *harness.Ctx, entity string, columns []string) map[string]string {
 	tags, err := classifyColumns(context.Background(), entity, columns)
 	ctx.NoError(err, "classifyColumns(%q, %d columns)", entity, len(columns))
 	return tags
 }
 
-func classifyFails(ctx *harness.Ctx, entity string, columns []string, why string) {
+func hClassifyFails(ctx *harness.Ctx, entity string, columns []string, why string) {
 	tags, err := classifyColumns(context.Background(), entity, columns)
 	ctx.Assert(err != nil, "%s: classifyColumns returned %v, expected an error wrapping ErrClassifyFailed", why, tags)
 	ctx.Assert(errors.Is(err, ErrClassifyFailed), "%s: classifyColumns returned %v, expected an error wrapping ErrClassifyFailed", why, err)
 }
 
 func CheckBatches(ctx *harness.Ctx) {
-	classifyWorld(ctx)
-	columns := classifyWide(400)
+	hClassifyWorld(ctx)
+	columns := hClassifyWide(400)
 	columns[320] = "passport_no"
-	tags := classifyOK(ctx, "deliveries", columns)
+	tags := hClassifyOK(ctx, "deliveries", columns)
 	var sizes []int
 	var sent []string
-	for _, call := range classifyCalls(ctx) {
+	for _, call := range hClassifyCalls(ctx) {
 		sizes = append(sizes, len(call.Request.(*pb.ClassifyRequest).GetColumns()))
 		sent = append(sent, call.Request.(*pb.ClassifyRequest).GetColumns()...)
 	}
@@ -1033,10 +1033,10 @@ func CheckBatches(ctx *harness.Ctx) {
 	ctx.Equal(sent, columns, "the batches must carry every column once, in column order")
 	ctx.Equal(len(tags), 400, "classifyColumns must answer every column; columns answered")
 	ctx.Equal(tags["passport_no"], "Personal.ID", "passport_no in the third batch")
-	before := len(classifyCalls(ctx))
-	exact := classifyOK(ctx, "orders", classifyWide(300))
+	before := len(hClassifyCalls(ctx))
+	exact := hClassifyOK(ctx, "orders", hClassifyWide(300))
 	var exactSizes []int
-	for _, call := range classifyCalls(ctx)[before:] {
+	for _, call := range hClassifyCalls(ctx)[before:] {
 		exactSizes = append(exactSizes, len(call.Request.(*pb.ClassifyRequest).GetColumns()))
 	}
 	ctx.Equal(exactSizes, []int{150, 150}, "300 columns, exactly two batches' worth, must take calls of 150 and 150 columns")
@@ -1044,62 +1044,62 @@ func CheckBatches(ctx *harness.Ctx) {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	classifyWorld(ctx)
-	classifyOK(ctx, "deliveries", classifyTable)
-	call := classifyCalls(ctx)[0]
+	hClassifyWorld(ctx)
+	hClassifyOK(ctx, "deliveries", hClassifyTable)
+	call := hClassifyCalls(ctx)[0]
 	ctx.Assert(call.HasDeadline(), "the Classify call carries no deadline: a gateway that hangs pins the worker")
 	ctx.Assert(14*time.Second <= call.Timeout && call.Timeout <= 16*time.Second, "the Classify deadline is %v, expected 15 s", call.Timeout)
 	// A slow gateway (10 s a call) across three batches, the first call of each refused late with
 	// UNAVAILABLE: every call, a retry included, carries a full deadline of its own.
-	ctx.GRPC.SetLatency("Classify", 10, classifyGateway)
-	first := len(classifyCalls(ctx))
-	classifyOK(ctx, "flaky", classifyWide(400))
+	ctx.GRPC.SetLatency("Classify", 10, kHClassifyGateway)
+	first := len(hClassifyCalls(ctx))
+	hClassifyOK(ctx, "flaky", hClassifyWide(400))
 	var timeouts []time.Duration
-	for _, c := range classifyCalls(ctx)[first:] {
+	for _, c := range hClassifyCalls(ctx)[first:] {
 		timeouts = append(timeouts, c.Timeout)
 	}
 	ctx.Equal(len(timeouts), 6, "a slow gateway refusing each batch's first call once must get 6 calls (three batches, each retried once); calls")
 	for _, t := range timeouts {
 		ctx.Assert(14*time.Second <= t && t <= 16*time.Second, "the calls carried deadlines of %v: each call, a retry or a later batch included, gets its own 15 s, not what is left of an earlier one", timeouts)
 	}
-	ctx.GRPC.SetLatency("Classify", 60, classifyGateway)
-	before, started := len(classifyCalls(ctx)), ctx.Clock.Now()
-	classifyFails(ctx, "deliveries", classifyTable, "a gateway that hangs for 60 s")
+	ctx.GRPC.SetLatency("Classify", 60, kHClassifyGateway)
+	before, started := len(hClassifyCalls(ctx)), ctx.Clock.Now()
+	hClassifyFails(ctx, "deliveries", hClassifyTable, "a gateway that hangs for 60 s")
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(waited <= 16, "classifyColumns waited %.0f s on a gateway that hangs, expected the 15 s deadline to cut it", waited)
-	ctx.Equal(len(classifyCalls(ctx))-before, 1, "a call cut by its deadline must not be retried (only UNAVAILABLE is); calls")
+	ctx.Equal(len(hClassifyCalls(ctx))-before, 1, "a call cut by its deadline must not be retried (only UNAVAILABLE is); calls")
 }
 
 func CheckRetryUnavailable(ctx *harness.Ctx) {
-	classifyWorld(ctx)
-	ctx.GRPC.Fail("Classify", codes.Unavailable, "gateway restarting", 1, classifyGateway)
-	tags := classifyOK(ctx, "deliveries", classifyTable)
-	ctx.Assert(len(classifyCalls(ctx)) == 2 && tags["nric"] == "Personal.ID", "one UNAVAILABLE must earn one retry that succeeds: %d calls, tags %v", len(classifyCalls(ctx)), tags)
-	ctx.GRPC.Fail("Classify", codes.Unavailable, "gateway down", 2, classifyGateway)
-	classifyFails(ctx, "deliveries", classifyTable, "a gateway that stays UNAVAILABLE")
-	ctx.Equal(len(classifyCalls(ctx)), 4, "a gateway that stays UNAVAILABLE gets maxAttempts = 2 calls; calls so far")
+	hClassifyWorld(ctx)
+	ctx.GRPC.Fail("Classify", codes.Unavailable, "gateway restarting", 1, kHClassifyGateway)
+	tags := hClassifyOK(ctx, "deliveries", hClassifyTable)
+	ctx.Assert(len(hClassifyCalls(ctx)) == 2 && tags["nric"] == "Personal.ID", "one UNAVAILABLE must earn one retry that succeeds: %d calls, tags %v", len(hClassifyCalls(ctx)), tags)
+	ctx.GRPC.Fail("Classify", codes.Unavailable, "gateway down", 2, kHClassifyGateway)
+	hClassifyFails(ctx, "deliveries", hClassifyTable, "a gateway that stays UNAVAILABLE")
+	ctx.Equal(len(hClassifyCalls(ctx)), 4, "a gateway that stays UNAVAILABLE gets maxAttempts = 2 calls; calls so far")
 	for _, code := range []codes.Code{codes.InvalidArgument, codes.ResourceExhausted, codes.Internal, codes.PermissionDenied} {
-		before := len(classifyCalls(ctx))
-		ctx.GRPC.Fail("Classify", code, "refused", 1, classifyGateway)
-		classifyFails(ctx, "deliveries", classifyTable, "a request the gateway refuses with "+code.String())
-		ctx.Equal(len(classifyCalls(ctx))-before, 1, "%v must not be retried: only UNAVAILABLE is, and each call is paid; calls", code)
+		before := len(hClassifyCalls(ctx))
+		ctx.GRPC.Fail("Classify", code, "refused", 1, kHClassifyGateway)
+		hClassifyFails(ctx, "deliveries", hClassifyTable, "a request the gateway refuses with "+code.String())
+		ctx.Equal(len(hClassifyCalls(ctx))-before, 1, "%v must not be retried: only UNAVAILABLE is, and each call is paid; calls", code)
 	}
 	// Each batch's first call is refused UNAVAILABLE: every batch has its own two attempts.
-	before := len(classifyCalls(ctx))
-	classifyOK(ctx, "flaky", classifyWide(400))
-	ctx.Equal(len(classifyCalls(ctx))-before, 6, "three batches, each refused UNAVAILABLE once, must take 6 calls: maxAttempts is per call; calls")
+	before := len(hClassifyCalls(ctx))
+	hClassifyOK(ctx, "flaky", hClassifyWide(400))
+	ctx.Equal(len(hClassifyCalls(ctx))-before, 6, "three batches, each refused UNAVAILABLE once, must take 6 calls: maxAttempts is per call; calls")
 }
 
 func CheckTaxonomy(ctx *harness.Ctx) {
-	classifyWorld(ctx)
-	tags := classifyOK(ctx, "customers", classifyTable)
+	hClassifyWorld(ctx)
+	tags := hClassifyOK(ctx, "customers", hClassifyTable)
 	ctx.Equal(tags["salary_band"], "None", "the model answered the tag Financial.Salary for salary_band: a tag outside the library is None")
 	ctx.Equal(tags["remarks"], "None", "the model skipped remarks: every requested column gets a tag, None when the model gave none")
 	_, extra := tags["internal_note"]
 	ctx.Assert(!extra, "the model tagged internal_note, a column nobody asked about, and classifyColumns kept it: the answer holds the requested columns only")
 	ctx.Equal(tags, map[string]string{"customer_name": "Personal.Name", "customer_email": "Personal.Contact_Info", "salary_band": "None", "remarks": "None", "pickup_geohash": "Geo.Geohash", "nric": "Personal.ID"}, "the tags")
-	classifyFails(ctx, "garbled", classifyTable, "content that is not JSON")
-	classifyFails(ctx, "object", classifyTable, "content that is a JSON object, not an array")
+	hClassifyFails(ctx, "garbled", hClassifyTable, "content that is not JSON")
+	hClassifyFails(ctx, "object", hClassifyTable, "content that is a JSON object, not an array")
 }
 `,
     cpp: `#include <leetbuild/harness.h>

@@ -921,9 +921,9 @@ import (
 	"cronsched/store"
 )
 
-var apiZones = []string{"Europe/Berlin", "Asia/Kolkata", "America/New_York"}
+var hApiZones = []string{"Europe/Berlin", "Asia/Kolkata", "America/New_York"}
 
-func apiBody(overrides ...string) map[string]string {
+func hApiBody(overrides ...string) map[string]string {
 	body := map[string]string{"cron": "*/15 * * * *", "timezone": "Europe/Berlin", "job_ref": "billing.invoice", "misfire_policy": "skip"}
 	for i := 0; i+1 < len(overrides); i += 2 {
 		body[overrides[i]] = overrides[i+1]
@@ -931,13 +931,13 @@ func apiBody(overrides ...string) map[string]string {
 	return body
 }
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiPost(c *harness.HTTP, body any, header ...string) *harness.Response {
+func hApiPost(c *harness.HTTP, body any, header ...string) *harness.Response {
 	if len(header) == 0 {
 		header = []string{"X-Tenant-Id", "t1"}
 	}
@@ -945,7 +945,7 @@ func apiPost(c *harness.HTTP, body any, header ...string) *harness.Response {
 }
 
 // apiField is a string field of the JSON body ("" when absent).
-func apiField(r *harness.Response, field string) string {
+func hApiField(r *harness.Response, field string) string {
 	var body map[string]any
 	if err := json.Unmarshal(r.Body, &body); err != nil {
 		return ""
@@ -954,8 +954,8 @@ func apiField(r *harness.Response, field string) string {
 	return s
 }
 
-func apiStored(ctx *harness.Ctx, r *harness.Response) store.Schedule {
-	s, err := store.Get(context.Background(), apiField(r, "id"))
+func hApiStored(ctx *harness.Ctx, r *harness.Response) store.Schedule {
+	s, err := store.Get(context.Background(), hApiField(r, "id"))
 	ctx.NoError(err, "reading the stored schedule")
 	if s == nil {
 		return store.Schedule{}
@@ -963,75 +963,75 @@ func apiStored(ctx *harness.Ctx, r *harness.Response) store.Schedule {
 	return *s
 }
 
-func apiNothingStored(ctx *harness.Ctx, what string) {
+func hApiNothingStored(ctx *harness.Ctx, what string) {
 	keys := ctx.Redis.Keys("schedule:*")
 	ctx.Assert(len(keys) == 0, "%s must store nothing, Redis holds %q", what, keys)
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiBody())
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiBody())
 	ctx.Equal(r.Status, 201, "POST /v1/schedules with a valid body (%s)", r.Text())
-	ctx.Assert(apiField(r, "id") != "", "the answer must carry the schedule's id: %s", r.Text())
-	stored := apiStored(ctx, r)
+	ctx.Assert(hApiField(r, "id") != "", "the answer must carry the schedule's id: %s", r.Text())
+	stored := hApiStored(ctx, r)
 	ctx.Assert(stored.Tenant == "t1" && stored.Cron == "*/15 * * * *" && stored.JobRef == "billing.invoice", "the stored schedule is %+v, expected tenant t1 with the request's cron and job_ref", stored)
-	r = apiPost(c, apiBody(), "Content-Type", "application/json")
+	r = hApiPost(c, hApiBody(), "Content-Type", "application/json")
 	ctx.Equal(r.Status, 401, "a request without X-Tenant-Id")
 }
 
 func CheckTimezone(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiBody("timezone", "Mars/Olympus"))
-	ctx.Assert(r.Status == 400 && apiField(r, "error") == "unknown_timezone", "timezone Mars/Olympus answered %d %s, expected 400 unknown_timezone: a zone the scheduler cannot resolve fires on some other clock", r.Status, r.Text())
-	apiNothingStored(ctx, "a schedule in an unknown zone")
-	r = apiPost(c, apiBody("timezone", "Asia/Kolkata"))
-	ctx.Assert(r.Status == 201 && apiField(r, "timezone") == "Asia/Kolkata", "timezone Asia/Kolkata answered %d %s, expected 201 with the zone echoed", r.Status, r.Text())
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiBody("timezone", "Mars/Olympus"))
+	ctx.Assert(r.Status == 400 && hApiField(r, "error") == "unknown_timezone", "timezone Mars/Olympus answered %d %s, expected 400 unknown_timezone: a zone the scheduler cannot resolve fires on some other clock", r.Status, r.Text())
+	hApiNothingStored(ctx, "a schedule in an unknown zone")
+	r = hApiPost(c, hApiBody("timezone", "Asia/Kolkata"))
+	ctx.Assert(r.Status == 201 && hApiField(r, "timezone") == "Asia/Kolkata", "timezone Asia/Kolkata answered %d %s, expected 201 with the zone echoed", r.Status, r.Text())
 }
 
 func CheckFrequency(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	for _, expr := range []string{"* * * * *", "*/2 * * * *", "*/4 * * * *", "0,1 9 * * *", "0,30,33 9 * * *"} {
-		r := apiPost(c, apiBody("cron", expr))
-		ctx.Assert(r.Status == 400 && apiField(r, "error") == "too_frequent", "cron %q answered %d %s, expected 400 too_frequent: its fires are less than five minutes apart", expr, r.Status, r.Text())
+		r := hApiPost(c, hApiBody("cron", expr))
+		ctx.Assert(r.Status == 400 && hApiField(r, "error") == "too_frequent", "cron %q answered %d %s, expected 400 too_frequent: its fires are less than five minutes apart", expr, r.Status, r.Text())
 	}
-	apiNothingStored(ctx, "a schedule that fires too often")
-	r := apiPost(c, apiBody("cron", "*/5 * * * *"))
+	hApiNothingStored(ctx, "a schedule that fires too often")
+	r := hApiPost(c, hApiBody("cron", "*/5 * * * *"))
 	ctx.Equal(r.Status, 201, "cron '*/5 * * * *' (every five minutes) (%s)", r.Text())
 }
 
 func CheckMisfirePolicy(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	body := apiBody()
+	c := hApiClient(ctx)
+	body := hApiBody()
 	delete(body, "misfire_policy")
-	r := apiPost(c, body)
-	ctx.Assert(r.Status == 400 && apiField(r, "error") == "invalid_misfire_policy", "a schedule without misfire_policy answered %d %s, expected 400 invalid_misfire_policy: a default decides for the job's owner what a pause costs", r.Status, r.Text())
-	r = apiPost(c, apiBody("misfire_policy", "retry_forever"))
-	ctx.Assert(r.Status == 400 && apiField(r, "error") == "invalid_misfire_policy", "misfire_policy retry_forever answered %d %s, expected 400 invalid_misfire_policy", r.Status, r.Text())
-	apiNothingStored(ctx, "a schedule without a known misfire policy")
+	r := hApiPost(c, body)
+	ctx.Assert(r.Status == 400 && hApiField(r, "error") == "invalid_misfire_policy", "a schedule without misfire_policy answered %d %s, expected 400 invalid_misfire_policy: a default decides for the job's owner what a pause costs", r.Status, r.Text())
+	r = hApiPost(c, hApiBody("misfire_policy", "retry_forever"))
+	ctx.Assert(r.Status == 400 && hApiField(r, "error") == "invalid_misfire_policy", "misfire_policy retry_forever answered %d %s, expected 400 invalid_misfire_policy", r.Status, r.Text())
+	hApiNothingStored(ctx, "a schedule without a known misfire policy")
 	for _, policy := range []string{"skip", "fire_once_now", "catch_up"} {
-		r = apiPost(c, apiBody("misfire_policy", policy))
+		r = hApiPost(c, hApiBody("misfire_policy", policy))
 		ctx.Equal(r.Status, 201, "misfire_policy %s (%s)", policy, r.Text())
-		ctx.Equal(apiStored(ctx, r).MisfirePolicy, policy, "the stored schedule's misfire_policy")
+		ctx.Equal(hApiStored(ctx, r).MisfirePolicy, policy, "the stored schedule's misfire_policy")
 	}
 }
 
 func CheckNextFire(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	now := time.Now().Unix()
 	spec, _ := cron.Parse("0 9 * * *")
 	utcFire, _ := cron.NextFire(spec, "UTC", now)
-	for _, zone := range apiZones {
-		r := apiPost(c, apiBody("cron", "0 9 * * *", "timezone", zone))
+	for _, zone := range hApiZones {
+		r := hApiPost(c, hApiBody("cron", "0 9 * * *", "timezone", zone))
 		ctx.Equal(r.Status, 201, "cron '0 9 * * *' in %s (%s)", zone, r.Text())
 		fire, _ := cron.NextFire(spec, zone, now)
 		expected := cron.FormatInstant(fire)
-		got := apiField(r, "next_fire")
+		got := hApiField(r, "next_fire")
 		onUTC := ""
 		if got == cron.FormatInstant(utcFire) {
 			onUTC = " (that is 09:00 UTC: the expression ran on the server's clock)"
 		}
 		ctx.Assert(got == expected, "cron '0 9 * * *' in %s answered next_fire %s, expected %s, the next 09:00 on the %s wall clock%s", zone, got, expected, zone, onUTC)
-		ctx.Equal(apiStored(ctx, r).NextFire, expected, "the stored next_fire")
+		ctx.Equal(hApiStored(ctx, r).NextFire, expected, "the stored next_fire")
 	}
 	// Noon UTC on the day before Europe/Berlin changes its clocks: the next 09:00 is on the other offset.
 	noon := now - now%86400 + 12*3600
@@ -1042,10 +1042,10 @@ func CheckNextFire(ctx *harness.Ctx) {
 		noon += 86400
 	}
 	ctx.Clock.Advance(float64(noon - now))
-	r := apiPost(c, apiBody("cron", "0 9 * * *", "timezone", "Europe/Berlin"))
+	r := hApiPost(c, hApiBody("cron", "0 9 * * *", "timezone", "Europe/Berlin"))
 	ctx.Equal(r.Status, 201, "cron '0 9 * * *' in Europe/Berlin (%s)", r.Text())
 	fire, _ := cron.NextFire(spec, "Europe/Berlin", noon)
-	got := apiField(r, "next_fire")
+	got := hApiField(r, "next_fire")
 	ctx.Assert(got == cron.FormatInstant(fire), "at %s, the day before Europe/Berlin changes its clocks, cron '0 9 * * *' answered next_fire %s, expected %s: the next 09:00 falls on the new offset, not on today's", cron.FormatInstant(noon), got, cron.FormatInstant(fire))
 }
 `,
@@ -1062,13 +1062,13 @@ func CheckNextFire(ctx *harness.Ctx) {
 
 namespace {
 
-const std::vector<std::string> kApiZones = {"Europe/Berlin", "Asia/Kolkata", "America/New_York"};
+const std::vector<std::string> kHApiZones = {"Europe/Berlin", "Asia/Kolkata", "America/New_York"};
 
-nlohmann::json apiBody() {
+nlohmann::json hApiBody() {
   return nlohmann::json{{"cron", "*/15 * * * *"}, {"timezone", "Europe/Berlin"}, {"job_ref", "billing.invoice"}, {"misfire_policy", "skip"}};
 }
 
-harness::HTTP apiClient(harness::Ctx& ctx) {
+harness::HTTP hApiClient(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1076,21 +1076,21 @@ harness::HTTP apiClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response apiPost(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant = "t1") {
+harness::Response hApiPost(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant = "t1") {
   if (tenant.empty()) return c.Post("/v1/schedules", body.dump(), "Content-Type", "application/json");
   return c.Post("/v1/schedules", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
 }
 
-std::string apiField(const harness::Response& r, const std::string& field) {
+std::string hApiField(const harness::Response& r, const std::string& field) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() && body.contains(field) && body[field].is_string() ? body[field].get<std::string>() : "";
 }
 
-cronsched::Schedule apiStored(const harness::Response& r) {
-  return cronsched::store::Get(apiField(r, "id")).value_or(cronsched::Schedule{});
+cronsched::Schedule hApiStored(const harness::Response& r) {
+  return cronsched::store::Get(hApiField(r, "id")).value_or(cronsched::Schedule{});
 }
 
-void apiNothingStored(harness::Ctx& ctx, const std::string& what) {
+void hApiNothingStored(harness::Ctx& ctx, const std::string& what) {
   const auto keys = ctx.Redis.Keys("schedule:*");
   ctx.Assert(keys.empty(), "%s must store nothing, Redis holds %q", what, keys);
 }
@@ -1098,86 +1098,86 @@ void apiNothingStored(harness::Ctx& ctx, const std::string& what) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  auto r = apiPost(c, apiBody());
+  auto c = hApiClient(ctx);
+  auto r = hApiPost(c, hApiBody());
   ctx.Equal(r.Status, 201, "POST /v1/schedules with a valid body (%s)", r.Text());
-  ctx.Assert(!apiField(r, "id").empty(), "the answer must carry the schedule's id: %s", r.Text());
-  const auto stored = apiStored(r);
+  ctx.Assert(!hApiField(r, "id").empty(), "the answer must carry the schedule's id: %s", r.Text());
+  const auto stored = hApiStored(r);
   ctx.Assert(stored.tenant == "t1" && stored.cron == "*/15 * * * *" && stored.job_ref == "billing.invoice",
              "the stored schedule is tenant=%s cron=%s job_ref=%s, expected tenant t1 with the request's cron and job_ref", stored.tenant,
              stored.cron, stored.job_ref);
-  r = apiPost(c, apiBody(), "");
+  r = hApiPost(c, hApiBody(), "");
   ctx.Equal(r.Status, 401, "a request without X-Tenant-Id");
 }
 
 void CheckTimezone(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  auto body = apiBody();
+  auto c = hApiClient(ctx);
+  auto body = hApiBody();
   body["timezone"] = "Mars/Olympus";
-  auto r = apiPost(c, body);
-  ctx.Assert(r.Status == 400 && apiField(r, "error") == "unknown_timezone",
+  auto r = hApiPost(c, body);
+  ctx.Assert(r.Status == 400 && hApiField(r, "error") == "unknown_timezone",
              "timezone Mars/Olympus answered %d %s, expected 400 unknown_timezone: a zone the scheduler cannot resolve fires on some other clock",
              r.Status, r.Text());
-  apiNothingStored(ctx, "a schedule in an unknown zone");
+  hApiNothingStored(ctx, "a schedule in an unknown zone");
   body["timezone"] = "Asia/Kolkata";
-  r = apiPost(c, body);
-  ctx.Assert(r.Status == 201 && apiField(r, "timezone") == "Asia/Kolkata",
+  r = hApiPost(c, body);
+  ctx.Assert(r.Status == 201 && hApiField(r, "timezone") == "Asia/Kolkata",
              "timezone Asia/Kolkata answered %d %s, expected 201 with the zone echoed", r.Status, r.Text());
 }
 
 void CheckFrequency(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  auto body = apiBody();
+  auto c = hApiClient(ctx);
+  auto body = hApiBody();
   for (const std::string expr : {"* * * * *", "*/2 * * * *", "*/4 * * * *", "0,1 9 * * *", "0,30,33 9 * * *"}) {
     body["cron"] = expr;
-    const auto r = apiPost(c, body);
-    ctx.Assert(r.Status == 400 && apiField(r, "error") == "too_frequent",
+    const auto r = hApiPost(c, body);
+    ctx.Assert(r.Status == 400 && hApiField(r, "error") == "too_frequent",
                "cron '%s' answered %d %s, expected 400 too_frequent: its fires are less than five minutes apart", expr, r.Status, r.Text());
   }
-  apiNothingStored(ctx, "a schedule that fires too often");
+  hApiNothingStored(ctx, "a schedule that fires too often");
   body["cron"] = "*/5 * * * *";
-  const auto r = apiPost(c, body);
+  const auto r = hApiPost(c, body);
   ctx.Equal(r.Status, 201, "cron '*/5 * * * *' (every five minutes) (%s)", r.Text());
 }
 
 void CheckMisfirePolicy(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  auto body = apiBody();
+  auto c = hApiClient(ctx);
+  auto body = hApiBody();
   body.erase("misfire_policy");
-  auto r = apiPost(c, body);
-  ctx.Assert(r.Status == 400 && apiField(r, "error") == "invalid_misfire_policy",
+  auto r = hApiPost(c, body);
+  ctx.Assert(r.Status == 400 && hApiField(r, "error") == "invalid_misfire_policy",
              "a schedule without misfire_policy answered %d %s, expected 400 invalid_misfire_policy: a default decides for the job's owner what a pause costs",
              r.Status, r.Text());
   body["misfire_policy"] = "retry_forever";
-  r = apiPost(c, body);
-  ctx.Assert(r.Status == 400 && apiField(r, "error") == "invalid_misfire_policy",
+  r = hApiPost(c, body);
+  ctx.Assert(r.Status == 400 && hApiField(r, "error") == "invalid_misfire_policy",
              "misfire_policy retry_forever answered %d %s, expected 400 invalid_misfire_policy", r.Status, r.Text());
-  apiNothingStored(ctx, "a schedule without a known misfire policy");
+  hApiNothingStored(ctx, "a schedule without a known misfire policy");
   for (const std::string policy : {"skip", "fire_once_now", "catch_up"}) {
     body["misfire_policy"] = policy;
-    r = apiPost(c, body);
+    r = hApiPost(c, body);
     ctx.Equal(r.Status, 201, "misfire_policy %s (%s)", policy, r.Text());
-    ctx.Equal(apiStored(r).misfire_policy, policy, "the stored schedule's misfire_policy");
+    ctx.Equal(hApiStored(r).misfire_policy, policy, "the stored schedule's misfire_policy");
   }
 }
 
 void CheckNextFire(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
+  auto c = hApiClient(ctx);
   const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
   const auto spec = *cronsched::cron::Parse("0 9 * * *");
   const std::string utc_fire = cronsched::cron::FormatInstant(*cronsched::cron::NextFire(spec, "UTC", now));
-  auto body = apiBody();
+  auto body = hApiBody();
   body["cron"] = "0 9 * * *";
-  for (const auto& zone : kApiZones) {
+  for (const auto& zone : kHApiZones) {
     body["timezone"] = zone;
-    const auto r = apiPost(c, body);
+    const auto r = hApiPost(c, body);
     ctx.Equal(r.Status, 201, "cron '0 9 * * *' in %s (%s)", zone, r.Text());
     const std::string expected = cronsched::cron::FormatInstant(*cronsched::cron::NextFire(spec, zone, now));
-    const std::string got = apiField(r, "next_fire");
+    const std::string got = hApiField(r, "next_fire");
     const std::string on_utc = got == utc_fire ? " (that is 09:00 UTC: the expression ran on the server's clock)" : "";
     ctx.Assert(got == expected, "cron '0 9 * * *' in %s answered next_fire %s, expected %s, the next 09:00 on the %s wall clock%s", zone, got,
                expected, zone, on_utc);
-    ctx.Equal(apiStored(r).next_fire, expected, "the stored next_fire");
+    ctx.Equal(hApiStored(r).next_fire, expected, "the stored next_fire");
   }
   // Noon UTC on the day before Europe/Berlin changes its clocks: the next 09:00 is on the other offset.
   int64_t noon = now - now % 86400 + 12 * 3600;
@@ -1185,10 +1185,10 @@ void CheckNextFire(harness::Ctx& ctx) {
   while (cronsched::cron::OffsetMinutes("Europe/Berlin", noon) == cronsched::cron::OffsetMinutes("Europe/Berlin", noon + 86400)) noon += 86400;
   ctx.Clock.Advance(static_cast<double>(noon - now));
   body["timezone"] = "Europe/Berlin";
-  const auto r = apiPost(c, body);
+  const auto r = hApiPost(c, body);
   ctx.Equal(r.Status, 201, "cron '0 9 * * *' in Europe/Berlin (%s)", r.Text());
   const std::string expected = cronsched::cron::FormatInstant(*cronsched::cron::NextFire(spec, "Europe/Berlin", noon));
-  const std::string got = apiField(r, "next_fire");
+  const std::string got = hApiField(r, "next_fire");
   ctx.Assert(got == expected,
              "at %s, the day before Europe/Berlin changes its clocks, cron '0 9 * * *' answered next_fire %s, expected %s: the next 09:00 "
              "falls on the new offset, not on today's",

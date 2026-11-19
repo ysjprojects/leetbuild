@@ -1066,46 +1066,46 @@ import (
 // Step 2's gates.go, which this file builds on. Go judges one step's file at a time, so the harness
 // supplies it as step 2's reference has it: the snapshot, its refresh and getVariant.
 
-var gatesRdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+var hGatesRdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type Share struct {
+type HShare struct {
 	Variant string \`json:"variant"\`
 	Pct     int    \`json:"pct"\`
 }
 
-type Population struct {
+type HPopulation struct {
 	Match map[string]string \`json:"match"\`
-	Mix   []Share           \`json:"mix"\`
+	Mix   []HShare           \`json:"mix"\`
 }
 
-type Override struct {
+type HOverride struct {
 	UserID    string \`json:"user_id"\`
 	Variant   string \`json:"variant"\`
 	ExpiresAt int64  \`json:"expires_at"\`
 }
 
-type Gate struct {
+type HGate struct {
 	Name        string       \`json:"name"\`
 	Seed        string       \`json:"seed"\`
 	Default     string       \`json:"default"\`
-	Populations []Population \`json:"populations"\`
-	Overrides   []Override   \`json:"overrides"\`
+	Populations []HPopulation \`json:"populations"\`
+	Overrides   []HOverride   \`json:"overrides"\`
 	Version     int          \`json:"version"\`
 }
 
-type Snapshot struct {
+type HSnapshot struct {
 	Version int
-	Gates   map[string]Gate
+	Gates   map[string]HGate
 }
 
-type snapshotBox struct{ v atomic.Value }
+type HSnapshotBox struct{ v atomic.Value }
 
-func (b *snapshotBox) Load() *Snapshot   { return b.v.Load().(*Snapshot) }
-func (b *snapshotBox) Store(s *Snapshot) { b.v.Store(s) }
+func (b *HSnapshotBox) Load() *HSnapshot   { return b.v.Load().(*HSnapshot) }
+func (b *HSnapshotBox) Store(s *HSnapshot) { b.v.Store(s) }
 
-var snapshot snapshotBox
+var snapshot HSnapshotBox
 
-func init() { snapshot.Store(&Snapshot{Gates: map[string]Gate{}}) }
+func init() { snapshot.Store(&HSnapshot{Gates: map[string]HGate{}}) }
 
 func getVariant(name string, attrs map[string]string) string {
 	gate, ok := snapshot.Load().Gates[name]
@@ -1140,8 +1140,8 @@ func getVariant(name string, attrs map[string]string) string {
 	return gate.Default
 }
 
-func refresh(ctx context.Context) (bool, error) {
-	raw, err := gatesRdb.Get(ctx, "gates:version").Result()
+func hRefresh(ctx context.Context) (bool, error) {
+	raw, err := hGatesRdb.Get(ctx, "gates:version").Result()
 	if err != nil && err != redis.Nil {
 		return false, err
 	}
@@ -1149,28 +1149,28 @@ func refresh(ctx context.Context) (bool, error) {
 	if version == snapshot.Load().Version {
 		return false, nil
 	}
-	fields, err := gatesRdb.HGetAll(ctx, "gates").Result()
+	fields, err := hGatesRdb.HGetAll(ctx, "gates").Result()
 	if err != nil {
 		return false, err
 	}
-	gates := make(map[string]Gate, len(fields))
+	gates := make(map[string]HGate, len(fields))
 	for name, body := range fields {
-		var gate Gate
+		var gate HGate
 		if err := json.Unmarshal([]byte(body), &gate); err != nil {
 			return false, fmt.Errorf("gate %s: %w", name, err)
 		}
 		gates[name] = gate
 	}
-	snapshot.Store(&Snapshot{Version: version, Gates: gates})
+	snapshot.Store(&HSnapshot{Version: version, Gates: gates})
 	return true, nil
 }
 
 // The checks.
 
-const exposureTopic = "gate-exposures"
+const kHExposureTopic = "gate-exposures"
 
 // publishExposureGates leaves what step 1 leaves behind: button_color and dark_mode in the hash, and the global version.
-func publishExposureGates(ctx *harness.Ctx, version int) {
+func hPublishExposureGates(ctx *harness.Ctx, version int) {
 	share := func(variant string, pct int) map[string]any { return map[string]any{"variant": variant, "pct": pct} }
 	gates := []map[string]any{
 		{"name": "button_color", "seed": "button_color", "default": "OFF", "overrides": []any{}, "version": 1, "populations": []any{
@@ -1189,41 +1189,41 @@ func publishExposureGates(ctx *harness.Ctx, version int) {
 }
 
 // exposureLog collects the lines the learner logs, still passing them on to the original output.
-type exposureLog struct {
+type HExposureLog struct {
 	guard sync.Mutex
 	lines []string
 }
 
-func (w *exposureLog) Write(p []byte) (int, error) {
+func (w *HExposureLog) Write(p []byte) (int, error) {
 	w.guard.Lock()
 	defer w.guard.Unlock()
 	w.lines = append(w.lines, string(p))
 	return len(p), nil
 }
 
-func (w *exposureLog) count() int {
+func (w *HExposureLog) count() int {
 	w.guard.Lock()
 	defer w.guard.Unlock()
 	return len(w.lines)
 }
 
 // loadExposures publishes the gates, loads step 2's snapshot, and collects every line the learner logs.
-func loadExposures(ctx *harness.Ctx, version int) *exposureLog {
-	publishExposureGates(ctx, version)
-	_, err := refresh(context.Background())
+func hLoadExposures(ctx *harness.Ctx, version int) *HExposureLog {
+	hPublishExposureGates(ctx, version)
+	_, err := hRefresh(context.Background())
 	ctx.NoError(err, "step 2's refresh")
-	logged := &exposureLog{}
+	logged := &HExposureLog{}
 	log.SetOutput(io.MultiWriter(log.Writer(), logged))
 	return logged
 }
 
-func deAttrs(i int) map[string]string {
+func hDeAttrs(i int) map[string]string {
 	return map[string]string{"user_id": fmt.Sprintf("u%d", i), "locale": "de"}
 }
 
-func exposureUsers(ctx *harness.Ctx) []string {
+func hExposureUsers(ctx *harness.Ctx) []string {
 	users := []string{}
-	for _, raw := range ctx.Kafka.Values(exposureTopic) {
+	for _, raw := range ctx.Kafka.Values(kHExposureTopic) {
 		var event struct {
 			UserID string \`json:"user_id"\`
 		}
@@ -1233,20 +1233,20 @@ func exposureUsers(ctx *harness.Ctx) []string {
 	return users
 }
 
-func secondsSince(ctx *harness.Ctx, before int64) float64 {
+func hSecondsSince(ctx *harness.Ctx, before int64) float64 {
 	return float64(ctx.Clock.Now()-before) / 1000
 }
 
 func CheckTopicKeyed(ctx *harness.Ctx) {
-	loadExposures(ctx, 7)
+	hLoadExposures(ctx, 7)
 	calls := []struct {
 		name  string
 		attrs map[string]string
 	}{
-		{"button_color", deAttrs(1)},
+		{"button_color", hDeAttrs(1)},
 		{"button_color", map[string]string{"user_id": "bo", "locale": "en"}},
 		{"dark_mode", map[string]string{"user_id": "cy"}},
-		{"button_color", deAttrs(2)},
+		{"button_color", hDeAttrs(2)},
 	}
 	for _, call := range calls {
 		want := getVariant(call.name, call.attrs)
@@ -1254,8 +1254,8 @@ func CheckTopicKeyed(ctx *harness.Ctx) {
 		ctx.Assert(got == want, "getExposedVariant(%q, %s) answered %q but step 2's getVariant says %q: the decision is getVariant's, the exposure is a side effect", call.name, call.attrs["user_id"], got, want)
 	}
 	ctx.Settle()
-	records := ctx.Kafka.Records(exposureTopic)
-	ctx.Equal(len(records), 4, "four decisions must produce four records on %s: every decision is one exposure; records", exposureTopic)
+	records := ctx.Kafka.Records(kHExposureTopic)
+	ctx.Equal(len(records), 4, "four decisions must produce four records on %s: every decision is one exposure; records", kHExposureTopic)
 	// kafka-go writes a batch partition by partition, so records of different gates need not follow the calls:
 	// each record is matched to its call by user_id (one per call); one gate's records must keep the call order.
 	inCallOrder := make([]harness.KafkaRecord, len(calls))
@@ -1271,7 +1271,7 @@ func CheckTopicKeyed(ctx *harness.Ctx) {
 				inCallOrder[i], position[i] = r, j
 			}
 		}
-		ctx.Assert(position[i] >= 0, "no exposure on %s carries user_id %q: every decision is one exposure for its user", exposureTopic, call.attrs["user_id"])
+		ctx.Assert(position[i] >= 0, "no exposure on %s carries user_id %q: every decision is one exposure for its user", kHExposureTopic, call.attrs["user_id"])
 	}
 	var keys []string
 	for _, r := range inCallOrder {
@@ -1291,45 +1291,45 @@ func CheckTopicKeyed(ctx *harness.Ctx) {
 		ts, isNumber := event["ts"].(float64)
 		ctx.Assert(isNumber && math.Abs(ts-now) < 5, "ts must be the current time in seconds, got %v", event["ts"])
 	}
-	publishExposureGates(ctx, 8)
-	_, err := refresh(context.Background())
+	hPublishExposureGates(ctx, 8)
+	_, err := hRefresh(context.Background())
 	ctx.NoError(err, "step 2's refresh")
-	getExposedVariant("button_color", deAttrs(3))
+	getExposedVariant("button_color", hDeAttrs(3))
 	ctx.Settle()
-	values := ctx.Kafka.Values(exposureTopic)
+	values := ctx.Kafka.Values(kHExposureTopic)
 	var last map[string]any
 	json.Unmarshal([]byte(values[len(values)-1]), &last)
 	ctx.Equal(last["version"], 8, "after the snapshot moved to version 8 the next exposure must say so (the graphs are annotated per edit)")
 }
 
 func CheckNonBlocking(ctx *harness.Ctx) {
-	loadExposures(ctx, 7)
-	ctx.Kafka.StallFor(exposureTopic, 2) // the broker answers 2 s later
+	hLoadExposures(ctx, 7)
+	ctx.Kafka.StallFor(kHExposureTopic, 2) // the broker answers 2 s later
 	before := ctx.Clock.Now()
-	got := getExposedVariant("button_color", deAttrs(1))
-	waited := secondsSince(ctx, before)
+	got := getExposedVariant("button_color", hDeAttrs(1))
+	waited := hSecondsSince(ctx, before)
 	ctx.Assert(waited < 0.5, "getExposedVariant waited %.1f s for a stalled broker's acknowledgement: hand the record to the producer and return, the request path never waits for Kafka", waited)
-	ctx.Equal(got, getVariant("button_color", deAttrs(1)), "with the broker stalled the decision must still be getVariant's")
-	ctx.Equal(len(ctx.Kafka.Records(exposureTopic)), 0, "getExposedVariant returned only after the broker acknowledged the record: hand it to the producer and return; records")
+	ctx.Equal(got, getVariant("button_color", hDeAttrs(1)), "with the broker stalled the decision must still be getVariant's")
+	ctx.Equal(len(ctx.Kafka.Records(kHExposureTopic)), 0, "getExposedVariant returned only after the broker acknowledged the record: hand it to the producer and return; records")
 	for i := 2; i < 4; i++ {
-		getExposedVariant("button_color", deAttrs(i))
+		getExposedVariant("button_color", hDeAttrs(i))
 	}
-	total := secondsSince(ctx, before)
+	total := hSecondsSince(ctx, before)
 	ctx.Assert(total < 0.5, "three decisions on a stalled broker took %.1f s of virtual time: none of them may wait", total)
 	ctx.Clock.Advance(2000) // the broker is back
 	ctx.Settle()
-	getExposedVariant("button_color", deAttrs(4))
+	getExposedVariant("button_color", hDeAttrs(4))
 	ctx.Settle()
-	ctx.Equal(exposureUsers(ctx), []string{"u1", "u2", "u3", "u4"}, "the exposures handed to the producer while the broker was away must arrive once it answers: the users on %s", exposureTopic)
+	ctx.Equal(hExposureUsers(ctx), []string{"u1", "u2", "u3", "u4"}, "the exposures handed to the producer while the broker was away must arrive once it answers: the users on %s", kHExposureTopic)
 }
 
 func CheckBounded(ctx *harness.Ctx) {
-	logged := loadExposures(ctx, 7)
-	ctx.Kafka.Stall(exposureTopic) // the broker stops acknowledging: nothing handed to the producer leaves the queue
+	logged := hLoadExposures(ctx, 7)
+	ctx.Kafka.Stall(kHExposureTopic) // the broker stops acknowledging: nothing handed to the producer leaves the queue
 	before := ctx.Clock.Now()
 	sameDecisions := true
 	for i := range 1200 {
-		sameDecisions = getExposedVariant("button_color", deAttrs(i)) == getVariant("button_color", deAttrs(i)) && sameDecisions
+		sameDecisions = getExposedVariant("button_color", hDeAttrs(i)) == getVariant("button_color", hDeAttrs(i)) && sameDecisions
 	}
 	ctx.Assert(sameDecisions, "a dropped exposure must not change the decision: every call still answers getVariant's variant")
 	ctx.Assert(dropped.Load() > 0, "1200 decisions on a stalled broker and nothing was dropped: the queue is unbounded, a broker that is not answering grows it until the server runs out of memory")
@@ -1339,42 +1339,42 @@ func CheckBounded(ctx *harness.Ctx) {
 	ctx.Assert(1 <= inHand && inHand <= 100, "pending = queued + the batch being written: %d exposures were accepted beyond the %d queued, expected the pump's one batch (1 to 100)", inHand, len(queue))
 	ctx.Equal(stalledDrops+maxPending+inHand, 1200, "pending = queued + the batch being written: dropped + maxPending (1000) + the %d being written must account for the 1200 exposures", inHand)
 	ctx.Assert(logged.count() >= 1, "dropping exposures must be logged: a rising dropped counter is the alarm")
-	took := secondsSince(ctx, before)
+	took := hSecondsSince(ctx, before)
 	ctx.Assert(took < 0.5, "1200 decisions on a stalled broker took %.1f s of virtual time: dropping must not wait either", took)
-	ctx.Equal(len(ctx.Kafka.Records(exposureTopic)), 0, "nothing can reach the topic while the broker is stalled; records")
-	ctx.Kafka.Resume(exposureTopic)
+	ctx.Equal(len(ctx.Kafka.Records(kHExposureTopic)), 0, "nothing can reach the topic while the broker is stalled; records")
+	ctx.Kafka.Resume(kHExposureTopic)
 	ctx.Clock.Advance(31_000) // the broker is back: the pending exposures are delivered
 	ctx.Settle()
-	getExposedVariant("button_color", deAttrs(1200))
+	getExposedVariant("button_color", hDeAttrs(1200))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(exposureTopic)), maxPending+inHand+1, "once the broker answers again the pending exposures (1000 queued + %d being written) must be delivered; records on the topic", inHand)
+	ctx.Equal(len(ctx.Kafka.Records(kHExposureTopic)), maxPending+inHand+1, "once the broker answers again the pending exposures (1000 queued + %d being written) must be delivered; records on the topic", inHand)
 	ctx.Equal(dropped.Load(), stalledDrops, "dropped after the pending exposures were delivered must stay")
 	for i := range 1000 {
-		getExposedVariant("button_color", deAttrs(i))
+		getExposedVariant("button_color", hDeAttrs(i))
 	}
 	ctx.Settle()
 	ctx.Assert(int(dropped.Load()) == stalledDrops, "after the pending exposures were delivered their slots must be free again, yet %d of the next 1000 decisions were dropped: the queue must drain", int(dropped.Load())-stalledDrops)
-	ctx.Equal(len(ctx.Kafka.Records(exposureTopic)), maxPending+inHand+1+1000, "with the broker back every decision is one exposure again; records on the topic")
+	ctx.Equal(len(ctx.Kafka.Records(kHExposureTopic)), maxPending+inHand+1+1000, "with the broker back every decision is one exposure again; records on the topic")
 }
 
 func CheckFlush(ctx *harness.Ctx) {
-	loadExposures(ctx, 7)
+	hLoadExposures(ctx, 7)
 	// shutdown closes the queue and the writer: it ends the process's exposures for good. The second stop below
 	// runs on a restarted process, re-initialised the way the program starts, with the queue the learner sized.
 	restart := struct {
 		capacity int
 		writer   kafka.Writer
 	}{cap(queue), *exposuresWriter}
-	ctx.Kafka.StallFor(exposureTopic, 2) // the broker is slow to answer at the moment of the stop
+	ctx.Kafka.StallFor(kHExposureTopic, 2) // the broker is slow to answer at the moment of the stop
 	for i := range 3 {
-		getExposedVariant("button_color", deAttrs(i))
+		getExposedVariant("button_color", hDeAttrs(i))
 	}
 	before := ctx.Clock.Now()
 	shutdown()
-	took := secondsSince(ctx, before)
-	ctx.Equal(exposureUsers(ctx), []string{"u0", "u1", "u2"}, "shutdown() returned with exposures still queued (the broker answered after 2 s): flush so a clean stop loses nothing; the users on %s", exposureTopic)
+	took := hSecondsSince(ctx, before)
+	ctx.Equal(hExposureUsers(ctx), []string{"u0", "u1", "u2"}, "shutdown() returned with exposures still queued (the broker answered after 2 s): flush so a clean stop loses nothing; the users on %s", kHExposureTopic)
 	ctx.Assert(took <= 5.5, "the broker answered after 2 s yet shutdown() took %.0f s: wait for the pending deliveries, not for the whole timeout", took)
-	ctx.Kafka.Stall(exposureTopic) // now the broker is down for good
+	ctx.Kafka.Stall(kHExposureTopic) // now the broker is down for good
 	writer := restart.writer
 	exposuresWriter = &writer
 	queue = make(chan kafka.Message, restart.capacity)
@@ -1382,13 +1382,13 @@ func CheckFlush(ctx *harness.Ctx) {
 	pumpCtx, stopPump = context.WithCancel(context.Background())
 	go pump()
 	for i := 3; i < 6; i++ {
-		getExposedVariant("button_color", deAttrs(i))
+		getExposedVariant("button_color", hDeAttrs(i))
 	}
 	before = ctx.Clock.Now()
 	shutdown()
-	took = secondsSince(ctx, before)
+	took = hSecondsSince(ctx, before)
 	ctx.Assert(took <= 6, "with the broker down, shutdown() took %.0f s: flush with a 5 s bound so a stop is not held for the producer's whole write timeout", took)
-	ctx.Equal(len(ctx.Kafka.Records(exposureTopic)), 3, "nothing can reach the topic while the broker is down; records")
+	ctx.Equal(len(ctx.Kafka.Records(kHExposureTopic)), 3, "nothing can reach the topic while the broker is down; records")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1406,11 +1406,11 @@ ${gatesStandInCpp}
 
 namespace {
 
-const std::string exposureTopic = "gate-exposures";
-using Attrs = std::map<std::string, std::string>;
+const std::string kHExposureTopic = "gate-exposures";
+using HAttrs = std::map<std::string, std::string>;
 
 // publishExposureGates leaves what step 1 leaves behind: button_color and dark_mode in the hash, and the global version.
-void publishExposureGates(harness::Ctx& ctx, int version) {
+void hPublishExposureGates(harness::Ctx& ctx, int version) {
   const auto share = [](const std::string& variant, int pct) { return nlohmann::json{{"variant", variant}, {"pct", pct}}; };
   const std::vector<nlohmann::json> gates = {
       {{"name", "button_color"}, {"seed", "button_color"}, {"default", "OFF"}, {"overrides", nlohmann::json::array()}, {"version", 1},
@@ -1428,43 +1428,43 @@ void publishExposureGates(harness::Ctx& ctx, int version) {
 }
 
 // ExposureLog collects what the learner logs to std::cerr while it lives, then passes it on to the original output.
-struct ExposureLog {
+struct HExposureLog {
   std::ostringstream lines;
   std::streambuf* original = std::cerr.rdbuf(lines.rdbuf());
-  ~ExposureLog() {
+  ~HExposureLog() {
     std::cerr.rdbuf(original);
     std::cerr << lines.str();
   }
 };
 
 // loadExposures publishes the gates and loads step 2's snapshot.
-void loadExposures(harness::Ctx& ctx, int version) {
-  publishExposureGates(ctx, version);
+void hLoadExposures(harness::Ctx& ctx, int version) {
+  hPublishExposureGates(ctx, version);
   refresh();
 }
 
-Attrs deAttrs(int i) { return {{"user_id", "u" + std::to_string(i)}, {"locale", "de"}}; }
+HAttrs hDeAttrs(int i) { return {{"user_id", "u" + std::to_string(i)}, {"locale", "de"}}; }
 
-std::vector<std::string> exposureUsers(harness::Ctx& ctx) {
+std::vector<std::string> hExposureUsers(harness::Ctx& ctx) {
   std::vector<std::string> users;
-  for (const auto& raw : ctx.Kafka.Values(exposureTopic)) {
+  for (const auto& raw : ctx.Kafka.Values(kHExposureTopic)) {
     const auto event = nlohmann::json::parse(raw, nullptr, false);
     users.push_back(event.is_object() ? event.value("user_id", "") : "");
   }
   return users;
 }
 
-double secondsSince(harness::Ctx& ctx, int64_t before) { return static_cast<double>(ctx.Clock.Now() - before) / 1000; }
+double hSecondsSince(harness::Ctx& ctx, int64_t before) { return static_cast<double>(ctx.Clock.Now() - before) / 1000; }
 
 }  // namespace
 
 void CheckTopicKeyed(harness::Ctx& ctx) {
-  loadExposures(ctx, 7);
-  const std::vector<std::pair<std::string, Attrs>> calls = {
-      {"button_color", deAttrs(1)},
+  hLoadExposures(ctx, 7);
+  const std::vector<std::pair<std::string, HAttrs>> calls = {
+      {"button_color", hDeAttrs(1)},
       {"button_color", {{"user_id", "bo"}, {"locale", "en"}}},
       {"dark_mode", {{"user_id", "cy"}}},
-      {"button_color", deAttrs(2)},
+      {"button_color", hDeAttrs(2)},
   };
   for (const auto& [name, attrs] : calls) {
     const std::string want = get_variant(name, attrs);
@@ -1475,9 +1475,9 @@ void CheckTopicKeyed(harness::Ctx& ctx) {
                name, attrs.at("user_id"), got, want);
   }
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(exposureTopic);
+  const auto records = ctx.Kafka.Records(kHExposureTopic);
   ctx.Equal(records.size(), 4,
-            "four decisions must produce four records on %s: every decision is one exposure; records", exposureTopic);
+            "four decisions must produce four records on %s: every decision is one exposure; records", kHExposureTopic);
   // each record is matched to its call by user_id (one per call); one gate's records must keep the call order.
   std::vector<harness::KafkaRecord> inCallOrder(calls.size());
   std::vector<int> position(calls.size(), -1);
@@ -1490,7 +1490,7 @@ void CheckTopicKeyed(harness::Ctx& ctx) {
       }
     }
     ctx.Assert(position[i] >= 0, "no exposure on %s carries user_id %q: every decision is one exposure for its user",
-               exposureTopic, calls[i].second.at("user_id"));
+               kHExposureTopic, calls[i].second.at("user_id"));
   }
   std::vector<std::string> keys;
   for (const auto& r : inCallOrder) keys.push_back(r.Key.value_or(""));
@@ -1512,52 +1512,52 @@ void CheckTopicKeyed(harness::Ctx& ctx) {
     ctx.Assert(event["ts"].IsNumber() && std::abs(event["ts"].Float() - now) < 5, "ts must be the current time in seconds, got %v",
                event["ts"]);
   }
-  publishExposureGates(ctx, 8);
+  hPublishExposureGates(ctx, 8);
   refresh();
-  get_exposed_variant("button_color", deAttrs(3));
+  get_exposed_variant("button_color", hDeAttrs(3));
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(exposureTopic);
+  const auto values = ctx.Kafka.Values(kHExposureTopic);
   const auto last = harness::ParseJSON(values.back()).value_or(harness::Any());
   ctx.Equal(last["version"], 8,
             "after the snapshot moved to version 8 the next exposure must say so (the graphs are annotated per edit)");
 }
 
 void CheckNonBlocking(harness::Ctx& ctx) {
-  loadExposures(ctx, 7);
-  ctx.Kafka.StallFor(exposureTopic, 2);  // the broker answers 2 s later
+  hLoadExposures(ctx, 7);
+  ctx.Kafka.StallFor(kHExposureTopic, 2);  // the broker answers 2 s later
   const int64_t before = ctx.Clock.Now();
-  const std::string got = get_exposed_variant("button_color", deAttrs(1));
-  const double waited = secondsSince(ctx, before);
+  const std::string got = get_exposed_variant("button_color", hDeAttrs(1));
+  const double waited = hSecondsSince(ctx, before);
   ctx.Assert(waited < 0.5,
              "get_exposed_variant waited %.1f s for a stalled broker's acknowledgement: hand the record to the producer "
              "and return, the request path never waits for Kafka",
              waited);
-  ctx.Equal(got, get_variant("button_color", deAttrs(1)), "with the broker stalled the decision must still be get_variant's");
-  ctx.Equal(ctx.Kafka.Records(exposureTopic).size(), 0,
+  ctx.Equal(got, get_variant("button_color", hDeAttrs(1)), "with the broker stalled the decision must still be get_variant's");
+  ctx.Equal(ctx.Kafka.Records(kHExposureTopic).size(), 0,
             "get_exposed_variant returned only after the broker acknowledged the record: hand it to the producer and "
             "return; records");
-  for (int i = 2; i < 4; i++) get_exposed_variant("button_color", deAttrs(i));
-  const double total = secondsSince(ctx, before);
+  for (int i = 2; i < 4; i++) get_exposed_variant("button_color", hDeAttrs(i));
+  const double total = hSecondsSince(ctx, before);
   ctx.Assert(total < 0.5, "three decisions on a stalled broker took %.1f s of virtual time: none of them may wait", total);
   ctx.Clock.Advance(2000);  // the broker is back
   ctx.Settle();
-  get_exposed_variant("button_color", deAttrs(4));
+  get_exposed_variant("button_color", hDeAttrs(4));
   ctx.Settle();
-  ctx.Equal(exposureUsers(ctx), {"u1", "u2", "u3", "u4"},
+  ctx.Equal(hExposureUsers(ctx), {"u1", "u2", "u3", "u4"},
             "the exposures handed to the producer while the broker was away must arrive once it answers: the users on %s",
-            exposureTopic);
+            kHExposureTopic);
 }
 
 void CheckBounded(harness::Ctx& ctx) {
-  loadExposures(ctx, 7);
+  hLoadExposures(ctx, 7);
   int stalledDrops = 0;
   {
-    ExposureLog logged;
-    ctx.Kafka.Stall(exposureTopic);  // the broker stops acknowledging: nothing handed to the producer leaves the queue
+    HExposureLog logged;
+    ctx.Kafka.Stall(kHExposureTopic);  // the broker stops acknowledging: nothing handed to the producer leaves the queue
     const int64_t before = ctx.Clock.Now();
     bool sameDecisions = true;
     for (int i = 0; i < 1200; i++) {
-      sameDecisions = get_exposed_variant("button_color", deAttrs(i)) == get_variant("button_color", deAttrs(i)) && sameDecisions;
+      sameDecisions = get_exposed_variant("button_color", hDeAttrs(i)) == get_variant("button_color", hDeAttrs(i)) && sameDecisions;
     }
     ctx.Assert(sameDecisions, "a dropped exposure must not change the decision: every call still answers get_variant's variant");
     ctx.Assert(dropped.load() > 0,
@@ -1570,54 +1570,54 @@ void CheckBounded(harness::Ctx& ctx) {
               "exposure handed to the producer and not yet acknowledged",
               kMaxPending);
     ctx.Assert(!logged.lines.str().empty(), "dropping exposures must be logged: a rising dropped counter is the alarm");
-    const double took = secondsSince(ctx, before);
+    const double took = hSecondsSince(ctx, before);
     ctx.Assert(took < 0.5, "1200 decisions on a stalled broker took %.1f s of virtual time: dropping must not wait either", took);
   }
-  ctx.Equal(ctx.Kafka.Records(exposureTopic).size(), 0, "nothing can reach the topic while the broker is stalled; records");
-  ctx.Kafka.Resume(exposureTopic);
+  ctx.Equal(ctx.Kafka.Records(kHExposureTopic).size(), 0, "nothing can reach the topic while the broker is stalled; records");
+  ctx.Kafka.Resume(kHExposureTopic);
   ctx.Clock.Advance(31000);  // the broker is back: the pending exposures are delivered
   ctx.Settle();
-  get_exposed_variant("button_color", deAttrs(1200));
+  get_exposed_variant("button_color", hDeAttrs(1200));
   ctx.Settle();
-  ctx.Equal(static_cast<int>(ctx.Kafka.Records(exposureTopic).size()), kMaxPending + 1,
+  ctx.Equal(static_cast<int>(ctx.Kafka.Records(kHExposureTopic).size()), kMaxPending + 1,
             "once the broker answers again the pending exposures (%d) must be delivered; records on the topic", kMaxPending);
   ctx.Equal(static_cast<int>(dropped.load()), stalledDrops, "dropped after the pending exposures were delivered must stay");
-  for (int i = 0; i < 1000; i++) get_exposed_variant("button_color", deAttrs(i));
+  for (int i = 0; i < 1000; i++) get_exposed_variant("button_color", hDeAttrs(i));
   ctx.Settle();
   ctx.Assert(static_cast<int>(dropped.load()) == stalledDrops,
              "after the pending exposures were delivered their slots must be free again, yet %d of the next 1000 decisions "
              "were dropped: the queue must drain",
              static_cast<int>(dropped.load()) - stalledDrops);
-  ctx.Equal(static_cast<int>(ctx.Kafka.Records(exposureTopic).size()), kMaxPending + 1 + 1000,
+  ctx.Equal(static_cast<int>(ctx.Kafka.Records(kHExposureTopic).size()), kMaxPending + 1 + 1000,
             "with the broker back every decision is one exposure again; records on the topic");
 }
 
 void CheckFlush(harness::Ctx& ctx) {
-  loadExposures(ctx, 7);
-  ctx.Kafka.StallFor(exposureTopic, 2);  // the broker is slow to answer at the moment of the stop
-  for (int i = 0; i < 3; i++) get_exposed_variant("button_color", deAttrs(i));
+  hLoadExposures(ctx, 7);
+  ctx.Kafka.StallFor(kHExposureTopic, 2);  // the broker is slow to answer at the moment of the stop
+  for (int i = 0; i < 3; i++) get_exposed_variant("button_color", hDeAttrs(i));
   int64_t before = ctx.Clock.Now();
   shutdown();
-  double took = secondsSince(ctx, before);
-  ctx.Equal(exposureUsers(ctx), {"u0", "u1", "u2"},
+  double took = hSecondsSince(ctx, before);
+  ctx.Equal(hExposureUsers(ctx), {"u0", "u1", "u2"},
             "shutdown() returned with exposures still queued (the broker answered after 2 s): flush so a clean stop loses "
             "nothing; the users on %s",
-            exposureTopic);
+            kHExposureTopic);
   ctx.Assert(took <= 5.5,
              "the broker answered after 2 s yet shutdown() took %.0f s: wait for the pending deliveries, not for the whole "
              "timeout",
              took);
   // The librdkafka producer outlives a flush, so the second stop needs no restart (Go re-initialises its writer).
-  ctx.Kafka.Stall(exposureTopic);  // now the broker is down for good
-  for (int i = 3; i < 6; i++) get_exposed_variant("button_color", deAttrs(i));
+  ctx.Kafka.Stall(kHExposureTopic);  // now the broker is down for good
+  for (int i = 3; i < 6; i++) get_exposed_variant("button_color", hDeAttrs(i));
   before = ctx.Clock.Now();
   shutdown();
-  took = secondsSince(ctx, before);
+  took = hSecondsSince(ctx, before);
   ctx.Assert(took <= 6,
              "with the broker down, shutdown() took %.0f s: flush with a 5 s bound so a stop is not held for the producer's "
              "whole write timeout",
              took);
-  ctx.Equal(ctx.Kafka.Records(exposureTopic).size(), 3, "nothing can reach the topic while the broker is down; records");
+  ctx.Equal(ctx.Kafka.Records(kHExposureTopic).size(), 3, "nothing can reach the topic while the broker is down; records");
 }
 `,
   },

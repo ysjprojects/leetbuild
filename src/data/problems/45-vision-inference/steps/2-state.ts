@@ -796,7 +796,7 @@ namespace {
 
 const std::string kHPool = "vision:gpu:t1";
 
-std::vector<std::string> held(harness::Ctx& ctx) {
+std::vector<std::string> hHeld(harness::Ctx& ctx) {
   std::vector<std::string> out;
   for (const auto& z : ctx.Redis.ZRangeWithScores(kHPool, 0, -1)) out.push_back(z.Member);
   std::sort(out.begin(), out.end());
@@ -854,10 +854,10 @@ void CheckOwnerRelease(harness::Ctx& ctx) {
   std::vector<std::string> want = {a, c};
   std::sort(want.begin(), want.end());
   ctx.Assert(release("t1", b), "releasing a held ticket must answer true");
-  ctx.Equal(held(ctx), want, "release(b) must free b's slot only; the pool holds");
+  ctx.Equal(hHeld(ctx), want, "release(b) must free b's slot only; the pool holds");
   ctx.Assert(!release("t1", b), "a second release of the same ticket must answer false");
   ctx.Assert(!release("t1", "forged-ticket"), "an unknown ticket must answer false");
-  ctx.Equal(held(ctx), want, "a stale or unknown release must free nothing; the pool holds");
+  ctx.Equal(hHeld(ctx), want, "a stale or unknown release must free nothing; the pool holds");
 }
 
 void CheckRetryAfter(harness::Ctx& ctx) {

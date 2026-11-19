@@ -655,32 +655,32 @@ import (
 	"leetbuild/harness"
 )
 
-const evTopic = "suggest.event"
+const kHEvTopic = "suggest.event"
 
-var evBg = context.Background()
+var hEvBg = context.Background()
 
-func evPublish(ctx *harness.Ctx, tenant, kind, prefix string, position, latencyMs int) bool {
-	ok, err := publishEvent(evBg, tenant, kind, prefix, position, latencyMs)
+func hEvPublish(ctx *harness.Ctx, tenant, kind, prefix string, position, latencyMs int) bool {
+	ok, err := publishEvent(hEvBg, tenant, kind, prefix, position, latencyMs)
 	ctx.NoError(err, "publishEvent(%s, %s, %q)", tenant, kind, prefix)
 	return ok
 }
 
 func CheckTenantKey(ctx *harness.Ctx) {
-	evPublish(ctx, "acme", "impression", "ke", 0, 12)
-	evPublish(ctx, "acme", "selection", "kettle", 2, 340)
-	evPublish(ctx, "globex", "impression", "ke", 0, 9)
+	hEvPublish(ctx, "acme", "impression", "ke", 0, 12)
+	hEvPublish(ctx, "acme", "selection", "kettle", 2, 340)
+	hEvPublish(ctx, "globex", "impression", "ke", 0, 9)
 	ctx.Settle()
-	records := ctx.Kafka.Records(evTopic)
+	records := ctx.Kafka.Records(kHEvTopic)
 	ctx.Equal(len(records), 3, "three publishEvent calls must produce three records on suggest.event; the records")
-	ctx.Equal(ctx.Kafka.Keys(evTopic), []string{"acme", "acme", "globex"}, "the records must be keyed by the tenants")
+	ctx.Equal(ctx.Kafka.Keys(kHEvTopic), []string{"acme", "acme", "globex"}, "the records must be keyed by the tenants")
 	ctx.Equal(records[0].Partition, records[1].Partition, "acme's two events must share a partition, or one tenant's impressions and selections arrive out of order; the partitions")
 }
 
 func CheckPrefixHash(ctx *harness.Ctx) {
-	evPublish(ctx, "acme", "selection", "jane do", 1, 80)
-	evPublish(ctx, "globex", "selection", "jane do", 1, 75)
+	hEvPublish(ctx, "acme", "selection", "jane do", 1, 80)
+	hEvPublish(ctx, "globex", "selection", "jane do", 1, 75)
 	ctx.Settle()
-	values := ctx.Kafka.Values(evTopic)
+	values := ctx.Kafka.Values(kHEvTopic)
 	ctx.Equal(len(values), 2, "two publishEvent calls must produce two records; the records")
 	ctx.Assert(!strings.Contains(values[0], "jane do"), "the event carries the prefix text: %s. A prefix can be a person's name; carry prefix_hash(tenant, prefix)", values[0])
 	var value map[string]any
@@ -693,36 +693,36 @@ func CheckPrefixHash(ctx *harness.Ctx) {
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(evTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	evPublish(ctx, "acme", "impression", "ke", 0, 12)
+	ctx.Kafka.LoseAcks(kHEvTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEvPublish(ctx, "acme", "impression", "ke", 0, 12)
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(evTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	evPublish(ctx, "acme", "selection", "kettle", 2, 340)
+	ctx.Equal(len(ctx.Kafka.Records(kHEvTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hEvPublish(ctx, "acme", "selection", "kettle", 2, 340)
 	ctx.Settle()
-	ctx.Kafka.Failover(evTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(evTopic)), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEvTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEvTopic)), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ok := evPublish(ctx, "acme", "impression", "kettle", 0, 15)
+	ok := hEvPublish(ctx, "acme", "impression", "kettle", 0, 15)
 	ctx.Settle()
-	ctx.Assert(ok && len(ctx.Kafka.Records(evTopic)) == 1, "a delivery the broker acknowledged returned %v with %d records on suggest.event, expected true and one record", ok, len(ctx.Kafka.Records(evTopic)))
-	ctx.Equal(len(outbox.Rows(evBg)), 0, "a delivery the broker acknowledged must leave no outbox row, or the relay publishes the event a second time; the rows")
-	ctx.Kafka.FailNext(evTopic, 1)
-	ok = evPublish(ctx, "acme", "selection", "kettle", 2, 340)
+	ctx.Assert(ok && len(ctx.Kafka.Records(kHEvTopic)) == 1, "a delivery the broker acknowledged returned %v with %d records on suggest.event, expected true and one record", ok, len(ctx.Kafka.Records(kHEvTopic)))
+	ctx.Equal(len(outbox.Rows(hEvBg)), 0, "a delivery the broker acknowledged must leave no outbox row, or the relay publishes the event a second time; the rows")
+	ctx.Kafka.FailNext(kHEvTopic, 1)
+	ok = hEvPublish(ctx, "acme", "selection", "kettle", 2, 340)
 	ctx.Settle()
-	rows := outbox.Rows(evBg)
+	rows := outbox.Rows(hEvBg)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the event is lost from every trend count; the rows")
-	ctx.Assert(rows[0].Topic == evTopic && rows[0].Key == "acme" && rows[0].Payload["prefix_hash"] == privacy.PrefixHash("acme", "kettle"), "the outbox row is %+v, expected the topic, the key acme and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == kHEvTopic && rows[0].Key == "acme" && rows[0].Payload["prefix_hash"] == privacy.PrefixHash("acme", "kettle"), "the outbox row is %+v, expected the topic, the key acme and the payload", rows[0])
 	rowJSON, _ := json.Marshal(rows[0])
 	ctx.Assert(!strings.Contains(string(rowJSON), "kettle") && rows[0].Payload["type"] == "selection" && rows[0].Payload["position"] == 2.0 && rows[0].Payload["latency_ms"] == 340.0, "the outbox row is %s, expected the payload the topic would have carried: prefix_hash and no prefix text", rowJSON)
 	ctx.Equal(ok, false, "publishEvent's result after a failed delivery")
-	ctx.Kafka.Stall(evTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEvTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = evPublish(ctx, "acme", "impression", "ke", 0, 12)
+	ok = hEvPublish(ctx, "acme", "impression", "ke", 0, 12)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishEvent waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = outbox.Rows(evBg)
+	rows = outbox.Rows(hEvBg)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["prefix_hash"] == privacy.PrefixHash("acme", "ke"), "no delivery report within the window and the outbox holds %+v", rows)
 	ctx.Equal(ok, false, "publishEvent's result without a delivery report")
 }
@@ -739,9 +739,9 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEvTopic = "suggest.event";
+const std::string kHEvTopic = "suggest.event";
 
-std::string evField(const nlohmann::json& j, const std::string& field) {
+std::string hEvField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
@@ -752,9 +752,9 @@ void CheckTenantKey(harness::Ctx& ctx) {
   publishEvent("acme", "selection", "kettle", 2, 340);
   publishEvent("globex", "impression", "ke", 0, 9);
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEvTopic);
+  const auto records = ctx.Kafka.Records(kHEvTopic);
   ctx.Equal(records.size(), 3, "three publishEvent calls must produce three records on suggest.event; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEvTopic), {"acme", "acme", "globex"}, "the records must be keyed by the tenants");
+  ctx.Equal(ctx.Kafka.Keys(kHEvTopic), {"acme", "acme", "globex"}, "the records must be keyed by the tenants");
   ctx.Equal(records[0].Partition, records[1].Partition,
             "acme's two events must share a partition, or one tenant's impressions and selections arrive out of order; the partitions");
 }
@@ -763,56 +763,56 @@ void CheckPrefixHash(harness::Ctx& ctx) {
   publishEvent("acme", "selection", "jane do", 1, 80);
   publishEvent("globex", "selection", "jane do", 1, 75);
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEvTopic);
+  const auto values = ctx.Kafka.Values(kHEvTopic);
   ctx.Equal(values.size(), 2, "two publishEvent calls must produce two records; the records");
   ctx.Assert(values[0].find("jane do") == std::string::npos,
              "the event carries the prefix text: %s. A prefix can be a person's name; carry prefix_hash(tenant, prefix)", values[0]);
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
-  ctx.Equal(evField(value, "prefix_hash"), privacy::prefixHash("acme", "jane do"), "the payload's prefix_hash");
-  ctx.Assert(evField(value, "type") == "selection" && evField(value, "tenant") == "acme" && value.value("position", -1) == 1 &&
+  ctx.Equal(hEvField(value, "prefix_hash"), privacy::prefixHash("acme", "jane do"), "the payload's prefix_hash");
+  ctx.Assert(hEvField(value, "type") == "selection" && hEvField(value, "tenant") == "acme" && value.value("position", -1) == 1 &&
                  value.value("latency_ms", -1) == 80,
              "the payload is %s, expected type, tenant, position and latency_ms", values[0]);
-  ctx.Equal(evField(nlohmann::json::parse(values[1], nullptr, false), "prefix_hash"), privacy::prefixHash("globex", "jane do"),
+  ctx.Equal(hEvField(nlohmann::json::parse(values[1], nullptr, false), "prefix_hash"), privacy::prefixHash("globex", "jane do"),
             "globex's event's prefix_hash");
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEvTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  ctx.Kafka.LoseAcks(kHEvTopic, 1);  // the broker wrote it, the acknowledgement never arrived
   publishEvent("acme", "impression", "ke", 0, 12);
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEvTopic).size(), 1,
+  ctx.Equal(ctx.Kafka.Records(kHEvTopic).size(), 1,
             "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
   publishEvent("acme", "selection", "kettle", 2, 340);
   ctx.Settle();
-  ctx.Kafka.Failover(kEvTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEvTopic).size(), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEvTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEvTopic).size(), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
   bool ok = publishEvent("acme", "impression", "kettle", 0, 15);
   ctx.Settle();
-  ctx.Assert(ok && ctx.Kafka.Records(kEvTopic).size() == 1, "a delivery the broker acknowledged returned %v with %d records on suggest.event, expected true and one record", ok, ctx.Kafka.Records(kEvTopic).size());
+  ctx.Assert(ok && ctx.Kafka.Records(kHEvTopic).size() == 1, "a delivery the broker acknowledged returned %v with %d records on suggest.event, expected true and one record", ok, ctx.Kafka.Records(kHEvTopic).size());
   ctx.Equal(outbox::rows().size(), 0, "a delivery the broker acknowledged must leave no outbox row, or the relay publishes the event a second time; the rows");
-  ctx.Kafka.FailNext(kEvTopic, 1);
+  ctx.Kafka.FailNext(kHEvTopic, 1);
   ok = publishEvent("acme", "selection", "kettle", 2, 340);
   ctx.Settle();
   auto rows = outbox::rows();
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the event is lost from every trend count; the rows");
-  ctx.Assert(evField(rows[0], "topic") == kEvTopic && evField(rows[0], "key") == "acme" && rows[0].contains("payload") &&
-                 evField(rows[0]["payload"], "prefix_hash") == privacy::prefixHash("acme", "kettle"),
+  ctx.Assert(hEvField(rows[0], "topic") == kHEvTopic && hEvField(rows[0], "key") == "acme" && rows[0].contains("payload") &&
+                 hEvField(rows[0]["payload"], "prefix_hash") == privacy::prefixHash("acme", "kettle"),
              "the outbox row is %s, expected the topic, the key acme and the payload", rows[0].dump());
   const auto& payload = rows[0]["payload"];
-  ctx.Assert(rows[0].dump().find("kettle") == std::string::npos && evField(payload, "type") == "selection" && payload.value("position", -1) == 2 &&
+  ctx.Assert(rows[0].dump().find("kettle") == std::string::npos && hEvField(payload, "type") == "selection" && payload.value("position", -1) == 2 &&
                  payload.value("latency_ms", -1) == 340,
              "the outbox row is %s, expected the payload the topic would have carried: prefix_hash and no prefix text", rows[0].dump());
   ctx.Equal(ok, false, "publishEvent's result after a failed delivery");
-  ctx.Kafka.Stall(kEvTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEvTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = publishEvent("acme", "impression", "ke", 0, 12);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publishEvent waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
   rows = outbox::rows();
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && evField(rows[1]["payload"], "prefix_hash") == privacy::prefixHash("acme", "ke"),
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hEvField(rows[1]["payload"], "prefix_hash") == privacy::prefixHash("acme", "ke"),
              "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishEvent's result without a delivery report");
 }

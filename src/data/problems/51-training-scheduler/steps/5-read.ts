@@ -695,15 +695,15 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func putRun(ctx *harness.Ctx, runID, state string, band int, at int64, nodes ...string) {
+func hPutRun(ctx *harness.Ctx, runID, state string, band int, at int64, nodes ...string) {
 	run := &runs.Run{RunID: runID, Tenant: "t1", RecipeVersion: "llama-ft-v3", DatasetVersion: "ds-1", Priority: 8 - 3*band, Band: band, State: state, EnqueuedAtMs: at, CheckpointID: "ckpt-7", Nodes: nodes}
 	if state == "running" {
 		run.Worker = "w-1"
@@ -711,20 +711,20 @@ func putRun(ctx *harness.Ctx, runID, state string, band int, at int64, nodes ...
 			run.Nodes = []string{"n1", "n2"}
 		}
 	}
-	ctx.NoError(runs.Put(readBg, run), "runs.Put")
+	ctx.NoError(runs.Put(hReadBg, run), "runs.Put")
 	if state == "queued" {
-		ctx.NoError(queue.Enqueue(readBg, runID, band, at), "queue.Enqueue")
+		ctx.NoError(queue.Enqueue(hReadBg, runID, band, at), "queue.Enqueue")
 	}
 }
 
-func readAs(c *harness.HTTP, runID, tenant string) *harness.Response {
+func hReadAs(c *harness.HTTP, runID, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Get("/v1/training/runs/" + runID)
 	}
 	return c.Get("/v1/training/runs/"+runID, "X-Tenant-Id", tenant)
 }
 
-type runView struct {
+type HRunView struct {
 	RunID         string   \`json:"run_id"\`
 	State         string   \`json:"state"\`
 	Band          int      \`json:"band"\`
@@ -733,40 +733,40 @@ type runView struct {
 	Reason        *string  \`json:"reason"\`
 }
 
-func readOK(ctx *harness.Ctx, r *harness.Response, what string) runView {
+func hReadOK(ctx *harness.Ctx, r *harness.Response, what string) HRunView {
 	ctx.Equal(r.Status, 200, "%s (%s)", what, r.Text())
-	var v runView
+	var v HRunView
 	r.Decode(&v)
 	return v
 }
 
 func CheckStatusRoute(ctx *harness.Ctx) {
-	putRun(ctx, "run-a", "queued", 1, ctx.Clock.Now())
-	v := readOK(ctx, readAs(readAPI(ctx), "run-a", "t1"), "the owner's read of a queued run")
+	hPutRun(ctx, "run-a", "queued", 1, ctx.Clock.Now())
+	v := hReadOK(ctx, hReadAs(hReadAPI(ctx), "run-a", "t1"), "the owner's read of a queued run")
 	ctx.Assert(v.RunID == "run-a" && v.State == "queued" && v.Band == 1, "the read answered %+v, expected run-a, state queued, band 1", v)
 }
 
 func CheckTenantScoped404(ctx *harness.Ctx) {
-	putRun(ctx, "run-a", "queued", 1, ctx.Clock.Now())
-	c := readAPI(ctx)
-	other := readAs(c, "run-a", "t2")
+	hPutRun(ctx, "run-a", "queued", 1, ctx.Clock.Now())
+	c := hReadAPI(ctx)
+	other := hReadAs(c, "run-a", "t2")
 	ctx.Equal(other.Status, 404, "tenant t2 reading t1's run (%s): another tenant's run is 404, as if it did not exist; the status", other.Text())
-	unknown := readAs(c, "run-zzz", "t1")
+	unknown := hReadAs(c, "run-zzz", "t1")
 	ctx.Equal(unknown.Status, 404, "an unknown run; the status")
 	ctx.Equal(strings.ReplaceAll(other.Text(), "run-a", "{id}"), strings.ReplaceAll(unknown.Text(), "run-zzz", "{id}"), "another tenant's run must answer as an unknown id does, or the difference tells t2 the id exists; the 404 body")
-	ctx.Equal(readAs(c, "run-a", "").Status, 401, "a read without X-Tenant-Id; the status")
-	readOK(ctx, readAs(c, "run-a", "t1"), "the owner's read")
+	ctx.Equal(hReadAs(c, "run-a", "").Status, 401, "a read without X-Tenant-Id; the status")
+	hReadOK(ctx, hReadAs(c, "run-a", "t1"), "the owner's read")
 }
 
 func CheckQueuePosition(ctx *harness.Ctx) {
 	t0 := ctx.Clock.Now()
-	putRun(ctx, "run-a", "queued", 0, t0)
-	putRun(ctx, "run-b", "queued", 1, t0)
-	putRun(ctx, "run-c", "queued", 1, t0+1)
-	c := readAPI(ctx)
+	hPutRun(ctx, "run-a", "queued", 0, t0)
+	hPutRun(ctx, "run-b", "queued", 1, t0)
+	hPutRun(ctx, "run-c", "queued", 1, t0+1)
+	c := hReadAPI(ctx)
 	positions := []int{}
 	for _, runID := range []string{"run-a", "run-b", "run-c"} {
-		v := readOK(ctx, readAs(c, runID, "t1"), "the read of "+runID)
+		v := hReadOK(ctx, hReadAs(c, runID, "t1"), "the read of "+runID)
 		p := -1
 		if v.QueuePosition != nil {
 			p = *v.QueuePosition
@@ -777,27 +777,27 @@ func CheckQueuePosition(ctx *harness.Ctx) {
 }
 
 func CheckClusterNodes(ctx *harness.Ctx) {
-	putRun(ctx, "run-a", "running", 1, 0)
+	hPutRun(ctx, "run-a", "running", 1, 0)
 	ctx.Redis.Do("HSET", "cluster:assignments", "run-a", "n3") // the cluster moved the run; the row still says n1, n2
 	// run-b was preempted and queued again; its row still names its old nodes.
-	putRun(ctx, "run-b", "queued", 1, ctx.Clock.Now(), "n1", "n2")
-	c := readAPI(ctx)
-	v := readOK(ctx, readAs(c, "run-a", "t1"), "the read of a running run")
-	requeued := readOK(ctx, readAs(c, "run-b", "t1"), "the read of a queued run")
+	hPutRun(ctx, "run-b", "queued", 1, ctx.Clock.Now(), "n1", "n2")
+	c := hReadAPI(ctx)
+	v := hReadOK(ctx, hReadAs(c, "run-a", "t1"), "the read of a running run")
+	requeued := hReadOK(ctx, hReadAs(c, "run-b", "t1"), "the read of a queued run")
 	ctx.Equal(v.Nodes, []string{"n3"}, "the cluster reports run-a on n3 and the row's list is stale; the nodes")
 	ctx.Assert(v.State == "running" && v.Reason == nil, "a running run the cluster knows must read running with no reason, got %+v", v)
 	ctx.Assert(len(requeued.Nodes) == 0, "a queued run whose row still names n1, n2 answered nodes %v: a run that is not running holds no nodes ([])", requeued.Nodes)
 }
 
 func CheckOrphanedFailed(ctx *harness.Ctx) {
-	putRun(ctx, "run-a", "running", 1, 0)
-	putRun(ctx, "run-b", "running", 1, 0)
-	putRun(ctx, "run-c", "starting", 1, 0, "n1") // claimed; its worker has not placed it yet
+	hPutRun(ctx, "run-a", "running", 1, 0)
+	hPutRun(ctx, "run-b", "running", 1, 0)
+	hPutRun(ctx, "run-c", "starting", 1, 0, "n1") // claimed; its worker has not placed it yet
 	ctx.Redis.Do("HSET", "cluster:assignments", "run-b", "n5,n6")
-	c := readAPI(ctx)
-	lost := readOK(ctx, readAs(c, "run-a", "t1"), "the read of a run the cluster lost")
-	alive := readOK(ctx, readAs(c, "run-b", "t1"), "the read of a run the cluster knows")
-	starting := readOK(ctx, readAs(c, "run-c", "t1"), "the read of a starting run")
+	c := hReadAPI(ctx)
+	lost := hReadOK(ctx, hReadAs(c, "run-a", "t1"), "the read of a run the cluster lost")
+	alive := hReadOK(ctx, hReadAs(c, "run-b", "t1"), "the read of a run the cluster knows")
+	starting := hReadOK(ctx, hReadAs(c, "run-c", "t1"), "the read of a starting run")
 	ctx.Assert(lost.State == "failed" && lost.Reason != nil && *lost.Reason == "not_on_cluster", "a running run the cluster does not know answered state %q: report it failed with reason not_on_cluster, or nobody restarts it", lost.State)
 	ctx.Assert(len(lost.Nodes) == 0, "a run the cluster lost answered nodes %v: it holds none ([])", lost.Nodes)
 	ctx.Assert(alive.State == "running" && alive.Reason == nil, "a running run the cluster knows must read running with no reason, got %+v", alive)
@@ -814,7 +814,7 @@ func CheckOrphanedFailed(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP readApi(harness::Ctx& ctx) {
+harness::HTTP hReadApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -822,7 +822,7 @@ harness::HTTP readApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-void putRun(const std::string& run_id, const std::string& state, int band, long long at, const std::vector<std::string>& nodes = {}) {
+void hPutRun(const std::string& run_id, const std::string& state, int band, long long at, const std::vector<std::string>& nodes = {}) {
   runs::Run run;
   run.run_id = run_id;
   run.tenant = "t1";
@@ -842,12 +842,12 @@ void putRun(const std::string& run_id, const std::string& state, int band, long 
   if (state == "queued") queue::enqueue(run_id, band, at);
 }
 
-harness::Response readAs(harness::HTTP& c, const std::string& run_id, const std::string& tenant) {
+harness::Response hReadAs(harness::HTTP& c, const std::string& run_id, const std::string& tenant) {
   if (tenant.empty()) return c.Get("/v1/training/runs/" + run_id);
   return c.Get("/v1/training/runs/" + run_id, "X-Tenant-Id", tenant);
 }
 
-nlohmann::json readOk(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
+nlohmann::json hReadOk(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
   ctx.Equal(r.Status, 200, "%s (%s)", what, r.Text());
   return nlohmann::json::parse(r.Text(), nullptr, false);
 }
@@ -870,60 +870,60 @@ std::string hReplaceAll(std::string s, const std::string& from, const std::strin
 }  // namespace
 
 void CheckStatusRoute(harness::Ctx& ctx) {
-  putRun("run-a", "queued", 1, ctx.Clock.Now());
-  auto c = readApi(ctx);
-  const auto v = readOk(ctx, readAs(c, "run-a", "t1"), "the owner's read of a queued run");
+  hPutRun("run-a", "queued", 1, ctx.Clock.Now());
+  auto c = hReadApi(ctx);
+  const auto v = hReadOk(ctx, hReadAs(c, "run-a", "t1"), "the owner's read of a queued run");
   ctx.Assert(hText(v, "run_id") == "run-a" && hText(v, "state") == "queued" && v.value("band", -1) == 1, "the read answered %s, expected run-a, state queued, band 1", v.dump());
 }
 
 void CheckTenantScoped404(harness::Ctx& ctx) {
-  putRun("run-a", "queued", 1, ctx.Clock.Now());
-  auto c = readApi(ctx);
-  const auto other = readAs(c, "run-a", "t2");
+  hPutRun("run-a", "queued", 1, ctx.Clock.Now());
+  auto c = hReadApi(ctx);
+  const auto other = hReadAs(c, "run-a", "t2");
   ctx.Equal(other.Status, 404, "tenant t2 reading t1's run (%s): another tenant's run is 404, as if it did not exist; the status", other.Text());
-  const auto unknown = readAs(c, "run-zzz", "t1");
+  const auto unknown = hReadAs(c, "run-zzz", "t1");
   ctx.Equal(unknown.Status, 404, "an unknown run; the status");
   ctx.Equal(hReplaceAll(other.Text(), "run-a", "{id}"), hReplaceAll(unknown.Text(), "run-zzz", "{id}"),
             "another tenant's run must answer as an unknown id does, or the difference tells t2 the id exists; the 404 body");
-  ctx.Equal(readAs(c, "run-a", "").Status, 401, "a read without X-Tenant-Id; the status");
-  readOk(ctx, readAs(c, "run-a", "t1"), "the owner's read");
+  ctx.Equal(hReadAs(c, "run-a", "").Status, 401, "a read without X-Tenant-Id; the status");
+  hReadOk(ctx, hReadAs(c, "run-a", "t1"), "the owner's read");
 }
 
 void CheckQueuePosition(harness::Ctx& ctx) {
   const long long t0 = ctx.Clock.Now();
-  putRun("run-a", "queued", 0, t0);
-  putRun("run-b", "queued", 1, t0);
-  putRun("run-c", "queued", 1, t0 + 1);
-  auto c = readApi(ctx);
+  hPutRun("run-a", "queued", 0, t0);
+  hPutRun("run-b", "queued", 1, t0);
+  hPutRun("run-c", "queued", 1, t0 + 1);
+  auto c = hReadApi(ctx);
   nlohmann::json positions = nlohmann::json::array();
   for (const std::string run_id : {"run-a", "run-b", "run-c"}) {
-    const auto v = readOk(ctx, readAs(c, run_id, "t1"), "the read of " + run_id);
+    const auto v = hReadOk(ctx, hReadAs(c, run_id, "t1"), "the read of " + run_id);
     positions.push_back(v.is_object() && v.contains("queue_position") ? v["queue_position"] : nlohmann::json());
   }
   ctx.Equal(positions, nlohmann::json{0, 1, 2}, "run-a starts next (0) and run-c last (2): count from the head with ZRANK; the positions");
 }
 
 void CheckClusterNodes(harness::Ctx& ctx) {
-  putRun("run-a", "running", 1, 0);
+  hPutRun("run-a", "running", 1, 0);
   ctx.Redis.Do("HSET", "cluster:assignments", "run-a", "n3");  // the cluster moved the run; the row still says n1, n2
-  putRun("run-b", "queued", 1, ctx.Clock.Now(), {"n1", "n2"});  // preempted and queued again; the row still names its old nodes
-  auto c = readApi(ctx);
-  const auto v = readOk(ctx, readAs(c, "run-a", "t1"), "the read of a running run");
-  const auto requeued = readOk(ctx, readAs(c, "run-b", "t1"), "the read of a queued run");
+  hPutRun("run-b", "queued", 1, ctx.Clock.Now(), {"n1", "n2"});  // preempted and queued again; the row still names its old nodes
+  auto c = hReadApi(ctx);
+  const auto v = hReadOk(ctx, hReadAs(c, "run-a", "t1"), "the read of a running run");
+  const auto requeued = hReadOk(ctx, hReadAs(c, "run-b", "t1"), "the read of a queued run");
   ctx.Equal(v.value("nodes", nlohmann::json()), nlohmann::json{"n3"}, "the cluster reports run-a on n3 and the row's list is stale; the nodes");
   ctx.Assert(hText(v, "state") == "running" && !v.contains("reason"), "a running run the cluster knows must read running with no reason, got %s", v.dump());
   ctx.Assert(hNoNodes(requeued), "a queued run whose row still names n1, n2 answered %s: a run that is not running holds no nodes ([])", requeued.dump());
 }
 
 void CheckOrphanedFailed(harness::Ctx& ctx) {
-  putRun("run-a", "running", 1, 0);
-  putRun("run-b", "running", 1, 0);
-  putRun("run-c", "starting", 1, 0, {"n1"});  // claimed; its worker has not placed it yet
+  hPutRun("run-a", "running", 1, 0);
+  hPutRun("run-b", "running", 1, 0);
+  hPutRun("run-c", "starting", 1, 0, {"n1"});  // claimed; its worker has not placed it yet
   ctx.Redis.Do("HSET", "cluster:assignments", "run-b", "n5,n6");
-  auto c = readApi(ctx);
-  const auto lost = readOk(ctx, readAs(c, "run-a", "t1"), "the read of a run the cluster lost");
-  const auto alive = readOk(ctx, readAs(c, "run-b", "t1"), "the read of a run the cluster knows");
-  const auto starting = readOk(ctx, readAs(c, "run-c", "t1"), "the read of a starting run");
+  auto c = hReadApi(ctx);
+  const auto lost = hReadOk(ctx, hReadAs(c, "run-a", "t1"), "the read of a run the cluster lost");
+  const auto alive = hReadOk(ctx, hReadAs(c, "run-b", "t1"), "the read of a run the cluster knows");
+  const auto starting = hReadOk(ctx, hReadAs(c, "run-c", "t1"), "the read of a starting run");
   ctx.Assert(hText(lost, "state") == "failed" && hText(lost, "reason") == "not_on_cluster",
              "a running run the cluster does not know answered %s: report it failed with reason not_on_cluster, or nobody restarts it", lost.dump());
   ctx.Assert(hNoNodes(lost), "a run the cluster lost answered %s: it holds no nodes ([])", lost.dump());

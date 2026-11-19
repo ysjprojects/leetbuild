@@ -1016,10 +1016,10 @@ import (
 	"leetbuild/harness"
 )
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func eventsSeed(ctx *harness.Ctx, checkoutRollout int) {
-	_, err := store.Save(eventsBg, store.Definition{Key: "checkout", Rollout: checkoutRollout, Rules: []registry.Rule{
+func hEventsSeed(ctx *harness.Ctx, checkoutRollout int) {
+	_, err := store.Save(hEventsBg, store.Definition{Key: "checkout", Rollout: checkoutRollout, Rules: []registry.Rule{
 		{Attribute: "user_id", Operator: "in", Value: []any{"u-17", "u-42"}},
 		{Attribute: "country", Operator: "eq", Value: "US"},
 		{Attribute: "country", Operator: "neq", Value: "CA"},
@@ -1027,22 +1027,22 @@ func eventsSeed(ctx *harness.Ctx, checkoutRollout int) {
 	ctx.NoError(err, "seeding checkout failed")
 }
 
-func eventsSetup(ctx *harness.Ctx) {
-	eventsSeed(ctx, 25)
-	_, err := store.Save(eventsBg, store.Definition{Key: "search-v2", Rollout: 10})
+func hEventsSetup(ctx *harness.Ctx) {
+	hEventsSeed(ctx, 25)
+	_, err := store.Save(hEventsBg, store.Definition{Key: "search-v2", Rollout: 10})
 	ctx.NoError(err, "seeding search-v2 failed")
 }
 
-func eventsApply(ctx *harness.Ctx, flagKey string) map[string]any {
-	event, err := applyChange(eventsBg, flagKey, "alice")
+func hEventsApply(ctx *harness.Ctx, flagKey string) map[string]any {
+	event, err := applyChange(hEventsBg, flagKey, "alice")
 	ctx.NoError(err, "applyChange(%s) failed", flagKey)
 	ctx.Assert(event != nil, "applyChange(%s) with no concurrent publish must commit the snapshot and answer the event", flagKey)
 	ctx.Settle()
 	return event
 }
 
-func eventsVersion(ctx *harness.Ctx) int64 {
-	s, err := engine.ReadSnapshot(eventsBg)
+func hEventsVersion(ctx *harness.Ctx) int64 {
+	s, err := engine.ReadSnapshot(hEventsBg)
 	ctx.NoError(err, "ReadSnapshot failed")
 	if s == nil {
 		return 0
@@ -1051,11 +1051,11 @@ func eventsVersion(ctx *harness.Ctx) int64 {
 }
 
 func CheckFlagKey(ctx *harness.Ctx) {
-	eventsSetup(ctx)
-	eventsApply(ctx, "checkout")
-	eventsApply(ctx, "search-v2")
-	eventsSeed(ctx, 50)
-	eventsApply(ctx, "checkout")
+	hEventsSetup(ctx)
+	hEventsApply(ctx, "checkout")
+	hEventsApply(ctx, "search-v2")
+	hEventsSeed(ctx, 50)
+	hEventsApply(ctx, "checkout")
 	records := ctx.Kafka.Records(eventTopic)
 	ctx.Equal(len(records), 3, "three changes, the records on %s", eventTopic)
 	ctx.Equal(ctx.Kafka.Keys(eventTopic), []string{"checkout", "search-v2", "checkout"}, "records must be keyed by the flag key (keyed by anything else, one flag's history is mixed with every other flag's)")
@@ -1063,22 +1063,22 @@ func CheckFlagKey(ctx *harness.Ctx) {
 }
 
 func CheckAfterCommit(ctx *harness.Ctx) {
-	eventsSetup(ctx)
+	hEventsSetup(ctx)
 	// What is already on the topic the moment the snapshot is written.
 	atCommit := ctx.Redis.After("flags:snapshot:version", func() any { return len(ctx.Kafka.Records(eventTopic)) })
-	event := eventsApply(ctx, "checkout")
+	event := hEventsApply(ctx, "checkout")
 	ctx.Assert(atCommit.Fired, "applyChange never published the snapshot")
 	ctx.Equal(atCommit.Result, 0, "when the snapshot was published the topic already held records: the event announced a version before the engine committed it. Publish the snapshot, then produce; records at the commit")
-	ctx.Equal(event["version"], eventsVersion(ctx), "the event must name the version the engine holds")
+	ctx.Equal(event["version"], hEventsVersion(ctx), "the event must name the version the engine holds")
 	// Another publisher takes version 2 between this change's read and its publish.
 	rival := ctx.Redis.After("flags:snapshot", func() any {
-		s, _ := engine.ReadSnapshot(eventsBg)
+		s, _ := engine.ReadSnapshot(hEventsBg)
 		s.Version = 2
-		moved, _ := engine.PublishSnapshot(eventsBg, *s)
+		moved, _ := engine.PublishSnapshot(hEventsBg, *s)
 		return moved
 	})
 	before := len(ctx.Kafka.Records(eventTopic))
-	lost, err := applyChange(eventsBg, "search-v2", "alice")
+	lost, err := applyChange(hEventsBg, "search-v2", "alice")
 	ctx.NoError(err, "a change that lost the race must not fail")
 	ctx.Settle()
 	ctx.Assert(rival.Fired && rival.Result == true, "the rival publish of version 2 must land")
@@ -1087,9 +1087,9 @@ func CheckAfterCommit(ctx *harness.Ctx) {
 }
 
 func CheckNoTargets(ctx *harness.Ctx) {
-	eventsSetup(ctx)
-	eventsApply(ctx, "search-v2") // the snapshot version (2) and checkout's definition version (1) now differ
-	event := eventsApply(ctx, "checkout")
+	hEventsSetup(ctx)
+	hEventsApply(ctx, "search-v2") // the snapshot version (2) and checkout's definition version (1) now differ
+	event := hEventsApply(ctx, "checkout")
 	records := ctx.Kafka.Records(eventTopic)
 	ctx.Equal(len(records), 2, "two changes, the records")
 	text := string(records[1].Value)
@@ -1105,13 +1105,13 @@ func CheckNoTargets(ctx *harness.Ctx) {
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	eventsSetup(ctx)
+	hEventsSetup(ctx)
 	ctx.Kafka.FailNext(eventTopic, 1)
-	event, err := applyChange(eventsBg, "checkout", "alice")
+	event, err := applyChange(hEventsBg, "checkout", "alice")
 	ctx.NoError(err, "a rejected event does not undo the change: applyChange must not fail")
 	ctx.Settle()
 	ctx.Assert(event != nil, "a rejected event does not undo the change: applyChange must still answer the event")
-	ctx.Equal(eventsVersion(ctx), int64(1), "the change must be live; the engine's version")
+	ctx.Equal(hEventsVersion(ctx), int64(1), "the change must be live; the engine's version")
 	rows := ctx.Redis.LRange(outboxKey, 0, -1)
 	ctx.Equal(len(rows), 1, "the broker rejected the event and %s holds %v: the change is live and nobody downstream will hear of it. Write the outbox row where the rejection arrives; rows", outboxKey, rows)
 	var row map[string]any
@@ -1126,7 +1126,7 @@ func CheckOutbox(ctx *harness.Ctx) {
 	}
 	ctx.Assert(payload != nil && payload["flag_key"] == "checkout" && payload["version"] == float64(1), "the outbox row must carry the event payload: %s", rows[0])
 	ctx.Equal(len(ctx.Kafka.Records(eventTopic)), 0, "a rejected record cannot be on the topic; the records")
-	eventsApply(ctx, "search-v2")
+	hEventsApply(ctx, "search-v2")
 	ctx.Equal(len(ctx.Kafka.Records(eventTopic)), 1, "once the broker answers again the next event is delivered; the records")
 	ctx.Equal(len(ctx.Redis.LRange(outboxKey, 0, -1)), 1, "a delivered event must not add an outbox row; rows")
 }
@@ -1144,7 +1144,7 @@ func CheckOutbox(ctx *harness.Ctx) {
 
 namespace {
 
-void eventsSeed(int checkout_rollout) {
+void hEventsSeed(int checkout_rollout) {
   store::save({{"key", "checkout"},
                {"default", false},
                {"rules", nlohmann::json::parse(R"([{"attribute": "user_id", "operator": "in", "value": ["u-17", "u-42"]},
@@ -1153,12 +1153,12 @@ void eventsSeed(int checkout_rollout) {
                {"rollout", checkout_rollout}});
 }
 
-void eventsSetup() {
-  eventsSeed(25);
+void hEventsSetup() {
+  hEventsSeed(25);
   store::save({{"key", "search-v2"}, {"default", false}, {"rules", nlohmann::json::array()}, {"rollout", 10}});
 }
 
-nlohmann::json eventsApply(harness::Ctx& ctx, const std::string& flag_key) {
+nlohmann::json hEventsApply(harness::Ctx& ctx, const std::string& flag_key) {
   std::optional<nlohmann::json> event;
   try {
     event = applyChange(flag_key, "alice");
@@ -1170,12 +1170,12 @@ nlohmann::json eventsApply(harness::Ctx& ctx, const std::string& flag_key) {
   return *event;
 }
 
-long long eventsVersion() {
+long long hEventsVersion() {
   const auto s = engine::readSnapshot();
   return s ? s->value("version", 0LL) : 0LL;
 }
 
-nlohmann::json eventsParsed(const std::string& text) {
+nlohmann::json hEventsParsed(const std::string& text) {
   const auto j = nlohmann::json::parse(text, nullptr, false);
   return j.is_discarded() ? nlohmann::json() : j;
 }
@@ -1183,11 +1183,11 @@ nlohmann::json eventsParsed(const std::string& text) {
 }  // namespace
 
 void CheckFlagKey(harness::Ctx& ctx) {
-  eventsSetup();
-  eventsApply(ctx, "checkout");
-  eventsApply(ctx, "search-v2");
-  eventsSeed(50);
-  eventsApply(ctx, "checkout");
+  hEventsSetup();
+  hEventsApply(ctx, "checkout");
+  hEventsApply(ctx, "search-v2");
+  hEventsSeed(50);
+  hEventsApply(ctx, "checkout");
   const auto records = ctx.Kafka.Records(kEventTopic);
   ctx.Equal(records.size(), 3, "three changes, the records on %s", kEventTopic);
   ctx.Equal(ctx.Kafka.Keys(kEventTopic), {"checkout", "search-v2", "checkout"}, "records must be keyed by the flag key (keyed by anything else, one flag's history is mixed with every other flag's)");
@@ -1195,14 +1195,14 @@ void CheckFlagKey(harness::Ctx& ctx) {
 }
 
 void CheckAfterCommit(harness::Ctx& ctx) {
-  eventsSetup();
+  hEventsSetup();
   // What is already on the topic the moment the snapshot is written.
   int at_commit = -1;
   ctx.Redis.After("flags:snapshot:version", [&] { at_commit = static_cast<int>(ctx.Kafka.Records(kEventTopic).size()); });
-  const auto event = eventsApply(ctx, "checkout");
+  const auto event = hEventsApply(ctx, "checkout");
   ctx.Assert(at_commit >= 0, "applyChange never published the snapshot");
   ctx.Equal(at_commit, 0, "when the snapshot was published the topic already held records: the event announced a version before the engine committed it. Publish the snapshot, then produce; records at the commit");
-  ctx.Equal(event.value("version", 0LL), eventsVersion(), "the event must name the version the engine holds");
+  ctx.Equal(event.value("version", 0LL), hEventsVersion(), "the event must name the version the engine holds");
   // Another publisher takes version 2 between this change's read and its publish.
   bool rival = false;
   ctx.Redis.After("flags:snapshot", [&] {
@@ -1219,13 +1219,13 @@ void CheckAfterCommit(harness::Ctx& ctx) {
 }
 
 void CheckNoTargets(harness::Ctx& ctx) {
-  eventsSetup();
-  eventsApply(ctx, "search-v2");  // the snapshot version (2) and checkout's definition version (1) now differ
-  const auto event = eventsApply(ctx, "checkout");
+  hEventsSetup();
+  hEventsApply(ctx, "search-v2");  // the snapshot version (2) and checkout's definition version (1) now differ
+  const auto event = hEventsApply(ctx, "checkout");
   const auto records = ctx.Kafka.Records(kEventTopic);
   ctx.Equal(records.size(), 2, "two changes, the records");
   const std::string text = records[1].Value.value_or("");
-  const auto payload = eventsParsed(text);
+  const auto payload = hEventsParsed(text);
   ctx.Assert(payload.is_object(), "the event must be JSON: %s", text);
   ctx.Assert(!payload.contains("rules") && text.find("u-17") == std::string::npos && text.find("u-42") == std::string::npos && text.find("CA") == std::string::npos, "the event carries the targeting rules: %s. User ids in a retained, replicated topic outlive every deletion request; name the attributes, not the values", text);
   ctx.Equal(payload.value("rule_attributes", std::vector<std::string>{}), {"country", "user_id"}, "rule_attributes must be the sorted, distinct attributes the rules target (two rules target country)");
@@ -1235,7 +1235,7 @@ void CheckNoTargets(harness::Ctx& ctx) {
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  eventsSetup();
+  hEventsSetup();
   ctx.Kafka.FailNext(kEventTopic, 1);
   std::optional<nlohmann::json> event;
   try {
@@ -1245,16 +1245,16 @@ void CheckOutbox(harness::Ctx& ctx) {
   }
   ctx.Settle();
   ctx.Assert(event.has_value(), "a rejected event does not undo the change: applyChange must still answer the event");
-  ctx.Equal(eventsVersion(), 1LL, "the change must be live; the engine's version");
+  ctx.Equal(hEventsVersion(), 1LL, "the change must be live; the engine's version");
   const auto rows = ctx.Redis.LRange(kOutboxKey, 0, -1);
   ctx.Equal(rows.size(), 1, "the broker rejected the event and %s holds %v: the change is live and nobody downstream will hear of it. Write the outbox row from the delivery report; rows", kOutboxKey, rows);
-  const auto row = eventsParsed(rows[0]);
+  const auto row = hEventsParsed(rows[0]);
   ctx.Assert(row.is_object() && row.value("key", "") == "checkout", "the outbox row must carry the record key (the flag key) so the relay keeps the partition (%s)", rows[0]);
   nlohmann::json payload;
-  if (row.contains("payload")) payload = row["payload"].is_string() ? eventsParsed(row["payload"].get<std::string>()) : row["payload"];
+  if (row.contains("payload")) payload = row["payload"].is_string() ? hEventsParsed(row["payload"].get<std::string>()) : row["payload"];
   ctx.Assert(payload.is_object() && payload.value("flag_key", "") == "checkout" && payload.value("version", 0) == 1, "the outbox row must carry the event payload: %s", rows[0]);
   ctx.Equal(ctx.Kafka.Records(kEventTopic).size(), 0, "a rejected record cannot be on the topic; the records");
-  eventsApply(ctx, "search-v2");
+  hEventsApply(ctx, "search-v2");
   ctx.Equal(ctx.Kafka.Records(kEventTopic).size(), 1, "once the broker answers again the next event is delivered; the records");
   ctx.Equal(ctx.Redis.LRange(kOutboxKey, 0, -1).size(), 1, "a delivered event must not add an outbox row; rows");
 }

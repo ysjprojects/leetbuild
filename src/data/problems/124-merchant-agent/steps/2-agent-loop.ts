@@ -1084,23 +1084,23 @@ import (
 )
 
 const (
-	loopCap       = 12 // the stand-in model answers in text after this many calls, so a loop with no exit still ends
-	loopCustomers = "which of my customers are from Toronto?"
-	loopForm      = "write an SEO description for the jacket I have open"
-	loopEndless   = "loop: compare this week's sales with every week this year"
+	kHLoopCap       = 12 // the stand-in model answers in text after this many calls, so a loop with no exit still ends
+	kHLoopCustomers = "which of my customers are from Toronto?"
+	kHLoopForm      = "write an SEO description for the jacket I have open"
+	kHLoopEndless   = "loop: compare this week's sales with every week this year"
 	// loopChain: the stand-in model asks for segment_customers, then for fill_product_form, then answers.
-	loopChain = "find my Toronto customers, then write an SEO description for the jacket"
+	kHLoopChain = "find my Toronto customers, then write an SEO description for the jacket"
 )
 
 // loopModel is the stand-in model: answers from sidekick/model.
-type loopModel struct {
+type HLoopModel struct {
 	pb.UnimplementedModelServer
 	calls int
 }
 
-func (p *loopModel) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
+func (p *HLoopModel) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
 	p.calls++
-	if p.calls > loopCap {
+	if p.calls > kHLoopCap {
 		return &pb.CompleteReply{Text: "(the stand-in model stopped asking for tools)"}, nil
 	}
 	user := ""
@@ -1113,7 +1113,7 @@ func (p *loopModel) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.Co
 			results = append(results, m.GetContent())
 		}
 	}
-	if user == loopChain {
+	if user == kHLoopChain {
 		switch len(results) {
 		case 0:
 			return &pb.CompleteReply{ToolCall: &pb.ToolCall{Name: "segment_customers", ArgsJson: \`{"query":"default_address_city = Toronto"}\`}}, nil
@@ -1128,8 +1128,8 @@ func (p *loopModel) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.Co
 
 // loopWorld serves the stand-in model and stands in for step 3: every reservation fits, and a tool
 // is answered by sidekick/tools and recorded.
-func loopWorld(ctx *harness.Ctx) *[]string {
-	pb.RegisterModelServer(ctx.GRPC.Server(config.ModelAddr), &loopModel{})
+func hLoopWorld(ctx *harness.Ctx) *[]string {
+	pb.RegisterModelServer(ctx.GRPC.Server(config.ModelAddr), &HLoopModel{})
 	invoked := &[]string{}
 	reserve = func(context.Context, string, int64) (bool, error) { return true, nil }
 	invokeTool = func(_ context.Context, shop, turnID, name, argsJSON string) (string, error) {
@@ -1139,13 +1139,13 @@ func loopWorld(ctx *harness.Ctx) *[]string {
 	return invoked
 }
 
-func loopRun(ctx *harness.Ctx, scopes []string, message, page, turnID string) outcome.Outcome {
+func hLoopRun(ctx *harness.Ctx, scopes []string, message, page, turnID string) outcome.Outcome {
 	out, err := runAgent(context.Background(), "s1", scopes, message, page, turnID)
 	ctx.NoError(err, "runAgent(%q)", message)
 	return out
 }
 
-func loopRequests(ctx *harness.Ctx) []*pb.CompleteRequest {
+func hLoopRequests(ctx *harness.Ctx) []*pb.CompleteRequest {
 	out := []*pb.CompleteRequest{}
 	for _, c := range ctx.GRPC.CallsTo("Complete", "") {
 		req, _ := c.Request.(*pb.CompleteRequest)
@@ -1155,7 +1155,7 @@ func loopRequests(ctx *harness.Ctx) []*pb.CompleteRequest {
 }
 
 // loopToolList is one call's tool list as sorted "name | description" lines.
-func loopToolList(r *pb.CompleteRequest) []string {
+func hLoopToolList(r *pb.CompleteRequest) []string {
 	out := []string{}
 	for _, t := range r.GetTools() {
 		out = append(out, t.GetName()+" | "+t.GetDescription())
@@ -1165,19 +1165,19 @@ func loopToolList(r *pb.CompleteRequest) []string {
 }
 
 // loopInstructions lists the instructions each call carried, from call number from on (0-based).
-func loopInstructions(ctx *harness.Ctx, from int) []string {
+func hLoopInstructions(ctx *harness.Ctx, from int) []string {
 	out := []string{}
-	for _, r := range loopRequests(ctx)[from:] {
+	for _, r := range hLoopRequests(ctx)[from:] {
 		out = append(out, r.GetInstructions())
 	}
 	return out
 }
 
 func CheckCompactPrompt(ctx *harness.Ctx) {
-	loopWorld(ctx)
-	loopRun(ctx, []string{"read_customers"}, loopCustomers, "customers", "t-1")
-	loopRun(ctx, []string{"read_reports"}, "how were sales last month?", "analytics", "t-2")
-	all := loopRequests(ctx)
+	hLoopWorld(ctx)
+	hLoopRun(ctx, []string{"read_customers"}, kHLoopCustomers, "customers", "t-1")
+	hLoopRun(ctx, []string{"read_reports"}, "how were sales last month?", "analytics", "t-2")
+	all := hLoopRequests(ctx)
 	ctx.Assert(len(all) >= 4, "two turns that each call one tool make 4 Complete calls, saw %d", len(all))
 	for _, r := range all {
 		ctx.Equal(r.GetSystemPrompt(), all[0].GetSystemPrompt(), "the system prompt changed between calls: every change misses the provider's prompt cache")
@@ -1191,59 +1191,59 @@ func CheckCompactPrompt(ctx *harness.Ctx) {
 	}
 	sort.Strings(expected)
 	for i, r := range all {
-		ctx.Equal(loopToolList(r), expected, "call %d: the tool list must be the catalog's names with their one-line descriptions, every call", i+1)
+		ctx.Equal(hLoopToolList(r), expected, "call %d: the tool list must be the catalog's names with their one-line descriptions, every call", i+1)
 	}
 }
 
 func CheckJitInstructions(ctx *harness.Ctx) {
-	loopWorld(ctx)
-	out := loopRun(ctx, []string{"read_customers"}, loopCustomers, "customers", "t-1")
-	all := loopRequests(ctx)
+	hLoopWorld(ctx)
+	out := hLoopRun(ctx, []string{"read_customers"}, kHLoopCustomers, "customers", "t-1")
+	all := hLoopRequests(ctx)
 	ctx.Assert(len(all) == 2 && len(out.ToolsUsed) == 1, "the Toronto question takes one tool call and two Complete calls, saw %d calls and %+v", len(all), out)
 	ctx.Equal(all[0].GetInstructions(), "", "the first call carries instructions though no tool has run")
 	seg, _ := catalog.Lookup("segment_customers")
 	ctx.Equal(all[1].GetInstructions(), seg.Instructions, "the call after segment_customers ran must carry its instructions in Instructions")
-	loopRun(ctx, []string{}, loopCustomers, "customers", "t-2")
-	later := loopRequests(ctx)[2:]
+	hLoopRun(ctx, []string{}, kHLoopCustomers, "customers", "t-2")
+	later := hLoopRequests(ctx)[2:]
 	ctx.Assert(len(later) > 0, "the refused turn made no Complete call")
 	for _, r := range later {
 		ctx.Equal(r.GetInstructions(), "", "a refused tool call ran nothing, so the next call carries no instructions")
 	}
-	seen := len(loopRequests(ctx))
-	chained := loopRun(ctx, []string{"read_customers"}, loopChain, "customers", "t-3")
-	chain := loopInstructions(ctx, seen)
+	seen := len(hLoopRequests(ctx))
+	chained := hLoopRun(ctx, []string{"read_customers"}, kHLoopChain, "customers", "t-3")
+	chain := hLoopInstructions(ctx, seen)
 	ctx.Assert(len(chain) == 3, "segment_customers, then a refused fill_product_form, then the answer: 3 Complete calls, saw %d and %+v", len(chain), chained)
 	ctx.Equal(chain, []string{"", seg.Instructions, ""}, "instructions travel in the one call after their tool ran: segment_customers ran, then fill_product_form was refused, so the third call carries none; the calls' instructions")
-	seen = len(loopRequests(ctx))
-	loopRun(ctx, []string{"read_customers", "write_products"}, loopChain, "products", "t-4")
+	seen = len(hLoopRequests(ctx))
+	hLoopRun(ctx, []string{"read_customers", "write_products"}, kHLoopChain, "products", "t-4")
 	form, _ := catalog.Lookup("fill_product_form")
-	ctx.Equal(loopInstructions(ctx, seen), []string{"", seg.Instructions, form.Instructions}, "after segment_customers and then fill_product_form ran, each next call carries only the instructions of the tool that just ran; the calls' instructions")
+	ctx.Equal(hLoopInstructions(ctx, seen), []string{"", seg.Instructions, form.Instructions}, "after segment_customers and then fill_product_form ran, each next call carries only the instructions of the tool that just ran; the calls' instructions")
 }
 
 func CheckTurnLimit(ctx *harness.Ctx) {
-	loopWorld(ctx)
-	out := loopRun(ctx, []string{"read_reports"}, loopEndless, "analytics", "t-1")
+	hLoopWorld(ctx)
+	out := hLoopRun(ctx, []string{"read_reports"}, kHLoopEndless, "analytics", "t-1")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Complete", "")), 6, "a model that asks for a tool on every turn: the loop stops at maxTurns = 6; Complete calls")
 	ctx.Equal(out.Status, "turn_limit", "the outcome's status")
 	ctx.Equal(len(out.ToolsUsed), 6, "ToolsUsed lists the six tool calls made")
-	out = loopRun(ctx, []string{"read_customers"}, loopEndless, "analytics", "t-2")
+	out = hLoopRun(ctx, []string{"read_customers"}, kHLoopEndless, "analytics", "t-2")
 	calls := len(ctx.GRPC.CallsTo("Complete", "")) - 6
 	ctx.Assert(calls == 6 && out.Status == "turn_limit", "a model that asks on every turn for a tool the merchant may not use got %d Complete calls and status %q: a refused call is a turn too, the loop stops at maxTurns = 6", calls, out.Status)
 	ctx.Assert(len(out.ToolsUsed) == 0, "every call was refused, so ToolsUsed stays empty, got %v", out.ToolsUsed)
 }
 
 func CheckCallDeadline(ctx *harness.Ctx) {
-	loopWorld(ctx)
+	hLoopWorld(ctx)
 	ctx.GRPC.SetLatency("Complete", 60, config.ModelAddr)
 	started := ctx.Clock.Now()
-	out := loopRun(ctx, []string{"read_customers"}, loopCustomers, "customers", "t-1")
+	out := hLoopRun(ctx, []string{"read_customers"}, kHLoopCustomers, "customers", "t-1")
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	first := ctx.GRPC.CallsTo("Complete", "")[0]
 	ctx.Assert(first.HasDeadline() && first.Timeout.Seconds() <= 10.5, "Complete must carry a deadline of at most 10 s, it carried %v", first.Timeout)
 	ctx.Assert(out.Status == "deadline" && waited <= 10.5, "a model that hangs held the turn %.0f s (status %q): cut it at modelDeadline and answer with status deadline", waited, out.Status)
 	ctx.GRPC.SetLatency("Complete", 8, config.ModelAddr)
 	started = ctx.Clock.Now()
-	out = loopRun(ctx, []string{"read_reports"}, loopEndless, "analytics", "t-2")
+	out = hLoopRun(ctx, []string{"read_reports"}, kHLoopEndless, "analytics", "t-2")
 	waited = float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(waited <= 30.5, "a model that takes 8 s per call held the loop %.0f s: the whole loop has loopBudget = 30 s", waited)
 	ctx.Equal(out.Status, "deadline", "a loop that ran out of time; status")
@@ -1252,17 +1252,17 @@ func CheckCallDeadline(ctx *harness.Ctx) {
 		ctx.Assert(c.HasDeadline() && c.Timeout.Seconds() <= 10.5, "every Complete carries a deadline of at most 10 s, call %d carried %v", i+1, c.Timeout)
 	}
 	ctx.GRPC.SetLatency("Complete", 4, config.ModelAddr)
-	out = loopRun(ctx, []string{"read_reports"}, loopEndless, "analytics", "t-3")
+	out = hLoopRun(ctx, []string{"read_reports"}, kHLoopEndless, "analytics", "t-3")
 	made := len(ctx.GRPC.CallsTo("Complete", "")) - len(calls)
 	ctx.Assert(out.Status == "turn_limit" && made == 6, "a model that takes 4 s per call fits six calls in the 30 s budget (24 s), got %d calls and status %q: the loop's budget is loopBudget = 30 s, each call's deadline is modelDeadline = 10 s", made, out.Status)
 }
 
 func CheckScopeGate(ctx *harness.Ctx) {
-	invoked := loopWorld(ctx)
-	out := loopRun(ctx, []string{"read_customers"}, loopForm, "products", "t-1")
+	invoked := hLoopWorld(ctx)
+	out := hLoopRun(ctx, []string{"read_customers"}, kHLoopForm, "products", "t-1")
 	ctx.Equal(*invoked, []string{}, "a staff account with only read_customers: fill_product_form needs write_products; invoked")
 	ctx.Assert(len(out.ToolsUsed) == 0, "ToolsUsed must stay empty when the call was refused, got %v", out.ToolsUsed)
-	all := loopRequests(ctx)
+	all := hLoopRequests(ctx)
 	var told *pb.Message
 	for _, m := range all[len(all)-1].GetMessages() {
 		if m.GetRole() == "tool" {
@@ -1270,11 +1270,11 @@ func CheckScopeGate(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Assert(told != nil && told.GetContent() == catalog.PermissionDenied && told.GetToolName() == "fill_product_form", "the model must hear PERMISSION_DENIED for fill_product_form, its messages were %v", all[len(all)-1].GetMessages())
-	out = loopRun(ctx, []string{"read_reports"}, loopCustomers, "customers", "t-2")
+	out = hLoopRun(ctx, []string{"read_reports"}, kHLoopCustomers, "customers", "t-2")
 	ctx.Assert(len(*invoked) == 0 && len(out.ToolsUsed) == 0, "a staff account with only read_reports got %v invoked: segment_customers reads customers and needs read_customers, read tools are gated too", *invoked)
-	loopRun(ctx, []string{"read_customers", "write_products"}, "delete my shop", "home", "t-3")
+	hLoopRun(ctx, []string{"read_customers", "write_products"}, "delete my shop", "home", "t-3")
 	ctx.Equal(*invoked, []string{}, "delete_shop is not in the catalog; invoked")
-	all = loopRequests(ctx)
+	all = hLoopRequests(ctx)
 	told = nil
 	for _, m := range all[len(all)-1].GetMessages() {
 		if m.GetRole() == "tool" {
@@ -1282,7 +1282,7 @@ func CheckScopeGate(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Assert(told != nil && told.GetContent() == catalog.PermissionDenied && told.GetToolName() == "delete_shop", "the model must hear PERMISSION_DENIED for delete_shop and answer, its last call's messages were %v", all[len(all)-1].GetMessages())
-	out = loopRun(ctx, []string{"read_customers", "write_products"}, loopForm, "products", "t-4")
+	out = hLoopRun(ctx, []string{"read_customers", "write_products"}, kHLoopForm, "products", "t-4")
 	ctx.Assert(len(*invoked) == 1 && (*invoked)[0] == "fill_product_form" && len(out.ToolsUsed) == 1, "with write_products the form is filled once: invoked %v, outcome %+v", *invoked, out)
 }
 `,
@@ -1300,22 +1300,22 @@ func CheckScopeGate(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr int kLoopCap = 12;  // the stand-in model answers in text after this many calls, so a loop with no exit still ends
-const std::string kCustomers = "which of my customers are from Toronto?";
-const std::string kForm = "write an SEO description for the jacket I have open";
-const std::string kEndless = "loop: compare this week's sales with every week this year";
+constexpr int kHLoopCap = 12;  // the stand-in model answers in text after this many calls, so a loop with no exit still ends
+const std::string kHCustomers = "which of my customers are from Toronto?";
+const std::string kHForm = "write an SEO description for the jacket I have open";
+const std::string kHEndless = "loop: compare this week's sales with every week this year";
 // The stand-in model asks for segment_customers, then for fill_product_form, then answers.
-const std::string kChain = "find my Toronto customers, then write an SEO description for the jacket";
+const std::string kHChain = "find my Toronto customers, then write an SEO description for the jacket";
 
-std::vector<std::string> loopInvoked;
+std::vector<std::string> hLoopInvoked;
 
 // The stand-in model: answers from sidekick/model.h.
-class LoopModel final : public sidekickrpc::Model::Service {
+class HLoopModel final : public sidekickrpc::Model::Service {
  public:
   int calls = 0;
   grpc::Status Complete(grpc::ServerContext*, const sidekickrpc::CompleteRequest* req, sidekickrpc::CompleteReply* reply) override {
     calls++;
-    if (calls > kLoopCap) {
+    if (calls > kHLoopCap) {
       reply->set_text("(the stand-in model stopped asking for tools)");
       return grpc::Status::OK;
     }
@@ -1324,7 +1324,7 @@ class LoopModel final : public sidekickrpc::Model::Service {
       if (m.role() == "tool") results.push_back(m.content());
     }
     const std::string user = req->messages_size() > 0 ? req->messages(0).content() : "";
-    if (user == kChain) {
+    if (user == kHChain) {
       if (results.size() < 2) {
         reply->mutable_tool_call()->set_name(results.empty() ? "segment_customers" : "fill_product_form");
         reply->mutable_tool_call()->set_args_json(results.empty() ? R"({"query":"default_address_city = Toronto"})" : R"({"product_id":"p-1","field":"seo_description"})");
@@ -1341,26 +1341,26 @@ class LoopModel final : public sidekickrpc::Model::Service {
   }
 };
 
-void loopWorld(harness::Ctx& ctx) {
-  static LoopModel* peer = nullptr;
+void hLoopWorld(harness::Ctx& ctx) {
+  static HLoopModel* peer = nullptr;
   delete peer;
-  peer = new LoopModel;
+  peer = new HLoopModel;
   ctx.GRPC.Server(config::kModelAddr)->RegisterService(peer);
-  loopInvoked.clear();
+  hLoopInvoked.clear();
 }
 
-outcome::Outcome loopRun(const std::vector<std::string>& scopes, const std::string& message, const std::string& page, const std::string& turn_id) {
+outcome::Outcome hLoopRun(const std::vector<std::string>& scopes, const std::string& message, const std::string& page, const std::string& turn_id) {
   return run_agent("s1", scopes, message, page, turn_id);
 }
 
-std::vector<sidekickrpc::CompleteRequest> loopRequests(harness::Ctx& ctx) {
+std::vector<sidekickrpc::CompleteRequest> hLoopRequests(harness::Ctx& ctx) {
   std::vector<sidekickrpc::CompleteRequest> out;
   for (const auto& c : ctx.GRPC.CallsTo("Complete")) out.push_back(c.Request<sidekickrpc::CompleteRequest>());
   return out;
 }
 
 // One call's tool list as sorted "name | description" lines.
-std::vector<std::string> loopToolList(const sidekickrpc::CompleteRequest& r) {
+std::vector<std::string> hLoopToolList(const sidekickrpc::CompleteRequest& r) {
   std::vector<std::string> out;
   for (const auto& t : r.tools()) out.push_back(t.name() + " | " + t.description());
   std::sort(out.begin(), out.end());
@@ -1368,9 +1368,9 @@ std::vector<std::string> loopToolList(const sidekickrpc::CompleteRequest& r) {
 }
 
 // The instructions each call carried, from call number from on (0-based).
-std::vector<std::string> loopInstructions(harness::Ctx& ctx, size_t from) {
+std::vector<std::string> hLoopInstructions(harness::Ctx& ctx, size_t from) {
   std::vector<std::string> out;
-  const auto all = loopRequests(ctx);
+  const auto all = hLoopRequests(ctx);
   for (size_t i = from; i < all.size(); ++i) out.push_back(all[i].instructions());
   return out;
 }
@@ -1381,15 +1381,15 @@ std::vector<std::string> loopInstructions(harness::Ctx& ctx, size_t from) {
 bool reserve(const std::string&, long long) { return true; }
 
 std::string invoke_tool(const std::string& shop, const std::string&, const std::string& name, const std::string& args_json) {
-  loopInvoked.push_back(name);
+  hLoopInvoked.push_back(name);
   return tools::invoke(shop, name, args_json);
 }
 
 void CheckCompactPrompt(harness::Ctx& ctx) {
-  loopWorld(ctx);
-  loopRun({"read_customers"}, kCustomers, "customers", "t-1");
-  loopRun({"read_reports"}, "how were sales last month?", "analytics", "t-2");
-  const auto all = loopRequests(ctx);
+  hLoopWorld(ctx);
+  hLoopRun({"read_customers"}, kHCustomers, "customers", "t-1");
+  hLoopRun({"read_reports"}, "how were sales last month?", "analytics", "t-2");
+  const auto all = hLoopRequests(ctx);
   ctx.Assert(all.size() >= 4, "two turns that each call one tool make 4 Complete calls, saw %d", all.size());
   for (const auto& r : all) ctx.Equal(r.system_prompt(), all[0].system_prompt(), "the system prompt changed between calls: every change misses the provider's prompt cache");
   for (const auto& t : catalog::tools()) {
@@ -1400,57 +1400,57 @@ void CheckCompactPrompt(harness::Ctx& ctx) {
   for (const auto& t : catalog::tools()) expected.push_back(t.name + " | " + t.description);
   std::sort(expected.begin(), expected.end());
   for (size_t i = 0; i < all.size(); ++i)
-    ctx.Equal(loopToolList(all[i]), expected, "call %d: the tool list must be the catalog's names with their one-line descriptions, every call", i + 1);
+    ctx.Equal(hLoopToolList(all[i]), expected, "call %d: the tool list must be the catalog's names with their one-line descriptions, every call", i + 1);
 }
 
 void CheckJitInstructions(harness::Ctx& ctx) {
-  loopWorld(ctx);
-  const auto out = loopRun({"read_customers"}, kCustomers, "customers", "t-1");
-  const auto all = loopRequests(ctx);
+  hLoopWorld(ctx);
+  const auto out = hLoopRun({"read_customers"}, kHCustomers, "customers", "t-1");
+  const auto all = hLoopRequests(ctx);
   ctx.Assert(all.size() == 2 && out.tools_used.size() == 1, "the Toronto question takes one tool call and two Complete calls, saw %d calls and %d tools", all.size(), out.tools_used.size());
   ctx.Equal(all[0].instructions(), "", "the first call carries instructions though no tool has run");
   ctx.Equal(all[1].instructions(), catalog::lookup("segment_customers")->instructions, "the call after segment_customers ran must carry its instructions in instructions");
-  loopRun({}, kCustomers, "customers", "t-2");
-  const auto later = loopRequests(ctx);
+  hLoopRun({}, kHCustomers, "customers", "t-2");
+  const auto later = hLoopRequests(ctx);
   ctx.Assert(later.size() > 2, "the refused turn made no Complete call");
   for (size_t i = 2; i < later.size(); ++i) ctx.Equal(later[i].instructions(), "", "a refused tool call ran nothing, so the next call carries no instructions");
   const std::string seg = catalog::lookup("segment_customers")->instructions;
   size_t seen = later.size();
-  const auto chained = loopRun({"read_customers"}, kChain, "customers", "t-3");
-  auto chain = loopInstructions(ctx, seen);
+  const auto chained = hLoopRun({"read_customers"}, kHChain, "customers", "t-3");
+  auto chain = hLoopInstructions(ctx, seen);
   ctx.Assert(chain.size() == 3, "segment_customers, then a refused fill_product_form, then the answer: 3 Complete calls, saw %d (status %q)", chain.size(), chained.status);
   ctx.Equal(chain, std::vector<std::string>{"", seg, ""},
             "instructions travel in the one call after their tool ran: segment_customers ran, then fill_product_form was refused, so the third call carries none; the calls' instructions");
-  seen = loopRequests(ctx).size();
-  loopRun({"read_customers", "write_products"}, kChain, "products", "t-4");
-  ctx.Equal(loopInstructions(ctx, seen), std::vector<std::string>{"", seg, catalog::lookup("fill_product_form")->instructions},
+  seen = hLoopRequests(ctx).size();
+  hLoopRun({"read_customers", "write_products"}, kHChain, "products", "t-4");
+  ctx.Equal(hLoopInstructions(ctx, seen), std::vector<std::string>{"", seg, catalog::lookup("fill_product_form")->instructions},
             "after segment_customers and then fill_product_form ran, each next call carries only the instructions of the tool that just ran; the calls' instructions");
 }
 
 void CheckTurnLimit(harness::Ctx& ctx) {
-  loopWorld(ctx);
-  auto out = loopRun({"read_reports"}, kEndless, "analytics", "t-1");
+  hLoopWorld(ctx);
+  auto out = hLoopRun({"read_reports"}, kHEndless, "analytics", "t-1");
   ctx.Equal(ctx.GRPC.CallsTo("Complete").size(), 6, "a model that asks for a tool on every turn: the loop stops at kMaxTurns = 6; Complete calls");
   ctx.Equal(out.status, "turn_limit", "the outcome's status");
   ctx.Equal(out.tools_used.size(), 6, "tools_used lists the six tool calls made");
-  out = loopRun({"read_customers"}, kEndless, "analytics", "t-2");
+  out = hLoopRun({"read_customers"}, kHEndless, "analytics", "t-2");
   const size_t calls = ctx.GRPC.CallsTo("Complete").size() - 6;
   ctx.Assert(calls == 6 && out.status == "turn_limit", "a model that asks on every turn for a tool the merchant may not use got %d Complete calls and status %q: a refused call is a turn too, the loop stops at kMaxTurns = 6", calls, out.status);
   ctx.Equal(out.tools_used, std::vector<std::string>{}, "every call was refused, so tools_used stays empty");
 }
 
 void CheckCallDeadline(harness::Ctx& ctx) {
-  loopWorld(ctx);
+  hLoopWorld(ctx);
   ctx.GRPC.SetLatency("Complete", 60, config::kModelAddr);
   auto started = ctx.Clock.Now();
-  auto out = loopRun({"read_customers"}, kCustomers, "customers", "t-1");
+  auto out = hLoopRun({"read_customers"}, kHCustomers, "customers", "t-1");
   double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   const auto first = ctx.GRPC.CallsTo("Complete")[0];
   ctx.Assert(first.HasDeadline() && first.TimeoutSeconds() <= 10.5, "Complete must carry a deadline of at most 10 s, it carried %vs", first.TimeoutSeconds());
   ctx.Assert(out.status == "deadline" && waited <= 10.5, "a model that hangs held the turn %.0f s (status %q): cut it at kModelDeadline and answer with status deadline", waited, out.status);
   ctx.GRPC.SetLatency("Complete", 8, config::kModelAddr);
   started = ctx.Clock.Now();
-  out = loopRun({"read_reports"}, kEndless, "analytics", "t-2");
+  out = hLoopRun({"read_reports"}, kHEndless, "analytics", "t-2");
   waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(waited <= 30.5, "a model that takes 8 s per call held the loop %.0f s: the whole loop has kLoopBudget = 30 s", waited);
   ctx.Equal(out.status, "deadline", "a loop that ran out of time; status");
@@ -1458,36 +1458,36 @@ void CheckCallDeadline(harness::Ctx& ctx) {
   for (size_t i = 0; i < calls.size(); ++i)
     ctx.Assert(calls[i].HasDeadline() && calls[i].TimeoutSeconds() <= 10.5, "every Complete carries a deadline of at most 10 s, call %d carried %vs", i + 1, calls[i].TimeoutSeconds());
   ctx.GRPC.SetLatency("Complete", 4, config::kModelAddr);
-  out = loopRun({"read_reports"}, kEndless, "analytics", "t-3");
+  out = hLoopRun({"read_reports"}, kHEndless, "analytics", "t-3");
   const size_t made = ctx.GRPC.CallsTo("Complete").size() - calls.size();
   ctx.Assert(out.status == "turn_limit" && made == 6, "a model that takes 4 s per call fits six calls in the 30 s budget (24 s), got %d calls and status %q: the loop's budget is kLoopBudget = 30 s, each call's deadline is kModelDeadline = 10 s", made, out.status);
 }
 
 void CheckScopeGate(harness::Ctx& ctx) {
-  loopWorld(ctx);
-  auto out = loopRun({"read_customers"}, kForm, "products", "t-1");
-  ctx.Equal(loopInvoked, std::vector<std::string>{}, "a staff account with only read_customers: fill_product_form needs write_products; invoked");
+  hLoopWorld(ctx);
+  auto out = hLoopRun({"read_customers"}, kHForm, "products", "t-1");
+  ctx.Equal(hLoopInvoked, std::vector<std::string>{}, "a staff account with only read_customers: fill_product_form needs write_products; invoked");
   ctx.Equal(out.tools_used, std::vector<std::string>{}, "tools_used when the call was refused");
-  const auto all = loopRequests(ctx);
+  const auto all = hLoopRequests(ctx);
   const sidekickrpc::Message* told = nullptr;
   for (const auto& m : all.back().messages()) {
     if (m.role() == "tool") told = &m;
   }
   ctx.Assert(told != nullptr && told->content() == catalog::kPermissionDenied && told->tool_name() == "fill_product_form",
              "the model must hear PERMISSION_DENIED for fill_product_form after the refused call");
-  out = loopRun({"read_reports"}, kCustomers, "customers", "t-2");
-  ctx.Assert(loopInvoked.empty() && out.tools_used.empty(), "a staff account with only read_reports got %v invoked: segment_customers reads customers and needs read_customers, read tools are gated too", loopInvoked);
-  loopRun({"read_customers", "write_products"}, "delete my shop", "home", "t-3");
-  ctx.Equal(loopInvoked, std::vector<std::string>{}, "delete_shop is not in the catalog; invoked");
-  const auto after = loopRequests(ctx);
+  out = hLoopRun({"read_reports"}, kHCustomers, "customers", "t-2");
+  ctx.Assert(hLoopInvoked.empty() && out.tools_used.empty(), "a staff account with only read_reports got %v invoked: segment_customers reads customers and needs read_customers, read tools are gated too", hLoopInvoked);
+  hLoopRun({"read_customers", "write_products"}, "delete my shop", "home", "t-3");
+  ctx.Equal(hLoopInvoked, std::vector<std::string>{}, "delete_shop is not in the catalog; invoked");
+  const auto after = hLoopRequests(ctx);
   told = nullptr;
   for (const auto& m : after.back().messages()) {
     if (m.role() == "tool") told = &m;
   }
   ctx.Assert(told != nullptr && told->content() == catalog::kPermissionDenied && told->tool_name() == "delete_shop",
              "the model must hear PERMISSION_DENIED for delete_shop and answer");
-  out = loopRun({"read_customers", "write_products"}, kForm, "products", "t-4");
-  ctx.Assert(loopInvoked == std::vector<std::string>{"fill_product_form"} && out.tools_used.size() == 1, "with write_products the form is filled once: invoked %v", loopInvoked);
+  out = hLoopRun({"read_customers", "write_products"}, kHForm, "products", "t-4");
+  ctx.Assert(hLoopInvoked == std::vector<std::string>{"fill_product_form"} && out.tools_used.size() == 1, "with write_products the form is filled once: invoked %v", hLoopInvoked);
 }
 `,
   },

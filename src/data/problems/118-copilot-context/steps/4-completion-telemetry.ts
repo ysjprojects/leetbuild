@@ -1176,18 +1176,18 @@ import (
 )
 
 const (
-	telShown    = "completion.shown"
-	telAccepted = "completion.accepted"
-	telCanary   = "CANARY_7731"
+	kHTelShown    = "completion.shown"
+	kHTelAccepted = "completion.accepted"
+	kHTelCanary   = "CANARY_7731"
 )
 
-func telApp(ctx *harness.Ctx) *harness.HTTP {
+func hTelApp(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func telReport(event, requestID string, extra map[string]any) map[string]any {
+func hTelReport(event, requestID string, extra map[string]any) map[string]any {
 	body := map[string]any{"event": event, "request_id": requestID, "language": "python", "candidate_len": 18, "latency_ms": 210}
 	for k, v := range extra {
 		body[k] = v
@@ -1196,16 +1196,16 @@ func telReport(event, requestID string, extra map[string]any) map[string]any {
 }
 
 func CheckSessionKey(ctx *harness.Ctx) {
-	c := telApp(ctx)
+	c := hTelApp(ctx)
 	for _, report := range [][2]string{{"shown", "req-1"}, {"accepted", "req-1"}, {"shown", "req-2"}} {
-		r := c.Post("/v1/telemetry", telReport(report[0], report[1], nil), "X-Session-Id", "s-ada")
+		r := c.Post("/v1/telemetry", hTelReport(report[0], report[1], nil), "X-Session-Id", "s-ada")
 		ctx.Equal(r.Status, 202, "POST /v1/telemetry (%s): %s", report[0], r.Text())
 	}
-	keys := append(ctx.Kafka.Keys(telShown), ctx.Kafka.Keys(telAccepted)...)
+	keys := append(ctx.Kafka.Keys(kHTelShown), ctx.Kafka.Keys(kHTelAccepted)...)
 	ctx.Equal(keys, []string{"s-ada", "s-ada", "s-ada"}, "records must be keyed by the session (keyed by request id, one session's events land on several partitions)")
 	ids := []string{}
 	events := []map[string]any{}
-	for _, v := range ctx.Kafka.Values(telShown) {
+	for _, v := range ctx.Kafka.Values(kHTelShown) {
 		var e map[string]any
 		json.Unmarshal([]byte(v), &e)
 		ctx.Equal(e["session"], "s-ada", "each event carries its session (%s)", v)
@@ -1222,42 +1222,42 @@ func CheckSessionKey(ctx *harness.Ctx) {
 	ctx.Equal(got, expected, "the event is {request_id, session, language, candidate_len, latency_ms} as reported (%v)", events[0])
 	before := len(ctx.Kafka.Topics())
 	for _, name := range []string{"copied", "accept", ""} {
-		bad := c.Post("/v1/telemetry", telReport(name, "req-3", nil), "X-Session-Id", "s-ada")
+		bad := c.Post("/v1/telemetry", hTelReport(name, "req-3", nil), "X-Session-Id", "s-ada")
 		ctx.Equal(bad.Status, 400, "the event %q is outside allowedEvents (the event must equal one of them); the status", name)
 	}
 	ctx.Equal(len(ctx.Kafka.Topics()), before, "an unknown event created a topic (%v); topics", ctx.Kafka.Topics())
-	anon := c.Post("/v1/telemetry", telReport("accepted", "req-4", map[string]any{"session": "s-ada"}))
+	anon := c.Post("/v1/telemetry", hTelReport("accepted", "req-4", map[string]any{"session": "s-ada"}))
 	ctx.Equal(anon.Status, 401, "a report without X-Session-Id (a session in its body: the session comes from the header only)")
-	ctx.Equal(len(ctx.Kafka.Records(telAccepted)), 1, "a report without a session reached the topic; records")
+	ctx.Equal(len(ctx.Kafka.Records(kHTelAccepted)), 1, "a report without a session reached the topic; records")
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
-	c := telApp(ctx)
-	ctx.Kafka.LoseAcks(telAccepted, 1) // the broker wrote it, the acknowledgement never arrived
-	r := c.Post("/v1/telemetry", telReport("accepted", "req-1", nil), "X-Session-Id", "s-ada")
+	c := hTelApp(ctx)
+	ctx.Kafka.LoseAcks(kHTelAccepted, 1) // the broker wrote it, the acknowledgement never arrived
+	r := c.Post("/v1/telemetry", hTelReport("accepted", "req-1", nil), "X-Session-Id", "s-ada")
 	ctx.Equal(r.Status, 202, "POST /v1/telemetry (%s)", r.Text())
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(telAccepted)), 1, "one acceptance whose acknowledgement was lost: the producer's retry wrote it twice. Make the producer idempotent with acks=all; records")
-	ctx.Kafka.Stall(telShown) // the broker stops acknowledging completion.shown
-	stalled := c.Post("/v1/telemetry", telReport("shown", "req-2", nil), "X-Session-Id", "s-ada")
+	ctx.Equal(len(ctx.Kafka.Records(kHTelAccepted)), 1, "one acceptance whose acknowledgement was lost: the producer's retry wrote it twice. Make the producer idempotent with acks=all; records")
+	ctx.Kafka.Stall(kHTelShown) // the broker stops acknowledging completion.shown
+	stalled := c.Post("/v1/telemetry", hTelReport("shown", "req-2", nil), "X-Session-Id", "s-ada")
 	ctx.Assert(stalled.Status != 202, "a report the broker never acknowledged answered 202: the count is lost and the editor is told it was kept. Answer an error when the produce is not acknowledged")
 }
 
 func CheckNoCode(ctx *harness.Ctx) {
-	c := telApp(ctx)
+	c := hTelApp(ctx)
 	var logged bytes.Buffer
 	log.SetOutput(&logged)
-	r := c.Post("/v1/telemetry", telReport("accepted", "req-1", map[string]any{"text": "conn.cursor()  # " + telCanary, "candidate_len": 30}), "X-Session-Id", "s-ada")
+	r := c.Post("/v1/telemetry", hTelReport("accepted", "req-1", map[string]any{"text": "conn.cursor()  # " + kHTelCanary, "candidate_len": 30}), "X-Session-Id", "s-ada")
 	log.SetOutput(os.Stderr)
 	ctx.Equal(r.Status, 202, "POST /v1/telemetry (%s)", r.Text())
-	values := ctx.Kafka.Values(telAccepted)
+	values := ctx.Kafka.Values(kHTelAccepted)
 	ctx.Equal(len(values), 1, "one report; records")
-	ctx.Assert(!strings.Contains(values[0], telCanary), "the event carries the suggestion's text: %s", values[0])
+	ctx.Assert(!strings.Contains(values[0], kHTelCanary), "the event carries the suggestion's text: %s", values[0])
 	var event map[string]any
 	json.Unmarshal([]byte(values[0]), &event)
 	_, hasText := event["text"]
 	ctx.Assert(event["candidate_len"] == float64(30) && !hasText, "the event reports candidate_len and no text, got %s", values[0])
-	ctx.Assert(!strings.Contains(logged.String(), telCanary), "the suggestion's text reached a log line: %q", strings.TrimSpace(logged.String()))
+	ctx.Assert(!strings.Contains(logged.String(), kHTelCanary), "the suggestion's text reached a log line: %q", strings.TrimSpace(logged.String()))
 }
 
 func CheckCountersBeforeCommit(ctx *harness.Ctx) {
@@ -1266,15 +1266,15 @@ func CheckCountersBeforeCommit(ctx *harness.Ctx) {
 		return string(b)
 	}
 	for i := 0; i < 3; i++ {
-		ctx.Kafka.SeedPartition(telAccepted, 0, "s-ada", value(i, "python"))
+		ctx.Kafka.SeedPartition(kHTelAccepted, 0, "s-ada", value(i, "python"))
 	}
 	for i := 0; i < 2; i++ {
-		ctx.Kafka.SeedPartition(telShown, 0, "s-ada", value(i, "python"))
+		ctx.Kafka.SeedPartition(kHTelShown, 0, "s-ada", value(i, "python"))
 	}
 	// The last record's HINCRBY fails: acceptance:rust is not a hash.
-	ctx.Kafka.SeedPartition(telAccepted, 0, "s-ada", value(9, "rust"))
+	ctx.Kafka.SeedPartition(kHTelAccepted, 0, "s-ada", value(9, "rust"))
 	ctx.Redis.Set("acceptance:rust", "not-a-hash")
-	countedRecords := map[string]int64{telAccepted: 3, telShown: 2}
+	countedRecords := map[string]int64{kHTelAccepted: 3, kHTelShown: 2}
 	early := []string{}
 	ctx.Kafka.OnCommit(func(_ string, offsets harness.KafkaOffsets) {
 		for tp, offset := range offsets {
@@ -1297,8 +1297,8 @@ func CheckCountersBeforeCommit(ctx *harness.Ctx) {
 		ctx.Fatalf("%s: the commit ran before HINCRBY, so a crash between them loses the count", early[0])
 	}
 	ctx.Equal(ctx.Redis.HGetAll("acceptance:python"), map[string]string{"accepted": "3", "shown": "2"}, "acceptance:python")
-	lag := ctx.Kafka.Lag("acceptance", telAccepted)
-	ctx.Assert(lag <= 1 && ctx.Kafka.Lag("acceptance", telShown) == 0, "every counted record must be committed")
+	lag := ctx.Kafka.Lag("acceptance", kHTelAccepted)
+	ctx.Assert(lag <= 1 && ctx.Kafka.Lag("acceptance", kHTelShown) == 0, "every counted record must be committed")
 	ctx.Assert(lag == 1, "the HINCRBY of req-9 failed (WRONGTYPE) and its offset was committed anyway: the count is lost for good. Commit only after HINCRBY succeeded")
 }
 `,
@@ -1315,11 +1315,11 @@ func CheckCountersBeforeCommit(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTelShown = "completion.shown";
-const std::string kTelAccepted = "completion.accepted";
-const std::string kTelCanary = "CANARY_7731";
+const std::string kHTelShown = "completion.shown";
+const std::string kHTelAccepted = "completion.accepted";
+const std::string kHTelCanary = "CANARY_7731";
 
-httplib::Server& telServer() {
+httplib::Server& hTelServer() {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1327,30 +1327,30 @@ httplib::Server& telServer() {
   return *svr;
 }
 
-std::string telReport(const std::string& event, const std::string& request_id, const nlohmann::json& extra = nlohmann::json::object()) {
+std::string hTelReport(const std::string& event, const std::string& request_id, const nlohmann::json& extra = nlohmann::json::object()) {
   nlohmann::json body = {{"event", event}, {"request_id", request_id}, {"language", "python"}, {"candidate_len", 18}, {"latency_ms", 210}};
   body.update(extra);
   return body.dump();
 }
 
-harness::Response telPost(harness::HTTP& c, const std::string& body) {
+harness::Response hTelPost(harness::HTTP& c, const std::string& body) {
   return c.Post("/v1/telemetry", body, "Content-Type", "application/json", "X-Session-Id", "s-ada");
 }
 
 }  // namespace
 
 void CheckSessionKey(harness::Ctx& ctx) {
-  auto c = ctx.HTTP(telServer());
+  auto c = ctx.HTTP(hTelServer());
   for (const auto& [event, request_id] : std::vector<std::pair<std::string, std::string>>{{"shown", "req-1"}, {"accepted", "req-1"}, {"shown", "req-2"}}) {
-    const auto r = telPost(c, telReport(event, request_id));
+    const auto r = hTelPost(c, hTelReport(event, request_id));
     ctx.Equal(r.Status, 202, "POST /v1/telemetry (%s): %s", event, r.Text());
   }
-  auto keys = ctx.Kafka.Keys(kTelShown);
-  for (const auto& k : ctx.Kafka.Keys(kTelAccepted)) keys.push_back(k);
+  auto keys = ctx.Kafka.Keys(kHTelShown);
+  for (const auto& k : ctx.Kafka.Keys(kHTelAccepted)) keys.push_back(k);
   ctx.Equal(keys, {"s-ada", "s-ada", "s-ada"}, "records must be keyed by the session (keyed by request id, one session's events land on several partitions)");
   std::vector<std::string> ids;
   std::vector<nlohmann::json> events;
-  for (const auto& v : ctx.Kafka.Values(kTelShown)) {
+  for (const auto& v : ctx.Kafka.Values(kHTelShown)) {
     const auto e = nlohmann::json::parse(v, nullptr, false);
     ctx.Assert(e.is_object() && e.value("session", "") == "s-ada", "each event carries its session (%s)", v);
     ids.push_back(e.is_object() ? e.value("request_id", "") : "");
@@ -1363,55 +1363,55 @@ void CheckSessionKey(harness::Ctx& ctx) {
   ctx.Assert(got == expected, "the event is {request_id, session, language, candidate_len, latency_ms} as reported: expected %s, got %s", expected.dump(), events[0].dump());
   const std::size_t before = ctx.Kafka.Topics().size();
   for (const std::string name : {"copied", "accept", ""}) {
-    const auto bad = telPost(c, telReport(name, "req-3"));
+    const auto bad = hTelPost(c, hTelReport(name, "req-3"));
     ctx.Equal(bad.Status, 400, "the event %q is outside kAllowedEvents (the event must equal one of them); the status", name);
   }
   ctx.Equal(ctx.Kafka.Topics().size(), before, "an unknown event created a topic (%v); topics", ctx.Kafka.Topics());
-  const auto anon = c.Post("/v1/telemetry", telReport("accepted", "req-4", {{"session", "s-ada"}}), "Content-Type", "application/json");
+  const auto anon = c.Post("/v1/telemetry", hTelReport("accepted", "req-4", {{"session", "s-ada"}}), "Content-Type", "application/json");
   ctx.Equal(anon.Status, 401, "a report without X-Session-Id (a session in its body: the session comes from the header only)");
-  ctx.Equal(ctx.Kafka.Records(kTelAccepted).size(), 1, "a report without a session reached the topic; records");
+  ctx.Equal(ctx.Kafka.Records(kHTelAccepted).size(), 1, "a report without a session reached the topic; records");
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
-  auto c = ctx.HTTP(telServer());
-  ctx.Kafka.LoseAcks(kTelAccepted, 1);  // the broker wrote it, the acknowledgement never arrived
-  const auto r = telPost(c, telReport("accepted", "req-1"));
+  auto c = ctx.HTTP(hTelServer());
+  ctx.Kafka.LoseAcks(kHTelAccepted, 1);  // the broker wrote it, the acknowledgement never arrived
+  const auto r = hTelPost(c, hTelReport("accepted", "req-1"));
   ctx.Equal(r.Status, 202, "POST /v1/telemetry (%s)", r.Text());
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kTelAccepted).size(), 1,
+  ctx.Equal(ctx.Kafka.Records(kHTelAccepted).size(), 1,
             "one acceptance whose acknowledgement was lost: the producer's retry wrote it twice. Set enable.idempotence with acks=all; records");
-  ctx.Kafka.Stall(kTelShown);  // the broker stops acknowledging completion.shown
-  const auto stalled = telPost(c, telReport("shown", "req-2"));
+  ctx.Kafka.Stall(kHTelShown);  // the broker stops acknowledging completion.shown
+  const auto stalled = hTelPost(c, hTelReport("shown", "req-2"));
   ctx.Assert(stalled.Status != 202, "a report the broker never acknowledged answered 202: the count is lost and the editor is told it was kept. Answer an error when the produce is not acknowledged");
 }
 
 void CheckNoCode(harness::Ctx& ctx) {
-  auto c = ctx.HTTP(telServer());
+  auto c = ctx.HTTP(hTelServer());
   std::ostringstream logged;
   auto* out = std::cout.rdbuf(logged.rdbuf());
   auto* err = std::cerr.rdbuf(logged.rdbuf());
-  const auto r = telPost(c, telReport("accepted", "req-1", {{"text", "conn.cursor()  # " + kTelCanary}, {"candidate_len", 30}}));
+  const auto r = hTelPost(c, hTelReport("accepted", "req-1", {{"text", "conn.cursor()  # " + kHTelCanary}, {"candidate_len", 30}}));
   std::cout.rdbuf(out);
   std::cerr.rdbuf(err);
   ctx.Equal(r.Status, 202, "POST /v1/telemetry (%s)", r.Text());
-  const auto values = ctx.Kafka.Values(kTelAccepted);
+  const auto values = ctx.Kafka.Values(kHTelAccepted);
   ctx.Equal(values.size(), 1, "one report; records");
-  ctx.Assert(values[0].find(kTelCanary) == std::string::npos, "the event carries the suggestion's text: %s", values[0]);
+  ctx.Assert(values[0].find(kHTelCanary) == std::string::npos, "the event carries the suggestion's text: %s", values[0]);
   const auto event = nlohmann::json::parse(values[0], nullptr, false);
   ctx.Assert(event.is_object() && event.value("candidate_len", 0) == 30 && !event.contains("text"), "the event reports candidate_len and no text, got %s", values[0]);
-  ctx.Assert(logged.str().find(kTelCanary) == std::string::npos, "the suggestion's text reached a log line: %q", logged.str());
+  ctx.Assert(logged.str().find(kHTelCanary) == std::string::npos, "the suggestion's text reached a log line: %q", logged.str());
 }
 
 void CheckCountersBeforeCommit(harness::Ctx& ctx) {
   const auto value = [](int i, const std::string& language) {
     return nlohmann::json{{"request_id", "req-" + std::to_string(i)}, {"session", "s-ada"}, {"language", language}, {"candidate_len", 18}, {"latency_ms", 200}}.dump();
   };
-  for (int i = 0; i < 3; i++) ctx.Kafka.SeedPartition(kTelAccepted, 0, "s-ada", value(i, "python"));
-  for (int i = 0; i < 2; i++) ctx.Kafka.SeedPartition(kTelShown, 0, "s-ada", value(i, "python"));
+  for (int i = 0; i < 3; i++) ctx.Kafka.SeedPartition(kHTelAccepted, 0, "s-ada", value(i, "python"));
+  for (int i = 0; i < 2; i++) ctx.Kafka.SeedPartition(kHTelShown, 0, "s-ada", value(i, "python"));
   // The last record's HINCRBY fails: acceptance:rust is not a hash.
-  ctx.Kafka.SeedPartition(kTelAccepted, 0, "s-ada", value(9, "rust"));
+  ctx.Kafka.SeedPartition(kHTelAccepted, 0, "s-ada", value(9, "rust"));
   ctx.Redis.Set("acceptance:rust", "not-a-hash");
-  const std::map<std::string, long long> counted_records = {{kTelAccepted, 3}, {kTelShown, 2}};
+  const std::map<std::string, long long> counted_records = {{kHTelAccepted, 3}, {kHTelShown, 2}};
   std::vector<std::string> early;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) {
     for (const auto& [tp, offset] : offsets) {
@@ -1431,8 +1431,8 @@ void CheckCountersBeforeCommit(harness::Ctx& ctx) {
   ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(), "auto-commit is on: offsets are committed on a timer, whatever the counter holds");
   if (!early.empty()) ctx.Fatalf("%s: the commit ran before HINCRBY, so a crash between them loses the count", early[0]);
   ctx.Equal(ctx.Redis.HGetAll("acceptance:python"), std::map<std::string, std::string>{{"accepted", "3"}, {"shown", "2"}}, "acceptance:python");
-  const auto lag = ctx.Kafka.Lag("acceptance", kTelAccepted);
-  ctx.Assert(lag <= 1 && ctx.Kafka.Lag("acceptance", kTelShown) == 0, "every counted record must be committed");
+  const auto lag = ctx.Kafka.Lag("acceptance", kHTelAccepted);
+  ctx.Assert(lag <= 1 && ctx.Kafka.Lag("acceptance", kHTelShown) == 0, "every counted record must be committed");
   ctx.Assert(lag == 1, "the HINCRBY of req-9 failed (WRONGTYPE) and its offset was committed anyway: the count is lost for good. Commit only after HINCRBY succeeded");
 }
 `,

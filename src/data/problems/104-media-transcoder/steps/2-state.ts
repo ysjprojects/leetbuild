@@ -1063,20 +1063,20 @@ import (
 	"leetbuild/harness"
 )
 
-const stateJob = "tj-1"
+const kHStateJob = "tj-1"
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
 // recorder is the encode callback: the indices it was asked for, whether each was already in the
 // done set at that moment, and the indices it fails.
-type recorder struct {
+type HRecorder struct {
 	ctx        *harness.Ctx
 	fail       map[int]bool
 	calls      []int
 	doneDuring []bool
 }
 
-func (e *recorder) encode(jobID string, index int) error {
+func (e *HRecorder) encode(jobID string, index int) error {
 	e.calls = append(e.calls, index)
 	e.doneDuring = append(e.doneDuring, e.ctx.Redis.SIsMember("transcode:done:"+jobID, strconv.Itoa(index)))
 	if e.fail[index] {
@@ -1085,19 +1085,19 @@ func (e *recorder) encode(jobID string, index int) error {
 	return nil
 }
 
-func mustClaim(ctx *harness.Ctx, index int, worker string) bool {
-	won, err := claim(stateBg, stateJob, index, worker)
-	ctx.NoError(err, "claim(%s, %d, %s) failed", stateJob, index, worker)
+func hMustClaim(ctx *harness.Ctx, index int, worker string) bool {
+	won, err := claim(hStateBg, kHStateJob, index, worker)
+	ctx.NoError(err, "claim(%s, %d, %s) failed", kHStateJob, index, worker)
 	return won
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
 	// A second worker's claim lands right after this worker's first command on the key.
 	rival := ctx.Redis.After("transcode:claim:tj-1:4", func() any {
-		won, _ := claim(stateBg, stateJob, 4, "w-2")
+		won, _ := claim(hStateBg, kHStateJob, 4, "w-2")
 		return won
 	})
-	mine := mustClaim(ctx, 4, "w-1")
+	mine := hMustClaim(ctx, 4, "w-1")
 	ctx.Assert(rival.Fired, "claim never touched transcode:claim:tj-1:4")
 	theirs, _ := rival.Result.(bool)
 	ctx.Assert(mine != theirs, "two workers claimed segment 4 at the same moment (w-1: %v, w-2: %v): exactly one must win. Reading the key and then setting it lets both in; one SET NX must decide", mine, theirs)
@@ -1107,33 +1107,33 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 	}
 	holder, _ := ctx.Redis.Get("transcode:claim:tj-1:4")
 	ctx.Equal(holder, winner, "%s won segment 4; the claim names", winner)
-	ctx.Equal(mustClaim(ctx, 4, "w-3"), false, "a third worker must not claim a segment another worker holds; won")
+	ctx.Equal(hMustClaim(ctx, 4, "w-3"), false, "a third worker must not claim a segment another worker holds; won")
 }
 
 func CheckLeaseRetake(ctx *harness.Ctx) {
-	ctx.Equal(mustClaim(ctx, 2, "w-1"), true, "the first claim of segment 2 must win; won")
+	ctx.Equal(hMustClaim(ctx, 2, "w-1"), true, "the first claim of segment 2 must win; won")
 	ttl := ctx.Redis.PTTL("transcode:claim:tj-1:2")
 	ctx.Assert(ttl > 0 && ttl <= 90000, "the claim on segment 2 has PTTL %d: with no expiry a crashed worker holds the segment forever. Claim with a 90 s lease (leaseMS)", ttl)
 	ctx.Clock.Advance(60)
-	ctx.Equal(mustClaim(ctx, 2, "w-2"), false, "60 s into w-1's 90-second lease, w-2 must not take segment 2; won")
+	ctx.Equal(hMustClaim(ctx, 2, "w-2"), false, "60 s into w-1's 90-second lease, w-2 must not take segment 2; won")
 	ctx.Clock.Advance(31)
-	ctx.Equal(mustClaim(ctx, 2, "w-2"), true, "w-1 died and its 90-second lease ran out: w-2 must retake segment 2; won")
+	ctx.Equal(hMustClaim(ctx, 2, "w-2"), true, "w-1 died and its 90-second lease ran out: w-2 must retake segment 2; won")
 	// The lease is read right after the first command that took the claim: an expiry set by a second command leaves a window where a crash holds the segment forever.
 	atClaim := ctx.Redis.After("transcode:claim:tj-1:7", func() any { return ctx.Redis.PTTL("transcode:claim:tj-1:7") })
-	ctx.Equal(mustClaim(ctx, 7, "w-1"), true, "the first claim of segment 7 must win; won")
+	ctx.Equal(hMustClaim(ctx, 7, "w-1"), true, "the first claim of segment 7 must win; won")
 	ctx.Assert(atClaim.Fired, "claim never touched transcode:claim:tj-1:7")
 	leaseAtClaim, _ := atClaim.Result.(int64)
 	ctx.Assert(leaseAtClaim > 0 && leaseAtClaim <= 90000, "right after the command that took segment 7 its PTTL was %v: a worker that crashes before a second command sets the expiry holds the segment forever. Set the lease in the claiming SET", atClaim.Result)
 }
 
 func CheckDoneAfterEncode(ctx *harness.Ctx) {
-	broken := &recorder{ctx: ctx, fail: map[int]bool{3: true}}
-	_, err := runSegment(stateBg, stateJob, 3, "w-1", broken.encode)
+	broken := &HRecorder{ctx: ctx, fail: map[int]bool{3: true}}
+	_, err := runSegment(hStateBg, kHStateJob, 3, "w-1", broken.encode)
 	ctx.Assert(err != nil, "the encode of segment 3 failed but runSegment returned no error")
 	ctx.Assert(!ctx.Redis.SIsMember("transcode:done:tj-1", "3"), "segment 3 is in the done set although its encode failed: the manifest will call a file with a hole complete. Record done after the encode returned")
-	ctx.Equal(mustClaim(ctx, 3, "w-2"), true, "the failed encode left w-1's claim on segment 3: release it so another worker retakes the segment now, not after the lease; won")
-	ok := &recorder{ctx: ctx}
-	status, err := runSegment(stateBg, stateJob, 5, "w-1", ok.encode)
+	ctx.Equal(hMustClaim(ctx, 3, "w-2"), true, "the failed encode left w-1's claim on segment 3: release it so another worker retakes the segment now, not after the lease; won")
+	ok := &HRecorder{ctx: ctx}
+	status, err := runSegment(hStateBg, kHStateJob, 5, "w-1", ok.encode)
 	ctx.NoError(err, "a successful encode of segment 5 failed")
 	ctx.Equal(status, "done", "a successful encode of segment 5")
 	ctx.Equal(ok.doneDuring, []bool{false}, "segment 5 was already in the done set while it was still encoding (a crash then leaves a hole marked done); done during the encode")
@@ -1141,50 +1141,50 @@ func CheckDoneAfterEncode(ctx *harness.Ctx) {
 	// w-1's encode outlives its lease, w-2 retakes the segment, then w-1's encode fails.
 	outlived := func(jobID string, index int) error {
 		ctx.Clock.Advance(91)
-		ctx.Equal(mustClaim(ctx, index, "w-2"), true, "w-1's lease ran out mid-encode, so w-2 must retake segment 8; won")
+		ctx.Equal(hMustClaim(ctx, index, "w-2"), true, "w-1's lease ran out mid-encode, so w-2 must retake segment 8; won")
 		return errors.New("worker lost while encoding the segment")
 	}
-	runSegment(stateBg, stateJob, 8, "w-1", outlived)
+	runSegment(hStateBg, kHStateJob, 8, "w-1", outlived)
 	holder, _ := ctx.Redis.Get("transcode:claim:tj-1:8")
 	ctx.Equal(holder, "w-2", "w-1's encode of segment 8 failed after its lease ran out and w-2 retook the segment: releasing must give back only a claim this worker still holds; the claim names")
 }
 
 func CheckDoneSkip(ctx *harness.Ctx) {
-	enc := &recorder{ctx: ctx}
-	status, err := runSegment(stateBg, stateJob, 1, "w-1", enc.encode)
+	enc := &HRecorder{ctx: ctx}
+	status, err := runSegment(hStateBg, kHStateJob, 1, "w-1", enc.encode)
 	ctx.NoError(err, "the first run of segment 1 failed")
 	ctx.Equal(status, "done", "the first run of segment 1")
-	again, err := runSegment(stateBg, stateJob, 1, "w-2", enc.encode)
+	again, err := runSegment(hStateBg, kHStateJob, 1, "w-2", enc.encode)
 	ctx.NoError(err, "the redelivery of segment 1 failed")
 	ctx.Equal(enc.calls, []int{1}, "a redelivered segment that is already done must be skipped, not encoded again; the encodes")
 	ctx.Equal(again, "skipped", "a redelivery of a done segment")
-	mustClaim(ctx, 6, "w-1")
-	busy, _ := runSegment(stateBg, stateJob, 6, "w-2", enc.encode)
+	hMustClaim(ctx, 6, "w-1")
+	busy, _ := runSegment(hStateBg, kHStateJob, 6, "w-2", enc.encode)
 	ctx.Assert(busy == "busy" && len(enc.calls) == 1, "a segment w-1 holds answered %q to w-2 and was encoded: it must answer busy", busy)
 }
 
 func CheckGaplessManifest(ctx *harness.Ctx) {
 	for _, i := range []int{0, 2, 2} { // 2 twice: a redelivered completion
-		ctx.NoError(markDone(stateBg, stateJob, i), "markDone(%d) failed", i)
+		ctx.NoError(markDone(hStateBg, kHStateJob, i), "markDone(%d) failed", i)
 	}
-	got, err := manifest(stateBg, stateJob, 4)
+	got, err := manifest(hStateBg, kHStateJob, 4)
 	ctx.NoError(err, "manifest failed")
 	ctx.Equal(got, Coverage{SegmentCount: 4, Done: []int{0, 2}, Missing: []int{1, 3}, Complete: false}, "segments 0 and 2 (twice) of 4 are done: the manifest must cover every expected index")
-	markDone(stateBg, stateJob, 1)
-	markDone(stateBg, stateJob, 3)
-	got, _ = manifest(stateBg, stateJob, 4)
+	markDone(hStateBg, kHStateJob, 1)
+	markDone(hStateBg, kHStateJob, 3)
+	got, _ = manifest(hStateBg, kHStateJob, 4)
 	ctx.Equal(got, Coverage{SegmentCount: 4, Done: []int{0, 1, 2, 3}, Missing: []int{}, Complete: true}, "with every segment done, the manifest")
 	for i := 0; i < 12; i++ {
 		if i != 9 {
-			markDone(stateBg, "tj-2", i)
+			markDone(hStateBg, "tj-2", i)
 		}
 	}
-	got, _ = manifest(stateBg, "tj-2", 12)
+	got, _ = manifest(hStateBg, "tj-2", 12)
 	ctx.Equal(got, Coverage{SegmentCount: 12, Done: []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11}, Missing: []int{9}, Complete: false}, "segments 0 to 11 but 9 of 12 are done (indices sort as numbers): the manifest")
 	for _, i := range []int{0, 1, 2, 5} {
-		markDone(stateBg, "tj-3", i)
+		markDone(hStateBg, "tj-3", i)
 	}
-	got, _ = manifest(stateBg, "tj-3", 4)
+	got, _ = manifest(hStateBg, "tj-3", 4)
 	ctx.Assert(len(got.Missing) == 1 && got.Missing[0] == 3 && !got.Complete, "segments 0, 1, 2 and a stray 5 of 4 are done and the manifest says missing %v, complete %v: segment 3 is missing, so the file is not complete", got.Missing, got.Complete)
 }
 `,
@@ -1198,17 +1198,17 @@ func CheckGaplessManifest(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kJob = "tj-1";
+const std::string kHJob = "tj-1";
 
 // The encode callback's record: the indices it was asked for, whether each was already in the done
 // set at that moment, and the indices it fails.
-struct Recorder {
+struct HRecorder {
   std::set<int> fail;
   std::vector<int> calls;
   std::vector<bool> done_during;
 };
 
-std::function<void(const std::string&, int)> encoder(harness::Ctx& ctx, Recorder& rec) {
+std::function<void(const std::string&, int)> hEncoder(harness::Ctx& ctx, HRecorder& rec) {
   return [&ctx, &rec](const std::string& job_id, int index) {
     rec.calls.push_back(index);
     rec.done_during.push_back(ctx.Redis.SIsMember("transcode:done:" + job_id, std::to_string(index)));
@@ -1224,24 +1224,24 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
   auto theirs = std::make_shared<bool>(false);
   ctx.Redis.After("transcode:claim:tj-1:4", [fired, theirs] {
     *fired = true;
-    *theirs = claim(kJob, 4, "w-2");
+    *theirs = claim(kHJob, 4, "w-2");
   });
-  const bool mine = claim(kJob, 4, "w-1");
+  const bool mine = claim(kHJob, 4, "w-1");
   ctx.Assert(*fired, "claim never touched transcode:claim:tj-1:4");
   ctx.Assert(mine != *theirs, "two workers claimed segment 4 at the same moment (w-1: %t, w-2: %t): exactly one must win. Reading the key and then setting it lets both in; one SET NX must decide", mine, *theirs);
   const std::string winner = mine ? "w-1" : "w-2";
   ctx.Equal(ctx.Redis.Get("transcode:claim:tj-1:4").value_or(""), winner, "%s won segment 4; the claim names", winner);
-  ctx.Equal(claim(kJob, 4, "w-3"), false, "a third worker must not claim a segment another worker holds; won");
+  ctx.Equal(claim(kHJob, 4, "w-3"), false, "a third worker must not claim a segment another worker holds; won");
 }
 
 void CheckLeaseRetake(harness::Ctx& ctx) {
-  ctx.Equal(claim(kJob, 2, "w-1"), true, "the first claim of segment 2 must win; won");
+  ctx.Equal(claim(kHJob, 2, "w-1"), true, "the first claim of segment 2 must win; won");
   const long long ttl = ctx.Redis.PTTL("transcode:claim:tj-1:2");
   ctx.Assert(ttl > 0 && ttl <= 90000, "the claim on segment 2 has PTTL %d: with no expiry a crashed worker holds the segment forever. Claim with a 90 s lease (kLeaseMs)", ttl);
   ctx.Clock.Advance(60);
-  ctx.Equal(claim(kJob, 2, "w-2"), false, "60 s into w-1's 90-second lease, w-2 must not take segment 2; won");
+  ctx.Equal(claim(kHJob, 2, "w-2"), false, "60 s into w-1's 90-second lease, w-2 must not take segment 2; won");
   ctx.Clock.Advance(31);
-  ctx.Equal(claim(kJob, 2, "w-2"), true, "w-1 died and its 90-second lease ran out: w-2 must retake segment 2; won");
+  ctx.Equal(claim(kHJob, 2, "w-2"), true, "w-1 died and its 90-second lease ran out: w-2 must retake segment 2; won");
   // The lease is read right after the first command that took the claim: an expiry set by a second command leaves a window where a crash holds the segment forever.
   auto lease_fired = std::make_shared<bool>(false);
   auto lease_at_claim = std::make_shared<long long>(0);
@@ -1249,30 +1249,30 @@ void CheckLeaseRetake(harness::Ctx& ctx) {
     *lease_fired = true;
     *lease_at_claim = ctx.Redis.PTTL("transcode:claim:tj-1:7");
   });
-  ctx.Equal(claim(kJob, 7, "w-1"), true, "the first claim of segment 7 must win; won");
+  ctx.Equal(claim(kHJob, 7, "w-1"), true, "the first claim of segment 7 must win; won");
   ctx.Assert(*lease_fired, "claim never touched transcode:claim:tj-1:7");
   ctx.Assert(*lease_at_claim > 0 && *lease_at_claim <= 90000, "right after the command that took segment 7 its PTTL was %d: a worker that crashes before a second command sets the expiry holds the segment forever. Set the lease in the claiming SET", *lease_at_claim);
 }
 
 void CheckDoneAfterEncode(harness::Ctx& ctx) {
-  Recorder broken;
+  HRecorder broken;
   broken.fail = {3};
   bool threw = false;
   try {
-    runSegment(kJob, 3, "w-1", encoder(ctx, broken));
+    runSegment(kHJob, 3, "w-1", hEncoder(ctx, broken));
   } catch (const std::runtime_error&) {
     threw = true;
   }
   ctx.Assert(threw, "the encode of segment 3 threw but runSegment did not");
   ctx.Assert(!ctx.Redis.SIsMember("transcode:done:tj-1", "3"), "segment 3 is in the done set although its encode failed: the manifest will call a file with a hole complete. Record done after the encode returned");
-  ctx.Equal(claim(kJob, 3, "w-2"), true, "the failed encode left w-1's claim on segment 3: release it so another worker retakes the segment now, not after the lease; won");
-  Recorder ok;
-  ctx.Equal(runSegment(kJob, 5, "w-1", encoder(ctx, ok)), "done", "a successful encode of segment 5");
+  ctx.Equal(claim(kHJob, 3, "w-2"), true, "the failed encode left w-1's claim on segment 3: release it so another worker retakes the segment now, not after the lease; won");
+  HRecorder ok;
+  ctx.Equal(runSegment(kHJob, 5, "w-1", hEncoder(ctx, ok)), "done", "a successful encode of segment 5");
   ctx.Equal(ok.done_during, std::vector<bool>{false}, "segment 5 was already in the done set while it was still encoding (a crash then leaves a hole marked done); done during the encode");
   ctx.Assert(ctx.Redis.SIsMember("transcode:done:tj-1", "5"), "after a successful encode segment 5 must be in the done set");
   // w-1's encode outlives its lease, w-2 retakes the segment, then w-1's encode fails.
   try {
-    runSegment(kJob, 8, "w-1", [&ctx](const std::string& job_id, int index) {
+    runSegment(kHJob, 8, "w-1", [&ctx](const std::string& job_id, int index) {
       ctx.Clock.Advance(91);
       ctx.Equal(claim(job_id, index, "w-2"), true, "w-1's lease ran out mid-encode, so w-2 must retake segment 8; won");
       throw std::runtime_error("worker lost while encoding segment " + std::to_string(index));
@@ -1283,27 +1283,27 @@ void CheckDoneAfterEncode(harness::Ctx& ctx) {
 }
 
 void CheckDoneSkip(harness::Ctx& ctx) {
-  Recorder rec;
-  ctx.Equal(runSegment(kJob, 1, "w-1", encoder(ctx, rec)), "done", "the first run of segment 1");
-  const std::string again = runSegment(kJob, 1, "w-2", encoder(ctx, rec));
+  HRecorder rec;
+  ctx.Equal(runSegment(kHJob, 1, "w-1", hEncoder(ctx, rec)), "done", "the first run of segment 1");
+  const std::string again = runSegment(kHJob, 1, "w-2", hEncoder(ctx, rec));
   ctx.Equal(rec.calls, std::vector<int>{1}, "a redelivered segment that is already done must be skipped, not encoded again; the encodes");
   ctx.Equal(again, "skipped", "a redelivery of a done segment");
-  claim(kJob, 6, "w-1");
-  const std::string busy = runSegment(kJob, 6, "w-2", encoder(ctx, rec));
+  claim(kHJob, 6, "w-1");
+  const std::string busy = runSegment(kHJob, 6, "w-2", hEncoder(ctx, rec));
   ctx.Assert(busy == "busy" && rec.calls.size() == 1, "a segment w-1 holds answered %q to w-2 and was encoded: it must answer busy", busy);
 }
 
 void CheckGaplessManifest(harness::Ctx& ctx) {
-  markDone(kJob, 0);
-  markDone(kJob, 2);
-  markDone(kJob, 2);  // a redelivered completion
-  Coverage got = manifest(kJob, 4);
+  markDone(kHJob, 0);
+  markDone(kHJob, 2);
+  markDone(kHJob, 2);  // a redelivered completion
+  Coverage got = manifest(kHJob, 4);
   ctx.Assert(got.segment_count == 4 && got.done == std::vector<int>{0, 2} && got.missing == std::vector<int>{1, 3} && !got.complete,
              "segments 0 and 2 (twice) of 4 are done and the manifest says done %v, missing %v, complete %t: it must cover every expected index (done [0 2], missing [1 3], not complete)",
              got.done, got.missing, got.complete);
-  markDone(kJob, 1);
-  markDone(kJob, 3);
-  got = manifest(kJob, 4);
+  markDone(kHJob, 1);
+  markDone(kHJob, 3);
+  got = manifest(kHJob, 4);
   ctx.Assert(got.done == std::vector<int>{0, 1, 2, 3} && got.missing.empty() && got.complete, "with every segment done the manifest says done %v, missing %v, complete %t", got.done, got.missing, got.complete);
   for (int i = 0; i < 12; ++i) {
     if (i != 9) markDone("tj-2", i);

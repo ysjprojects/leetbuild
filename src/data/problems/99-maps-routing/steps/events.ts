@@ -750,15 +750,15 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "route.computed"
+const kHEventsTopic = "route.computed"
 
 var (
 	hBg       = context.Background()
-	sf        = geo.Point{Lat: 37.77412, Lng: -122.41942}
-	oakland   = geo.Point{Lat: 37.80418, Lng: -122.27112}
-	berkeley  = geo.Point{Lat: 37.87159, Lng: -122.27275}
-	manhattan = geo.Point{Lat: 40.71277, Lng: -74.00597}
-	brooklyn  = geo.Point{Lat: 40.67818, Lng: -73.94416}
+	hSf        = geo.Point{Lat: 37.77412, Lng: -122.41942}
+	hOakland   = geo.Point{Lat: 37.80418, Lng: -122.27112}
+	hBerkeley  = geo.Point{Lat: 37.87159, Lng: -122.27275}
+	hManhattan = geo.Point{Lat: 40.71277, Lng: -74.00597}
+	hBrooklyn  = geo.Point{Lat: 40.67818, Lng: -73.94416}
 	hRoute    = geo.Route{DistanceM: 18842.5, DurationS: 1713.0, Geometry: "poly:2", Epoch: 5871200, EngineVersion: "osrm-v26.9"}
 )
 
@@ -769,19 +769,19 @@ func hPayloadOf(ctx *harness.Ctx, value []byte) map[string]any {
 }
 
 func CheckRegionKey(ctx *harness.Ctx) {
-	ctx.Assert(publishRouteComputed(hBg, "r-1", "us-west", sf, oakland, hRoute, 40), "publishing r-1 must return true")
-	ctx.Assert(publishRouteComputed(hBg, "r-2", "us-west", oakland, berkeley, hRoute, 40), "publishing r-2 must return true")
-	ctx.Assert(publishRouteComputed(hBg, "r-3", "us-west", berkeley, sf, hRoute, 40), "publishing r-3 must return true")
-	publishRouteComputed(hBg, "r-4", "us-east", manhattan, brooklyn, hRoute, 40)
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"us-west", "us-west", "us-west", "us-east"}, "records must be keyed by region (keyed by anything else, one region's events scatter across partitions)")
+	ctx.Assert(publishRouteComputed(hBg, "r-1", "us-west", hSf, hOakland, hRoute, 40), "publishing r-1 must return true")
+	ctx.Assert(publishRouteComputed(hBg, "r-2", "us-west", hOakland, hBerkeley, hRoute, 40), "publishing r-2 must return true")
+	ctx.Assert(publishRouteComputed(hBg, "r-3", "us-west", hBerkeley, hSf, hRoute, 40), "publishing r-3 must return true")
+	publishRouteComputed(hBg, "r-4", "us-east", hManhattan, hBrooklyn, hRoute, 40)
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"us-west", "us-west", "us-west", "us-east"}, "records must be keyed by region (keyed by anything else, one region's events scatter across partitions)")
 	ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition, "us-west's events landed on partitions %d, %d, %d: one region must stay on one partition, in order", records[0].Partition, records[1].Partition, records[2].Partition)
 }
 
 func CheckTripCell(ctx *harness.Ctx) {
-	publishRouteComputed(hBg, "r-1", "us-west", sf, oakland, hRoute, 40)
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 1, "one published event, the records on %s", eventsTopic)
+	publishRouteComputed(hBg, "r-1", "us-west", hSf, hOakland, hRoute, 40)
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 1, "one published event, the records on %s", kHEventsTopic)
 	text := string(records[0].Value)
 	p := hPayloadOf(ctx, records[0].Value)
 	for _, name := range []string{"origin", "destination"} {
@@ -794,17 +794,17 @@ func CheckTripCell(ctx *harness.Ctx) {
 	// A rounded coordinate is still a coordinate: no number in the event may sit within ~5 km of an endpoint's lat or lng.
 	for _, number := range regexp.MustCompile(\`-?\\d+(?:\\.\\d+)?\`).FindAllString(text, -1) {
 		v, _ := strconv.ParseFloat(number, 64)
-		for _, c := range []float64{sf.Lat, sf.Lng, oakland.Lat, oakland.Lng} {
+		for _, c := range []float64{hSf.Lat, hSf.Lng, hOakland.Lat, hOakland.Lng} {
 			ctx.Assert(math.Abs(v-c) >= 0.05, "the event carries %s, a coordinate of the trip (%v) rounded: %s. Carry trip_cell and no coordinate at all", number, c, text)
 		}
 	}
-	ctx.Equal(p["trip_cell"], geo.TripCell(sf, oakland), "trip_cell must be geo.TripCell(origin, destination)")
+	ctx.Equal(p["trip_cell"], geo.TripCell(hSf, hOakland), "trip_cell must be geo.TripCell(origin, destination)")
 }
 
 func CheckPayloadFields(ctx *harness.Ctx) {
-	publishRouteComputed(hBg, "r-1", "us-west", sf, oakland, hRoute, 40)
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 1, "one published event, the records on %s", eventsTopic)
+	publishRouteComputed(hBg, "r-1", "us-west", hSf, hOakland, hRoute, 40)
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 1, "one published event, the records on %s", kHEventsTopic)
 	p := hPayloadOf(ctx, records[0].Value)
 	expected := map[string]any{"route_id": "r-1", "region": "us-west", "distance_m": 18842.5, "epoch": 5871200.0, "latency_ms": 40.0, "degraded": false}
 	for name, value := range expected {
@@ -813,8 +813,8 @@ func CheckPayloadFields(ctx *harness.Ctx) {
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := publishRouteComputed(hBg, "r-1", "us-west", sf, oakland, hRoute, 40)
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok := publishRouteComputed(hBg, "r-1", "us-west", hSf, hOakland, hRoute, 40)
 	ctx.Assert(!ok, "the broker refused the event (WriteMessages returned an error), but publishRouteComputed returned true")
 	rows := ctx.Redis.LRange(routes.OutboxKey, 0, -1)
 	ctx.Equal(len(rows), 1, "after the broker refused the event, the rows in %s (without one the event is gone)", routes.OutboxKey)
@@ -822,7 +822,7 @@ func CheckOutbox(ctx *harness.Ctx) {
 	ctx.Assert(json.Unmarshal([]byte(rows[0]), &row) == nil, "the outbox row is not JSON: %s", rows[0])
 	ctx.Equal(row["key"], "us-west", "the outbox row's record key")
 	ctx.Equal(hPayloadOf(ctx, []byte(row["payload"]))["route_id"], "r-1", "the outbox row must carry the event's payload; its route_id")
-	ctx.Assert(publishRouteComputed(hBg, "r-2", "us-west", oakland, berkeley, hRoute, 40), "a delivered event must return true")
+	ctx.Assert(publishRouteComputed(hBg, "r-2", "us-west", hOakland, hBerkeley, hRoute, 40), "a delivered event must return true")
 	ctx.Equal(ctx.Redis.LLen(routes.OutboxKey), int64(1), "a delivered event must not be written to the outbox; the rows")
 }
 `,
@@ -842,12 +842,12 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kEventsTopic = "route.computed";
-const geo::Point kSf{37.77412, -122.41942};
-const geo::Point kOakland{37.80418, -122.27112};
-const geo::Point kBerkeley{37.87159, -122.27275};
-const geo::Point kManhattan{40.71277, -74.00597};
-const geo::Point kBrooklyn{40.67818, -73.94416};
+const std::string kHEventsTopic = "route.computed";
+const geo::Point kHSf{37.77412, -122.41942};
+const geo::Point kHOakland{37.80418, -122.27112};
+const geo::Point kHBerkeley{37.87159, -122.27275};
+const geo::Point kHManhattan{40.71277, -74.00597};
+const geo::Point kHBrooklyn{40.67818, -73.94416};
 
 geo::Route hRoute() {
   geo::Route r;
@@ -870,21 +870,21 @@ json hPayloadOf(harness::Ctx& ctx, const std::string& text) {
 }  // namespace
 
 void CheckRegionKey(harness::Ctx& ctx) {
-  ctx.Assert(publishRouteComputed("r-1", "us-west", kSf, kOakland, hRoute(), 40), "publishing r-1 must return true");
-  ctx.Assert(publishRouteComputed("r-2", "us-west", kOakland, kBerkeley, hRoute(), 40), "publishing r-2 must return true");
-  ctx.Assert(publishRouteComputed("r-3", "us-west", kBerkeley, kSf, hRoute(), 40), "publishing r-3 must return true");
-  publishRouteComputed("r-4", "us-east", kManhattan, kBrooklyn, hRoute(), 40);
-  const auto records = ctx.Kafka.Records(kEventsTopic);
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"us-west", "us-west", "us-west", "us-east"}, "records must be keyed by region (keyed by anything else, one region's events scatter across partitions)");
+  ctx.Assert(publishRouteComputed("r-1", "us-west", kHSf, kHOakland, hRoute(), 40), "publishing r-1 must return true");
+  ctx.Assert(publishRouteComputed("r-2", "us-west", kHOakland, kHBerkeley, hRoute(), 40), "publishing r-2 must return true");
+  ctx.Assert(publishRouteComputed("r-3", "us-west", kHBerkeley, kHSf, hRoute(), 40), "publishing r-3 must return true");
+  publishRouteComputed("r-4", "us-east", kHManhattan, kHBrooklyn, hRoute(), 40);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"us-west", "us-west", "us-west", "us-east"}, "records must be keyed by region (keyed by anything else, one region's events scatter across partitions)");
   ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition,
              "us-west's events landed on partitions %d, %d, %d: one region must stay on one partition, in order", records[0].Partition, records[1].Partition,
              records[2].Partition);
 }
 
 void CheckTripCell(harness::Ctx& ctx) {
-  publishRouteComputed("r-1", "us-west", kSf, kOakland, hRoute(), 40);
-  const auto records = ctx.Kafka.Records(kEventsTopic);
-  ctx.Equal(records.size(), 1, "one published event, the records on %s", kEventsTopic);
+  publishRouteComputed("r-1", "us-west", kHSf, kHOakland, hRoute(), 40);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
+  ctx.Equal(records.size(), 1, "one published event, the records on %s", kHEventsTopic);
   const std::string text = records[0].Value.value_or("");
   const json p = hPayloadOf(ctx, text);
   for (const std::string name : {"origin", "destination"}) {
@@ -897,17 +897,17 @@ void CheckTripCell(harness::Ctx& ctx) {
   const std::regex number_re(R"(-?\\d+(?:\\.\\d+)?)");
   for (auto it = std::sregex_iterator(text.begin(), text.end(), number_re); it != std::sregex_iterator(); ++it) {
     const double v = std::stod(it->str());
-    for (const double c : {kSf.lat, kSf.lng, kOakland.lat, kOakland.lng}) {
+    for (const double c : {kHSf.lat, kHSf.lng, kHOakland.lat, kHOakland.lng}) {
       ctx.Assert(std::abs(v - c) >= 0.05, "the event carries %s, a coordinate of the trip (%v) rounded: %s. Carry trip_cell and no coordinate at all", it->str(), c, text);
     }
   }
-  ctx.Equal(p.value("trip_cell", ""), geo::tripCell(kSf, kOakland), "trip_cell must be geo::tripCell(origin, destination)");
+  ctx.Equal(p.value("trip_cell", ""), geo::tripCell(kHSf, kHOakland), "trip_cell must be geo::tripCell(origin, destination)");
 }
 
 void CheckPayloadFields(harness::Ctx& ctx) {
-  publishRouteComputed("r-1", "us-west", kSf, kOakland, hRoute(), 40);
-  const auto records = ctx.Kafka.Records(kEventsTopic);
-  ctx.Equal(records.size(), 1, "one published event, the records on %s", kEventsTopic);
+  publishRouteComputed("r-1", "us-west", kHSf, kHOakland, hRoute(), 40);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
+  ctx.Equal(records.size(), 1, "one published event, the records on %s", kHEventsTopic);
   const json p = hPayloadOf(ctx, records[0].Value.value_or(""));
   ctx.Equal(p.value("route_id", ""), "r-1", "the event's route_id (event: %s)", p.dump());
   ctx.Equal(p.value("region", ""), "us-west", "the event's region (event: %s)", p.dump());
@@ -918,15 +918,15 @@ void CheckPayloadFields(harness::Ctx& ctx) {
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  const bool ok = publishRouteComputed("r-1", "us-west", kSf, kOakland, hRoute(), 40);
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  const bool ok = publishRouteComputed("r-1", "us-west", kHSf, kHOakland, hRoute(), 40);
   ctx.Assert(!ok, "the broker refused the event (an error in the delivery report), but publishRouteComputed returned true");
   const auto rows = ctx.Redis.LRange(routes::kOutboxKey, 0, -1);
   ctx.Equal(rows.size(), 1, "after the broker refused the event, the rows in %s (without one the event is gone)", routes::kOutboxKey);
   const json row = hPayloadOf(ctx, rows[0]);
   ctx.Equal(row.value("key", ""), "us-west", "the outbox row's record key");
   ctx.Equal(hPayloadOf(ctx, row.value("payload", "{}")).value("route_id", ""), "r-1", "the outbox row must carry the event's payload; its route_id");
-  ctx.Assert(publishRouteComputed("r-2", "us-west", kOakland, kBerkeley, hRoute(), 40), "a delivered event must return true");
+  ctx.Assert(publishRouteComputed("r-2", "us-west", kHOakland, kHBerkeley, hRoute(), 40), "a delivered event must return true");
   ctx.Equal(ctx.Redis.LLen(routes::kOutboxKey), 1, "a delivered event must not be written to the outbox; the rows");
 }
 `,

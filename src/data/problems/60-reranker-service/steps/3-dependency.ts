@@ -809,21 +809,21 @@ import (
 	"leetbuild/harness"
 )
 
-const clientQuery = "solar panel efficiency"
+const kHClientQuery = "solar panel efficiency"
 
 // clientStatusFaults: a passage starting with one of these prefixes makes the stand-in fail its batch with that status.
-var clientStatusFaults = []struct {
+var hClientStatusFaults = []struct {
 	prefix string
 	code   codes.Code
 }{{"internal:", codes.Internal}, {"exhausted:", codes.ResourceExhausted}, {"precondition:", codes.FailedPrecondition}}
 
 // clientPeer is the stand-in cross-encoder: scores from rerank/model, faults from model.BatchFault; records batch sizes.
-type clientPeer struct {
+type HClientPeer struct {
 	pb.UnimplementedRerankerServer
 	batches []int
 }
 
-func (p *clientPeer) Score(_ context.Context, req *pb.ScoreRequest) (*pb.ScoreReply, error) {
+func (p *HClientPeer) Score(_ context.Context, req *pb.ScoreRequest) (*pb.ScoreReply, error) {
 	passages := req.GetPassages()
 	p.batches = append(p.batches, len(passages))
 	fault := model.BatchFault(passages)
@@ -833,7 +833,7 @@ func (p *clientPeer) Score(_ context.Context, req *pb.ScoreRequest) (*pb.ScoreRe
 	if fault == "invalid_argument" {
 		return nil, status.Error(codes.InvalidArgument, "empty passage in batch")
 	}
-	for _, f := range clientStatusFaults {
+	for _, f := range hClientStatusFaults {
 		for _, p := range passages {
 			if strings.HasPrefix(p, f.prefix) {
 				return nil, status.Error(f.code, "replica failed: "+f.code.String())
@@ -847,13 +847,13 @@ func (p *clientPeer) Score(_ context.Context, req *pb.ScoreRequest) (*pb.ScoreRe
 	return &pb.ScoreReply{Scores: scores, ModelVersion: model.Version}, nil
 }
 
-func clientWorld(ctx *harness.Ctx) *clientPeer {
-	peer := &clientPeer{}
+func hClientWorld(ctx *harness.Ctx) *HClientPeer {
+	peer := &HClientPeer{}
 	pb.RegisterRerankerServer(ctx.GRPC.Server(config.Model), peer)
 	return peer
 }
 
-func clientPassages(n int) []string {
+func hClientPassages(n int) []string {
 	words := []string{"solar", "panel", "efficiency", "wind"}
 	out := make([]string, n)
 	for i := range out {
@@ -862,23 +862,23 @@ func clientPassages(n int) []string {
 	return out
 }
 
-func clientRerank(ctx *harness.Ctx, passages []string) []*float64 {
-	scores, err := rerankPassages(context.Background(), clientQuery, passages)
+func hClientRerank(ctx *harness.Ctx, passages []string) []*float64 {
+	scores, err := rerankPassages(context.Background(), kHClientQuery, passages)
 	ctx.NoError(err, "rerankPassages(%d passages)", len(passages))
 	return scores
 }
 
-func clientWrong(scores []*float64, passages []string, indexes []int) []int {
+func hClientWrong(scores []*float64, passages []string, indexes []int) []int {
 	var wrong []int
 	for _, i := range indexes {
-		if scores[i] == nil || math.Abs(*scores[i]-model.Score(clientQuery, passages[i])) > 1e-6 {
+		if scores[i] == nil || math.Abs(*scores[i]-model.Score(kHClientQuery, passages[i])) > 1e-6 {
 			wrong = append(wrong, i)
 		}
 	}
 	return wrong
 }
 
-func clientRange(from, to int) []int {
+func hClientRange(from, to int) []int {
 	out := []int{}
 	for i := from; i < to; i++ {
 		out = append(out, i)
@@ -887,24 +887,24 @@ func clientRange(from, to int) []int {
 }
 
 func CheckBatchSize(ctx *harness.Ctx) {
-	peer := clientWorld(ctx)
-	passages := clientPassages(150)
-	scores := clientRerank(ctx, passages)
+	peer := hClientWorld(ctx)
+	passages := hClientPassages(150)
+	scores := hClientRerank(ctx, passages)
 	ctx.Equal(peer.batches, []int{64, 64, 22}, "150 passages must be three calls of 64, 64 and 22; the batches the model saw")
 	ctx.Equal(len(scores), 150, "one score per passage; the scores")
-	wrong := clientWrong(scores, passages, clientRange(0, 150))
+	wrong := hClientWrong(scores, passages, hClientRange(0, 150))
 	ctx.Equal(len(wrong), 0, "the scores must be the model's, in passage order (passages %v are not); wrong scores", wrong)
 }
 
 func CheckBatchDeadline(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	clientRerank(ctx, clientPassages(10))
+	hClientWorld(ctx)
+	hClientRerank(ctx, hClientPassages(10))
 	calls := ctx.GRPC.CallsTo("Score", "")
 	ctx.Assert(len(calls) > 0 && calls[0].HasDeadline(), "the Score call carries no deadline: a slow replica holds the request as long as it likes")
 	ctx.Assert(calls[0].Timeout.Seconds() >= 0.6 && calls[0].Timeout.Seconds() <= 0.75, "each call's deadline must be 700 ms, got %v", calls[0].Timeout)
 	ctx.GRPC.SetLatency("Score", 0.5, config.Model)
 	before := len(ctx.GRPC.CallsTo("Score", ""))
-	steady := clientRerank(ctx, clientPassages(100))
+	steady := hClientRerank(ctx, hClientPassages(100))
 	timeouts := []float64{}
 	for _, call := range ctx.GRPC.CallsTo("Score", "")[before:] {
 		timeouts = append(timeouts, math.Round(call.Timeout.Seconds()*100)/100)
@@ -924,7 +924,7 @@ func CheckBatchDeadline(ctx *harness.Ctx) {
 	ctx.GRPC.SetLatency("Score", 1.0, config.Model)
 	before = len(ctx.GRPC.CallsTo("Score", ""))
 	started := ctx.Clock.Now()
-	scores := clientRerank(ctx, clientPassages(100))
+	scores := hClientRerank(ctx, hClientPassages(100))
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	unscored := 0
 	for _, s := range scores {
@@ -938,10 +938,10 @@ func CheckBatchDeadline(ctx *harness.Ctx) {
 }
 
 func CheckUnscoredNotNeutral(ctx *harness.Ctx) {
-	peer := clientWorld(ctx)
-	passages := clientPassages(150)
+	peer := hClientWorld(ctx)
+	passages := hClientPassages(150)
 	passages[70] = "brownout: solar panel" // the second batch lands on a replica that keeps failing
-	scores := clientRerank(ctx, passages)
+	scores := hClientRerank(ctx, passages)
 	ctx.Equal(len(scores), 150, "one entry per passage; the entries")
 	scored := []float64{}
 	for _, s := range scores[64:128] {
@@ -950,12 +950,12 @@ func CheckUnscoredNotNeutral(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Equal(len(scored), 0, "the passages of the failed batch must come back unscored (nil), not as a score: a neutral score makes an outage read as mid-tier relevance; scored entries")
-	kept := clientWrong(scores, passages, append(clientRange(0, 64), clientRange(128, 150)...))
+	kept := hClientWrong(scores, passages, append(hClientRange(0, 64), hClientRange(128, 150)...))
 	ctx.Equal(len(kept), 0, "the healthy batches must keep their scores (passages %v lost theirs); lost scores", kept)
 	ctx.Equal(len(peer.batches), 3, "three batches must be three calls: a failed batch is not retried inside the 700 ms budget; the calls")
-	for _, f := range clientStatusFaults {
+	for _, f := range hClientStatusFaults {
 		before := len(peer.batches)
-		got, err := rerankPassages(context.Background(), clientQuery, []string{"solar panel", f.prefix + " solar"})
+		got, err := rerankPassages(context.Background(), kHClientQuery, []string{"solar panel", f.prefix + " solar"})
 		ctx.Assert(err == nil, "a batch failing with %s returned the error %v: only INVALID_ARGUMENT ends the call, any other failure leaves the batch unscored", f.code, err)
 		ctx.Assert(len(got) == 2 && got[0] == nil && got[1] == nil, "a batch failing with %s must come back unscored (two nil entries), got %d entries", f.code, len(got))
 		ctx.Equal(len(peer.batches)-before, 1, "a batch failing with %s must be called once; the calls", f.code)
@@ -963,11 +963,11 @@ func CheckUnscoredNotNeutral(ctx *harness.Ctx) {
 }
 
 func CheckMalformedTerminal(ctx *harness.Ctx) {
-	peer := clientWorld(ctx)
-	scores, err := rerankPassages(context.Background(), clientQuery, []string{"solar panel", "", "wind panel"})
+	peer := hClientWorld(ctx)
+	scores, err := rerankPassages(context.Background(), kHClientQuery, []string{"solar panel", "", "wind panel"})
 	ctx.Assert(err != nil, "a batch the model rejected as INVALID_ARGUMENT must end the call with an error, rerankPassages returned %d scores and no error", len(scores))
 	ctx.Equal(len(peer.batches), 1, "INVALID_ARGUMENT is terminal: the model must be called once; the calls")
-	ctx.Equal(len(clientRerank(ctx, []string{"solar panel"})), 1, "a well-formed request after the malformed one is served; its scores")
+	ctx.Equal(len(hClientRerank(ctx, []string{"solar panel"})), 1, "a well-formed request after the malformed one is served; its scores")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -984,14 +984,14 @@ func CheckMalformedTerminal(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kQuery = "solar panel efficiency";
+const std::string kHQuery = "solar panel efficiency";
 
 // A passage starting with one of these prefixes makes the stand-in fail its batch with that status.
-const std::vector<std::pair<std::string, grpc::StatusCode>> kStatusFaults = {
+const std::vector<std::pair<std::string, grpc::StatusCode>> kHStatusFaults = {
     {"internal:", grpc::StatusCode::INTERNAL}, {"exhausted:", grpc::StatusCode::RESOURCE_EXHAUSTED}, {"precondition:", grpc::StatusCode::FAILED_PRECONDITION}};
 
 // The stand-in cross-encoder: scores from rerank/model.h, faults from model::batch_fault; records batch sizes.
-class RerankerPeer final : public rerankd::Reranker::Service {
+class HRerankerPeer final : public rerankd::Reranker::Service {
  public:
   std::vector<int> batches;
 
@@ -1001,7 +1001,7 @@ class RerankerPeer final : public rerankd::Reranker::Service {
     const std::string fault = model::batch_fault(passages);
     if (fault == "unavailable") return grpc::Status(grpc::StatusCode::UNAVAILABLE, "replica draining");
     if (fault == "invalid_argument") return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "empty passage in batch");
-    for (const auto& [prefix, code] : kStatusFaults) {
+    for (const auto& [prefix, code] : kHStatusFaults) {
       for (const auto& p : passages) {
         if (p.rfind(prefix, 0) == 0) return grpc::Status(code, "replica failed: " + prefix);
       }
@@ -1012,25 +1012,25 @@ class RerankerPeer final : public rerankd::Reranker::Service {
   }
 };
 
-RerankerPeer& clientWorld(harness::Ctx& ctx) {
-  static RerankerPeer* peer = nullptr;
+HRerankerPeer& hClientWorld(harness::Ctx& ctx) {
+  static HRerankerPeer* peer = nullptr;
   delete peer;
-  peer = new RerankerPeer;
+  peer = new HRerankerPeer;
   ctx.GRPC.Server(config::kModel)->RegisterService(peer);
   return *peer;
 }
 
-std::vector<std::string> passagesOf(int n) {
+std::vector<std::string> hPassagesOf(int n) {
   const std::vector<std::string> words = {"solar", "panel", "efficiency", "wind"};
   std::vector<std::string> out;
   for (int i = 0; i < n; i++) out.push_back(words[i % 4] + " " + words[(i + 1) % 4] + " note " + std::to_string(i));
   return out;
 }
 
-int wrongScores(const std::vector<std::optional<double>>& scores, const std::vector<std::string>& passages, size_t from, size_t to) {
+int hWrongScores(const std::vector<std::optional<double>>& scores, const std::vector<std::string>& passages, size_t from, size_t to) {
   int wrong = 0;
   for (size_t i = from; i < to; i++) {
-    if (!scores[i] || std::fabs(*scores[i] - model::score(kQuery, passages[i])) > 1e-6) wrong++;
+    if (!scores[i] || std::fabs(*scores[i] - model::score(kHQuery, passages[i])) > 1e-6) wrong++;
   }
   return wrong;
 }
@@ -1038,23 +1038,23 @@ int wrongScores(const std::vector<std::optional<double>>& scores, const std::vec
 }  // namespace
 
 void CheckBatchSize(harness::Ctx& ctx) {
-  auto& peer = clientWorld(ctx);
-  const auto passages = passagesOf(150);
-  const auto scores = rerankPassages(kQuery, passages);
+  auto& peer = hClientWorld(ctx);
+  const auto passages = hPassagesOf(150);
+  const auto scores = rerankPassages(kHQuery, passages);
   ctx.Equal(peer.batches, std::vector<int>{64, 64, 22}, "150 passages must be three calls of 64, 64 and 22; the batches the model saw");
   ctx.Equal(scores.size(), 150, "one score per passage; the scores");
-  ctx.Equal(wrongScores(scores, passages, 0, 150), 0, "the scores must be the model's, in passage order; wrong scores");
+  ctx.Equal(hWrongScores(scores, passages, 0, 150), 0, "the scores must be the model's, in passage order; wrong scores");
 }
 
 void CheckBatchDeadline(harness::Ctx& ctx) {
-  clientWorld(ctx);
-  rerankPassages(kQuery, passagesOf(10));
+  hClientWorld(ctx);
+  rerankPassages(kHQuery, hPassagesOf(10));
   const auto calls = ctx.GRPC.CallsTo("Score");
   ctx.Assert(!calls.empty() && calls[0].HasDeadline(), "the Score call carries no deadline: a slow replica holds the request as long as it likes");
   ctx.Assert(calls[0].TimeoutSeconds() >= 0.6 && calls[0].TimeoutSeconds() <= 0.75, "each call's deadline must be 700 ms, got %vs", calls[0].TimeoutSeconds());
   ctx.GRPC.SetLatency("Score", 0.5, config::kModel);
   size_t before = ctx.GRPC.CallsTo("Score").size();
-  const auto steady = rerankPassages(kQuery, passagesOf(100));
+  const auto steady = rerankPassages(kHQuery, hPassagesOf(100));
   const auto afterSteady = ctx.GRPC.CallsTo("Score");
   std::vector<double> timeouts;
   for (size_t i = before; i < afterSteady.size(); i++) timeouts.push_back(std::round(afterSteady[i].TimeoutSeconds() * 100) / 100);
@@ -1067,7 +1067,7 @@ void CheckBatchDeadline(harness::Ctx& ctx) {
   ctx.GRPC.SetLatency("Score", 1.0, config::kModel);
   before = ctx.GRPC.CallsTo("Score").size();
   const int64_t started = ctx.Clock.Now();
-  const auto scores = rerankPassages(kQuery, passagesOf(100));
+  const auto scores = rerankPassages(kHQuery, hPassagesOf(100));
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   int unscored = 0;
   for (const auto& s : scores) unscored += s ? 0 : 1;
@@ -1077,10 +1077,10 @@ void CheckBatchDeadline(harness::Ctx& ctx) {
 }
 
 void CheckUnscoredNotNeutral(harness::Ctx& ctx) {
-  auto& peer = clientWorld(ctx);
-  auto passages = passagesOf(150);
+  auto& peer = hClientWorld(ctx);
+  auto passages = hPassagesOf(150);
   passages[70] = "brownout: solar panel";  // the second batch lands on a replica that keeps failing
-  const auto scores = rerankPassages(kQuery, passages);
+  const auto scores = rerankPassages(kHQuery, passages);
   ctx.Equal(scores.size(), 150, "one entry per passage; the entries");
   int scored = 0;
   double sample = 0;
@@ -1091,14 +1091,14 @@ void CheckUnscoredNotNeutral(harness::Ctx& ctx) {
     }
   }
   ctx.Equal(scored, 0, "the passages of the failed batch must come back unscored (nullopt), not %v: a neutral score makes an outage read as mid-tier relevance; scored entries", sample);
-  ctx.Equal(wrongScores(scores, passages, 0, 64) + wrongScores(scores, passages, 128, 150), 0, "the healthy batches must keep their scores; lost scores");
+  ctx.Equal(hWrongScores(scores, passages, 0, 64) + hWrongScores(scores, passages, 128, 150), 0, "the healthy batches must keep their scores; lost scores");
   ctx.Equal(peer.batches.size(), 3, "three batches must be three calls: a failed batch is not retried inside the 700 ms budget; the calls");
-  for (const auto& [prefix, code] : kStatusFaults) {
+  for (const auto& [prefix, code] : kHStatusFaults) {
     const size_t before = peer.batches.size();
     std::vector<std::optional<double>> got;
     std::string raised;
     try {
-      got = rerankPassages(kQuery, {"solar panel", prefix + " solar"});
+      got = rerankPassages(kHQuery, {"solar panel", prefix + " solar"});
     } catch (const std::exception& e) {
       raised = e.what();
     }
@@ -1109,17 +1109,17 @@ void CheckUnscoredNotNeutral(harness::Ctx& ctx) {
 }
 
 void CheckMalformedTerminal(harness::Ctx& ctx) {
-  auto& peer = clientWorld(ctx);
+  auto& peer = hClientWorld(ctx);
   bool raised = false;
   size_t returned = 0;
   try {
-    returned = rerankPassages(kQuery, {"solar panel", "", "wind panel"}).size();
+    returned = rerankPassages(kHQuery, {"solar panel", "", "wind panel"}).size();
   } catch (const std::exception&) {
     raised = true;
   }
   ctx.Assert(raised, "a batch the model rejected as INVALID_ARGUMENT must end the call with an exception, rerankPassages returned %d scores", returned);
   ctx.Equal(peer.batches.size(), 1, "INVALID_ARGUMENT is terminal: the model must be called once; the calls");
-  ctx.Equal(rerankPassages(kQuery, {"solar panel"}).size(), 1, "a well-formed request after the malformed one is served; its scores");
+  ctx.Equal(rerankPassages(kHQuery, {"solar panel"}).size(), 1, "a well-formed request after the malformed one is served; its scores");
 }
 `,
   },

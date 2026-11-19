@@ -1135,7 +1135,7 @@ void hPending(harness::Ctx& ctx, const std::string& version, const std::string& 
   ctx.Fatalf("%s: validateAndPromote returned %q instead of throwing ValidationPending", why, got);
 }
 
-void held(harness::Ctx& ctx, const std::string& version, const std::string& status, const std::string& why) {
+void hHeld(harness::Ctx& ctx, const std::string& version, const std::string& status, const std::string& why) {
   ctx.Equal(store::version(kHDS, version)->status, status, "%s: the status of %s", why, version);
   ctx.Equal(pointer::latest(kHDS), "2026-01", "%s: the latest version must stay 2026-01; latest", why);
 }
@@ -1156,7 +1156,7 @@ void CheckDeadline(harness::Ctx& ctx) {
   hPending(ctx, "2026-02", "with the validator taking 120 s");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 31, "the promotion waited %v s on the validator, expected at most the 30 s deadline", waited);
-  held(ctx, "2026-02", "pending", "after the deadline");
+  hHeld(ctx, "2026-02", "pending", "after the deadline");
 }
 
 void CheckTimeoutNoPromote(harness::Ctx& ctx) {
@@ -1165,15 +1165,15 @@ void CheckTimeoutNoPromote(harness::Ctx& ctx) {
   hRegisterVersion("2026-03", 10);
   ctx.GRPC.Fail("Validate", grpc::StatusCode::UNAVAILABLE, "validator restarting", 1);
   hPending(ctx, "2026-02", "with the validator UNAVAILABLE");
-  held(ctx, "2026-02", "pending", "with the validator UNAVAILABLE");
+  hHeld(ctx, "2026-02", "pending", "with the validator UNAVAILABLE");
   for (const auto& [code, name] : std::vector<std::pair<grpc::StatusCode, std::string>>{{grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"}}) {
     ctx.GRPC.Fail("Validate", code, "validator error", 1);
     hPending(ctx, "2026-02", "with the validator failing " + name);
-    held(ctx, "2026-02", "pending", "with the validator failing " + name);
+    hHeld(ctx, "2026-02", "pending", "with the validator failing " + name);
   }
   ctx.GRPC.SetLatency("Validate", 120.0);
   hPending(ctx, "2026-03", "with the validator past its deadline");
-  held(ctx, "2026-03", "pending", "with the validator past its deadline");
+  hHeld(ctx, "2026-03", "pending", "with the validator past its deadline");
   ctx.GRPC.SetLatency("Validate", 0);
   ctx.Equal(validateAndPromote(kHDS, "2026-02", "bob"), "validated", "once the validator answers, the pending version's status");
   ctx.Equal(pointer::latest(kHDS), "2026-02", "the validated 2026-02 must be promoted; the latest");
@@ -1183,7 +1183,7 @@ void CheckRejectedHeld(harness::Ctx& ctx) {
   hClient(ctx);
   hRegisterVersion("2026-02", 10, 3);
   ctx.Equal(validateAndPromote(kHDS, "2026-02", "bob"), "rejected", "a report with passed false; validateAndPromote returned");
-  held(ctx, "2026-02", "rejected", "after a failed report");
+  hHeld(ctx, "2026-02", "rejected", "after a failed report");
   const auto report = store::version(kHDS, "2026-02")->report;
   ctx.Assert(report && !report->value("passed", true) && !report->value("failures", nlohmann::json::array()).empty(),
              "the rejected version must keep the validator's report, it holds %s", report ? report->dump() : "nothing");
@@ -1205,15 +1205,15 @@ void CheckCoverage(harness::Ctx& ctx) {
   const auto calls = ctx.GRPC.CallsTo("Validate");
   const long long asked = calls.back().Request<datasetregistry::ValidateRequest>().max_rows();
   ctx.Equal(got, "rejected", "a version with a bad row at 1200: the validator was asked for max_rows %d, so it must read that row (ask for every row, max_rows 0); the status", asked);
-  held(ctx, "2026-02", "rejected", "with a bad row at 1200");
+  hHeld(ctx, "2026-02", "rejected", "with a bad row at 1200");
   peer.cap = 500;
   hPending(ctx, "2026-03", "with a validator that scanned 500 of 1500 rows");
-  held(ctx, "2026-03", "pending", "after a scan of 500 of 1500 rows");
+  hHeld(ctx, "2026-03", "pending", "after a scan of 500 of 1500 rows");
   peer.short_view = true;
   peer.cap = 1000;
   hRegisterVersion("2026-04", 1500);
   hPending(ctx, "2026-04", "with a validator that scanned 1000 of the 1500 rows the registry measured (its report says rows_total 1000)");
-  held(ctx, "2026-04", "pending", "after a scan of 1000 of 1500 measured rows");
+  hHeld(ctx, "2026-04", "pending", "after a scan of 1000 of 1500 measured rows");
 }
 `,
   },

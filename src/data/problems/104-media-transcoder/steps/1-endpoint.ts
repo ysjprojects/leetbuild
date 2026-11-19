@@ -811,17 +811,17 @@ import (
 )
 
 var (
-	sourceSHA = strings.Repeat("9f", 32)
-	evilArgs  = []string{"-vf", "movie=/etc/passwd", "-f", "image2"}
+	hSourceSHA = strings.Repeat("9f", 32)
+	hEvilArgs  = []string{"-vf", "movie=/etc/passwd", "-f", "image2"}
 )
 
-type jobAnswer struct {
+type HJobAnswer struct {
 	JobID        string \`json:"job_id"\`
 	SegmentCount int    \`json:"segment_count"\`
 	Deduped      bool   \`json:"deduped"\`
 }
 
-func transcodeBody(sha, preset string, duration float64, uri, bucket string, args []string) map[string]any {
+func hTranscodeBody(sha, preset string, duration float64, uri, bucket string, args []string) map[string]any {
 	body := map[string]any{
 		"source": map[string]any{"uri": uri, "sha256": sha, "duration_s": duration},
 		"preset": preset,
@@ -833,112 +833,112 @@ func transcodeBody(sha, preset string, duration float64, uri, bucket string, arg
 	return body
 }
 
-func validBody() map[string]any {
-	return transcodeBody(sourceSHA, "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)
+func hValidBody() map[string]any {
+	return hTranscodeBody(hSourceSHA, "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)
 }
 
-func submitter(ctx *harness.Ctx) *harness.HTTP {
+func hSubmitter(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func postJob(c *harness.HTTP, body any, tenant string) *harness.Response {
+func hPostJob(c *harness.HTTP, body any, tenant string) *harness.Response {
 	return c.Post("/v1/transcodes", body, "X-Tenant-Id", tenant)
 }
 
-func decodeJob(r *harness.Response) jobAnswer {
-	var a jobAnswer
+func hDecodeJob(r *harness.Response) HJobAnswer {
+	var a HJobAnswer
 	r.Decode(&a)
 	return a
 }
 
-func jobsCreated(ctx *harness.Ctx) int {
+func hJobsCreated(ctx *harness.Ctx) int {
 	raw, _ := ctx.Redis.Get("job:seq")
 	n, _ := strconv.Atoi(raw)
 	return n
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := submitter(ctx)
-	r := postJob(c, validBody(), "t-1")
+	c := hSubmitter(ctx)
+	r := hPostJob(c, hValidBody(), "t-1")
 	ctx.Equal(r.Status, 201, "a valid submit (%s)", r.Text())
-	a := decodeJob(r)
+	a := hDecodeJob(r)
 	ctx.Assert(a.SegmentCount == 3 && !a.Deduped, "a 14-second source in 6-second segments is 3 segments, deduped false; the submit answered %s", r.Text())
 	job := jobs.Get(context.Background(), a.JobID)
-	ctx.Assert(job != nil && job.Tenant == "t-1" && job.SourceSHA256 == sourceSHA, "the job store holds %+v for job %s", job, a.JobID)
+	ctx.Assert(job != nil && job.Tenant == "t-1" && job.SourceSHA256 == hSourceSHA, "the job store holds %+v for job %s", job, a.JobID)
 }
 
 func CheckDedupe(ctx *harness.Ctx) {
-	c := submitter(ctx)
-	first := postJob(c, validBody(), "t-1")
+	c := hSubmitter(ctx)
+	first := hPostJob(c, hValidBody(), "t-1")
 	ctx.Equal(first.Status, 201, "the first submit (%s)", first.Text())
-	firstID := decodeJob(first).JobID
-	retry := postJob(c, validBody(), "t-1")
-	again := decodeJob(retry)
+	firstID := hDecodeJob(first).JobID
+	retry := hPostJob(c, hValidBody(), "t-1")
+	again := hDecodeJob(retry)
 	ctx.Assert(retry.Status == 200 && again.JobID == firstID && again.Deduped, "a retry of the same source and preset answered %d %s: it must answer the existing job %s with 200 and deduped true", retry.Status, retry.Text(), firstID)
-	ctx.Equal(jobsCreated(ctx), 1, "two submits of one source and preset must create one job (a second pays for the encode twice); jobs created")
-	moved := postJob(c, transcodeBody(sourceSHA, "h264-720p", 30, "s3://uploads/talk-copy.mov", "renditions", nil), "t-1")
-	stored := decodeJob(moved)
+	ctx.Equal(hJobsCreated(ctx), 1, "two submits of one source and preset must create one job (a second pays for the encode twice); jobs created")
+	moved := hPostJob(c, hTranscodeBody(hSourceSHA, "h264-720p", 30, "s3://uploads/talk-copy.mov", "renditions", nil), "t-1")
+	stored := hDecodeJob(moved)
 	ctx.Assert(moved.Status == 200 && stored.JobID == firstID && stored.SegmentCount == 3 && stored.Deduped, "a retry of the same sha256 and preset from another uri with a 30-second duration answered %d %s: it must answer the existing job %s as stored (3 segments), 200 and deduped true", moved.Status, moved.Text(), firstID)
-	otherSource := postJob(c, transcodeBody(strings.Repeat("7c", 32), "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil), "t-1")
-	ctx.Assert(otherSource.Status == 201 && decodeJob(otherSource).JobID != firstID, "another source of the same tenant and preset is another job, the submit answered %d %s", otherSource.Status, otherSource.Text())
-	otherPreset := postJob(c, transcodeBody(sourceSHA, "h265-1080p", 14, "s3://uploads/talk.mov", "renditions", nil), "t-1")
-	ctx.Assert(otherPreset.Status == 201 && decodeJob(otherPreset).JobID != firstID, "another preset of the same source is another job, the submit answered %d %s", otherPreset.Status, otherPreset.Text())
-	otherTenant := postJob(c, validBody(), "t-2")
-	ctx.Assert(otherTenant.Status == 201 && decodeJob(otherTenant).JobID != firstID, "another tenant's upload of the same file answered %d %s: it is that tenant's own job, keyed by (tenant, sha256, preset)", otherTenant.Status, otherTenant.Text())
+	otherSource := hPostJob(c, hTranscodeBody(strings.Repeat("7c", 32), "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil), "t-1")
+	ctx.Assert(otherSource.Status == 201 && hDecodeJob(otherSource).JobID != firstID, "another source of the same tenant and preset is another job, the submit answered %d %s", otherSource.Status, otherSource.Text())
+	otherPreset := hPostJob(c, hTranscodeBody(hSourceSHA, "h265-1080p", 14, "s3://uploads/talk.mov", "renditions", nil), "t-1")
+	ctx.Assert(otherPreset.Status == 201 && hDecodeJob(otherPreset).JobID != firstID, "another preset of the same source is another job, the submit answered %d %s", otherPreset.Status, otherPreset.Text())
+	otherTenant := hPostJob(c, hValidBody(), "t-2")
+	ctx.Assert(otherTenant.Status == 201 && hDecodeJob(otherTenant).JobID != firstID, "another tenant's upload of the same file answered %d %s: it is that tenant's own job, keyed by (tenant, sha256, preset)", otherTenant.Status, otherTenant.Text())
 }
 
 func CheckPresetArgs(ctx *harness.Ctx) {
-	c := submitter(ctx)
-	r := postJob(c, transcodeBody(sourceSHA, "h264-720p", 14, "s3://uploads/talk.mov", "renditions", evilArgs), "t-1")
+	c := hSubmitter(ctx)
+	r := hPostJob(c, hTranscodeBody(hSourceSHA, "h264-720p", 14, "s3://uploads/talk.mov", "renditions", hEvilArgs), "t-1")
 	ctx.Equal(r.Status, 201, "a submit carrying args (%s)", r.Text())
-	job := jobs.Get(context.Background(), decodeJob(r).JobID)
+	job := jobs.Get(context.Background(), hDecodeJob(r).JobID)
 	want, _ := presets.EncoderArgs("h264-720p")
-	ctx.Assert(job != nil, "the job store holds no job %s", decodeJob(r).JobID)
+	ctx.Assert(job != nil, "the job store holds no job %s", hDecodeJob(r).JobID)
 	ctx.Equal(job.EncoderArgs, want, "the job's encoder arguments must come from the h264-720p preset, the caller's args are never read")
 }
 
 func CheckPreset404(ctx *harness.Ctx) {
-	c := submitter(ctx)
+	c := hSubmitter(ctx)
 	for _, preset := range []string{"h264-4k", "H264-720P", "../h264-720p"} {
-		r := postJob(c, transcodeBody(sourceSHA, preset, 14, "s3://uploads/talk.mov", "renditions", nil), "t-1")
+		r := hPostJob(c, hTranscodeBody(hSourceSHA, preset, 14, "s3://uploads/talk.mov", "renditions", nil), "t-1")
 		ctx.Equal(r.Status, 404, "a submit with the unknown preset %q must answer 404 before any job exists; the status", preset)
 	}
-	ctx.Equal(jobsCreated(ctx), 0, "submits with unknown presets must create nothing; jobs created")
-	r := postJob(c, transcodeBody(sourceSHA, "h264-1080p", 14, "s3://uploads/talk.mov", "renditions", nil), "t-1")
+	ctx.Equal(hJobsCreated(ctx), 0, "submits with unknown presets must create nothing; jobs created")
+	r := hPostJob(c, hTranscodeBody(hSourceSHA, "h264-1080p", 14, "s3://uploads/talk.mov", "renditions", nil), "t-1")
 	ctx.Equal(r.Status, 201, "a known preset (%s)", r.Text())
 }
 
 func CheckSourceHash(ctx *harness.Ctx) {
-	c := submitter(ctx)
-	noPrefix := validBody()
+	c := hSubmitter(ctx)
+	noPrefix := hValidBody()
 	noPrefix["output"] = map[string]any{"bucket": "renditions", "prefix": ""}
 	bad := []struct {
 		what string
 		body map[string]any
 	}{
-		{"a short hash", transcodeBody("abc123", "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
-		{"an upper-case hash", transcodeBody(strings.ToUpper(sourceSHA), "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
-		{"a 63-character hash", transcodeBody(sourceSHA[:63], "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
-		{"a non-hex hash", transcodeBody(strings.Repeat("z", 64), "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
-		{"a 65-character hash", transcodeBody(sourceSHA+"9", "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
-		{"a hash followed by a newline", transcodeBody(sourceSHA+"\\n", "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
-		{"a zero duration", transcodeBody(sourceSHA, "h264-720p", 0, "s3://uploads/talk.mov", "renditions", nil)},
-		{"a negative duration", transcodeBody(sourceSHA, "h264-720p", -6, "s3://uploads/talk.mov", "renditions", nil)},
-		{"an empty uri", transcodeBody(sourceSHA, "h264-720p", 14, "", "renditions", nil)},
-		{"an empty bucket", transcodeBody(sourceSHA, "h264-720p", 14, "s3://uploads/talk.mov", "", nil)},
+		{"a short hash", hTranscodeBody("abc123", "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
+		{"an upper-case hash", hTranscodeBody(strings.ToUpper(hSourceSHA), "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
+		{"a 63-character hash", hTranscodeBody(hSourceSHA[:63], "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
+		{"a non-hex hash", hTranscodeBody(strings.Repeat("z", 64), "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
+		{"a 65-character hash", hTranscodeBody(hSourceSHA+"9", "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
+		{"a hash followed by a newline", hTranscodeBody(hSourceSHA+"\\n", "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
+		{"a zero duration", hTranscodeBody(hSourceSHA, "h264-720p", 0, "s3://uploads/talk.mov", "renditions", nil)},
+		{"a negative duration", hTranscodeBody(hSourceSHA, "h264-720p", -6, "s3://uploads/talk.mov", "renditions", nil)},
+		{"an empty uri", hTranscodeBody(hSourceSHA, "h264-720p", 14, "", "renditions", nil)},
+		{"an empty bucket", hTranscodeBody(hSourceSHA, "h264-720p", 14, "s3://uploads/talk.mov", "", nil)},
 		{"an empty prefix", noPrefix},
 	}
 	for _, b := range bad {
-		r := postJob(c, b.body, "t-1")
+		r := hPostJob(c, b.body, "t-1")
 		ctx.Equal(r.Status, 400, "a submit with %s; the status", b.what)
 	}
-	ctx.Equal(jobsCreated(ctx), 0, "invalid submits must create nothing (the dedupe key would be built from whatever arrived); jobs created")
-	r := postJob(c, validBody(), "t-1")
+	ctx.Equal(hJobsCreated(ctx), 0, "invalid submits must create nothing (the dedupe key would be built from whatever arrived); jobs created")
+	r := hPostJob(c, hValidBody(), "t-1")
 	ctx.Equal(r.Status, 201, "the valid submit (%s)", r.Text())
-	short := postJob(c, transcodeBody(strings.Repeat("7c", 32), "h264-720p", 0.5, "s3://uploads/talk.mov", "renditions", nil), "t-1")
-	ctx.Assert(short.Status == 201 && decodeJob(short).SegmentCount == 1, "a valid half-second source answered %d %s: any positive duration is one segment or more", short.Status, short.Text())
+	short := hPostJob(c, hTranscodeBody(strings.Repeat("7c", 32), "h264-720p", 0.5, "s3://uploads/talk.mov", "renditions", nil), "t-1")
+	ctx.Assert(short.Status == 201 && hDecodeJob(short).SegmentCount == 1, "a valid half-second source answered %d %s: any positive duration is one segment or more", short.Status, short.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -954,16 +954,16 @@ func CheckSourceHash(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kSha(64, 'f');
-const std::vector<std::string> kEvilArgs = {"-vf", "movie=/etc/passwd", "-f", "image2"};
+const std::string hKSha(64, 'f');
+const std::vector<std::string> kHEvilArgs = {"-vf", "movie=/etc/passwd", "-f", "image2"};
 
-nlohmann::json transcodeBody(const std::string& sha, const std::string& preset, double duration, const std::string& uri, const std::string& bucket) {
+nlohmann::json hTranscodeBody(const std::string& sha, const std::string& preset, double duration, const std::string& uri, const std::string& bucket) {
   return {{"source", {{"uri", uri}, {"sha256", sha}, {"duration_s", duration}}}, {"preset", preset}, {"output", {{"bucket", bucket}, {"prefix", "talks/42"}}}};
 }
 
-nlohmann::json validBody() { return transcodeBody(kSha, "h264-720p", 14, "s3://uploads/talk.mov", "renditions"); }
+nlohmann::json hValidBody() { return hTranscodeBody(hKSha, "h264-720p", 14, "s3://uploads/talk.mov", "renditions"); }
 
-harness::HTTP submitter(harness::Ctx& ctx) {
+harness::HTTP hSubmitter(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -971,16 +971,16 @@ harness::HTTP submitter(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response postJob(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant) {
+harness::Response hPostJob(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant) {
   return c.Post("/v1/transcodes", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
 }
 
-nlohmann::json answerOf(const harness::Response& r) {
+nlohmann::json hAnswerOf(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : nlohmann::json::object();
 }
 
-long jobsCreated(harness::Ctx& ctx) {
+long hJobsCreated(harness::Ctx& ctx) {
   const auto raw = ctx.Redis.Get("job:seq");
   return raw ? std::stol(*raw) : 0L;
 }
@@ -988,85 +988,85 @@ long jobsCreated(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = submitter(ctx);
-  const auto r = postJob(c, validBody(), "t-1");
+  auto c = hSubmitter(ctx);
+  const auto r = hPostJob(c, hValidBody(), "t-1");
   ctx.Equal(r.Status, 201, "a valid submit (%s)", r.Text());
-  const auto a = answerOf(r);
+  const auto a = hAnswerOf(r);
   ctx.Assert(a.value("segment_count", 0) == 3 && a.value("deduped", true) == false, "a 14-second source in 6-second segments is 3 segments, deduped false; the submit answered %s", r.Text());
   const auto job = jobs::get(a.value("job_id", ""));
-  ctx.Assert(job && job->tenant == "t-1" && job->source_sha256 == kSha, "the job store holds no job of t-1 for this source under %s", a.value("job_id", ""));
+  ctx.Assert(job && job->tenant == "t-1" && job->source_sha256 == hKSha, "the job store holds no job of t-1 for this source under %s", a.value("job_id", ""));
 }
 
 void CheckDedupe(harness::Ctx& ctx) {
-  auto c = submitter(ctx);
-  const auto first = postJob(c, validBody(), "t-1");
+  auto c = hSubmitter(ctx);
+  const auto first = hPostJob(c, hValidBody(), "t-1");
   ctx.Equal(first.Status, 201, "the first submit (%s)", first.Text());
-  const std::string first_id = answerOf(first).value("job_id", "");
-  const auto retry = postJob(c, validBody(), "t-1");
-  const auto again = answerOf(retry);
+  const std::string first_id = hAnswerOf(first).value("job_id", "");
+  const auto retry = hPostJob(c, hValidBody(), "t-1");
+  const auto again = hAnswerOf(retry);
   ctx.Assert(retry.Status == 200 && again.value("job_id", "") == first_id && again.value("deduped", false), "a retry of the same source and preset answered %d %s: it must answer the existing job %s with 200 and deduped true", retry.Status, retry.Text(), first_id);
-  ctx.Equal(jobsCreated(ctx), 1L, "two submits of one source and preset must create one job (a second pays for the encode twice); jobs created");
-  const auto moved = postJob(c, transcodeBody(kSha, "h264-720p", 30, "s3://uploads/talk-copy.mov", "renditions"), "t-1");
-  const auto stored = answerOf(moved);
+  ctx.Equal(hJobsCreated(ctx), 1L, "two submits of one source and preset must create one job (a second pays for the encode twice); jobs created");
+  const auto moved = hPostJob(c, hTranscodeBody(hKSha, "h264-720p", 30, "s3://uploads/talk-copy.mov", "renditions"), "t-1");
+  const auto stored = hAnswerOf(moved);
   ctx.Assert(moved.Status == 200 && stored.value("job_id", "") == first_id && stored.value("segment_count", 0) == 3 && stored.value("deduped", false), "a retry of the same sha256 and preset from another uri with a 30-second duration answered %d %s: it must answer the existing job %s as stored (3 segments), 200 and deduped true", moved.Status, moved.Text(), first_id);
-  const auto other_source = postJob(c, transcodeBody(std::string(64, '7'), "h264-720p", 14, "s3://uploads/talk.mov", "renditions"), "t-1");
-  ctx.Assert(other_source.Status == 201 && answerOf(other_source).value("job_id", "") != first_id, "another source of the same tenant and preset is another job, the submit answered %d %s", other_source.Status, other_source.Text());
-  const auto other_preset = postJob(c, transcodeBody(kSha, "h265-1080p", 14, "s3://uploads/talk.mov", "renditions"), "t-1");
-  ctx.Assert(other_preset.Status == 201 && answerOf(other_preset).value("job_id", "") != first_id, "another preset of the same source is another job, the submit answered %d %s", other_preset.Status, other_preset.Text());
-  const auto other_tenant = postJob(c, validBody(), "t-2");
-  ctx.Assert(other_tenant.Status == 201 && answerOf(other_tenant).value("job_id", "") != first_id, "another tenant's upload of the same file answered %d %s: it is that tenant's own job, keyed by (tenant, sha256, preset)", other_tenant.Status, other_tenant.Text());
+  const auto other_source = hPostJob(c, hTranscodeBody(std::string(64, '7'), "h264-720p", 14, "s3://uploads/talk.mov", "renditions"), "t-1");
+  ctx.Assert(other_source.Status == 201 && hAnswerOf(other_source).value("job_id", "") != first_id, "another source of the same tenant and preset is another job, the submit answered %d %s", other_source.Status, other_source.Text());
+  const auto other_preset = hPostJob(c, hTranscodeBody(hKSha, "h265-1080p", 14, "s3://uploads/talk.mov", "renditions"), "t-1");
+  ctx.Assert(other_preset.Status == 201 && hAnswerOf(other_preset).value("job_id", "") != first_id, "another preset of the same source is another job, the submit answered %d %s", other_preset.Status, other_preset.Text());
+  const auto other_tenant = hPostJob(c, hValidBody(), "t-2");
+  ctx.Assert(other_tenant.Status == 201 && hAnswerOf(other_tenant).value("job_id", "") != first_id, "another tenant's upload of the same file answered %d %s: it is that tenant's own job, keyed by (tenant, sha256, preset)", other_tenant.Status, other_tenant.Text());
 }
 
 void CheckPresetArgs(harness::Ctx& ctx) {
-  auto c = submitter(ctx);
-  nlohmann::json body = validBody();
-  body["args"] = kEvilArgs;
-  const auto r = postJob(c, body, "t-1");
+  auto c = hSubmitter(ctx);
+  nlohmann::json body = hValidBody();
+  body["args"] = kHEvilArgs;
+  const auto r = hPostJob(c, body, "t-1");
   ctx.Equal(r.Status, 201, "a submit carrying args (%s)", r.Text());
-  const auto job = jobs::get(answerOf(r).value("job_id", ""));
+  const auto job = jobs::get(hAnswerOf(r).value("job_id", ""));
   ctx.Assert(job.has_value(), "the job store holds no job for %s", r.Text());
   ctx.Equal(job->encoder_args, *presets::encoderArgs("h264-720p"), "the job's encoder arguments must come from the h264-720p preset, the caller's args are never read");
 }
 
 void CheckPreset404(harness::Ctx& ctx) {
-  auto c = submitter(ctx);
+  auto c = hSubmitter(ctx);
   for (const std::string preset : {"h264-4k", "H264-720P", "../h264-720p"}) {
-    const auto r = postJob(c, transcodeBody(kSha, preset, 14, "s3://uploads/talk.mov", "renditions"), "t-1");
+    const auto r = hPostJob(c, hTranscodeBody(hKSha, preset, 14, "s3://uploads/talk.mov", "renditions"), "t-1");
     ctx.Equal(r.Status, 404, "a submit with the unknown preset %q must answer 404 before any job exists; the status", preset);
   }
-  ctx.Equal(jobsCreated(ctx), 0L, "submits with unknown presets must create nothing; jobs created");
-  const auto r = postJob(c, transcodeBody(kSha, "h264-1080p", 14, "s3://uploads/talk.mov", "renditions"), "t-1");
+  ctx.Equal(hJobsCreated(ctx), 0L, "submits with unknown presets must create nothing; jobs created");
+  const auto r = hPostJob(c, hTranscodeBody(hKSha, "h264-1080p", 14, "s3://uploads/talk.mov", "renditions"), "t-1");
   ctx.Equal(r.Status, 201, "a known preset (%s)", r.Text());
 }
 
 void CheckSourceHash(harness::Ctx& ctx) {
-  auto c = submitter(ctx);
-  std::string upper = kSha;
+  auto c = hSubmitter(ctx);
+  std::string upper = hKSha;
   for (char& ch : upper) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-  nlohmann::json no_prefix = validBody();
+  nlohmann::json no_prefix = hValidBody();
   no_prefix["output"]["prefix"] = "";
   const std::vector<std::pair<std::string, nlohmann::json>> bad = {
-      {"a short hash", transcodeBody("abc123", "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
-      {"an upper-case hash", transcodeBody(upper, "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
-      {"a 63-character hash", transcodeBody(kSha.substr(0, 63), "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
-      {"a non-hex hash", transcodeBody(std::string(64, 'z'), "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
-      {"a 65-character hash", transcodeBody(kSha + "9", "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
-      {"a hash followed by a newline", transcodeBody(kSha + "\\n", "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
-      {"a zero duration", transcodeBody(kSha, "h264-720p", 0, "s3://uploads/talk.mov", "renditions")},
-      {"a negative duration", transcodeBody(kSha, "h264-720p", -6, "s3://uploads/talk.mov", "renditions")},
-      {"an empty uri", transcodeBody(kSha, "h264-720p", 14, "", "renditions")},
-      {"an empty bucket", transcodeBody(kSha, "h264-720p", 14, "s3://uploads/talk.mov", "")},
+      {"a short hash", hTranscodeBody("abc123", "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
+      {"an upper-case hash", hTranscodeBody(upper, "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
+      {"a 63-character hash", hTranscodeBody(hKSha.substr(0, 63), "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
+      {"a non-hex hash", hTranscodeBody(std::string(64, 'z'), "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
+      {"a 65-character hash", hTranscodeBody(hKSha + "9", "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
+      {"a hash followed by a newline", hTranscodeBody(hKSha + "\\n", "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
+      {"a zero duration", hTranscodeBody(hKSha, "h264-720p", 0, "s3://uploads/talk.mov", "renditions")},
+      {"a negative duration", hTranscodeBody(hKSha, "h264-720p", -6, "s3://uploads/talk.mov", "renditions")},
+      {"an empty uri", hTranscodeBody(hKSha, "h264-720p", 14, "", "renditions")},
+      {"an empty bucket", hTranscodeBody(hKSha, "h264-720p", 14, "s3://uploads/talk.mov", "")},
       {"an empty prefix", no_prefix},
   };
   for (const auto& [what, body] : bad) {
-    const auto r = postJob(c, body, "t-1");
+    const auto r = hPostJob(c, body, "t-1");
     ctx.Equal(r.Status, 400, "a submit with %s; the status", what);
   }
-  ctx.Equal(jobsCreated(ctx), 0L, "invalid submits must create nothing (the dedupe key would be built from whatever arrived); jobs created");
-  const auto r = postJob(c, validBody(), "t-1");
+  ctx.Equal(hJobsCreated(ctx), 0L, "invalid submits must create nothing (the dedupe key would be built from whatever arrived); jobs created");
+  const auto r = hPostJob(c, hValidBody(), "t-1");
   ctx.Equal(r.Status, 201, "the valid submit (%s)", r.Text());
-  const auto short_source = postJob(c, transcodeBody(std::string(64, '7'), "h264-720p", 0.5, "s3://uploads/talk.mov", "renditions"), "t-1");
-  ctx.Assert(short_source.Status == 201 && answerOf(short_source).value("segment_count", 0) == 1, "a valid half-second source answered %d %s: any positive duration is one segment or more", short_source.Status, short_source.Text());
+  const auto short_source = hPostJob(c, hTranscodeBody(std::string(64, '7'), "h264-720p", 0.5, "s3://uploads/talk.mov", "renditions"), "t-1");
+  ctx.Assert(short_source.Status == 201 && hAnswerOf(short_source).value("segment_count", 0) == 1, "a valid half-second source answered %d %s: any positive duration is one segment or more", short_source.Status, short_source.Text());
 }
 `,
   },

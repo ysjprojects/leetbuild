@@ -554,43 +554,43 @@ import (
 	"cronsched/store"
 )
 
-const stateSchedule = "s1"
+const kHStateSchedule = "s1"
 
 // stateWindow is 2026-03-10T09:00:00Z: a fire window, the start of a minute.
-const stateWindow int64 = 1773133200
+const kHStateWindow int64 = 1773133200
 
-type stateFire struct {
+type HStateFire struct {
 	scheduleID string
 	window     int64
 }
 
-func stateTrigger(fired *[]stateFire) func(string, int64) error {
+func hStateTrigger(fired *[]HStateFire) func(string, int64) error {
 	return func(scheduleID string, window int64) error {
-		*fired = append(*fired, stateFire{scheduleID, window})
+		*fired = append(*fired, HStateFire{scheduleID, window})
 		return nil
 	}
 }
 
-func stateRuns(ctx *harness.Ctx) []store.Run {
-	runs, err := store.Runs(context.Background(), stateSchedule)
+func hStateRuns(ctx *harness.Ctx) []store.Run {
+	runs, err := store.Runs(context.Background(), kHStateSchedule)
 	ctx.NoError(err, "reading the ledger")
 	return runs
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
-	var fired []stateFire
-	key := store.LeaseKey(stateSchedule, stateWindow)
+	var fired []HStateFire
+	key := store.LeaseKey(kHStateSchedule, kHStateWindow)
 	// Instance b's ticker lands right after instance a's first command on the lease: b claims the
 	// window if it can, and fires if it did.
 	won := false
 	probe := ctx.Redis.After(key, func() any {
 		won = ctx.Redis.Set(key, "b", "NX", "EX", 300)
 		if won {
-			fired = append(fired, stateFire{stateSchedule, stateWindow})
+			fired = append(fired, HStateFire{kHStateSchedule, kHStateWindow})
 		}
 		return won
 	})
-	outcome, err := fireWindow(context.Background(), stateSchedule, stateWindow, "a", stateTrigger(&fired))
+	outcome, err := fireWindow(context.Background(), kHStateSchedule, kHStateWindow, "a", hStateTrigger(&fired))
 	ctx.NoError(err, "fireWindow")
 	ctx.Assert(probe.Fired, "fireWindow never touched %s", key)
 	ctx.Assert(len(fired) == 1, "two instances ticked on the 09:00 window and the job ran %d times: instance b claimed the lease between your check and your write, so the check and the claim must be one command (SET ... NX)", len(fired))
@@ -602,22 +602,22 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 }
 
 func CheckWindowBucket(ctx *harness.Ctx) {
-	var fired []stateFire
-	a, err := fireWindow(context.Background(), stateSchedule, stateWindow+2, "a", stateTrigger(&fired))
+	var fired []HStateFire
+	a, err := fireWindow(context.Background(), kHStateSchedule, kHStateWindow+2, "a", hStateTrigger(&fired))
 	ctx.NoError(err, "fireWindow")
-	b, err := fireWindow(context.Background(), stateSchedule, stateWindow+7, "b", stateTrigger(&fired))
+	b, err := fireWindow(context.Background(), kHStateSchedule, kHStateWindow+7, "b", hStateTrigger(&fired))
 	ctx.NoError(err, "fireWindow")
-	c, err := fireWindow(context.Background(), stateSchedule, stateWindow+59, "c", stateTrigger(&fired))
+	c, err := fireWindow(context.Background(), kHStateSchedule, kHStateWindow+59, "c", hStateTrigger(&fired))
 	ctx.NoError(err, "fireWindow")
-	ctx.Assert(len(fired) == 1, "instances a, b and c ticked 2 s, 7 s and 59 s into the 09:00 minute and the job ran %d times (leases %q): every tick belongs to window %d, so all three claim %s", len(fired), ctx.Redis.Keys("lease:*"), stateWindow, store.LeaseKey(stateSchedule, stateWindow))
-	ctx.Equal(fired[0].window, stateWindow, "the window the trigger received (the start of the minute)")
+	ctx.Assert(len(fired) == 1, "instances a, b and c ticked 2 s, 7 s and 59 s into the 09:00 minute and the job ran %d times (leases %q): every tick belongs to window %d, so all three claim %s", len(fired), ctx.Redis.Keys("lease:*"), kHStateWindow, store.LeaseKey(kHStateSchedule, kHStateWindow))
+	ctx.Equal(fired[0].window, kHStateWindow, "the window the trigger received (the start of the minute)")
 	ctx.Assert(a == "fired" && b == "taken" && c == "taken", "fireWindow returned %q, %q then %q, expected fired, taken, taken", a, b, c)
-	ctx.Equal(stateRuns(ctx), []store.Run{{Window: stateWindow, Outcome: "fired", Reason: ""}}, "the ledger runs:s1 (one fired row for the window)")
+	ctx.Equal(hStateRuns(ctx), []store.Run{{Window: kHStateWindow, Outcome: "fired", Reason: ""}}, "the ledger runs:s1 (one fired row for the window)")
 }
 
 func CheckLeaseTtl(ctx *harness.Ctx) {
-	var fired []stateFire
-	key := store.LeaseKey(stateSchedule, stateWindow)
+	var fired []HStateFire
+	key := store.LeaseKey(kHStateSchedule, kHStateWindow)
 	// A snapshot right after the first command on the lease: a TTL set by a later command is not there yet.
 	var holder string
 	var first int64
@@ -626,7 +626,7 @@ func CheckLeaseTtl(ctx *harness.Ctx) {
 		first = ctx.Redis.TTL(key)
 		return nil
 	})
-	_, err := fireWindow(context.Background(), stateSchedule, stateWindow, "a", stateTrigger(&fired))
+	_, err := fireWindow(context.Background(), kHStateSchedule, kHStateWindow, "a", hStateTrigger(&fired))
 	ctx.NoError(err, "fireWindow")
 	ctx.Assert(probe.Fired, "fireWindow never touched %s", key)
 	ctx.Equal(holder, "a", "the owner %s holds right after the claim", key)
@@ -639,14 +639,14 @@ func CheckLeaseTtl(ctx *harness.Ctx) {
 
 func CheckErrorRecorded(ctx *harness.Ctx) {
 	failing := func(string, int64) error { return errors.New("job service unreachable") }
-	outcome, err := fireWindow(context.Background(), stateSchedule, stateWindow, "a", failing)
+	outcome, err := fireWindow(context.Background(), kHStateSchedule, kHStateWindow, "a", failing)
 	ctx.Assert(err == nil && outcome == "error", "a trigger that failed made fireWindow return (%q, %v), expected (\\"error\\", nil)", outcome, err)
-	ctx.Equal(stateRuns(ctx), []store.Run{{Window: stateWindow, Outcome: "error", Reason: "trigger_failed"}}, "the ledger runs:s1 after a failed trigger (without the row the window reads as never attempted)")
-	var fired []stateFire
-	outcome, err = fireWindow(context.Background(), stateSchedule, stateWindow+60, "a", stateTrigger(&fired))
+	ctx.Equal(hStateRuns(ctx), []store.Run{{Window: kHStateWindow, Outcome: "error", Reason: "trigger_failed"}}, "the ledger runs:s1 after a failed trigger (without the row the window reads as never attempted)")
+	var fired []HStateFire
+	outcome, err = fireWindow(context.Background(), kHStateSchedule, kHStateWindow+60, "a", hStateTrigger(&fired))
 	ctx.NoError(err, "fireWindow")
 	ctx.Equal(outcome, "fired", "the next window, with the job service back")
-	ctx.Equal(len(stateRuns(ctx)), 2, "the ledger rows after an error and a fire")
+	ctx.Equal(len(hStateRuns(ctx)), 2, "the ledger rows after an error and a fire")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -660,19 +660,19 @@ func CheckErrorRecorded(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kStateSchedule = "s1";
-constexpr int64_t kStateWindow = 1773133200;  // 2026-03-10T09:00:00Z: a fire window, the start of a minute
+const std::string kHStateSchedule = "s1";
+constexpr int64_t kHStateWindow = 1773133200;  // 2026-03-10T09:00:00Z: a fire window, the start of a minute
 
-std::function<bool(const std::string&, int64_t)> stateTrigger(std::vector<std::pair<std::string, int64_t>>& fired) {
+std::function<bool(const std::string&, int64_t)> hStateTrigger(std::vector<std::pair<std::string, int64_t>>& fired) {
   return [&fired](const std::string& schedule_id, int64_t window) {
     fired.emplace_back(schedule_id, window);
     return true;
   };
 }
 
-std::string stateRuns() {
+std::string hStateRuns() {
   std::string out;
-  for (const auto& run : cronsched::store::Runs(kStateSchedule)) {
+  for (const auto& run : cronsched::store::Runs(kHStateSchedule)) {
     out += std::to_string(run.window) + "=" + run.outcome + ":" + run.reason + ";";
   }
   return out;
@@ -682,7 +682,7 @@ std::string stateRuns() {
 
 void CheckAtomicClaim(harness::Ctx& ctx) {
   std::vector<std::pair<std::string, int64_t>> fired;
-  const std::string key = cronsched::LeaseKey(kStateSchedule, kStateWindow);
+  const std::string key = cronsched::LeaseKey(kHStateSchedule, kHStateWindow);
   // Instance b's ticker lands right after instance a's first command on the lease: b claims the
   // window if it can, and fires if it did.
   bool probed = false;
@@ -690,9 +690,9 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
   ctx.Redis.After(key, [&] {
     probed = true;
     won = ctx.Redis.Set(key, "b", "NX", "EX", 300);
-    if (won) fired.emplace_back(kStateSchedule, kStateWindow);
+    if (won) fired.emplace_back(kHStateSchedule, kHStateWindow);
   });
-  const std::string outcome = fireWindow(kStateSchedule, kStateWindow, "a", stateTrigger(fired));
+  const std::string outcome = fireWindow(kHStateSchedule, kHStateWindow, "a", hStateTrigger(fired));
   ctx.Assert(probed, "fireWindow never touched %s", key);
   ctx.Assert(fired.size() == 1,
              "two instances ticked on the 09:00 window and the job ran %d times: instance b claimed the lease between your check "
@@ -703,21 +703,21 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
 
 void CheckWindowBucket(harness::Ctx& ctx) {
   std::vector<std::pair<std::string, int64_t>> fired;
-  const std::string a = fireWindow(kStateSchedule, kStateWindow + 2, "a", stateTrigger(fired));
-  const std::string b = fireWindow(kStateSchedule, kStateWindow + 7, "b", stateTrigger(fired));
-  const std::string c = fireWindow(kStateSchedule, kStateWindow + 59, "c", stateTrigger(fired));
+  const std::string a = fireWindow(kHStateSchedule, kHStateWindow + 2, "a", hStateTrigger(fired));
+  const std::string b = fireWindow(kHStateSchedule, kHStateWindow + 7, "b", hStateTrigger(fired));
+  const std::string c = fireWindow(kHStateSchedule, kHStateWindow + 59, "c", hStateTrigger(fired));
   ctx.Assert(fired.size() == 1,
              "instances a, b and c ticked 2 s, 7 s and 59 s into the 09:00 minute and the job ran %d times (leases %q): every tick "
              "belongs to window %d, so all three claim %s",
-             fired.size(), ctx.Redis.Keys("lease:*"), kStateWindow, cronsched::LeaseKey(kStateSchedule, kStateWindow));
-  ctx.Equal(fired[0].second, kStateWindow, "the window the trigger received (the start of the minute)");
+             fired.size(), ctx.Redis.Keys("lease:*"), kHStateWindow, cronsched::LeaseKey(kHStateSchedule, kHStateWindow));
+  ctx.Equal(fired[0].second, kHStateWindow, "the window the trigger received (the start of the minute)");
   ctx.Assert(a == "fired" && b == "taken" && c == "taken", "fireWindow returned %s, %s then %s, expected fired, taken, taken", a, b, c);
-  ctx.Equal(stateRuns(), std::to_string(kStateWindow) + "=fired:;", "the ledger runs:s1 (one fired row for the window)");
+  ctx.Equal(hStateRuns(), std::to_string(kHStateWindow) + "=fired:;", "the ledger runs:s1 (one fired row for the window)");
 }
 
 void CheckLeaseTtl(harness::Ctx& ctx) {
   std::vector<std::pair<std::string, int64_t>> fired;
-  const std::string key = cronsched::LeaseKey(kStateSchedule, kStateWindow);
+  const std::string key = cronsched::LeaseKey(kHStateSchedule, kHStateWindow);
   // A snapshot right after the first command on the lease: a TTL set by a later command is not there yet.
   bool probed = false;
   std::string holder;
@@ -727,7 +727,7 @@ void CheckLeaseTtl(harness::Ctx& ctx) {
     holder = ctx.Redis.Get(key).value_or("");
     first = ctx.Redis.TTL(key);
   });
-  fireWindow(kStateSchedule, kStateWindow, "a", stateTrigger(fired));
+  fireWindow(kHStateSchedule, kHStateWindow, "a", hStateTrigger(fired));
   ctx.Assert(probed, "fireWindow never touched %s", key);
   ctx.Equal(holder, "a", "the owner %s holds right after the claim", key);
   ctx.Assert(290 <= first && first <= 300,
@@ -743,13 +743,13 @@ void CheckLeaseTtl(harness::Ctx& ctx) {
 }
 
 void CheckErrorRecorded(harness::Ctx& ctx) {
-  const std::string outcome = fireWindow(kStateSchedule, kStateWindow, "a", [](const std::string&, int64_t) { return false; });
+  const std::string outcome = fireWindow(kHStateSchedule, kHStateWindow, "a", [](const std::string&, int64_t) { return false; });
   ctx.Equal(outcome, "error", "fireWindow's outcome for a trigger that failed");
-  ctx.Equal(stateRuns(), std::to_string(kStateWindow) + "=error:trigger_failed;",
+  ctx.Equal(hStateRuns(), std::to_string(kHStateWindow) + "=error:trigger_failed;",
             "the ledger runs:s1 after a failed trigger (without the row the window reads as never attempted)");
   std::vector<std::pair<std::string, int64_t>> fired;
-  ctx.Equal(fireWindow(kStateSchedule, kStateWindow + 60, "a", stateTrigger(fired)), "fired", "the next window, with the job service back");
-  ctx.Equal(cronsched::store::Runs(kStateSchedule).size(), 2, "the ledger rows after an error and a fire");
+  ctx.Equal(fireWindow(kHStateSchedule, kHStateWindow + 60, "a", hStateTrigger(fired)), "fired", "the next window, with the job service back");
+  ctx.Equal(cronsched::store::Runs(kHStateSchedule).size(), 2, "the ledger rows after an error and a fire");
 }
 `,
   },

@@ -812,12 +812,12 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "returns.event"
+const kHEventsTopic = "returns.event"
 
-var eventsFields = []string{"grade", "order_line_id", "refund_cents", "return_id", "state"}
+var hEventsFields = []string{"grade", "order_line_id", "refund_cents", "return_id", "state"}
 
 // eventsKeys is a payload's field names, sorted.
-func eventsKeys(payload map[string]any) []string {
+func hEventsKeys(payload map[string]any) []string {
 	keys := []string{}
 	for k := range payload {
 		keys = append(keys, k)
@@ -826,32 +826,32 @@ func eventsKeys(payload map[string]any) []string {
 	return keys
 }
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func eventsOpen(ctx *harness.Ctx, returnID string) *store.Return {
+func hEventsOpen(ctx *harness.Ctx, returnID string) *store.Return {
 	ctx.Redis.Set("line:L1:returnable", 9)
-	_, err := ledger.RegisterReturn(eventsBg, "L1", returnID, 1, map[string]string{"tenant": "t-1", "reason_code": "damaged", "photo_ref": "photos/" + returnID + "-kitchen.jpg"})
+	_, err := ledger.RegisterReturn(hEventsBg, "L1", returnID, 1, map[string]string{"tenant": "t-1", "reason_code": "damaged", "photo_ref": "photos/" + returnID + "-kitchen.jpg"})
 	ctx.NoError(err, "registering %s", returnID)
-	store.UpdateReturn(eventsBg, returnID, map[string]any{"grade": "damaged", "refund_cents": 2000})
-	return store.ReturnOf(eventsBg, returnID)
+	store.UpdateReturn(hEventsBg, returnID, map[string]any{"grade": "damaged", "refund_cents": 2000})
+	return store.ReturnOf(hEventsBg, returnID)
 }
 
-func eventsRecord(ctx *harness.Ctx, ret *store.Return, state string) bool {
-	ok, err := recordTransition(eventsBg, ret, state)
+func hEventsRecord(ctx *harness.Ctx, ret *store.Return, state string) bool {
+	ok, err := recordTransition(hEventsBg, ret, state)
 	ctx.NoError(err, "recordTransition(%s, %s)", ret.ReturnID, state)
 	return ok
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	var rows []HEventsRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -859,16 +859,16 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckReturnKey(ctx *harness.Ctx) {
-	first, second := eventsOpen(ctx, "ret-1"), eventsOpen(ctx, "ret-2")
-	eventsRecord(ctx, first, "awaiting_inspection")
-	eventsRecord(ctx, second, "awaiting_inspection")
-	eventsRecord(ctx, first, "refund_pending")
+	first, second := hEventsOpen(ctx, "ret-1"), hEventsOpen(ctx, "ret-2")
+	hEventsRecord(ctx, first, "awaiting_inspection")
+	hEventsRecord(ctx, second, "awaiting_inspection")
+	hEventsRecord(ctx, first, "refund_pending")
 	ctx.Settle()
-	keys := ctx.Kafka.Keys(eventsTopic)
+	keys := ctx.Kafka.Keys(kHEventsTopic)
 	sorted := append([]string(nil), keys...)
 	sort.Strings(sorted)
 	ctx.Equal(sorted, []string{"ret-1", "ret-1", "ret-2"}, "three transitions of ret-1, ret-2, ret-1 must produce records keyed by the return ids; the keys")
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	var partitions []int
 	for i, key := range keys {
 		if key == "ret-1" {
@@ -879,63 +879,63 @@ func CheckReturnKey(ctx *harness.Ctx) {
 }
 
 func CheckNoPhoto(ctx *harness.Ctx) {
-	eventsRecord(ctx, eventsOpen(ctx, "ret-1"), "refund_pending")
+	hEventsRecord(ctx, hEventsOpen(ctx, "ret-1"), "refund_pending")
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one transition must produce one record; the records")
 	ctx.Assert(!strings.Contains(values[0], "kitchen.jpg"), "the event carries the customer's photo reference: %s. returns.event is retained and read by every consumer; the evidence stays in the returns store", values[0])
 	var value map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the payload must be JSON")
 	ctx.Assert(value["return_id"] == "ret-1" && value["order_line_id"] == "L1" && value["state"] == "refund_pending" && value["grade"] == "damaged" && value["refund_cents"] == float64(2000),
 		"the payload is %s, expected return_id ret-1, order_line_id L1, state refund_pending, grade damaged, refund_cents 2000", values[0])
-	ctx.Equal(eventsKeys(value), eventsFields, "the payload must carry exactly these fields: the timeline gets what it needs to place the event, and the rest of the return stays in the store; the fields")
+	ctx.Equal(hEventsKeys(value), hEventsFields, "the payload must carry exactly these fields: the timeline gets what it needs to place the event, and the rest of the return stays in the store; the fields")
 }
 
 func CheckPublishAfterCommit(ctx *harness.Ctx) {
-	ret := eventsOpen(ctx, "ret-1")
-	probe := ctx.Redis.After("return:ret-1", func() any { return len(ctx.Kafka.Records(eventsTopic)) })
-	eventsRecord(ctx, ret, "refund_pending")
+	ret := hEventsOpen(ctx, "ret-1")
+	probe := ctx.Redis.After("return:ret-1", func() any { return len(ctx.Kafka.Records(kHEventsTopic)) })
+	hEventsRecord(ctx, ret, "refund_pending")
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "recordTransition never wrote the return's state (no write to return:ret-1)")
 	ctx.Equal(probe.Result, 0, "when the state was written the topic already held events: a consumer reading the return on that event found the old state. Write the state, then produce; the events at the state write")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the state write; the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "the event must still be produced after the state write; the records")
 	state, _ := ctx.Redis.HGet("return:ret-1", "state")
 	ctx.Equal(state, "refund_pending", "return:ret-1's state after the transition")
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsRecord(ctx, eventsOpen(ctx, "ret-1"), "refund_pending")
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsRecord(ctx, hEventsOpen(ctx, "ret-1"), "refund_pending")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	eventsRecord(ctx, eventsOpen(ctx, "ret-2"), "refund_pending")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hEventsRecord(ctx, hEventsOpen(ctx, "ret-2"), "refund_pending")
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ok := eventsRecord(ctx, eventsOpen(ctx, "ret-0"), "refund_pending")
+	ok := hEventsRecord(ctx, hEventsOpen(ctx, "ret-0"), "refund_pending")
 	ctx.Settle()
-	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0, "an acknowledged event returned %v and left the outbox rows %v, expected true and no row", ok, eventsOutbox(ctx))
-	first := eventsOpen(ctx, "ret-1")
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok = eventsRecord(ctx, first, "refund_pending")
+	ctx.Assert(ok && len(hEventsOutbox(ctx)) == 0, "an acknowledged event returned %v and left the outbox rows %v, expected true and no row", ok, hEventsOutbox(ctx))
+	first := hEventsOpen(ctx, "ret-1")
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok = hEventsRecord(ctx, first, "refund_pending")
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the transition never reaches the timeline; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "ret-1" && rows[0].Payload["return_id"] == "ret-1", "the outbox row is %v, expected the topic, the key ret-1 and the payload", rows[0])
-	ctx.Assert(strings.Join(eventsKeys(rows[0].Payload), ",") == strings.Join(eventsFields, ",") && rows[0].Payload["state"] == "refund_pending", "the outbox row carries the payload %v, expected the event's own payload (exactly %v, state refund_pending): the relay publishes it to the same topic", rows[0].Payload, eventsFields)
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == "ret-1" && rows[0].Payload["return_id"] == "ret-1", "the outbox row is %v, expected the topic, the key ret-1 and the payload", rows[0])
+	ctx.Assert(strings.Join(hEventsKeys(rows[0].Payload), ",") == strings.Join(hEventsFields, ",") && rows[0].Payload["state"] == "refund_pending", "the outbox row carries the payload %v, expected the event's own payload (exactly %v, state refund_pending): the relay publishes it to the same topic", rows[0].Payload, hEventsFields)
 	ctx.Equal(ok, false, "recordTransition's result after a failed delivery")
 	state, _ := ctx.Redis.HGet("return:ret-1", "state")
 	ctx.Equal(state, "refund_pending", "the state must stay written when only the produce failed; the state")
-	second := eventsOpen(ctx, "ret-2")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	second := hEventsOpen(ctx, "ret-2")
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsRecord(ctx, second, "refund_pending")
+	ok = hEventsRecord(ctx, second, "refund_pending")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "recordTransition waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout (2 s), then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["return_id"] == "ret-2", "no acknowledgement within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "recordTransition's result without an acknowledgement")
 }
@@ -953,7 +953,7 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "returns.event";
+const std::string kHEventsTopic = "returns.event";
 const std::vector<std::string> hEventFields = {"grade", "order_line_id", "refund_cents", "return_id", "state"};
 
 store::Return hOpen(harness::Ctx& ctx, const std::string& return_id) {
@@ -995,11 +995,11 @@ void CheckReturnKey(harness::Ctx& ctx) {
   recordTransition(second, "awaiting_inspection");
   recordTransition(first, "refund_pending");
   ctx.Settle();
-  const auto keys = ctx.Kafka.Keys(kEventsTopic);
+  const auto keys = ctx.Kafka.Keys(kHEventsTopic);
   auto sorted = keys;
   std::sort(sorted.begin(), sorted.end());
   ctx.Equal(sorted, {"ret-1", "ret-1", "ret-2"}, "three transitions of ret-1, ret-2, ret-1 must produce records keyed by the return ids; the keys");
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   std::vector<int> partitions;
   for (size_t i = 0; i < keys.size(); i++) {
     if (keys[i] == "ret-1") partitions.push_back(records[i].Partition);
@@ -1010,7 +1010,7 @@ void CheckReturnKey(harness::Ctx& ctx) {
 void CheckNoPhoto(harness::Ctx& ctx) {
   recordTransition(hOpen(ctx, "ret-1"), "refund_pending");
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one transition must produce one record; the records");
   ctx.Assert(values[0].find("kitchen.jpg") == std::string::npos, "the event carries the customer's photo reference: %s. returns.event is retained and read by every consumer; the evidence stays in the returns store", values[0]);
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
@@ -1026,25 +1026,25 @@ void CheckPublishAfterCommit(harness::Ctx& ctx) {
   bool fired = false;
   ctx.Redis.After("return:ret-1", [&] {
     fired = true;
-    atWrite = ctx.Kafka.Records(kEventsTopic).size();
+    atWrite = ctx.Kafka.Records(kHEventsTopic).size();
   });
   recordTransition(ret, "refund_pending");
   ctx.Settle();
   ctx.Assert(fired, "recordTransition never wrote the return's state (no write to return:ret-1)");
   ctx.Equal(atWrite, 0, "when the state was written the topic already held events: a consumer reading the return on that event found the old state. Write the state, then produce; the events at the state write");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the event must still be produced after the state write; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "the event must still be produced after the state write; the records");
   ctx.Equal(ctx.Redis.HGet("return:ret-1", "state").value_or(""), "refund_pending", "return:ret-1's state after the transition");
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
   recordTransition(hOpen(ctx, "ret-1"), "refund_pending");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
   recordTransition(hOpen(ctx, "ret-2"), "refund_pending");
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
@@ -1052,12 +1052,12 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   ctx.Settle();
   ctx.Assert(ok && hOutboxRows(ctx).empty(), "an acknowledged event returned %t and left %d outbox rows, expected true and no row", ok, hOutboxRows(ctx).size());
   const store::Return first = hOpen(ctx, "ret-1");
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   ok = recordTransition(first, "refund_pending");
   ctx.Settle();
   auto rows = hOutboxRows(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the transition never reaches the timeline; the rows");
-  ctx.Assert(hField(rows[0], "topic") == kEventsTopic && hField(rows[0], "key") == "ret-1" && rows[0].contains("payload") && hField(rows[0]["payload"], "return_id") == "ret-1",
+  ctx.Assert(hField(rows[0], "topic") == kHEventsTopic && hField(rows[0], "key") == "ret-1" && rows[0].contains("payload") && hField(rows[0]["payload"], "return_id") == "ret-1",
              "the outbox row is %s, expected the topic, the key ret-1 and the payload", rows[0].dump());
   const nlohmann::json payload = rows[0].contains("payload") ? rows[0]["payload"] : nlohmann::json::object();
   ctx.Assert(hKeys(payload) == hEventFields && hField(payload, "state") == "refund_pending",
@@ -1065,7 +1065,7 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   ctx.Equal(ok, false, "recordTransition's result after a failed delivery");
   ctx.Equal(ctx.Redis.HGet("return:ret-1", "state").value_or(""), "refund_pending", "the state must stay written when only the produce failed; the state");
   const store::Return second = hOpen(ctx, "ret-2");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = recordTransition(second, "refund_pending");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;

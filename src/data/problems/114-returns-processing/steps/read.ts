@@ -677,50 +677,50 @@ import (
 	"leetbuild/harness"
 )
 
-const readTenant = "t-1"
+const kHReadTenant = "t-1"
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
-	store.PutLine(readBg, store.OrderLine{OrderLineID: "L1", Tenant: readTenant, SKU: "KETTLE-2L", OrderedQuantity: 3, UnitPriceCents: 4000, DeliveredAt: "2026-10-20", PolicyWindow: "standard"})
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
+	store.PutLine(hReadBg, store.OrderLine{OrderLineID: "L1", Tenant: kHReadTenant, SKU: "KETTLE-2L", OrderedQuantity: 3, UnitPriceCents: 4000, DeliveredAt: "2026-10-20", PolicyWindow: "standard"})
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
 // readOpen writes a return of 1 unit of L1 in state; a non-empty refund (the processor's state) adds a refund of 4000 cents.
-func readOpen(returnID, state, grade, refund string) {
+func hReadOpen(returnID, state, grade, refund string) {
 	fields := map[string]any{
-		"return_id": returnID, "tenant": readTenant, "order_line_id": "L1", "quantity": 1, "reason_code": "damaged",
+		"return_id": returnID, "tenant": kHReadTenant, "order_line_id": "L1", "quantity": 1, "reason_code": "damaged",
 		"photo_ref": "photos/kettle.jpg", "state": state, "grade": grade, "refund_cents": 0, "refund_id": "",
 	}
 	if refund != "" {
 		fields["refund_cents"] = 4000
 		fields["refund_id"] = "rf-" + returnID
-		store.PutRefund(readBg, store.Refund{RefundID: "rf-" + returnID, ReturnID: returnID, AmountCents: 4000, State: refund})
+		store.PutRefund(hReadBg, store.Refund{RefundID: "rf-" + returnID, ReturnID: returnID, AmountCents: 4000, State: refund})
 	}
-	store.UpdateReturn(readBg, returnID, fields)
+	store.UpdateReturn(hReadBg, returnID, fields)
 }
 
-func readGet(c *harness.HTTP, returnID, tenant string) *harness.Response {
+func hReadGet(c *harness.HTTP, returnID, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Get("/v1/returns/" + returnID)
 	}
 	return c.Get("/v1/returns/"+returnID, "X-Tenant-Id", tenant)
 }
 
-func readBody(r *harness.Response) map[string]any {
+func hReadBody(r *harness.Response) map[string]any {
 	var v map[string]any
 	json.Unmarshal([]byte(r.Text()), &v)
 	return v
 }
 
 func CheckReadRoute(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	readOpen("ret-1", "registered", "", "")
-	r := readGet(c, "ret-1", readTenant)
+	c := hReadAPI(ctx)
+	hReadOpen("ret-1", "registered", "", "")
+	r := hReadGet(c, "ret-1", kHReadTenant)
 	ctx.Equal(r.Status, 200, "GET /v1/returns/ret-1 by its owner (%s)", r.Text())
-	body := readBody(r)
+	body := hReadBody(r)
 	ctx.Assert(body["return_id"] == "ret-1" && body["state"] == "registered" && body["quantity"] == float64(1), "the read answered %s, expected ret-1, registered, quantity 1", r.Text())
 	ctx.Assert(body["refund"] == nil, "a return with no refund shows refund %v", body["refund"])
 	line, _ := body["order_line"].(map[string]any)
@@ -728,45 +728,45 @@ func CheckReadRoute(ctx *harness.Ctx) {
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	readOpen("ret-1", "registered", "", "")
-	ctx.Equal(readGet(c, "ret-1", "").Status, 401, "a read without X-Tenant-Id")
-	other := readGet(c, "ret-1", "t-2")
+	c := hReadAPI(ctx)
+	hReadOpen("ret-1", "registered", "", "")
+	ctx.Equal(hReadGet(c, "ret-1", "").Status, 401, "a read without X-Tenant-Id")
+	other := hReadGet(c, "ret-1", "t-2")
 	ctx.Equal(other.Status, 404, "tenant t-2 reading t-1's return must get 404, like a return that does not exist (%.120s)", other.Text())
-	unknown := readGet(c, "ret-404", readTenant)
+	unknown := hReadGet(c, "ret-404", kHReadTenant)
 	ctx.Equal(unknown.Status, 404, "an unknown return")
 	foreign, missing := strings.ReplaceAll(other.Text(), "ret-1", "<id>"), strings.ReplaceAll(unknown.Text(), "ret-404", "<id>")
 	ctx.Assert(foreign == missing, "another tenant's return answered %q and a missing one %q: the two must read the same, or ids can be probed", other.Text(), unknown.Text())
 }
 
 func CheckRefundState(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	readOpen("ret-1", "refund_pending", "sellable", "initiated")
-	readOpen("ret-2", "refund_pending", "sellable", "confirmed")
-	readOpen("ret-3", "refund_pending", "damaged", "failed")
-	readOpen("ret-4", "awaiting_inspection", "", "")
+	c := hReadAPI(ctx)
+	hReadOpen("ret-1", "refund_pending", "sellable", "initiated")
+	hReadOpen("ret-2", "refund_pending", "sellable", "confirmed")
+	hReadOpen("ret-3", "refund_pending", "damaged", "failed")
+	hReadOpen("ret-4", "awaiting_inspection", "", "")
 	// The store already says refunded, but the processor has only started the refund.
-	readOpen("ret-5", "refunded", "sellable", "initiated")
+	hReadOpen("ret-5", "refunded", "sellable", "initiated")
 	for _, tc := range [][3]string{{"ret-1", "refund_pending", "initiated"}, {"ret-2", "refunded", "confirmed"}, {"ret-3", "refund_failed", "failed"}, {"ret-4", "awaiting_inspection", "no refund"}, {"ret-5", "refund_pending", "initiated (the store says refunded)"}} {
-		r := readGet(c, tc[0], readTenant)
+		r := hReadGet(c, tc[0], kHReadTenant)
 		ctx.Equal(r.Status, 200, "GET /v1/returns/%s (%s)", tc[0], r.Text())
-		ctx.Equal(readBody(r)["state"], tc[1], "a return whose refund the processor reports as %s (refunded means the processor confirmed it); the state", tc[2])
+		ctx.Equal(hReadBody(r)["state"], tc[1], "a return whose refund the processor reports as %s (refunded means the processor confirmed it); the state", tc[2])
 	}
 }
 
 func CheckFailedRefundVisible(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	readOpen("ret-1", "refund_pending", "damaged", "failed")
-	readOpen("ret-2", "registered", "", "")
-	failed := readBody(readGet(c, "ret-1", readTenant))
+	c := hReadAPI(ctx)
+	hReadOpen("ret-1", "refund_pending", "damaged", "failed")
+	hReadOpen("ret-2", "registered", "", "")
+	failed := hReadBody(hReadGet(c, "ret-1", kHReadTenant))
 	ctx.Equal(failed["refund"], map[string]any{"refund_id": "rf-ret-1", "state": "failed", "amount_cents": float64(4000)}, "a return whose refund failed must show it (support needs to see it failed); the refund")
-	ctx.Assert(readBody(readGet(c, "ret-2", readTenant))["refund"] == nil, "a return with no refund must show refund null")
+	ctx.Assert(hReadBody(hReadGet(c, "ret-2", kHReadTenant))["refund"] == nil, "a return with no refund must show refund null")
 }
 
 func CheckOrderLine(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	readOpen("ret-1", "registered", "", "")
-	line, _ := readBody(readGet(c, "ret-1", readTenant))["order_line"].(map[string]any)
+	c := hReadAPI(ctx)
+	hReadOpen("ret-1", "registered", "", "")
+	line, _ := hReadBody(hReadGet(c, "ret-1", kHReadTenant))["order_line"].(map[string]any)
 	ctx.Assert(line != nil && line["order_line_id"] == "L1" && line["sku"] == "KETTLE-2L" && line["ordered_quantity"] == float64(3) && line["delivered_at"] == "2026-10-20",
 		"the read's order_line is %v, expected the line itself: order_line_id L1, sku KETTLE-2L, ordered_quantity 3, delivered_at 2026-10-20", line)
 	keys := []string{}

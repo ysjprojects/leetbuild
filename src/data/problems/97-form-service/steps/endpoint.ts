@@ -770,18 +770,18 @@ import (
 
 // The author's next version adds phone and drops message; it is not published yet.
 var (
-	apiPublished = store.Schema{"name": 40, "email": 80, "message": 200}
-	apiDraft     = store.Schema{"name": 40, "email": 80, "phone": 20}
+	hApiPublished = store.Schema{"name": 40, "email": 80, "message": 200}
+	hApiDraft     = store.Schema{"name": 40, "email": 80, "phone": 20}
 )
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
-	ctx.NoError(store.DefineForm(context.Background(), "f-1", "u-owner", apiPublished, apiDraft), "DefineForm")
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
+	ctx.NoError(store.DefineForm(context.Background(), "f-1", "u-owner", hApiPublished, hApiDraft), "DefineForm")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiSubmit(c *harness.HTTP, fields map[string]string, key string) *harness.Response {
+func hApiSubmit(c *harness.HTTP, fields map[string]string, key string) *harness.Response {
 	body := map[string]any{"fields": fields}
 	if key == "" {
 		return c.Post("/v1/forms/f-1/submissions", body)
@@ -789,9 +789,9 @@ func apiSubmit(c *harness.HTTP, fields map[string]string, key string) *harness.R
 	return c.Post("/v1/forms/f-1/submissions", body, "Idempotency-Key", key)
 }
 
-func apiCount(ctx *harness.Ctx) int64 { return ctx.Redis.ZCard("form:f-1:submissions") }
+func hApiCount(ctx *harness.Ctx) int64 { return ctx.Redis.ZCard("form:f-1:submissions") }
 
-func apiID(r *harness.Response) string {
+func hApiID(r *harness.Response) string {
 	var body struct {
 		SubmissionID string \`json:"submission_id"\`
 	}
@@ -800,66 +800,66 @@ func apiID(r *harness.Response) string {
 }
 
 func CheckPublishedSchema(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiSubmit(c, map[string]string{"name": "Ada", "message": "Hello"}, "k-1")
+	c := hApiClient(ctx)
+	r := hApiSubmit(c, map[string]string{"name": "Ada", "message": "Hello"}, "k-1")
 	ctx.Equal(r.Status, 201, "a submission of the published fields name and message (%s); submitters see the published form, whatever the draft dropped", r.Text())
-	r = apiSubmit(c, map[string]string{"name": "Ada", "phone": "555-0100"}, "k-2")
+	r = hApiSubmit(c, map[string]string{"name": "Ada", "phone": "555-0100"}, "k-2")
 	ctx.Equal(r.Status, 422, "a submission of phone, a field only the unpublished draft declares: a public caller must not write a field the author has not shipped")
 	ctx.Assert(strings.Contains(r.Text(), "phone"), "the 422 must name the field phone, got %s", r.Text())
-	ctx.Equal(apiCount(ctx), 1, "the form must hold only the valid submission; submissions")
+	ctx.Equal(hApiCount(ctx), 1, "the form must hold only the valid submission; submissions")
 }
 
 func CheckUnknownFields(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiSubmit(c, map[string]string{"name": "Ada", "is_admin": "true", "plan": "enterprise"}, "k-1")
+	c := hApiClient(ctx)
+	r := hApiSubmit(c, map[string]string{"name": "Ada", "is_admin": "true", "plan": "enterprise"}, "k-1")
 	ctx.Equal(r.Status, 422, "a submission with the undeclared fields is_admin and plan")
 	ctx.Assert(strings.Contains(r.Text(), "is_admin") && strings.Contains(r.Text(), "plan"), "the 422 must name every undeclared field (is_admin, plan), got %s", r.Text())
-	ctx.Equal(apiCount(ctx), 0, "a rejected submission must not be stored; submissions")
-	r = apiSubmit(c, map[string]string{"name": "Ada"}, "k-2")
+	ctx.Equal(hApiCount(ctx), 0, "a rejected submission must not be stored; submissions")
+	r = hApiSubmit(c, map[string]string{"name": "Ada"}, "k-2")
 	ctx.Equal(r.Status, 201, "a submission of declared fields only (%s)", r.Text())
 }
 
 func CheckFieldLimits(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiSubmit(c, map[string]string{"name": strings.Repeat("é", 21)}, "k-1")
+	c := hApiClient(ctx)
+	r := hApiSubmit(c, map[string]string{"name": strings.Repeat("é", 21)}, "k-1")
 	ctx.Equal(r.Status, 422, "21 characters of é (42 bytes) in name, declared max_bytes 40: count the limit in UTF-8 bytes, not characters")
 	ctx.Assert(strings.Contains(r.Text(), "name"), "the 422 must name the field, got %s", r.Text())
-	r = apiSubmit(c, map[string]string{"message": strings.Repeat("x", 201)}, "k-2")
+	r = hApiSubmit(c, map[string]string{"message": strings.Repeat("x", 201)}, "k-2")
 	ctx.Equal(r.Status, 422, "201 bytes in message, declared max_bytes 200")
-	r = apiSubmit(c, map[string]string{"name": strings.Repeat("é", 21), "plan": "enterprise"}, "k-3")
+	r = hApiSubmit(c, map[string]string{"name": strings.Repeat("é", 21), "plan": "enterprise"}, "k-3")
 	ctx.Assert(r.Status == 422 && strings.Contains(r.Text(), "name") && strings.Contains(r.Text(), "plan"), "a submission with an over-long name and an undeclared plan answered %d %s: the 422 must name every offending field, whatever is wrong with each", r.Status, r.Text())
-	r = apiSubmit(c, map[string]string{"name": strings.Repeat("a", 40), "message": strings.Repeat("x", 200)}, "k-4")
+	r = hApiSubmit(c, map[string]string{"name": strings.Repeat("a", 40), "message": strings.Repeat("x", 200)}, "k-4")
 	ctx.Equal(r.Status, 201, "values exactly at their max_bytes (%s)", r.Text())
-	r = apiSubmit(c, map[string]string{"message": "<b>" + strings.Repeat("x", 193) + "&"}, "k-5")
+	r = hApiSubmit(c, map[string]string{"message": "<b>" + strings.Repeat("x", 193) + "&"}, "k-5")
 	ctx.Equal(r.Status, 201, "a message of 197 bytes with markup (%s): the limit holds the value as submitted, not its escaped form", r.Text())
-	ctx.Equal(apiCount(ctx), 2, "the form must hold only the two submissions within their limits; submissions")
+	ctx.Equal(hApiCount(ctx), 2, "the form must hold only the two submissions within their limits; submissions")
 }
 
 func CheckEscapeMarkup(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiSubmit(c, map[string]string{"message": "<script>alert(1)</script> & thanks"}, "k-1")
+	c := hApiClient(ctx)
+	r := hApiSubmit(c, map[string]string{"message": "<script>alert(1)</script> & thanks"}, "k-1")
 	ctx.Equal(r.Status, 201, "a message with markup (%s)", r.Text())
-	s := store.LoadSubmission(context.Background(), apiID(r))
-	ctx.Assert(s != nil, "the submission %s is not in the store", apiID(r))
+	s := store.LoadSubmission(context.Background(), hApiID(r))
+	ctx.Assert(s != nil, "the submission %s is not in the store", hApiID(r))
 	stored := s.Values["message"]
 	ctx.Assert(!strings.ContainsAny(stored, "<>"), "the stored message %q still holds raw markup the dashboard would run", stored)
 	ctx.Equal(stored, "&lt;script&gt;alert(1)&lt;/script&gt; &amp; thanks", "the markup must be escaped (&lt; &gt; &amp;), not cut out with the submitter's words; the stored message")
 }
 
 func CheckReplayId(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	first := apiSubmit(c, map[string]string{"name": "Ada"}, "k-1")
-	replay := apiSubmit(c, map[string]string{"name": "Ada"}, "k-1")
+	c := hApiClient(ctx)
+	first := hApiSubmit(c, map[string]string{"name": "Ada"}, "k-1")
+	replay := hApiSubmit(c, map[string]string{"name": "Ada"}, "k-1")
 	ctx.Assert(first.Status == 201 && (replay.Status == 200 || replay.Status == 201), "the first POST answered %d, its replay %d", first.Status, replay.Status)
-	ctx.Equal(apiID(replay), apiID(first), "a replay of Idempotency-Key k-1 must answer the first submission_id (one person, one submission)")
-	ctx.Equal(apiCount(ctx), 1, "two POSTs with one Idempotency-Key; submissions")
-	other := apiSubmit(c, map[string]string{"name": "Grace"}, "k-2")
-	ctx.Assert(other.Status == 201 && apiID(other) != apiID(first), "a new key must store a new submission, got %d %s", other.Status, other.Text())
-	none := apiSubmit(c, map[string]string{"name": "Ada"}, "")
+	ctx.Equal(hApiID(replay), hApiID(first), "a replay of Idempotency-Key k-1 must answer the first submission_id (one person, one submission)")
+	ctx.Equal(hApiCount(ctx), 1, "two POSTs with one Idempotency-Key; submissions")
+	other := hApiSubmit(c, map[string]string{"name": "Grace"}, "k-2")
+	ctx.Assert(other.Status == 201 && hApiID(other) != hApiID(first), "a new key must store a new submission, got %d %s", other.Status, other.Text())
+	none := hApiSubmit(c, map[string]string{"name": "Ada"}, "")
 	ctx.Equal(none.Status, 400, "a POST without Idempotency-Key")
 	empty := c.Post("/v1/forms/f-1/submissions", map[string]any{"fields": map[string]string{"name": "Ada"}}, "Idempotency-Key", "")
 	ctx.Equal(empty.Status, 400, "a POST with an empty Idempotency-Key (an empty key is no key)")
-	ctx.Equal(apiCount(ctx), 2, "the keyless POSTs must store nothing; submissions")
+	ctx.Equal(hApiCount(ctx), 2, "the keyless POSTs must store nothing; submissions")
 }
 `,
     cpp: `#include <leetbuild/harness.h>

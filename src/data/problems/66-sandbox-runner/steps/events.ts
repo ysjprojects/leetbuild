@@ -829,36 +829,36 @@ import (
 )
 
 const (
-	eventsTopic  = "sandbox.job"
-	eventsCode   = "print(open('/data/patients.csv').read())"
-	eventsOutput = "name,ssn\\nAda,123-45-6789\\n"
+	kHEventsTopic  = "sandbox.job"
+	kHEventsCode   = "print(open('/data/patients.csv').read())"
+	kHEventsOutput = "name,ssn\\nAda,123-45-6789\\n"
 )
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func eventsJob(profile, used string) string {
-	jobID := jobs.Create(eventsBg, "t1", profile, nil, eventsCode).JobID
-	jobs.MarkRunning(eventsBg, jobID, used)
-	jobs.PutResult(eventsBg, jobID, 0, eventsOutput, 120, 64)
+func hEventsJob(profile, used string) string {
+	jobID := jobs.Create(hEventsBg, "t1", profile, nil, kHEventsCode).JobID
+	jobs.MarkRunning(hEventsBg, jobID, used)
+	jobs.PutResult(hEventsBg, jobID, 0, kHEventsOutput, 120, 64)
 	return jobID
 }
 
-func eventsPublish(ctx *harness.Ctx, jobID string) bool {
-	ok, err := publish(eventsBg, jobID, "finished")
+func hEventsPublish(ctx *harness.Ctx, jobID string) bool {
+	ok, err := publish(hEventsBg, jobID, "finished")
 	ctx.NoError(err, "publish(%s)", jobID)
 	return ok
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	var rows []HEventsRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -866,30 +866,30 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckJobKey(ctx *harness.Ctx) {
-	j1, j2 := eventsJob("gvisor", "gvisor"), eventsJob("gvisor", "gvisor")
-	_, err := publish(eventsBg, j1, "started")
+	j1, j2 := hEventsJob("gvisor", "gvisor"), hEventsJob("gvisor", "gvisor")
+	_, err := publish(hEventsBg, j1, "started")
 	ctx.NoError(err, "publish(%s, started)", j1)
-	_, err = publish(eventsBg, j2, "started")
+	_, err = publish(hEventsBg, j2, "started")
 	ctx.NoError(err, "publish(%s, started)", j2)
-	eventsPublish(ctx, j1)
+	hEventsPublish(ctx, j1)
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three publish calls must produce three records on sandbox.job; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{j1, j2, j1}, "the records must be keyed by the job ids")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{j1, j2, j1}, "the records must be keyed by the job ids")
 	ctx.Equal(records[0].Partition, records[2].Partition, "%s's started and finished must share a partition, or the audit consumer sees them out of order; the partitions", j1)
 }
 
 func CheckDigestPayload(ctx *harness.Ctx) {
-	jobID := eventsJob("gvisor", "kata")
-	eventsPublish(ctx, jobID)
+	jobID := hEventsJob("gvisor", "kata")
+	hEventsPublish(ctx, jobID)
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one publish must produce one record; the records")
 	var value map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the payload must be JSON")
 	ctx.Assert(value["job_id"] == jobID && value["stage"] == "finished" && value["tenant"] == "t1", "the payload is %s, expected job_id, stage and tenant", values[0])
-	ctx.Equal(value["code_digest"], jobs.Digest(eventsCode), "code_digest must be the SHA-256 of the code")
-	ctx.Equal(value["output_digest"], jobs.Digest(eventsOutput), "output_digest must be the SHA-256 of the output")
+	ctx.Equal(value["code_digest"], jobs.Digest(kHEventsCode), "code_digest must be the SHA-256 of the code")
+	ctx.Equal(value["output_digest"], jobs.Digest(kHEventsOutput), "output_digest must be the SHA-256 of the output")
 	ctx.Assert(value["profile"] == "kata" && value["exit_code"] == float64(0), "the payload must carry the used profile (kata) and the exit code, got %s", values[0])
 	ctx.Equal(value["usage"], map[string]any{"cpu_ms": 120, "mem_mb": 64}, "the payload's usage")
 	for _, secret := range []string{"123-45-6789", "name,ssn", "Ada", "patients.csv", "print(open"} {
@@ -898,35 +898,35 @@ func CheckDigestPayload(ctx *harness.Ctx) {
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	j1, j2 := eventsJob("gvisor", "gvisor"), eventsJob("gvisor", "gvisor")
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, j1)
+	j1, j2 := hEventsJob("gvisor", "gvisor"), hEventsJob("gvisor", "gvisor")
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish(ctx, j1)
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	eventsPublish(ctx, j2)
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hEventsPublish(ctx, j2)
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	j0, j1, j2 := eventsJob("gvisor", "gvisor"), eventsJob("gvisor", "gvisor"), eventsJob("gvisor", "gvisor")
-	ok := eventsPublish(ctx, j0)
+	j0, j1, j2 := hEventsJob("gvisor", "gvisor"), hEventsJob("gvisor", "gvisor"), hEventsJob("gvisor", "gvisor")
+	ok := hEventsPublish(ctx, j0)
 	ctx.Settle()
-	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0, "a delivered event answered %v and left the outbox %v, expected true and no row", ok, eventsOutbox(ctx))
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok = eventsPublish(ctx, j1)
+	ctx.Assert(ok && len(hEventsOutbox(ctx)) == 0, "a delivered event answered %v and left the outbox %v, expected true and no row", ok, hEventsOutbox(ctx))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok = hEventsPublish(ctx, j1)
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the job vanishes from the audit trail; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == j1 && rows[0].Payload["job_id"] == j1, "the outbox row is %v, expected the topic, the key %s and the payload", rows[0], j1)
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == j1 && rows[0].Payload["job_id"] == j1, "the outbox row is %v, expected the topic, the key %s and the payload", rows[0], j1)
 	ctx.Equal(ok, false, "publish's result after a failed delivery")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsPublish(ctx, j2)
+	ok = hEventsPublish(ctx, j2)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publish waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout (2 s), then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["job_id"] == j2, "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publish's result without a delivery report")
 }
@@ -942,18 +942,18 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "sandbox.job";
-const std::string kEventsCode = "print(open('/data/patients.csv').read())";
-const std::string kEventsOutput = "name,ssn\\nAda,123-45-6789\\n";
+const std::string kHEventsTopic = "sandbox.job";
+const std::string kHEventsCode = "print(open('/data/patients.csv').read())";
+const std::string kHEventsOutput = "name,ssn\\nAda,123-45-6789\\n";
 
-std::string eventsJob(const std::string& profile = "gvisor", const std::string& used = "gvisor") {
-  const std::string job_id = jobs::create("t1", profile, {}, kEventsCode).job_id;
+std::string hEventsJob(const std::string& profile = "gvisor", const std::string& used = "gvisor") {
+  const std::string job_id = jobs::create("t1", profile, {}, kHEventsCode).job_id;
   jobs::markRunning(job_id, used);
-  jobs::putResult(job_id, 0, kEventsOutput, 120, 64);
+  jobs::putResult(job_id, 0, kHEventsOutput, 120, 64);
   return job_id;
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -963,37 +963,37 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
+std::string hEventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckJobKey(harness::Ctx& ctx) {
-  const std::string j1 = eventsJob();
-  const std::string j2 = eventsJob();
+  const std::string j1 = hEventsJob();
+  const std::string j2 = hEventsJob();
   publish(j1, "started");
   publish(j2, "started");
   publish(j1, "finished");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three publish calls must produce three records on sandbox.job; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {j1, j2, j1}, "the records must be keyed by the job ids");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {j1, j2, j1}, "the records must be keyed by the job ids");
   ctx.Equal(records[0].Partition, records[2].Partition, "%s's started and finished must share a partition, or the audit consumer sees them out of order; the partitions", j1);
 }
 
 void CheckDigestPayload(harness::Ctx& ctx) {
-  const std::string job_id = eventsJob("gvisor", "kata");
+  const std::string job_id = hEventsJob("gvisor", "kata");
   publish(job_id, "finished");
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one publish must produce one record; the records");
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
-  ctx.Assert(eventsField(value, "job_id") == job_id && eventsField(value, "stage") == "finished" && eventsField(value, "tenant") == "t1",
+  ctx.Assert(hEventsField(value, "job_id") == job_id && hEventsField(value, "stage") == "finished" && hEventsField(value, "tenant") == "t1",
              "the payload is %s, expected job_id, stage and tenant", values[0]);
-  ctx.Equal(eventsField(value, "code_digest"), jobs::digest(kEventsCode), "code_digest must be the SHA-256 of the code");
-  ctx.Equal(eventsField(value, "output_digest"), jobs::digest(kEventsOutput), "output_digest must be the SHA-256 of the output");
-  ctx.Assert(eventsField(value, "profile") == "kata" && value.value("exit_code", -1) == 0, "the payload must carry the used profile (kata) and the exit code, got %s", values[0]);
+  ctx.Equal(hEventsField(value, "code_digest"), jobs::digest(kHEventsCode), "code_digest must be the SHA-256 of the code");
+  ctx.Equal(hEventsField(value, "output_digest"), jobs::digest(kHEventsOutput), "output_digest must be the SHA-256 of the output");
+  ctx.Assert(hEventsField(value, "profile") == "kata" && value.value("exit_code", -1) == 0, "the payload must carry the used profile (kata) and the exit code, got %s", values[0]);
   ctx.Equal(value.is_object() && value.contains("usage") ? value["usage"] : nlohmann::json(), nlohmann::json{{"cpu_ms", 120}, {"mem_mb", 64}}, "the payload's usage");
   for (const char* secret : {"123-45-6789", "name,ssn", "Ada", "patients.csv", "print(open"}) {
     ctx.Assert(values[0].find(secret) == std::string::npos, "the event carries the job's code or output (%s) into a retained, replicated topic: %s. Carry its digest", secret, values[0]);
@@ -1001,40 +1001,40 @@ void CheckDigestPayload(harness::Ctx& ctx) {
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  const std::string j1 = eventsJob();
-  const std::string j2 = eventsJob();
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  const std::string j1 = hEventsJob();
+  const std::string j2 = hEventsJob();
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
   publish(j1, "finished");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
   publish(j2, "finished");
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  const std::string j0 = eventsJob();
-  const std::string j1 = eventsJob();
-  const std::string j2 = eventsJob();
+  const std::string j0 = hEventsJob();
+  const std::string j1 = hEventsJob();
+  const std::string j2 = hEventsJob();
   bool ok = publish(j0, "finished");
   ctx.Settle();
-  ctx.Assert(ok && eventsOutbox(ctx).empty(), "a delivered event answered %v and left %d outbox rows, expected true and no row", ok, eventsOutbox(ctx).size());
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ctx.Assert(ok && hEventsOutbox(ctx).empty(), "a delivered event answered %v and left %d outbox rows, expected true and no row", ok, hEventsOutbox(ctx).size());
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   ok = publish(j1, "finished");
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the job vanishes from the audit trail; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == j1 && rows[0].contains("payload") && eventsField(rows[0]["payload"], "job_id") == j1,
+  ctx.Assert(hEventsField(rows[0], "topic") == kHEventsTopic && hEventsField(rows[0], "key") == j1 && rows[0].contains("payload") && hEventsField(rows[0]["payload"], "job_id") == j1,
              "the outbox row is %s, expected the topic, the key %s and the payload", rows[0].dump(), j1);
   ctx.Equal(ok, false, "publish's result after a failed delivery");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = publish(j2, "finished");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publish waited %.1f s for a broker that does not answer: wait for the report at most kAckTimeoutMs (2 s), then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "job_id") == j2, "no delivery report within the window and the outbox holds %d rows", rows.size());
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hEventsField(rows[1]["payload"], "job_id") == j2, "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publish's result without a delivery report");
 }
 `,

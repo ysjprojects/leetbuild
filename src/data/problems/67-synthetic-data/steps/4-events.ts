@@ -848,25 +848,25 @@ import (
 )
 
 const (
-	eventsTopic   = "synthetic.record"
-	eventsSeed    = "Marie Curie won Nobel Prizes in physics and in chemistry."
-	eventsText    = "Q: In which two sciences did Marie Curie win a Nobel Prize? A: Physics and chemistry."
-	eventsVersion = "judge-rm-2026.10"
+	kHEventsTopic   = "synthetic.record"
+	kHEventsSeed    = "Marie Curie won Nobel Prizes in physics and in chemistry."
+	kHEventsText    = "Q: In which two sciences did Marie Curie win a Nobel Prize? A: Physics and chemistry."
+	kHEventsVersion = "judge-rm-2026.10"
 )
 
-func eventsRecord(n int, recipe string) records.SyntheticRecord {
-	return records.SyntheticRecord{RecordID: "r-" + strconv.Itoa(n), JobID: "j1", RecipeID: recipe, EntityID: "e-curie", Seq: n, SeedText: eventsSeed, Text: eventsText}
+func hEventsRecord(n int, recipe string) records.SyntheticRecord {
+	return records.SyntheticRecord{RecordID: "r-" + strconv.Itoa(n), JobID: "j1", RecipeID: recipe, EntityID: "e-curie", Seq: n, SeedText: kHEventsSeed, Text: kHEventsText}
 }
 
-func eventsPublish(ctx *harness.Ctx, r records.SyntheticRecord) bool {
-	ok, err := publishAdmission(context.Background(), r, 0.87, eventsVersion)
+func hEventsPublish(ctx *harness.Ctx, r records.SyntheticRecord) bool {
+	ok, err := publishAdmission(context.Background(), r, 0.87, kHEventsVersion)
 	ctx.NoError(err, "publishAdmission(%s)", r.RecordID)
 	return ok
 }
 
-func eventsAll(ctx *harness.Ctx) []map[string]any {
+func hEventsAll(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
-	for _, v := range ctx.Kafka.Values(eventsTopic) {
+	for _, v := range ctx.Kafka.Values(kHEventsTopic) {
 		var e map[string]any
 		ctx.NoError(json.Unmarshal([]byte(v), &e), "the event is JSON: %s", v)
 		out = append(out, e)
@@ -874,7 +874,7 @@ func eventsAll(ctx *harness.Ctx) []map[string]any {
 	return out
 }
 
-func eventsOutbox(ctx *harness.Ctx) []map[string]any {
+func hEventsOutbox(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
 	for _, row := range ctx.Redis.LRange("synth:outbox", 0, -1) {
 		var e map[string]any
@@ -885,13 +885,13 @@ func eventsOutbox(ctx *harness.Ctx) []map[string]any {
 }
 
 func CheckRecipeKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsRecord(1, "qa-pairs"))
-	eventsPublish(ctx, eventsRecord(2, "summaries"))
-	eventsPublish(ctx, eventsRecord(3, "qa-pairs"))
+	hEventsPublish(ctx, hEventsRecord(1, "qa-pairs"))
+	hEventsPublish(ctx, hEventsRecord(2, "summaries"))
+	hEventsPublish(ctx, hEventsRecord(3, "qa-pairs"))
 	ctx.Settle()
-	recs := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(recs), 3, "three admissions must produce three records on %s; the records", eventsTopic)
-	keys := ctx.Kafka.Keys(eventsTopic)
+	recs := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(recs), 3, "three admissions must produce three records on %s; the records", kHEventsTopic)
+	keys := ctx.Kafka.Keys(kHEventsTopic)
 	sort.Strings(keys)
 	ctx.Equal(keys, []string{"qa-pairs", "qa-pairs", "summaries"}, "records must be keyed by recipe id (keyed by record, one recipe's records scatter across partitions)")
 	parts := map[int]bool{}
@@ -904,20 +904,20 @@ func CheckRecipeKey(ctx *harness.Ctx) {
 }
 
 func CheckSeedDigest(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsRecord(1, "qa-pairs"))
+	hEventsPublish(ctx, hEventsRecord(1, "qa-pairs"))
 	ctx.Settle()
-	all := eventsAll(ctx)
+	all := hEventsAll(ctx)
 	ctx.Equal(len(all), 1, "one admission; records")
-	ctx.Assert(all[0]["seed_digest"] != records.SeedDigest(eventsText), "seed_digest is the SHA-256 of the generated text: a reviewer cannot trace that to any seed; hash record.SeedText")
-	ctx.Equal(all[0], map[string]any{"record_id": "r-1", "job_id": "j1", "recipe_id": "qa-pairs", "entity_id": "e-curie", "seed_digest": records.SeedDigest(eventsSeed), "judge_score": 0.87, "judge_version": eventsVersion}, "the event must carry the ids, the seed digest, judge_score and judge_version, nothing else")
+	ctx.Assert(all[0]["seed_digest"] != records.SeedDigest(kHEventsText), "seed_digest is the SHA-256 of the generated text: a reviewer cannot trace that to any seed; hash record.SeedText")
+	ctx.Equal(all[0], map[string]any{"record_id": "r-1", "job_id": "j1", "recipe_id": "qa-pairs", "entity_id": "e-curie", "seed_digest": records.SeedDigest(kHEventsSeed), "judge_score": 0.87, "judge_version": kHEventsVersion}, "the event must carry the ids, the seed digest, judge_score and judge_version, nothing else")
 }
 
 func CheckNoContent(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	publishAdmission(context.Background(), eventsRecord(1, "qa-pairs"), 0.87, eventsVersion)
-	publishAdmission(context.Background(), eventsRecord(2, "qa-pairs"), 0.87, eventsVersion)
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	publishAdmission(context.Background(), hEventsRecord(1, "qa-pairs"), 0.87, kHEventsVersion)
+	publishAdmission(context.Background(), hEventsRecord(2, "qa-pairs"), 0.87, kHEventsVersion)
 	ctx.Settle()
-	for _, value := range ctx.Kafka.Values(eventsTopic) {
+	for _, value := range ctx.Kafka.Values(kHEventsTopic) {
 		ctx.Assert(!strings.Contains(value, "Marie Curie"), "the event carries generated or seed text: %s; the topic is retained and replicated, ids and digests only", value)
 	}
 	for _, row := range ctx.Redis.LRange("synth:outbox", 0, -1) {
@@ -926,37 +926,37 @@ func CheckNoContent(ctx *harness.Ctx) {
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, eventsRecord(1, "qa-pairs"))
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish(ctx, hEventsRecord(1, "qa-pairs"))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsPublish(ctx, eventsRecord(1, "qa-pairs"))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok := hEventsPublish(ctx, hEventsRecord(1, "qa-pairs"))
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused one event: the refusal arrives in the delivery report, after Produce returned; outbox rows")
 	ctx.Assert(rows[0]["record_id"] == "r-1" && rows[0]["recipe_id"] == "qa-pairs", "the outbox row must be the event itself, got %v", rows[0])
 	ctx.Equal(ok, false, "publishAdmission's result for an event the broker refused")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "nothing reached the topic for the refused event; records")
-	ctx.Equal(eventsPublish(ctx, eventsRecord(2, "qa-pairs")), true, "a healthy produce returns true once the broker acknowledged it")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 0, "nothing reached the topic for the refused event; records")
+	ctx.Equal(hEventsPublish(ctx, hEventsRecord(2, "qa-pairs")), true, "a healthy produce returns true once the broker acknowledged it")
 	ctx.Settle()
-	ctx.Assert(len(ctx.Kafka.Records(eventsTopic)) == 1 && len(eventsOutbox(ctx)) == 1, "a healthy produce after the failure reaches the topic and adds no outbox row")
-	ctx.Kafka.StallFor(eventsTopic, 1.0)
-	ctx.Equal(eventsPublish(ctx, eventsRecord(3, "qa-pairs")), true, "a broker that acknowledges after 1 s is within the 2 s window: the call waits for the delivery report; publishAdmission's result")
+	ctx.Assert(len(ctx.Kafka.Records(kHEventsTopic)) == 1 && len(hEventsOutbox(ctx)) == 1, "a healthy produce after the failure reaches the topic and adds no outbox row")
+	ctx.Kafka.StallFor(kHEventsTopic, 1.0)
+	ctx.Equal(hEventsPublish(ctx, hEventsRecord(3, "qa-pairs")), true, "a broker that acknowledges after 1 s is within the 2 s window: the call waits for the delivery report; publishAdmission's result")
 	ctx.Settle()
-	ctx.Assert(len(ctx.Kafka.Records(eventsTopic)) == 2 && len(eventsOutbox(ctx)) == 1, "an event acknowledged within the window reaches the topic and writes no outbox row (the relay would publish it twice): the topic holds %d records, the outbox %d rows", len(ctx.Kafka.Records(eventsTopic)), len(eventsOutbox(ctx)))
-	ctx.Kafka.Stall(eventsTopic)
+	ctx.Assert(len(ctx.Kafka.Records(kHEventsTopic)) == 2 && len(hEventsOutbox(ctx)) == 1, "an event acknowledged within the window reaches the topic and writes no outbox row (the relay would publish it twice): the topic holds %d records, the outbox %d rows", len(ctx.Kafka.Records(kHEventsTopic)), len(hEventsOutbox(ctx)))
+	ctx.Kafka.Stall(kHEventsTopic)
 	started := ctx.Clock.Now()
-	late := eventsPublish(ctx, eventsRecord(4, "qa-pairs"))
+	late := hEventsPublish(ctx, hEventsRecord(4, "qa-pairs"))
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(waited <= 2.5, "the broker stopped answering and publishAdmission waited %.1f s: the delivery report gets at most 2 s", waited)
 	ctx.Equal(late, false, "no delivery report within 2 s; publishAdmission's result")
-	all := eventsOutbox(ctx)
+	all := hEventsOutbox(ctx)
 	ctx.Equal(len(all), 2, "a missing delivery report writes the event to the outbox like a refused one (%v); outbox rows", all)
-	ctx.Equal(all[1], map[string]any{"record_id": "r-4", "job_id": "j1", "recipe_id": "qa-pairs", "entity_id": "e-curie", "seed_digest": records.SeedDigest(eventsSeed), "judge_score": 0.87, "judge_version": eventsVersion}, "the outbox row for a missing delivery report must be the whole event")
+	ctx.Equal(all[1], map[string]any{"record_id": "r-4", "job_id": "j1", "recipe_id": "qa-pairs", "entity_id": "e-curie", "seed_digest": records.SeedDigest(kHEventsSeed), "judge_score": 0.87, "judge_version": kHEventsVersion}, "the outbox row for a missing delivery report must be the whole event")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -978,17 +978,17 @@ const std::string hSeed = "Marie Curie won Nobel Prizes in physics and in chemis
 const std::string hText = "Q: In which two sciences did Marie Curie win a Nobel Prize? A: Physics and chemistry.";
 const std::string hVersion = "judge-rm-2026.10";
 
-records::SyntheticRecord eventsRecord(int n, const std::string& recipe = "qa-pairs") {
+records::SyntheticRecord hEventsRecord(int n, const std::string& recipe = "qa-pairs") {
   return {"r-" + std::to_string(n), "j1", recipe, "e-curie", n, hSeed, hText};
 }
 
-std::vector<nlohmann::json> eventsAll(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsAll(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
   for (const auto& v : ctx.Kafka.Values(hTopic)) out.push_back(nlohmann::json::parse(v, nullptr, false));
   return out;
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
   for (const auto& row : ctx.Redis.LRange("synth:outbox", 0, -1)) out.push_back(nlohmann::json::parse(row, nullptr, false));
   return out;
@@ -997,9 +997,9 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckRecipeKey(harness::Ctx& ctx) {
-  publish_admission(eventsRecord(1, "qa-pairs"), 0.87, hVersion);
-  publish_admission(eventsRecord(2, "summaries"), 0.87, hVersion);
-  publish_admission(eventsRecord(3, "qa-pairs"), 0.87, hVersion);
+  publish_admission(hEventsRecord(1, "qa-pairs"), 0.87, hVersion);
+  publish_admission(hEventsRecord(2, "summaries"), 0.87, hVersion);
+  publish_admission(hEventsRecord(3, "qa-pairs"), 0.87, hVersion);
   ctx.Settle();
   producer->poll(0);
   const auto recs = ctx.Kafka.Records(hTopic);
@@ -1015,10 +1015,10 @@ void CheckRecipeKey(harness::Ctx& ctx) {
 }
 
 void CheckSeedDigest(harness::Ctx& ctx) {
-  publish_admission(eventsRecord(1), 0.87, hVersion);
+  publish_admission(hEventsRecord(1), 0.87, hVersion);
   ctx.Settle();
   producer->poll(0);
-  const auto all = eventsAll(ctx);
+  const auto all = hEventsAll(ctx);
   ctx.Equal(all.size(), 1, "one admission; records");
   ctx.Assert(all[0].value("seed_digest", "") != records::seed_digest(hText), "seed_digest is the SHA-256 of the generated text: a reviewer cannot trace that to any seed; hash record.seed_text");
   ctx.Equal(all[0], nlohmann::json({{"record_id", "r-1"}, {"job_id", "j1"}, {"recipe_id", "qa-pairs"}, {"entity_id", "e-curie"}, {"seed_digest", records::seed_digest(hSeed)}, {"judge_score", 0.87}, {"judge_version", hVersion}}),
@@ -1027,8 +1027,8 @@ void CheckSeedDigest(harness::Ctx& ctx) {
 
 void CheckNoContent(harness::Ctx& ctx) {
   ctx.Kafka.FailNext(hTopic, 1);
-  publish_admission(eventsRecord(1), 0.87, hVersion);
-  publish_admission(eventsRecord(2), 0.87, hVersion);
+  publish_admission(hEventsRecord(1), 0.87, hVersion);
+  publish_admission(hEventsRecord(2), 0.87, hVersion);
   ctx.Settle();
   producer->poll(0);
   for (const auto& value : ctx.Kafka.Values(hTopic)) {
@@ -1041,7 +1041,7 @@ void CheckNoContent(harness::Ctx& ctx) {
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks(hTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publish_admission(eventsRecord(1), 0.87, hVersion);
+  publish_admission(hEventsRecord(1), 0.87, hVersion);
   ctx.Settle();
   producer->poll(0);
   ctx.Equal(ctx.Kafka.Records(hTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
@@ -1051,31 +1051,31 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   ctx.Kafka.FailNext(hTopic, 1);
   bool ok = true;
   try {
-    ok = publish_admission(eventsRecord(1), 0.87, hVersion);
+    ok = publish_admission(hEventsRecord(1), 0.87, hVersion);
   } catch (const std::exception& e) {
     ctx.Fatalf("publish_admission threw when the broker refused the event: %s; the event goes to the outbox, the worker goes on", e.what());
   }
   ctx.Settle();
   producer->poll(0);  // the worker's loop serves delivery reports between records
-  const auto rows = eventsOutbox(ctx);
+  const auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused one event: the refusal arrives in the delivery report, after produce returned; outbox rows");
   ctx.Assert(!rows.empty() && rows[0].value("record_id", "") == "r-1" && rows[0].value("recipe_id", "") == "qa-pairs", "the outbox row must be the event itself, got %v", rows.empty() ? nlohmann::json() : rows[0]);
   ctx.Equal(ok, false, "publish_admission's result for an event the broker refused");
   ctx.Equal(ctx.Kafka.Records(hTopic).size(), 0, "nothing reached the topic for the refused event; records");
-  ctx.Equal(publish_admission(eventsRecord(2), 0.87, hVersion), true, "a healthy produce returns true once the broker acknowledged it");
+  ctx.Equal(publish_admission(hEventsRecord(2), 0.87, hVersion), true, "a healthy produce returns true once the broker acknowledged it");
   ctx.Settle();
-  ctx.Assert(ctx.Kafka.Records(hTopic).size() == 1 && eventsOutbox(ctx).size() == 1, "a healthy produce after the failure reaches the topic and adds no outbox row");
+  ctx.Assert(ctx.Kafka.Records(hTopic).size() == 1 && hEventsOutbox(ctx).size() == 1, "a healthy produce after the failure reaches the topic and adds no outbox row");
   ctx.Kafka.StallFor(hTopic, 1.0);
-  ctx.Equal(publish_admission(eventsRecord(3), 0.87, hVersion), true, "a broker that acknowledges after 1 s is within the 2 s window: the call waits for the delivery report; publish_admission's result");
+  ctx.Equal(publish_admission(hEventsRecord(3), 0.87, hVersion), true, "a broker that acknowledges after 1 s is within the 2 s window: the call waits for the delivery report; publish_admission's result");
   ctx.Settle();
-  ctx.Assert(ctx.Kafka.Records(hTopic).size() == 2 && eventsOutbox(ctx).size() == 1, "an event acknowledged within the window reaches the topic and writes no outbox row (the relay would publish it twice): the topic holds %d records, the outbox %d rows", ctx.Kafka.Records(hTopic).size(), eventsOutbox(ctx).size());
+  ctx.Assert(ctx.Kafka.Records(hTopic).size() == 2 && hEventsOutbox(ctx).size() == 1, "an event acknowledged within the window reaches the topic and writes no outbox row (the relay would publish it twice): the topic holds %d records, the outbox %d rows", ctx.Kafka.Records(hTopic).size(), hEventsOutbox(ctx).size());
   ctx.Kafka.Stall(hTopic);
   const int64_t started = ctx.Clock.Now();
-  const bool late = publish_admission(eventsRecord(4), 0.87, hVersion);
+  const bool late = publish_admission(hEventsRecord(4), 0.87, hVersion);
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(waited <= 2.5, "the broker stopped answering and publish_admission waited %.1f s: the delivery report gets at most 2 s", waited);
   ctx.Equal(late, false, "no delivery report within 2 s; publish_admission's result");
-  const auto all = eventsOutbox(ctx);
+  const auto all = hEventsOutbox(ctx);
   ctx.Equal(all.size(), 2, "a missing delivery report writes the event to the outbox like a refused one (%v); outbox rows", all);
   ctx.Equal(all.empty() ? nlohmann::json() : all.back(), nlohmann::json({{"record_id", "r-4"}, {"job_id", "j1"}, {"recipe_id", "qa-pairs"}, {"entity_id", "e-curie"}, {"seed_digest", records::seed_digest(hSeed)}, {"judge_score", 0.87}, {"judge_version", hVersion}}),
             "the outbox row for a missing delivery report must be the whole event");

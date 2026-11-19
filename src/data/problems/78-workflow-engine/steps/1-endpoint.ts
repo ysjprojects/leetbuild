@@ -1017,11 +1017,11 @@ func CheckBounds(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kV3 = R"({"name": "signup", "version": 3, "steps": ["create_account", "send_welcome"], "edges": [["create_account", "send_welcome"]]})";
-const std::string kV4 =
+const std::string kHV3 = R"({"name": "signup", "version": 3, "steps": ["create_account", "send_welcome"], "edges": [["create_account", "send_welcome"]]})";
+const std::string kHV4 =
     R"({"name": "signup", "version": 4, "steps": ["create_account", "send_welcome", "notify_sales"], "edges": [["create_account", "send_welcome"], ["send_welcome", "notify_sales"]]})";
-const std::vector<std::string> kV3Steps = {"create_account", "send_welcome"};
-const std::vector<std::vector<std::string>> kV3Edges = {{"create_account", "send_welcome"}};
+const std::vector<std::string> kHV3Steps = {"create_account", "send_welcome"};
+const std::vector<std::vector<std::string>> kHV3Edges = {{"create_account", "send_welcome"}};
 
 harness::HTTP hEndpointApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
@@ -1039,7 +1039,7 @@ std::string hRunBody(long version, const nlohmann::json& input, long max_steps) 
   return nlohmann::json{{"workflow", "signup"}, {"version", version}, {"input", input}, {"max_steps", max_steps}}.dump();
 }
 
-const nlohmann::json kEmail = {{"email", "ada@example.com"}};
+const nlohmann::json kHEmail = {{"email", "ada@example.com"}};
 
 }  // namespace
 
@@ -1048,14 +1048,14 @@ void CheckCycle(harness::Ctx& ctx) {
   auto r = hPost(c, "/v1/workflows", R"({"name": "loop", "version": 1, "steps": ["a", "b", "c"], "edges": [["a", "b"], ["b", "c"], ["c", "a"]]})");
   ctx.Equal(r.Status, 422, "publishing a graph whose edges run a → b → c → a (a run of it never reaches a last step); the status");
   ctx.Assert(!definitions::get("loop", 1), "the cyclic graph was stored");
-  r = hPost(c, "/v1/workflows", kV3);
+  r = hPost(c, "/v1/workflows", kHV3);
   ctx.Equal(r.Status, 201, "publishing an acyclic graph (%s); the status", r.Text());
   ctx.Assert(definitions::get("signup", 3).has_value(), "the acyclic graph must be stored");
 }
 
 void CheckImmutable(harness::Ctx& ctx) {
   auto c = hEndpointApi(ctx);
-  auto r = hPost(c, "/v1/workflows", kV3);
+  auto r = hPost(c, "/v1/workflows", kHV3);
   ctx.Equal(r.Status, 201, "the first publish of signup v3 (%s); the status", r.Text());
   r = hPost(c, "/v1/workflows", R"({"name": "signup", "version": 3, "steps": ["create_account"], "edges": []})");
   ctx.Equal(r.Status, 409, "re-publishing signup v3 with other steps; the status");
@@ -1063,8 +1063,8 @@ void CheckImmutable(harness::Ctx& ctx) {
   ctx.Equal(r.Status, 409, "re-publishing signup v3 with its steps but other edges (an existing (name, version) is never written again); the status");
   const auto stored = definitions::get("signup", 3);
   ctx.Assert(stored.has_value(), "signup v3 must stay stored");
-  ctx.Equal(stored->steps, kV3Steps, "re-publishing signup v3 must not rewrite it (every run pinned to v3 would run other steps); its steps");
-  ctx.Equal(stored->edges, kV3Edges, "re-publishing signup v3 must not rewrite it (every run pinned to v3 would run another graph); its edges");
+  ctx.Equal(stored->steps, kHV3Steps, "re-publishing signup v3 must not rewrite it (every run pinned to v3 would run other steps); its steps");
+  ctx.Equal(stored->edges, kHV3Edges, "re-publishing signup v3 must not rewrite it (every run pinned to v3 would run another graph); its edges");
   r = hPost(c, "/v1/workflows", R"({"name": "signup", "version": 2, "steps": ["create_account", "send_welcome"], "edges": [["create_account", "send_welcome"]]})");
   ctx.Equal(r.Status, 201, "publishing signup v2, never published, after v3 (only an existing (name, version) is a conflict); the status");
   ctx.Assert(definitions::get("signup", 2).has_value(), "signup v2 must be stored");
@@ -1072,22 +1072,22 @@ void CheckImmutable(harness::Ctx& ctx) {
 
 void CheckPin(harness::Ctx& ctx) {
   auto c = hEndpointApi(ctx);
-  hPost(c, "/v1/workflows", kV3);
-  hPost(c, "/v1/workflows", kV4);
-  auto r = hPost(c, "/v1/runs", hRunBody(3, kEmail, 50));
+  hPost(c, "/v1/workflows", kHV3);
+  hPost(c, "/v1/workflows", kHV4);
+  auto r = hPost(c, "/v1/runs", hRunBody(3, kHEmail, 50));
   ctx.Equal(r.Status, 202, "starting a run of signup v3 (%s); the status", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
-  const bool pinned = body.is_object() && body.value("definition_version", 0L) == 3 && body.value("pinned_steps", std::vector<std::string>{}) == kV3Steps;
+  const bool pinned = body.is_object() && body.value("definition_version", 0L) == 3 && body.value("pinned_steps", std::vector<std::string>{}) == kHV3Steps;
   ctx.Assert(pinned, "a run that asked for signup v3 answered %s: it must pin version 3 and its steps, whatever was published later", r.Text());
   const auto stored = runs::get(body.value("run_id", ""));
-  ctx.Assert(stored && stored->definition_version == 3 && stored->pinned_steps == kV3Steps, "the stored run must hold version 3 and its steps");
-  r = hPost(c, "/v1/runs", hRunBody(9, kEmail, 50));
+  ctx.Assert(stored && stored->definition_version == 3 && stored->pinned_steps == kHV3Steps, "the stored run must hold version 3 and its steps");
+  r = hPost(c, "/v1/runs", hRunBody(9, kHEmail, 50));
   ctx.Equal(r.Status, 404, "a run of signup v9, never published; the status");
 }
 
 void CheckBounds(harness::Ctx& ctx) {
   auto c = hEndpointApi(ctx);
-  hPost(c, "/v1/workflows", kV3);
+  hPost(c, "/v1/workflows", kHV3);
   auto r = hPost(c, "/v1/runs", hRunBody(3, nlohmann::json{{"blob", std::string(70000, 'x')}}, 50));
   ctx.Equal(r.Status, 413, "a 70 KB input (kMaxInputBytes = 1 << 16); the status");
   std::string accented;
@@ -1099,9 +1099,9 @@ void CheckBounds(harness::Ctx& ctx) {
     ctx.Equal(r.Status, 400, "max_steps %d (1..kMaxSteps = 500); the status", budget);
   }
   ctx.Equal(ctx.Redis.Keys("run:run-*"), std::vector<std::string>{}, "rejected requests must not write run records; the run keys");
-  r = hPost(c, "/v1/runs", hRunBody(3, kEmail, 500));
+  r = hPost(c, "/v1/runs", hRunBody(3, kHEmail, 500));
   ctx.Equal(r.Status, 202, "max_steps 500 with a small input (%s); the status", r.Text());
-  r = hPost(c, "/v1/runs", hRunBody(3, kEmail, 1));
+  r = hPost(c, "/v1/runs", hRunBody(3, kHEmail, 1));
   ctx.Equal(r.Status, 202, "max_steps 1 (1..kMaxSteps = 500; %s); the status", r.Text());
   const size_t pad = (size_t{1} << 16) - nlohmann::json{{"blob", ""}}.dump().size();
   r = hPost(c, "/v1/runs", hRunBody(3, nlohmann::json{{"blob", std::string(pad, 'x')}}, 50));

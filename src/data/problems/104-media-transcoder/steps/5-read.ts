@@ -747,9 +747,9 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-type jobView struct {
+type HJobView struct {
 	JobID             string \`json:"job_id"\`
 	State             string \`json:"state"\`
 	SegmentCount      int    \`json:"segment_count"\`
@@ -763,14 +763,14 @@ type jobView struct {
 	} \`json:"renditions"\`
 }
 
-func readerJob(duration float64) *jobs.Job {
+func hReaderJob(duration float64) *jobs.Job {
 	args, _ := presets.EncoderArgs("h264-720p")
-	return jobs.Create(readBg, "t-1", "s3://uploads/talk.mov", "9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f", duration, "h264-720p", args, "renditions", "talks/42")
+	return jobs.Create(hReadBg, "t-1", "s3://uploads/talk.mov", "9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f", duration, "h264-720p", args, "renditions", "talks/42")
 }
 
-func markAll(job *jobs.Job, indices ...int) {
+func hMarkAll(job *jobs.Job, indices ...int) {
 	for _, i := range indices {
-		segments.MarkDone(readBg, job.JobID, i)
+		segments.MarkDone(hReadBg, job.JobID, i)
 	}
 }
 
@@ -780,17 +780,17 @@ func harnessReader(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func harnessView(ctx *harness.Ctx, c *harness.HTTP, jobID string) jobView {
+func harnessView(ctx *harness.Ctx, c *harness.HTTP, jobID string) HJobView {
 	r := c.Get("/v1/transcodes/"+jobID, "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 200, "the owner's read of %s (%s)", jobID, r.Text())
-	var v jobView
+	var v HJobView
 	r.Decode(&v)
 	return v
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	job := readerJob(18)
-	markAll(job, 0)
+	job := hReaderJob(18)
+	hMarkAll(job, 0)
 	v := harnessView(ctx, harnessReader(ctx), job.JobID)
 	ctx.Assert(v.JobID == job.JobID && v.SegmentCount == 3 && v.CompletedSegments == 1, "a 3-segment job with segment 0 done answered %+v", v)
 	ctx.Equal(v.State, "processing", "a job with 1 of 3 segments done; its state")
@@ -798,39 +798,39 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckDoneManifest(ctx *harness.Ctx) {
-	job := readerJob(600)
+	job := hReaderJob(600)
 	for i := 0; i < 100; i++ {
 		if i != 57 {
-			markAll(job, i)
+			hMarkAll(job, i)
 		}
 	}
 	c := harnessReader(ctx)
 	v := harnessView(ctx, c, job.JobID)
 	ctx.Assert(v.CompletedSegments == 99 && v.State == "processing", "a 100-segment job with segment 57 missing reads as %q (%d completed): done means every segment exists, not 99 %%", v.State, v.CompletedSegments)
-	markAll(job, 57)
+	hMarkAll(job, 57)
 	ctx.Equal(harnessView(ctx, c, job.JobID).State, "done", "with every segment done, the state")
 }
 
 func CheckFailedIndices(ctx *harness.Ctx) {
-	job := readerJob(30)
-	markAll(job, 0, 1, 3)
-	segments.MarkFailed(readBg, job.JobID, 4)
-	segments.MarkFailed(readBg, job.JobID, 2)
+	job := hReaderJob(30)
+	hMarkAll(job, 0, 1, 3)
+	segments.MarkFailed(hReadBg, job.JobID, 4)
+	segments.MarkFailed(hReadBg, job.JobID, 2)
 	v := harnessView(ctx, harnessReader(ctx), job.JobID)
 	ctx.Equal(v.FailedSegments, []int{2, 4}, "segments 4 and 2 failed; failed_segments")
 	ctx.Equal(v.State, "failed", "a job with failed segments; its state")
 	// Every segment has a done mark, but segment 1 also failed: a failure still fails the job.
 	args, _ := presets.EncoderArgs("h264-720p")
-	other := jobs.Create(readBg, "t-1", "s3://uploads/talk.mov", "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c", 18, "h264-720p", args, "renditions", "talks/43")
-	markAll(other, 0, 1, 2)
-	segments.MarkFailed(readBg, other.JobID, 1)
+	other := jobs.Create(hReadBg, "t-1", "s3://uploads/talk.mov", "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c", 18, "h264-720p", args, "renditions", "talks/43")
+	hMarkAll(other, 0, 1, 2)
+	segments.MarkFailed(hReadBg, other.JobID, 1)
 	mixed := harnessView(ctx, harnessReader(ctx), other.JobID)
 	ctx.Assert(mixed.State == "failed" && len(mixed.FailedSegments) == 1 && mixed.FailedSegments[0] == 1, "a job whose segments are all done but whose segment 1 failed reads as %q with failed_segments %v: any failed segment makes the state failed", mixed.State, mixed.FailedSegments)
 }
 
 func CheckOwner404(ctx *harness.Ctx) {
-	job := readerJob(18)
-	markAll(job, 0, 1, 2)
+	job := hReaderJob(18)
+	hMarkAll(job, 0, 1, 2)
 	c := harnessReader(ctx)
 	foreign := c.Get("/v1/transcodes/"+job.JobID, "X-Tenant-Id", "t-2")
 	missing := c.Get("/v1/transcodes/tj-999", "X-Tenant-Id", "t-2")
@@ -840,12 +840,12 @@ func CheckOwner404(ctx *harness.Ctx) {
 }
 
 func CheckSignedRenditions(ctx *harness.Ctx) {
-	job := readerJob(18)
-	markAll(job, 0, 1)
+	job := hReaderJob(18)
+	hMarkAll(job, 0, 1)
 	c := harnessReader(ctx)
 	ctx.Equal(len(harnessView(ctx, c, job.JobID).Renditions), 0, "a job still processing must list no renditions; renditions")
-	markAll(job, 2)
-	jobs.FinalizeJob(readBg, job.JobID, []jobs.Rendition{{Preset: "h264-720p", Key: jobs.OutputKey(job), DurationS: 18}})
+	hMarkAll(job, 2)
+	jobs.FinalizeJob(hReadBg, job.JobID, []jobs.Rendition{{Preset: "h264-720p", Key: jobs.OutputKey(job), DurationS: 18}})
 	v := harnessView(ctx, c, job.JobID)
 	ctx.Assert(len(v.Renditions) == 1, "a done job must list its rendition, got %+v", v.Renditions)
 	r := v.Renditions[0]
@@ -876,11 +876,11 @@ func CheckSignedRenditions(ctx *harness.Ctx) {
 
 namespace {
 
-jobs::Job readerJob(double duration) {
+jobs::Job hReaderJob(double duration) {
   return jobs::create("t-1", "s3://uploads/talk.mov", std::string(64, 'f'), duration, "h264-720p", *presets::encoderArgs("h264-720p"), "renditions", "talks/42");
 }
 
-void markAll(const jobs::Job& job, const std::vector<int>& indices) {
+void hMarkAll(const jobs::Job& job, const std::vector<int>& indices) {
   for (int i : indices) segments::markDone(job.job_id, i);
 }
 
@@ -903,8 +903,8 @@ nlohmann::json harnessView(harness::Ctx& ctx, harness::HTTP& c, const std::strin
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  const jobs::Job job = readerJob(18);
-  markAll(job, {0});
+  const jobs::Job job = hReaderJob(18);
+  hMarkAll(job, {0});
   auto c = harnessReader(ctx);
   const auto v = harnessView(ctx, c, job.job_id);
   ctx.Assert(v.value("job_id", "") == job.job_id && v.value("segment_count", 0) == 3 && v.value("completed_segments", 0) == 1, "a 3-segment job with segment 0 done answered %s", v.dump());
@@ -913,22 +913,22 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckDoneManifest(harness::Ctx& ctx) {
-  const jobs::Job job = readerJob(600);
+  const jobs::Job job = hReaderJob(600);
   std::vector<int> all_but_57;
   for (int i = 0; i < 100; i++) {
     if (i != 57) all_but_57.push_back(i);
   }
-  markAll(job, all_but_57);
+  hMarkAll(job, all_but_57);
   auto c = harnessReader(ctx);
   const auto v = harnessView(ctx, c, job.job_id);
   ctx.Assert(v.value("completed_segments", 0) == 99 && v.value("state", "") == "processing", "a 100-segment job with segment 57 missing reads as %s (%d completed): done means every segment exists, not 99 percent", v.value("state", ""), v.value("completed_segments", 0));
-  markAll(job, {57});
+  hMarkAll(job, {57});
   ctx.Equal(harnessView(ctx, c, job.job_id).value("state", ""), "done", "with every segment done, the state");
 }
 
 void CheckFailedIndices(harness::Ctx& ctx) {
-  const jobs::Job job = readerJob(30);
-  markAll(job, {0, 1, 3});
+  const jobs::Job job = hReaderJob(30);
+  hMarkAll(job, {0, 1, 3});
   segments::markFailed(job.job_id, 4);
   segments::markFailed(job.job_id, 2);
   auto c = harnessReader(ctx);
@@ -937,15 +937,15 @@ void CheckFailedIndices(harness::Ctx& ctx) {
   ctx.Equal(v.value("state", ""), "failed", "a job with failed segments; its state");
   // Every segment has a done mark, but segment 1 also failed: a failure still fails the job.
   const jobs::Job other = jobs::create("t-1", "s3://uploads/talk.mov", std::string(64, '7'), 18, "h264-720p", *presets::encoderArgs("h264-720p"), "renditions", "talks/43");
-  markAll(other, {0, 1, 2});
+  hMarkAll(other, {0, 1, 2});
   segments::markFailed(other.job_id, 1);
   const auto mixed = harnessView(ctx, c, other.job_id);
   ctx.Assert(mixed.value("state", "") == "failed" && mixed.value("failed_segments", std::vector<int>{}) == std::vector<int>{1}, "a job whose segments are all done but whose segment 1 failed answered %s: any failed segment makes the state failed", mixed.dump());
 }
 
 void CheckOwner404(harness::Ctx& ctx) {
-  const jobs::Job job = readerJob(18);
-  markAll(job, {0, 1, 2});
+  const jobs::Job job = hReaderJob(18);
+  hMarkAll(job, {0, 1, 2});
   auto c = harnessReader(ctx);
   const auto foreign = c.Get("/v1/transcodes/" + job.job_id, "X-Tenant-Id", "t-2");
   const auto missing = c.Get("/v1/transcodes/tj-999", "X-Tenant-Id", "t-2");
@@ -955,11 +955,11 @@ void CheckOwner404(harness::Ctx& ctx) {
 }
 
 void CheckSignedRenditions(harness::Ctx& ctx) {
-  const jobs::Job job = readerJob(18);
-  markAll(job, {0, 1});
+  const jobs::Job job = hReaderJob(18);
+  hMarkAll(job, {0, 1});
   auto c = harnessReader(ctx);
   ctx.Equal(harnessView(ctx, c, job.job_id).value("renditions", nlohmann::json::array()).size(), size_t{0}, "a job still processing must list no renditions; renditions");
-  markAll(job, {2});
+  hMarkAll(job, {2});
   jobs::finalizeJob(job.job_id, {{"h264-720p", jobs::outputKey(job), 18}});
   const auto v = harnessView(ctx, c, job.job_id);
   const auto renditions = v.value("renditions", nlohmann::json::array());

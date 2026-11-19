@@ -760,26 +760,26 @@ import (
 )
 
 var (
-	clientBg   = context.Background()
-	clientRows = map[string]int64{"p-0": 250, "p-1": 240, "p-2": 260}
-	clientLoad = store.Load{LoadID: "ld-1", Tenant: "acme", Dataset: "orders", Version: "2026-10-20", Target: "wh_acme.orders", Mode: "merge",
+	hClientBg   = context.Background()
+	hClientRows = map[string]int64{"p-0": 250, "p-1": 240, "p-2": 260}
+	hClientLoad = store.Load{LoadID: "ld-1", Tenant: "acme", Dataset: "orders", Version: "2026-10-20", Target: "wh_acme.orders", Mode: "merge",
 		Transform: "dedupe", SQL: "SELECT DISTINCT * FROM source", Partitions: 3, RowsPlanned: 750, RowsRead: 750, Status: "loading"}
 )
 
-type clientRow struct {
+type HClientRow struct {
 	target, loadID, mergeKey string
 	rows                     int64
 }
 
 // warehousePeer has one table per target: an INSERT adds the partition's rows, a MERGE first drops
 // what its merge key wrote. While loseReply > 0 a write lands and its reply is lost (UNAVAILABLE).
-type warehousePeer struct {
+type HWarehousePeer struct {
 	pb.UnimplementedWarehouseServer
-	rows      []clientRow
+	rows      []HClientRow
 	loseReply int
 }
 
-func (w *warehousePeer) WritePartition(_ context.Context, req *pb.WriteRequest) (*pb.WriteReply, error) {
+func (w *HWarehousePeer) WritePartition(_ context.Context, req *pb.WriteRequest) (*pb.WriteReply, error) {
 	if req.GetMergeKey() != "" {
 		kept := w.rows[:0]
 		for _, r := range w.rows {
@@ -789,11 +789,11 @@ func (w *warehousePeer) WritePartition(_ context.Context, req *pb.WriteRequest) 
 		}
 		w.rows = kept
 	}
-	rows, ok := clientRows[req.GetPartitionId()]
+	rows, ok := hClientRows[req.GetPartitionId()]
 	if !ok {
 		rows = 100
 	}
-	w.rows = append(w.rows, clientRow{req.GetTarget(), req.GetLoadId(), req.GetMergeKey(), rows})
+	w.rows = append(w.rows, HClientRow{req.GetTarget(), req.GetLoadId(), req.GetMergeKey(), rows})
 	if w.loseReply > 0 {
 		w.loseReply--
 		return nil, status.Error(codes.Unavailable, "connection reset before the reply")
@@ -801,7 +801,7 @@ func (w *warehousePeer) WritePartition(_ context.Context, req *pb.WriteRequest) 
 	return &pb.WriteReply{RowsWritten: rows}, nil
 }
 
-func (w *warehousePeer) held(target, loadID string) int64 {
+func (w *HWarehousePeer) held(target, loadID string) int64 {
 	var sum int64
 	for _, r := range w.rows {
 		if r.target == target && r.loadID == loadID {
@@ -811,44 +811,44 @@ func (w *warehousePeer) held(target, loadID string) int64 {
 	return sum
 }
 
-func hlServeWarehouse(ctx *harness.Ctx) *warehousePeer {
-	peer := &warehousePeer{}
+func hHlServeWarehouse(ctx *harness.Ctx) *HWarehousePeer {
+	peer := &HWarehousePeer{}
 	pb.RegisterWarehouseServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func clientWrite(ctx *harness.Ctx, load store.Load, partitionID string) int64 {
-	written, err := writePartition(clientBg, load, partitionID)
+func hClientWrite(ctx *harness.Ctx, load store.Load, partitionID string) int64 {
+	written, err := writePartition(hClientBg, load, partitionID)
 	ctx.NoError(err, "writePartition(%s, %s) failed", load.LoadID, partitionID)
 	return written
 }
 
-func clientFails(ctx *harness.Ctx, load store.Load, partitionID, why string) string {
-	written, err := writePartition(clientBg, load, partitionID)
+func hClientFails(ctx *harness.Ctx, load store.Load, partitionID, why string) string {
+	written, err := writePartition(hClientBg, load, partitionID)
 	ctx.Assert(err != nil, "%s: writePartition returned %d instead of an error wrapping ErrLoadFailed", why, written)
 	ctx.ErrorIs(err, ErrLoadFailed, "%s: writePartition returned %v", why, err)
 	return err.Error()
 }
 
 func CheckWrites(ctx *harness.Ctx) {
-	peer := hlServeWarehouse(ctx)
-	ctx.Equal(clientWrite(ctx, clientLoad, "p-0"), 250, "writePartition must return the rows_written the warehouse answered for p-0")
-	ctx.Equal(clientWrite(ctx, clientLoad, "p-1"), 240, "writePartition must return the rows_written the warehouse answered for p-1")
+	peer := hHlServeWarehouse(ctx)
+	ctx.Equal(hClientWrite(ctx, hClientLoad, "p-0"), 250, "writePartition must return the rows_written the warehouse answered for p-0")
+	ctx.Equal(hClientWrite(ctx, hClientLoad, "p-1"), 240, "writePartition must return the rows_written the warehouse answered for p-1")
 	ctx.Equal(peer.held("wh_acme.orders", "ld-1"), 490, "the rows of ld-1 in wh_acme.orders")
 	req := ctx.GRPC.CallsTo("WritePartition", "")[0].Request.(*pb.WriteRequest)
-	ctx.Equal([]string{req.GetTarget(), req.GetLoadId(), req.GetPartitionId(), req.GetSql()}, []string{"wh_acme.orders", "ld-1", "p-0", clientLoad.SQL}, "the write must carry the load's target, load id, partition id and SQL")
+	ctx.Equal([]string{req.GetTarget(), req.GetLoadId(), req.GetPartitionId(), req.GetSql()}, []string{"wh_acme.orders", "ld-1", "p-0", hClientLoad.SQL}, "the write must carry the load's target, load id, partition id and SQL")
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	hlServeWarehouse(ctx)
-	clientWrite(ctx, clientLoad, "p-0")
+	hHlServeWarehouse(ctx)
+	hClientWrite(ctx, hClientLoad, "p-0")
 	for _, call := range ctx.GRPC.CallsTo("WritePartition", "") {
 		ctx.Assert(call.HasDeadline(), "a WritePartition call carries no deadline: a stalled warehouse would hold the worker forever")
 		ctx.Assert(29500*time.Millisecond <= call.Timeout && call.Timeout <= 30500*time.Millisecond, "a WritePartition call carries a %v deadline, expected 30 s", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("WritePartition", 45.0, "")
 	before := len(ctx.GRPC.CallsTo("WritePartition", ""))
-	clientFails(ctx, clientLoad, "p-1", "with the warehouse slower than the deadline on every attempt")
+	hClientFails(ctx, hClientLoad, "p-1", "with the warehouse slower than the deadline on every attempt")
 	ctx.Equal(len(ctx.GRPC.CallsTo("WritePartition", ""))-before, 3, "a passed deadline is retryable: the attempts (maxAttempts)")
 	for i, call := range ctx.GRPC.CallsTo("WritePartition", "")[before:] {
 		ctx.Assert(call.HasDeadline() && 29500*time.Millisecond <= call.Timeout && call.Timeout <= 30500*time.Millisecond, "attempt %d after a deadline that passed carries a %v deadline: every attempt gets its own 30 s, not what is left of the first one's", i+1, call.Timeout)
@@ -856,16 +856,16 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckMergeKey(ctx *harness.Ctx) {
-	peer := hlServeWarehouse(ctx)
+	peer := hHlServeWarehouse(ctx)
 	peer.loseReply = 1
-	written := clientWrite(ctx, clientLoad, "p-0")
+	written := hClientWrite(ctx, hClientLoad, "p-0")
 	ctx.Equal(len(ctx.GRPC.CallsTo("WritePartition", "")), 2, "a write whose reply was lost must be retried once; the attempts")
 	ctx.Equal(written, 250, "the retried write must return the warehouse's count")
 	ctx.Equal(peer.held("wh_acme.orders", "ld-1"), 250, "after one retried write the retry inserted the partition a second time: set MergeKey so the warehouse merges it; the rows of ld-1's p-0")
-	next := clientLoad
+	next := hClientLoad
 	next.LoadID = "ld-2"
 	next.Version = "2026-10-21"
-	clientWrite(ctx, next, "p-0")
+	hClientWrite(ctx, next, "p-0")
 	ctx.Equal(peer.held("wh_acme.orders", "ld-1"), 250, "ld-2's p-0 must not replace ld-1's p-0 (the merge key is {load_id}/{partition_id}); the rows of ld-1")
 	ctx.Equal(peer.held("wh_acme.orders", "ld-2"), 250, "the rows of ld-2's p-0")
 	for i, call := range ctx.GRPC.CallsTo("WritePartition", "")[:2] {
@@ -874,23 +874,23 @@ func CheckMergeKey(ctx *harness.Ctx) {
 }
 
 func CheckRetryClassification(ctx *harness.Ctx) {
-	hlServeWarehouse(ctx)
+	hHlServeWarehouse(ctx)
 	ctx.GRPC.Fail("WritePartition", codes.PermissionDenied, "loaderd may not write wh_acme.orders", 1, "")
-	reason := clientFails(ctx, clientLoad, "p-0", "with the loader's grant on wh_acme.orders revoked")
+	reason := hClientFails(ctx, hClientLoad, "p-0", "with the loader's grant on wh_acme.orders revoked")
 	ctx.Equal(len(ctx.GRPC.CallsTo("WritePartition", "")), 1, "PERMISSION_DENIED cannot succeed on a retry, it stops the load; the attempts")
 	ctx.Equal(ctx.Clock.Sleeps(), 0, "PERMISSION_DENIED must not be slept on; the sleeps")
 	ctx.Assert(strings.Contains(reason, "wh_acme.orders") && strings.Contains(reason, "p-0"), "the error must name the target and the partition, it says %q", reason)
 	for _, code := range []codes.Code{codes.InvalidArgument, codes.NotFound, codes.FailedPrecondition, codes.Internal} {
 		before := len(ctx.GRPC.CallsTo("WritePartition", ""))
 		ctx.GRPC.Fail("WritePartition", code, "the warehouse answered "+code.String(), 1, "")
-		clientFails(ctx, clientLoad, "p-0", "with the warehouse answering "+code.String())
+		hClientFails(ctx, hClientLoad, "p-0", "with the warehouse answering "+code.String())
 		ctx.Equal(len(ctx.GRPC.CallsTo("WritePartition", ""))-before, 1, "only Unavailable and DeadlineExceeded are retried, every other status stops the load: the attempts with %v", code)
 	}
 	ctx.Equal(ctx.Clock.Sleeps(), 0, "a status that is not retried must not be slept on; the sleeps")
 	ctx.GRPC.Fail("WritePartition", codes.DeadlineExceeded, "", 2, "")
-	ctx.Equal(clientWrite(ctx, clientLoad, "p-2"), 260, "DeadlineExceeded is retryable: after two failures the third attempt must write p-2")
+	ctx.Equal(hClientWrite(ctx, hClientLoad, "p-2"), 260, "DeadlineExceeded is retryable: after two failures the third attempt must write p-2")
 	ctx.GRPC.Fail("WritePartition", codes.Unavailable, "", 2, "")
-	ctx.Equal(clientWrite(ctx, clientLoad, "p-1"), 240, "UNAVAILABLE is retryable: after two failures the third attempt must write p-1")
+	ctx.Equal(hClientWrite(ctx, hClientLoad, "p-1"), 240, "UNAVAILABLE is retryable: after two failures the third attempt must write p-1")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -904,32 +904,32 @@ func CheckRetryClassification(ctx *harness.Ctx) {
 
 namespace {
 
-const std::map<std::string, long> kRows = {{"p-0", 250}, {"p-1", 240}, {"p-2", 260}};
-const store::Load kLoad{"ld-1", "acme", "orders", "2026-10-20", "wh_acme.orders", "merge", "dedupe", "SELECT DISTINCT * FROM source", 3, 750, 750, "loading"};
+const std::map<std::string, long> kHRows = {{"p-0", 250}, {"p-1", 240}, {"p-2", 260}};
+const store::Load kHLoad{"ld-1", "acme", "orders", "2026-10-20", "wh_acme.orders", "merge", "dedupe", "SELECT DISTINCT * FROM source", 3, 750, 750, "loading"};
 
-struct HlRow {
+struct HHlRow {
   std::string target, load_id, merge_key;
   long rows;
 };
 
 // One table per target: an INSERT adds the partition's rows, a MERGE first drops what its merge key
 // wrote. While lose_reply > 0 a write lands and its reply is lost (UNAVAILABLE).
-class WarehousePeer final : public whloader::Warehouse::Service {
+class HWarehousePeer final : public whloader::Warehouse::Service {
  public:
-  std::vector<HlRow> rows;
+  std::vector<HHlRow> rows;
   int lose_reply = 0;
 
   grpc::Status WritePartition(grpc::ServerContext*, const whloader::WriteRequest* req, whloader::WriteReply* out) override {
     if (!req->merge_key().empty()) {
-      std::vector<HlRow> kept;
-      for (const HlRow& r : rows) {
+      std::vector<HHlRow> kept;
+      for (const HHlRow& r : rows) {
         if (!(r.target == req->target() && r.merge_key == req->merge_key())) kept.push_back(r);
       }
       rows = kept;
     }
-    const auto known = kRows.find(req->partition_id());
-    const long n = known == kRows.end() ? 100 : known->second;
-    rows.push_back(HlRow{req->target(), req->load_id(), req->merge_key(), n});
+    const auto known = kHRows.find(req->partition_id());
+    const long n = known == kHRows.end() ? 100 : known->second;
+    rows.push_back(HHlRow{req->target(), req->load_id(), req->merge_key(), n});
     if (lose_reply > 0) {
       lose_reply--;
       return grpc::Status(grpc::StatusCode::UNAVAILABLE, "connection reset before the reply");
@@ -940,22 +940,22 @@ class WarehousePeer final : public whloader::Warehouse::Service {
 
   long held(const std::string& target, const std::string& load_id) const {
     long sum = 0;
-    for (const HlRow& r : rows) {
+    for (const HHlRow& r : rows) {
       if (r.target == target && r.load_id == load_id) sum += r.rows;
     }
     return sum;
   }
 };
 
-WarehousePeer& hlServeWarehouse(harness::Ctx& ctx) {
-  static WarehousePeer* peer = nullptr;
+HWarehousePeer& hHlServeWarehouse(harness::Ctx& ctx) {
+  static HWarehousePeer* peer = nullptr;
   delete peer;
-  peer = new WarehousePeer;
+  peer = new HWarehousePeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-long hlMustWrite(harness::Ctx& ctx, const store::Load& load, const std::string& partition_id) {
+long hHlMustWrite(harness::Ctx& ctx, const store::Load& load, const std::string& partition_id) {
   try {
     return writePartition(load, partition_id);
   } catch (const std::exception& e) {
@@ -964,7 +964,7 @@ long hlMustWrite(harness::Ctx& ctx, const store::Load& load, const std::string& 
   return 0;
 }
 
-std::string hlMustFail(harness::Ctx& ctx, const store::Load& load, const std::string& partition_id, const std::string& why) {
+std::string hHlMustFail(harness::Ctx& ctx, const store::Load& load, const std::string& partition_id, const std::string& why) {
   long written = 0;
   try {
     written = writePartition(load, partition_id);
@@ -980,25 +980,25 @@ std::string hlMustFail(harness::Ctx& ctx, const store::Load& load, const std::st
 }  // namespace
 
 void CheckWrites(harness::Ctx& ctx) {
-  WarehousePeer& peer = hlServeWarehouse(ctx);
-  ctx.Equal(hlMustWrite(ctx, kLoad, "p-0"), 250, "writePartition must return the rows_written the warehouse answered for p-0");
-  ctx.Equal(hlMustWrite(ctx, kLoad, "p-1"), 240, "writePartition must return the rows_written the warehouse answered for p-1");
+  HWarehousePeer& peer = hHlServeWarehouse(ctx);
+  ctx.Equal(hHlMustWrite(ctx, kHLoad, "p-0"), 250, "writePartition must return the rows_written the warehouse answered for p-0");
+  ctx.Equal(hHlMustWrite(ctx, kHLoad, "p-1"), 240, "writePartition must return the rows_written the warehouse answered for p-1");
   ctx.Equal(peer.held("wh_acme.orders", "ld-1"), 490, "the rows of ld-1 in wh_acme.orders");
   const auto& req = ctx.GRPC.CallsTo("WritePartition")[0].Request<whloader::WriteRequest>();
-  ctx.Equal(std::vector<std::string>{req.target(), req.load_id(), req.partition_id(), req.sql()}, std::vector<std::string>{"wh_acme.orders", "ld-1", "p-0", kLoad.sql},
+  ctx.Equal(std::vector<std::string>{req.target(), req.load_id(), req.partition_id(), req.sql()}, std::vector<std::string>{"wh_acme.orders", "ld-1", "p-0", kHLoad.sql},
             "the write must carry the load's target, load id, partition id and SQL");
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  hlServeWarehouse(ctx);
-  hlMustWrite(ctx, kLoad, "p-0");
+  hHlServeWarehouse(ctx);
+  hHlMustWrite(ctx, kHLoad, "p-0");
   for (const auto& call : ctx.GRPC.CallsTo("WritePartition")) {
     ctx.Assert(call.HasDeadline(), "a WritePartition call carries no deadline: a stalled warehouse would hold the worker forever");
     ctx.Assert(29.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 30.5, "a WritePartition call carries a %v s deadline, expected kDeadline = 30 s", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("WritePartition", 45.0);
   const size_t before = ctx.GRPC.CallsTo("WritePartition").size();
-  hlMustFail(ctx, kLoad, "p-1", "with the warehouse slower than the deadline on every attempt");
+  hHlMustFail(ctx, kHLoad, "p-1", "with the warehouse slower than the deadline on every attempt");
   ctx.Equal(ctx.GRPC.CallsTo("WritePartition").size() - before, 3, "a passed deadline is retryable: the attempts (kMaxAttempts)");
   const auto calls = ctx.GRPC.CallsTo("WritePartition");
   for (size_t i = before; i < calls.size(); i++) {
@@ -1007,16 +1007,16 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckMergeKey(harness::Ctx& ctx) {
-  WarehousePeer& peer = hlServeWarehouse(ctx);
+  HWarehousePeer& peer = hHlServeWarehouse(ctx);
   peer.lose_reply = 1;
-  const long written = hlMustWrite(ctx, kLoad, "p-0");
+  const long written = hHlMustWrite(ctx, kHLoad, "p-0");
   ctx.Equal(ctx.GRPC.CallsTo("WritePartition").size(), 2, "a write whose reply was lost must be retried once; the attempts");
   ctx.Equal(written, 250, "the retried write must return the warehouse's count");
   ctx.Equal(peer.held("wh_acme.orders", "ld-1"), 250, "after one retried write the retry inserted the partition a second time: set merge_key so the warehouse merges it; the rows of ld-1's p-0");
-  store::Load next = kLoad;
+  store::Load next = kHLoad;
   next.load_id = "ld-2";
   next.version = "2026-10-21";
-  hlMustWrite(ctx, next, "p-0");
+  hHlMustWrite(ctx, next, "p-0");
   ctx.Equal(peer.held("wh_acme.orders", "ld-1"), 250, "ld-2's p-0 must not replace ld-1's p-0 (the merge key is {load_id}/{partition_id}); the rows of ld-1");
   ctx.Equal(peer.held("wh_acme.orders", "ld-2"), 250, "the rows of ld-2's p-0");
   const auto attempts = ctx.GRPC.CallsTo("WritePartition");
@@ -1026,9 +1026,9 @@ void CheckMergeKey(harness::Ctx& ctx) {
 }
 
 void CheckRetryClassification(harness::Ctx& ctx) {
-  hlServeWarehouse(ctx);
+  hHlServeWarehouse(ctx);
   ctx.GRPC.Fail("WritePartition", grpc::StatusCode::PERMISSION_DENIED, "loaderd may not write wh_acme.orders", 1);
-  const std::string reason = hlMustFail(ctx, kLoad, "p-0", "with the loader's grant on wh_acme.orders revoked");
+  const std::string reason = hHlMustFail(ctx, kHLoad, "p-0", "with the loader's grant on wh_acme.orders revoked");
   ctx.Equal(ctx.GRPC.CallsTo("WritePartition").size(), 1, "PERMISSION_DENIED cannot succeed on a retry, it stops the load; the attempts");
   ctx.Equal(ctx.Clock.Sleeps(), 0, "PERMISSION_DENIED must not be slept on; the sleeps");
   ctx.Assert(reason.find("wh_acme.orders") != std::string::npos && reason.find("p-0") != std::string::npos, "LoadFailed must name the target and the partition, it says %q", reason);
@@ -1041,14 +1041,14 @@ void CheckRetryClassification(harness::Ctx& ctx) {
   for (const auto& [code, name] : terminal) {
     const size_t before = ctx.GRPC.CallsTo("WritePartition").size();
     ctx.GRPC.Fail("WritePartition", code, "the warehouse answered " + name, 1);
-    hlMustFail(ctx, kLoad, "p-0", "with the warehouse answering " + name);
+    hHlMustFail(ctx, kHLoad, "p-0", "with the warehouse answering " + name);
     ctx.Equal(ctx.GRPC.CallsTo("WritePartition").size() - before, 1, "only UNAVAILABLE and DEADLINE_EXCEEDED are retried, every other status stops the load: the attempts with %s", name);
   }
   ctx.Equal(ctx.Clock.Sleeps(), 0, "a status that is not retried must not be slept on; the sleeps");
   ctx.GRPC.Fail("WritePartition", grpc::StatusCode::DEADLINE_EXCEEDED, "", 2);
-  ctx.Equal(hlMustWrite(ctx, kLoad, "p-2"), 260, "DEADLINE_EXCEEDED is retryable: after two failures the third attempt must write p-2");
+  ctx.Equal(hHlMustWrite(ctx, kHLoad, "p-2"), 260, "DEADLINE_EXCEEDED is retryable: after two failures the third attempt must write p-2");
   ctx.GRPC.Fail("WritePartition", grpc::StatusCode::UNAVAILABLE, "", 2);
-  ctx.Equal(hlMustWrite(ctx, kLoad, "p-1"), 240, "UNAVAILABLE is retryable: after two failures the third attempt must write p-1");
+  ctx.Equal(hHlMustWrite(ctx, kHLoad, "p-1"), 240, "UNAVAILABLE is retryable: after two failures the third attempt must write p-1");
 }
 `,
   },

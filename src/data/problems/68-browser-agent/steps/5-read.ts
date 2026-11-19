@@ -591,12 +591,12 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
 func hWorld(ctx *harness.Ctx, steps int) (*harness.HTTP, string) {
-	sid := sessions.CreateSession(readBg, "acme", "public-web", "buy a kettle", 200, "https://www.example.com/").ID
+	sid := sessions.CreateSession(hReadBg, "acme", "public-web", "buy a kettle", 200, "https://www.example.com/").ID
 	for index := 1; index <= steps; index++ {
-		trace.AppendStep(readBg, sid, map[string]any{"session_id": sid, "step_index": index, "action": "click", "outcome": "ok", "reason": "", "target_digest": trace.Digest(fmt.Sprintf("#b%d", index))})
+		trace.AppendStep(hReadBg, sid, map[string]any{"session_id": sid, "step_index": index, "action": "click", "outcome": "ok", "reason": "", "target_digest": trace.Digest(fmt.Sprintf("#b%d", index))})
 	}
 	ctx.Redis.Do("HSET", sessions.SessionKey(sid), "step_index", fmt.Sprint(steps), "budget_remaining", fmt.Sprint(200-steps))
 	mux := http.NewServeMux()

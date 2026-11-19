@@ -995,13 +995,13 @@ import (
 	"leetbuild/harness"
 )
 
-func hlManifest(version, target, mode, transform string) map[string]any {
+func hHlManifest(version, target, mode, transform string) map[string]any {
 	return map[string]any{"source": map[string]string{"dataset": "orders", "version": version}, "target": target, "mode": mode, "transform": transform}
 }
 
-var hlDefault = hlManifest("2026-10-20", "wh_acme.orders", "merge", "dedupe")
+var hHlDefault = hHlManifest("2026-10-20", "wh_acme.orders", "merge", "dedupe")
 
-func hlAPI(ctx *harness.Ctx) *harness.HTTP {
+func hHlAPI(ctx *harness.Ctx) *harness.HTTP {
 	ctx.Redis.Do("HSET", "source:orders:2026-10-20", "p-0", "250", "p-1", "250", "p-2", "250", "p-3", "250")
 	ctx.Redis.Do("HSET", "source:orders:2026-10-21", "p-0", "300", "p-1", "300")
 	mux := http.NewServeMux()
@@ -1009,7 +1009,7 @@ func hlAPI(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func hlPost(c *harness.HTTP, body any, tenant, key string) *harness.Response {
+func hHlPost(c *harness.HTTP, body any, tenant, key string) *harness.Response {
 	var header []string
 	if tenant != "" {
 		header = append(header, "X-Tenant-Id", tenant)
@@ -1021,13 +1021,13 @@ func hlPost(c *harness.HTTP, body any, tenant, key string) *harness.Response {
 }
 
 // hlPostText sends a manifest as these exact bytes.
-func hlPostText(c *harness.HTTP, text, key string) *harness.Response {
+func hHlPostText(c *harness.HTTP, text, key string) *harness.Response {
 	return c.Post("/v1/loads", text, "X-Tenant-Id", "acme", "Idempotency-Key", key, "Content-Type", "application/json")
 }
 
 // hlSized is a valid manifest whose body is exactly size bytes.
-func hlSized(size int) string {
-	m := hlManifest("2026-10-20", "wh_acme.orders", "merge", "dedupe")
+func hHlSized(size int) string {
+	m := hHlManifest("2026-10-20", "wh_acme.orders", "merge", "dedupe")
 	m["notes"] = ""
 	base, _ := json.Marshal(m)
 	m["notes"] = strings.Repeat("x", size-len(base))
@@ -1035,15 +1035,15 @@ func hlSized(size int) string {
 	return string(out)
 }
 
-const hlDedupeSQL = "SELECT DISTINCT * FROM source"
+const kHHlDedupeSQL = "SELECT DISTINCT * FROM source"
 
-func hlBody(r *harness.Response) map[string]any {
+func hHlBody(r *harness.Response) map[string]any {
 	var body map[string]any
 	r.Decode(&body)
 	return body
 }
 
-func hlLoads(ctx *harness.Ctx) []string {
+func hHlLoads(ctx *harness.Ctx) []string {
 	var out []string
 	for _, k := range ctx.Redis.Keys("load:ld-*") {
 		if strings.Count(k, ":") == 1 {
@@ -1054,101 +1054,101 @@ func hlLoads(ctx *harness.Ctx) []string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := hlAPI(ctx)
-	r := hlPost(c, hlDefault, "acme", "k-1")
+	c := hHlAPI(ctx)
+	r := hHlPost(c, hHlDefault, "acme", "k-1")
 	ctx.Equal(r.Status, 202, "POST /v1/loads (%s)", r.Text())
-	body := hlBody(r)
+	body := hHlBody(r)
 	want := map[string]any{"status": "queued", "target": "wh_acme.orders", "mode": "merge", "partitions": 4, "rows_planned": 1000}
 	for name, value := range want {
 		ctx.Equal(body[name], value, "the new load's %s (%s)", name, r.Text())
 	}
 	loadID, _ := body["load_id"].(string)
 	ctx.Assert(store.GetLoad(context.Background(), "acme", loadID) != nil, "the load %q the API answered is not in the loads store", loadID)
-	anonymous := hlPost(c, hlDefault, "", "k-2")
+	anonymous := hHlPost(c, hHlDefault, "", "k-2")
 	ctx.Equal(anonymous.Status, 401, "a POST without X-Tenant-Id")
 }
 
 func CheckRegisteredTransform(ctx *harness.Ctx) {
-	c := hlAPI(ctx)
-	sql := hlPost(c, hlManifest("2026-10-20", "wh_acme.orders", "merge", "SELECT * FROM wh_globex.orders"), "acme", "k-sql")
+	c := hHlAPI(ctx)
+	sql := hHlPost(c, hHlManifest("2026-10-20", "wh_acme.orders", "merge", "SELECT * FROM wh_globex.orders"), "acme", "k-sql")
 	ctx.Equal(sql.Status, 400, "a transform that is SQL, not a registered name, would run with the loader's warehouse credentials (%s)", sql.Text())
-	ctx.Equal(len(hlLoads(ctx)), 0, "the load with caller SQL must not be stored; loads")
+	ctx.Equal(len(hHlLoads(ctx)), 0, "the load with caller SQL must not be stored; loads")
 	for _, name := range []string{"pivot", "constructor"} {
-		unknown := hlPost(c, hlManifest("2026-10-20", "wh_acme.orders", "merge", name), "acme", "k-"+name)
+		unknown := hHlPost(c, hHlManifest("2026-10-20", "wh_acme.orders", "merge", name), "acme", "k-"+name)
 		ctx.Equal(unknown.Status, 400, "the unregistered transform name %q", name)
 	}
-	r := hlPost(c, hlDefault, "acme", "k-ok")
+	r := hHlPost(c, hHlDefault, "acme", "k-ok")
 	ctx.Equal(r.Status, 202, "a load with the registered transform dedupe (%s)", r.Text())
-	loadID, _ := hlBody(r)["load_id"].(string)
+	loadID, _ := hHlBody(r)["load_id"].(string)
 	load := store.GetLoad(context.Background(), "acme", loadID)
 	ctx.Assert(load != nil, "the load %q is not in the store", loadID)
-	ctx.Equal(load.SQL, hlDedupeSQL, "the load must carry the registry's SQL for dedupe; its sql")
+	ctx.Equal(load.SQL, kHHlDedupeSQL, "the load must carry the registry's SQL for dedupe; its sql")
 }
 
 func CheckTenantSchema(ctx *harness.Ctx) {
-	c := hlAPI(ctx)
+	c := hHlAPI(ctx)
 	for _, target := range []string{"wh_globex.orders", "shared.loads", "wh_acmecorp.orders"} {
-		r := hlPost(c, hlManifest("2026-10-20", target, "merge", "dedupe"), "acme", "k-"+target)
+		r := hHlPost(c, hHlManifest("2026-10-20", target, "merge", "dedupe"), "acme", "k-"+target)
 		ctx.Equal(r.Status, 403, "tenant acme loading into %s must be refused: a load writes into wh_acme only (%s)", target, r.Text())
 	}
 	for _, target := range []string{"orders", "wh_acme."} {
-		bare := hlPost(c, hlManifest("2026-10-20", target, "merge", "dedupe"), "acme", "k-bare-"+target)
+		bare := hHlPost(c, hHlManifest("2026-10-20", target, "merge", "dedupe"), "acme", "k-bare-"+target)
 		ctx.Equal(bare.Status, 400, "the target %q is not schema.table", target)
 	}
-	ctx.Equal(len(hlLoads(ctx)), 0, "a refused target must not be stored as a load; loads")
-	own := hlPost(c, hlDefault, "acme", "k-own")
+	ctx.Equal(len(hHlLoads(ctx)), 0, "a refused target must not be stored as a load; loads")
+	own := hHlPost(c, hHlDefault, "acme", "k-own")
 	ctx.Equal(own.Status, 202, "tenant acme loading into wh_acme.orders (%s)", own.Text())
 }
 
 func CheckManifestKey(ctx *harness.Ctx) {
-	c := hlAPI(ctx)
-	other := hlManifest("2026-10-21", "wh_acme.orders", "merge", "dedupe")
-	none := hlPost(c, hlDefault, "acme", "")
+	c := hHlAPI(ctx)
+	other := hHlManifest("2026-10-21", "wh_acme.orders", "merge", "dedupe")
+	none := hHlPost(c, hHlDefault, "acme", "")
 	ctx.Equal(none.Status, 400, "a POST without Idempotency-Key")
-	first := hlPost(c, hlDefault, "acme", "k-1")
+	first := hHlPost(c, hHlDefault, "acme", "k-1")
 	ctx.Equal(first.Status, 202, "the first POST (%s)", first.Text())
-	firstID, _ := hlBody(first)["load_id"].(string)
+	firstID, _ := hHlBody(first)["load_id"].(string)
 	ctx.Redis.Do("HSET", "load:"+firstID, "status", "running")
-	replay := hlPost(c, hlDefault, "acme", "k-1")
+	replay := hHlPost(c, hHlDefault, "acme", "k-1")
 	ctx.Equal(replay.Status, 200, "a retry of the same manifest under the same key must answer the recorded load")
-	ctx.Equal(hlBody(replay)["load_id"], hlBody(first)["load_id"], "one manifest, one load: the retry's load_id")
-	ctx.Equal(hlBody(replay)["status"], "running", "the retry must answer the recorded load as the store holds it; its status")
+	ctx.Equal(hHlBody(replay)["load_id"], hHlBody(first)["load_id"], "one manifest, one load: the retry's load_id")
+	ctx.Equal(hHlBody(replay)["status"], "running", "the retry must answer the recorded load as the store holds it; its status")
 	for _, changed := range []struct {
 		field string
 		body  map[string]any
 	}{
 		{"source", other},
-		{"mode", hlManifest("2026-10-20", "wh_acme.orders", "append", "dedupe")},
-		{"transform", hlManifest("2026-10-20", "wh_acme.orders", "merge", "identity")},
-		{"target", hlManifest("2026-10-20", "wh_acme.orders_v2", "merge", "dedupe")},
+		{"mode", hHlManifest("2026-10-20", "wh_acme.orders", "append", "dedupe")},
+		{"transform", hHlManifest("2026-10-20", "wh_acme.orders", "merge", "identity")},
+		{"target", hHlManifest("2026-10-20", "wh_acme.orders_v2", "merge", "dedupe")},
 	} {
-		r := hlPost(c, changed.body, "acme", "k-1")
+		r := hHlPost(c, changed.body, "acme", "k-1")
 		ctx.Equal(r.Status, 409, "the manifest with another %s under a used key (the fingerprint covers dataset, version, target, mode and transform)", changed.field)
 	}
-	fresh := hlPost(c, other, "acme", "k-2")
-	ctx.Assert(fresh.Status == 202 && hlBody(fresh)["load_id"] != hlBody(first)["load_id"], "a new key must start a new load, got %d %s", fresh.Status, fresh.Text())
-	theirs := hlPost(c, hlManifest("2026-10-20", "wh_globex.orders", "merge", "dedupe"), "globex", "k-1")
+	fresh := hHlPost(c, other, "acme", "k-2")
+	ctx.Assert(fresh.Status == 202 && hHlBody(fresh)["load_id"] != hHlBody(first)["load_id"], "a new key must start a new load, got %d %s", fresh.Status, fresh.Text())
+	theirs := hHlPost(c, hHlManifest("2026-10-20", "wh_globex.orders", "merge", "dedupe"), "globex", "k-1")
 	ctx.Equal(theirs.Status, 202, "another tenant's k-1 is its own key: globex's first POST (%s)", theirs.Text())
-	ctx.Equal(len(hlLoads(ctx)), 3, "three distinct loads were started; the loads in the store")
+	ctx.Equal(len(hHlLoads(ctx)), 3, "three distinct loads were started; the loads in the store")
 }
 
 func CheckManifestBounds(ctx *harness.Ctx) {
-	c := hlAPI(ctx)
-	mode := hlPost(c, hlManifest("2026-10-20", "wh_acme.orders", "upsert", "dedupe"), "acme", "k-mode")
+	c := hHlAPI(ctx)
+	mode := hHlPost(c, hHlManifest("2026-10-20", "wh_acme.orders", "upsert", "dedupe"), "acme", "k-mode")
 	ctx.Equal(mode.Status, 400, "mode upsert (the modes are append, merge and replace)")
-	big := hlManifest("2026-10-20", "wh_acme.orders", "merge", "dedupe")
+	big := hHlManifest("2026-10-20", "wh_acme.orders", "merge", "dedupe")
 	big["notes"] = strings.Repeat("x", 70000)
-	r := hlPost(c, big, "acme", "k-big")
+	r := hHlPost(c, big, "acme", "k-big")
 	ctx.Equal(r.Status, 413, "a 70 KB manifest is over maxManifestBytes (64 KiB)")
-	wide := hlManifest("2026-10-20", "wh_acme.orders", "merge", "dedupe")
+	wide := hHlManifest("2026-10-20", "wh_acme.orders", "merge", "dedupe")
 	wide["notes"] = strings.Repeat("\\u00e9", 40000)
 	wideText, _ := json.Marshal(wide)
-	ctx.Equal(hlPostText(c, string(wideText), "k-wide").Status, 413, "a manifest of 40,000 two-byte characters (80 KB): the limit counts bytes")
-	ctx.Equal(hlPostText(c, hlSized(65537), "k-over").Status, 413, "a manifest of 65,537 bytes is over maxManifestBytes")
-	ctx.Equal(len(hlLoads(ctx)), 0, "a refused manifest must not be stored as a load; loads")
-	replace := hlPost(c, hlManifest("2026-10-20", "wh_acme.orders", "replace", "dedupe"), "acme", "k-replace")
+	ctx.Equal(hHlPostText(c, string(wideText), "k-wide").Status, 413, "a manifest of 40,000 two-byte characters (80 KB): the limit counts bytes")
+	ctx.Equal(hHlPostText(c, hHlSized(65537), "k-over").Status, 413, "a manifest of 65,537 bytes is over maxManifestBytes")
+	ctx.Equal(len(hHlLoads(ctx)), 0, "a refused manifest must not be stored as a load; loads")
+	replace := hHlPost(c, hHlManifest("2026-10-20", "wh_acme.orders", "replace", "dedupe"), "acme", "k-replace")
 	ctx.Equal(replace.Status, 202, "mode replace (%s)", replace.Text())
-	edge := hlPostText(c, hlSized(65536), "k-edge")
+	edge := hHlPostText(c, hHlSized(65536), "k-edge")
 	ctx.Equal(edge.Status, 202, "a manifest of exactly 65,536 bytes: only a body over maxManifestBytes is refused (%s)", edge.Text())
 }
 `,
@@ -1164,13 +1164,13 @@ func CheckManifestBounds(ctx *harness.Ctx) {
 
 namespace {
 
-nlohmann::json hlManifest(const std::string& version, const std::string& target, const std::string& mode, const std::string& transform) {
+nlohmann::json hHlManifest(const std::string& version, const std::string& target, const std::string& mode, const std::string& transform) {
   return {{"source", {{"dataset", "orders"}, {"version", version}}}, {"target", target}, {"mode", mode}, {"transform", transform}};
 }
 
-const nlohmann::json kHlManifest = hlManifest("2026-10-20", "wh_acme.orders", "merge", "dedupe");
+const nlohmann::json kHHlManifest = hHlManifest("2026-10-20", "wh_acme.orders", "merge", "dedupe");
 
-harness::HTTP hlApi(harness::Ctx& ctx) {
+harness::HTTP hHlApi(harness::Ctx& ctx) {
   ctx.Redis.Do("HSET", "source:orders:2026-10-20", "p-0", "250", "p-1", "250", "p-2", "250", "p-3", "250");
   ctx.Redis.Do("HSET", "source:orders:2026-10-21", "p-0", "300", "p-1", "300");
   static httplib::Server* svr = nullptr;
@@ -1180,7 +1180,7 @@ harness::HTTP hlApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response hlPost(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant, const std::string& key) {
+harness::Response hHlPost(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant, const std::string& key) {
   const std::string text = body.dump();
   if (tenant.empty()) return c.Post("/v1/loads", text, "Content-Type", "application/json", "Idempotency-Key", key);
   if (key.empty()) return c.Post("/v1/loads", text, "Content-Type", "application/json", "X-Tenant-Id", tenant);
@@ -1188,23 +1188,23 @@ harness::Response hlPost(harness::HTTP& c, const nlohmann::json& body, const std
 }
 
 // A manifest sent as these exact bytes.
-harness::Response hlPostText(harness::HTTP& c, const std::string& text, const std::string& key) {
+harness::Response hHlPostText(harness::HTTP& c, const std::string& text, const std::string& key) {
   return c.Post("/v1/loads", text, "Content-Type", "application/json", "X-Tenant-Id", "acme", "Idempotency-Key", key);
 }
 
 // A valid manifest whose body is exactly size bytes.
-std::string hlSized(size_t size) {
-  nlohmann::json m = kHlManifest;
+std::string hHlSized(size_t size) {
+  nlohmann::json m = kHHlManifest;
   m["notes"] = "";
   m["notes"] = std::string(size - m.dump().size(), 'x');
   return m.dump();
 }
 
-const std::string kHlDedupeSql = "SELECT DISTINCT * FROM source";
+const std::string kHHlDedupeSql = "SELECT DISTINCT * FROM source";
 
-nlohmann::json hlBodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hHlBodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
-size_t hlLoads(harness::Ctx& ctx) {
+size_t hHlLoads(harness::Ctx& ctx) {
   size_t n = 0;
   for (const auto& k : ctx.Redis.Keys("load:ld-*")) {
     if (k.find(':', 5) == std::string::npos) n++;
@@ -1215,10 +1215,10 @@ size_t hlLoads(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = hlApi(ctx);
-  const auto r = hlPost(c, kHlManifest, "acme", "k-1");
+  auto c = hHlApi(ctx);
+  const auto r = hHlPost(c, kHHlManifest, "acme", "k-1");
   ctx.Equal(r.Status, 202, "POST /v1/loads (%s)", r.Text());
-  const auto body = hlBodyOf(r);
+  const auto body = hHlBodyOf(r);
   ctx.Equal(body.value("status", ""), "queued", "the new load's status (%s)", r.Text());
   ctx.Equal(body.value("target", ""), "wh_acme.orders", "the new load's target (%s)", r.Text());
   ctx.Equal(body.value("mode", ""), "merge", "the new load's mode (%s)", r.Text());
@@ -1226,88 +1226,88 @@ void CheckRoute(harness::Ctx& ctx) {
   ctx.Equal(body.value("rows_planned", 0L), 1000, "the new load's rows_planned (%s)", r.Text());
   const std::string load_id = body.value("load_id", "");
   ctx.Assert(store::getLoad("acme", load_id).has_value(), "the load %q the API answered is not in the loads store", load_id);
-  const auto anonymous = hlPost(c, kHlManifest, "", "k-2");
+  const auto anonymous = hHlPost(c, kHHlManifest, "", "k-2");
   ctx.Equal(anonymous.Status, 401, "a POST without X-Tenant-Id");
 }
 
 void CheckRegisteredTransform(harness::Ctx& ctx) {
-  auto c = hlApi(ctx);
-  const auto sql = hlPost(c, hlManifest("2026-10-20", "wh_acme.orders", "merge", "SELECT * FROM wh_globex.orders"), "acme", "k-sql");
+  auto c = hHlApi(ctx);
+  const auto sql = hHlPost(c, hHlManifest("2026-10-20", "wh_acme.orders", "merge", "SELECT * FROM wh_globex.orders"), "acme", "k-sql");
   ctx.Equal(sql.Status, 400, "a transform that is SQL, not a registered name, would run with the loader's warehouse credentials (%s)", sql.Text());
-  ctx.Equal(hlLoads(ctx), 0, "the load with caller SQL must not be stored; loads");
+  ctx.Equal(hHlLoads(ctx), 0, "the load with caller SQL must not be stored; loads");
   for (const std::string name : {"pivot", "constructor"}) {
-    const auto unknown = hlPost(c, hlManifest("2026-10-20", "wh_acme.orders", "merge", name), "acme", "k-" + name);
+    const auto unknown = hHlPost(c, hHlManifest("2026-10-20", "wh_acme.orders", "merge", name), "acme", "k-" + name);
     ctx.Equal(unknown.Status, 400, "the unregistered transform name %q", name);
   }
-  const auto r = hlPost(c, kHlManifest, "acme", "k-ok");
+  const auto r = hHlPost(c, kHHlManifest, "acme", "k-ok");
   ctx.Equal(r.Status, 202, "a load with the registered transform dedupe (%s)", r.Text());
-  const auto load = store::getLoad("acme", hlBodyOf(r).value("load_id", ""));
+  const auto load = store::getLoad("acme", hHlBodyOf(r).value("load_id", ""));
   ctx.Assert(load.has_value(), "the load the API answered is not in the store");
-  ctx.Equal(load->sql, kHlDedupeSql, "the load must carry the registry's SQL for dedupe; its sql");
+  ctx.Equal(load->sql, kHHlDedupeSql, "the load must carry the registry's SQL for dedupe; its sql");
 }
 
 void CheckTenantSchema(harness::Ctx& ctx) {
-  auto c = hlApi(ctx);
+  auto c = hHlApi(ctx);
   for (const std::string target : {"wh_globex.orders", "shared.loads", "wh_acmecorp.orders"}) {
-    const auto r = hlPost(c, hlManifest("2026-10-20", target, "merge", "dedupe"), "acme", "k-" + target);
+    const auto r = hHlPost(c, hHlManifest("2026-10-20", target, "merge", "dedupe"), "acme", "k-" + target);
     ctx.Equal(r.Status, 403, "tenant acme loading into %s must be refused: a load writes into wh_acme only (%s)", target, r.Text());
   }
   for (const std::string target : {"orders", "wh_acme."}) {
-    const auto bare = hlPost(c, hlManifest("2026-10-20", target, "merge", "dedupe"), "acme", "k-bare-" + target);
+    const auto bare = hHlPost(c, hHlManifest("2026-10-20", target, "merge", "dedupe"), "acme", "k-bare-" + target);
     ctx.Equal(bare.Status, 400, "the target %q is not schema.table", target);
   }
-  ctx.Equal(hlLoads(ctx), 0, "a refused target must not be stored as a load; loads");
-  const auto own = hlPost(c, kHlManifest, "acme", "k-own");
+  ctx.Equal(hHlLoads(ctx), 0, "a refused target must not be stored as a load; loads");
+  const auto own = hHlPost(c, kHHlManifest, "acme", "k-own");
   ctx.Equal(own.Status, 202, "tenant acme loading into wh_acme.orders (%s)", own.Text());
 }
 
 void CheckManifestKey(harness::Ctx& ctx) {
-  auto c = hlApi(ctx);
-  const auto other = hlManifest("2026-10-21", "wh_acme.orders", "merge", "dedupe");
-  const auto none = hlPost(c, kHlManifest, "acme", "");
+  auto c = hHlApi(ctx);
+  const auto other = hHlManifest("2026-10-21", "wh_acme.orders", "merge", "dedupe");
+  const auto none = hHlPost(c, kHHlManifest, "acme", "");
   ctx.Equal(none.Status, 400, "a POST without Idempotency-Key");
-  const auto first = hlPost(c, kHlManifest, "acme", "k-1");
+  const auto first = hHlPost(c, kHHlManifest, "acme", "k-1");
   ctx.Equal(first.Status, 202, "the first POST (%s)", first.Text());
-  ctx.Redis.Do("HSET", "load:" + hlBodyOf(first).value("load_id", ""), "status", "running");
-  const auto replay = hlPost(c, kHlManifest, "acme", "k-1");
+  ctx.Redis.Do("HSET", "load:" + hHlBodyOf(first).value("load_id", ""), "status", "running");
+  const auto replay = hHlPost(c, kHHlManifest, "acme", "k-1");
   ctx.Equal(replay.Status, 200, "a retry of the same manifest under the same key must answer the recorded load");
-  ctx.Equal(hlBodyOf(replay).value("load_id", ""), hlBodyOf(first).value("load_id", ""), "one manifest, one load: the retry's load_id");
-  ctx.Equal(hlBodyOf(replay).value("status", ""), "running", "the retry must answer the recorded load as the store holds it; its status");
+  ctx.Equal(hHlBodyOf(replay).value("load_id", ""), hHlBodyOf(first).value("load_id", ""), "one manifest, one load: the retry's load_id");
+  ctx.Equal(hHlBodyOf(replay).value("status", ""), "running", "the retry must answer the recorded load as the store holds it; its status");
   const std::vector<std::pair<std::string, nlohmann::json>> changed = {
       {"source", other},
-      {"mode", hlManifest("2026-10-20", "wh_acme.orders", "append", "dedupe")},
-      {"transform", hlManifest("2026-10-20", "wh_acme.orders", "merge", "identity")},
-      {"target", hlManifest("2026-10-20", "wh_acme.orders_v2", "merge", "dedupe")},
+      {"mode", hHlManifest("2026-10-20", "wh_acme.orders", "append", "dedupe")},
+      {"transform", hHlManifest("2026-10-20", "wh_acme.orders", "merge", "identity")},
+      {"target", hHlManifest("2026-10-20", "wh_acme.orders_v2", "merge", "dedupe")},
   };
   for (const auto& [field, body] : changed) {
-    const auto r = hlPost(c, body, "acme", "k-1");
+    const auto r = hHlPost(c, body, "acme", "k-1");
     ctx.Equal(r.Status, 409, "the manifest with another %s under a used key (the fingerprint covers dataset, version, target, mode and transform)", field);
   }
-  const auto fresh = hlPost(c, other, "acme", "k-2");
-  ctx.Assert(fresh.Status == 202 && hlBodyOf(fresh).value("load_id", "") != hlBodyOf(first).value("load_id", ""), "a new key must start a new load, got %d %s", fresh.Status, fresh.Text());
-  const auto theirs = hlPost(c, hlManifest("2026-10-20", "wh_globex.orders", "merge", "dedupe"), "globex", "k-1");
+  const auto fresh = hHlPost(c, other, "acme", "k-2");
+  ctx.Assert(fresh.Status == 202 && hHlBodyOf(fresh).value("load_id", "") != hHlBodyOf(first).value("load_id", ""), "a new key must start a new load, got %d %s", fresh.Status, fresh.Text());
+  const auto theirs = hHlPost(c, hHlManifest("2026-10-20", "wh_globex.orders", "merge", "dedupe"), "globex", "k-1");
   ctx.Equal(theirs.Status, 202, "another tenant's k-1 is its own key: globex's first POST (%s)", theirs.Text());
-  ctx.Equal(hlLoads(ctx), 3, "three distinct loads were started; the loads in the store");
+  ctx.Equal(hHlLoads(ctx), 3, "three distinct loads were started; the loads in the store");
 }
 
 void CheckManifestBounds(harness::Ctx& ctx) {
-  auto c = hlApi(ctx);
-  const auto mode = hlPost(c, hlManifest("2026-10-20", "wh_acme.orders", "upsert", "dedupe"), "acme", "k-mode");
+  auto c = hHlApi(ctx);
+  const auto mode = hHlPost(c, hHlManifest("2026-10-20", "wh_acme.orders", "upsert", "dedupe"), "acme", "k-mode");
   ctx.Equal(mode.Status, 400, "mode upsert (the modes are append, merge and replace)");
-  nlohmann::json big = kHlManifest;
+  nlohmann::json big = kHHlManifest;
   big["notes"] = std::string(70000, 'x');
-  const auto r = hlPost(c, big, "acme", "k-big");
+  const auto r = hHlPost(c, big, "acme", "k-big");
   ctx.Equal(r.Status, 413, "a 70 KB manifest is over kMaxManifestBytes (64 KiB)");
-  nlohmann::json wide = kHlManifest;
+  nlohmann::json wide = kHHlManifest;
   std::string accents;
   for (int i = 0; i < 40000; i++) accents += "\\xc3\\xa9";
   wide["notes"] = accents;
-  ctx.Equal(hlPostText(c, wide.dump(), "k-wide").Status, 413, "a manifest of 40,000 two-byte characters (80 KB): the limit counts bytes");
-  ctx.Equal(hlPostText(c, hlSized(65537), "k-over").Status, 413, "a manifest of 65,537 bytes is over kMaxManifestBytes");
-  ctx.Equal(hlLoads(ctx), 0, "a refused manifest must not be stored as a load; loads");
-  const auto replace = hlPost(c, hlManifest("2026-10-20", "wh_acme.orders", "replace", "dedupe"), "acme", "k-replace");
+  ctx.Equal(hHlPostText(c, wide.dump(), "k-wide").Status, 413, "a manifest of 40,000 two-byte characters (80 KB): the limit counts bytes");
+  ctx.Equal(hHlPostText(c, hHlSized(65537), "k-over").Status, 413, "a manifest of 65,537 bytes is over kMaxManifestBytes");
+  ctx.Equal(hHlLoads(ctx), 0, "a refused manifest must not be stored as a load; loads");
+  const auto replace = hHlPost(c, hHlManifest("2026-10-20", "wh_acme.orders", "replace", "dedupe"), "acme", "k-replace");
   ctx.Equal(replace.Status, 202, "mode replace (%s)", replace.Text());
-  const auto edge = hlPostText(c, hlSized(65536), "k-edge");
+  const auto edge = hHlPostText(c, hHlSized(65536), "k-edge");
   ctx.Equal(edge.Status, 202, "a manifest of exactly 65,536 bytes: only a body over kMaxManifestBytes is refused (%s)", edge.Text());
 }
 `,

@@ -837,35 +837,35 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "ads.impression"
+const kHEventsTopic = "ads.impression"
 
-func eventsBeacon(n int, campaign string) store.Beacon {
+func hEventsBeacon(n int, campaign string) store.Beacon {
 	return store.Beacon{BeaconID: fmt.Sprintf("b-%d", n), CampaignID: campaign, CreativeID: "cr-" + campaign, UserHash: fmt.Sprintf("u-%d", n), PriceMicros: 1500}
 }
 
-func eventsRecord(ctx *harness.Ctx, b store.Beacon) bool {
+func hEventsRecord(ctx *harness.Ctx, b store.Beacon) bool {
 	ok, err := recordImpression(context.Background(), b)
 	ctx.NoError(err, "recordImpression(%s)", b.BeaconID)
 	return ok
 }
 
-func eventsRendered(ctx *harness.Ctx) store.Rendered {
+func hEventsRendered(ctx *harness.Ctx) store.Rendered {
 	raw := ctx.Redis.HGetAll("render:c-1")
 	impressions, _ := strconv.ParseInt(raw["impressions"], 10, 64)
 	spend, _ := strconv.ParseInt(raw["spend_micros"], 10, 64)
 	return store.Rendered{Impressions: impressions, SpendMicros: spend}
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	var rows []HEventsRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -873,90 +873,90 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 // eventsPayload is the event a c-1 beacon must produce: these four fields, nothing else.
-func eventsPayload(beaconID string) map[string]any {
+func hEventsPayload(beaconID string) map[string]any {
 	return map[string]any{"beacon_id": beaconID, "campaign_id": "c-1", "creative_id": "cr-c-1", "price_micros": 1500}
 }
 
 func CheckCampaignKey(ctx *harness.Ctx) {
-	eventsRecord(ctx, eventsBeacon(1, "c-1"))
-	eventsRecord(ctx, eventsBeacon(2, "c-2"))
-	eventsRecord(ctx, eventsBeacon(3, "c-1"))
+	hEventsRecord(ctx, hEventsBeacon(1, "c-1"))
+	hEventsRecord(ctx, hEventsBeacon(2, "c-2"))
+	hEventsRecord(ctx, hEventsBeacon(3, "c-1"))
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three rendered beacons must produce three records on ads.impression; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"c-1", "c-2", "c-1"}, "the records must be keyed by the campaign ids")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"c-1", "c-2", "c-1"}, "the records must be keyed by the campaign ids")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both c-1 impressions must land on one partition, or a per-campaign consumer sees them out of order; the partitions")
 	var payload map[string]any
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &payload), "the event for b-1 must be JSON, got %s", values[0])
-	ctx.Equal(payload, eventsPayload("b-1"), "the user's hash stays out of the topic; the event for b-1")
+	ctx.Equal(payload, hEventsPayload("b-1"), "the user's hash stays out of the topic; the event for b-1")
 }
 
 func CheckDedupeBeacon(ctx *harness.Ctx) {
 	// Read the claim's TTL right after the command that first touches it (-2: it does not exist yet, a plain read).
 	atClaim := ctx.Redis.After("beacon:b-1", func() any { return ctx.Redis.TTL("beacon:b-1") })
-	ctx.Equal(eventsRecord(ctx, eventsBeacon(1, "c-1")), true, "the first delivery of beacon b-1 must be recorded")
+	ctx.Equal(hEventsRecord(ctx, hEventsBeacon(1, "c-1")), true, "the first delivery of beacon b-1 must be recorded")
 	ctx.Assert(atClaim.Fired, "recordImpression never touched beacon:b-1: nothing claims the beacon, so a page that retries it is billed again")
 	claimed, _ := atClaim.Result.(int64)
 	ctx.Assert(claimed == -2 || (86000 <= claimed && claimed <= 86400), "right after the command that created beacon:b-1 its TTL was %d: the claim must carry its expiry in the same write (SET NX EX), or a crash leaves it forever", claimed)
-	again := eventsRecord(ctx, eventsBeacon(1, "c-1")) // the page retried its beacon
+	again := hEventsRecord(ctx, hEventsBeacon(1, "c-1")) // the page retried its beacon
 	ctx.Settle()
 	ctx.Equal(again, true, "a retried beacon was already recorded; its result")
-	ctx.Equal(eventsRendered(ctx), store.Rendered{Impressions: 1, SpendMicros: 1500}, "one beacon delivered twice must be billed once; render:c-1")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "one beacon delivered twice must produce one event; the records")
+	ctx.Equal(hEventsRendered(ctx), store.Rendered{Impressions: 1, SpendMicros: 1500}, "one beacon delivered twice must be billed once; render:c-1")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "one beacon delivered twice must produce one event; the records")
 	ttl := ctx.Redis.TTL("beacon:b-1")
 	ctx.Assert(86000 <= ttl && ttl <= 86400, "beacon:b-1 has TTL %d, expected 24 h: a claim with no expiry grows Redis forever", ttl)
 	// The page's retry of b-2 lands on another app server right after the first delivery touches the claim.
 	rival := ctx.Redis.After("beacon:b-2", func() any {
-		ok, err := recordImpression(context.Background(), eventsBeacon(2, "c-1"))
+		ok, err := recordImpression(context.Background(), hEventsBeacon(2, "c-1"))
 		ctx.NoError(err, "the rival delivery of b-2 failed")
 		return ok
 	})
-	first := eventsRecord(ctx, eventsBeacon(2, "c-1"))
+	first := hEventsRecord(ctx, hEventsBeacon(2, "c-1"))
 	ctx.Settle()
 	ctx.Assert(rival.Fired, "recordImpression never touched beacon:b-2")
 	ctx.Assert(rival.Err == nil, "the rival delivery of b-2 failed: %v", rival.Err)
 	ctx.Assert(first && rival.Result == true, "two racing deliveries of b-2 answered %v and %v, expected true for both", first, rival.Result)
-	ctx.Equal(eventsRendered(ctx), store.Rendered{Impressions: 2, SpendMicros: 3000}, "b-1 once and two racing deliveries of b-2 must count 2 impressions: check and claim in one write (SET NX), not a read then a write; render:c-1")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "b-1 once and two racing deliveries of b-2 must produce 2 events; the records")
+	ctx.Equal(hEventsRendered(ctx), store.Rendered{Impressions: 2, SpendMicros: 3000}, "b-1 once and two racing deliveries of b-2 must count 2 impressions: check and claim in one write (SET NX), not a read then a write; render:c-1")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "b-1 once and two racing deliveries of b-2 must produce 2 events; the records")
 }
 
 func CheckCommitBeforeProduce(ctx *harness.Ctx) {
-	probe := ctx.Redis.After("render:c-1", func() any { return len(ctx.Kafka.Records(eventsTopic)) })
-	eventsRecord(ctx, eventsBeacon(1, "c-1"))
+	probe := ctx.Redis.After("render:c-1", func() any { return len(ctx.Kafka.Records(kHEventsTopic)) })
+	hEventsRecord(ctx, hEventsBeacon(1, "c-1"))
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "recordImpression never counted the render (no write to render:c-1)")
 	ctx.Equal(probe.Result, 0, "when the render was counted the topic already held events: a consumer read an impression the counters did not hold. Count first, then produce; the records at count time")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the count; the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "the event must still be produced after the count; the records")
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsRecord(ctx, eventsBeacon(1, "c-1"))
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsRecord(ctx, hEventsBeacon(1, "c-1"))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the impression twice (enable.idempotence); the records")
-	eventsRecord(ctx, eventsBeacon(2, "c-1"))
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the impression twice (enable.idempotence); the records")
+	hEventsRecord(ctx, hEventsBeacon(2, "c-1"))
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsRecord(ctx, eventsBeacon(1, "c-1"))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok := hEventsRecord(ctx, hEventsBeacon(1, "c-1"))
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the impression never reaches the delivery report; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "c-1", "the outbox row is %v, expected the topic and the key c-1", rows[0])
-	ctx.Equal(rows[0].Payload, eventsPayload("b-1"), "the outbox row's payload")
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == "c-1", "the outbox row is %v, expected the topic and the key c-1", rows[0])
+	ctx.Equal(rows[0].Payload, hEventsPayload("b-1"), "the outbox row's payload")
 	ctx.Equal(ok, false, "recordImpression's result after a failed delivery")
-	ctx.Equal(eventsRendered(ctx).Impressions, 1, "the render must stay counted when only the produce failed; the impressions")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Equal(hEventsRendered(ctx).Impressions, 1, "the render must stay counted when only the produce failed; the impressions")
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsRecord(ctx, eventsBeacon(2, "c-1"))
+	ok = hEventsRecord(ctx, hEventsBeacon(2, "c-1"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "recordImpression waited %.1f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["beacon_id"] == "b-2", "no acknowledgement within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "recordImpression's result without an acknowledgement")
 }
@@ -972,23 +972,23 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "ads.impression";
+const std::string kHEventsTopic = "ads.impression";
 
-store::Beacon eventsBeacon(int n, const std::string& campaign = "c-1") {
+store::Beacon hEventsBeacon(int n, const std::string& campaign = "c-1") {
   return store::Beacon{"b-" + std::to_string(n), campaign, "cr-" + campaign, "u-" + std::to_string(n), 1500};
 }
 
-long long eventsImpressions(harness::Ctx& ctx) {
+long long hEventsImpressions(harness::Ctx& ctx) {
   const auto value = ctx.Redis.HGet("render:c-1", "impressions");
   return value ? std::stoll(*value) : 0;
 }
 
-long long eventsSpend(harness::Ctx& ctx) {
+long long hEventsSpend(harness::Ctx& ctx) {
   const auto value = ctx.Redis.HGet("render:c-1", "spend_micros");
   return value ? std::stoll(*value) : 0;
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -998,30 +998,30 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
+std::string hEventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 // The event a c-1 beacon must produce: these four fields, nothing else.
-nlohmann::json eventsPayload(const std::string& beacon_id) {
+nlohmann::json hEventsPayload(const std::string& beacon_id) {
   return {{"beacon_id", beacon_id}, {"campaign_id", "c-1"}, {"creative_id", "cr-c-1"}, {"price_micros", 1500}};
 }
 
 }  // namespace
 
 void CheckCampaignKey(harness::Ctx& ctx) {
-  recordImpression(eventsBeacon(1, "c-1"));
-  recordImpression(eventsBeacon(2, "c-2"));
-  recordImpression(eventsBeacon(3, "c-1"));
+  recordImpression(hEventsBeacon(1, "c-1"));
+  recordImpression(hEventsBeacon(2, "c-2"));
+  recordImpression(hEventsBeacon(3, "c-1"));
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three rendered beacons must produce three records on ads.impression; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"c-1", "c-2", "c-1"}, "the records must be keyed by the campaign ids");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"c-1", "c-2", "c-1"}, "the records must be keyed by the campaign ids");
   ctx.Equal(records[0].Partition, records[2].Partition,
             "both c-1 impressions must land on one partition, or a per-campaign consumer sees them out of order; the partitions");
-  const auto value = ctx.Kafka.Values(kEventsTopic)[0];
+  const auto value = ctx.Kafka.Values(kHEventsTopic)[0];
   const auto payload = nlohmann::json::parse(value, nullptr, false);
-  ctx.Assert(payload == eventsPayload("b-1"), "the event for b-1 carries %s, expected exactly %s: the user's hash stays out of the topic", value, eventsPayload("b-1").dump());
+  ctx.Assert(payload == hEventsPayload("b-1"), "the event for b-1 carries %s, expected exactly %s: the user's hash stays out of the topic", value, hEventsPayload("b-1").dump());
 }
 
 void CheckDedupeBeacon(harness::Ctx& ctx) {
@@ -1032,16 +1032,16 @@ void CheckDedupeBeacon(harness::Ctx& ctx) {
     claimFired = true;
     claimed = ctx.Redis.TTL("beacon:b-1");
   });
-  ctx.Equal(recordImpression(eventsBeacon(1)), true, "the first delivery of beacon b-1 must be recorded");
+  ctx.Equal(recordImpression(hEventsBeacon(1)), true, "the first delivery of beacon b-1 must be recorded");
   ctx.Assert(claimFired, "recordImpression never touched beacon:b-1: nothing claims the beacon, so a page that retries it is billed again");
   ctx.Assert(claimed == -2 || (86000 <= claimed && claimed <= 86400),
              "right after the command that created beacon:b-1 its TTL was %d: the claim must carry its expiry in the same write (SET NX EX), or a crash leaves it forever", claimed);
-  const bool again = recordImpression(eventsBeacon(1));  // the page retried its beacon
+  const bool again = recordImpression(hEventsBeacon(1));  // the page retried its beacon
   ctx.Settle();
   ctx.Equal(again, true, "a retried beacon was already recorded; its result");
-  ctx.Equal(eventsImpressions(ctx), 1, "one beacon delivered twice must be billed once; render:c-1 impressions");
-  ctx.Equal(eventsSpend(ctx), 1500, "one beacon delivered twice must be billed once; render:c-1 spend_micros");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "one beacon delivered twice must produce one event; the records");
+  ctx.Equal(hEventsImpressions(ctx), 1, "one beacon delivered twice must be billed once; render:c-1 impressions");
+  ctx.Equal(hEventsSpend(ctx), 1500, "one beacon delivered twice must be billed once; render:c-1 spend_micros");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "one beacon delivered twice must produce one event; the records");
   const long long ttl = ctx.Redis.TTL("beacon:b-1");
   ctx.Assert(86000 <= ttl && ttl <= 86400, "beacon:b-1 has TTL %d, expected kDedupeTtlS = 86400: a claim with no expiry grows Redis forever", ttl);
   // The page's retry of b-2 lands on another app server right after the first delivery touches the claim.
@@ -1049,14 +1049,14 @@ void CheckDedupeBeacon(harness::Ctx& ctx) {
   bool theirs = false;
   ctx.Redis.After("beacon:b-2", [&] {
     rivalFired = true;
-    theirs = recordImpression(eventsBeacon(2));
+    theirs = recordImpression(hEventsBeacon(2));
   });
-  const bool first = recordImpression(eventsBeacon(2));
+  const bool first = recordImpression(hEventsBeacon(2));
   ctx.Settle();
   ctx.Assert(rivalFired, "recordImpression never touched beacon:b-2");
   ctx.Assert(first && theirs, "two racing deliveries of b-2 answered %s and %s, expected true for both", first ? "true" : "false", theirs ? "true" : "false");
-  ctx.Equal(eventsImpressions(ctx), 2, "b-1 once and two racing deliveries of b-2 must count 2 impressions: check and claim in one write (SET NX), not a read then a write; render:c-1 impressions");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "b-1 once and two racing deliveries of b-2 must produce 2 events; the records");
+  ctx.Equal(hEventsImpressions(ctx), 2, "b-1 once and two racing deliveries of b-2 must count 2 impressions: check and claim in one write (SET NX), not a read then a write; render:c-1 impressions");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "b-1 once and two racing deliveries of b-2 must produce 2 events; the records");
 }
 
 void CheckCommitBeforeProduce(harness::Ctx& ctx) {
@@ -1064,46 +1064,46 @@ void CheckCommitBeforeProduce(harness::Ctx& ctx) {
   bool fired = false;
   ctx.Redis.After("render:c-1", [&] {
     fired = true;
-    atCount = ctx.Kafka.Records(kEventsTopic).size();
+    atCount = ctx.Kafka.Records(kHEventsTopic).size();
   });
-  recordImpression(eventsBeacon(1));
+  recordImpression(hEventsBeacon(1));
   ctx.Settle();
   ctx.Assert(fired, "recordImpression never counted the render (no write to render:c-1)");
   ctx.Equal(atCount, 0,
             "when the render was counted the topic already held events: a consumer read an impression the counters did not hold. "
             "Count first, then produce; the records at count time");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the event must still be produced after the count; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "the event must still be produced after the count; the records");
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  recordImpression(eventsBeacon(1));
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  recordImpression(hEventsBeacon(1));
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1,
             "after one lost acknowledgement the producer's retry must not write the impression twice (enable.idempotence); the records");
-  recordImpression(eventsBeacon(2));
+  recordImpression(hEventsBeacon(2));
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = recordImpression(eventsBeacon(1));
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  bool ok = recordImpression(hEventsBeacon(1));
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the impression never reaches the delivery report; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "c-1" && rows[0].contains("payload") && rows[0]["payload"] == eventsPayload("b-1"),
-             "the outbox row is %s, expected the topic, the key c-1 and the payload %s", rows[0].dump(), eventsPayload("b-1").dump());
+  ctx.Assert(hEventsField(rows[0], "topic") == kHEventsTopic && hEventsField(rows[0], "key") == "c-1" && rows[0].contains("payload") && rows[0]["payload"] == hEventsPayload("b-1"),
+             "the outbox row is %s, expected the topic, the key c-1 and the payload %s", rows[0].dump(), hEventsPayload("b-1").dump());
   ctx.Equal(ok, false, "recordImpression's result after a failed delivery");
-  ctx.Equal(eventsImpressions(ctx), 1, "the render must stay counted when only the produce failed; the impressions");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Equal(hEventsImpressions(ctx), 1, "the render must stay counted when only the produce failed; the impressions");
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = recordImpression(eventsBeacon(2));
+  ok = recordImpression(hEventsBeacon(2));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "recordImpression waited %.1f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "beacon_id") == "b-2",
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hEventsField(rows[1]["payload"], "beacon_id") == "b-2",
              "no acknowledgement within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "recordImpression's result without an acknowledgement");
 }

@@ -803,10 +803,10 @@ import (
 	"leetbuild/harness"
 )
 
-var readFull = map[string]any{"hits_total": 8, "misses_total": 12, "similarity_sum": 7.2, "automated_total": 5, "automated_hits": 3, "hits_older_than_1h": 2}
+var hReadFull = map[string]any{"hits_total": 8, "misses_total": 12, "similarity_sum": 7.2, "automated_total": 5, "automated_hits": 3, "hits_older_than_1h": 2}
 
 // readCounters writes the hash the stats consumer (step 4) maintains, as it would stand after the traffic.
-func readCounters(ctx *harness.Ctx, key string, fields map[string]any) {
+func hReadCounters(ctx *harness.Ctx, key string, fields map[string]any) {
 	args := []any{"HSET", key}
 	for _, field := range []string{"hits_total", "misses_total", "similarity_sum", "automated_total", "automated_hits", "hits_older_than_1h"} {
 		if v, ok := fields[field]; ok {
@@ -816,13 +816,13 @@ func readCounters(ctx *harness.Ctx, key string, fields map[string]any) {
 	ctx.Redis.Do(args...)
 }
 
-func readServer(ctx *harness.Ctx) *harness.HTTP {
+func hReadServer(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readGet(c *harness.HTTP, tenant, modelVersion string, header ...string) *harness.Response {
+func hReadGet(c *harness.HTTP, tenant, modelVersion string, header ...string) *harness.Response {
 	path := "/v1/semantic-cache/" + tenant + "/stats"
 	if modelVersion != "" {
 		path += "?model_version=" + modelVersion
@@ -830,86 +830,86 @@ func readGet(c *harness.HTTP, tenant, modelVersion string, header ...string) *ha
 	return c.Get(path, header...)
 }
 
-func readBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hReadBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the report must be a JSON object, got %s", r.Text())
 	return body
 }
 
-func readNear(v any, expected float64) bool {
+func hReadNear(v any, expected float64) bool {
 	f, ok := v.(float64)
 	return ok && math.Abs(f-expected) < 1e-9
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readServer(ctx)
-	readCounters(ctx, "stats:acme:2024-06", readFull)
-	readCounters(ctx, "stats:all", readFull)
-	r := readGet(c, "acme", "2024-06", "X-Tenant-Id", "acme")
+	c := hReadServer(ctx)
+	hReadCounters(ctx, "stats:acme:2024-06", hReadFull)
+	hReadCounters(ctx, "stats:all", hReadFull)
+	r := hReadGet(c, "acme", "2024-06", "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/semantic-cache/acme/stats (%s)", r.Text())
 	ctx.Assert(strings.HasPrefix(r.Header.Get("Content-Type"), "application/json"), "the report must be JSON, got Content-Type %q", r.Header.Get("Content-Type"))
-	body := readBody(ctx, r)
+	body := hReadBody(ctx, r)
 	ctx.Assert(body["tenant"] == "acme" && body["model_version"] == "2024-06", "the report names its tenant and model version: %s", r.Text())
-	ctx.Assert(readNear(body["hit_rate"], 0.4), "hit_rate is %v, expected 8 hits / 20 lookups = 0.4", body["hit_rate"])
+	ctx.Assert(hReadNear(body["hit_rate"], 0.4), "hit_rate is %v, expected 8 hits / 20 lookups = 0.4", body["hit_rate"])
 }
 
 func CheckTenantAuthz(ctx *harness.Ctx) {
-	c := readServer(ctx)
-	readCounters(ctx, "stats:acme:2024-06", readFull)
-	readCounters(ctx, "stats:all", readFull)
-	r := readGet(c, "acme", "2024-06")
+	c := hReadServer(ctx)
+	hReadCounters(ctx, "stats:acme:2024-06", hReadFull)
+	hReadCounters(ctx, "stats:all", hReadFull)
+	r := hReadGet(c, "acme", "2024-06")
 	ctx.Equal(r.Status, 401, "a request without X-Tenant-Id")
-	r = readGet(c, "acme", "2024-06", "X-Tenant-Id", "globex")
+	r = hReadGet(c, "acme", "2024-06", "X-Tenant-Id", "globex")
 	ctx.Equal(r.Status, 403, "globex asked for acme's stats (%s)", r.Text())
-	r = readGet(c, "acme", "2024-06", "X-Tenant-Id", "acme")
+	r = hReadGet(c, "acme", "2024-06", "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "acme asked for its own stats (%s)", r.Text())
 }
 
 func CheckAge(ctx *harness.Ctx) {
-	c := readServer(ctx)
-	readCounters(ctx, "stats:acme:2024-06", readFull)
-	r := readGet(c, "acme", "2024-06", "X-Tenant-Id", "acme")
+	c := hReadServer(ctx)
+	hReadCounters(ctx, "stats:acme:2024-06", hReadFull)
+	r := hReadGet(c, "acme", "2024-06", "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "stats (%s)", r.Text())
-	body := readBody(ctx, r)
+	body := hReadBody(ctx, r)
 	ctx.Equal(body["aging_hits"], 2, "aging_hits must be the consumer's hits_older_than_1h count")
-	ctx.Assert(readNear(body["hits_older_than_1h_share"], 0.25), "hits_older_than_1h_share is %v, expected 2 / 8 hits = 0.25", body["hits_older_than_1h_share"])
+	ctx.Assert(hReadNear(body["hits_older_than_1h_share"], 0.25), "hits_older_than_1h_share is %v, expected 2 / 8 hits = 0.25", body["hits_older_than_1h_share"])
 }
 
 func CheckAutomated(ctx *harness.Ctx) {
-	c := readServer(ctx)
-	readCounters(ctx, "stats:acme:2024-06", readFull)
-	r := readGet(c, "acme", "2024-06", "X-Tenant-Id", "acme")
+	c := hReadServer(ctx)
+	hReadCounters(ctx, "stats:acme:2024-06", hReadFull)
+	r := hReadGet(c, "acme", "2024-06", "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "stats (%s)", r.Text())
-	body := readBody(ctx, r)
-	ctx.Assert(readNear(body["hit_rate"], 0.4), "hit_rate is %v, expected 8 hits / 20 lookups = 0.4", body["hit_rate"])
-	ctx.Assert(readNear(body["hit_rate_automated"], 0.6), "hit_rate_automated is %v, expected 3 automated hits / 5 automated lookups = 0.6", body["hit_rate_automated"])
-	ctx.Assert(readNear(body["automated_share"], 0.25), "automated_share is %v, expected 5 automated lookups / 20 lookups = 0.25", body["automated_share"])
-	ctx.Assert(readNear(body["avg_similarity"], 0.9), "avg_similarity is %v, expected 7.2 / 8 hits = 0.9", body["avg_similarity"])
+	body := hReadBody(ctx, r)
+	ctx.Assert(hReadNear(body["hit_rate"], 0.4), "hit_rate is %v, expected 8 hits / 20 lookups = 0.4", body["hit_rate"])
+	ctx.Assert(hReadNear(body["hit_rate_automated"], 0.6), "hit_rate_automated is %v, expected 3 automated hits / 5 automated lookups = 0.6", body["hit_rate_automated"])
+	ctx.Assert(hReadNear(body["automated_share"], 0.25), "automated_share is %v, expected 5 automated lookups / 20 lookups = 0.25", body["automated_share"])
+	ctx.Assert(hReadNear(body["avg_similarity"], 0.9), "avg_similarity is %v, expected 7.2 / 8 hits = 0.9", body["avg_similarity"])
 }
 
 func CheckScope(ctx *harness.Ctx) {
-	c := readServer(ctx)
-	readCounters(ctx, "stats:all", map[string]any{"hits_total": 99, "misses_total": 1, "similarity_sum": 90})
-	readCounters(ctx, "stats:acme:2024-06", readFull)
-	readCounters(ctx, "stats:acme:2024-07", map[string]any{"hits_total": 1, "misses_total": 9, "similarity_sum": 0.9})
-	readCounters(ctx, "stats:acme:2024-08", map[string]any{"misses_total": 4})
-	r := readGet(c, "acme", "2024-06", "X-Tenant-Id", "acme")
-	ctx.Assert(readNear(readBody(ctx, r)["hit_rate"], 0.4), "acme 2024-06 reports hit_rate %v, expected 0.4 from stats:acme:2024-06 (not another hash's numbers)", readBody(ctx, r)["hit_rate"])
-	r = readGet(c, "acme", "2024-07", "X-Tenant-Id", "acme")
-	ctx.Assert(readNear(readBody(ctx, r)["hit_rate"], 0.1), "acme 2024-07 reports hit_rate %v, expected 0.1 from stats:acme:2024-07", readBody(ctx, r)["hit_rate"])
-	r = readGet(c, "acme", "2024-08", "X-Tenant-Id", "acme")
+	c := hReadServer(ctx)
+	hReadCounters(ctx, "stats:all", map[string]any{"hits_total": 99, "misses_total": 1, "similarity_sum": 90})
+	hReadCounters(ctx, "stats:acme:2024-06", hReadFull)
+	hReadCounters(ctx, "stats:acme:2024-07", map[string]any{"hits_total": 1, "misses_total": 9, "similarity_sum": 0.9})
+	hReadCounters(ctx, "stats:acme:2024-08", map[string]any{"misses_total": 4})
+	r := hReadGet(c, "acme", "2024-06", "X-Tenant-Id", "acme")
+	ctx.Assert(hReadNear(hReadBody(ctx, r)["hit_rate"], 0.4), "acme 2024-06 reports hit_rate %v, expected 0.4 from stats:acme:2024-06 (not another hash's numbers)", hReadBody(ctx, r)["hit_rate"])
+	r = hReadGet(c, "acme", "2024-07", "X-Tenant-Id", "acme")
+	ctx.Assert(hReadNear(hReadBody(ctx, r)["hit_rate"], 0.1), "acme 2024-07 reports hit_rate %v, expected 0.1 from stats:acme:2024-07", hReadBody(ctx, r)["hit_rate"])
+	r = hReadGet(c, "acme", "2024-08", "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "acme 2024-08 (four misses, no hits) (%s)", r.Text())
-	noHits := readBody(ctx, r)
+	noHits := hReadBody(ctx, r)
 	for _, field := range []string{"hit_rate", "hit_rate_automated", "automated_share", "avg_similarity", "hits_older_than_1h_share"} {
-		ctx.Assert(readNear(noHits[field], 0), "%s is %v for four misses and no hits, expected 0.0: every division is guarded, not only the one by lookups", field, noHits[field])
+		ctx.Assert(hReadNear(noHits[field], 0), "%s is %v for four misses and no hits, expected 0.0: every division is guarded, not only the one by lookups", field, noHits[field])
 	}
-	r = readGet(c, "acme", "", "X-Tenant-Id", "acme")
+	r = hReadGet(c, "acme", "", "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 400, "a request without model_version")
-	r = readGet(c, "globex", "2024-06", "X-Tenant-Id", "globex")
+	r = hReadGet(c, "globex", "2024-06", "X-Tenant-Id", "globex")
 	ctx.Equal(r.Status, 200, "a tenant with no traffic (%s)", r.Text())
-	body := readBody(ctx, r)
+	body := hReadBody(ctx, r)
 	for _, field := range []string{"hit_rate", "hit_rate_automated", "automated_share", "avg_similarity", "hits_older_than_1h_share"} {
-		ctx.Assert(readNear(body[field], 0), "%s is %v for a tenant with no traffic, expected 0.0 (no NaN, no division error)", field, body[field])
+		ctx.Assert(hReadNear(body[field], 0), "%s is %v for a tenant with no traffic, expected 0.0 (no NaN, no division error)", field, body[field])
 	}
 }
 `,
@@ -923,11 +923,11 @@ func CheckScope(ctx *harness.Ctx) {
 
 namespace {
 
-const std::map<std::string, double> kFull = {{"hits_total", 8}, {"misses_total", 12}, {"similarity_sum", 7.2},
+const std::map<std::string, double> kHFull = {{"hits_total", 8}, {"misses_total", 12}, {"similarity_sum", 7.2},
                                               {"automated_total", 5}, {"automated_hits", 3}, {"hits_older_than_1h", 2}};
 
 // The hash the stats consumer (step 4) maintains, as it would stand after the traffic.
-void readCounters(harness::Ctx& ctx, const std::string& key, const std::map<std::string, double>& fields) {
+void hReadCounters(harness::Ctx& ctx, const std::string& key, const std::map<std::string, double>& fields) {
   std::vector<std::string> args = {"HSET", key};
   for (const auto& [field, value] : fields) {
     args.push_back(field);
@@ -936,26 +936,26 @@ void readCounters(harness::Ctx& ctx, const std::string& key, const std::map<std:
   ctx.Redis.Must(args);
 }
 
-struct ReadServer {
+struct HReadServer {
   httplib::Server svr;
 };
 
-harness::HTTP readServer(harness::Ctx& ctx) {
-  static ReadServer* server = nullptr;
+harness::HTTP hReadServer(harness::Ctx& ctx) {
+  static HReadServer* server = nullptr;
   delete server;
-  server = new ReadServer;
+  server = new HReadServer;
   register_routes(server->svr);
   return ctx.HTTP(server->svr);
 }
 
-harness::Response readGet(harness::HTTP& c, const std::string& tenant, const std::string& modelVersion, const std::string& caller) {
+harness::Response hReadGet(harness::HTTP& c, const std::string& tenant, const std::string& modelVersion, const std::string& caller) {
   std::string path = "/v1/semantic-cache/" + tenant + "/stats";
   if (!modelVersion.empty()) path += "?model_version=" + modelVersion;
   if (caller.empty()) return c.Get(path);
   return c.Get(path, "X-Tenant-Id", caller);
 }
 
-nlohmann::json readBody(harness::Ctx& ctx, const harness::Response& r) {
+nlohmann::json hReadBody(harness::Ctx& ctx, const harness::Response& r) {
   nlohmann::json body;
   try {
     body = nlohmann::json::parse(r.Text());
@@ -965,94 +965,94 @@ nlohmann::json readBody(harness::Ctx& ctx, const harness::Response& r) {
   return body;
 }
 
-bool readNear(const nlohmann::json& body, const std::string& field, double expected) {
+bool hReadNear(const nlohmann::json& body, const std::string& field, double expected) {
   return body.contains(field) && body[field].is_number() && std::fabs(body[field].get<double>() - expected) < 1e-9;
 }
 
-std::string shown(const nlohmann::json& body, const std::string& field) { return body.value(field, nlohmann::json()).dump(); }
+std::string hShown(const nlohmann::json& body, const std::string& field) { return body.value(field, nlohmann::json()).dump(); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readServer(ctx);
-  readCounters(ctx, "stats:acme:2024-06", kFull);
-  readCounters(ctx, "stats:all", kFull);
-  auto r = readGet(c, "acme", "2024-06", "acme");
+  auto c = hReadServer(ctx);
+  hReadCounters(ctx, "stats:acme:2024-06", kHFull);
+  hReadCounters(ctx, "stats:all", kHFull);
+  auto r = hReadGet(c, "acme", "2024-06", "acme");
   ctx.Equal(r.Status, 200, "GET /v1/semantic-cache/acme/stats (%s)", r.Text());
   ctx.Assert(r.HeaderValue("Content-Type").rfind("application/json", 0) == 0, "the report must be JSON, got Content-Type %q",
              r.HeaderValue("Content-Type"));
-  const auto body = readBody(ctx, r);
+  const auto body = hReadBody(ctx, r);
   ctx.Assert(body.value("tenant", "") == "acme" && body.value("model_version", "") == "2024-06", "the report names its tenant and model version: %s",
              r.Text());
-  ctx.Assert(readNear(body, "hit_rate", 0.4), "hit_rate is %s, expected 8 hits / 20 lookups = 0.4", shown(body, "hit_rate"));
+  ctx.Assert(hReadNear(body, "hit_rate", 0.4), "hit_rate is %s, expected 8 hits / 20 lookups = 0.4", hShown(body, "hit_rate"));
 }
 
 void CheckTenantAuthz(harness::Ctx& ctx) {
-  auto c = readServer(ctx);
-  readCounters(ctx, "stats:acme:2024-06", kFull);
-  readCounters(ctx, "stats:all", kFull);
-  auto r = readGet(c, "acme", "2024-06", "");
+  auto c = hReadServer(ctx);
+  hReadCounters(ctx, "stats:acme:2024-06", kHFull);
+  hReadCounters(ctx, "stats:all", kHFull);
+  auto r = hReadGet(c, "acme", "2024-06", "");
   ctx.Equal(r.Status, 401, "a request without X-Tenant-Id");
-  r = readGet(c, "acme", "2024-06", "globex");
+  r = hReadGet(c, "acme", "2024-06", "globex");
   ctx.Equal(r.Status, 403, "globex asked for acme's stats (%s)", r.Text());
-  r = readGet(c, "acme", "2024-06", "acme");
+  r = hReadGet(c, "acme", "2024-06", "acme");
   ctx.Equal(r.Status, 200, "acme asked for its own stats (%s)", r.Text());
 }
 
 void CheckAge(harness::Ctx& ctx) {
-  auto c = readServer(ctx);
-  readCounters(ctx, "stats:acme:2024-06", kFull);
-  auto r = readGet(c, "acme", "2024-06", "acme");
+  auto c = hReadServer(ctx);
+  hReadCounters(ctx, "stats:acme:2024-06", kHFull);
+  auto r = hReadGet(c, "acme", "2024-06", "acme");
   ctx.Equal(r.Status, 200, "stats (%s)", r.Text());
-  const auto body = readBody(ctx, r);
+  const auto body = hReadBody(ctx, r);
   ctx.Assert(body.contains("aging_hits") && body["aging_hits"] == 2, "aging_hits is %s, expected the consumer's hits_older_than_1h count, 2",
-             shown(body, "aging_hits"));
-  ctx.Assert(readNear(body, "hits_older_than_1h_share", 0.25), "hits_older_than_1h_share is %s, expected 2 / 8 hits = 0.25",
-             shown(body, "hits_older_than_1h_share"));
+             hShown(body, "aging_hits"));
+  ctx.Assert(hReadNear(body, "hits_older_than_1h_share", 0.25), "hits_older_than_1h_share is %s, expected 2 / 8 hits = 0.25",
+             hShown(body, "hits_older_than_1h_share"));
 }
 
 void CheckAutomated(harness::Ctx& ctx) {
-  auto c = readServer(ctx);
-  readCounters(ctx, "stats:acme:2024-06", kFull);
-  auto r = readGet(c, "acme", "2024-06", "acme");
+  auto c = hReadServer(ctx);
+  hReadCounters(ctx, "stats:acme:2024-06", kHFull);
+  auto r = hReadGet(c, "acme", "2024-06", "acme");
   ctx.Equal(r.Status, 200, "stats (%s)", r.Text());
-  const auto body = readBody(ctx, r);
-  ctx.Assert(readNear(body, "hit_rate", 0.4), "hit_rate is %s, expected 8 hits / 20 lookups = 0.4", shown(body, "hit_rate"));
-  ctx.Assert(readNear(body, "hit_rate_automated", 0.6), "hit_rate_automated is %s, expected 3 automated hits / 5 automated lookups = 0.6",
-             shown(body, "hit_rate_automated"));
-  ctx.Assert(readNear(body, "automated_share", 0.25), "automated_share is %s, expected 5 automated lookups / 20 lookups = 0.25",
-             shown(body, "automated_share"));
-  ctx.Assert(readNear(body, "avg_similarity", 0.9), "avg_similarity is %s, expected 7.2 / 8 hits = 0.9", shown(body, "avg_similarity"));
+  const auto body = hReadBody(ctx, r);
+  ctx.Assert(hReadNear(body, "hit_rate", 0.4), "hit_rate is %s, expected 8 hits / 20 lookups = 0.4", hShown(body, "hit_rate"));
+  ctx.Assert(hReadNear(body, "hit_rate_automated", 0.6), "hit_rate_automated is %s, expected 3 automated hits / 5 automated lookups = 0.6",
+             hShown(body, "hit_rate_automated"));
+  ctx.Assert(hReadNear(body, "automated_share", 0.25), "automated_share is %s, expected 5 automated lookups / 20 lookups = 0.25",
+             hShown(body, "automated_share"));
+  ctx.Assert(hReadNear(body, "avg_similarity", 0.9), "avg_similarity is %s, expected 7.2 / 8 hits = 0.9", hShown(body, "avg_similarity"));
 }
 
 void CheckScope(harness::Ctx& ctx) {
-  auto c = readServer(ctx);
-  readCounters(ctx, "stats:all", {{"hits_total", 99}, {"misses_total", 1}, {"similarity_sum", 90}});
-  readCounters(ctx, "stats:acme:2024-06", kFull);
-  readCounters(ctx, "stats:acme:2024-07", {{"hits_total", 1}, {"misses_total", 9}, {"similarity_sum", 0.9}});
-  readCounters(ctx, "stats:acme:2024-08", {{"misses_total", 4}});
-  auto r = readGet(c, "acme", "2024-06", "acme");
-  auto body = readBody(ctx, r);
-  ctx.Assert(readNear(body, "hit_rate", 0.4), "acme 2024-06 reports hit_rate %s, expected 0.4 from stats:acme:2024-06 (not another hash's numbers)",
-             shown(body, "hit_rate"));
-  r = readGet(c, "acme", "2024-07", "acme");
-  body = readBody(ctx, r);
-  ctx.Assert(readNear(body, "hit_rate", 0.1), "acme 2024-07 reports hit_rate %s, expected 0.1 from stats:acme:2024-07", shown(body, "hit_rate"));
-  r = readGet(c, "acme", "2024-08", "acme");
+  auto c = hReadServer(ctx);
+  hReadCounters(ctx, "stats:all", {{"hits_total", 99}, {"misses_total", 1}, {"similarity_sum", 90}});
+  hReadCounters(ctx, "stats:acme:2024-06", kHFull);
+  hReadCounters(ctx, "stats:acme:2024-07", {{"hits_total", 1}, {"misses_total", 9}, {"similarity_sum", 0.9}});
+  hReadCounters(ctx, "stats:acme:2024-08", {{"misses_total", 4}});
+  auto r = hReadGet(c, "acme", "2024-06", "acme");
+  auto body = hReadBody(ctx, r);
+  ctx.Assert(hReadNear(body, "hit_rate", 0.4), "acme 2024-06 reports hit_rate %s, expected 0.4 from stats:acme:2024-06 (not another hash's numbers)",
+             hShown(body, "hit_rate"));
+  r = hReadGet(c, "acme", "2024-07", "acme");
+  body = hReadBody(ctx, r);
+  ctx.Assert(hReadNear(body, "hit_rate", 0.1), "acme 2024-07 reports hit_rate %s, expected 0.1 from stats:acme:2024-07", hShown(body, "hit_rate"));
+  r = hReadGet(c, "acme", "2024-08", "acme");
   ctx.Equal(r.Status, 200, "acme 2024-08 (four misses, no hits) (%s)", r.Text());
-  body = readBody(ctx, r);
+  body = hReadBody(ctx, r);
   for (const std::string field : {"hit_rate", "hit_rate_automated", "automated_share", "avg_similarity", "hits_older_than_1h_share"}) {
-    ctx.Assert(readNear(body, field, 0), "%s is %s for four misses and no hits, expected 0.0: every division is guarded, not only the one by lookups",
-               field, shown(body, field));
+    ctx.Assert(hReadNear(body, field, 0), "%s is %s for four misses and no hits, expected 0.0: every division is guarded, not only the one by lookups",
+               field, hShown(body, field));
   }
-  r = readGet(c, "acme", "", "acme");
+  r = hReadGet(c, "acme", "", "acme");
   ctx.Equal(r.Status, 400, "a request without model_version");
-  r = readGet(c, "globex", "2024-06", "globex");
+  r = hReadGet(c, "globex", "2024-06", "globex");
   ctx.Equal(r.Status, 200, "a tenant with no traffic (%s)", r.Text());
-  body = readBody(ctx, r);
+  body = hReadBody(ctx, r);
   for (const std::string field : {"hit_rate", "hit_rate_automated", "automated_share", "avg_similarity", "hits_older_than_1h_share"}) {
-    ctx.Assert(readNear(body, field, 0), "%s is %s for a tenant with no traffic, expected 0.0 (no NaN, no division error)", field,
-               shown(body, field));
+    ctx.Assert(hReadNear(body, field, 0), "%s is %s for a tenant with no traffic, expected 0.0 (no NaN, no division error)", field,
+               hShown(body, field));
   }
 }
 `,

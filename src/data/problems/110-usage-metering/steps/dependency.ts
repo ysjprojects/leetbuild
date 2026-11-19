@@ -715,17 +715,17 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
 // billingPeer bills each close id once; short takes units off what it bills (a billing service that lost some).
-type billingPeer struct {
+type HBillingPeer struct {
 	pb.UnimplementedBillingServer
 	billed map[string]int64
 	ids    []string
 	short  int64
 }
 
-func (b *billingPeer) ClosePeriod(_ context.Context, req *pb.ClosePeriodRequest) (*pb.ClosePeriodReply, error) {
+func (b *HBillingPeer) ClosePeriod(_ context.Context, req *pb.ClosePeriodRequest) (*pb.ClosePeriodReply, error) {
 	if _, seen := b.billed[req.GetCloseId()]; !seen {
 		b.billed[req.GetCloseId()] = req.GetTotalUnits() - b.short
 		b.ids = append(b.ids, req.GetCloseId())
@@ -733,23 +733,23 @@ func (b *billingPeer) ClosePeriod(_ context.Context, req *pb.ClosePeriodRequest)
 	return &pb.ClosePeriodReply{CloseId: req.GetCloseId(), BilledUnits: b.billed[req.GetCloseId()]}, nil
 }
 
-func hSetup(ctx *harness.Ctx) (*billingPeer, int64) {
-	peer := &billingPeer{billed: map[string]int64{}}
+func hSetup(ctx *harness.Ctx) (*HBillingPeer, int64) {
+	peer := &HBillingPeer{billed: map[string]int64{}}
 	pb.RegisterBillingServer(ctx.GRPC.Server(""), peer)
-	ledger.RecordUsage(clientBg, ledger.Record{RequestID: "req_1", Account: "acct_1", Route: "/v1/generate", Units: 1200, Gateway: "gw-eu-1"})
-	ledger.RecordUsage(clientBg, ledger.Record{RequestID: "req_2", Account: "acct_1", Route: "/v1/embed", Units: 300, Gateway: "gw-eu-1"})
+	ledger.RecordUsage(hClientBg, ledger.Record{RequestID: "req_1", Account: "acct_1", Route: "/v1/generate", Units: 1200, Gateway: "gw-eu-1"})
+	ledger.RecordUsage(hClientBg, ledger.Record{RequestID: "req_2", Account: "acct_1", Route: "/v1/embed", Units: 300, Gateway: "gw-eu-1"})
 	return peer, ledger.CurrentWindow()
 }
 
 func CheckCloses(ctx *harness.Ctx) {
 	_, w := hSetup(ctx)
-	result := closePeriod(clientBg, "acct_1", w)
+	result := closePeriod(hClientBg, "acct_1", w)
 	ctx.Equal(result, "PERIOD_CLOSED", "with billing healthy, closePeriod")
 	calls := ctx.GRPC.CallsTo("ClosePeriod", "")
 	ctx.Assert(len(calls) > 0, "closePeriod never called Billing.ClosePeriod")
 	sent := calls[len(calls)-1].Request.(*pb.ClosePeriodRequest)
 	ctx.Assert(sent.GetAccount() == "acct_1" && sent.GetWindow() == w && sent.GetTotalUnits() == 1500, "ClosePeriod carried account %q window %d total %d, expected acct_1, %d, 1500", sent.GetAccount(), sent.GetWindow(), sent.GetTotalUnits(), w)
-	close := ledger.LastClose(clientBg, "acct_1")
+	close := ledger.LastClose(hClientBg, "acct_1")
 	ctx.Assert(close != nil && close.Window == w && close.Units == 1500, "the closed window must be marked with its 1500 units, the ledger holds %+v", close)
 }
 
@@ -757,23 +757,23 @@ func CheckCloseId(ctx *harness.Ctx) {
 	peer, w := hSetup(ctx)
 	expected := fmt.Sprintf("close:acct_1:%d", w)
 	ctx.GRPC.Fail("ClosePeriod", codes.Unavailable, "", 1, "")
-	ctx.Equal(closePeriod(clientBg, "acct_1", w), "PERIOD_CLOSED", "after one UNAVAILABLE the retry must close the period; closePeriod")
+	ctx.Equal(closePeriod(hClientBg, "acct_1", w), "PERIOD_CLOSED", "after one UNAVAILABLE the retry must close the period; closePeriod")
 	var ids []string
 	for _, c := range ctx.GRPC.CallsTo("ClosePeriod", "") {
 		ids = append(ids, c.Request.(*pb.ClosePeriodRequest).GetCloseId())
 	}
 	ctx.Equal(ids, []string{expected, expected}, "a fresh id per attempt lets an attempt that landed be billed again; the two attempts' close ids")
-	ctx.Equal(ledger.LastClose(clientBg, "acct_1").CloseID, expected, "the window must be marked closed under the derived close id")
+	ctx.Equal(ledger.LastClose(hClientBg, "acct_1").CloseID, expected, "the window must be marked closed under the derived close id")
 	// The scheduler runs the close again an hour later, for the window it left behind.
 	ctx.Clock.Advance(ledger.WindowSeconds)
-	closePeriod(clientBg, "acct_1", w)
+	closePeriod(hClientBg, "acct_1", w)
 	ctx.Equal(peer.ids, []string{expected}, "running the close of window %d again an hour later must carry %s, derived from the window closed, not the current one; the close ids billing billed", w, expected)
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
 	_, w := hSetup(ctx)
 	ctx.GRPC.SetLatency("ClosePeriod", 30.0, "")
-	result := closePeriod(clientBg, "acct_1", w)
+	result := closePeriod(hClientBg, "acct_1", w)
 	calls := ctx.GRPC.CallsTo("ClosePeriod", "")
 	ctx.Assert(len(calls) > 0, "closePeriod never called Billing.ClosePeriod")
 	for _, call := range calls {
@@ -787,23 +787,23 @@ func CheckDeadline(ctx *harness.Ctx) {
 func CheckTimeoutOpen(ctx *harness.Ctx) {
 	_, w := hSetup(ctx)
 	ctx.GRPC.Fail("ClosePeriod", codes.DeadlineExceeded, "", 3, "")
-	result := closePeriod(clientBg, "acct_1", w)
+	result := closePeriod(hClientBg, "acct_1", w)
 	ctx.Equal(result, "PERIOD_OPEN", "every attempt timed out: billing never confirmed the close, so the period stays open; closePeriod")
-	ctx.Assert(ledger.LastClose(clientBg, "acct_1") == nil, "a close no attempt confirmed was marked: %+v", ledger.LastClose(clientBg, "acct_1"))
-	ctx.Equal(closePeriod(clientBg, "acct_1", w), "PERIOD_CLOSED", "once billing answers again the period must close; closePeriod")
+	ctx.Assert(ledger.LastClose(hClientBg, "acct_1") == nil, "a close no attempt confirmed was marked: %+v", ledger.LastClose(hClientBg, "acct_1"))
+	ctx.Equal(closePeriod(hClientBg, "acct_1", w), "PERIOD_CLOSED", "once billing answers again the period must close; closePeriod")
 }
 
 func CheckReconcile(ctx *harness.Ctx) {
 	peer, w := hSetup(ctx)
 	peer.short = 100
-	result := closePeriod(clientBg, "acct_1", w)
+	result := closePeriod(hClientBg, "acct_1", w)
 	ctx.Equal(result, "PERIOD_OPEN", "billing billed 1400 of the window's 1500 units: a close that does not tie out stays open; closePeriod")
-	ctx.Assert(ledger.LastClose(clientBg, "acct_1") == nil, "a close that does not tie out was marked: %+v", ledger.LastClose(clientBg, "acct_1"))
+	ctx.Assert(ledger.LastClose(hClientBg, "acct_1") == nil, "a close that does not tie out was marked: %+v", ledger.LastClose(hClientBg, "acct_1"))
 	// A billing service that bills more than was counted does not tie out either.
-	ledger.RecordUsage(clientBg, ledger.Record{RequestID: "req_9", Account: "acct_2", Route: "/v1/generate", Units: 500, Gateway: "gw-eu-1"})
+	ledger.RecordUsage(hClientBg, ledger.Record{RequestID: "req_9", Account: "acct_2", Route: "/v1/generate", Units: 500, Gateway: "gw-eu-1"})
 	peer.short = -100
-	ctx.Equal(closePeriod(clientBg, "acct_2", w), "PERIOD_OPEN", "billing billed 600 of the window's 500 units: a close that does not tie out stays open, whichever way it is off; closePeriod")
-	ctx.Assert(ledger.LastClose(clientBg, "acct_2") == nil, "a close billed above the window was marked: %+v", ledger.LastClose(clientBg, "acct_2"))
+	ctx.Equal(closePeriod(hClientBg, "acct_2", w), "PERIOD_OPEN", "billing billed 600 of the window's 500 units: a close that does not tie out stays open, whichever way it is off; closePeriod")
+	ctx.Assert(ledger.LastClose(hClientBg, "acct_2") == nil, "a close billed above the window was marked: %+v", ledger.LastClose(hClientBg, "acct_2"))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -817,7 +817,7 @@ func CheckReconcile(ctx *harness.Ctx) {
 namespace {
 
 // Bills each close id once; short takes units off what it bills (a billing service that lost some).
-class BillingPeer final : public usagemeter::Billing::Service {
+class HBillingPeer final : public usagemeter::Billing::Service {
  public:
   std::map<std::string, long long> billed;
   std::vector<std::string> ids;
@@ -833,10 +833,10 @@ class BillingPeer final : public usagemeter::Billing::Service {
   }
 };
 
-BillingPeer& hSetup(harness::Ctx& ctx) {
-  static BillingPeer* peer = nullptr;
+HBillingPeer& hSetup(harness::Ctx& ctx) {
+  static HBillingPeer* peer = nullptr;
   delete peer;
-  peer = new BillingPeer;
+  peer = new HBillingPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   ledger::Record first;
   first.request_id = "req_1";
@@ -868,7 +868,7 @@ void CheckCloses(harness::Ctx& ctx) {
 }
 
 void CheckCloseId(harness::Ctx& ctx) {
-  BillingPeer& peer = hSetup(ctx);
+  HBillingPeer& peer = hSetup(ctx);
   const long long w = ledger::currentWindow();
   const std::string expected = "close:acct_1:" + std::to_string(w);
   ctx.GRPC.Fail("ClosePeriod", grpc::StatusCode::UNAVAILABLE, "", 1);
@@ -909,7 +909,7 @@ void CheckTimeoutOpen(harness::Ctx& ctx) {
 }
 
 void CheckReconcile(harness::Ctx& ctx) {
-  BillingPeer& peer = hSetup(ctx);
+  HBillingPeer& peer = hSetup(ctx);
   const long long w = ledger::currentWindow();
   peer.short_by = 100;
   ctx.Equal(closePeriod("acct_1", w), "PERIOD_OPEN", "billing billed 1400 of the window's 1500 units: a close that does not tie out stays open; closePeriod");

@@ -533,32 +533,32 @@ import (
 )
 
 const (
-	stateKey       = "run:r1:checkpoint"
-	stateRetention = 7 * 24 * 3600
+	kHStateKey       = "run:r1:checkpoint"
+	kHStateRetention = 7 * 24 * 3600
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func stateStart(ctx *harness.Ctx) {
-	ctx.Redis.Do("HSET", stateKey, "current_step", "create_account", "completed", "", "output_ref", "", "updated_at", "1000")
+func hStateStart(ctx *harness.Ctx) {
+	ctx.Redis.Do("HSET", kHStateKey, "current_step", "create_account", "completed", "", "output_ref", "", "updated_at", "1000")
 }
 
 func hMustAdvance(ctx *harness.Ctx, from, to, output string, now int64) bool {
-	moved, err := advance(stateBg, "r1", from, to, output, now)
+	moved, err := advance(hStateBg, "r1", from, to, output, now)
 	ctx.NoError(err, "advance(r1, %q, %q) failed", from, to)
 	return moved
 }
 
 func hStateField(ctx *harness.Ctx, field string) string {
-	value, _ := ctx.Redis.HGet(stateKey, field)
+	value, _ := ctx.Redis.HGet(kHStateKey, field)
 	return value
 }
 
 func CheckCas(ctx *harness.Ctx) {
-	stateStart(ctx)
+	hStateStart(ctx)
 	// A duplicate worker advances the run right after the first worker touched the checkpoint.
-	rival := ctx.Redis.After(stateKey, func() any {
-		moved, err := advance(stateBg, "r1", "create_account", "send_welcome", \`{"worker": "w2"}\`, 2000)
+	rival := ctx.Redis.After(kHStateKey, func() any {
+		moved, err := advance(hStateBg, "r1", "create_account", "send_welcome", \`{"worker": "w2"}\`, 2000)
 		ctx.NoError(err, "the second worker's advance failed")
 		return moved
 	})
@@ -582,11 +582,11 @@ func CheckCas(ctx *harness.Ctx) {
 }
 
 func CheckRef(ctx *harness.Ctx) {
-	stateStart(ctx)
+	hStateStart(ctx)
 	output := \`{"account": "\` + strings.Repeat("a", 100000) + \`"}\`
 	ctx.Equal(hMustAdvance(ctx, "create_account", "send_welcome", output, 2000), true, "advancing a run at create_account; moved")
 	var big []string
-	for name, value := range ctx.Redis.HGetAll(stateKey) {
+	for name, value := range ctx.Redis.HGetAll(kHStateKey) {
 		if len(value) > 1024 {
 			big = append(big, name)
 		}
@@ -598,7 +598,7 @@ func CheckRef(ctx *harness.Ctx) {
 }
 
 func CheckTrail(ctx *harness.Ctx) {
-	stateStart(ctx)
+	hStateStart(ctx)
 	ctx.Equal(hMustAdvance(ctx, "create_account", "send_welcome", "{}", 2000), true, "advancing from create_account; moved")
 	ctx.Equal(hMustAdvance(ctx, "send_welcome", "notify_sales", "{}", 2100), true, "advancing from send_welcome; moved")
 	ctx.Equal(hMustAdvance(ctx, "create_account", "send_welcome", "{}", 2200), false, "a stale advance from create_account, two steps later; moved")
@@ -613,20 +613,20 @@ type hTTLSeen struct {
 }
 
 func CheckRetention(ctx *harness.Ctx) {
-	stateStart(ctx)
+	hStateStart(ctx)
 	hMustAdvance(ctx, "create_account", "send_welcome", "{}", 2000)
-	ctx.Equal(ctx.Redis.TTL(stateKey), int64(-1), "a running checkpoint must not expire (a run waiting on a slow step would lose its state); its TTL")
+	ctx.Equal(ctx.Redis.TTL(kHStateKey), int64(-1), "a running checkpoint must not expire (a run waiting on a slow step would lose its state); its TTL")
 	// Read the TTL the moment the finishing advance has touched the checkpoint, before anything else runs.
-	seen := ctx.Redis.After(stateKey, func() any {
-		return hTTLSeen{hStateField(ctx, "current_step"), ctx.Redis.TTL(stateKey)}
+	seen := ctx.Redis.After(kHStateKey, func() any {
+		return hTTLSeen{hStateField(ctx, "current_step"), ctx.Redis.TTL(kHStateKey)}
 	})
 	ctx.Equal(hMustAdvance(ctx, "send_welcome", "", "{}", 2100), true, "advancing the last step to ''; moved")
 	ctx.Equal(hStateField(ctx, "current_step"), "", "a finished run's current_step")
-	ttl := ctx.Redis.TTL(stateKey)
-	ctx.Assert(stateRetention-60 <= ttl && ttl <= stateRetention, "the finished run's checkpoint has a TTL of %d s, expected seven days (retentionSeconds = %d)", ttl, stateRetention)
+	ttl := ctx.Redis.TTL(kHStateKey)
+	ctx.Assert(kHStateRetention-60 <= ttl && ttl <= kHStateRetention, "the finished run's checkpoint has a TTL of %d s, expected seven days (retentionSeconds = %d)", ttl, kHStateRetention)
 	ctx.Assert(seen.Fired, "the finishing advance never touched run:r1:checkpoint")
 	early, _ := seen.Result.(hTTLSeen)
-	ctx.Assert(early.step != "" || (stateRetention-60 <= early.ttl && early.ttl <= stateRetention), "right after the command that finished the run its checkpoint had a TTL of %d s: an expiry set by a second command is lost when the worker stops in between. Finish and expire in the one script", early.ttl)
+	ctx.Assert(early.step != "" || (kHStateRetention-60 <= early.ttl && early.ttl <= kHStateRetention), "right after the command that finished the run its checkpoint had a TTL of %d s: an expiry set by a second command is lost when the worker stops in between. Finish and expire in the one script", early.ttl)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -638,12 +638,12 @@ func CheckRetention(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kKey = "run:r1:checkpoint";
-constexpr long long kRetention = 7 * 24 * 3600;
+const std::string kHKey = "run:r1:checkpoint";
+constexpr long long kHRetention = 7 * 24 * 3600;
 
-void hStateStart(harness::Ctx& ctx) { ctx.Redis.Do("HSET", kKey, "current_step", "create_account", "completed", "", "output_ref", "", "updated_at", "1000"); }
+void hStateStart(harness::Ctx& ctx) { ctx.Redis.Do("HSET", kHKey, "current_step", "create_account", "completed", "", "output_ref", "", "updated_at", "1000"); }
 
-std::string hStateField(harness::Ctx& ctx, const std::string& name) { return ctx.Redis.HGet(kKey, name).value_or(""); }
+std::string hStateField(harness::Ctx& ctx, const std::string& name) { return ctx.Redis.HGet(kHKey, name).value_or(""); }
 
 struct HRival {
   bool fired = false;
@@ -663,7 +663,7 @@ void CheckCas(harness::Ctx& ctx) {
   hStateStart(ctx);
   // A duplicate worker advances the run right after the first worker touched the checkpoint.
   auto rival = std::make_shared<HRival>();
-  ctx.Redis.After(kKey, [rival] {
+  ctx.Redis.After(kHKey, [rival] {
     rival->fired = true;
     try {
       rival->moved = advance("r1", "create_account", "send_welcome", R"({"worker": "w2"})", 2000);
@@ -686,7 +686,7 @@ void CheckRef(harness::Ctx& ctx) {
   const std::string output = R"({"account": ")" + std::string(100000, 'a') + R"("})";
   ctx.Equal(advance("r1", "create_account", "send_welcome", output, 2000), true, "advancing a run at create_account; moved");
   std::vector<std::string> big;
-  for (const auto& [name, value] : ctx.Redis.HGetAll(kKey)) {
+  for (const auto& [name, value] : ctx.Redis.HGetAll(kHKey)) {
     if (value.size() > 1024) big.push_back(name);
   }
   ctx.Assert(big.empty(), "the checkpoint hash holds the field(s) %q over 1 KB: the 100 KB output belongs in the blob store, the hash holds its reference", big);
@@ -707,20 +707,20 @@ void CheckTrail(harness::Ctx& ctx) {
 void CheckRetention(harness::Ctx& ctx) {
   hStateStart(ctx);
   advance("r1", "create_account", "send_welcome", "{}", 2000);
-  ctx.Equal(ctx.Redis.TTL(kKey), -1LL, "a running checkpoint must not expire (a run waiting on a slow step would lose its state); its TTL");
+  ctx.Equal(ctx.Redis.TTL(kHKey), -1LL, "a running checkpoint must not expire (a run waiting on a slow step would lose its state); its TTL");
   // Read the TTL the moment the finishing advance has touched the checkpoint, before anything else runs.
   auto seen = std::make_shared<HTTLSeen>();
-  ctx.Redis.After(kKey, [seen, &ctx] {
+  ctx.Redis.After(kHKey, [seen, &ctx] {
     seen->fired = true;
     seen->step = hStateField(ctx, "current_step");
-    seen->ttl = ctx.Redis.TTL(kKey);
+    seen->ttl = ctx.Redis.TTL(kHKey);
   });
   ctx.Equal(advance("r1", "send_welcome", "", "{}", 2100), true, "advancing the last step to ''; moved");
   ctx.Equal(hStateField(ctx, "current_step"), "", "a finished run's current_step");
-  const long long ttl = ctx.Redis.TTL(kKey);
-  ctx.Assert(kRetention - 60 <= ttl && ttl <= kRetention, "the finished run's checkpoint has a TTL of %d s, expected seven days (kRetentionSeconds = %d)", ttl, kRetention);
+  const long long ttl = ctx.Redis.TTL(kHKey);
+  ctx.Assert(kHRetention - 60 <= ttl && ttl <= kHRetention, "the finished run's checkpoint has a TTL of %d s, expected seven days (kRetentionSeconds = %d)", ttl, kHRetention);
   ctx.Assert(seen->fired, "the finishing advance never touched run:r1:checkpoint");
-  ctx.Assert(!seen->step.empty() || (kRetention - 60 <= seen->ttl && seen->ttl <= kRetention), "right after the command that finished the run its checkpoint had a TTL of %d s: an expiry set by a second command is lost when the worker stops in between. Finish and expire in the one script", seen->ttl);
+  ctx.Assert(!seen->step.empty() || (kHRetention - 60 <= seen->ttl && seen->ttl <= kHRetention), "right after the command that finished the run its checkpoint had a TTL of %d s: an expiry set by a second command is lost when the worker stops in between. Finish and expire in the one script", seen->ttl);
 }
 `,
   },

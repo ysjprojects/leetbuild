@@ -752,46 +752,46 @@ import (
 	"leetbuild/harness"
 )
 
-const apiQuery = "solar panel efficiency"
+const kHApiQuery = "solar panel efficiency"
 
-type apiResult struct {
+type HApiResult struct {
 	PassageID string   \`json:"passage_id"\`
 	Score     float64  \`json:"score"\`
 	Truncated *bool    \`json:"truncated"\`
 }
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiCand(id, text string) map[string]string { return map[string]string{"passage_id": id, "text": text} }
+func hApiCand(id, text string) map[string]string { return map[string]string{"passage_id": id, "text": text} }
 
-func apiRerank(c *harness.HTTP, query string, candidates []map[string]string, header ...string) *harness.Response {
+func hApiRerank(c *harness.HTTP, query string, candidates []map[string]string, header ...string) *harness.Response {
 	if header == nil {
 		header = []string{"X-Tenant-Id", "t-acme"}
 	}
 	return c.Post("/v1/rerank", map[string]any{"query": query, "candidates": candidates}, header...)
 }
 
-func apiResults(r *harness.Response) []apiResult {
+func hApiResults(r *harness.Response) []HApiResult {
 	var body struct {
-		Results []apiResult \`json:"results"\`
+		Results []HApiResult \`json:"results"\`
 	}
 	r.Decode(&body)
 	return body.Results
 }
 
-func apiByID(r *harness.Response) map[string]apiResult {
-	out := map[string]apiResult{}
-	for _, item := range apiResults(r) {
+func hApiByID(r *harness.Response) map[string]HApiResult {
+	out := map[string]HApiResult{}
+	for _, item := range hApiResults(r) {
 		out[item.PassageID] = item
 	}
 	return out
 }
 
-func apiFlag(item apiResult) string {
+func hApiFlag(item HApiResult) string {
 	if item.Truncated == nil {
 		return "missing"
 	}
@@ -799,78 +799,78 @@ func apiFlag(item apiResult) string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiRerank(c, apiQuery, []map[string]string{apiCand("p-1", "solar panel efficiency in winter"), apiCand("p-2", "wind turbines")})
+	c := hApiClient(ctx)
+	r := hApiRerank(c, kHApiQuery, []map[string]string{hApiCand("p-1", "solar panel efficiency in winter"), hApiCand("p-2", "wind turbines")})
 	ctx.Equal(r.Status, 200, "POST /v1/rerank (%s)", r.Text())
-	results := apiByID(r)
+	results := hApiByID(r)
 	ctx.Equal(len(results), 2, "two candidates must answer two results (%s)", r.Text())
 	ctx.Assert(math.Abs(results["p-1"].Score-1) < 1e-6 && math.Abs(results["p-2"].Score) < 1e-6, "the scores must be the model's (p-1 1.0, p-2 0.0), got %s", r.Text())
-	none := apiRerank(c, apiQuery, []map[string]string{apiCand("p-1", "solar")}, "X-Request-Id", "r-1")
+	none := hApiRerank(c, kHApiQuery, []map[string]string{hApiCand("p-1", "solar")}, "X-Request-Id", "r-1")
 	ctx.Equal(none.Status, 401, "a request without X-Tenant-Id")
 }
 
 func CheckQueryCap(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	one := []map[string]string{apiCand("p-1", "solar")}
-	long := apiRerank(c, strings.Repeat("solar ", 400), one)
+	c := hApiClient(ctx)
+	one := []map[string]string{hApiCand("p-1", "solar")}
+	long := hApiRerank(c, strings.Repeat("solar ", 400), one)
 	ctx.Equal(long.Status, 413, "a 2400-byte query must be refused before the model sees it; the status")
-	wide := apiRerank(c, strings.Repeat("\\u00e9", 1100), one)
+	wide := hApiRerank(c, strings.Repeat("\\u00e9", 1100), one)
 	ctx.Equal(wide.Status, 413, "a query of 1100 accented letters (2200 bytes of UTF-8): the cap counts bytes; the status")
-	edge := apiRerank(c, strings.Repeat("a", 2048), one)
+	edge := hApiRerank(c, strings.Repeat("a", 2048), one)
 	ctx.Equal(edge.Status, 200, "a query of exactly 2048 bytes (%s)", edge.Text())
-	over := apiRerank(c, strings.Repeat("a", 2049), one)
+	over := hApiRerank(c, strings.Repeat("a", 2049), one)
 	ctx.Equal(over.Status, 413, "a query of 2049 bytes (the cap is 2048 bytes); the status")
 }
 
 func CheckCandidateCap(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	many := func(n int) []map[string]string {
 		out := make([]map[string]string, 0, n)
 		for i := 0; i < n; i++ {
-			out = append(out, apiCand(fmt.Sprintf("p-%03d", i), "solar panel"))
+			out = append(out, hApiCand(fmt.Sprintf("p-%03d", i), "solar panel"))
 		}
 		return out
 	}
-	over := apiRerank(c, apiQuery, many(201))
+	over := hApiRerank(c, kHApiQuery, many(201))
 	ctx.Equal(over.Status, 400, "201 candidates must be refused (one caller sets the model bill); the status")
-	edge := apiRerank(c, apiQuery, many(200))
+	edge := hApiRerank(c, kHApiQuery, many(200))
 	ctx.Equal(edge.Status, 200, "200 candidates (%s)", edge.Text())
-	ctx.Equal(len(apiResults(edge)), 200, "200 candidates must answer 200 results")
+	ctx.Equal(len(hApiResults(edge)), 200, "200 candidates must answer 200 results")
 }
 
 func CheckTruncationReported(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiRerank(c, "solar", []map[string]string{
-		apiCand("long", strings.Repeat("panel ", 1000)+"solar"),
-		apiCand("exact", strings.Repeat("y", 4096)),
-		apiCand("wide", strings.Repeat("\\u00e9", 2500)),
-		apiCand("short", "solar power"),
+	c := hApiClient(ctx)
+	r := hApiRerank(c, "solar", []map[string]string{
+		hApiCand("long", strings.Repeat("panel ", 1000)+"solar"),
+		hApiCand("exact", strings.Repeat("y", 4096)),
+		hApiCand("wide", strings.Repeat("\\u00e9", 2500)),
+		hApiCand("short", "solar power"),
 	})
 	ctx.Equal(r.Status, 200, "POST /v1/rerank (%s)", r.Text())
-	results := apiByID(r)
-	ctx.Equal(apiFlag(results["long"]), "true", "a 6005-byte passage must come back truncated: true; truncated")
-	ctx.Equal(apiFlag(results["wide"]), "true", "2500 accented letters are 5000 bytes of UTF-8 and must come back truncated: true; truncated")
-	ctx.Assert(apiFlag(results["exact"]) == "false" && apiFlag(results["short"]) == "false", "passages within 4096 bytes must say truncated: false, got exact %s, short %s", apiFlag(results["exact"]), apiFlag(results["short"]))
+	results := hApiByID(r)
+	ctx.Equal(hApiFlag(results["long"]), "true", "a 6005-byte passage must come back truncated: true; truncated")
+	ctx.Equal(hApiFlag(results["wide"]), "true", "2500 accented letters are 5000 bytes of UTF-8 and must come back truncated: true; truncated")
+	ctx.Assert(hApiFlag(results["exact"]) == "false" && hApiFlag(results["short"]) == "false", "passages within 4096 bytes must say truncated: false, got exact %s, short %s", hApiFlag(results["exact"]), hApiFlag(results["short"]))
 	ctx.Assert(math.Abs(results["long"].Score) < 1e-6, "the long passage's only 'solar' sits past 4 KiB: scored cut, its score is 0, got %v", results["long"].Score)
-	mid := apiByID(apiRerank(c, "ab", []map[string]string{apiCand("mid", strings.Repeat("z", 4092)+" ab"+"\\u00e9")}))["mid"]
-	ctx.Equal(apiFlag(mid), "true", "a 4097-byte passage must come back truncated: true; truncated")
+	mid := hApiByID(hApiRerank(c, "ab", []map[string]string{hApiCand("mid", strings.Repeat("z", 4092)+" ab"+"\\u00e9")}))["mid"]
+	ctx.Equal(hApiFlag(mid), "true", "a 4097-byte passage must come back truncated: true; truncated")
 	ctx.Assert(math.Abs(mid.Score-1) < 1e-6, "a 4097-byte passage whose 4 KiB cut falls inside its last 2-byte letter is scored on the text before that letter (it ends in the word 'ab', score 1.0), got %v: the cut keeps whole characters only", mid.Score)
 }
 
 func CheckTieBreak(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	candidates := []map[string]string{apiCand("p-4", "unrelated text"), apiCand("p-2", "solar output"), apiCand("p-1", "panel cost"), apiCand("p-3", "solar panel efficiency")}
+	c := hApiClient(ctx)
+	candidates := []map[string]string{hApiCand("p-4", "unrelated text"), hApiCand("p-2", "solar output"), hApiCand("p-1", "panel cost"), hApiCand("p-3", "solar panel efficiency")}
 	reversed := []map[string]string{candidates[3], candidates[2], candidates[1], candidates[0]}
 	ids := func(r *harness.Response) []string {
 		out := []string{}
-		for _, item := range apiResults(r) {
+		for _, item := range hApiResults(r) {
 			out = append(out, item.PassageID)
 		}
 		return out
 	}
-	order := ids(apiRerank(c, apiQuery, candidates))
+	order := ids(hApiRerank(c, kHApiQuery, candidates))
 	ctx.Equal(order, []string{"p-3", "p-1", "p-2", "p-4"}, "score descending, ties by passage_id; the order")
-	ctx.Equal(ids(apiRerank(c, apiQuery, reversed)), order, "the same candidates sent in another order (a tie must not follow the client's order); the order")
+	ctx.Equal(ids(hApiRerank(c, kHApiQuery, reversed)), order, "the same candidates sent in another order (a tie must not follow the client's order); the order")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -885,7 +885,7 @@ func CheckTieBreak(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kQuery = "solar panel efficiency";
+const std::string kHQuery = "solar panel efficiency";
 
 harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
@@ -903,20 +903,20 @@ std::string hRepeat(const std::string& s, int n) {
   return out;
 }
 
-harness::Response rerankWith(harness::HTTP& c, const std::string& query, const nlohmann::json& candidates, bool tenant = true) {
+harness::Response hRerankWith(harness::HTTP& c, const std::string& query, const nlohmann::json& candidates, bool tenant = true) {
   const std::string body = nlohmann::json{{"query", query}, {"candidates", candidates}}.dump();
   if (!tenant) return c.Post("/v1/rerank", body, "Content-Type", "application/json");
   return c.Post("/v1/rerank", body, "Content-Type", "application/json", "X-Tenant-Id", "t-acme");
 }
 
-nlohmann::json resultsOf(const harness::Response& r) {
+nlohmann::json hResultsOf(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() && body.contains("results") && body["results"].is_array() ? body["results"] : nlohmann::json::array();
 }
 
 std::map<std::string, nlohmann::json> hById(const harness::Response& r) {
   std::map<std::string, nlohmann::json> out;
-  for (const auto& item : resultsOf(r)) out[item.value("passage_id", "")] = item;
+  for (const auto& item : hResultsOf(r)) out[item.value("passage_id", "")] = item;
   return out;
 }
 
@@ -927,7 +927,7 @@ std::string hFlag(const nlohmann::json& item) {
 
 std::vector<std::string> hIds(const harness::Response& r) {
   std::vector<std::string> out;
-  for (const auto& item : resultsOf(r)) out.push_back(item.value("passage_id", ""));
+  for (const auto& item : hResultsOf(r)) out.push_back(item.value("passage_id", ""));
   return out;
 }
 
@@ -935,24 +935,24 @@ std::vector<std::string> hIds(const harness::Response& r) {
 
 void CheckRoute(harness::Ctx& ctx) {
   auto c = hApi(ctx);
-  const auto r = rerankWith(c, kQuery, nlohmann::json::array({hCand("p-1", "solar panel efficiency in winter"), hCand("p-2", "wind turbines")}));
+  const auto r = hRerankWith(c, kHQuery, nlohmann::json::array({hCand("p-1", "solar panel efficiency in winter"), hCand("p-2", "wind turbines")}));
   ctx.Equal(r.Status, 200, "POST /v1/rerank (%s)", r.Text());
   auto results = hById(r);
   ctx.Equal(results.size(), 2, "two candidates must answer two results (%s)", r.Text());
   ctx.Assert(std::fabs(results["p-1"].value("score", -1.0) - 1) < 1e-6 && std::fabs(results["p-2"].value("score", -1.0)) < 1e-6,
              "the scores must be the model's (p-1 1.0, p-2 0.0), got %s", r.Text());
-  const auto none = rerankWith(c, kQuery, nlohmann::json::array({hCand("p-1", "solar")}), false);
+  const auto none = hRerankWith(c, kHQuery, nlohmann::json::array({hCand("p-1", "solar")}), false);
   ctx.Equal(none.Status, 401, "a request without X-Tenant-Id");
 }
 
 void CheckQueryCap(harness::Ctx& ctx) {
   auto c = hApi(ctx);
   const auto one = nlohmann::json::array({hCand("p-1", "solar")});
-  ctx.Equal(rerankWith(c, hRepeat("solar ", 400), one).Status, 413, "a 2400-byte query must be refused before the model sees it; the status");
-  ctx.Equal(rerankWith(c, hRepeat("\\xc3\\xa9", 1100), one).Status, 413, "a query of 1100 accented letters (2200 bytes of UTF-8): the cap counts bytes; the status");
-  const auto edge = rerankWith(c, hRepeat("a", 2048), one);
+  ctx.Equal(hRerankWith(c, hRepeat("solar ", 400), one).Status, 413, "a 2400-byte query must be refused before the model sees it; the status");
+  ctx.Equal(hRerankWith(c, hRepeat("\\xc3\\xa9", 1100), one).Status, 413, "a query of 1100 accented letters (2200 bytes of UTF-8): the cap counts bytes; the status");
+  const auto edge = hRerankWith(c, hRepeat("a", 2048), one);
   ctx.Equal(edge.Status, 200, "a query of exactly 2048 bytes (%s)", edge.Text());
-  ctx.Equal(rerankWith(c, hRepeat("a", 2049), one).Status, 413, "a query of 2049 bytes (the cap is 2048 bytes); the status");
+  ctx.Equal(hRerankWith(c, hRepeat("a", 2049), one).Status, 413, "a query of 2049 bytes (the cap is 2048 bytes); the status");
 }
 
 void CheckCandidateCap(harness::Ctx& ctx) {
@@ -966,15 +966,15 @@ void CheckCandidateCap(harness::Ctx& ctx) {
     }
     return out;
   };
-  ctx.Equal(rerankWith(c, kQuery, many(201)).Status, 400, "201 candidates must be refused (one caller sets the model bill); the status");
-  const auto edge = rerankWith(c, kQuery, many(200));
+  ctx.Equal(hRerankWith(c, kHQuery, many(201)).Status, 400, "201 candidates must be refused (one caller sets the model bill); the status");
+  const auto edge = hRerankWith(c, kHQuery, many(200));
   ctx.Equal(edge.Status, 200, "200 candidates");
-  ctx.Equal(resultsOf(edge).size(), 200, "200 candidates must answer 200 results");
+  ctx.Equal(hResultsOf(edge).size(), 200, "200 candidates must answer 200 results");
 }
 
 void CheckTruncationReported(harness::Ctx& ctx) {
   auto c = hApi(ctx);
-  const auto r = rerankWith(c, "solar", nlohmann::json::array({hCand("long", hRepeat("panel ", 1000) + "solar"), hCand("exact", hRepeat("y", 4096)),
+  const auto r = hRerankWith(c, "solar", nlohmann::json::array({hCand("long", hRepeat("panel ", 1000) + "solar"), hCand("exact", hRepeat("y", 4096)),
                                                                hCand("wide", hRepeat("\\xc3\\xa9", 2500)), hCand("short", "solar power")}));
   ctx.Equal(r.Status, 200, "POST /v1/rerank");
   auto results = hById(r);
@@ -984,7 +984,7 @@ void CheckTruncationReported(harness::Ctx& ctx) {
              hFlag(results["exact"]), hFlag(results["short"]));
   ctx.Assert(std::fabs(results["long"].value("score", -1.0)) < 1e-6, "the long passage's only 'solar' sits past 4 KiB: scored cut, its score is 0, got %s",
              results["long"].dump());
-  auto mid = hById(rerankWith(c, "ab", nlohmann::json::array({hCand("mid", hRepeat("z", 4092) + " ab" + "\\xc3\\xa9")})))["mid"];
+  auto mid = hById(hRerankWith(c, "ab", nlohmann::json::array({hCand("mid", hRepeat("z", 4092) + " ab" + "\\xc3\\xa9")})))["mid"];
   ctx.Equal(hFlag(mid), "true", "a 4097-byte passage must come back truncated: true; truncated");
   ctx.Assert(std::fabs(mid.value("score", -1.0) - 1) < 1e-6,
              "a 4097-byte passage whose 4 KiB cut falls inside its last 2-byte letter is scored on the text before that letter (it ends in the word 'ab', score 1.0), got %s: the cut keeps whole characters only",
@@ -995,9 +995,9 @@ void CheckTieBreak(harness::Ctx& ctx) {
   auto c = hApi(ctx);
   const auto candidates = nlohmann::json::array({hCand("p-4", "unrelated text"), hCand("p-2", "solar output"), hCand("p-1", "panel cost"), hCand("p-3", "solar panel efficiency")});
   const auto reversed = nlohmann::json::array({candidates[3], candidates[2], candidates[1], candidates[0]});
-  const auto order = hIds(rerankWith(c, kQuery, candidates));
+  const auto order = hIds(hRerankWith(c, kHQuery, candidates));
   ctx.Equal(order, std::vector<std::string>{"p-3", "p-1", "p-2", "p-4"}, "score descending, ties by passage_id; the order");
-  ctx.Equal(hIds(rerankWith(c, kQuery, reversed)), order, "the same candidates sent in another order (a tie must not follow the client's order); the order");
+  ctx.Equal(hIds(hRerankWith(c, kHQuery, reversed)), order, "the same candidates sent in another order (a tie must not follow the client's order); the order");
 }
 `,
   },

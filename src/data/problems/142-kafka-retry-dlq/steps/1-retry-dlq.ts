@@ -1069,27 +1069,27 @@ import (
 	"leetbuild/harness"
 )
 
-func seedOrder(ctx *harness.Ctx, key string, order int) {
+func hSeedOrder(ctx *harness.Ctx, key string, order int) {
 	ctx.Kafka.Seed("orders", key, map[string]any{"order": order, "sku": "lamp"})
 }
 
-// headerOf is a record's header as text, nil when absent.
-func headerOf(r harness.KafkaRecord, name string) any {
+// hHeaderOf is a record's header as text, nil when absent.
+func hHeaderOf(r harness.KafkaRecord, name string) any {
 	if v, ok := r.Header(name); ok {
 		return string(v)
 	}
 	return nil
 }
 
-func headersOf(records []harness.KafkaRecord, name string) []any {
+func hHeadersOf(records []harness.KafkaRecord, name string) []any {
 	out := []any{}
 	for _, r := range records {
-		out = append(out, headerOf(r, name))
+		out = append(out, hHeaderOf(r, name))
 	}
 	return out
 }
 
-func orderOf(r harness.KafkaRecord) any {
+func hOrderOf(r harness.KafkaRecord) any {
 	var event map[string]any
 	if json.Unmarshal(r.Value, &event) != nil {
 		return nil
@@ -1097,8 +1097,8 @@ func orderOf(r harness.KafkaRecord) any {
 	return event["order"]
 }
 
-// failingHandler returns an error for its first times calls and succeeds after; calls collects the orders it saw.
-func failingHandler(times int, calls *[]int) Handler {
+// hFailingHandler returns an error for its first times calls and succeeds after; calls collects the orders it saw.
+func hFailingHandler(times int, calls *[]int) Handler {
 	return func(event map[string]any) error {
 		order, _ := event["order"].(float64)
 		*calls = append(*calls, int(order))
@@ -1109,8 +1109,8 @@ func failingHandler(times int, calls *[]int) Handler {
 	}
 }
 
-// consumeOrders runs the learner's loop until it waits for records that will not come, then stops it.
-func consumeOrders(ctx *harness.Ctx, handler Handler) {
+// hConsumeOrders runs the learner's loop until it waits for records that will not come, then stops it.
+func hConsumeOrders(ctx *harness.Ctx, handler Handler) {
 	c, cancel := context.WithCancel(context.Background())
 	var err error
 	ctx.Drain(func() { err = run(c, handler) })
@@ -1121,44 +1121,44 @@ func consumeOrders(ctx *harness.Ctx, handler Handler) {
 	}
 }
 
-func noLag(ctx *harness.Ctx) bool {
+func hNoLag(ctx *harness.Ctx) bool {
 	return ctx.Kafka.Lag("fulfilment", "orders") == 0 && ctx.Kafka.Lag("fulfilment", "orders.retry") == 0
 }
 
 func CheckRetryThenSucceed(ctx *harness.Ctx) {
-	seedOrder(ctx, "order-7", 7)
+	hSeedOrder(ctx, "order-7", 7)
 	var calls []int
-	consumeOrders(ctx, failingHandler(2, &calls))
+	hConsumeOrders(ctx, hFailingHandler(2, &calls))
 	ctx.Equal(calls, []int{7, 7, 7}, "the handler must see the order once per attempt (3 times)")
 	retry := ctx.Kafka.Records("orders.retry")
-	ctx.Equal(headersOf(retry, "attempt"), []any{"1", "2"}, "orders.retry must hold attempt 1 then 2")
+	ctx.Equal(hHeadersOf(retry, "attempt"), []any{"1", "2"}, "orders.retry must hold attempt 1 then 2")
 	for _, r := range retry {
-		ctx.Assert(headerOf(r, "error") == "warehouse down", "the error header must carry the handler error's message, got %s", harness.Show(headerOf(r, "error")))
-		ctx.Assert(orderOf(r) == float64(7), "the hand-off must carry the source value unchanged, got %q", r.Value)
+		ctx.Assert(hHeaderOf(r, "error") == "warehouse down", "the error header must carry the handler error's message, got %s", harness.Show(hHeaderOf(r, "error")))
+		ctx.Assert(hOrderOf(r) == float64(7), "the hand-off must carry the source value unchanged, got %q", r.Value)
 	}
 	ctx.Equal(len(ctx.Kafka.Records("orders.dlq")), 0, "a record that eventually succeeds must not be dead-lettered: records on orders.dlq")
-	ctx.Assert(noLag(ctx), "every handled record must be committed")
+	ctx.Assert(hNoLag(ctx), "every handled record must be committed")
 }
 
 func CheckDeadLetter(ctx *harness.Ctx) {
-	seedOrder(ctx, "order-7", 7)
+	hSeedOrder(ctx, "order-7", 7)
 	var calls []int
-	consumeOrders(ctx, failingHandler(99, &calls))
+	hConsumeOrders(ctx, hFailingHandler(99, &calls))
 	ctx.Equal(len(calls), 3, "a record is tried maxAttempts = 3 times: handler calls")
-	ctx.Equal(headersOf(ctx.Kafka.Records("orders.retry"), "attempt"), []any{"1", "2"}, "the first two failures go to orders.retry")
+	ctx.Equal(hHeadersOf(ctx.Kafka.Records("orders.retry"), "attempt"), []any{"1", "2"}, "the first two failures go to orders.retry")
 	dlq := ctx.Kafka.Records("orders.dlq")
 	ctx.Equal(len(dlq), 1, "the third failure dead-letters the record once: records on orders.dlq")
-	ctx.Equal(headerOf(dlq[0], "attempt"), "3", "the dead letter's attempt header")
-	ctx.Equal(headerOf(dlq[0], "error"), "warehouse down", "the dead letter's error header must carry the handler error's message")
-	ctx.Equal(orderOf(dlq[0]), 7, "the dead letter must carry the source value unchanged: its order")
-	ctx.Assert(noLag(ctx), "dead-lettering commits the source offset")
+	ctx.Equal(hHeaderOf(dlq[0], "attempt"), "3", "the dead letter's attempt header")
+	ctx.Equal(hHeaderOf(dlq[0], "error"), "warehouse down", "the dead letter's error header must carry the handler error's message")
+	ctx.Equal(hOrderOf(dlq[0]), 7, "the dead letter must carry the source value unchanged: its order")
+	ctx.Assert(hNoLag(ctx), "dead-lettering commits the source offset")
 }
 
 func CheckKeyedHandoff(ctx *harness.Ctx) {
-	seedOrder(ctx, "order-7", 7)
-	seedOrder(ctx, "order-8", 8)
+	hSeedOrder(ctx, "order-7", 7)
+	hSeedOrder(ctx, "order-8", 8)
 	var calls []int
-	consumeOrders(ctx, func(event map[string]any) error {
+	hConsumeOrders(ctx, func(event map[string]any) error {
 		order, _ := event["order"].(float64)
 		calls = append(calls, int(order))
 		if order == 7 {
@@ -1196,13 +1196,13 @@ func CheckKeyedHandoff(ctx *harness.Ctx) {
 }
 
 func CheckAckBeforeCommit(ctx *harness.Ctx) {
-	seedOrder(ctx, "order-7", 7)
+	hSeedOrder(ctx, "order-7", 7)
 	ctx.Kafka.StallFor("orders.retry", 5)
 	var atCommit []int
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, len(ctx.Kafka.Records("orders.retry"))) })
 	var calls []int
 	before := ctx.Clock.Now()
-	consumeOrders(ctx, failingHandler(1, &calls))
+	hConsumeOrders(ctx, hFailingHandler(1, &calls))
 	stalled := false
 	for _, e := range ctx.Kafka.EventsOf("produce-stalled") {
 		stalled = stalled || e.Topic == "orders.retry"
@@ -1212,31 +1212,31 @@ func CheckAckBeforeCommit(ctx *harness.Ctx) {
 	ctx.Equal(atCommit[0], 1, "the source offset was committed while the hand-off was still in flight (wait for the acknowledgement first): records on orders.retry at the first commit")
 	ctx.Assert(ctx.Clock.Now()-before > 4000, "the commit must wait out the stall (5 s of virtual time) for the broker's acknowledgement")
 	ctx.Equal(calls, []int{7, 7}, "the retry record must be handled once the broker resumes: handler calls")
-	ctx.Assert(noLag(ctx), "every handled record must be committed")
+	ctx.Assert(hNoLag(ctx), "every handled record must be committed")
 }
 
 func CheckPoison(ctx *harness.Ctx) {
 	ctx.Kafka.Seed("orders", "order-9", "not json")
-	seedOrder(ctx, "order-7", 7)
+	hSeedOrder(ctx, "order-7", 7)
 	var calls []int
-	consumeOrders(ctx, failingHandler(0, &calls))
+	hConsumeOrders(ctx, hFailingHandler(0, &calls))
 	ctx.Equal(calls, []int{7}, "the handler must never see a record that does not parse: handler calls")
 	ctx.Equal(len(ctx.Kafka.Records("orders.retry")), 0, "malformed JSON is not retried: records on orders.retry")
 	dlq := ctx.Kafka.Records("orders.dlq")
 	ctx.Assert(len(dlq) == 1 && string(dlq[0].Key) == "order-9" && string(dlq[0].Value) == "not json", "the malformed record goes to orders.dlq with its key and value")
-	ctx.Equal(headerOf(dlq[0], "attempt"), "1", "dead-lettered on first sight: the attempt header")
-	errText, _ := headerOf(dlq[0], "error").(string)
+	ctx.Equal(hHeaderOf(dlq[0], "attempt"), "1", "dead-lettered on first sight: the attempt header")
+	errText, _ := hHeaderOf(dlq[0], "error").(string)
 	ctx.Assert(errText != "", "the dead letter's error header must say why")
 	ctx.Equal(ctx.Kafka.Lag("fulfilment", "orders"), 0, "a dead-lettered record's offset must be committed: lag on orders")
 }
 
 func CheckCommitsAdvance(ctx *harness.Ctx) {
 	for _, order := range []int{7, 8, 9, 10} {
-		seedOrder(ctx, fmt.Sprintf("order-%d", order), order)
+		hSeedOrder(ctx, fmt.Sprintf("order-%d", order), order)
 	}
 	var calls []int
 	eightFailed := false
-	consumeOrders(ctx, func(event map[string]any) error {
+	hConsumeOrders(ctx, func(event map[string]any) error {
 		order, _ := event["order"].(float64)
 		calls = append(calls, int(order))
 		if order == 8 && !eightFailed {
@@ -1276,40 +1276,40 @@ func CheckCommitsAdvance(ctx *harness.Ctx) {
 
 namespace {
 
-using OrderHandler = std::function<void(const std::string&)>;
+using HOrderHandler = std::function<void(const std::string&)>;
 
-void seedOrder(harness::Ctx& ctx, const std::string& key, int order) {
+void hSeedOrder(harness::Ctx& ctx, const std::string& key, int order) {
   ctx.Kafka.Seed("orders", key, nlohmann::json{{"order", order}, {"sku", "lamp"}});
 }
 
-// headersOf is each record's header as text, empty when absent.
-std::vector<std::optional<std::string>> headersOf(const std::vector<harness::KafkaRecord>& records, const std::string& name) {
+// hHeadersOf is each record's header as text, empty when absent.
+std::vector<std::optional<std::string>> hHeadersOf(const std::vector<harness::KafkaRecord>& records, const std::string& name) {
   std::vector<std::optional<std::string>> out;
   for (const auto& r : records) out.push_back(r.Header(name));
   return out;
 }
 
-// orderOf is the order field of a record's JSON value, null when it does not parse.
-nlohmann::json orderOf(const harness::KafkaRecord& r) {
+// hOrderOf is the order field of a record's JSON value, null when it does not parse.
+nlohmann::json hOrderOf(const harness::KafkaRecord& r) {
   const auto event = nlohmann::json::parse(r.Value.value_or(""), nullptr, false);
   return event.is_object() && event.contains("order") ? event["order"] : nlohmann::json();
 }
 
-int orderIn(const std::string& value) {
+int hOrderIn(const std::string& value) {
   const auto event = nlohmann::json::parse(value, nullptr, false);
   return event.is_object() && event.contains("order") && event["order"].is_number() ? event["order"].get<int>() : 0;
 }
 
-// failingHandler throws for its first times calls and succeeds after; calls collects the orders it saw.
-OrderHandler failingHandler(int times, std::vector<int>& calls) {
+// hFailingHandler throws for its first times calls and succeeds after; calls collects the orders it saw.
+HOrderHandler hFailingHandler(int times, std::vector<int>& calls) {
   return [times, &calls](const std::string& value) {
-    calls.push_back(orderIn(value));
+    calls.push_back(hOrderIn(value));
     if (static_cast<int>(calls.size()) <= times) throw std::runtime_error("warehouse down");
   };
 }
 
-// consumeOrders runs the learner's loop until it waits for records that will not come.
-void consumeOrders(harness::Ctx& ctx, const OrderHandler& handler) {
+// hConsumeOrders runs the learner's loop until it waits for records that will not come.
+void hConsumeOrders(harness::Ctx& ctx, const HOrderHandler& handler) {
   try {
     ctx.Drain([&] { run(handler); });
   } catch (const std::exception& e) {
@@ -1317,48 +1317,48 @@ void consumeOrders(harness::Ctx& ctx, const OrderHandler& handler) {
   }
 }
 
-bool noLag(harness::Ctx& ctx) {
+bool hNoLag(harness::Ctx& ctx) {
   return ctx.Kafka.Lag("fulfilment", "orders") == 0 && ctx.Kafka.Lag("fulfilment", "orders.retry") == 0;
 }
 
 }  // namespace
 
 void CheckRetryThenSucceed(harness::Ctx& ctx) {
-  seedOrder(ctx, "order-7", 7);
+  hSeedOrder(ctx, "order-7", 7);
   std::vector<int> calls;
-  consumeOrders(ctx, failingHandler(2, calls));
+  hConsumeOrders(ctx, hFailingHandler(2, calls));
   ctx.Equal(calls, {7, 7, 7}, "the handler must see the order once per attempt (3 times)");
   const auto retry = ctx.Kafka.Records("orders.retry");
-  ctx.Equal(headersOf(retry, "attempt"), {"1", "2"}, "orders.retry must hold attempt 1 then 2");
+  ctx.Equal(hHeadersOf(retry, "attempt"), {"1", "2"}, "orders.retry must hold attempt 1 then 2");
   for (const auto& r : retry) {
     ctx.Assert(r.Header("error") == "warehouse down", "the error header must carry the handler error's message, got %q", r.Header("error"));
-    ctx.Assert(orderOf(r) == 7, "the hand-off must carry the source value unchanged, got %q", r.Value);
+    ctx.Assert(hOrderOf(r) == 7, "the hand-off must carry the source value unchanged, got %q", r.Value);
   }
   ctx.Equal(ctx.Kafka.Records("orders.dlq").size(), 0,
             "a record that eventually succeeds must not be dead-lettered: records on orders.dlq");
-  ctx.Assert(noLag(ctx), "every handled record must be committed");
+  ctx.Assert(hNoLag(ctx), "every handled record must be committed");
 }
 
 void CheckDeadLetter(harness::Ctx& ctx) {
-  seedOrder(ctx, "order-7", 7);
+  hSeedOrder(ctx, "order-7", 7);
   std::vector<int> calls;
-  consumeOrders(ctx, failingHandler(99, calls));
+  hConsumeOrders(ctx, hFailingHandler(99, calls));
   ctx.Equal(calls.size(), 3, "a record is tried maxAttempts = 3 times: handler calls");
-  ctx.Equal(headersOf(ctx.Kafka.Records("orders.retry"), "attempt"), {"1", "2"}, "the first two failures go to orders.retry");
+  ctx.Equal(hHeadersOf(ctx.Kafka.Records("orders.retry"), "attempt"), {"1", "2"}, "the first two failures go to orders.retry");
   const auto dlq = ctx.Kafka.Records("orders.dlq");
   ctx.Equal(dlq.size(), 1, "the third failure dead-letters the record once: records on orders.dlq");
   ctx.Equal(dlq[0].Header("attempt"), "3", "the dead letter's attempt header");
   ctx.Equal(dlq[0].Header("error"), "warehouse down", "the dead letter's error header must carry the handler error's message");
-  ctx.Assert(orderOf(dlq[0]) == 7, "the dead letter must carry the source value unchanged: its order is %v", orderOf(dlq[0]).dump());
-  ctx.Assert(noLag(ctx), "dead-lettering commits the source offset");
+  ctx.Assert(hOrderOf(dlq[0]) == 7, "the dead letter must carry the source value unchanged: its order is %v", hOrderOf(dlq[0]).dump());
+  ctx.Assert(hNoLag(ctx), "dead-lettering commits the source offset");
 }
 
 void CheckKeyedHandoff(harness::Ctx& ctx) {
-  seedOrder(ctx, "order-7", 7);
-  seedOrder(ctx, "order-8", 8);
+  hSeedOrder(ctx, "order-7", 7);
+  hSeedOrder(ctx, "order-8", 8);
   std::vector<int> calls;
-  consumeOrders(ctx, [&](const std::string& value) {
-    const int order = orderIn(value);
+  hConsumeOrders(ctx, [&](const std::string& value) {
+    const int order = hOrderIn(value);
     calls.push_back(order);
     if (order == 7) throw std::runtime_error("warehouse down");
   });
@@ -1376,7 +1376,7 @@ void CheckKeyedHandoff(harness::Ctx& ctx) {
 }
 
 void CheckAckBeforeCommit(harness::Ctx& ctx) {
-  seedOrder(ctx, "order-7", 7);
+  hSeedOrder(ctx, "order-7", 7);
   ctx.Kafka.StallFor("orders.retry", 5);
   std::vector<size_t> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) {
@@ -1384,7 +1384,7 @@ void CheckAckBeforeCommit(harness::Ctx& ctx) {
   });
   std::vector<int> calls;
   const int64_t before = ctx.Clock.Now();
-  consumeOrders(ctx, failingHandler(1, calls));
+  hConsumeOrders(ctx, hFailingHandler(1, calls));
   bool stalled = false;
   for (const auto& e : ctx.Kafka.EventsOf("produce-stalled")) stalled = stalled || e.Topic == "orders.retry";
   ctx.Assert(stalled, "the hand-off must be produced to orders.retry (it was stalled)");
@@ -1394,14 +1394,14 @@ void CheckAckBeforeCommit(harness::Ctx& ctx) {
   ctx.Assert(ctx.Clock.Now() - before > 4000,
              "the commit must wait out the stall (5 s of virtual time) for the broker's acknowledgement");
   ctx.Equal(calls, {7, 7}, "the retry record must be handled once the broker resumes: handler calls");
-  ctx.Assert(noLag(ctx), "every handled record must be committed");
+  ctx.Assert(hNoLag(ctx), "every handled record must be committed");
 }
 
 void CheckPoison(harness::Ctx& ctx) {
   ctx.Kafka.Seed("orders", "order-9", "not json");
-  seedOrder(ctx, "order-7", 7);
+  hSeedOrder(ctx, "order-7", 7);
   std::vector<int> calls;
-  consumeOrders(ctx, failingHandler(0, calls));
+  hConsumeOrders(ctx, hFailingHandler(0, calls));
   ctx.Equal(calls, {7}, "the handler must never see a record that does not parse: handler calls");
   ctx.Equal(ctx.Kafka.Records("orders.retry").size(), 0, "malformed JSON is not retried: records on orders.retry");
   const auto dlq = ctx.Kafka.Records("orders.dlq");
@@ -1413,11 +1413,11 @@ void CheckPoison(harness::Ctx& ctx) {
 }
 
 void CheckCommitsAdvance(harness::Ctx& ctx) {
-  for (const int order : {7, 8, 9, 10}) seedOrder(ctx, "order-" + std::to_string(order), order);
+  for (const int order : {7, 8, 9, 10}) hSeedOrder(ctx, "order-" + std::to_string(order), order);
   std::vector<int> calls;
   bool eightFailed = false;
-  consumeOrders(ctx, [&](const std::string& value) {
-    const int order = orderIn(value);
+  hConsumeOrders(ctx, [&](const std::string& value) {
+    const int order = hOrderIn(value);
     calls.push_back(order);
     if (order == 8 && !eightFailed) {
       eightFailed = true;

@@ -733,98 +733,98 @@ import (
 )
 
 var (
-	stateBg        = context.Background()
-	stateApprovers = []string{"u-mgr", "u-dir", "u-cfo"}
+	hStateBg        = context.Background()
+	hStateApprovers = []string{"u-mgr", "u-dir", "u-cfo"}
 )
 
-const stateHashKey = "approval:r-1:state"
+const kHStateHashKey = "approval:r-1:state"
 
-func stateChain(ctx *harness.Ctx) {
-	ctx.NoError(startChain(stateBg, "r-1", stateApprovers), "startChain(r-1)")
+func hStateChain(ctx *harness.Ctx) {
+	ctx.NoError(startChain(hStateBg, "r-1", hStateApprovers), "startChain(r-1)")
 }
 
-func stateDecide(ctx *harness.Ctx, step int, actor, decision string) Outcome {
-	o, err := advance(stateBg, "r-1", step, actor, decision)
+func hStateDecide(ctx *harness.Ctx, step int, actor, decision string) Outcome {
+	o, err := advance(hStateBg, "r-1", step, actor, decision)
 	ctx.NoError(err, "advance(r-1, %d, %s, %s)", step, actor, decision)
 	return o
 }
 
-func stateRefused(ctx *harness.Ctx, o Outcome, reason, why string) {
+func hStateRefused(ctx *harness.Ctx, o Outcome, reason, why string) {
 	ctx.Assert(!o.Advanced, "%s: advance answered %+v, expected advanced false", why, o)
 	ctx.Equal(o.Reason, reason, "%s: the reason", why)
 }
 
 func CheckStateHash(ctx *harness.Ctx) {
-	stateChain(ctx)
-	ctx.Equal(ctx.Redis.Type(stateHashKey), "hash", "the state of a request is one hash (step_index, step_count, status, current_approver, approver:{i}); the type of %s", stateHashKey)
+	hStateChain(ctx)
+	ctx.Equal(ctx.Redis.Type(kHStateHashKey), "hash", "the state of a request is one hash (step_index, step_count, status, current_approver, approver:{i}); the type of %s", kHStateHashKey)
 	want := map[string]string{"step_index": "0", "step_count": "3", "status": "pending", "current_approver": "u-mgr", "approver:0": "u-mgr", "approver:1": "u-dir", "approver:2": "u-cfo"}
-	ctx.Equal(ctx.Redis.HGetAll(stateHashKey), want, "the fields startChain wrote")
-	ctx.Equal(ctx.Redis.TTL(stateHashKey), int64(-1), "a chain can wait weeks for its approvers; the TTL of %s", stateHashKey)
-	stateDecide(ctx, 0, "u-mgr", "approved")
-	f := ctx.Redis.HGetAll(stateHashKey)
+	ctx.Equal(ctx.Redis.HGetAll(kHStateHashKey), want, "the fields startChain wrote")
+	ctx.Equal(ctx.Redis.TTL(kHStateHashKey), int64(-1), "a chain can wait weeks for its approvers; the TTL of %s", kHStateHashKey)
+	hStateDecide(ctx, 0, "u-mgr", "approved")
+	f := ctx.Redis.HGetAll(kHStateHashKey)
 	ctx.Assert(f["step_index"] == "1" && f["current_approver"] == "u-dir" && f["decision:0"] == "approved" && f["actor:0"] == "u-mgr", "after the manager's approval the state is %v", f)
-	ctx.Equal(ctx.Redis.TTL(stateHashKey), int64(-1), "after a decision, the TTL of %s", stateHashKey)
+	ctx.Equal(ctx.Redis.TTL(kHStateHashKey), int64(-1), "after a decision, the TTL of %s", kHStateHashKey)
 }
 
 func CheckSingleStep(ctx *harness.Ctx) {
-	stateChain(ctx)
-	ctx.Equal(stateDecide(ctx, 0, "u-mgr", "approved"), Outcome{Advanced: true, StepIndex: 1, Status: "pending"}, "the manager's approval of step 0")
-	again := stateDecide(ctx, 0, "u-mgr", "approved")
-	stateRefused(ctx, again, "stale step", "a repeated approval of step 0 (a double click)")
+	hStateChain(ctx)
+	ctx.Equal(hStateDecide(ctx, 0, "u-mgr", "approved"), Outcome{Advanced: true, StepIndex: 1, Status: "pending"}, "the manager's approval of step 0")
+	again := hStateDecide(ctx, 0, "u-mgr", "approved")
+	hStateRefused(ctx, again, "stale step", "a repeated approval of step 0 (a double click)")
 	ctx.Equal(again.StepIndex, 1, "a repeated approval must leave the chain on step 1; step_index")
-	stateRefused(ctx, stateDecide(ctx, 2, "u-dir", "approved"), "stale step", "a decision on step 2 while the chain is on step 1")
-	second := stateDecide(ctx, 1, "u-dir", "approved")
+	hStateRefused(ctx, hStateDecide(ctx, 2, "u-dir", "approved"), "stale step", "a decision on step 2 while the chain is on step 1")
+	second := hStateDecide(ctx, 1, "u-dir", "approved")
 	ctx.Assert(second.Advanced && second.Status == "pending" && second.StepIndex == 2, "the director's approval of step 1 answered %+v: one signature is still missing", second)
-	last := stateDecide(ctx, 2, "u-cfo", "approved")
+	last := hStateDecide(ctx, 2, "u-cfo", "approved")
 	ctx.Assert(last.Status == "approved" && last.StepIndex == 3, "the last approval answered %+v, expected status approved", last)
 }
 
 func CheckCurrentApprover(ctx *harness.Ctx) {
-	stateChain(ctx)
-	stateRefused(ctx, stateDecide(ctx, 0, "u-dir", "approved"), "not the current approver", "the director approving the manager's step 0")
-	stateRefused(ctx, stateDecide(ctx, 0, "u-intruder", "approved"), "not the current approver", "an actor who is on no step")
-	ok := stateDecide(ctx, 0, "u-mgr", "approved")
+	hStateChain(ctx)
+	hStateRefused(ctx, hStateDecide(ctx, 0, "u-dir", "approved"), "not the current approver", "the director approving the manager's step 0")
+	hStateRefused(ctx, hStateDecide(ctx, 0, "u-intruder", "approved"), "not the current approver", "an actor who is on no step")
+	ok := hStateDecide(ctx, 0, "u-mgr", "approved")
 	ctx.Assert(ok.Advanced && ok.StepIndex == 1, "the manager's approval of step 0 answered %+v", ok)
-	stateRefused(ctx, stateDecide(ctx, 1, "u-cfo", "approved"), "not the current approver", "the CFO approving the director's step 1")
+	hStateRefused(ctx, hStateDecide(ctx, 1, "u-cfo", "approved"), "not the current approver", "the CFO approving the director's step 1")
 }
 
 func CheckRejectionEnds(ctx *harness.Ctx) {
-	stateChain(ctx)
-	stateDecide(ctx, 0, "u-mgr", "approved")
-	ctx.Equal(stateDecide(ctx, 1, "u-dir", "rejected"), Outcome{Advanced: true, StepIndex: 1, Status: "rejected"}, "the director's rejection must close the chain as rejected on step 1")
-	f := ctx.Redis.HGetAll(stateHashKey)
+	hStateChain(ctx)
+	hStateDecide(ctx, 0, "u-mgr", "approved")
+	ctx.Equal(hStateDecide(ctx, 1, "u-dir", "rejected"), Outcome{Advanced: true, StepIndex: 1, Status: "rejected"}, "the director's rejection must close the chain as rejected on step 1")
+	f := ctx.Redis.HGetAll(kHStateHashKey)
 	ctx.Assert(f["status"] == "rejected" && f["step_index"] == "1" && f["decision:1"] == "rejected" && f["actor:1"] == "u-dir", "after the director's rejection the state is %v: expected status rejected, step_index 1, decision:1 rejected by u-dir", f)
-	stateRefused(ctx, stateDecide(ctx, 1, "u-dir", "approved"), "chain closed", "an approval after the rejection")
-	stateRefused(ctx, stateDecide(ctx, 2, "u-cfo", "approved"), "chain closed", "the CFO deciding a rejected chain")
+	hStateRefused(ctx, hStateDecide(ctx, 1, "u-dir", "approved"), "chain closed", "an approval after the rejection")
+	hStateRefused(ctx, hStateDecide(ctx, 2, "u-cfo", "approved"), "chain closed", "the CFO deciding a rejected chain")
 	decideOn := func(id string, step int, actor, decision string) Outcome {
-		o, err := advance(stateBg, id, step, actor, decision)
+		o, err := advance(hStateBg, id, step, actor, decision)
 		ctx.NoError(err, "advance(%s, %d, %s, %s)", id, step, actor, decision)
 		return o
 	}
-	ctx.NoError(startChain(stateBg, "r-2", []string{"u-mgr", "u-dir"}), "startChain(r-2)")
+	ctx.NoError(startChain(hStateBg, "r-2", []string{"u-mgr", "u-dir"}), "startChain(r-2)")
 	decideOn("r-2", 0, "u-mgr", "approved")
 	last := decideOn("r-2", 1, "u-dir", "rejected")
 	ctx.Assert(last.Advanced && last.Status == "rejected", "the director rejecting the last step of r-2 answered %+v, expected status rejected", last)
-	ctx.NoError(startChain(stateBg, "r-3", []string{"u-mgr", "u-dir"}), "startChain(r-3)")
+	ctx.NoError(startChain(hStateBg, "r-3", []string{"u-mgr", "u-dir"}), "startChain(r-3)")
 	decideOn("r-3", 0, "u-mgr", "approved")
 	done := decideOn("r-3", 1, "u-dir", "approved")
 	ctx.Equal(done.Status, "approved", "the last approval of r-3; status")
-	stateRefused(ctx, decideOn("r-3", 1, "u-dir", "approved"), "chain closed", "a repeated approval on an approved chain")
+	hStateRefused(ctx, decideOn("r-3", 1, "u-dir", "approved"), "chain closed", "a repeated approval on an approved chain")
 }
 
 func CheckAtomicDecision(ctx *harness.Ctx) {
-	stateChain(ctx)
+	hStateChain(ctx)
 	// Two app servers handle the same approval: the second lands right after the first touched the state.
-	rival := ctx.Redis.After(stateHashKey, func() any {
-		o, err := advance(stateBg, "r-1", 0, "u-mgr", "approved")
+	rival := ctx.Redis.After(kHStateHashKey, func() any {
+		o, err := advance(hStateBg, "r-1", 0, "u-mgr", "approved")
 		ctx.NoError(err, "the rival advance failed")
 		return o
 	})
-	mine := stateDecide(ctx, 0, "u-mgr", "approved")
+	mine := hStateDecide(ctx, 0, "u-mgr", "approved")
 	ctx.Assert(rival.Fired, "advance never touched the state hash")
 	theirs, _ := rival.Result.(Outcome)
 	ctx.Assert(theirs.Advanced != mine.Advanced, "two servers handling one approval answered %+v and %+v: exactly one may advance the chain", theirs, mine)
-	next := stateDecide(ctx, 1, "u-dir", "approved")
+	next := hStateDecide(ctx, 1, "u-dir", "approved")
 	ctx.Assert(next.Advanced && next.StepIndex == 2 && next.Status == "pending", "after the race the director's approval answered %+v: the race skipped a step", next)
 }
 `,
@@ -837,14 +837,14 @@ func CheckAtomicDecision(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kStateKey = "approval:r-1:state";
+const std::string kHStateKey = "approval:r-1:state";
 
-void stateRefused(harness::Ctx& ctx, const Outcome& o, const std::string& reason, const std::string& why) {
+void hStateRefused(harness::Ctx& ctx, const Outcome& o, const std::string& reason, const std::string& why) {
   ctx.Assert(!o.advanced, "%s: advance answered advanced %t step_index %d status %q, expected advanced false", why, o.advanced, o.step_index, o.status);
   ctx.Equal(o.reason, reason, "%s: the reason", why);
 }
 
-std::string stateShow(const Outcome& o) {
+std::string hStateShow(const Outcome& o) {
   return "{advanced " + std::string(o.advanced ? "true" : "false") + ", step_index " + std::to_string(o.step_index) + ", status " + o.status + ", reason \\"" + o.reason + "\\"}";
 }
 
@@ -852,70 +852,70 @@ std::string stateShow(const Outcome& o) {
 
 void CheckStateHash(harness::Ctx& ctx) {
   startChain("r-1", {"u-mgr", "u-dir", "u-cfo"});
-  ctx.Equal(ctx.Redis.Type(kStateKey), "hash", "the state of a request is one hash (step_index, step_count, status, current_approver, approver:{i}); the type of %s", kStateKey);
+  ctx.Equal(ctx.Redis.Type(kHStateKey), "hash", "the state of a request is one hash (step_index, step_count, status, current_approver, approver:{i}); the type of %s", kHStateKey);
   const std::map<std::string, std::string> want = {{"step_index", "0"}, {"step_count", "3"}, {"status", "pending"}, {"current_approver", "u-mgr"},
                                                    {"approver:0", "u-mgr"}, {"approver:1", "u-dir"}, {"approver:2", "u-cfo"}};
-  ctx.Equal(ctx.Redis.HGetAll(kStateKey), want, "the fields startChain wrote");
-  ctx.Equal(ctx.Redis.TTL(kStateKey), -1, "a chain can wait weeks for its approvers; the TTL of %s", kStateKey);
+  ctx.Equal(ctx.Redis.HGetAll(kHStateKey), want, "the fields startChain wrote");
+  ctx.Equal(ctx.Redis.TTL(kHStateKey), -1, "a chain can wait weeks for its approvers; the TTL of %s", kHStateKey);
   advance("r-1", 0, "u-mgr", "approved");
-  auto f = ctx.Redis.HGetAll(kStateKey);
+  auto f = ctx.Redis.HGetAll(kHStateKey);
   ctx.Assert(f["step_index"] == "1" && f["current_approver"] == "u-dir" && f["decision:0"] == "approved" && f["actor:0"] == "u-mgr", "after the manager's approval the state is %v", f);
-  ctx.Equal(ctx.Redis.TTL(kStateKey), -1, "after a decision, the TTL of %s", kStateKey);
+  ctx.Equal(ctx.Redis.TTL(kHStateKey), -1, "after a decision, the TTL of %s", kHStateKey);
 }
 
 void CheckSingleStep(harness::Ctx& ctx) {
   startChain("r-1", {"u-mgr", "u-dir", "u-cfo"});
   const Outcome first = advance("r-1", 0, "u-mgr", "approved");
-  ctx.Assert(first.advanced && first.step_index == 1 && first.status == "pending", "the manager's approval of step 0 answered %s", stateShow(first));
+  ctx.Assert(first.advanced && first.step_index == 1 && first.status == "pending", "the manager's approval of step 0 answered %s", hStateShow(first));
   const Outcome again = advance("r-1", 0, "u-mgr", "approved");
-  stateRefused(ctx, again, "stale step", "a repeated approval of step 0 (a double click)");
+  hStateRefused(ctx, again, "stale step", "a repeated approval of step 0 (a double click)");
   ctx.Equal(again.step_index, 1, "a repeated approval must leave the chain on step 1; step_index");
-  stateRefused(ctx, advance("r-1", 2, "u-dir", "approved"), "stale step", "a decision on step 2 while the chain is on step 1");
+  hStateRefused(ctx, advance("r-1", 2, "u-dir", "approved"), "stale step", "a decision on step 2 while the chain is on step 1");
   const Outcome second = advance("r-1", 1, "u-dir", "approved");
-  ctx.Assert(second.advanced && second.status == "pending" && second.step_index == 2, "the director's approval of step 1 answered %s: one signature is still missing", stateShow(second));
+  ctx.Assert(second.advanced && second.status == "pending" && second.step_index == 2, "the director's approval of step 1 answered %s: one signature is still missing", hStateShow(second));
   const Outcome last = advance("r-1", 2, "u-cfo", "approved");
-  ctx.Assert(last.status == "approved" && last.step_index == 3, "the last approval answered %s, expected status approved", stateShow(last));
+  ctx.Assert(last.status == "approved" && last.step_index == 3, "the last approval answered %s, expected status approved", hStateShow(last));
 }
 
 void CheckCurrentApprover(harness::Ctx& ctx) {
   startChain("r-1", {"u-mgr", "u-dir", "u-cfo"});
-  stateRefused(ctx, advance("r-1", 0, "u-dir", "approved"), "not the current approver", "the director approving the manager's step 0");
-  stateRefused(ctx, advance("r-1", 0, "u-intruder", "approved"), "not the current approver", "an actor who is on no step");
+  hStateRefused(ctx, advance("r-1", 0, "u-dir", "approved"), "not the current approver", "the director approving the manager's step 0");
+  hStateRefused(ctx, advance("r-1", 0, "u-intruder", "approved"), "not the current approver", "an actor who is on no step");
   const Outcome ok = advance("r-1", 0, "u-mgr", "approved");
-  ctx.Assert(ok.advanced && ok.step_index == 1, "the manager's approval of step 0 answered %s", stateShow(ok));
-  stateRefused(ctx, advance("r-1", 1, "u-cfo", "approved"), "not the current approver", "the CFO approving the director's step 1");
+  ctx.Assert(ok.advanced && ok.step_index == 1, "the manager's approval of step 0 answered %s", hStateShow(ok));
+  hStateRefused(ctx, advance("r-1", 1, "u-cfo", "approved"), "not the current approver", "the CFO approving the director's step 1");
 }
 
 void CheckRejectionEnds(harness::Ctx& ctx) {
   startChain("r-1", {"u-mgr", "u-dir", "u-cfo"});
   advance("r-1", 0, "u-mgr", "approved");
   const Outcome rejected = advance("r-1", 1, "u-dir", "rejected");
-  ctx.Assert(rejected.advanced && rejected.step_index == 1 && rejected.status == "rejected", "the director's rejection answered %s, expected the chain closed as rejected on step 1", stateShow(rejected));
-  auto f = ctx.Redis.HGetAll(kStateKey);
+  ctx.Assert(rejected.advanced && rejected.step_index == 1 && rejected.status == "rejected", "the director's rejection answered %s, expected the chain closed as rejected on step 1", hStateShow(rejected));
+  auto f = ctx.Redis.HGetAll(kHStateKey);
   ctx.Assert(f["status"] == "rejected" && f["step_index"] == "1" && f["decision:1"] == "rejected" && f["actor:1"] == "u-dir", "after the director's rejection the state is %v: expected status rejected, step_index 1, decision:1 rejected by u-dir", f);
-  stateRefused(ctx, advance("r-1", 1, "u-dir", "approved"), "chain closed", "an approval after the rejection");
-  stateRefused(ctx, advance("r-1", 2, "u-cfo", "approved"), "chain closed", "the CFO deciding a rejected chain");
+  hStateRefused(ctx, advance("r-1", 1, "u-dir", "approved"), "chain closed", "an approval after the rejection");
+  hStateRefused(ctx, advance("r-1", 2, "u-cfo", "approved"), "chain closed", "the CFO deciding a rejected chain");
   startChain("r-2", {"u-mgr", "u-dir"});
   advance("r-2", 0, "u-mgr", "approved");
   const Outcome last = advance("r-2", 1, "u-dir", "rejected");
-  ctx.Assert(last.advanced && last.status == "rejected", "the director rejecting the last step of r-2 answered %s, expected status rejected", stateShow(last));
+  ctx.Assert(last.advanced && last.status == "rejected", "the director rejecting the last step of r-2 answered %s, expected status rejected", hStateShow(last));
   startChain("r-3", {"u-mgr", "u-dir"});
   advance("r-3", 0, "u-mgr", "approved");
   const Outcome done = advance("r-3", 1, "u-dir", "approved");
   ctx.Equal(done.status, "approved", "the last approval of r-3; status");
-  stateRefused(ctx, advance("r-3", 1, "u-dir", "approved"), "chain closed", "a repeated approval on an approved chain");
+  hStateRefused(ctx, advance("r-3", 1, "u-dir", "approved"), "chain closed", "a repeated approval on an approved chain");
 }
 
 void CheckAtomicDecision(harness::Ctx& ctx) {
   startChain("r-1", {"u-mgr", "u-dir", "u-cfo"});
   // Two app servers handle the same approval: the second lands right after the first touched the state.
   auto theirs = std::make_shared<std::optional<Outcome>>();
-  ctx.Redis.After(kStateKey, [theirs] { *theirs = advance("r-1", 0, "u-mgr", "approved"); });
+  ctx.Redis.After(kHStateKey, [theirs] { *theirs = advance("r-1", 0, "u-mgr", "approved"); });
   const Outcome mine = advance("r-1", 0, "u-mgr", "approved");
   ctx.Assert(theirs->has_value(), "advance never touched the state hash");
-  ctx.Assert((*theirs)->advanced != mine.advanced, "two servers handling one approval answered %s and %s: exactly one may advance the chain", stateShow(**theirs), stateShow(mine));
+  ctx.Assert((*theirs)->advanced != mine.advanced, "two servers handling one approval answered %s and %s: exactly one may advance the chain", hStateShow(**theirs), hStateShow(mine));
   const Outcome next = advance("r-1", 1, "u-dir", "approved");
-  ctx.Assert(next.advanced && next.step_index == 2 && next.status == "pending", "after the race the director's approval answered %s: the race skipped a step", stateShow(next));
+  ctx.Assert(next.advanced && next.step_index == 2 && next.status == "pending", "after the race the director's approval answered %s: the race skipped a step", hStateShow(next));
 }
 `,
   },

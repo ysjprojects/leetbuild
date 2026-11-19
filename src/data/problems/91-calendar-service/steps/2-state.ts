@@ -1074,18 +1074,18 @@ import (
 	"calendard/store"
 )
 
-func stAt(text string) int64 {
+func hStAt(text string) int64 {
 	instant, _ := rrule.ParseInstant(text)
 	return instant
 }
 
 var (
-	stWeek1 = [2]int64{stAt("2026-03-02T00:00:00Z"), stAt("2026-03-09T00:00:00Z")}
-	stWeek2 = [2]int64{stAt("2026-03-09T00:00:00Z"), stAt("2026-03-16T00:00:00Z")}
+	hStWeek1 = [2]int64{hStAt("2026-03-02T00:00:00Z"), hStAt("2026-03-09T00:00:00Z")}
+	hStWeek2 = [2]int64{hStAt("2026-03-09T00:00:00Z"), hStAt("2026-03-16T00:00:00Z")}
 )
 
 // stWorld is a public calendar with a 30-minute daily standup, ten times from Monday 2 March 2026.
-func stWorld(ctx *harness.Ctx) {
+func hStWorld(ctx *harness.Ctx) {
 	ctx.NoError(store.PutCalendar(context.Background(), "c1", "public", "t1"), "seeding the calendar")
 	e := store.Event{
 		EventID: "e-1", CalendarID: "c1", Tenant: "t1", Title: "Standup", Rrule: "FREQ=DAILY;COUNT=10",
@@ -1094,17 +1094,17 @@ func stWorld(ctx *harness.Ctx) {
 	ctx.NoError(store.PutEvent(context.Background(), &e), "seeding the event")
 }
 
-func stOccurrence(day int) string {
-	return "e-1:" + strconv.FormatInt(stAt("2026-03-0"+strconv.Itoa(day)+"T09:00:00Z"), 10)
+func hStOccurrence(day int) string {
+	return "e-1:" + strconv.FormatInt(hStAt("2026-03-0"+strconv.Itoa(day)+"T09:00:00Z"), 10)
 }
 
-func stRead(ctx *harness.Ctx, window [2]int64) []rrule.Occurrence {
+func hStRead(ctx *harness.Ctx, window [2]int64) []rrule.Occurrence {
 	occurrences, err := cachedExpansion(context.Background(), "c1", window[0], window[1])
 	ctx.NoError(err, "cachedExpansion")
 	return occurrences
 }
 
-func stStarts(occurrences []rrule.Occurrence) []string {
+func hStStarts(occurrences []rrule.Occurrence) []string {
 	starts := []string{}
 	for _, o := range occurrences {
 		starts = append(starts, o.Start)
@@ -1112,7 +1112,7 @@ func stStarts(occurrences []rrule.Occurrence) []string {
 	return starts
 }
 
-func stIDs(occurrences []rrule.Occurrence) []string {
+func hStIDs(occurrences []rrule.Occurrence) []string {
 	ids := []string{}
 	for _, o := range occurrences {
 		ids = append(ids, o.OccurrenceID)
@@ -1122,36 +1122,36 @@ func stIDs(occurrences []rrule.Occurrence) []string {
 
 // stTTLWhenWritten fires on every command that touches key until the key exists, then records its TTL:
 // the TTL the creating command gave it.
-func stTTLWhenWritten(ctx *harness.Ctx, key string, ttl *int64, written *bool) {
+func hStTTLWhenWritten(ctx *harness.Ctx, key string, ttl *int64, written *bool) {
 	ctx.Redis.After(key, func() any {
 		if ctx.Redis.Exists(key) > 0 {
 			*ttl, *written = ctx.Redis.TTL(key), true
 		} else {
-			stTTLWhenWritten(ctx, key, ttl, written)
+			hStTTLWhenWritten(ctx, key, ttl, written)
 		}
 		return nil
 	})
 }
 
 func CheckRangeKey(ctx *harness.Ctx) {
-	stWorld(ctx)
-	week1 := stRead(ctx, stWeek1)
-	ctx.Equal(len(week1), 7, "the week of 2 March must answer 7 standups (%v); the count", stStarts(week1))
-	week2 := stRead(ctx, stWeek2)
-	ctx.Equal(stStarts(week2), []string{"2026-03-09T09:00:00Z", "2026-03-10T09:00:00Z", "2026-03-11T09:00:00Z"}, "the week of 9 March (a slice cached for one window must not be served for another)")
-	ctx.Equal(stStarts(stRead(ctx, stWeek1)), stStarts(week1), "the week of 2 March, read again")
+	hStWorld(ctx)
+	week1 := hStRead(ctx, hStWeek1)
+	ctx.Equal(len(week1), 7, "the week of 2 March must answer 7 standups (%v); the count", hStStarts(week1))
+	week2 := hStRead(ctx, hStWeek2)
+	ctx.Equal(hStStarts(week2), []string{"2026-03-09T09:00:00Z", "2026-03-10T09:00:00Z", "2026-03-11T09:00:00Z"}, "the week of 9 March (a slice cached for one window must not be served for another)")
+	ctx.Equal(hStStarts(hStRead(ctx, hStWeek1)), hStStarts(week1), "the week of 2 March, read again")
 	// Same start, shorter window: 2 to 4 March.
-	short := stRead(ctx, [2]int64{stWeek1[0], stWeek1[0] + 2*86400})
-	ctx.Equal(stStarts(short), []string{"2026-03-02T09:00:00Z", "2026-03-03T09:00:00Z"}, "2 to 4 March (a window is its start and its end)")
+	short := hStRead(ctx, [2]int64{hStWeek1[0], hStWeek1[0] + 2*86400})
+	ctx.Equal(hStStarts(short), []string{"2026-03-02T09:00:00Z", "2026-03-03T09:00:00Z"}, "2 to 4 March (a window is its start and its end)")
 }
 
 func CheckTtl(ctx *harness.Ctx) {
-	stWorld(ctx)
-	key := "exp:c1:0:" + strconv.FormatInt(stWeek1[0], 10) + ":" + strconv.FormatInt(stWeek1[1], 10)
+	hStWorld(ctx)
+	key := "exp:c1:0:" + strconv.FormatInt(hStWeek1[0], 10) + ":" + strconv.FormatInt(hStWeek1[1], 10)
 	var ttlAtWrite int64
 	written := false
-	stTTLWhenWritten(ctx, key, &ttlAtWrite, &written)
-	stRead(ctx, stWeek1)
+	hStTTLWhenWritten(ctx, key, &ttlAtWrite, &written)
+	hStRead(ctx, hStWeek1)
 	keys := ctx.Redis.Keys("exp:*")
 	ctx.Assert(len(keys) > 0, "cachedExpansion cached nothing under exp:*")
 	// A slice under the key the task names is checked the instant it is written.
@@ -1167,9 +1167,9 @@ func CheckTtl(ctx *harness.Ctx) {
 }
 
 func CheckWriteThenBump(ctx *harness.Ctx) {
-	stWorld(ctx)
-	stRead(ctx, stWeek1) // the week is cached
-	cancelled := stOccurrence(4)
+	hStWorld(ctx)
+	hStRead(ctx, hStWeek1) // the week is cached
+	cancelled := hStOccurrence(4)
 	// The state of the world at the instant the generation moves: what a reader landing right then would expand.
 	probe := ctx.Redis.After("gen:c1", func() any {
 		value, _ := ctx.Redis.HGet("exceptions:c1", cancelled)
@@ -1178,43 +1178,43 @@ func CheckWriteThenBump(ctx *harness.Ctx) {
 	ctx.NoError(recordException(context.Background(), "c1", cancelled, "cancelled"), "recordException")
 	ctx.Assert(probe.Fired, "recordException never bumped gen:c1: the cached week stays the week before the change")
 	ctx.Equal(probe.Result, "cancelled", "when gen:c1 moved the exception was not written yet: a reader in between expands the old calendar and caches it under the new generation for the whole TTL. Write the exception, then bump; the exception at the bump")
-	for _, id := range stIDs(stRead(ctx, stWeek1)) {
+	for _, id := range hStIDs(hStRead(ctx, hStWeek1)) {
 		ctx.Assert(id != cancelled, "after recordException the cancelled 4 March standup is still in the week")
 	}
 	// Another replica cancels 9 March while this reader is expanding the week of 9 March.
-	late := stOccurrence(9)
+	late := hStOccurrence(9)
 	during := ctx.Redis.After("exceptions:c1", func() any {
 		ctx.Redis.Do("HSET", "exceptions:c1", late, "cancelled")
 		ctx.Redis.Do("INCR", "gen:c1")
 		return nil
 	})
-	stRead(ctx, stWeek2)
+	hStRead(ctx, hStWeek2)
 	ctx.Assert(during.Fired, "cachedExpansion never read exceptions:c1 for the week of 9 March")
-	for _, id := range stIDs(stRead(ctx, stWeek2)) {
+	for _, id := range hStIDs(hStRead(ctx, hStWeek2)) {
 		ctx.Assert(id != late, "9 March was cancelled (and gen:c1 bumped) while the week of 9 March was being expanded, and the next read still lists it: the expansion of the old calendar was cached under the new generation")
 	}
 }
 
 func CheckExceptions(ctx *harness.Ctx) {
-	stWorld(ctx)
-	ctx.NoError(store.PutException(context.Background(), "c1", stOccurrence(3), "cancelled"), "seeding an exception")
-	ctx.NoError(store.PutException(context.Background(), "c1", stOccurrence(5), "moved:2026-03-05T14:00:00Z"), "seeding an exception")
-	ctx.NoError(store.PutException(context.Background(), "c1", stOccurrence(6), "moved:2026-03-04T08:00:00+01:00"), "seeding an exception")
-	week := stRead(ctx, stWeek1)
+	hStWorld(ctx)
+	ctx.NoError(store.PutException(context.Background(), "c1", hStOccurrence(3), "cancelled"), "seeding an exception")
+	ctx.NoError(store.PutException(context.Background(), "c1", hStOccurrence(5), "moved:2026-03-05T14:00:00Z"), "seeding an exception")
+	ctx.NoError(store.PutException(context.Background(), "c1", hStOccurrence(6), "moved:2026-03-04T08:00:00+01:00"), "seeding an exception")
+	week := hStRead(ctx, hStWeek1)
 	copies := 0
 	for _, o := range week {
-		ctx.Assert(o.OccurrenceID != stOccurrence(3), "the cancelled 3 March standup is still listed: %v", stStarts(week))
-		if o.OccurrenceID == stOccurrence(5) {
+		ctx.Assert(o.OccurrenceID != hStOccurrence(3), "the cancelled 3 March standup is still listed: %v", hStStarts(week))
+		if o.OccurrenceID == hStOccurrence(5) {
 			copies++
 			ctx.Assert(o.Start == "2026-03-05T14:00:00Z" && o.End == "2026-03-05T14:30:00Z", "the moved standup is %v, expected 14:00 to 14:30 on 5 March", o)
 		}
-		if o.OccurrenceID == stOccurrence(6) {
+		if o.OccurrenceID == hStOccurrence(6) {
 			ctx.Assert(o.Start == "2026-03-04T07:00:00Z" && o.End == "2026-03-04T07:30:00Z", "the 6 March standup moved to 08:00+01:00 on 4 March is %v, expected 07:00Z to 07:30Z", o)
 		}
 	}
-	ctx.Equal(copies, 1, "the moved 5 March standup must be listed once, in place of the original (%v); the copies", stStarts(week))
-	ctx.Equal(len(week), 6, "the week must answer 6 standups, 7 minus the cancelled one (%v); the count", stStarts(week))
-	ctx.Equal(stStarts(week), []string{"2026-03-02T09:00:00Z", "2026-03-04T07:00:00Z", "2026-03-04T09:00:00Z", "2026-03-05T14:00:00Z", "2026-03-07T09:00:00Z", "2026-03-08T09:00:00Z"}, "the week, earliest first with moved instances at their new start")
+	ctx.Equal(copies, 1, "the moved 5 March standup must be listed once, in place of the original (%v); the copies", hStStarts(week))
+	ctx.Equal(len(week), 6, "the week must answer 6 standups, 7 minus the cancelled one (%v); the count", hStStarts(week))
+	ctx.Equal(hStStarts(week), []string{"2026-03-02T09:00:00Z", "2026-03-04T07:00:00Z", "2026-03-04T09:00:00Z", "2026-03-05T14:00:00Z", "2026-03-07T09:00:00Z", "2026-03-08T09:00:00Z"}, "the week, earliest first with moved instances at their new start")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1224,35 +1224,35 @@ func CheckExceptions(ctx *harness.Ctx) {
 
 namespace {
 
-int64_t stAt(const std::string& text) { return calendard::rrule::ParseInstant(text).value_or(0); }
+int64_t hStAt(const std::string& text) { return calendard::rrule::ParseInstant(text).value_or(0); }
 
-const int64_t kWeek1Start = stAt("2026-03-02T00:00:00Z");
-const int64_t kWeek1End = stAt("2026-03-09T00:00:00Z");
-const int64_t kWeek2End = stAt("2026-03-16T00:00:00Z");
+const int64_t kHWeek1Start = hStAt("2026-03-02T00:00:00Z");
+const int64_t kHWeek1End = hStAt("2026-03-09T00:00:00Z");
+const int64_t kHWeek2End = hStAt("2026-03-16T00:00:00Z");
 
 // A public calendar with a 30-minute daily standup, ten times from Monday 2 March 2026.
-void stWorld() {
+void hStWorld() {
   calendard::store::PutCalendar("c1", "public", {"t1"});
   calendard::store::PutEvent({"e-1", "c1", "t1", "Standup", "FREQ=DAILY;COUNT=10", "2026-03-02T09:00:00Z", "2026-03-02T09:30:00Z", 1,
                               {"ana@example.com"}});
 }
 
-std::string stOccurrence(int day) { return "e-1:" + std::to_string(stAt("2026-03-0" + std::to_string(day) + "T09:00:00Z")); }
+std::string hStOccurrence(int day) { return "e-1:" + std::to_string(hStAt("2026-03-0" + std::to_string(day) + "T09:00:00Z")); }
 
-std::vector<std::string> stStarts(const std::vector<calendard::Occurrence>& occurrences) {
+std::vector<std::string> hStStarts(const std::vector<calendard::Occurrence>& occurrences) {
   std::vector<std::string> starts;
   for (const auto& o : occurrences) starts.push_back(o.start);
   return starts;
 }
 
 // Fires on every command that touches key until the key exists, then records its TTL: the TTL the creating command gave it.
-void stTtlWhenWritten(harness::Ctx& ctx, const std::string& key, long long& ttl, bool& written) {
+void hStTtlWhenWritten(harness::Ctx& ctx, const std::string& key, long long& ttl, bool& written) {
   ctx.Redis.After(key, [&ctx, key, &ttl, &written] {
     if (ctx.Redis.Exists(key) > 0) {
       ttl = ctx.Redis.TTL(key);
       written = true;
     } else {
-      stTtlWhenWritten(ctx, key, ttl, written);
+      hStTtlWhenWritten(ctx, key, ttl, written);
     }
   });
 }
@@ -1260,25 +1260,25 @@ void stTtlWhenWritten(harness::Ctx& ctx, const std::string& key, long long& ttl,
 }  // namespace
 
 void CheckRangeKey(harness::Ctx& ctx) {
-  stWorld();
-  const auto week1 = cachedExpansion("c1", kWeek1Start, kWeek1End);
-  ctx.Equal(week1.size(), 7, "the week of 2 March must answer 7 standups (%v); the count", stStarts(week1));
-  const auto week2 = cachedExpansion("c1", kWeek1End, kWeek2End);
-  ctx.Equal(stStarts(week2), {"2026-03-09T09:00:00Z", "2026-03-10T09:00:00Z", "2026-03-11T09:00:00Z"},
+  hStWorld();
+  const auto week1 = cachedExpansion("c1", kHWeek1Start, kHWeek1End);
+  ctx.Equal(week1.size(), 7, "the week of 2 March must answer 7 standups (%v); the count", hStStarts(week1));
+  const auto week2 = cachedExpansion("c1", kHWeek1End, kHWeek2End);
+  ctx.Equal(hStStarts(week2), {"2026-03-09T09:00:00Z", "2026-03-10T09:00:00Z", "2026-03-11T09:00:00Z"},
             "the week of 9 March (a slice cached for one window must not be served for another)");
-  ctx.Equal(stStarts(cachedExpansion("c1", kWeek1Start, kWeek1End)), stStarts(week1), "the week of 2 March, read again");
+  ctx.Equal(hStStarts(cachedExpansion("c1", kHWeek1Start, kHWeek1End)), hStStarts(week1), "the week of 2 March, read again");
   // Same start, shorter window: 2 to 4 March.
-  ctx.Equal(stStarts(cachedExpansion("c1", kWeek1Start, kWeek1Start + 2 * 86400)), {"2026-03-02T09:00:00Z", "2026-03-03T09:00:00Z"},
+  ctx.Equal(hStStarts(cachedExpansion("c1", kHWeek1Start, kHWeek1Start + 2 * 86400)), {"2026-03-02T09:00:00Z", "2026-03-03T09:00:00Z"},
             "2 to 4 March (a window is its start and its end)");
 }
 
 void CheckTtl(harness::Ctx& ctx) {
-  stWorld();
-  const std::string key = "exp:c1:0:" + std::to_string(kWeek1Start) + ":" + std::to_string(kWeek1End);
+  hStWorld();
+  const std::string key = "exp:c1:0:" + std::to_string(kHWeek1Start) + ":" + std::to_string(kHWeek1End);
   long long ttlAtWrite = 0;
   bool written = false;
-  stTtlWhenWritten(ctx, key, ttlAtWrite, written);
-  cachedExpansion("c1", kWeek1Start, kWeek1End);
+  hStTtlWhenWritten(ctx, key, ttlAtWrite, written);
+  cachedExpansion("c1", kHWeek1Start, kHWeek1End);
   const auto keys = ctx.Redis.Keys("exp:*");
   ctx.Assert(!keys.empty(), "cachedExpansion cached nothing under exp:*");
   // A slice under the key the task names is checked the instant it is written.
@@ -1297,9 +1297,9 @@ void CheckTtl(harness::Ctx& ctx) {
 }
 
 void CheckWriteThenBump(harness::Ctx& ctx) {
-  stWorld();
-  cachedExpansion("c1", kWeek1Start, kWeek1End);  // the week is cached
-  const std::string cancelled = stOccurrence(4);
+  hStWorld();
+  cachedExpansion("c1", kHWeek1Start, kHWeek1End);  // the week is cached
+  const std::string cancelled = hStOccurrence(4);
   // The state of the world at the instant the generation moves: what a reader landing right then would expand.
   bool fired = false;
   std::string atBump;
@@ -1312,20 +1312,20 @@ void CheckWriteThenBump(harness::Ctx& ctx) {
   ctx.Equal(atBump, "cancelled",
             "when gen:c1 moved the exception was not written yet: a reader in between expands the old calendar and caches it "
             "under the new generation for the whole TTL. Write the exception, then bump; the exception at the bump");
-  for (const auto& o : cachedExpansion("c1", kWeek1Start, kWeek1End)) {
+  for (const auto& o : cachedExpansion("c1", kHWeek1Start, kHWeek1End)) {
     ctx.Assert(o.occurrence_id != cancelled, "after recordException the cancelled 4 March standup is still in the week");
   }
   // Another replica cancels 9 March while this reader is expanding the week of 9 March.
-  const std::string late = stOccurrence(9);
+  const std::string late = hStOccurrence(9);
   bool during = false;
   ctx.Redis.After("exceptions:c1", [&] {
     during = true;
     ctx.Redis.Do("HSET", "exceptions:c1", late, "cancelled");
     ctx.Redis.Do("INCR", "gen:c1");
   });
-  cachedExpansion("c1", kWeek1End, kWeek2End);
+  cachedExpansion("c1", kHWeek1End, kHWeek2End);
   ctx.Assert(during, "cachedExpansion never read exceptions:c1 for the week of 9 March");
-  for (const auto& o : cachedExpansion("c1", kWeek1End, kWeek2End)) {
+  for (const auto& o : cachedExpansion("c1", kHWeek1End, kHWeek2End)) {
     ctx.Assert(o.occurrence_id != late,
                "9 March was cancelled (and gen:c1 bumped) while the week of 9 March was being expanded, and the next read still lists it: "
                "the expansion of the old calendar was cached under the new generation");
@@ -1333,27 +1333,27 @@ void CheckWriteThenBump(harness::Ctx& ctx) {
 }
 
 void CheckExceptions(harness::Ctx& ctx) {
-  stWorld();
-  calendard::store::PutException("c1", stOccurrence(3), "cancelled");
-  calendard::store::PutException("c1", stOccurrence(5), "moved:2026-03-05T14:00:00Z");
-  calendard::store::PutException("c1", stOccurrence(6), "moved:2026-03-04T08:00:00+01:00");
-  const auto week = cachedExpansion("c1", kWeek1Start, kWeek1End);
+  hStWorld();
+  calendard::store::PutException("c1", hStOccurrence(3), "cancelled");
+  calendard::store::PutException("c1", hStOccurrence(5), "moved:2026-03-05T14:00:00Z");
+  calendard::store::PutException("c1", hStOccurrence(6), "moved:2026-03-04T08:00:00+01:00");
+  const auto week = cachedExpansion("c1", kHWeek1Start, kHWeek1End);
   int copies = 0;
   for (const auto& o : week) {
-    ctx.Assert(o.occurrence_id != stOccurrence(3), "the cancelled 3 March standup is still listed: %v", stStarts(week));
-    if (o.occurrence_id == stOccurrence(5)) {
+    ctx.Assert(o.occurrence_id != hStOccurrence(3), "the cancelled 3 March standup is still listed: %v", hStStarts(week));
+    if (o.occurrence_id == hStOccurrence(5)) {
       copies++;
       ctx.Assert(o.start == "2026-03-05T14:00:00Z" && o.end == "2026-03-05T14:30:00Z",
                  "the moved standup runs %s to %s, expected 14:00 to 14:30 on 5 March", o.start, o.end);
     }
-    if (o.occurrence_id == stOccurrence(6)) {
+    if (o.occurrence_id == hStOccurrence(6)) {
       ctx.Assert(o.start == "2026-03-04T07:00:00Z" && o.end == "2026-03-04T07:30:00Z",
                  "the 6 March standup moved to 08:00+01:00 on 4 March runs %s to %s, expected 07:00Z to 07:30Z", o.start, o.end);
     }
   }
-  ctx.Equal(copies, 1, "the moved 5 March standup must be listed once, in place of the original (%v); the copies", stStarts(week));
-  ctx.Equal(week.size(), 6, "the week must answer 6 standups, 7 minus the cancelled one (%v); the count", stStarts(week));
-  ctx.Equal(stStarts(week),
+  ctx.Equal(copies, 1, "the moved 5 March standup must be listed once, in place of the original (%v); the copies", hStStarts(week));
+  ctx.Equal(week.size(), 6, "the week must answer 6 standups, 7 minus the cancelled one (%v); the count", hStStarts(week));
+  ctx.Equal(hStStarts(week),
             {"2026-03-02T09:00:00Z", "2026-03-04T07:00:00Z", "2026-03-04T09:00:00Z", "2026-03-05T14:00:00Z", "2026-03-07T09:00:00Z",
              "2026-03-08T09:00:00Z"},
             "the week, earliest first with moved instances at their new start");

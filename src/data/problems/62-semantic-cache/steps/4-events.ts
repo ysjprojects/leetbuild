@@ -1354,29 +1354,29 @@ import (
 )
 
 const (
-	eventsTopic  = "semantic-cache.result"
-	eventsGroup  = "semantic-cache-stats"
-	eventsOutbox = "outbox:semantic-cache.result"
-	eventsAnswer = "Refunds take five business days."
+	kHEventsTopic  = "semantic-cache.result"
+	kHEventsGroup  = "semantic-cache-stats"
+	kHEventsOutbox = "outbox:semantic-cache.result"
+	kHEventsAnswer = "Refunds take five business days."
 )
 
-var eventsWireFields = []string{"outcome", "entry_id", "similarity", "policy_version", "model_version", "client_class", "entry_age_seconds"}
+var hEventsWireFields = []string{"outcome", "entry_id", "similarity", "policy_version", "model_version", "client_class", "entry_age_seconds"}
 
-func eventsHit(similarity float64, age int64, class string) ResultEvent {
+func hEventsHit(similarity float64, age int64, class string) ResultEvent {
 	return ResultEvent{Outcome: "hit", EntryID: "e1", Similarity: &similarity, PolicyVersion: "2024-06-1", ModelVersion: "2024-06", ClientClass: class, EntryAgeSeconds: age}
 }
 
-func eventsMiss(class string) ResultEvent {
+func hEventsMiss(class string) ResultEvent {
 	return ResultEvent{Outcome: "miss", ModelVersion: "2024-06", ClientClass: class}
 }
 
 // eventsEntry is the entry a hit refers to, as the store holds it.
-func eventsEntry(ctx *harness.Ctx, tenant, entryID string) {
-	ctx.Redis.Do("HSET", "entry:"+tenant+":2024-06:"+entryID, "embedding", "[1,0,0,0]", "answer", eventsAnswer, "created_at", 0, "expires_at", 86400, "policy_version", "2024-06-1")
+func hEventsEntry(ctx *harness.Ctx, tenant, entryID string) {
+	ctx.Redis.Do("HSET", "entry:"+tenant+":2024-06:"+entryID, "embedding", "[1,0,0,0]", "answer", kHEventsAnswer, "created_at", 0, "expires_at", 86400, "policy_version", "2024-06-1")
 }
 
 // eventsPublish is publishResult, reporting a panic as an error instead of ending the check.
-func eventsPublish(tenant string, result ResultEvent) (err error) {
+func hEventsPublish(tenant string, result ResultEvent) (err error) {
 	defer func() {
 		if e := recover(); e != nil {
 			err = errors.New("panic: " + harness.Show(e))
@@ -1385,49 +1385,49 @@ func eventsPublish(tenant string, result ResultEvent) (err error) {
 	return publishResult(context.Background(), tenant, result)
 }
 
-func eventsFloat(s string) float64 {
+func hEventsFloat(s string) float64 {
 	f, _ := strconv.ParseFloat(s, 64)
 	return f
 }
 
 func CheckTenantKey(ctx *harness.Ctx) {
-	eventsEntry(ctx, "acme", "e1")
+	hEventsEntry(ctx, "acme", "e1")
 	for _, in := range []struct {
 		tenant string
 		result ResultEvent
-	}{{"acme", eventsHit(0.93, 41, "human")}, {"globex", eventsMiss("human")}, {"acme", eventsHit(0.88, 4000, "automated")}, {"acme", eventsHit(0.9, 3600, "human")}, {"globex", eventsMiss("automated")}} {
-		ctx.NoError(eventsPublish(in.tenant, in.result), "publishResult on a healthy broker")
+	}{{"acme", hEventsHit(0.93, 41, "human")}, {"globex", hEventsMiss("human")}, {"acme", hEventsHit(0.88, 4000, "automated")}, {"acme", hEventsHit(0.9, 3600, "human")}, {"globex", hEventsMiss("automated")}} {
+		ctx.NoError(hEventsPublish(in.tenant, in.result), "publishResult on a healthy broker")
 	}
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 5, "five lookups must produce five records on %s; the records", eventsTopic)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"acme", "globex", "acme", "acme", "globex"}, "records must be keyed by the tenant")
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 5, "five lookups must produce five records on %s; the records", kHEventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"acme", "globex", "acme", "acme", "globex"}, "records must be keyed by the tenant")
 	ctx.Assert(records[0].Partition == records[2].Partition && records[0].Partition == records[3].Partition && records[1].Partition == records[4].Partition, "the same tenant must land on the same partition so its hits and misses are read as one stream")
 	ctx.Drain(func() { consumeResults(context.Background()) })
 	acme := ctx.Redis.HGetAll("stats:acme:2024-06")
 	ctx.Assert(acme["hits_total"] == "3" && (acme["misses_total"] == "" || acme["misses_total"] == "0"), "stats:acme:2024-06 holds %v, expected hits_total 3 and no misses", acme)
-	ctx.Assert(eventsFloat(acme["similarity_sum"]) > 2.7099 && eventsFloat(acme["similarity_sum"]) < 2.7101, "similarity_sum is %q, expected 0.93 + 0.88 + 0.9 = 2.71", acme["similarity_sum"])
+	ctx.Assert(hEventsFloat(acme["similarity_sum"]) > 2.7099 && hEventsFloat(acme["similarity_sum"]) < 2.7101, "similarity_sum is %q, expected 0.93 + 0.88 + 0.9 = 2.71", acme["similarity_sum"])
 	ctx.Assert(acme["automated_total"] == "1" && acme["automated_hits"] == "1", "stats:acme:2024-06 holds %v, expected automated_total 1 and automated_hits 1 for the automated hit", acme)
 	ctx.Equal(acme["hits_older_than_1h"], "1", "hits_older_than_1h: the hit on a 4000 s old entry counts, the one on a 3600 s old entry is not over an hour (stats:acme:2024-06 holds %v)", acme)
 	globex := ctx.Redis.HGetAll("stats:globex:2024-06")
 	ctx.Assert(globex["misses_total"] == "2" && (globex["hits_total"] == "" || globex["hits_total"] == "0"), "stats:globex:2024-06 holds %v, expected misses_total 2", globex)
 	ctx.Assert(globex["automated_total"] == "1" && (globex["automated_hits"] == "" || globex["automated_hits"] == "0"), "stats:globex:2024-06 holds %v, expected automated_total 1 and no automated_hits: the automated lookup was a miss", globex)
-	ctx.Equal(ctx.Kafka.Lag(eventsGroup, eventsTopic), 0, "records the consumer left uncommitted")
+	ctx.Equal(ctx.Kafka.Lag(kHEventsGroup, kHEventsTopic), 0, "records the consumer left uncommitted")
 }
 
 func CheckNoText(ctx *harness.Ctx) {
-	eventsEntry(ctx, "acme", "e1")
-	ctx.NoError(eventsPublish("acme", eventsHit(0.93, 41, "human")), "publishResult on a healthy broker")
+	hEventsEntry(ctx, "acme", "e1")
+	ctx.NoError(hEventsPublish("acme", hEventsHit(0.93, 41, "human")), "publishResult on a healthy broker")
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 1, "one lookup must produce one record; the records")
 	text := string(records[0].Value)
 	var event map[string]any
 	ctx.NoError(json.Unmarshal(records[0].Value, &event), "the event must be JSON (%s)", text)
-	ctx.Assert(!strings.Contains(text, eventsAnswer), "the event carries the served answer: %s. The topic is retained and replicated; the entry id is enough to find the answer in the store", text)
+	ctx.Assert(!strings.Contains(text, kHEventsAnswer), "the event carries the served answer: %s. The topic is retained and replicated; the entry id is enough to find the answer in the store", text)
 	_, hasAnswer := event["answer"]
 	ctx.Assert(!hasAnswer, "the event has an answer field: %s", text)
-	for _, field := range eventsWireFields {
+	for _, field := range hEventsWireFields {
 		_, ok := event[field]
 		ctx.Assert(ok, "the event %s lacks %s", text, field)
 	}
@@ -1435,12 +1435,12 @@ func CheckNoText(ctx *harness.Ctx) {
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	eventsEntry(ctx, "acme", "e1")
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	eventsPublish("acme", eventsHit(0.93, 41, "human"))
+	hEventsEntry(ctx, "acme", "e1")
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	hEventsPublish("acme", hEventsHit(0.93, 41, "human"))
 	ctx.Settle()
-	rows := ctx.Redis.LRange(eventsOutbox, 0, -1)
-	ctx.Equal(len(rows), 1, "after the broker rejected the produce %s must hold one row with the event; it holds %v; rows", eventsOutbox, rows)
+	rows := ctx.Redis.LRange(kHEventsOutbox, 0, -1)
+	ctx.Equal(len(rows), 1, "after the broker rejected the produce %s must hold one row with the event; it holds %v; rows", kHEventsOutbox, rows)
 	var row map[string]any
 	ctx.NoError(json.Unmarshal([]byte(rows[0]), &row), "the outbox row must be JSON (%s)", rows[0])
 	ctx.Equal(row["key"], "acme", "the outbox row must carry the message key (the tenant) so the relay publishes it to the same partition (%s)", rows[0])
@@ -1453,36 +1453,36 @@ func CheckOutbox(ctx *harness.Ctx) {
 	}
 	ctx.Assert(payload != nil && payload["outcome"] == "hit" && payload["entry_id"] == "e1", "the outbox row must carry the event payload: %s", rows[0])
 	_, hasAnswer := payload["answer"]
-	ctx.Assert(!hasAnswer && !strings.Contains(rows[0], eventsAnswer), "the outbox row's payload must be the event, its seven fields and no answer text: %s. The relay republishes it to the same retained topic", rows[0])
-	for _, field := range eventsWireFields {
+	ctx.Assert(!hasAnswer && !strings.Contains(rows[0], kHEventsAnswer), "the outbox row's payload must be the event, its seven fields and no answer text: %s. The relay republishes it to the same retained topic", rows[0])
+	for _, field := range hEventsWireFields {
 		_, ok := payload[field]
 		ctx.Assert(ok, "the outbox row's payload must be the event, its seven fields and no answer text: %s lacks %s", rows[0], field)
 	}
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "a rejected produce cannot be on the topic; the records")
-	ctx.NoError(eventsPublish("globex", eventsMiss("human")), "after the broker recovered publishResult")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 0, "a rejected produce cannot be on the topic; the records")
+	ctx.NoError(hEventsPublish("globex", hEventsMiss("human")), "after the broker recovered publishResult")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "once the broker answers again events flow; the records")
-	ctx.Equal(len(ctx.Redis.LRange(eventsOutbox, 0, -1)), 1, "a delivered event leaves no outbox row; the rows")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "once the broker answers again events flow; the records")
+	ctx.Equal(len(ctx.Redis.LRange(kHEventsOutbox, 0, -1)), 1, "a delivered event leaves no outbox row; the rows")
 }
 
 func CheckDelivery(ctx *harness.Ctx) {
-	ctx.NoError(eventsPublish("acme", eventsHit(0.93, 41, "human")), "publishResult on a healthy broker")
+	ctx.NoError(hEventsPublish("acme", hEventsHit(0.93, 41, "human")), "publishResult on a healthy broker")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "one lookup must produce one record; the records")
-	lost := ctx.Kafka.Failover(eventsTopic)
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "one lookup must produce one record; the records")
+	lost := ctx.Kafka.Failover(kHEventsTopic)
 	ctx.Equal(lost, 0, "a leader failover right after the write lost the record: it was acknowledged by the leader alone (RequiredAcks: kafka.RequireAll, a synchronous write); records lost")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after a leader failover the record must still be on the topic; the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after a leader failover the record must still be on the topic; the records")
 }
 
 func CheckProduceFailure(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	err := eventsPublish("acme", eventsHit(0.93, 41, "human"))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	err := hEventsPublish("acme", hEventsHit(0.93, 41, "human"))
 	ctx.Settle()
 	ctx.Assert(err != nil, "the broker rejected the produce and publishResult returned nil as if the event were recorded: return ErrProduceRejected after the outbox row")
 	ctx.Assert(errors.Is(err, ErrProduceRejected), "publishResult returned %v, expected an error wrapping ErrProduceRejected", err)
 	failures, _ := ctx.Redis.Get("cache_result_produce_failures")
 	ctx.Equal(failures, "1", "cache_result_produce_failures after one rejection")
-	ctx.NoError(eventsPublish("acme", eventsHit(0.93, 41, "human")), "a delivered produce must not fail")
+	ctx.NoError(hEventsPublish("acme", hEventsHit(0.93, 41, "human")), "a delivered produce must not fail")
 	ctx.Settle()
 	failures, _ = ctx.Redis.Get("cache_result_produce_failures")
 	ctx.Equal(failures, "1", "a delivered produce must not count as a failure; cache_result_produce_failures")
@@ -1499,26 +1499,26 @@ func CheckProduceFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "semantic-cache.result";
-const std::string kEventsGroup = "semantic-cache-stats";
-const std::string kEventsOutbox = "outbox:semantic-cache.result";
-const std::string kEventsAnswer = "Refunds take five business days.";
-const std::vector<std::string> kEventsWire = {"outcome", "entry_id", "similarity", "policy_version", "model_version", "client_class", "entry_age_seconds"};
+const std::string kHEventsTopic = "semantic-cache.result";
+const std::string kHEventsGroup = "semantic-cache-stats";
+const std::string kHEventsOutbox = "outbox:semantic-cache.result";
+const std::string kHEventsAnswer = "Refunds take five business days.";
+const std::vector<std::string> kHEventsWire = {"outcome", "entry_id", "similarity", "policy_version", "model_version", "client_class", "entry_age_seconds"};
 
-ResultEvent eventsHit(double similarity, long age, const std::string& cls) {
+ResultEvent hEventsHit(double similarity, long age, const std::string& cls) {
   return ResultEvent{"hit", "e1", similarity, "2024-06-1", "2024-06", cls, age};
 }
 
-ResultEvent eventsMiss(const std::string& cls) { return ResultEvent{"miss", "", std::nullopt, "", "2024-06", cls, 0}; }
+ResultEvent hEventsMiss(const std::string& cls) { return ResultEvent{"miss", "", std::nullopt, "", "2024-06", cls, 0}; }
 
 // The entry a hit refers to, as the store holds it.
-void eventsEntry(harness::Ctx& ctx, const std::string& tenant, const std::string& entryId) {
-  ctx.Redis.Do("HSET", "entry:" + tenant + ":2024-06:" + entryId, "embedding", "[1,0,0,0]", "answer", kEventsAnswer, "created_at", 0,
+void hEventsEntry(harness::Ctx& ctx, const std::string& tenant, const std::string& entryId) {
+  ctx.Redis.Do("HSET", "entry:" + tenant + ":2024-06:" + entryId, "embedding", "[1,0,0,0]", "answer", kHEventsAnswer, "created_at", 0,
                "expires_at", 86400, "policy_version", "2024-06-1");
 }
 
 // publish_result, reporting the exception's type (empty when none) instead of ending the check.
-std::string eventsPublish(const std::string& tenant, const ResultEvent& result) {
+std::string hEventsPublish(const std::string& tenant, const ResultEvent& result) {
   try {
     publish_result(tenant, result);
     return "";
@@ -1540,16 +1540,16 @@ nlohmann::json hParsed(const std::string& text) {
 }  // namespace
 
 void CheckTenantKey(harness::Ctx& ctx) {
-  eventsEntry(ctx, "acme", "e1");
-  ctx.Equal(eventsPublish("acme", eventsHit(0.93, 41, "human")), "", "publish_result on a healthy broker threw");
-  ctx.Equal(eventsPublish("globex", eventsMiss("human")), "", "publish_result on a healthy broker threw");
-  ctx.Equal(eventsPublish("acme", eventsHit(0.88, 4000, "automated")), "", "publish_result on a healthy broker threw");
-  ctx.Equal(eventsPublish("acme", eventsHit(0.9, 3600, "human")), "", "publish_result on a healthy broker threw");
-  ctx.Equal(eventsPublish("globex", eventsMiss("automated")), "", "publish_result on a healthy broker threw");
+  hEventsEntry(ctx, "acme", "e1");
+  ctx.Equal(hEventsPublish("acme", hEventsHit(0.93, 41, "human")), "", "publish_result on a healthy broker threw");
+  ctx.Equal(hEventsPublish("globex", hEventsMiss("human")), "", "publish_result on a healthy broker threw");
+  ctx.Equal(hEventsPublish("acme", hEventsHit(0.88, 4000, "automated")), "", "publish_result on a healthy broker threw");
+  ctx.Equal(hEventsPublish("acme", hEventsHit(0.9, 3600, "human")), "", "publish_result on a healthy broker threw");
+  ctx.Equal(hEventsPublish("globex", hEventsMiss("automated")), "", "publish_result on a healthy broker threw");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
-  ctx.Equal(records.size(), 5, "five lookups must produce five records on %s; the records", kEventsTopic);
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"acme", "globex", "acme", "acme", "globex"}, "records must be keyed by the tenant");
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
+  ctx.Equal(records.size(), 5, "five lookups must produce five records on %s; the records", kHEventsTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"acme", "globex", "acme", "acme", "globex"}, "records must be keyed by the tenant");
   ctx.Assert(records[0].Partition == records[2].Partition && records[0].Partition == records[3].Partition &&
                  records[1].Partition == records[4].Partition,
              "the same tenant must land on the same partition so its hits and misses are read as one stream");
@@ -1570,35 +1570,35 @@ void CheckTenantKey(harness::Ctx& ctx) {
              "stats:globex:2024-06 holds %v, expected misses_total 2", globex);
   ctx.Assert(field(globex, "automated_total") == "1" && (field(globex, "automated_hits") == "" || field(globex, "automated_hits") == "0"),
              "stats:globex:2024-06 holds %v, expected automated_total 1 and no automated_hits: the automated lookup was a miss", globex);
-  ctx.Equal(ctx.Kafka.Lag(kEventsGroup, kEventsTopic), 0, "records the consumer left uncommitted");
+  ctx.Equal(ctx.Kafka.Lag(kHEventsGroup, kHEventsTopic), 0, "records the consumer left uncommitted");
 }
 
 void CheckNoText(harness::Ctx& ctx) {
-  eventsEntry(ctx, "acme", "e1");
-  ctx.Equal(eventsPublish("acme", eventsHit(0.93, 41, "human")), "", "publish_result on a healthy broker threw");
+  hEventsEntry(ctx, "acme", "e1");
+  ctx.Equal(hEventsPublish("acme", hEventsHit(0.93, 41, "human")), "", "publish_result on a healthy broker threw");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 1, "one lookup must produce one record; the records");
   const std::string text = records[0].Value.value_or("");
   const auto event = hParsed(text);
   ctx.Assert(event.is_object(), "the event must be JSON: %s", text);
-  ctx.Assert(text.find(kEventsAnswer) == std::string::npos,
+  ctx.Assert(text.find(kHEventsAnswer) == std::string::npos,
              "the event carries the served answer: %s. The topic is retained and replicated; the entry id is enough to find the answer in the store",
              text);
   ctx.Assert(!event.contains("answer"), "the event has an answer field: %s", text);
-  for (const auto& f : kEventsWire) ctx.Assert(event.contains(f), "the event %s lacks %s", text, f);
+  for (const auto& f : kHEventsWire) ctx.Assert(event.contains(f), "the event %s lacks %s", text, f);
   ctx.Assert(event["entry_id"] == "e1" && event["outcome"] == "hit" && event["similarity"] == 0.93 && event["client_class"] == "human" &&
                  event["entry_age_seconds"] == 41,
              "the event's fields must come from the result the lookup passed: %s", text);
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  eventsEntry(ctx, "acme", "e1");
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  eventsPublish("acme", eventsHit(0.93, 41, "human"));
+  hEventsEntry(ctx, "acme", "e1");
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  hEventsPublish("acme", hEventsHit(0.93, 41, "human"));
   ctx.Settle();
-  const auto rows = ctx.Redis.LRange(kEventsOutbox, 0, -1);
-  ctx.Equal(rows.size(), 1, "after the broker rejected the produce %s must hold one row with the event; it holds %v; rows", kEventsOutbox, rows);
+  const auto rows = ctx.Redis.LRange(kHEventsOutbox, 0, -1);
+  ctx.Equal(rows.size(), 1, "after the broker rejected the produce %s must hold one row with the event; it holds %v; rows", kHEventsOutbox, rows);
   const auto row = hParsed(rows[0]);
   ctx.Assert(row.is_object() && row.value("key", "") == "acme",
              "the outbox row must carry the message key (the tenant) so the relay publishes it to the same partition (%s)", rows[0]);
@@ -1606,39 +1606,39 @@ void CheckOutbox(harness::Ctx& ctx) {
   if (row.contains("payload")) payload = row["payload"].is_string() ? hParsed(row["payload"].get<std::string>()) : row["payload"];
   ctx.Assert(payload.is_object() && payload.value("outcome", "") == "hit" && payload.value("entry_id", "") == "e1",
              "the outbox row must carry the event payload: %s", rows[0]);
-  bool wire = payload.is_object() && !payload.contains("answer") && rows[0].find(kEventsAnswer) == std::string::npos;
-  for (const auto& f : kEventsWire) wire = wire && payload.contains(f);
+  bool wire = payload.is_object() && !payload.contains("answer") && rows[0].find(kHEventsAnswer) == std::string::npos;
+  for (const auto& f : kHEventsWire) wire = wire && payload.contains(f);
   ctx.Assert(wire, "the outbox row's payload must be the event, its seven fields and no answer text: %s. The relay republishes it to the same retained topic",
              rows[0]);
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "a rejected produce cannot be on the topic; the records");
-  ctx.Equal(eventsPublish("globex", eventsMiss("human")), "", "after the broker recovered publish_result threw");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 0, "a rejected produce cannot be on the topic; the records");
+  ctx.Equal(hEventsPublish("globex", hEventsMiss("human")), "", "after the broker recovered publish_result threw");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "once the broker answers again events flow; the records");
-  ctx.Equal(ctx.Redis.LRange(kEventsOutbox, 0, -1).size(), 1, "a delivered event leaves no outbox row; the rows");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "once the broker answers again events flow; the records");
+  ctx.Equal(ctx.Redis.LRange(kHEventsOutbox, 0, -1).size(), 1, "a delivered event leaves no outbox row; the rows");
 }
 
 void CheckDelivery(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);
-  ctx.Equal(eventsPublish("acme", eventsHit(0.93, 41, "human")), "", "publish_result threw: a lost acknowledgement is retried by the client, not reported;");
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);
+  ctx.Equal(hEventsPublish("acme", hEventsHit(0.93, 41, "human")), "", "publish_result threw: a lost acknowledgement is retried by the client, not reported;");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1,
             "after one lost acknowledgement the topic must hold one record: the retry duplicated the event (enable.idempotence); the records");
-  eventsPublish("acme", eventsMiss("human"));
+  hEventsPublish("acme", hEventsMiss("human"));
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2,
+  ctx.Kafka.Failover(kHEventsTopic);
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2,
             "after a leader failover the topic must hold both records: a record acknowledged by the leader alone is lost (acks=all); the records");
 }
 
 void CheckProduceFailure(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  const std::string raised = eventsPublish("acme", eventsHit(0.93, 41, "human"));
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  const std::string raised = hEventsPublish("acme", hEventsHit(0.93, 41, "human"));
   ctx.Settle();
   ctx.Assert(!raised.empty(),
              "the broker rejected the produce and publish_result returned as if the event were recorded: throw ProduceRejected after the outbox row");
   ctx.Equal(raised, "ProduceRejected", "publish_result must throw ProduceRejected; it threw");
   ctx.Equal(ctx.Redis.Get("cache_result_produce_failures"), "1", "cache_result_produce_failures after one rejection");
-  ctx.Equal(eventsPublish("acme", eventsHit(0.93, 41, "human")), "", "a delivered produce must not throw;");
+  ctx.Equal(hEventsPublish("acme", hEventsHit(0.93, 41, "human")), "", "a delivered produce must not throw;");
   ctx.Settle();
   ctx.Equal(ctx.Redis.Get("cache_result_produce_failures"), "1", "a delivered produce must not count as a failure; cache_result_produce_failures");
 }

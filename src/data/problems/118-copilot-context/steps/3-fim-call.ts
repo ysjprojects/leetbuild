@@ -754,16 +754,16 @@ import (
 )
 
 const (
-	fimTarget = "model:9000"
-	fimPrefix = "def load_user(conn, user_id):\\n    row = "
-	fimSuffix = "\\n    return User.from_row(row)\\n"
+	kHFimTarget = "model:9000"
+	kHFimPrefix = "def load_user(conn, user_id):\\n    row = "
+	kHFimSuffix = "\\n    return User.from_row(row)\\n"
 )
 
-var fimSnippets = []string{"class User:\\n    user_id: int\\n"}
+var hFimSnippets = []string{"class User:\\n    user_id: int\\n"}
 
 // fimModel is the stand-in model service: records every request, answers the candidates it was given,
 // and can fail one call late (UNAVAILABLE after a stall).
-type fimModel struct {
+type HFimModel struct {
 	pb.UnimplementedModelServer
 	ctx        *harness.Ctx
 	candidates []*pb.Candidate
@@ -771,7 +771,7 @@ type fimModel struct {
 	stall      float64
 }
 
-func (m *fimModel) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
+func (m *HFimModel) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
 	m.requests = append(m.requests, req)
 	if m.stall > 0 {
 		m.ctx.Clock.Advance(m.stall) // the model restarts under the call
@@ -781,80 +781,80 @@ func (m *fimModel) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.Com
 	return &pb.CompleteReply{Candidates: m.candidates}, nil
 }
 
-func fimWorld(ctx *harness.Ctx, candidates []*pb.Candidate) *fimModel {
+func hFimWorld(ctx *harness.Ctx, candidates []*pb.Candidate) *HFimModel {
 	if candidates == nil {
 		candidates = []*pb.Candidate{{Text: "cursor.fetchone()"}, {Text: "cursor.fetchall()[0]"}, {Text: "next(cursor)"}}
 	}
-	peer := &fimModel{ctx: ctx, candidates: candidates}
-	pb.RegisterModelServer(ctx.GRPC.Server(fimTarget), peer)
+	peer := &HFimModel{ctx: ctx, candidates: candidates}
+	pb.RegisterModelServer(ctx.GRPC.Server(kHFimTarget), peer)
 	return peer
 }
 
-func fimCall() []string {
-	return complete(context.Background(), fimPrefix, fimSuffix, fimSnippets, "python")
+func hFimCall() []string {
+	return complete(context.Background(), kHFimPrefix, kHFimSuffix, hFimSnippets, "python")
 }
 
-func fimCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Complete", "") }
+func hFimCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Complete", "") }
 
 func CheckFimOrder(ctx *harness.Ctx) {
-	peer := fimWorld(ctx, nil)
-	fimCall()
+	peer := hFimWorld(ctx, nil)
+	hFimCall()
 	ctx.Equal(len(peer.requests), 1, "one Complete call expected; calls")
 	sent := peer.requests[0]
-	ctx.Equal(sent.GetPrefix(), fimPrefix, "the model's prefix must be the code before the cursor")
-	ctx.Equal(sent.GetSuffix(), fimSuffix, "the model's suffix must be the code after the cursor (glued into the prefix, the model completes the end of the file)")
-	ctx.Assert(len(sent.GetSnippets()) == 1 && sent.GetSnippets()[0] == fimSnippets[0] && sent.GetLanguage() == "python", "snippets and language travel in their own fields, got %q and %q", sent.GetSnippets(), sent.GetLanguage())
+	ctx.Equal(sent.GetPrefix(), kHFimPrefix, "the model's prefix must be the code before the cursor")
+	ctx.Equal(sent.GetSuffix(), kHFimSuffix, "the model's suffix must be the code after the cursor (glued into the prefix, the model completes the end of the file)")
+	ctx.Assert(len(sent.GetSnippets()) == 1 && sent.GetSnippets()[0] == hFimSnippets[0] && sent.GetLanguage() == "python", "snippets and language travel in their own fields, got %q and %q", sent.GetSnippets(), sent.GetLanguage())
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	peer := fimWorld(ctx, nil)
-	fimCall()
-	call := fimCalls(ctx)[0]
+	peer := hFimWorld(ctx, nil)
+	hFimCall()
+	call := hFimCalls(ctx)[0]
 	ctx.Assert(call.HasDeadline(), "the Complete call carries no deadline: a slow model holds the request after the editor moved on")
 	ctx.Assert(call.Timeout >= 250*time.Millisecond && call.Timeout <= 350*time.Millisecond, "the deadline must be 300 ms, got %v", call.Timeout)
 	peer.stall = 0.2 // the first attempt fails UNAVAILABLE after 200 ms, the retry answers at once
-	shown := fimCall()
-	calls := fimCalls(ctx)
+	shown := hFimCall()
+	calls := hFimCalls(ctx)
 	ctx.Assert(len(calls) == 3 && len(shown) > 0, "an UNAVAILABLE after 200 ms earns one retry that succeeds: saw %d calls and %q", len(calls)-1, shown)
 	ctx.Assert(len(calls) == 3 && calls[2].HasDeadline() && calls[2].Timeout >= 250*time.Millisecond && calls[2].Timeout <= 350*time.Millisecond, "the retry must carry its own 300 ms deadline, got %v: a deadline shared by both attempts leaves the retry what the first one did not use", calls[len(calls)-1].Timeout)
-	ctx.GRPC.SetLatency("Complete", 2.0, fimTarget)
+	ctx.GRPC.SetLatency("Complete", 2.0, kHFimTarget)
 	started := ctx.Clock.Now()
-	shown = fimCall()
+	shown = hFimCall()
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Equal(len(shown), 0, "a model that answers after the deadline must give no ghost text; candidates shown")
 	ctx.Assert(waited <= 0.4, "complete waited %.2f s on a model that takes 2 s: the deadline must cut it at 300 ms", waited)
-	calls = fimCalls(ctx)
+	calls = hFimCalls(ctx)
 	ctx.Assert(len(calls) == 4 && calls[3].Code == codes.DeadlineExceeded, "the slow call must end DEADLINE_EXCEEDED and not be retried: %d calls", len(calls)-3)
 }
 
 func CheckRetryOnce(ctx *harness.Ctx) {
-	fimWorld(ctx, nil)
-	ctx.GRPC.Fail("Complete", codes.Unavailable, "model restarting", 1, fimTarget)
-	shown := fimCall()
-	ctx.Assert(len(fimCalls(ctx)) == 2 && len(shown) > 0, "one UNAVAILABLE earns one retry that succeeds: saw %d calls and %q", len(fimCalls(ctx)), shown)
-	ctx.GRPC.Fail("Complete", codes.Unavailable, "model down", 2, fimTarget)
-	shown = fimCall()
-	ctx.Equal(len(fimCalls(ctx)), 4, "a model that stays UNAVAILABLE gets maxAttempts = 2 calls; calls so far")
+	hFimWorld(ctx, nil)
+	ctx.GRPC.Fail("Complete", codes.Unavailable, "model restarting", 1, kHFimTarget)
+	shown := hFimCall()
+	ctx.Assert(len(hFimCalls(ctx)) == 2 && len(shown) > 0, "one UNAVAILABLE earns one retry that succeeds: saw %d calls and %q", len(hFimCalls(ctx)), shown)
+	ctx.GRPC.Fail("Complete", codes.Unavailable, "model down", 2, kHFimTarget)
+	shown = hFimCall()
+	ctx.Equal(len(hFimCalls(ctx)), 4, "a model that stays UNAVAILABLE gets maxAttempts = 2 calls; calls so far")
 	ctx.Equal(len(shown), 0, "after two UNAVAILABLE the keystroke gets no ghost text; candidates shown")
-	ctx.GRPC.Fail("Complete", codes.InvalidArgument, "prompt too long", 1, fimTarget)
-	shown = fimCall()
-	ctx.Equal(len(fimCalls(ctx)), 5, "INVALID_ARGUMENT is not transient: one call, no retry; calls so far")
+	ctx.GRPC.Fail("Complete", codes.InvalidArgument, "prompt too long", 1, kHFimTarget)
+	shown = hFimCall()
+	ctx.Equal(len(hFimCalls(ctx)), 5, "INVALID_ARGUMENT is not transient: one call, no retry; calls so far")
 	ctx.Equal(len(shown), 0, "a rejected request gives no ghost text; candidates shown")
 	for _, code := range []codes.Code{codes.ResourceExhausted, codes.Internal, codes.Unknown, codes.PermissionDenied} {
-		before := len(fimCalls(ctx))
-		ctx.GRPC.Fail("Complete", code, "refused", 1, fimTarget)
-		shown = fimCall()
-		ctx.Equal(len(fimCalls(ctx))-before, 1, "%v is not UNAVAILABLE: one call, no retry; calls", code)
+		before := len(hFimCalls(ctx))
+		ctx.GRPC.Fail("Complete", code, "refused", 1, kHFimTarget)
+		shown = hFimCall()
+		ctx.Equal(len(hFimCalls(ctx))-before, 1, "%v is not UNAVAILABLE: one call, no retry; calls", code)
 		ctx.Equal(len(shown), 0, "a call that ended %v gives no ghost text; candidates shown", code)
 	}
 }
 
 func CheckFilter(ctx *harness.Ctx) {
-	peer := fimWorld(ctx, []*pb.Candidate{
+	peer := hFimWorld(ctx, []*pb.Candidate{
 		{Text: ""}, {Text: "   "}, {Text: "\\n\\t"}, {Text: "cursor.fetchone()"}, {Text: "cursor.fetchone()  "}, {Text: "cursor.close()", Truncated: true},
 		{Text: "next(cursor)"}, {Text: "\\tnext(cursor)"}, {Text: "cursor.close()"},
 	})
-	shown := fimCall()
+	shown := hFimCall()
 	ctx.Equal(peer.requests[0].GetN(), int32(3), "the request must ask for nCandidates = 3")
 	ctx.Equal(shown, []string{"cursor.fetchone()", "next(cursor)", "cursor.close()"}, "empty or whitespace-only, truncated and duplicate (after trimming both ends) candidates must be dropped in the model's order; a truncated candidate does not hide a later complete one")
 }
@@ -868,13 +868,13 @@ func CheckFilter(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kFimTarget = "model:9000";
-const std::string kFimPrefix = "def load_user(conn, user_id):\\n    row = ";
-const std::string kFimSuffix = "\\n    return User.from_row(row)\\n";
-const std::vector<std::string> kFimSnippets = {"class User:\\n    user_id: int\\n"};
+const std::string kHFimTarget = "model:9000";
+const std::string kHFimPrefix = "def load_user(conn, user_id):\\n    row = ";
+const std::string kHFimSuffix = "\\n    return User.from_row(row)\\n";
+const std::vector<std::string> kHFimSnippets = {"class User:\\n    user_id: int\\n"};
 
 // The stand-in model service: records every request, answers the candidates it was given, and can fail one call late (UNAVAILABLE after a stall).
-class FimModel final : public copilotctx::Model::Service {
+class HFimModel final : public copilotctx::Model::Service {
  public:
   harness::Ctx* ctx = nullptr;
   double stall = 0;
@@ -896,47 +896,47 @@ class FimModel final : public copilotctx::Model::Service {
   }
 };
 
-FimModel& fimWorld(harness::Ctx& ctx, std::vector<std::pair<std::string, bool>> candidates = {
+HFimModel& hFimWorld(harness::Ctx& ctx, std::vector<std::pair<std::string, bool>> candidates = {
                                           {"cursor.fetchone()", false}, {"cursor.fetchall()[0]", false}, {"next(cursor)", false}}) {
-  static FimModel* peer = nullptr;
+  static HFimModel* peer = nullptr;
   delete peer;
-  peer = new FimModel();
+  peer = new HFimModel();
   peer->ctx = &ctx;
   peer->candidates = std::move(candidates);
-  ctx.GRPC.Server(kFimTarget)->RegisterService(peer);
+  ctx.GRPC.Server(kHFimTarget)->RegisterService(peer);
   return *peer;
 }
 
-std::vector<std::string> fimCall() { return complete(kFimPrefix, kFimSuffix, kFimSnippets, "python"); }
+std::vector<std::string> hFimCall() { return complete(kHFimPrefix, kHFimSuffix, kHFimSnippets, "python"); }
 
 }  // namespace
 
 void CheckFimOrder(harness::Ctx& ctx) {
-  auto& peer = fimWorld(ctx);
-  fimCall();
+  auto& peer = hFimWorld(ctx);
+  hFimCall();
   ctx.Equal(peer.requests.size(), 1, "one Complete call expected; calls");
   const auto& sent = peer.requests[0];
-  ctx.Equal(sent.prefix(), kFimPrefix, "the model's prefix must be the code before the cursor");
-  ctx.Equal(sent.suffix(), kFimSuffix, "the model's suffix must be the code after the cursor (glued into the prefix, the model completes the end of the file)");
-  ctx.Assert(sent.snippets_size() == 1 && sent.snippets(0) == kFimSnippets[0] && sent.language() == "python",
+  ctx.Equal(sent.prefix(), kHFimPrefix, "the model's prefix must be the code before the cursor");
+  ctx.Equal(sent.suffix(), kHFimSuffix, "the model's suffix must be the code after the cursor (glued into the prefix, the model completes the end of the file)");
+  ctx.Assert(sent.snippets_size() == 1 && sent.snippets(0) == kHFimSnippets[0] && sent.language() == "python",
              "snippets and language travel in their own fields, got %d snippets and %q", sent.snippets_size(), sent.language());
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  auto& peer = fimWorld(ctx);
-  fimCall();
+  auto& peer = hFimWorld(ctx);
+  hFimCall();
   const auto first = ctx.GRPC.CallsTo("Complete")[0];
   ctx.Assert(first.HasDeadline(), "the Complete call carries no deadline: a slow model holds the request after the editor moved on");
   ctx.Assert(first.TimeoutSeconds() >= 0.25 && first.TimeoutSeconds() <= 0.35, "the deadline must be 300 ms, got %vs", first.TimeoutSeconds());
   peer.stall = 0.2;  // the first attempt fails UNAVAILABLE after 200 ms, the retry answers at once
-  auto shown = fimCall();
+  auto shown = hFimCall();
   auto calls = ctx.GRPC.CallsTo("Complete");
   ctx.Assert(calls.size() == 3 && !shown.empty(), "an UNAVAILABLE after 200 ms earns one retry that succeeds: saw %d calls and %d candidates", calls.size() - 1, shown.size());
   const double retry_timeout = calls.back().HasDeadline() ? calls.back().TimeoutSeconds() : -1;
   ctx.Assert(calls.size() == 3 && retry_timeout >= 0.25 && retry_timeout <= 0.35, "the retry must carry its own 300 ms deadline, got %vs: a deadline shared by both attempts leaves the retry what the first one did not use", retry_timeout);
-  ctx.GRPC.SetLatency("Complete", 2.0, kFimTarget);
+  ctx.GRPC.SetLatency("Complete", 2.0, kHFimTarget);
   const int64_t started = ctx.Clock.Now();
-  shown = fimCall();
+  shown = hFimCall();
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Equal(shown.size(), 0, "a model that answers after the deadline must give no ghost text; candidates shown");
   ctx.Assert(waited <= 0.4, "complete waited %.2f s on a model that takes 2 s: the deadline must cut it at 300 ms", waited);
@@ -945,32 +945,32 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckRetryOnce(harness::Ctx& ctx) {
-  fimWorld(ctx);
-  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "model restarting", 1, kFimTarget);
-  auto shown = fimCall();
+  hFimWorld(ctx);
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "model restarting", 1, kHFimTarget);
+  auto shown = hFimCall();
   ctx.Assert(ctx.GRPC.CallsTo("Complete").size() == 2 && !shown.empty(), "one UNAVAILABLE earns one retry that succeeds: saw %d calls and %d candidates", ctx.GRPC.CallsTo("Complete").size(), shown.size());
-  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "model down", 2, kFimTarget);
-  shown = fimCall();
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "model down", 2, kHFimTarget);
+  shown = hFimCall();
   ctx.Equal(ctx.GRPC.CallsTo("Complete").size(), 4, "a model that stays UNAVAILABLE gets kMaxAttempts = 2 calls; calls so far");
   ctx.Equal(shown.size(), 0, "after two UNAVAILABLE the keystroke gets no ghost text; candidates shown");
-  ctx.GRPC.Fail("Complete", grpc::StatusCode::INVALID_ARGUMENT, "prompt too long", 1, kFimTarget);
-  shown = fimCall();
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::INVALID_ARGUMENT, "prompt too long", 1, kHFimTarget);
+  shown = hFimCall();
   ctx.Equal(ctx.GRPC.CallsTo("Complete").size(), 5, "INVALID_ARGUMENT is not transient: one call, no retry; calls so far");
   ctx.Equal(shown.size(), 0, "a rejected request gives no ghost text; candidates shown");
   for (const auto& [code, name] : std::vector<std::pair<grpc::StatusCode, std::string>>{
            {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}, {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::UNKNOWN, "UNKNOWN"}, {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}}) {
     const std::size_t before = ctx.GRPC.CallsTo("Complete").size();
-    ctx.GRPC.Fail("Complete", code, "refused", 1, kFimTarget);
-    shown = fimCall();
+    ctx.GRPC.Fail("Complete", code, "refused", 1, kHFimTarget);
+    shown = hFimCall();
     ctx.Equal(ctx.GRPC.CallsTo("Complete").size() - before, 1, "%s is not UNAVAILABLE: one call, no retry; calls", name);
     ctx.Equal(shown.size(), 0, "a call that ended %s gives no ghost text; candidates shown", name);
   }
 }
 
 void CheckFilter(harness::Ctx& ctx) {
-  auto& peer = fimWorld(ctx, {{"", false}, {"   ", false}, {"\\n\\t", false}, {"cursor.fetchone()", false}, {"cursor.fetchone()  ", false}, {"cursor.close()", true},
+  auto& peer = hFimWorld(ctx, {{"", false}, {"   ", false}, {"\\n\\t", false}, {"cursor.fetchone()", false}, {"cursor.fetchone()  ", false}, {"cursor.close()", true},
                               {"next(cursor)", false}, {"\\tnext(cursor)", false}, {"cursor.close()", false}});
-  const auto shown = fimCall();
+  const auto shown = hFimCall();
   ctx.Equal(peer.requests[0].n(), 3, "the request must ask for kNCandidates = 3");
   ctx.Equal(shown, {"cursor.fetchone()", "next(cursor)", "cursor.close()"}, "empty or whitespace-only, truncated and duplicate (after trimming both ends) candidates must be dropped in the model's order; a truncated candidate does not hide a later complete one");
 }

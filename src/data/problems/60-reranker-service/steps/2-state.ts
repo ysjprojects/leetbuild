@@ -694,23 +694,23 @@ import (
 )
 
 const (
-	stateQ1 = "solar panel efficiency"
-	stateQ2 = "wind turbine noise"
-	stateV  = "xenc-v7"
-	stateP1 = "solar panel guide"
-	stateP2 = "efficiency of panels"
-	stateP3 = "solar efficiency panel tips"
-	stateP4 = "wind farm permits"
+	kHStateQ1 = "solar panel efficiency"
+	kHStateQ2 = "wind turbine noise"
+	kHStateV  = "xenc-v7"
+	kHStateP1 = "solar panel guide"
+	kHStateP2 = "efficiency of panels"
+	kHStateP3 = "solar efficiency panel tips"
+	kHStateP4 = "wind farm permits"
 )
 
 // stateModel is the compute the service hands in: the stand-in model for one query, counting what it was asked.
-type stateModel struct {
+type HStateModel struct {
 	query string
 	scale float64
 	calls [][]string
 }
 
-func (s *stateModel) compute(passages []string) []float64 {
+func (s *HStateModel) compute(passages []string) []float64 {
 	s.calls = append(s.calls, append([]string{}, passages...))
 	out := make([]float64, len(passages))
 	for i, p := range passages {
@@ -719,17 +719,17 @@ func (s *stateModel) compute(passages []string) []float64 {
 	return out
 }
 
-func stateKey(query, passage, version string) string {
+func hStateKey(query, passage, version string) string {
 	return "rerank:score:" + config.Fingerprint(query) + ":" + config.Fingerprint(passage) + ":" + version
 }
 
-func stateLookup(ctx *harness.Ctx, query string, passages []string, version string, s *stateModel) []float64 {
+func hStateLookup(ctx *harness.Ctx, query string, passages []string, version string, s *HStateModel) []float64 {
 	got, err := cachedScores(context.Background(), query, passages, version, s.compute)
 	ctx.NoError(err, "cachedScores")
 	return got
 }
 
-func stateClose(got, want []float64) bool {
+func hStateClose(got, want []float64) bool {
 	if len(got) != len(want) {
 		return false
 	}
@@ -742,31 +742,31 @@ func stateClose(got, want []float64) bool {
 }
 
 func CheckPairKey(ctx *harness.Ctx) {
-	first := stateLookup(ctx, stateQ1, []string{stateP1}, stateV, &stateModel{query: stateQ1, scale: 1})
-	ctx.Assert(stateClose(first, []float64{model.Score(stateQ1, stateP1)}), "the first lookup must answer the model's score, got %v", first)
-	other := &stateModel{query: stateQ2, scale: 1}
-	second := stateLookup(ctx, stateQ2, []string{stateP1}, stateV, other)
-	ctx.Equal(other.calls, [][]string{{stateP1}}, "a second query over the same passage must be scored for itself (the key must name the query too); the model calls")
-	ctx.Assert(stateClose(second, []float64{model.Score(stateQ2, stateP1)}), "the second query must get its own score, got %v", second)
-	for _, q := range []string{stateQ1, stateQ2} {
-		ctx.Equal(ctx.Redis.Exists(stateKey(q, stateP1, stateV)), int64(1), "an entry at %s (rerank:score:{fingerprint(query)}:{fingerprint(passage)}:{model_version}); Redis holds %v", stateKey(q, stateP1, stateV), ctx.Redis.Keys("rerank:score:*"))
+	first := hStateLookup(ctx, kHStateQ1, []string{kHStateP1}, kHStateV, &HStateModel{query: kHStateQ1, scale: 1})
+	ctx.Assert(hStateClose(first, []float64{model.Score(kHStateQ1, kHStateP1)}), "the first lookup must answer the model's score, got %v", first)
+	other := &HStateModel{query: kHStateQ2, scale: 1}
+	second := hStateLookup(ctx, kHStateQ2, []string{kHStateP1}, kHStateV, other)
+	ctx.Equal(other.calls, [][]string{{kHStateP1}}, "a second query over the same passage must be scored for itself (the key must name the query too); the model calls")
+	ctx.Assert(hStateClose(second, []float64{model.Score(kHStateQ2, kHStateP1)}), "the second query must get its own score, got %v", second)
+	for _, q := range []string{kHStateQ1, kHStateQ2} {
+		ctx.Equal(ctx.Redis.Exists(hStateKey(q, kHStateP1, kHStateV)), int64(1), "an entry at %s (rerank:score:{fingerprint(query)}:{fingerprint(passage)}:{model_version}); Redis holds %v", hStateKey(q, kHStateP1, kHStateV), ctx.Redis.Keys("rerank:score:*"))
 	}
 }
 
 func CheckVersionInKey(ctx *harness.Ctx) {
-	stateLookup(ctx, stateQ1, []string{stateP1}, "xenc-v7", &stateModel{query: stateQ1, scale: 1})
-	rebuilt := &stateModel{query: stateQ1, scale: 0.5}
-	got := stateLookup(ctx, stateQ1, []string{stateP1}, "xenc-v8", rebuilt)
-	ctx.Equal(rebuilt.calls, [][]string{{stateP1}}, "the next model build must be asked (a new model_version is a new key); the model calls")
-	ctx.Assert(stateClose(got, []float64{model.Score(stateQ1, stateP1) * 0.5}), "under xenc-v8 the pair must get the new build's score, got %v", got)
-	ctx.Equal(ctx.Redis.Exists(stateKey(stateQ1, stateP1, "xenc-v8")), int64(1), "an entry at %s", stateKey(stateQ1, stateP1, "xenc-v8"))
-	old := &stateModel{query: stateQ1, scale: 1}
-	again := stateLookup(ctx, stateQ1, []string{stateP1}, "xenc-v7", old)
-	ctx.Assert(len(old.calls) == 0 && stateClose(again, []float64{model.Score(stateQ1, stateP1)}), "xenc-v7's entry must still answer for xenc-v7, got %v after %d model calls", again, len(old.calls))
+	hStateLookup(ctx, kHStateQ1, []string{kHStateP1}, "xenc-v7", &HStateModel{query: kHStateQ1, scale: 1})
+	rebuilt := &HStateModel{query: kHStateQ1, scale: 0.5}
+	got := hStateLookup(ctx, kHStateQ1, []string{kHStateP1}, "xenc-v8", rebuilt)
+	ctx.Equal(rebuilt.calls, [][]string{{kHStateP1}}, "the next model build must be asked (a new model_version is a new key); the model calls")
+	ctx.Assert(hStateClose(got, []float64{model.Score(kHStateQ1, kHStateP1) * 0.5}), "under xenc-v8 the pair must get the new build's score, got %v", got)
+	ctx.Equal(ctx.Redis.Exists(hStateKey(kHStateQ1, kHStateP1, "xenc-v8")), int64(1), "an entry at %s", hStateKey(kHStateQ1, kHStateP1, "xenc-v8"))
+	old := &HStateModel{query: kHStateQ1, scale: 1}
+	again := hStateLookup(ctx, kHStateQ1, []string{kHStateP1}, "xenc-v7", old)
+	ctx.Assert(len(old.calls) == 0 && hStateClose(again, []float64{model.Score(kHStateQ1, kHStateP1)}), "xenc-v7's entry must still answer for xenc-v7, got %v after %d model calls", again, len(old.calls))
 }
 
 func CheckScoreTtl(ctx *harness.Ctx) {
-	first := stateKey(stateQ1, stateP1, stateV)
+	first := hStateKey(kHStateQ1, kHStateP1, kHStateV)
 	written := int64(-3)
 	// The lookup touches the key first; the next command touching it is the write.
 	ctx.Redis.After(first, func() any {
@@ -775,7 +775,7 @@ func CheckScoreTtl(ctx *harness.Ctx) {
 			return nil
 		})
 	})
-	stateLookup(ctx, stateQ1, []string{stateP1, stateP2}, stateV, &stateModel{query: stateQ1, scale: 1})
+	hStateLookup(ctx, kHStateQ1, []string{kHStateP1, kHStateP2}, kHStateV, &HStateModel{query: kHStateQ1, scale: 1})
 	keys := ctx.Redis.Keys("rerank:score:*")
 	ctx.Equal(len(keys), 2, "two scored passages must leave two entries (%v); the entries", keys)
 	for _, key := range keys {
@@ -786,26 +786,26 @@ func CheckScoreTtl(ctx *harness.Ctx) {
 }
 
 func CheckOneMget(ctx *harness.Ctx) {
-	passages := []string{stateP1, stateP2, stateP3}
-	stateLookup(ctx, stateQ1, passages, stateV, &stateModel{query: stateQ1, scale: 1})
+	passages := []string{kHStateP1, kHStateP2, kHStateP3}
+	hStateLookup(ctx, kHStateQ1, passages, kHStateV, &HStateModel{query: kHStateQ1, scale: 1})
 	before := len(ctx.Redis.RoundTrips())
-	warm := &stateModel{query: stateQ1, scale: 1}
-	got := stateLookup(ctx, stateQ1, passages, stateV, warm)
+	warm := &HStateModel{query: kHStateQ1, scale: 1}
+	got := hStateLookup(ctx, kHStateQ1, passages, kHStateV, warm)
 	trips := ctx.Redis.RoundTrips()[before:]
 	ctx.Equal(len(warm.calls), 0, "three cached passages must not ask the model again; the model calls")
-	ctx.Assert(stateClose(got, []float64{model.Score(stateQ1, stateP1), model.Score(stateQ1, stateP2), model.Score(stateQ1, stateP3)}), "the cached scores came back as %v", got)
+	ctx.Assert(hStateClose(got, []float64{model.Score(kHStateQ1, kHStateP1), model.Score(kHStateQ1, kHStateP2), model.Score(kHStateQ1, kHStateP3)}), "the cached scores came back as %v", got)
 	ctx.Equal(trips, [][]string{{"MGET"}}, "a lookup of three cached passages: one MGET round trip, not a GET each; the round trips")
 }
 
 func CheckMissesOnly(ctx *harness.Ctx) {
-	ctx.Redis.Set(stateKey(stateQ1, stateP2, stateV), "0.42", "EX", 600) // another replica scored P2 twenty minutes ago
-	ctx.Redis.Set(stateKey(stateQ1, stateP4, stateV), "0", "EX", 600)    // and found P4 unrelated: a cached 0 is a hit
-	asked := &stateModel{query: stateQ1, scale: 1}
-	got := stateLookup(ctx, stateQ1, []string{stateP1, stateP2, stateP3, stateP4}, stateV, asked)
-	ctx.Equal(asked.calls, [][]string{{stateP1, stateP3}}, "with P2 and P4 cached (P4 at 0) the model must be asked once for [P1, P3] in order; the model calls")
-	ctx.Assert(stateClose(got, []float64{model.Score(stateQ1, stateP1), 0.42, model.Score(stateQ1, stateP3), 0}), "the scores must be P1's, the cached 0.42, P3's, the cached 0, in passage order, got %v", got)
-	for _, p := range []string{stateP2, stateP4} {
-		ttl := ctx.Redis.TTL(stateKey(stateQ1, p, stateV))
+	ctx.Redis.Set(hStateKey(kHStateQ1, kHStateP2, kHStateV), "0.42", "EX", 600) // another replica scored P2 twenty minutes ago
+	ctx.Redis.Set(hStateKey(kHStateQ1, kHStateP4, kHStateV), "0", "EX", 600)    // and found P4 unrelated: a cached 0 is a hit
+	asked := &HStateModel{query: kHStateQ1, scale: 1}
+	got := hStateLookup(ctx, kHStateQ1, []string{kHStateP1, kHStateP2, kHStateP3, kHStateP4}, kHStateV, asked)
+	ctx.Equal(asked.calls, [][]string{{kHStateP1, kHStateP3}}, "with P2 and P4 cached (P4 at 0) the model must be asked once for [P1, P3] in order; the model calls")
+	ctx.Assert(hStateClose(got, []float64{model.Score(kHStateQ1, kHStateP1), 0.42, model.Score(kHStateQ1, kHStateP3), 0}), "the scores must be P1's, the cached 0.42, P3's, the cached 0, in passage order, got %v", got)
+	for _, p := range []string{kHStateP2, kHStateP4} {
+		ttl := ctx.Redis.TTL(hStateKey(kHStateQ1, p, kHStateV))
 		ctx.Assert(ttl > 0 && ttl <= 600, "a cached entry with 600 s left has TTL %d after the lookup: only fresh scores are written, a hit keeps the expiry it was written with", ttl)
 	}
 }
@@ -821,16 +821,16 @@ func CheckMissesOnly(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kQ1 = "solar panel efficiency";
-const std::string kQ2 = "wind turbine noise";
-const std::string kV = "xenc-v7";
-const std::string kP1 = "solar panel guide";
-const std::string kP2 = "efficiency of panels";
-const std::string kP3 = "solar efficiency panel tips";
-const std::string kP4 = "wind farm permits";
+const std::string kHQ1 = "solar panel efficiency";
+const std::string kHQ2 = "wind turbine noise";
+const std::string kHV = "xenc-v7";
+const std::string kHP1 = "solar panel guide";
+const std::string kHP2 = "efficiency of panels";
+const std::string kHP3 = "solar efficiency panel tips";
+const std::string kHP4 = "wind farm permits";
 
 // The compute the service hands in: the stand-in model for one query, counting what it was asked.
-struct Counting {
+struct HCounting {
   std::string query;
   double scale = 1.0;
   std::vector<std::vector<std::string>> calls;
@@ -860,38 +860,38 @@ bool hClose(const std::vector<double>& got, const std::vector<double>& want) {
 }  // namespace
 
 void CheckPairKey(harness::Ctx& ctx) {
-  Counting first{kQ1};
-  const auto a = cachedScores(kQ1, {kP1}, kV, first.fn());
-  ctx.Assert(hClose(a, {model::score(kQ1, kP1)}), "the first lookup must answer the model's score, got %v", a);
-  Counting other{kQ2};
-  const auto b = cachedScores(kQ2, {kP1}, kV, other.fn());
-  ctx.Equal(other.calls, std::vector<std::vector<std::string>>{{kP1}}, "a second query over the same passage must be scored for itself (the key must name the query too); the model calls");
-  ctx.Assert(hClose(b, {model::score(kQ2, kP1)}), "the second query must get its own score, got %v", b);
-  for (const auto& q : {kQ1, kQ2}) {
-    ctx.Equal(ctx.Redis.Exists(hKey(q, kP1, kV)), 1, "an entry at %s (rerank:score:{fingerprint(query)}:{fingerprint(passage)}:{model_version}); Redis holds %v", hKey(q, kP1, kV), ctx.Redis.Keys("rerank:score:*"));
+  HCounting first{kHQ1};
+  const auto a = cachedScores(kHQ1, {kHP1}, kHV, first.fn());
+  ctx.Assert(hClose(a, {model::score(kHQ1, kHP1)}), "the first lookup must answer the model's score, got %v", a);
+  HCounting other{kHQ2};
+  const auto b = cachedScores(kHQ2, {kHP1}, kHV, other.fn());
+  ctx.Equal(other.calls, std::vector<std::vector<std::string>>{{kHP1}}, "a second query over the same passage must be scored for itself (the key must name the query too); the model calls");
+  ctx.Assert(hClose(b, {model::score(kHQ2, kHP1)}), "the second query must get its own score, got %v", b);
+  for (const auto& q : {kHQ1, kHQ2}) {
+    ctx.Equal(ctx.Redis.Exists(hKey(q, kHP1, kHV)), 1, "an entry at %s (rerank:score:{fingerprint(query)}:{fingerprint(passage)}:{model_version}); Redis holds %v", hKey(q, kHP1, kHV), ctx.Redis.Keys("rerank:score:*"));
   }
 }
 
 void CheckVersionInKey(harness::Ctx& ctx) {
-  Counting seed{kQ1};
-  cachedScores(kQ1, {kP1}, "xenc-v7", seed.fn());
-  Counting rebuilt{kQ1, 0.5};
-  const auto got = cachedScores(kQ1, {kP1}, "xenc-v8", rebuilt.fn());
-  ctx.Equal(rebuilt.calls, std::vector<std::vector<std::string>>{{kP1}}, "the next model build must be asked (a new model_version is a new key); the model calls");
-  ctx.Assert(hClose(got, {model::score(kQ1, kP1) * 0.5}), "under xenc-v8 the pair must get the new build's score, got %v", got);
-  ctx.Equal(ctx.Redis.Exists(hKey(kQ1, kP1, "xenc-v8")), 1, "an entry at %s", hKey(kQ1, kP1, "xenc-v8"));
-  Counting old{kQ1};
-  const auto again = cachedScores(kQ1, {kP1}, "xenc-v7", old.fn());
-  ctx.Assert(old.calls.empty() && hClose(again, {model::score(kQ1, kP1)}), "xenc-v7's entry must still answer for xenc-v7, got %v after %d model calls", again, old.calls.size());
+  HCounting seed{kHQ1};
+  cachedScores(kHQ1, {kHP1}, "xenc-v7", seed.fn());
+  HCounting rebuilt{kHQ1, 0.5};
+  const auto got = cachedScores(kHQ1, {kHP1}, "xenc-v8", rebuilt.fn());
+  ctx.Equal(rebuilt.calls, std::vector<std::vector<std::string>>{{kHP1}}, "the next model build must be asked (a new model_version is a new key); the model calls");
+  ctx.Assert(hClose(got, {model::score(kHQ1, kHP1) * 0.5}), "under xenc-v8 the pair must get the new build's score, got %v", got);
+  ctx.Equal(ctx.Redis.Exists(hKey(kHQ1, kHP1, "xenc-v8")), 1, "an entry at %s", hKey(kHQ1, kHP1, "xenc-v8"));
+  HCounting old{kHQ1};
+  const auto again = cachedScores(kHQ1, {kHP1}, "xenc-v7", old.fn());
+  ctx.Assert(old.calls.empty() && hClose(again, {model::score(kHQ1, kHP1)}), "xenc-v7's entry must still answer for xenc-v7, got %v after %d model calls", again, old.calls.size());
 }
 
 void CheckScoreTtl(harness::Ctx& ctx) {
-  const std::string first = hKey(kQ1, kP1, kV);
+  const std::string first = hKey(kHQ1, kHP1, kHV);
   long long written = -3;
   // The lookup touches the key first; the next command touching it is the write.
   ctx.Redis.After(first, [&ctx, &written, first] { ctx.Redis.After(first, [&ctx, &written, first] { written = ctx.Redis.TTL(first); }); });
-  Counting seed{kQ1};
-  cachedScores(kQ1, {kP1, kP2}, kV, seed.fn());
+  HCounting seed{kHQ1};
+  cachedScores(kHQ1, {kHP1, kHP2}, kHV, seed.fn());
   const auto keys = ctx.Redis.Keys("rerank:score:*");
   ctx.Equal(keys.size(), 2, "two scored passages must leave two entries (%v); the entries", keys);
   for (const auto& k : keys) {
@@ -902,28 +902,28 @@ void CheckScoreTtl(harness::Ctx& ctx) {
 }
 
 void CheckOneMget(harness::Ctx& ctx) {
-  const std::vector<std::string> passages = {kP1, kP2, kP3};
-  Counting seed{kQ1};
-  cachedScores(kQ1, passages, kV, seed.fn());
+  const std::vector<std::string> passages = {kHP1, kHP2, kHP3};
+  HCounting seed{kHQ1};
+  cachedScores(kHQ1, passages, kHV, seed.fn());
   const size_t before = ctx.Redis.RoundTrips().size();
-  Counting warm{kQ1};
-  const auto got = cachedScores(kQ1, passages, kV, warm.fn());
+  HCounting warm{kHQ1};
+  const auto got = cachedScores(kHQ1, passages, kHV, warm.fn());
   const auto all = ctx.Redis.RoundTrips();
   const std::vector<std::vector<std::string>> trips(all.begin() + static_cast<long>(before), all.end());
   ctx.Equal(warm.calls.size(), 0, "three cached passages must not ask the model again; the model calls");
-  ctx.Assert(hClose(got, {model::score(kQ1, kP1), model::score(kQ1, kP2), model::score(kQ1, kP3)}), "the cached scores came back as %v", got);
+  ctx.Assert(hClose(got, {model::score(kHQ1, kHP1), model::score(kHQ1, kHP2), model::score(kHQ1, kHP3)}), "the cached scores came back as %v", got);
   ctx.Equal(trips, std::vector<std::vector<std::string>>{{"MGET"}}, "a lookup of three cached passages: one MGET round trip, not a GET each; the round trips");
 }
 
 void CheckMissesOnly(harness::Ctx& ctx) {
-  ctx.Redis.Set(hKey(kQ1, kP2, kV), "0.42", "EX", 600);  // another replica scored P2 twenty minutes ago
-  ctx.Redis.Set(hKey(kQ1, kP4, kV), "0", "EX", 600);     // and found P4 unrelated: a cached 0 is a hit
-  Counting asked{kQ1};
-  const auto got = cachedScores(kQ1, {kP1, kP2, kP3, kP4}, kV, asked.fn());
-  ctx.Equal(asked.calls, std::vector<std::vector<std::string>>{{kP1, kP3}}, "with P2 and P4 cached (P4 at 0) the model must be asked once for [P1, P3] in order; the model calls");
-  ctx.Assert(hClose(got, {model::score(kQ1, kP1), 0.42, model::score(kQ1, kP3), 0.0}), "the scores must be P1's, the cached 0.42, P3's, the cached 0, in passage order, got %v", got);
-  for (const auto& p : {kP2, kP4}) {
-    const long long ttl = ctx.Redis.TTL(hKey(kQ1, p, kV));
+  ctx.Redis.Set(hKey(kHQ1, kHP2, kHV), "0.42", "EX", 600);  // another replica scored P2 twenty minutes ago
+  ctx.Redis.Set(hKey(kHQ1, kHP4, kHV), "0", "EX", 600);     // and found P4 unrelated: a cached 0 is a hit
+  HCounting asked{kHQ1};
+  const auto got = cachedScores(kHQ1, {kHP1, kHP2, kHP3, kHP4}, kHV, asked.fn());
+  ctx.Equal(asked.calls, std::vector<std::vector<std::string>>{{kHP1, kHP3}}, "with P2 and P4 cached (P4 at 0) the model must be asked once for [P1, P3] in order; the model calls");
+  ctx.Assert(hClose(got, {model::score(kHQ1, kHP1), 0.42, model::score(kHQ1, kHP3), 0.0}), "the scores must be P1's, the cached 0.42, P3's, the cached 0, in passage order, got %v", got);
+  for (const auto& p : {kHP2, kHP4}) {
+    const long long ttl = ctx.Redis.TTL(hKey(kHQ1, p, kHV));
     ctx.Assert(ttl > 0 && ttl <= 600, "a cached entry with 600 s left has TTL %d after the lookup: only fresh scores are written, a hit keeps the expiry it was written with", ttl);
   }
 }

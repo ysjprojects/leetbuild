@@ -758,12 +758,12 @@ import (
 	"calendard/store"
 )
 
-const rdWeek = "from=2026-03-02T00:00:00Z&to=2026-03-09T00:00:00Z"
+const kHRdWeek = "from=2026-03-02T00:00:00Z&to=2026-03-09T00:00:00Z"
 
 // rdClient seeds c1 (public) and c2 (private), t1 a member of both, each with a 30-minute daily
 // standup ten times from Monday 2 March 2026, and serves the learner's route over step 2's cache,
 // which the harness stands in for: every event expanded, sorted, the slice written for 300 s.
-func rdClient(ctx *harness.Ctx) *harness.HTTP {
+func hRdClient(ctx *harness.Ctx) *harness.HTTP {
 	bg := context.Background()
 	ctx.NoError(store.PutCalendar(bg, "c1", "public", "t1"), "seeding c1")
 	ctx.NoError(store.PutCalendar(bg, "c2", "private", "t1"), "seeding c2")
@@ -793,36 +793,36 @@ func rdClient(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func rdGet(c *harness.HTTP, path, tenant string) *harness.Response {
+func hRdGet(c *harness.HTTP, path, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Get(path)
 	}
 	return c.Get(path, "X-Tenant-Id", tenant)
 }
 
-type rdBody struct {
+type HRdBody struct {
 	Error       string             \`json:"error"\`
 	Occurrences []rrule.Occurrence \`json:"occurrences"\`
 }
 
-func rdDecode(r *harness.Response) rdBody {
-	var body rdBody
+func hRdDecode(r *harness.Response) HRdBody {
+	var body HRdBody
 	_ = json.Unmarshal(r.Body, &body)
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := rdClient(ctx)
-	r := rdGet(c, "/v1/calendars/c1/events?"+rdWeek, "t1")
+	c := hRdClient(ctx)
+	r := hRdGet(c, "/v1/calendars/c1/events?"+kHRdWeek, "t1")
 	ctx.Equal(r.Status, 200, "GET a week of the public calendar c1 (%s)", r.Text())
-	occurrences := rdDecode(r).Occurrences
+	occurrences := hRdDecode(r).Occurrences
 	ctx.Equal(len(occurrences), 7, "the week must answer the 7 daily standups; the occurrences")
 	first, _ := rrule.ParseInstant("2026-03-02T09:00:00Z")
 	ctx.Assert(occurrences[0].OccurrenceID == "e-1:"+strconv.FormatInt(first, 10) && occurrences[0].Start == "2026-03-02T09:00:00Z", "the first occurrence is %v", occurrences[0])
 }
 
 func CheckRangeCap(ctx *harness.Ctx) {
-	c := rdClient(ctx)
+	c := hRdClient(ctx)
 	for _, tc := range [][2]string{
 		{"from=2026-03-02T00:00:00Z&to=2026-06-30T00:00:00Z", "a 120-day window"},
 		{"from=2026-03-02T00:00:00Z&to=2026-05-31T00:00:01Z", "a window of 90 days and one second"},
@@ -831,47 +831,47 @@ func CheckRangeCap(ctx *harness.Ctx) {
 		{"from=2026-03-02T00:00:00&to=2026-03-09T00:00:00Z", "a from without an offset"},
 		{"from=2026-03-09T00:00:00Z&to=2026-03-02T00:00:00Z", "a to before from"},
 	} {
-		r := rdGet(c, "/v1/calendars/c1/events?"+tc[0], "t1")
-		ctx.Assert(r.Status == 400 && rdDecode(r).Error == "invalid_window", "%s answered %d, expected 400 invalid_window: a read bounds what one request may expand", tc[1], r.Status)
+		r := hRdGet(c, "/v1/calendars/c1/events?"+tc[0], "t1")
+		ctx.Assert(r.Status == 400 && hRdDecode(r).Error == "invalid_window", "%s answered %d, expected 400 invalid_window: a read bounds what one request may expand", tc[1], r.Status)
 	}
-	r := rdGet(c, "/v1/calendars/c1/events?from=2026-03-02T00:00:00Z&to=2026-05-31T00:00:00Z", "t1")
+	r := hRdGet(c, "/v1/calendars/c1/events?from=2026-03-02T00:00:00Z&to=2026-05-31T00:00:00Z", "t1")
 	ctx.Equal(r.Status, 200, "a window of exactly 90 days")
 }
 
 func CheckUnknownCalendar(ctx *harness.Ctx) {
-	c := rdClient(ctx)
-	r := rdGet(c, "/v1/calendars/nope/events?"+rdWeek, "t1")
-	ctx.Assert(r.Status == 404 && rdDecode(r).Error == "calendar_not_found", "an unknown calendar answered %d %s, expected 404 calendar_not_found: an empty week is a different answer", r.Status, r.Text())
-	r = rdGet(c, "/v1/calendars/nope/events?from=2026-03-02T00:00:00Z", "t1")
-	ctx.Assert(r.Status == 404 && rdDecode(r).Error == "calendar_not_found", "an unknown calendar with a window without to answered %d %s, expected 404 calendar_not_found: the calendar is judged before the window", r.Status, r.Text())
+	c := hRdClient(ctx)
+	r := hRdGet(c, "/v1/calendars/nope/events?"+kHRdWeek, "t1")
+	ctx.Assert(r.Status == 404 && hRdDecode(r).Error == "calendar_not_found", "an unknown calendar answered %d %s, expected 404 calendar_not_found: an empty week is a different answer", r.Status, r.Text())
+	r = hRdGet(c, "/v1/calendars/nope/events?from=2026-03-02T00:00:00Z", "t1")
+	ctx.Assert(r.Status == 404 && hRdDecode(r).Error == "calendar_not_found", "an unknown calendar with a window without to answered %d %s, expected 404 calendar_not_found: the calendar is judged before the window", r.Status, r.Text())
 	ctx.Equal(ctx.Redis.Keys("exp:nope*"), []string{}, "the slices an unknown calendar left in the cache")
 }
 
 func CheckPrivateCalendars(ctx *harness.Ctx) {
-	c := rdClient(ctx)
+	c := hRdClient(ctx)
 	for _, tc := range [][3]string{
-		{"t2", rdWeek, "a tenant outside the calendar"},
-		{"", rdWeek, "a request without X-Tenant-Id"},
-		{"t2", rdWeek + "&tenant=t1", "a tenant outside the calendar naming t1 in the query"},
+		{"t2", kHRdWeek, "a tenant outside the calendar"},
+		{"", kHRdWeek, "a request without X-Tenant-Id"},
+		{"t2", kHRdWeek + "&tenant=t1", "a tenant outside the calendar naming t1 in the query"},
 		{"t2", "from=2026-03-02T00:00:00Z", "a tenant outside the calendar with a window without to"},
 	} {
-		r := rdGet(c, "/v1/calendars/c2/events?"+tc[1], tc[0])
-		ctx.Assert(r.Status == 403 && rdDecode(r).Error == "not_a_member", "%s reading the private calendar c2 answered %d, expected 403 not_a_member", tc[2], r.Status)
+		r := hRdGet(c, "/v1/calendars/c2/events?"+tc[1], tc[0])
+		ctx.Assert(r.Status == 403 && hRdDecode(r).Error == "not_a_member", "%s reading the private calendar c2 answered %d, expected 403 not_a_member", tc[2], r.Status)
 	}
 	ctx.Equal(ctx.Redis.Keys("exp:c2*"), []string{}, "the slices the refused reads of c2 left in the cache (a stranger is refused before anything is expanded)")
-	r := rdGet(c, "/v1/calendars/c2/events?"+rdWeek, "t1")
-	ctx.Assert(r.Status == 200 && len(rdDecode(r).Occurrences) == 7, "the member t1 reading c2 answered %d %s", r.Status, r.Text())
-	r = rdGet(c, "/v1/calendars/c1/events?"+rdWeek, "t2")
-	ctx.Assert(r.Status == 200 && len(rdDecode(r).Occurrences) == 7, "t2 reading the public calendar c1 answered %d %s: a public calendar is readable by anyone", r.Status, r.Text())
+	r := hRdGet(c, "/v1/calendars/c2/events?"+kHRdWeek, "t1")
+	ctx.Assert(r.Status == 200 && len(hRdDecode(r).Occurrences) == 7, "the member t1 reading c2 answered %d %s", r.Status, r.Text())
+	r = hRdGet(c, "/v1/calendars/c1/events?"+kHRdWeek, "t2")
+	ctx.Assert(r.Status == 200 && len(hRdDecode(r).Occurrences) == 7, "t2 reading the public calendar c1 answered %d %s: a public calendar is readable by anyone", r.Status, r.Text())
 }
 
 func CheckCacheControl(ctx *harness.Ctx) {
-	c := rdClient(ctx)
-	r := rdGet(c, "/v1/calendars/c2/events?"+rdWeek, "t1")
+	c := hRdClient(ctx)
+	r := hRdGet(c, "/v1/calendars/c2/events?"+kHRdWeek, "t1")
 	ctx.Equal(r.Status, 200, "the member t1 reading the private calendar c2 (%s)", r.Text())
 	cacheControl := r.Header.Get("Cache-Control")
 	ctx.Assert(strings.Contains(cacheControl, "private") && !strings.Contains(cacheControl, "public"), "the private calendar answered Cache-Control %q: a shared cache may store it and hand it to the next caller without asking the service", cacheControl)
-	r = rdGet(c, "/v1/calendars/c1/events?"+rdWeek, "t1")
+	r = hRdGet(c, "/v1/calendars/c1/events?"+kHRdWeek, "t1")
 	ctx.Assert(strings.Contains(r.Header.Get("Cache-Control"), "public"), "the public calendar answered Cache-Control %q, expected public, max-age=60", r.Header.Get("Cache-Control"))
 }
 `,
@@ -887,11 +887,11 @@ func CheckCacheControl(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kRdWeek = "from=2026-03-02T00:00:00Z&to=2026-03-09T00:00:00Z";
+const std::string kHRdWeek = "from=2026-03-02T00:00:00Z&to=2026-03-09T00:00:00Z";
 
 // c1 is public, c2 private, t1 a member of both, each with a 30-minute daily standup ten times from
 // Monday 2 March 2026; the route runs over step 2's cache.
-harness::HTTP rdClient(harness::Ctx& ctx) {
+harness::HTTP hRdClient(harness::Ctx& ctx) {
   calendard::store::PutCalendar("c1", "public", {"t1"});
   calendard::store::PutCalendar("c2", "private", {"t1"});
   calendard::store::PutEvent({"e-1", "c1", "t1", "Standup", "FREQ=DAILY;COUNT=10", "2026-03-02T09:00:00Z", "2026-03-02T09:30:00Z", 1, {"ana@example.com"}});
@@ -903,35 +903,35 @@ harness::HTTP rdClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response rdGet(harness::HTTP& c, const std::string& path, const std::string& tenant = "t1") {
+harness::Response hRdGet(harness::HTTP& c, const std::string& path, const std::string& tenant = "t1") {
   if (tenant.empty()) return c.Get(path);
   return c.Get(path, "X-Tenant-Id", tenant);
 }
 
-nlohmann::json rdBody(const harness::Response& r) {
+nlohmann::json hRdBody(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : nlohmann::json::object();
 }
 
-size_t rdCount(const harness::Response& r) {
-  const auto body = rdBody(r);
+size_t hRdCount(const harness::Response& r) {
+  const auto body = hRdBody(r);
   return body.contains("occurrences") && body["occurrences"].is_array() ? body["occurrences"].size() : 0;
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = rdClient(ctx);
-  const auto r = rdGet(c, "/v1/calendars/c1/events?" + kRdWeek);
+  auto c = hRdClient(ctx);
+  const auto r = hRdGet(c, "/v1/calendars/c1/events?" + kHRdWeek);
   ctx.Equal(r.Status, 200, "GET a week of the public calendar c1 (%s)", r.Text());
-  ctx.Equal(rdCount(r), 7, "the week must answer the 7 daily standups; the occurrences");
-  const auto first = rdBody(r)["occurrences"][0];
+  ctx.Equal(hRdCount(r), 7, "the week must answer the 7 daily standups; the occurrences");
+  const auto first = hRdBody(r)["occurrences"][0];
   const std::string expected_id = "e-1:" + std::to_string(calendard::rrule::ParseInstant("2026-03-02T09:00:00Z").value_or(0));
   ctx.Assert(first.value("occurrence_id", "") == expected_id && first.value("start", "") == "2026-03-02T09:00:00Z", "the first occurrence is %s", first.dump());
 }
 
 void CheckRangeCap(harness::Ctx& ctx) {
-  auto c = rdClient(ctx);
+  auto c = hRdClient(ctx);
   const std::vector<std::pair<std::string, std::string>> cases = {
       {"from=2026-03-02T00:00:00Z&to=2026-06-30T00:00:00Z", "a 120-day window"},
       {"from=2026-03-02T00:00:00Z&to=2026-05-31T00:00:01Z", "a window of 90 days and one second"},
@@ -941,56 +941,56 @@ void CheckRangeCap(harness::Ctx& ctx) {
       {"from=2026-03-09T00:00:00Z&to=2026-03-02T00:00:00Z", "a to before from"},
   };
   for (const auto& [query, what] : cases) {
-    const auto r = rdGet(c, "/v1/calendars/c1/events?" + query);
-    ctx.Assert(r.Status == 400 && rdBody(r).value("error", "") == "invalid_window",
+    const auto r = hRdGet(c, "/v1/calendars/c1/events?" + query);
+    ctx.Assert(r.Status == 400 && hRdBody(r).value("error", "") == "invalid_window",
                "%s answered %d, expected 400 invalid_window: a read bounds what one request may expand", what, r.Status);
   }
-  const auto r = rdGet(c, "/v1/calendars/c1/events?from=2026-03-02T00:00:00Z&to=2026-05-31T00:00:00Z");
+  const auto r = hRdGet(c, "/v1/calendars/c1/events?from=2026-03-02T00:00:00Z&to=2026-05-31T00:00:00Z");
   ctx.Equal(r.Status, 200, "a window of exactly 90 days");
 }
 
 void CheckUnknownCalendar(harness::Ctx& ctx) {
-  auto c = rdClient(ctx);
-  auto r = rdGet(c, "/v1/calendars/nope/events?" + kRdWeek);
-  ctx.Assert(r.Status == 404 && rdBody(r).value("error", "") == "calendar_not_found",
+  auto c = hRdClient(ctx);
+  auto r = hRdGet(c, "/v1/calendars/nope/events?" + kHRdWeek);
+  ctx.Assert(r.Status == 404 && hRdBody(r).value("error", "") == "calendar_not_found",
              "an unknown calendar answered %d %s, expected 404 calendar_not_found: an empty week is a different answer", r.Status, r.Text());
-  r = rdGet(c, "/v1/calendars/nope/events?from=2026-03-02T00:00:00Z");
-  ctx.Assert(r.Status == 404 && rdBody(r).value("error", "") == "calendar_not_found",
+  r = hRdGet(c, "/v1/calendars/nope/events?from=2026-03-02T00:00:00Z");
+  ctx.Assert(r.Status == 404 && hRdBody(r).value("error", "") == "calendar_not_found",
              "an unknown calendar with a window without to answered %d %s, expected 404 calendar_not_found: the calendar is judged before the window", r.Status,
              r.Text());
   ctx.Equal(ctx.Redis.Keys("exp:nope*"), std::vector<std::string>{}, "the slices an unknown calendar left in the cache");
 }
 
 void CheckPrivateCalendars(harness::Ctx& ctx) {
-  auto c = rdClient(ctx);
+  auto c = hRdClient(ctx);
   const std::vector<std::tuple<std::string, std::string, std::string>> cases = {
-      {"t2", kRdWeek, "a tenant outside the calendar"},
-      {"", kRdWeek, "a request without X-Tenant-Id"},
-      {"t2", kRdWeek + "&tenant=t1", "a tenant outside the calendar naming t1 in the query"},
+      {"t2", kHRdWeek, "a tenant outside the calendar"},
+      {"", kHRdWeek, "a request without X-Tenant-Id"},
+      {"t2", kHRdWeek + "&tenant=t1", "a tenant outside the calendar naming t1 in the query"},
       {"t2", "from=2026-03-02T00:00:00Z", "a tenant outside the calendar with a window without to"},
   };
   for (const auto& [tenant, query, what] : cases) {
-    const auto r = rdGet(c, "/v1/calendars/c2/events?" + query, tenant);
-    ctx.Assert(r.Status == 403 && rdBody(r).value("error", "") == "not_a_member",
+    const auto r = hRdGet(c, "/v1/calendars/c2/events?" + query, tenant);
+    ctx.Assert(r.Status == 403 && hRdBody(r).value("error", "") == "not_a_member",
                "%s reading the private calendar c2 answered %d, expected 403 not_a_member", what, r.Status);
   }
   ctx.Equal(ctx.Redis.Keys("exp:c2*"), std::vector<std::string>{},
             "the slices the refused reads of c2 left in the cache (a stranger is refused before anything is expanded)");
-  auto r = rdGet(c, "/v1/calendars/c2/events?" + kRdWeek, "t1");
-  ctx.Assert(r.Status == 200 && rdCount(r) == 7, "the member t1 reading c2 answered %d %s", r.Status, r.Text());
-  r = rdGet(c, "/v1/calendars/c1/events?" + kRdWeek, "t2");
-  ctx.Assert(r.Status == 200 && rdCount(r) == 7, "t2 reading the public calendar c1 answered %d %s: a public calendar is readable by anyone", r.Status, r.Text());
+  auto r = hRdGet(c, "/v1/calendars/c2/events?" + kHRdWeek, "t1");
+  ctx.Assert(r.Status == 200 && hRdCount(r) == 7, "the member t1 reading c2 answered %d %s", r.Status, r.Text());
+  r = hRdGet(c, "/v1/calendars/c1/events?" + kHRdWeek, "t2");
+  ctx.Assert(r.Status == 200 && hRdCount(r) == 7, "t2 reading the public calendar c1 answered %d %s: a public calendar is readable by anyone", r.Status, r.Text());
 }
 
 void CheckCacheControl(harness::Ctx& ctx) {
-  auto c = rdClient(ctx);
-  auto r = rdGet(c, "/v1/calendars/c2/events?" + kRdWeek, "t1");
+  auto c = hRdClient(ctx);
+  auto r = hRdGet(c, "/v1/calendars/c2/events?" + kHRdWeek, "t1");
   ctx.Equal(r.Status, 200, "the member t1 reading the private calendar c2 (%s)", r.Text());
   const std::string cache_control = r.HeaderValue("Cache-Control");
   ctx.Assert(cache_control.find("private") != std::string::npos && cache_control.find("public") == std::string::npos,
              "the private calendar answered Cache-Control %q: a shared cache may store it and hand it to the next caller without asking the service",
              cache_control);
-  r = rdGet(c, "/v1/calendars/c1/events?" + kRdWeek);
+  r = hRdGet(c, "/v1/calendars/c1/events?" + kHRdWeek);
   ctx.Assert(r.HeaderValue("Cache-Control").find("public") != std::string::npos, "the public calendar answered Cache-Control %q, expected public, max-age=60",
              r.HeaderValue("Cache-Control"));
 }

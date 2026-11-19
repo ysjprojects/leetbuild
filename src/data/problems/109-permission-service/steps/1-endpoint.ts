@@ -738,7 +738,7 @@ import (
 	"leetbuild/harness"
 )
 
-type assignReply struct {
+type HAssignReply struct {
 	GrantID           string \`json:"grant_id"\`
 	Subject           string \`json:"subject"\`
 	Role              string \`json:"role"\`
@@ -757,17 +757,17 @@ func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func assignAs(c *harness.HTTP, assigner, role, scope, key string) (*harness.Response, assignReply) {
+func hAssignAs(c *harness.HTTP, assigner, role, scope, key string) (*harness.Response, HAssignReply) {
 	if key == "" {
 		key = assigner + "/" + role + "/" + scope
 	}
 	r := c.Post("/v1/roles/assignments", map[string]string{"subject": "cyd", "role": role, "scope": scope}, "X-Assigner-Id", assigner, "Idempotency-Key", key)
-	var body assignReply
+	var body HAssignReply
 	r.Decode(&body)
 	return r, body
 }
 
-func heldByCyd() []string {
+func hHeldByCyd() []string {
 	out := []string{}
 	for _, g := range grants.GrantsOf(context.Background(), "cyd") {
 		out = append(out, g.Role+"@"+g.Scope)
@@ -777,10 +777,10 @@ func heldByCyd() []string {
 
 func CheckRoute(ctx *harness.Ctx) {
 	c := hAPI(ctx)
-	r, body := assignAs(c, "olu", "viewer", "team:eng", "")
+	r, body := hAssignAs(c, "olu", "viewer", "team:eng", "")
 	ctx.Equal(r.Status, 201, "olu (org_admin at org) assigning viewer at team:eng (%s)", r.Text())
 	ctx.Assert(body.Subject == "cyd" && body.Role == "viewer" && body.Scope == "team:eng" && body.GrantID != "", "the 201 must carry the grant (grant_id, subject, role, scope), got %s", r.Text())
-	ctx.Equal(heldByCyd(), []string{"viewer@team:eng"}, "after the assignment, cyd's grants")
+	ctx.Equal(hHeldByCyd(), []string{"viewer@team:eng"}, "after the assignment, cyd's grants")
 }
 
 func CheckCatalog(ctx *harness.Ctx) {
@@ -792,47 +792,47 @@ func CheckCatalog(ctx *harness.Ctx) {
 		{"viewer", "org", "viewer at org (the catalog allows viewer at team and project scopes)"},
 		{"team_admin", "project:eng/api", "team_admin at a project (the catalog allows it at team scopes)"},
 	} {
-		r, _ := assignAs(c, "olu", tc[0], tc[1], "")
+		r, _ := hAssignAs(c, "olu", tc[0], tc[1], "")
 		ctx.Equal(r.Status, 422, "olu assigning %s must be refused: the catalog is the only source of roles and of the scope kinds each may be granted at; the status", tc[2])
 	}
-	r, _ := assignAs(c, "olu", "developer", "project:eng/api", "")
+	r, _ := hAssignAs(c, "olu", "developer", "project:eng/api", "")
 	ctx.Equal(r.Status, 201, "olu assigning developer at project:eng/api (%s)", r.Text())
-	ctx.Equal(heldByCyd(), []string{"developer@project:eng/api"}, "only the assignment the catalog allows may be written; cyd's grants")
+	ctx.Equal(hHeldByCyd(), []string{"developer@project:eng/api"}, "only the assignment the catalog allows may be written; cyd's grants")
 }
 
 func CheckNoEscalation(ctx *harness.Ctx) {
 	c := hAPI(ctx)
-	r, body := assignAs(c, "ada", "org_admin", "org", "")
+	r, body := hAssignAs(c, "ada", "org_admin", "org", "")
 	ctx.Equal(r.Status, 403, "ada (team_admin at team:eng) granting org_admin at org must be refused: an assigner hands out only what it holds; the status")
 	ctx.Assert(body.MissingPermission != "" && body.Error == "insufficient_permissions", "the 403 must be {\\"error\\": \\"insufficient_permissions\\"} naming the missing permission (missing_permission), got %s", r.Text())
-	r, _ = assignAs(c, "ada", "team_admin", "team:ops", "")
+	r, _ = hAssignAs(c, "ada", "team_admin", "team:ops", "")
 	ctx.Equal(r.Status, 403, "ada granting team_admin at team:ops must be refused (team:eng does not cover team:ops); the status")
-	r, body = assignAs(c, "ada", "developer", "project:eng/api", "")
+	r, body = hAssignAs(c, "ada", "developer", "project:eng/api", "")
 	ctx.Assert(r.Status == 403 && body.MissingPermission == "code:write", "ada granting developer (code:write, team:read) at project:eng/api answered %d %s, expected 403 naming code:write, which ada does not hold", r.Status, r.Text())
-	r, body = assignAs(c, "bob", "viewer", "team:eng", "")
+	r, body = hAssignAs(c, "bob", "viewer", "team:eng", "")
 	ctx.Assert(r.Status == 403 && body.MissingPermission == "roles:assign", "bob (viewer at team:eng) granting viewer answered %d %s, expected 403 naming roles:assign", r.Status, r.Text())
-	r, body = assignAs(c, "bob", "developer", "team:eng", "")
+	r, body = hAssignAs(c, "bob", "developer", "team:eng", "")
 	ctx.Assert(r.Status == 403 && body.MissingPermission == "roles:assign", "bob (viewer at team:eng) granting developer answered %d %s, expected 403 naming roles:assign: bob lacks roles:assign and code:write, and roles:assign is checked first", r.Status, r.Text())
-	r, _ = assignAs(c, "ada", "viewer", "project:eng/api", "")
+	r, _ = hAssignAs(c, "ada", "viewer", "project:eng/api", "")
 	ctx.Equal(r.Status, 201, "ada granting viewer at project:eng/api must succeed, team:eng covers its projects (%s); the status", r.Text())
-	ctx.Equal(heldByCyd(), []string{"viewer@project:eng/api"}, "a refused assignment was written; cyd's grants")
+	ctx.Equal(hHeldByCyd(), []string{"viewer@project:eng/api"}, "a refused assignment was written; cyd's grants")
 }
 
 func CheckIdempotent(ctx *harness.Ctx) {
 	c := hAPI(ctx)
 	none := c.Post("/v1/roles/assignments", map[string]string{"subject": "cyd", "role": "viewer", "scope": "team:eng"}, "X-Assigner-Id", "olu")
 	ctx.Equal(none.Status, 400, "an assignment without Idempotency-Key")
-	ctx.Equal(heldByCyd(), []string{}, "an assignment without Idempotency-Key must write nothing; cyd's grants")
-	first, a := assignAs(c, "olu", "viewer", "team:eng", "k-1")
-	replay, b := assignAs(c, "olu", "viewer", "team:eng", "k-1")
+	ctx.Equal(hHeldByCyd(), []string{}, "an assignment without Idempotency-Key must write nothing; cyd's grants")
+	first, a := hAssignAs(c, "olu", "viewer", "team:eng", "k-1")
+	replay, b := hAssignAs(c, "olu", "viewer", "team:eng", "k-1")
 	ctx.Assert(first.Status == 201 && (replay.Status == 200 || replay.Status == 201), "the assignment answered %d, its replay %d", first.Status, replay.Status)
 	ctx.Equal(b.GrantID, a.GrantID, "a replay of Idempotency-Key k-1 must answer the recorded grant; its grant_id")
-	ctx.Equal(len(heldByCyd()), 1, "a retried assignment must write one grant; cyd's grants")
-	mine, m := assignAs(c, "ada", "viewer", "project:eng/api", "k-1")
+	ctx.Equal(len(hHeldByCyd()), 1, "a retried assignment must write one grant; cyd's grants")
+	mine, m := hAssignAs(c, "ada", "viewer", "project:eng/api", "k-1")
 	ctx.Assert(mine.Status == 201 && m.GrantID != "" && m.GrantID != a.GrantID, "ada's assignment with Idempotency-Key k-1 (olu's key, another assigner) answered %d %s: a key is scoped to its assigner, so this is a new assignment", mine.Status, mine.Text())
-	ctx.Equal(len(heldByCyd()), 2, "after ada's own k-1 assignment, cyd's grants")
-	other, _ := assignAs(c, "olu", "viewer", "team:ops", "k-2")
-	ctx.Assert(other.Status == 201 && len(heldByCyd()) == 3, "an assignment with a new key answered %d; cyd holds %v", other.Status, heldByCyd())
+	ctx.Equal(len(hHeldByCyd()), 2, "after ada's own k-1 assignment, cyd's grants")
+	other, _ := hAssignAs(c, "olu", "viewer", "team:ops", "k-2")
+	ctx.Assert(other.Status == 201 && len(hHeldByCyd()) == 3, "an assignment with a new key answered %d; cyd holds %v", other.Status, hHeldByCyd())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -857,7 +857,7 @@ harness::HTTP hAPI(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response assignAs(harness::HTTP& c, const std::string& assigner, const std::string& role, const std::string& scope,
+harness::Response hAssignAs(harness::HTTP& c, const std::string& assigner, const std::string& role, const std::string& scope,
                            std::string key = "") {
   if (key.empty()) key = assigner + "/" + role + "/" + scope;
   const std::string body = nlohmann::json{{"subject", "cyd"}, {"role", role}, {"scope", scope}}.dump();
@@ -869,7 +869,7 @@ std::string hField(const harness::Response& r, const std::string& name) {
   return body.is_object() && body.contains(name) && body[name].is_string() ? body[name].get<std::string>() : "";
 }
 
-std::vector<std::string> heldByCyd() {
+std::vector<std::string> hHeldByCyd() {
   std::vector<std::string> out;
   for (const grants::Grant& g : grants::grantsOf("cyd")) out.push_back(g.role + "@" + g.scope);
   return out;
@@ -879,11 +879,11 @@ std::vector<std::string> heldByCyd() {
 
 void CheckRoute(harness::Ctx& ctx) {
   auto c = hAPI(ctx);
-  const auto r = assignAs(c, "olu", "viewer", "team:eng");
+  const auto r = hAssignAs(c, "olu", "viewer", "team:eng");
   ctx.Equal(r.Status, 201, "olu (org_admin at org) assigning viewer at team:eng (%s)", r.Text());
   ctx.Assert(hField(r, "subject") == "cyd" && hField(r, "role") == "viewer" && hField(r, "scope") == "team:eng" && !hField(r, "grant_id").empty(),
              "the 201 must carry the grant (grant_id, subject, role, scope), got %s", r.Text());
-  ctx.Equal(heldByCyd(), {"viewer@team:eng"}, "after the assignment, cyd's grants");
+  ctx.Equal(hHeldByCyd(), {"viewer@team:eng"}, "after the assignment, cyd's grants");
 }
 
 void CheckCatalog(harness::Ctx& ctx) {
@@ -896,51 +896,51 @@ void CheckCatalog(harness::Ctx& ctx) {
       {"team_admin", "project:eng/api", "team_admin at a project (the catalog allows it at team scopes)"},
   };
   for (const auto& tc : invalid) {
-    const auto r = assignAs(c, "olu", tc[0], tc[1]);
+    const auto r = hAssignAs(c, "olu", tc[0], tc[1]);
     ctx.Equal(r.Status, 422, "olu assigning %s must be refused: the catalog is the only source of roles and of the scope kinds each may be granted at; the status", tc[2]);
   }
-  const auto r = assignAs(c, "olu", "developer", "project:eng/api");
+  const auto r = hAssignAs(c, "olu", "developer", "project:eng/api");
   ctx.Equal(r.Status, 201, "olu assigning developer at project:eng/api (%s)", r.Text());
-  ctx.Equal(heldByCyd(), {"developer@project:eng/api"}, "only the assignment the catalog allows may be written; cyd's grants");
+  ctx.Equal(hHeldByCyd(), {"developer@project:eng/api"}, "only the assignment the catalog allows may be written; cyd's grants");
 }
 
 void CheckNoEscalation(harness::Ctx& ctx) {
   auto c = hAPI(ctx);
-  auto r = assignAs(c, "ada", "org_admin", "org");
+  auto r = hAssignAs(c, "ada", "org_admin", "org");
   ctx.Equal(r.Status, 403, "ada (team_admin at team:eng) granting org_admin at org must be refused: an assigner hands out only what it holds; the status");
   ctx.Assert(!hField(r, "missing_permission").empty() && hField(r, "error") == "insufficient_permissions",
              "the 403 must be {\\"error\\": \\"insufficient_permissions\\"} naming the missing permission (missing_permission), got %s", r.Text());
-  r = assignAs(c, "ada", "team_admin", "team:ops");
+  r = hAssignAs(c, "ada", "team_admin", "team:ops");
   ctx.Equal(r.Status, 403, "ada granting team_admin at team:ops must be refused (team:eng does not cover team:ops); the status");
-  r = assignAs(c, "ada", "developer", "project:eng/api");
+  r = hAssignAs(c, "ada", "developer", "project:eng/api");
   ctx.Assert(r.Status == 403 && hField(r, "missing_permission") == "code:write",
              "ada granting developer (code:write, team:read) at project:eng/api answered %d %s, expected 403 naming code:write, which ada does not hold", r.Status, r.Text());
-  r = assignAs(c, "bob", "viewer", "team:eng");
+  r = hAssignAs(c, "bob", "viewer", "team:eng");
   ctx.Assert(r.Status == 403 && hField(r, "missing_permission") == "roles:assign", "bob (viewer at team:eng) granting viewer answered %d %s, expected 403 naming roles:assign", r.Status, r.Text());
-  r = assignAs(c, "bob", "developer", "team:eng");
+  r = hAssignAs(c, "bob", "developer", "team:eng");
   ctx.Assert(r.Status == 403 && hField(r, "missing_permission") == "roles:assign",
              "bob (viewer at team:eng) granting developer answered %d %s, expected 403 naming roles:assign: bob lacks roles:assign and code:write, and roles:assign is checked first", r.Status, r.Text());
-  r = assignAs(c, "ada", "viewer", "project:eng/api");
+  r = hAssignAs(c, "ada", "viewer", "project:eng/api");
   ctx.Equal(r.Status, 201, "ada granting viewer at project:eng/api must succeed, team:eng covers its projects (%s); the status", r.Text());
-  ctx.Equal(heldByCyd(), {"viewer@project:eng/api"}, "a refused assignment was written; cyd's grants");
+  ctx.Equal(hHeldByCyd(), {"viewer@project:eng/api"}, "a refused assignment was written; cyd's grants");
 }
 
 void CheckIdempotent(harness::Ctx& ctx) {
   auto c = hAPI(ctx);
   const auto none = c.Post("/v1/roles/assignments", R"({"subject": "cyd", "role": "viewer", "scope": "team:eng"})", "Content-Type", "application/json", "X-Assigner-Id", "olu");
   ctx.Equal(none.Status, 400, "an assignment without Idempotency-Key");
-  ctx.Equal(heldByCyd(), std::vector<std::string>{}, "an assignment without Idempotency-Key must write nothing; cyd's grants");
-  const auto first = assignAs(c, "olu", "viewer", "team:eng", "k-1");
-  const auto replay = assignAs(c, "olu", "viewer", "team:eng", "k-1");
+  ctx.Equal(hHeldByCyd(), std::vector<std::string>{}, "an assignment without Idempotency-Key must write nothing; cyd's grants");
+  const auto first = hAssignAs(c, "olu", "viewer", "team:eng", "k-1");
+  const auto replay = hAssignAs(c, "olu", "viewer", "team:eng", "k-1");
   ctx.Assert(first.Status == 201 && (replay.Status == 200 || replay.Status == 201), "the assignment answered %d, its replay %d", first.Status, replay.Status);
   ctx.Equal(hField(replay, "grant_id"), hField(first, "grant_id"), "a replay of Idempotency-Key k-1 must answer the recorded grant; its grant_id");
-  ctx.Equal(heldByCyd().size(), 1, "a retried assignment must write one grant; cyd's grants");
-  const auto mine = assignAs(c, "ada", "viewer", "project:eng/api", "k-1");
+  ctx.Equal(hHeldByCyd().size(), 1, "a retried assignment must write one grant; cyd's grants");
+  const auto mine = hAssignAs(c, "ada", "viewer", "project:eng/api", "k-1");
   ctx.Assert(mine.Status == 201 && !hField(mine, "grant_id").empty() && hField(mine, "grant_id") != hField(first, "grant_id"),
              "ada's assignment with Idempotency-Key k-1 (olu's key, another assigner) answered %d %s: a key is scoped to its assigner, so this is a new assignment", mine.Status, mine.Text());
-  ctx.Equal(heldByCyd().size(), 2, "after ada's own k-1 assignment, cyd's grants");
-  const auto other = assignAs(c, "olu", "viewer", "team:ops", "k-2");
-  ctx.Assert(other.Status == 201 && heldByCyd().size() == 3, "an assignment with a new key answered %d; cyd holds %d grants", other.Status, heldByCyd().size());
+  ctx.Equal(hHeldByCyd().size(), 2, "after ada's own k-1 assignment, cyd's grants");
+  const auto other = hAssignAs(c, "olu", "viewer", "team:ops", "k-2");
+  ctx.Assert(other.Status == 201 && hHeldByCyd().size() == 3, "an assignment with a new key answered %d; cyd holds %d grants", other.Status, hHeldByCyd().size());
 }
 `,
   },

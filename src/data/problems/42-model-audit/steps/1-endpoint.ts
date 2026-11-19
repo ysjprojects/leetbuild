@@ -810,11 +810,11 @@ import (
 	"leetbuild/harness"
 )
 
-const promptText = "Customer 4411 asks for a refund of order 9921 after the kettle broke"
+const kHPromptText = "Customer 4411 asks for a refund of order 9921 after the kettle broke"
 
-var storedFields = map[string]bool{"id": true, "tenant": true, "model_version": true, "policy_id": true, "input_digest": true, "decision_digest": true, "recorded_at": true, "position": true, "status": true}
+var hStoredFields = map[string]bool{"id": true, "tenant": true, "model_version": true, "policy_id": true, "input_digest": true, "decision_digest": true, "recorded_at": true, "position": true, "status": true}
 
-func validBody() map[string]any {
+func hValidBody() map[string]any {
 	return map[string]any{
 		"model_version":   "risk-v7",
 		"policy_id":       "refunds-2026-10",
@@ -823,7 +823,7 @@ func validBody() map[string]any {
 	}
 }
 
-func with(body map[string]any, name string, value any) map[string]any {
+func hWith(body map[string]any, name string, value any) map[string]any {
 	out := map[string]any{}
 	for k, v := range body {
 		out[k] = v
@@ -832,7 +832,7 @@ func with(body map[string]any, name string, value any) map[string]any {
 	return out
 }
 
-func without(body map[string]any, name string) map[string]any {
+func hWithout(body map[string]any, name string) map[string]any {
 	out := map[string]any{}
 	for k, v := range body {
 		if k != name {
@@ -842,35 +842,35 @@ func without(body map[string]any, name string) map[string]any {
 	return out
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func appendAs(c *harness.HTTP, body map[string]any, tenant string) *harness.Response {
+func hAppendAs(c *harness.HTTP, body map[string]any, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Post("/v1/audit/decisions", body)
 	}
 	return c.Post("/v1/audit/decisions", body, "X-Tenant-Id", tenant)
 }
 
-type appendedRecord struct {
+type HAppendedRecord struct {
 	ID         string \`json:"id"\`
 	Tenant     string \`json:"tenant"\`
 	RecordedAt int64  \`json:"recorded_at"\`
 }
 
-func appendedOf(r *harness.Response) appendedRecord {
-	var a appendedRecord
+func hAppendedOf(r *harness.Response) HAppendedRecord {
+	var a HAppendedRecord
 	r.Decode(&a)
 	return a
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	body := validBody()
-	r := appendAs(c, body, "t1")
+	c := hApi(ctx)
+	body := hValidBody()
+	r := hAppendAs(c, body, "t1")
 	ctx.Equal(r.Status, 201, "POST /v1/audit/decisions (%s)", r.Text())
 	got := r.JSON().(map[string]any)
 	id, _ := got["id"].(string)
@@ -883,25 +883,25 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckTenantHeader(ctx *harness.Ctx) {
-	c := api(ctx)
-	anonymous := appendAs(c, with(validBody(), "tenant", "t2"), "")
+	c := hApi(ctx)
+	anonymous := hAppendAs(c, hWith(hValidBody(), "tenant", "t2"), "")
 	ctx.Equal(anonymous.Status, 401, "an append without X-Tenant-Id (its body naming tenant t2) must be refused: the tenant is the authenticated header, never the body; the status")
 	ctx.Equal(len(ctx.Redis.Keys("audit:rec:*")), 0, "an append without a tenant was stored; the records")
-	spoofed := appendAs(c, with(validBody(), "tenant", "t2"), "t1")
+	spoofed := hAppendAs(c, hWith(hValidBody(), "tenant", "t2"), "t1")
 	ctx.Equal(spoofed.Status, 201, "an append as t1 (%s)", spoofed.Text())
-	record := ledger.Get(context.Background(), appendedOf(spoofed).ID)
+	record := ledger.Get(context.Background(), hAppendedOf(spoofed).ID)
 	ctx.Assert(record != nil && record.Tenant == "t1", "a caller authenticated as t1 wrote a record into another tenant by naming it in the body (%+v): the tenant comes from X-Tenant-Id only", record)
 }
 
 func CheckDigestsOnly(ctx *harness.Ctx) {
-	c := api(ctx)
-	body := validBody()
-	r := appendAs(c, with(with(with(body, "prompt", promptText), "decision", "approve the refund"), "context", map[string]any{"order": "9921"}), "t1")
+	c := hApi(ctx)
+	body := hValidBody()
+	r := hAppendAs(c, hWith(hWith(hWith(body, "prompt", kHPromptText), "decision", "approve the refund"), "context", map[string]any{"order": "9921"}), "t1")
 	ctx.Equal(r.Status, 201, "a valid append with extra fields (%s)", r.Text())
-	raw := ctx.Redis.HGetAll("audit:rec:" + appendedOf(r).ID)
+	raw := ctx.Redis.HGetAll("audit:rec:" + hAppendedOf(r).ID)
 	var extra []string
 	for name := range raw {
-		if !storedFields[name] {
+		if !hStoredFields[name] {
 			extra = append(extra, name)
 		}
 	}
@@ -914,37 +914,37 @@ func CheckDigestsOnly(ctx *harness.Ctx) {
 		body map[string]any
 		what string
 	}{
-		{with(body, "input_digest", strings.ToUpper(in)), "an upper-case input_digest"},
-		{with(body, "decision_digest", out[:63]), "a 63-character decision_digest"},
-		{with(body, "decision_digest", promptText), "a decision_digest holding text"},
-		{without(body, "input_digest"), "no input_digest"},
-		{with(body, "model_version", ""), "an empty model_version"},
-		{without(body, "policy_id"), "no policy_id"},
-		{with(body, "decision_digest", strings.ToUpper(out)), "an upper-case decision_digest"},
-		{with(body, "input_digest", strings.Repeat("z", 64)), "a 64-character input_digest that is not hex"},
-		{with(body, "policy_id", ""), "an empty policy_id"},
-		{without(body, "model_version"), "no model_version"},
+		{hWith(body, "input_digest", strings.ToUpper(in)), "an upper-case input_digest"},
+		{hWith(body, "decision_digest", out[:63]), "a 63-character decision_digest"},
+		{hWith(body, "decision_digest", kHPromptText), "a decision_digest holding text"},
+		{hWithout(body, "input_digest"), "no input_digest"},
+		{hWith(body, "model_version", ""), "an empty model_version"},
+		{hWithout(body, "policy_id"), "no policy_id"},
+		{hWith(body, "decision_digest", strings.ToUpper(out)), "an upper-case decision_digest"},
+		{hWith(body, "input_digest", strings.Repeat("z", 64)), "a 64-character input_digest that is not hex"},
+		{hWith(body, "policy_id", ""), "an empty policy_id"},
+		{hWithout(body, "model_version"), "no model_version"},
 	}
 	for _, b := range bad {
-		rejected := appendAs(c, b.body, "t1")
+		rejected := hAppendAs(c, b.body, "t1")
 		ctx.Equal(rejected.Status, 400, "an append with %s; the status", b.what)
 	}
 	ctx.Equal(len(ctx.Redis.Keys("audit:rec:*")), 1, "a rejected append was stored; the records")
 }
 
 func CheckServerTime(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	now := ctx.Clock.Now()
-	backdated := with(validBody(), "timestamp", 1262304000000)
-	first := appendedOf(appendAs(c, backdated, "t1"))
-	second := appendedOf(appendAs(c, backdated, "t1"))
-	third := appendedOf(appendAs(c, validBody(), "t1"))
-	other := appendedOf(appendAs(c, validBody(), "t2"))
+	backdated := hWith(hValidBody(), "timestamp", 1262304000000)
+	first := hAppendedOf(hAppendAs(c, backdated, "t1"))
+	second := hAppendedOf(hAppendAs(c, backdated, "t1"))
+	third := hAppendedOf(hAppendAs(c, hValidBody(), "t1"))
+	other := hAppendedOf(hAppendAs(c, hValidBody(), "t2"))
 	// Another replica already wrote t3's newest record a minute ahead: the ledger, not this process, knows it.
 	ctx.Redis.Do("HSET", "audit:tenant:t3", "last_recorded_at", strconv.FormatInt(now+60000, 10))
-	replica := appendedOf(appendAs(c, validBody(), "t3"))
+	replica := hAppendedOf(hAppendAs(c, hValidBody(), "t3"))
 	ctx.Clock.Advance(5.25)
-	later := appendedOf(appendAs(c, validBody(), "t1"))
+	later := hAppendedOf(hAppendAs(c, hValidBody(), "t1"))
 	ctx.Assert(first.RecordedAt >= now-1000 && first.RecordedAt <= now+1000, "recorded_at is %d while the server clock reads %d: the caller's timestamp (2010-01-01) was kept. recorded_at comes from the server clock", first.RecordedAt, now)
 	ctx.Assert(second.RecordedAt == first.RecordedAt+1 && third.RecordedAt == first.RecordedAt+2, "three appends in one millisecond got recorded_at %d, %d, %d: each record of a tenant lands strictly after the tenant's last one", first.RecordedAt, second.RecordedAt, third.RecordedAt)
 	ctx.Assert(other.RecordedAt >= now-1000 && other.RecordedAt <= now+1000, "t2's first record got recorded_at %d, expected the clock (%d): the order is per tenant", other.RecordedAt, now)
@@ -954,8 +954,8 @@ func CheckServerTime(ctx *harness.Ctx) {
 }
 
 func CheckAppendOnly(ctx *harness.Ctx) {
-	c := api(ctx)
-	record := appendedOf(appendAs(c, validBody(), "t1"))
+	c := hApi(ctx)
+	record := hAppendedOf(hAppendAs(c, hValidBody(), "t1"))
 	before := ctx.Redis.HGetAll("audit:rec:" + record.ID)
 	for _, method := range []string{"PATCH", "PUT", "DELETE"} {
 		r := c.Do(method, "/v1/audit/decisions/"+record.ID, map[string]any{"decision_digest": strings.Repeat("0", 64)}, "X-Tenant-Id", "t1")
@@ -978,22 +978,22 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kPrompt = "Customer 4411 asks for a refund of order 9921 after the kettle broke";
-const std::set<std::string> kAllowed = {"id", "tenant", "model_version", "policy_id", "input_digest", "decision_digest", "recorded_at", "position", "status"};
+const std::string kHPrompt = "Customer 4411 asks for a refund of order 9921 after the kettle broke";
+const std::set<std::string> kHAllowed = {"id", "tenant", "model_version", "policy_id", "input_digest", "decision_digest", "recorded_at", "position", "status"};
 
-json validBody() {
+json hValidBody() {
   return {{"model_version", "risk-v7"},
           {"policy_id", "refunds-2026-10"},
           {"input_digest", sha256_hex("input:ticket-4411")},
           {"decision_digest", sha256_hex("decision:approve")}};
 }
 
-json without(json body, const std::string& name) {
+json hWithout(json body, const std::string& name) {
   body.erase(name);
   return body;
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1001,26 +1001,26 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response appendAs(harness::HTTP& c, const json& body, const std::string& tenant) {
+harness::Response hAppendAs(harness::HTTP& c, const json& body, const std::string& tenant) {
   if (tenant.empty()) return c.Post("/v1/audit/decisions", body.dump(), "Content-Type", "application/json");
   return c.Post("/v1/audit/decisions", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
 }
 
-json answerOf(const harness::Response& r) { return json::parse(r.Text(), nullptr, false); }
+json hAnswerOf(const harness::Response& r) { return json::parse(r.Text(), nullptr, false); }
 
-long long recordedAt(const harness::Response& r) {
-  const json a = answerOf(r);
+long long hRecordedAt(const harness::Response& r) {
+  const json a = hAnswerOf(r);
   return a.is_object() && a.contains("recorded_at") && a["recorded_at"].is_number() ? a["recorded_at"].get<long long>() : -1;
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const json body = validBody();
-  const auto r = appendAs(c, body, "t1");
+  auto c = hApi(ctx);
+  const json body = hValidBody();
+  const auto r = hAppendAs(c, body, "t1");
   ctx.Equal(r.Status, 201, "POST /v1/audit/decisions (%s)", r.Text());
-  const json got = answerOf(r);
+  const json got = hAnswerOf(r);
   const std::string id = got.is_object() ? got.value("id", "") : "";
   ctx.Assert(!id.empty(), "the answer must carry the record id, got %s", r.Text());
   const auto stored = ctx.Redis.HGetAll("audit:rec:" + id);
@@ -1032,33 +1032,33 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckTenantHeader(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  json anonymous_body = validBody();
+  auto c = hApi(ctx);
+  json anonymous_body = hValidBody();
   anonymous_body["tenant"] = "t2";
-  const auto anonymous = appendAs(c, anonymous_body, "");
+  const auto anonymous = hAppendAs(c, anonymous_body, "");
   ctx.Equal(anonymous.Status, 401, "an append without X-Tenant-Id (its body naming tenant t2) must be refused: the tenant is the authenticated header, never the body; the status");
   ctx.Equal(ctx.Redis.Keys("audit:rec:*").size(), 0, "an append without a tenant was stored; the records");
-  json spoof = validBody();
+  json spoof = hValidBody();
   spoof["tenant"] = "t2";
-  const auto spoofed = appendAs(c, spoof, "t1");
+  const auto spoofed = hAppendAs(c, spoof, "t1");
   ctx.Equal(spoofed.Status, 201, "an append as t1 (%s)", spoofed.Text());
-  const auto record = ledger::get(answerOf(spoofed).value("id", ""));
+  const auto record = ledger::get(hAnswerOf(spoofed).value("id", ""));
   ctx.Assert(record && record->tenant == "t1", "a caller authenticated as t1 wrote a record into tenant %q by naming it in the body: the tenant comes from X-Tenant-Id only", record ? record->tenant : "");
 }
 
 void CheckDigestsOnly(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const json body = validBody();
+  auto c = hApi(ctx);
+  const json body = hValidBody();
   json extra_fields = body;
-  extra_fields["prompt"] = kPrompt;
+  extra_fields["prompt"] = kHPrompt;
   extra_fields["decision"] = "approve the refund";
   extra_fields["context"] = {{"order", "9921"}};
-  const auto r = appendAs(c, extra_fields, "t1");
+  const auto r = hAppendAs(c, extra_fields, "t1");
   ctx.Equal(r.Status, 201, "a valid append with extra fields (%s)", r.Text());
-  const auto raw = ctx.Redis.HGetAll("audit:rec:" + answerOf(r).value("id", ""));
+  const auto raw = ctx.Redis.HGetAll("audit:rec:" + hAnswerOf(r).value("id", ""));
   std::vector<std::string> extra;
   for (const auto& [name, value] : raw) {
-    if (!kAllowed.count(name)) extra.push_back(name);
+    if (!kHAllowed.count(name)) extra.push_back(name);
   }
   ctx.Assert(extra.empty(), "the ledger row holds %q (%v): the body went to the ledger as it came. Only model_version, policy_id and the two digests are stored", extra, raw);
   ctx.Assert(r.Text().find("kettle") == std::string::npos, "the answer echoes the prompt: %s", r.Text());
@@ -1069,49 +1069,49 @@ void CheckDigestsOnly(harness::Ctx& ctx) {
   json b1 = body, b2 = body, b3 = body, b5 = body, b6 = body, b7 = body, b8 = body;
   b1["input_digest"] = upper(body["input_digest"].get<std::string>());
   b2["decision_digest"] = body["decision_digest"].get<std::string>().substr(0, 63);
-  b3["decision_digest"] = kPrompt;
+  b3["decision_digest"] = kHPrompt;
   b5["model_version"] = "";
   b6["decision_digest"] = upper(body["decision_digest"].get<std::string>());
   b7["input_digest"] = std::string(64, 'z');
   b8["policy_id"] = "";
   const std::vector<std::pair<json, std::string>> bad = {
       {b1, "an upper-case input_digest"}, {b2, "a 63-character decision_digest"}, {b3, "a decision_digest holding text"},
-      {without(body, "input_digest"), "no input_digest"}, {b5, "an empty model_version"}, {without(body, "policy_id"), "no policy_id"},
+      {hWithout(body, "input_digest"), "no input_digest"}, {b5, "an empty model_version"}, {hWithout(body, "policy_id"), "no policy_id"},
       {b6, "an upper-case decision_digest"}, {b7, "a 64-character input_digest that is not hex"}, {b8, "an empty policy_id"},
-      {without(body, "model_version"), "no model_version"}};
+      {hWithout(body, "model_version"), "no model_version"}};
   for (const auto& [b, what] : bad) {
-    const auto rejected = appendAs(c, b, "t1");
+    const auto rejected = hAppendAs(c, b, "t1");
     ctx.Equal(rejected.Status, 400, "an append with %s; the status", what);
   }
   ctx.Equal(ctx.Redis.Keys("audit:rec:*").size(), 1, "a rejected append was stored; the records");
 }
 
 void CheckServerTime(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const long long now = ctx.Clock.Now();
-  json backdated = validBody();
+  json backdated = hValidBody();
   backdated["timestamp"] = 1262304000000LL;
-  const auto first = appendAs(c, backdated, "t1");
-  const auto second = appendAs(c, backdated, "t1");
-  const auto third = appendAs(c, validBody(), "t1");
-  const auto other = appendAs(c, validBody(), "t2");
+  const auto first = hAppendAs(c, backdated, "t1");
+  const auto second = hAppendAs(c, backdated, "t1");
+  const auto third = hAppendAs(c, hValidBody(), "t1");
+  const auto other = hAppendAs(c, hValidBody(), "t2");
   // Another replica already wrote t3's newest record a minute ahead: the ledger, not this process, knows it.
   ctx.Redis.Do("HSET", "audit:tenant:t3", "last_recorded_at", std::to_string(now + 60000));
-  const auto replica = appendAs(c, validBody(), "t3");
+  const auto replica = hAppendAs(c, hValidBody(), "t3");
   ctx.Clock.Advance(5.25);
-  const auto later = appendAs(c, validBody(), "t1");
-  const long long at0 = recordedAt(first), at1 = recordedAt(second), at2 = recordedAt(third);
+  const auto later = hAppendAs(c, hValidBody(), "t1");
+  const long long at0 = hRecordedAt(first), at1 = hRecordedAt(second), at2 = hRecordedAt(third);
   ctx.Assert(at0 >= now - 1000 && at0 <= now + 1000, "recorded_at is %d while the server clock reads %d: the caller's timestamp (2010-01-01) was kept. recorded_at comes from the server clock", at0, now);
   ctx.Assert(at1 == at0 + 1 && at2 == at0 + 2, "three appends in one millisecond got recorded_at %d, %d, %d: each record of a tenant lands strictly after the tenant's last one", at0, at1, at2);
-  ctx.Assert(recordedAt(other) >= now - 1000 && recordedAt(other) <= now + 1000, "t2's first record got recorded_at %d, expected the clock (%d): the order is per tenant", recordedAt(other), now);
-  ctx.Equal(recordedAt(replica), now + 60001, "t3's last record (written by another replica) has recorded_at %d; the next one must land right after it: the tenant's last record is the ledger's last_recorded_at; its recorded_at", now + 60000);
-  ctx.Assert(recordedAt(later) >= now + 5249 && recordedAt(later) <= now + 5251, "5.25 seconds later recorded_at is %d, expected %d: recorded_at is the server clock in milliseconds", recordedAt(later), now + 5250);
-  ctx.Equal(ledger::get(answerOf(first).value("id", ""))->recorded_at, at0, "the ledger must hold the recorded_at the answer gave");
+  ctx.Assert(hRecordedAt(other) >= now - 1000 && hRecordedAt(other) <= now + 1000, "t2's first record got recorded_at %d, expected the clock (%d): the order is per tenant", hRecordedAt(other), now);
+  ctx.Equal(hRecordedAt(replica), now + 60001, "t3's last record (written by another replica) has recorded_at %d; the next one must land right after it: the tenant's last record is the ledger's last_recorded_at; its recorded_at", now + 60000);
+  ctx.Assert(hRecordedAt(later) >= now + 5249 && hRecordedAt(later) <= now + 5251, "5.25 seconds later recorded_at is %d, expected %d: recorded_at is the server clock in milliseconds", hRecordedAt(later), now + 5250);
+  ctx.Equal(ledger::get(hAnswerOf(first).value("id", ""))->recorded_at, at0, "the ledger must hold the recorded_at the answer gave");
 }
 
 void CheckAppendOnly(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string id = answerOf(appendAs(c, validBody(), "t1")).value("id", "");
+  auto c = hApi(ctx);
+  const std::string id = hAnswerOf(hAppendAs(c, hValidBody(), "t1")).value("id", "");
   const auto before = ctx.Redis.HGetAll("audit:rec:" + id);
   const std::string edit = json{{"decision_digest", std::string(64, '0')}}.dump();
   for (const std::string method : {"PATCH", "PUT", "DELETE"}) {

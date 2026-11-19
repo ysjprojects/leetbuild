@@ -1070,7 +1070,7 @@ import (
 )
 
 // apiClient serves the learner's route over step 2's bumpGeneration, which the harness stands in for.
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
 	bumpGeneration = func(_ context.Context, calendarID string) (int64, error) {
 		generation, _ := ctx.Redis.Do("INCR", "gen:"+calendarID).(int64)
 		return generation, nil
@@ -1081,7 +1081,7 @@ func apiClient(ctx *harness.Ctx) *harness.HTTP {
 }
 
 // apiPost sends a weekly 30-minute standup, four times from Monday 2 March 2026, with changes applied.
-func apiPost(c *harness.HTTP, changes map[string]any) *harness.Response {
+func hApiPost(c *harness.HTTP, changes map[string]any) *harness.Response {
 	body := map[string]any{
 		"calendar_id": "c1", "title": "Standup", "rrule": "FREQ=WEEKLY;COUNT=4",
 		"dtstart": "2026-03-02T09:00:00Z", "dtend": "2026-03-02T09:30:00Z", "attendees": []string{"ana@example.com", "bo@example.com"},
@@ -1092,7 +1092,7 @@ func apiPost(c *harness.HTTP, changes map[string]any) *harness.Response {
 	return c.Post("/v1/events", body, "X-Tenant-Id", "t1")
 }
 
-func apiBody(r *harness.Response) map[string]any {
+func hApiBody(r *harness.Response) map[string]any {
 	var body map[string]any
 	if err := json.Unmarshal(r.Body, &body); err != nil {
 		return map[string]any{}
@@ -1100,18 +1100,18 @@ func apiBody(r *harness.Response) map[string]any {
 	return body
 }
 
-func apiRefused(ctx *harness.Ctx, c *harness.HTTP, status int, code, what string, changes map[string]any) {
-	r := apiPost(c, changes)
-	ctx.Assert(r.Status == status && apiBody(r)["error"] == code, "%s answered %d %s, expected %d %s", what, r.Status, r.Text(), status, code)
+func hApiRefused(ctx *harness.Ctx, c *harness.HTTP, status int, code, what string, changes map[string]any) {
+	r := hApiPost(c, changes)
+	ctx.Assert(r.Status == status && hApiBody(r)["error"] == code, "%s answered %d %s, expected %d %s", what, r.Status, r.Text(), status, code)
 	keys := ctx.Redis.Keys("event:*")
 	ctx.Assert(len(keys) == 0, "%s was stored anyway: Redis holds %q", what, keys)
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, nil)
+	c := hApiClient(ctx)
+	r := hApiPost(c, nil)
 	ctx.Equal(r.Status, 201, "POST /v1/events for a weekly rule with COUNT=4 (%s)", r.Text())
-	event := apiBody(r)
+	event := hApiBody(r)
 	eventID, _ := event["event_id"].(string)
 	ctx.Assert(eventID != "" && event["revision"] == float64(1), "the answer must carry event_id and revision 1: %s", r.Text())
 	stored := ctx.Redis.HGetAll("event:" + eventID)
@@ -1122,50 +1122,50 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckUnknownParts(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	for _, rule := range []string{"FREQ=WEEKLY;COUNT=4;BYSECOND=30", "FREQ=WEEKLY;COUNT=4;BYDAY=MO,WE", "FREQ=SECONDLY;COUNT=10", "FREQ=WEEKLY;COUNT", "COUNT=3", "FREQ=DAILY;BYDAY=MO"} {
-		apiRefused(ctx, c, 422, "unsupported_rrule_part", "the rule "+rule, map[string]any{"rrule": rule})
+		hApiRefused(ctx, c, 422, "unsupported_rrule_part", "the rule "+rule, map[string]any{"rrule": rule})
 	}
 	// The rule is judged before the instants.
-	apiRefused(ctx, c, 422, "unsupported_rrule_part", "the rule FREQ=WEEKLY;COUNT=4;BYDAY=MO with a dtstart without an offset", map[string]any{"rrule": "FREQ=WEEKLY;COUNT=4;BYDAY=MO", "dtstart": "2026-03-02T09:00:00"})
-	r := apiPost(c, map[string]any{"rrule": ""})
+	hApiRefused(ctx, c, 422, "unsupported_rrule_part", "the rule FREQ=WEEKLY;COUNT=4;BYDAY=MO with a dtstart without an offset", map[string]any{"rrule": "FREQ=WEEKLY;COUNT=4;BYDAY=MO", "dtstart": "2026-03-02T09:00:00"})
+	r := hApiPost(c, map[string]any{"rrule": ""})
 	ctx.Equal(r.Status, 201, "an empty rule, one occurrence (%s)", r.Text())
 }
 
 func CheckRuleTerminates(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	for _, rule := range []string{"FREQ=DAILY", "FREQ=DAILY;COUNT=6000", "FREQ=DAILY;COUNT=5001", "FREQ=DAILY;COUNT=0", "FREQ=DAILY;COUNT=many", "FREQ=DAILY;INTERVAL=0;UNTIL=2026-06-01T00:00:00Z", "FREQ=DAILY;INTERVAL=-1;COUNT=3", "FREQ=DAILY;INTERVAL=two;COUNT=3"} {
-		apiRefused(ctx, c, 422, "rule_not_terminating", "the rule "+rule, map[string]any{"rrule": rule})
+		hApiRefused(ctx, c, 422, "rule_not_terminating", "the rule "+rule, map[string]any{"rrule": rule})
 	}
 	// The rule is judged before the instants.
-	apiRefused(ctx, c, 422, "rule_not_terminating", "the rule FREQ=DAILY;COUNT=0 with a dtstart without an offset", map[string]any{"rrule": "FREQ=DAILY;COUNT=0", "dtstart": "2026-03-02T09:00:00"})
+	hApiRefused(ctx, c, 422, "rule_not_terminating", "the rule FREQ=DAILY;COUNT=0 with a dtstart without an offset", map[string]any{"rrule": "FREQ=DAILY;COUNT=0", "dtstart": "2026-03-02T09:00:00"})
 	for _, rule := range []string{"FREQ=DAILY;UNTIL=2026-06-01T00:00:00Z", "FREQ=DAILY;INTERVAL=2;COUNT=5000", "FREQ=WEEKLY;COUNT=1"} {
-		r := apiPost(c, map[string]any{"rrule": rule})
+		r := hApiPost(c, map[string]any{"rrule": rule})
 		ctx.Equal(r.Status, 201, "the rule %s ends (%s)", rule, r.Text())
 	}
 }
 
 func CheckTzAware(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	apiRefused(ctx, c, 422, "invalid_instant", "a dtstart without an offset", map[string]any{"dtstart": "2026-03-02T09:00:00"})
-	apiRefused(ctx, c, 422, "invalid_instant", "a dtend without an offset", map[string]any{"dtend": "2026-03-02T09:30:00"})
-	apiRefused(ctx, c, 422, "invalid_instant", "an UNTIL without an offset", map[string]any{"rrule": "FREQ=DAILY;UNTIL=2026-06-01T00:00:00"})
-	apiRefused(ctx, c, 422, "invalid_instant", "a dtstart without an offset after its dtend", map[string]any{"dtstart": "2026-03-02T10:00:00"})
-	r := apiPost(c, map[string]any{"dtstart": "2026-03-02T10:00:00+01:00", "dtend": "2026-03-02T10:30:00+01:00"})
+	c := hApiClient(ctx)
+	hApiRefused(ctx, c, 422, "invalid_instant", "a dtstart without an offset", map[string]any{"dtstart": "2026-03-02T09:00:00"})
+	hApiRefused(ctx, c, 422, "invalid_instant", "a dtend without an offset", map[string]any{"dtend": "2026-03-02T09:30:00"})
+	hApiRefused(ctx, c, 422, "invalid_instant", "an UNTIL without an offset", map[string]any{"rrule": "FREQ=DAILY;UNTIL=2026-06-01T00:00:00"})
+	hApiRefused(ctx, c, 422, "invalid_instant", "a dtstart without an offset after its dtend", map[string]any{"dtstart": "2026-03-02T10:00:00"})
+	r := hApiPost(c, map[string]any{"dtstart": "2026-03-02T10:00:00+01:00", "dtend": "2026-03-02T10:30:00+01:00"})
 	ctx.Equal(r.Status, 201, "instants with a +01:00 offset (%s)", r.Text())
-	eventID, _ := apiBody(r)["event_id"].(string)
+	eventID, _ := hApiBody(r)["event_id"].(string)
 	stored := ctx.Redis.HGetAll("event:" + eventID)
 	ctx.Equal(stored["dtstart"], "2026-03-02T09:00:00Z", "the stored dtstart of 10:00+01:00")
 	ctx.Equal(stored["dtend"], "2026-03-02T09:30:00Z", "the stored dtend of 10:30+01:00")
 }
 
 func CheckRangeOrder(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	apiRefused(ctx, c, 422, "invalid_range", "an event that ends when it starts", map[string]any{"dtend": "2026-03-02T09:00:00Z"})
-	apiRefused(ctx, c, 422, "invalid_range", "an event that ends before it starts", map[string]any{"dtend": "2026-03-02T08:00:00Z"})
-	apiRefused(ctx, c, 422, "invalid_range", "09:00Z to 09:30+01:00 (08:30Z)", map[string]any{"dtend": "2026-03-02T09:30:00+01:00"})
+	c := hApiClient(ctx)
+	hApiRefused(ctx, c, 422, "invalid_range", "an event that ends when it starts", map[string]any{"dtend": "2026-03-02T09:00:00Z"})
+	hApiRefused(ctx, c, 422, "invalid_range", "an event that ends before it starts", map[string]any{"dtend": "2026-03-02T08:00:00Z"})
+	hApiRefused(ctx, c, 422, "invalid_range", "09:00Z to 09:30+01:00 (08:30Z)", map[string]any{"dtend": "2026-03-02T09:30:00+01:00"})
 	// Instants are compared, not their text: 10:00+02:00 is 08:00Z.
-	r := apiPost(c, map[string]any{"dtstart": "2026-03-02T10:00:00+02:00", "dtend": "2026-03-02T09:30:00Z"})
+	r := hApiPost(c, map[string]any{"dtstart": "2026-03-02T10:00:00+02:00", "dtend": "2026-03-02T09:30:00Z"})
 	ctx.Equal(r.Status, 201, "10:00+02:00 (08:00Z) to 09:30Z (%s)", r.Text())
 }
 `,
@@ -1180,7 +1180,7 @@ func CheckRangeOrder(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP apiClient(harness::Ctx& ctx) {
+harness::HTTP hApiClient(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1189,7 +1189,7 @@ harness::HTTP apiClient(harness::Ctx& ctx) {
 }
 
 // A weekly 30-minute standup, four times from Monday 2 March 2026, with the given fields changed.
-harness::Response apiPost(harness::HTTP& c, const nlohmann::json& changes = nlohmann::json::object()) {
+harness::Response hApiPost(harness::HTTP& c, const nlohmann::json& changes = nlohmann::json::object()) {
   nlohmann::json body = {{"calendar_id", "c1"},
                          {"title", "Standup"},
                          {"rrule", "FREQ=WEEKLY;COUNT=4"},
@@ -1200,15 +1200,15 @@ harness::Response apiPost(harness::HTTP& c, const nlohmann::json& changes = nloh
   return c.Post("/v1/events", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
 }
 
-nlohmann::json apiBody(const harness::Response& r) {
+nlohmann::json hApiBody(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : nlohmann::json::object();
 }
 
-void apiRefused(harness::Ctx& ctx, harness::HTTP& c, int status, const std::string& code, const std::string& what,
+void hApiRefused(harness::Ctx& ctx, harness::HTTP& c, int status, const std::string& code, const std::string& what,
                 const nlohmann::json& changes) {
-  const auto r = apiPost(c, changes);
-  ctx.Assert(r.Status == status && apiBody(r).value("error", "") == code, "%s answered %d %s, expected %d %s", what, r.Status,
+  const auto r = hApiPost(c, changes);
+  ctx.Assert(r.Status == status && hApiBody(r).value("error", "") == code, "%s answered %d %s, expected %d %s", what, r.Status,
              r.Text(), status, code);
   const auto keys = ctx.Redis.Keys("event:*");
   ctx.Assert(keys.empty(), "%s was stored anyway: Redis holds %q", what, keys);
@@ -1217,10 +1217,10 @@ void apiRefused(harness::Ctx& ctx, harness::HTTP& c, int status, const std::stri
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto r = apiPost(c);
+  auto c = hApiClient(ctx);
+  const auto r = hApiPost(c);
   ctx.Equal(r.Status, 201, "POST /v1/events for a weekly rule with COUNT=4 (%s)", r.Text());
-  const auto event = apiBody(r);
+  const auto event = hApiBody(r);
   const std::string event_id = event.value("event_id", "");
   ctx.Assert(!event_id.empty() && event.value("revision", 0) == 1, "the answer must carry event_id and revision 1: %s", r.Text());
   auto stored = ctx.Redis.HGetAll("event:" + event_id);
@@ -1230,52 +1230,52 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckUnknownParts(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
+  auto c = hApiClient(ctx);
   for (const std::string rule : {"FREQ=WEEKLY;COUNT=4;BYSECOND=30", "FREQ=WEEKLY;COUNT=4;BYDAY=MO,WE", "FREQ=SECONDLY;COUNT=10", "FREQ=WEEKLY;COUNT", "COUNT=3", "FREQ=DAILY;BYDAY=MO"}) {
-    apiRefused(ctx, c, 422, "unsupported_rrule_part", "the rule " + rule, {{"rrule", rule}});
+    hApiRefused(ctx, c, 422, "unsupported_rrule_part", "the rule " + rule, {{"rrule", rule}});
   }
   // The rule is judged before the instants.
-  apiRefused(ctx, c, 422, "unsupported_rrule_part", "the rule FREQ=WEEKLY;COUNT=4;BYDAY=MO with a dtstart without an offset",
+  hApiRefused(ctx, c, 422, "unsupported_rrule_part", "the rule FREQ=WEEKLY;COUNT=4;BYDAY=MO with a dtstart without an offset",
              {{"rrule", "FREQ=WEEKLY;COUNT=4;BYDAY=MO"}, {"dtstart", "2026-03-02T09:00:00"}});
-  const auto r = apiPost(c, {{"rrule", ""}});
+  const auto r = hApiPost(c, {{"rrule", ""}});
   ctx.Equal(r.Status, 201, "an empty rule, one occurrence (%s)", r.Text());
 }
 
 void CheckRuleTerminates(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
+  auto c = hApiClient(ctx);
   for (const std::string rule : {"FREQ=DAILY", "FREQ=DAILY;COUNT=6000", "FREQ=DAILY;COUNT=5001", "FREQ=DAILY;COUNT=0", "FREQ=DAILY;COUNT=many",
                                  "FREQ=DAILY;INTERVAL=0;UNTIL=2026-06-01T00:00:00Z", "FREQ=DAILY;INTERVAL=-1;COUNT=3", "FREQ=DAILY;INTERVAL=two;COUNT=3"}) {
-    apiRefused(ctx, c, 422, "rule_not_terminating", "the rule " + rule, {{"rrule", rule}});
+    hApiRefused(ctx, c, 422, "rule_not_terminating", "the rule " + rule, {{"rrule", rule}});
   }
   // The rule is judged before the instants.
-  apiRefused(ctx, c, 422, "rule_not_terminating", "the rule FREQ=DAILY;COUNT=0 with a dtstart without an offset",
+  hApiRefused(ctx, c, 422, "rule_not_terminating", "the rule FREQ=DAILY;COUNT=0 with a dtstart without an offset",
              {{"rrule", "FREQ=DAILY;COUNT=0"}, {"dtstart", "2026-03-02T09:00:00"}});
   for (const std::string rule : {"FREQ=DAILY;UNTIL=2026-06-01T00:00:00Z", "FREQ=DAILY;INTERVAL=2;COUNT=5000", "FREQ=WEEKLY;COUNT=1"}) {
-    const auto r = apiPost(c, {{"rrule", rule}});
+    const auto r = hApiPost(c, {{"rrule", rule}});
     ctx.Equal(r.Status, 201, "the rule %s ends (%s)", rule, r.Text());
   }
 }
 
 void CheckTzAware(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  apiRefused(ctx, c, 422, "invalid_instant", "a dtstart without an offset", {{"dtstart", "2026-03-02T09:00:00"}});
-  apiRefused(ctx, c, 422, "invalid_instant", "a dtend without an offset", {{"dtend", "2026-03-02T09:30:00"}});
-  apiRefused(ctx, c, 422, "invalid_instant", "an UNTIL without an offset", {{"rrule", "FREQ=DAILY;UNTIL=2026-06-01T00:00:00"}});
-  apiRefused(ctx, c, 422, "invalid_instant", "a dtstart without an offset after its dtend", {{"dtstart", "2026-03-02T10:00:00"}});
-  const auto r = apiPost(c, {{"dtstart", "2026-03-02T10:00:00+01:00"}, {"dtend", "2026-03-02T10:30:00+01:00"}});
+  auto c = hApiClient(ctx);
+  hApiRefused(ctx, c, 422, "invalid_instant", "a dtstart without an offset", {{"dtstart", "2026-03-02T09:00:00"}});
+  hApiRefused(ctx, c, 422, "invalid_instant", "a dtend without an offset", {{"dtend", "2026-03-02T09:30:00"}});
+  hApiRefused(ctx, c, 422, "invalid_instant", "an UNTIL without an offset", {{"rrule", "FREQ=DAILY;UNTIL=2026-06-01T00:00:00"}});
+  hApiRefused(ctx, c, 422, "invalid_instant", "a dtstart without an offset after its dtend", {{"dtstart", "2026-03-02T10:00:00"}});
+  const auto r = hApiPost(c, {{"dtstart", "2026-03-02T10:00:00+01:00"}, {"dtend", "2026-03-02T10:30:00+01:00"}});
   ctx.Equal(r.Status, 201, "instants with a +01:00 offset (%s)", r.Text());
-  auto stored = ctx.Redis.HGetAll("event:" + apiBody(r).value("event_id", ""));
+  auto stored = ctx.Redis.HGetAll("event:" + hApiBody(r).value("event_id", ""));
   ctx.Equal(stored["dtstart"], "2026-03-02T09:00:00Z", "the stored dtstart of 10:00+01:00");
   ctx.Equal(stored["dtend"], "2026-03-02T09:30:00Z", "the stored dtend of 10:30+01:00");
 }
 
 void CheckRangeOrder(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  apiRefused(ctx, c, 422, "invalid_range", "an event that ends when it starts", {{"dtend", "2026-03-02T09:00:00Z"}});
-  apiRefused(ctx, c, 422, "invalid_range", "an event that ends before it starts", {{"dtend", "2026-03-02T08:00:00Z"}});
-  apiRefused(ctx, c, 422, "invalid_range", "09:00Z to 09:30+01:00 (08:30Z)", {{"dtend", "2026-03-02T09:30:00+01:00"}});
+  auto c = hApiClient(ctx);
+  hApiRefused(ctx, c, 422, "invalid_range", "an event that ends when it starts", {{"dtend", "2026-03-02T09:00:00Z"}});
+  hApiRefused(ctx, c, 422, "invalid_range", "an event that ends before it starts", {{"dtend", "2026-03-02T08:00:00Z"}});
+  hApiRefused(ctx, c, 422, "invalid_range", "09:00Z to 09:30+01:00 (08:30Z)", {{"dtend", "2026-03-02T09:30:00+01:00"}});
   // Instants are compared, not their text: 10:00+02:00 is 08:00Z.
-  const auto r = apiPost(c, {{"dtstart", "2026-03-02T10:00:00+02:00"}, {"dtend", "2026-03-02T09:30:00Z"}});
+  const auto r = hApiPost(c, {{"dtstart", "2026-03-02T10:00:00+02:00"}, {"dtend", "2026-03-02T09:30:00Z"}});
   ctx.Equal(r.Status, 201, "10:00+02:00 (08:00Z) to 09:30Z (%s)", r.Text());
 }
 `,

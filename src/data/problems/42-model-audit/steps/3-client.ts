@@ -912,22 +912,22 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
 // signerPeer signs (tenant, position, link) with key k-2026.
-type signerPeer struct {
+type HSignerPeer struct {
 	pb.UnimplementedReceiptSignerServer
 }
 
-func (signerPeer) Sign(_ context.Context, req *pb.SignRequest) (*pb.Receipt, error) {
+func (HSignerPeer) Sign(_ context.Context, req *pb.SignRequest) (*pb.Receipt, error) {
 	return &pb.Receipt{RecordId: req.GetRecordId(), Signature: fmt.Sprintf("sig:%s:%d:%s", req.GetTenant(), req.GetPosition(), req.GetDigest()[:12]), KeyId: "k-2026"}, nil
 }
 
-func serveSigner(ctx *harness.Ctx) {
-	pb.RegisterReceiptSignerServer(ctx.GRPC.Server(""), signerPeer{})
+func hServeSigner(ctx *harness.Ctx) {
+	pb.RegisterReceiptSignerServer(ctx.GRPC.Server(""), HSignerPeer{})
 }
 
-func chained(ctx *harness.Ctx, n int) (string, chain.Entry) {
+func hChained(ctx *harness.Ctx, n int) (string, chain.Entry) {
 	fields := map[string]any{
 		"model_version":   "risk-v7",
 		"policy_id":       "refunds-2026-10",
@@ -935,20 +935,20 @@ func chained(ctx *harness.Ctx, n int) (string, chain.Entry) {
 		"decision_digest": digest.Sha256Hex(fmt.Sprintf("out-%d", n)),
 		"recorded_at":     fmt.Sprint(1700000000000 + n),
 	}
-	record, err := ledger.Insert(clientBg, "t1", fields)
+	record, err := ledger.Insert(hClientBg, "t1", fields)
 	ctx.NoError(err, "the ledger insert failed")
-	entry, err := chain.AppendEntry(clientBg, "t1", record.ID, ledger.RecordDigest(record))
+	entry, err := chain.AppendEntry(hClientBg, "t1", record.ID, ledger.RecordDigest(record))
 	ctx.NoError(err, "the chain append failed")
-	ledger.SetPosition(clientBg, record.ID, entry.Position)
+	ledger.SetPosition(hClientBg, record.ID, entry.Position)
 	return record.ID, entry
 }
 
-func signingQueue(ctx *harness.Ctx) []string { return ctx.Redis.LRange("audit:signing_queue", 0, -1) }
+func hSigningQueue(ctx *harness.Ctx) []string { return ctx.Redis.LRange("audit:signing_queue", 0, -1) }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	serveSigner(ctx)
-	recordID, entry := chained(ctx, 1)
-	signed, err := requestReceipt(clientBg, recordID)
+	hServeSigner(ctx)
+	recordID, entry := hChained(ctx, 1)
+	signed, err := requestReceipt(hClientBg, recordID)
 	ctx.NoError(err, "with a healthy signer requestReceipt failed")
 	want := fmt.Sprintf("sig:t1:1:%s", entry.Digest[:12])
 	ctx.Assert(signed.Status == "signed" && signed.Signature == want && signed.RecordID == recordID, "with a healthy signer requestReceipt answered %+v, expected the signature of the record's link", signed)
@@ -957,9 +957,9 @@ func CheckDeadline(ctx *harness.Ctx) {
 		ctx.Assert(450*time.Millisecond <= call.Timeout && call.Timeout <= 550*time.Millisecond, "a Sign call carries a %v deadline, expected 500 ms", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Sign", 2.0, "")
-	other, _ := chained(ctx, 2)
+	other, _ := hChained(ctx, 2)
 	before := len(ctx.GRPC.CallsTo("Sign", ""))
-	slow, _ := requestReceipt(clientBg, other)
+	slow, _ := requestReceipt(hClientBg, other)
 	calls := ctx.GRPC.CallsTo("Sign", "")[before:]
 	for _, call := range calls {
 		ctx.Assert(call.HasDeadline() && 450*time.Millisecond <= call.Timeout && call.Timeout <= 550*time.Millisecond, "against a signer that takes 2 s an attempt carried a %v deadline, expected 500 ms: every attempt carries its own full deadline, not what is left of one shared by the retries", call.Timeout)
@@ -969,75 +969,75 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckTransientOnly(ctx *harness.Ctx) {
-	serveSigner(ctx)
-	recordID, _ := chained(ctx, 1)
+	hServeSigner(ctx)
+	recordID, _ := hChained(ctx, 1)
 	ctx.GRPC.Fail("Sign", codes.PermissionDenied, "key k-2026 is revoked", 1, "")
-	answer, err := requestReceipt(clientBg, recordID)
+	answer, err := requestReceipt(hClientBg, recordID)
 	ctx.Assert(err != nil && errors.Is(err, ErrReceiptRefused), "a PERMISSION_DENIED from the signer was answered %+v (error %v): a revoked key is not a blip, requestReceipt must return an error wrapping ErrReceiptRefused", answer, err)
 	calls := len(ctx.GRPC.CallsTo("Sign", ""))
 	ctx.Equal(calls, 1, "a PERMISSION_DENIED must not be retried; the Sign calls")
-	ctx.Equal(signingQueue(ctx), []string{recordID}, "a refused record must wait in audit:signing_queue")
-	other, _ := chained(ctx, 2)
+	ctx.Equal(hSigningQueue(ctx), []string{recordID}, "a refused record must wait in audit:signing_queue")
+	other, _ := hChained(ctx, 2)
 	ctx.GRPC.Fail("Sign", codes.Unavailable, "signer restarting", 1, "")
 	ctx.GRPC.Fail("Sign", codes.DeadlineExceeded, "", 1, "")
-	retried, err := requestReceipt(clientBg, other)
+	retried, err := requestReceipt(hClientBg, other)
 	ctx.NoError(err, "after two transient failures requestReceipt failed")
 	ctx.Equal(retried.Status, "signed", "after one UNAVAILABLE and one DEADLINE_EXCEEDED the third attempt must sign the record; the status")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Sign", "")), calls+3, "the transient failures and the success; the Sign calls")
 	// Every code but the two transient ones is final, after one call, whichever it is and whichever attempt meets it.
 	terminal := []codes.Code{codes.InvalidArgument, codes.FailedPrecondition, codes.Unauthenticated, codes.ResourceExhausted, codes.Internal}
 	for i, code := range terminal {
-		record, _ := chained(ctx, 3+i)
+		record, _ := hChained(ctx, 3+i)
 		ctx.GRPC.Fail("Sign", code, "refused", 1, "")
 		sent := len(ctx.GRPC.CallsTo("Sign", ""))
-		answer, err := requestReceipt(clientBg, record)
+		answer, err := requestReceipt(hClientBg, record)
 		ctx.Assert(err != nil && errors.Is(err, ErrReceiptRefused), "a Sign that failed with %v was answered %+v (error %v): only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other code returns an error wrapping ErrReceiptRefused", code, answer, err)
 		ctx.Equal(len(ctx.GRPC.CallsTo("Sign", ""))-sent, 1, "a Sign that failed with %v must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the Sign calls", code)
-		queued := signingQueue(ctx)
+		queued := hSigningQueue(ctx)
 		ctx.Assert(len(queued) > 0 && queued[len(queued)-1] == record, "a record refused with %v must wait in audit:signing_queue, it holds %q", code, queued)
 	}
-	late, _ := chained(ctx, 9)
+	late, _ := hChained(ctx, 9)
 	ctx.GRPC.Fail("Sign", codes.Unavailable, "signer restarting", 1, "")
 	ctx.GRPC.Fail("Sign", codes.PermissionDenied, "key k-2026 is revoked", 1, "")
 	sent := len(ctx.GRPC.CallsTo("Sign", ""))
-	lateAnswer, err := requestReceipt(clientBg, late)
+	lateAnswer, err := requestReceipt(hClientBg, late)
 	ctx.Assert(err != nil && errors.Is(err, ErrReceiptRefused), "an UNAVAILABLE then a PERMISSION_DENIED was answered %+v (error %v): the second attempt's refusal is final, requestReceipt must return an error wrapping ErrReceiptRefused", lateAnswer, err)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Sign", ""))-sent, 2, "an UNAVAILABLE then a PERMISSION_DENIED; the Sign calls")
-	queued := signingQueue(ctx)
+	queued := hSigningQueue(ctx)
 	ctx.Assert(len(queued) > 0 && queued[len(queued)-1] == late, "a record refused on its second attempt must wait in audit:signing_queue, it holds %q", queued)
 }
 
 func CheckUnsignedQueue(ctx *harness.Ctx) {
-	serveSigner(ctx)
-	recordID, _ := chained(ctx, 1)
+	hServeSigner(ctx)
+	recordID, _ := hChained(ctx, 1)
 	ctx.GRPC.Fail("Sign", codes.Unavailable, "signer down", 3, "")
-	answer, err := requestReceipt(clientBg, recordID)
+	answer, err := requestReceipt(hClientBg, recordID)
 	ctx.NoError(err, "a signer down for every attempt is not an error of the record")
 	ctx.Assert(answer.Status == "unsigned" && answer.Signature == "", "with the signer down for every attempt requestReceipt answered %+v, expected unsigned with no signature", answer)
-	record := ledger.Get(clientBg, recordID)
+	record := ledger.Get(hClientBg, recordID)
 	ctx.Equal(record.Status, "unsigned", "a record the signer never signed is unsigned (signature %q); the ledger status", record.Signature)
-	ctx.Equal(signingQueue(ctx), []string{recordID}, "audit:signing_queue must hold the record for the signing worker")
+	ctx.Equal(hSigningQueue(ctx), []string{recordID}, "audit:signing_queue must hold the record for the signing worker")
 }
 
 func CheckNoStickyFailure(ctx *harness.Ctx) {
-	serveSigner(ctx)
-	first, _ := chained(ctx, 1)
+	hServeSigner(ctx)
+	first, _ := hChained(ctx, 1)
 	ctx.GRPC.Fail("Sign", codes.Unavailable, "signer down", 3, "")
-	requestReceipt(clientBg, first)
+	requestReceipt(hClientBg, first)
 	before := len(ctx.GRPC.CallsTo("Sign", ""))
-	second, _ := chained(ctx, 2)
-	answer, err := requestReceipt(clientBg, second)
+	second, _ := hChained(ctx, 2)
+	answer, err := requestReceipt(hClientBg, second)
 	ctx.NoError(err, "with the signer back requestReceipt failed")
 	ctx.Assert(len(ctx.GRPC.CallsTo("Sign", "")) > before, "after one record failed, the next record was never sent to the signer: a failure must not be remembered for the whole process")
 	ctx.Equal(answer.Status, "signed", "with the signer back, the next record's status")
-	ctx.Equal(ledger.Get(clientBg, second).Status, "signed", "the ledger status of the record the recovered signer signed")
+	ctx.Equal(ledger.Get(hClientBg, second).Status, "signed", "the ledger status of the record the recovered signer signed")
 	// Another outage, then a record that meets one blip: it makes its own maxAttempts and rides it out.
 	ctx.GRPC.Fail("Sign", codes.Unavailable, "signer down", 3, "")
-	third, _ := chained(ctx, 3)
-	requestReceipt(clientBg, third)
-	fourth, _ := chained(ctx, 4)
+	third, _ := hChained(ctx, 3)
+	requestReceipt(hClientBg, third)
+	fourth, _ := hChained(ctx, 4)
 	ctx.GRPC.Fail("Sign", codes.Unavailable, "signer restarting", 1, "")
-	blip, err := requestReceipt(clientBg, fourth)
+	blip, err := requestReceipt(hClientBg, fourth)
 	ctx.Assert(err == nil && blip.Status == "signed", "right after a record the signer never signed, the next one met one UNAVAILABLE and answered %+v (error %v), expected signed on its second attempt: each record makes its own maxAttempts", blip, err)
 }
 `,
@@ -1050,7 +1050,7 @@ func CheckNoStickyFailure(ctx *harness.Ctx) {
 namespace {
 
 // Signs (tenant, position, link) with key k-2026.
-class SignerPeer final : public audit::ReceiptSigner::Service {
+class HSignerPeer final : public audit::ReceiptSigner::Service {
  public:
   grpc::Status Sign(grpc::ServerContext*, const audit::SignRequest* req, audit::Receipt* out) override {
     out->set_record_id(req->record_id());
@@ -1060,14 +1060,14 @@ class SignerPeer final : public audit::ReceiptSigner::Service {
   }
 };
 
-void serveSigner(harness::Ctx& ctx) {
-  static SignerPeer* peer = nullptr;
+void hServeSigner(harness::Ctx& ctx) {
+  static HSignerPeer* peer = nullptr;
   delete peer;
-  peer = new SignerPeer;
+  peer = new HSignerPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
 }
 
-std::pair<std::string, chain::Entry> chained(int n) {
+std::pair<std::string, chain::Entry> hChained(int n) {
   const nlohmann::json fields = {{"model_version", "risk-v7"},
                                  {"policy_id", "refunds-2026-10"},
                                  {"input_digest", sha256_hex("in-" + std::to_string(n))},
@@ -1079,13 +1079,13 @@ std::pair<std::string, chain::Entry> chained(int n) {
   return {record.id, entry};
 }
 
-std::vector<std::string> signingQueue(harness::Ctx& ctx) { return ctx.Redis.LRange("audit:signing_queue", 0, -1); }
+std::vector<std::string> hSigningQueue(harness::Ctx& ctx) { return ctx.Redis.LRange("audit:signing_queue", 0, -1); }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  serveSigner(ctx);
-  const auto [record_id, entry] = chained(1);
+  hServeSigner(ctx);
+  const auto [record_id, entry] = hChained(1);
   const ReceiptResult signed_ = requestReceipt(record_id);
   const std::string want = "sig:t1:1:" + entry.digest.substr(0, 12);
   ctx.Assert(signed_.status == "signed" && signed_.signature == want, "with a healthy signer requestReceipt answered %s / %q, expected the signature of the record's link", signed_.status, signed_.signature);
@@ -1094,7 +1094,7 @@ void CheckDeadline(harness::Ctx& ctx) {
     ctx.Assert(0.45 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.55, "a Sign call carries a %v s deadline, expected 0.5 s", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("Sign", 2.0);
-  const std::string other = chained(2).first;
+  const std::string other = hChained(2).first;
   const size_t before = ctx.GRPC.CallsTo("Sign").size();
   const ReceiptResult slow = requestReceipt(other);
   const auto calls = ctx.GRPC.CallsTo("Sign");
@@ -1106,8 +1106,8 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckTransientOnly(harness::Ctx& ctx) {
-  serveSigner(ctx);
-  const std::string record_id = chained(1).first;
+  hServeSigner(ctx);
+  const std::string record_id = hChained(1).first;
   ctx.GRPC.Fail("Sign", grpc::StatusCode::PERMISSION_DENIED, "key k-2026 is revoked", 1);
   bool refused = false;
   std::string answered;
@@ -1119,8 +1119,8 @@ void CheckTransientOnly(harness::Ctx& ctx) {
   ctx.Assert(refused, "a PERMISSION_DENIED from the signer was answered %q: a revoked key is not a blip, requestReceipt must throw ReceiptRefused", answered);
   const size_t calls = ctx.GRPC.CallsTo("Sign").size();
   ctx.Equal(calls, 1, "a PERMISSION_DENIED must not be retried; the Sign calls");
-  ctx.Equal(signingQueue(ctx), {record_id}, "a refused record must wait in audit:signing_queue");
-  const std::string other = chained(2).first;
+  ctx.Equal(hSigningQueue(ctx), {record_id}, "a refused record must wait in audit:signing_queue");
+  const std::string other = hChained(2).first;
   ctx.GRPC.Fail("Sign", grpc::StatusCode::UNAVAILABLE, "signer restarting", 1);
   ctx.GRPC.Fail("Sign", grpc::StatusCode::DEADLINE_EXCEEDED, "", 1);
   const ReceiptResult retried = requestReceipt(other);
@@ -1134,7 +1134,7 @@ void CheckTransientOnly(harness::Ctx& ctx) {
                                                                           {grpc::StatusCode::INTERNAL, "INTERNAL"}};
   int n = 3;
   for (const auto& [code, name] : terminal) {
-    const std::string record = chained(n++).first;
+    const std::string record = hChained(n++).first;
     ctx.GRPC.Fail("Sign", code, "refused", 1);
     const size_t sent = ctx.GRPC.CallsTo("Sign").size();
     bool final_ = false;
@@ -1146,10 +1146,10 @@ void CheckTransientOnly(harness::Ctx& ctx) {
     }
     ctx.Assert(final_, "a Sign that failed with %s was answered %q: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other code throws ReceiptRefused", name, status);
     ctx.Equal(ctx.GRPC.CallsTo("Sign").size() - sent, 1, "a Sign that failed with %s must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the Sign calls", name);
-    const auto queued = signingQueue(ctx);
+    const auto queued = hSigningQueue(ctx);
     ctx.Assert(!queued.empty() && queued.back() == record, "a record refused with %s must wait in audit:signing_queue, it holds %v", name, queued);
   }
-  const std::string late = chained(9).first;
+  const std::string late = hChained(9).first;
   ctx.GRPC.Fail("Sign", grpc::StatusCode::UNAVAILABLE, "signer restarting", 1);
   ctx.GRPC.Fail("Sign", grpc::StatusCode::PERMISSION_DENIED, "key k-2026 is revoked", 1);
   const size_t sent = ctx.GRPC.CallsTo("Sign").size();
@@ -1162,36 +1162,36 @@ void CheckTransientOnly(harness::Ctx& ctx) {
   }
   ctx.Assert(late_refused, "an UNAVAILABLE then a PERMISSION_DENIED was answered %q: the second attempt's refusal is final, requestReceipt must throw ReceiptRefused", late_status);
   ctx.Equal(ctx.GRPC.CallsTo("Sign").size() - sent, 2, "an UNAVAILABLE then a PERMISSION_DENIED; the Sign calls");
-  const auto queued = signingQueue(ctx);
+  const auto queued = hSigningQueue(ctx);
   ctx.Assert(!queued.empty() && queued.back() == late, "a record refused on its second attempt must wait in audit:signing_queue, it holds %v", queued);
 }
 
 void CheckUnsignedQueue(harness::Ctx& ctx) {
-  serveSigner(ctx);
-  const std::string record_id = chained(1).first;
+  hServeSigner(ctx);
+  const std::string record_id = hChained(1).first;
   ctx.GRPC.Fail("Sign", grpc::StatusCode::UNAVAILABLE, "signer down", 3);
   const ReceiptResult answer = requestReceipt(record_id);
   ctx.Assert(answer.status == "unsigned" && answer.signature.empty(), "with the signer down for every attempt requestReceipt answered %s / %q, expected unsigned with no signature", answer.status, answer.signature);
   const auto record = ledger::get(record_id);
   ctx.Equal(record->status, "unsigned", "a record the signer never signed is unsigned (signature %q); the ledger status", record->signature);
-  ctx.Equal(signingQueue(ctx), {record_id}, "audit:signing_queue must hold the record for the signing worker");
+  ctx.Equal(hSigningQueue(ctx), {record_id}, "audit:signing_queue must hold the record for the signing worker");
 }
 
 void CheckNoStickyFailure(harness::Ctx& ctx) {
-  serveSigner(ctx);
-  const std::string first = chained(1).first;
+  hServeSigner(ctx);
+  const std::string first = hChained(1).first;
   ctx.GRPC.Fail("Sign", grpc::StatusCode::UNAVAILABLE, "signer down", 3);
   requestReceipt(first);
   const size_t before = ctx.GRPC.CallsTo("Sign").size();
-  const std::string second = chained(2).first;
+  const std::string second = hChained(2).first;
   const ReceiptResult answer = requestReceipt(second);
   ctx.Assert(ctx.GRPC.CallsTo("Sign").size() > before, "after one record failed, the next record was never sent to the signer: a failure must not be remembered for the whole process");
   ctx.Equal(answer.status, "signed", "with the signer back, the next record's status");
   ctx.Equal(ledger::get(second)->status, "signed", "the ledger status of the record the recovered signer signed");
   // Another outage, then a record that meets one blip: it makes its own kMaxAttempts and rides it out.
   ctx.GRPC.Fail("Sign", grpc::StatusCode::UNAVAILABLE, "signer down", 3);
-  requestReceipt(chained(3).first);
-  const std::string fourth = chained(4).first;
+  requestReceipt(hChained(3).first);
+  const std::string fourth = hChained(4).first;
   ctx.GRPC.Fail("Sign", grpc::StatusCode::UNAVAILABLE, "signer restarting", 1);
   const ReceiptResult blip = requestReceipt(fourth);
   ctx.Equal(blip.status, "signed", "right after a record the signer never signed, the next one met one UNAVAILABLE and must be signed on its second attempt (each record makes its own kMaxAttempts); the status");

@@ -878,34 +878,34 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "billing.invoice"
+const kHEventsTopic = "billing.invoice"
 
 var (
-	eventsBg      = context.Background()
-	chargedResult = store.Outcome{State: "charged", Reference: "ch_1"}
+	hEventsBg      = context.Background()
+	hChargedResult = store.Outcome{State: "charged", Reference: "ch_1"}
 )
 
-func eventsInvoice(subscriptionID string) *store.Invoice {
-	store.PutSubscription(eventsBg, subscriptionID, "t-acme", "scale", "2026-03-01", "2026-04-01")
-	return store.OpenInvoice(eventsBg, subscriptionID, "2026-03-01", "2026-04-01", 9900)
+func hEventsInvoice(subscriptionID string) *store.Invoice {
+	store.PutSubscription(hEventsBg, subscriptionID, "t-acme", "scale", "2026-03-01", "2026-04-01")
+	return store.OpenInvoice(hEventsBg, subscriptionID, "2026-03-01", "2026-04-01", 9900)
 }
 
-func eventsRecord(ctx *harness.Ctx, invoice *store.Invoice, outcome store.Outcome) bool {
-	ok, err := recordOutcome(eventsBg, invoice, outcome)
+func hEventsRecord(ctx *harness.Ctx, invoice *store.Invoice, outcome store.Outcome) bool {
+	ok, err := recordOutcome(hEventsBg, invoice, outcome)
 	ctx.NoError(err, "recordOutcome(%s)", invoice.InvoiceID)
 	return ok
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	var rows []HEventsRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -914,89 +914,89 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 
 func CheckSubscriptionKey(ctx *harness.Ctx) {
 	for _, subscriptionID := range []string{"sub_1", "sub_2", "sub_1"} {
-		eventsRecord(ctx, eventsInvoice(subscriptionID), chargedResult)
+		hEventsRecord(ctx, hEventsInvoice(subscriptionID), hChargedResult)
 	}
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three charged invoices must produce three records on billing.invoice; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"sub_1", "sub_2", "sub_1"}, "the records must be keyed by the subscription ids")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"sub_1", "sub_2", "sub_1"}, "the records must be keyed by the subscription ids")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both sub_1 events must land on one partition, or the ledger applies one subscription's invoices out of order; the partitions")
 }
 
 func CheckRecordBeforeProduce(ctx *harness.Ctx) {
-	invoice := eventsInvoice("sub_1")
-	probe := ctx.Redis.After("invoice:"+invoice.InvoiceID, func() any { return len(ctx.Kafka.Records(eventsTopic)) })
-	eventsRecord(ctx, invoice, chargedResult)
+	invoice := hEventsInvoice("sub_1")
+	probe := ctx.Redis.After("invoice:"+invoice.InvoiceID, func() any { return len(ctx.Kafka.Records(kHEventsTopic)) })
+	hEventsRecord(ctx, invoice, hChargedResult)
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "recordOutcome never wrote the invoice row")
 	ctx.Equal(probe.Result, 0, "when the invoice row was marked charged the topic already held records: the ledger heard of a charge the billing store did not show. Store first, then produce; the records at store time")
-	ctx.Equal(store.FindInvoice(eventsBg, invoice.InvoiceID).State, "charged", "the invoice's state")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the store write; the records")
+	ctx.Equal(store.FindInvoice(hEventsBg, invoice.InvoiceID).State, "charged", "the invoice's state")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "the event must still be produced after the store write; the records")
 	// A declined charge is stored first too: when its row reads failed, its event is not on the topic yet.
-	declined := eventsInvoice("sub_2")
-	failedProbe := ctx.Redis.After("invoice:"+declined.InvoiceID, func() any { return len(ctx.Kafka.Records(eventsTopic)) })
-	eventsRecord(ctx, declined, store.Outcome{State: "failed", Reason: "card_declined"})
+	declined := hEventsInvoice("sub_2")
+	failedProbe := ctx.Redis.After("invoice:"+declined.InvoiceID, func() any { return len(ctx.Kafka.Records(kHEventsTopic)) })
+	hEventsRecord(ctx, declined, store.Outcome{State: "failed", Reason: "card_declined"})
 	ctx.Settle()
 	ctx.Assert(failedProbe.Fired, "recordOutcome never wrote the declined invoice's row")
 	ctx.Equal(failedProbe.Result, 1, "when the declined invoice's row was marked failed the topic must hold only the earlier charge's record: store a failure first, then produce it, like a charge; the records at store time")
 	// The billing store refuses the write (WRONGTYPE): no event, and no outbox row, may announce an outcome the store does not hold.
-	broken := eventsInvoice("sub_3")
+	broken := hEventsInvoice("sub_3")
 	ctx.Redis.Set("invoice:"+broken.InvoiceID, "not a hash")
-	recordsBefore := len(ctx.Kafka.Records(eventsTopic))
-	ok, err := recordOutcome(eventsBg, broken, chargedResult)
+	recordsBefore := len(ctx.Kafka.Records(kHEventsTopic))
+	ok, err := recordOutcome(hEventsBg, broken, hChargedResult)
 	ctx.Settle()
-	produced := len(ctx.Kafka.Records(eventsTopic)) - recordsBefore
-	ctx.Assert(produced == 0 && len(eventsOutbox(ctx)) == 0, "the store write for %s failed, yet recordOutcome produced %d record(s) and left the outbox %v: a failed store write stops the event", broken.InvoiceID, produced, eventsOutbox(ctx))
+	produced := len(ctx.Kafka.Records(kHEventsTopic)) - recordsBefore
+	ctx.Assert(produced == 0 && len(hEventsOutbox(ctx)) == 0, "the store write for %s failed, yet recordOutcome produced %d record(s) and left the outbox %v: a failed store write stops the event", broken.InvoiceID, produced, hEventsOutbox(ctx))
 	ctx.Assert(!ok || err != nil, "recordOutcome returned true and no error although the store write failed: let the failure reach the caller")
 }
 
 func CheckFailedPublished(ctx *harness.Ctx) {
-	invoice := eventsInvoice("sub_1")
-	eventsRecord(ctx, invoice, store.Outcome{State: "failed", Reason: "card_declined"})
+	invoice := hEventsInvoice("sub_1")
+	hEventsRecord(ctx, invoice, store.Outcome{State: "failed", Reason: "card_declined"})
 	ctx.Settle()
-	ctx.Equal(store.FindInvoice(eventsBg, invoice.InvoiceID).State, "failed", "a declined charge must mark the invoice failed; its state")
-	values := ctx.Kafka.Values(eventsTopic)
+	ctx.Equal(store.FindInvoice(hEventsBg, invoice.InvoiceID).State, "failed", "a declined charge must mark the invoice failed; its state")
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "a declined charge must be published: the ledger needs the failure too; the records")
 	var event map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &event), "the event must be JSON")
 	ctx.Assert(event["state"] == "failed" && event["reason"] == "card_declined" && event["invoice_id"] == invoice.InvoiceID, "the event is %s, expected state failed with reason card_declined for %s", values[0], invoice.InvoiceID)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"sub_1"}, "the failure's record must be keyed by the subscription id")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"sub_1"}, "the failure's record must be keyed by the subscription id")
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsRecord(ctx, eventsInvoice("sub_1"), chargedResult)
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsRecord(ctx, hEventsInvoice("sub_1"), hChargedResult)
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	eventsRecord(ctx, eventsInvoice("sub_1"), chargedResult)
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hEventsRecord(ctx, hEventsInvoice("sub_1"), hChargedResult)
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	healthy := eventsInvoice("sub_1")
-	ok := eventsRecord(ctx, healthy, chargedResult)
+	healthy := hEventsInvoice("sub_1")
+	ok := hEventsRecord(ctx, healthy, hChargedResult)
 	ctx.Settle()
-	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0, "a delivery the broker acknowledged returned %t and left the outbox %v: return true and keep no row", ok, eventsOutbox(ctx))
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	first := eventsInvoice("sub_1")
-	ok = eventsRecord(ctx, first, chargedResult)
+	ctx.Assert(ok && len(hEventsOutbox(ctx)) == 0, "a delivery the broker acknowledged returned %t and left the outbox %v: return true and keep no row", ok, hEventsOutbox(ctx))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	first := hEventsInvoice("sub_1")
+	ok = hEventsRecord(ctx, first, hChargedResult)
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the ledger never hears of the charge; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "sub_1" && rows[0].Payload["invoice_id"] == first.InvoiceID, "the outbox row is %v, expected the topic, the key sub_1 and the event", rows[0])
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == "sub_1" && rows[0].Payload["invoice_id"] == first.InvoiceID, "the outbox row is %v, expected the topic, the key sub_1 and the event", rows[0])
 	payload := rows[0].Payload
 	ctx.Assert(payload["subscription_id"] == "sub_1" && payload["state"] == "charged" && payload["reference"] == "ch_1", "the outbox payload is %v, expected the event the broker did not take (state charged, reference ch_1), which the relay publishes as is", payload)
 	ctx.Equal(ok, false, "recordOutcome's result after a failed delivery")
-	ctx.Equal(store.FindInvoice(eventsBg, first.InvoiceID).State, "charged", "the invoice must stay charged when only the produce failed; its state")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
-	second := eventsInvoice("sub_1")
+	ctx.Equal(store.FindInvoice(hEventsBg, first.InvoiceID).State, "charged", "the invoice must stay charged when only the produce failed; its state")
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
+	second := hEventsInvoice("sub_1")
 	before := ctx.Clock.Now()
-	ok = eventsRecord(ctx, second, chargedResult)
+	ok = hEventsRecord(ctx, second, hChargedResult)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "recordOutcome waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["invoice_id"] == second.InvoiceID, "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "recordOutcome's result without a delivery report")
 }
@@ -1012,15 +1012,15 @@ func CheckOutbox(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "billing.invoice";
-const store::Outcome kEventsCharged{"charged", "ch_1", ""};
+const std::string kHEventsTopic = "billing.invoice";
+const store::Outcome kHEventsCharged{"charged", "ch_1", ""};
 
-store::Invoice eventsInvoice(const std::string& subscription_id = "sub_1") {
+store::Invoice hEventsInvoice(const std::string& subscription_id = "sub_1") {
   store::putSubscription(subscription_id, "t-acme", "scale", "2026-03-01", "2026-04-01");
   return store::openInvoice(subscription_id, "2026-03-01", "2026-04-01", 9900);
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -1030,45 +1030,45 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
+std::string hEventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckSubscriptionKey(harness::Ctx& ctx) {
-  for (const std::string subscription_id : {"sub_1", "sub_2", "sub_1"}) recordOutcome(eventsInvoice(subscription_id), kEventsCharged);
+  for (const std::string subscription_id : {"sub_1", "sub_2", "sub_1"}) recordOutcome(hEventsInvoice(subscription_id), kHEventsCharged);
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three charged invoices must produce three records on billing.invoice; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"sub_1", "sub_2", "sub_1"}, "the records must be keyed by the subscription ids");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"sub_1", "sub_2", "sub_1"}, "the records must be keyed by the subscription ids");
   ctx.Equal(records[0].Partition, records[2].Partition,
             "both sub_1 events must land on one partition, or the ledger applies one subscription's invoices out of order; the partitions");
 }
 
 void CheckRecordBeforeProduce(harness::Ctx& ctx) {
-  const store::Invoice invoice = eventsInvoice();
+  const store::Invoice invoice = hEventsInvoice();
   size_t atStore = 999;
   bool fired = false;
   ctx.Redis.After("invoice:" + invoice.invoice_id, [&] {
     fired = true;
-    atStore = ctx.Kafka.Records(kEventsTopic).size();
+    atStore = ctx.Kafka.Records(kHEventsTopic).size();
   });
-  recordOutcome(invoice, kEventsCharged);
+  recordOutcome(invoice, kHEventsCharged);
   ctx.Settle();
   ctx.Assert(fired, "recordOutcome never wrote the invoice row");
   ctx.Equal(atStore, 0,
             "when the invoice row was marked charged the topic already held records: the ledger heard of a charge the billing store "
             "did not show. Store first, then produce; the records at store time");
   ctx.Equal(store::findInvoice(invoice.invoice_id)->state, "charged", "the invoice's state");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the event must still be produced after the store write; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "the event must still be produced after the store write; the records");
   // A declined charge is stored first too: when its row reads failed, its event is not on the topic yet.
-  const store::Invoice declined = eventsInvoice("sub_2");
+  const store::Invoice declined = hEventsInvoice("sub_2");
   size_t atFailed = 999;
   bool failedFired = false;
   ctx.Redis.After("invoice:" + declined.invoice_id, [&] {
     failedFired = true;
-    atFailed = ctx.Kafka.Records(kEventsTopic).size();
+    atFailed = ctx.Kafka.Records(kHEventsTopic).size();
   });
   recordOutcome(declined, store::Outcome{"failed", "", "card_declined"});
   ctx.Settle();
@@ -1077,76 +1077,76 @@ void CheckRecordBeforeProduce(harness::Ctx& ctx) {
             "when the declined invoice's row was marked failed the topic must hold only the earlier charge's record: store a failure first, then "
             "produce it, like a charge; the records at store time");
   // The billing store refuses the write (WRONGTYPE): no event, and no outbox row, may announce an outcome the store does not hold.
-  const store::Invoice broken = eventsInvoice("sub_3");
+  const store::Invoice broken = hEventsInvoice("sub_3");
   ctx.Redis.Set("invoice:" + broken.invoice_id, "not a hash");
-  const size_t recordsBefore = ctx.Kafka.Records(kEventsTopic).size();
+  const size_t recordsBefore = ctx.Kafka.Records(kHEventsTopic).size();
   bool reported = false;
   try {
-    reported = recordOutcome(broken, kEventsCharged);
+    reported = recordOutcome(broken, kHEventsCharged);
   } catch (const std::exception&) {
     reported = false;
   }
   ctx.Settle();
-  const size_t produced = ctx.Kafka.Records(kEventsTopic).size() - recordsBefore;
-  ctx.Assert(produced == 0 && eventsOutbox(ctx).empty(),
+  const size_t produced = ctx.Kafka.Records(kHEventsTopic).size() - recordsBefore;
+  ctx.Assert(produced == 0 && hEventsOutbox(ctx).empty(),
              "the store write for %s failed, yet recordOutcome produced %d record(s) and left %d outbox row(s): a failed store write stops the event",
-             broken.invoice_id, produced, eventsOutbox(ctx).size());
+             broken.invoice_id, produced, hEventsOutbox(ctx).size());
   ctx.Assert(!reported, "recordOutcome returned true although the store write failed: let the failure reach the caller");
 }
 
 void CheckFailedPublished(harness::Ctx& ctx) {
-  const store::Invoice invoice = eventsInvoice();
+  const store::Invoice invoice = hEventsInvoice();
   recordOutcome(invoice, store::Outcome{"failed", "", "card_declined"});
   ctx.Settle();
   ctx.Equal(store::findInvoice(invoice.invoice_id)->state, "failed", "a declined charge must mark the invoice failed; its state");
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "a declined charge must be published: the ledger needs the failure too; the records");
   const auto event = nlohmann::json::parse(values[0], nullptr, false);
-  ctx.Assert(eventsField(event, "state") == "failed" && eventsField(event, "reason") == "card_declined" && eventsField(event, "invoice_id") == invoice.invoice_id,
+  ctx.Assert(hEventsField(event, "state") == "failed" && hEventsField(event, "reason") == "card_declined" && hEventsField(event, "invoice_id") == invoice.invoice_id,
              "the event is %s, expected state failed with reason card_declined for %s", values[0], invoice.invoice_id);
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"sub_1"}, "the failure's record must be keyed by the subscription id");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"sub_1"}, "the failure's record must be keyed by the subscription id");
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  recordOutcome(eventsInvoice(), kEventsCharged);
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  recordOutcome(hEventsInvoice(), kHEventsCharged);
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1,
             "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  recordOutcome(eventsInvoice(), kEventsCharged);
+  recordOutcome(hEventsInvoice(), kHEventsCharged);
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  const store::Invoice healthy = eventsInvoice();
-  bool ok = recordOutcome(healthy, kEventsCharged);
+  const store::Invoice healthy = hEventsInvoice();
+  bool ok = recordOutcome(healthy, kHEventsCharged);
   ctx.Settle();
-  ctx.Assert(ok && eventsOutbox(ctx).empty(), "a delivery the broker acknowledged returned %t and left %d outbox row(s): return true and keep no row", ok,
-             eventsOutbox(ctx).size());
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  const store::Invoice first = eventsInvoice();
-  ok = recordOutcome(first, kEventsCharged);
+  ctx.Assert(ok && hEventsOutbox(ctx).empty(), "a delivery the broker acknowledged returned %t and left %d outbox row(s): return true and keep no row", ok,
+             hEventsOutbox(ctx).size());
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  const store::Invoice first = hEventsInvoice();
+  ok = recordOutcome(first, kHEventsCharged);
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the ledger never hears of the charge; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "sub_1" && rows[0].contains("payload") &&
-                 eventsField(rows[0]["payload"], "invoice_id") == first.invoice_id,
+  ctx.Assert(hEventsField(rows[0], "topic") == kHEventsTopic && hEventsField(rows[0], "key") == "sub_1" && rows[0].contains("payload") &&
+                 hEventsField(rows[0]["payload"], "invoice_id") == first.invoice_id,
              "the outbox row is %s, expected the topic, the key sub_1 and the event", rows[0].dump());
   const nlohmann::json& payload = rows[0]["payload"];
-  ctx.Assert(eventsField(payload, "subscription_id") == "sub_1" && eventsField(payload, "state") == "charged" && eventsField(payload, "reference") == "ch_1",
+  ctx.Assert(hEventsField(payload, "subscription_id") == "sub_1" && hEventsField(payload, "state") == "charged" && hEventsField(payload, "reference") == "ch_1",
              "the outbox payload is %s, expected the event the broker did not take (state charged, reference ch_1), which the relay publishes as is", payload.dump());
   ctx.Equal(ok, false, "recordOutcome's result after a failed delivery");
   ctx.Equal(store::findInvoice(first.invoice_id)->state, "charged", "the invoice must stay charged when only the produce failed; its state");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
-  const store::Invoice second = eventsInvoice();
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
+  const store::Invoice second = hEventsInvoice();
   const int64_t before = ctx.Clock.Now();
-  ok = recordOutcome(second, kEventsCharged);
+  ok = recordOutcome(second, kHEventsCharged);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "recordOutcome waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "invoice_id") == second.invoice_id,
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hEventsField(rows[1]["payload"], "invoice_id") == second.invoice_id,
              "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "recordOutcome's result without a delivery report");
 }

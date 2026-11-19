@@ -680,7 +680,7 @@ import (
 	"leetbuild/harness"
 )
 
-const clientText = "Jane Doe, 1 Main St, Springfield"
+const kHClientText = "Jane Doe, 1 Main St, Springfield"
 
 type hScored struct {
 	recordID string
@@ -716,25 +716,25 @@ var hFailures = []codes.Code{codes.Unavailable, codes.DeadlineExceeded, codes.In
 
 func CheckCall(ctx *harness.Ctx) {
 	p := hPeer(ctx)
-	p.answers["acme/"+clientText] = []hScored{{"r-1", 0.96}}
-	got := fuzzyMatch(context.Background(), "acme", clientText)
+	p.answers["acme/"+kHClientText] = []hScored{{"r-1", 0.96}}
+	got := fuzzyMatch(context.Background(), "acme", kHClientText)
 	ctx.Equal(hShow(got), \`{"match":{"record_id":"r-1","score":0.96},"exact_only":false}\`, "with r-1 scoring 0.96, fuzzyMatch")
 	calls := ctx.GRPC.CallsTo("Resolve", "")
 	ctx.Assert(len(calls) > 0, "no Resolve call was made")
 	req := calls[0].Request.(*pb.ResolveRequest)
-	ctx.Assert(req.GetTenant() == "acme" && req.GetText() == clientText, "Resolve must be asked about acme's text, it was asked about %s/%q", req.GetTenant(), req.GetText())
+	ctx.Assert(req.GetTenant() == "acme" && req.GetText() == kHClientText, "Resolve must be asked about acme's text, it was asked about %s/%q", req.GetTenant(), req.GetText())
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
 	p := hPeer(ctx)
-	p.answers["acme/"+clientText] = []hScored{{"r-1", 0.96}}
-	fuzzyMatch(context.Background(), "acme", clientText)
+	p.answers["acme/"+kHClientText] = []hScored{{"r-1", 0.96}}
+	fuzzyMatch(context.Background(), "acme", kHClientText)
 	call := ctx.GRPC.CallsTo("Resolve", "")[0]
 	ctx.Assert(call.HasDeadline(), "the Resolve call carries no deadline: a stalled similarity service holds every check open")
 	ctx.Assert(150*time.Millisecond <= call.Timeout && call.Timeout <= 250*time.Millisecond, "the Resolve call carries a %v deadline, expected 200 ms", call.Timeout)
 	ctx.GRPC.SetLatency("Resolve", 5.0, "") // the similarity service stalls
 	before, callsBefore := ctx.Clock.Now(), len(ctx.GRPC.CallsTo("Resolve", ""))
-	got := fuzzyMatch(context.Background(), "acme", clientText)
+	got := fuzzyMatch(context.Background(), "acme", kHClientText)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	calls := len(ctx.GRPC.CallsTo("Resolve", "")) - callsBefore
 	ctx.Assert(calls == 1, "a check called the stalled similarity service %d times, expected one call that times out", calls)
@@ -744,12 +744,12 @@ func CheckDeadline(ctx *harness.Ctx) {
 
 func CheckNoRetry(ctx *harness.Ctx) {
 	p := hPeer(ctx)
-	p.answers["acme/"+clientText] = []hScored{{"r-1", 0.96}}
+	p.answers["acme/"+kHClientText] = []hScored{{"r-1", 0.96}}
 	for _, code := range hFailures {
 		ctx.GRPC.ClearFailures()
 		ctx.GRPC.Fail("Resolve", code, "similarity is failing", 3, "")
 		before := len(ctx.GRPC.CallsTo("Resolve", ""))
-		fuzzyMatch(context.Background(), "acme", clientText)
+		fuzzyMatch(context.Background(), "acme", kHClientText)
 		calls := len(ctx.GRPC.CallsTo("Resolve", "")) - before
 		ctx.Assert(calls == 1, "one check called Resolve %d times on a service failing with %v: a retry in the request spends the latency the deadline protects and multiplies the load. Make one attempt", calls, code)
 	}
@@ -757,11 +757,11 @@ func CheckNoRetry(ctx *harness.Ctx) {
 
 func CheckExactOnly(ctx *harness.Ctx) {
 	p := hPeer(ctx)
-	p.answers["acme/"+clientText] = []hScored{{"r-1", 0.96}}
+	p.answers["acme/"+kHClientText] = []hScored{{"r-1", 0.96}}
 	for _, code := range hFailures {
 		ctx.GRPC.ClearFailures()
 		ctx.GRPC.Fail("Resolve", code, "similarity is failing", 3, "")
-		got := fuzzyMatch(context.Background(), "acme", clientText)
+		got := fuzzyMatch(context.Background(), "acme", kHClientText)
 		ctx.Assert(hShow(got) == \`{"match":null,"exact_only":true}\`, "Resolve failed with %v and fuzzyMatch answered %s: the caller cannot tell \\"no fuzzy duplicate\\" from \\"the fuzzy pass did not run\\". Expected exact_only true for any failed call", code, hShow(got))
 	}
 	ctx.GRPC.ClearFailures()
@@ -772,15 +772,15 @@ func CheckExactOnly(ctx *harness.Ctx) {
 func CheckThreshold(ctx *harness.Ctx) {
 	p := hPeer(ctx)
 	for _, score := range []float64{0.62, 0.89} {
-		p.answers["acme/"+clientText] = []hScored{{"r-9", score}}
-		got := fuzzyMatch(context.Background(), "acme", clientText)
+		p.answers["acme/"+kHClientText] = []hScored{{"r-9", score}}
+		got := fuzzyMatch(context.Background(), "acme", kHClientText)
 		ctx.Assert(hShow(got) == \`{"match":null,"exact_only":false}\`, "the best candidate scores %v and fuzzyMatch answered %s: a look-alike below matchThreshold = 0.9 is not a duplicate", score, hShow(got))
 	}
-	p.answers["acme/"+clientText] = []hScored{{"r-5", 0.9}}
-	got := fuzzyMatch(context.Background(), "acme", clientText)
+	p.answers["acme/"+kHClientText] = []hScored{{"r-5", 0.9}}
+	got := fuzzyMatch(context.Background(), "acme", kHClientText)
 	ctx.Equal(hShow(got), \`{"match":{"record_id":"r-5","score":0.9},"exact_only":false}\`, "r-5 scores exactly 0.9, and a candidate at matchThreshold is a match; fuzzyMatch")
-	p.answers["acme/"+clientText] = []hScored{{"r-3", 0.91}, {"r-4", 0.5}}
-	got = fuzzyMatch(context.Background(), "acme", clientText)
+	p.answers["acme/"+kHClientText] = []hScored{{"r-3", 0.91}, {"r-4", 0.5}}
+	got = fuzzyMatch(context.Background(), "acme", kHClientText)
 	ctx.Equal(hShow(got), \`{"match":{"record_id":"r-3","score":0.91},"exact_only":false}\`, "r-3 scores 0.91; fuzzyMatch")
 }
 `,
@@ -795,7 +795,7 @@ func CheckThreshold(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kText = "Jane Doe, 1 Main St, Springfield";
+const std::string kHText = "Jane Doe, 1 Main St, Springfield";
 
 // Answers the candidates registered for tenant/text, best first; none for anything else.
 class HSimilarityPeer final : public dedupd::Similarity::Service {
@@ -837,26 +837,26 @@ const std::vector<std::pair<grpc::StatusCode, std::string>> kHFailures = {
 
 void CheckCall(harness::Ctx& ctx) {
   HSimilarityPeer& p = h_peer(ctx);
-  p.answers["acme/" + kText] = {{"r-1", 0.96}};
-  const FuzzyResult got = fuzzyMatch("acme", kText);
+  p.answers["acme/" + kHText] = {{"r-1", 0.96}};
+  const FuzzyResult got = fuzzyMatch("acme", kHText);
   ctx.Assert(got.match && got.match->record_id == "r-1" && got.match->score == 0.96 && !got.exact_only, "with r-1 scoring 0.96 fuzzyMatch answered %s", h_show(got));
   const auto calls = ctx.GRPC.CallsTo("Resolve");
   ctx.Assert(!calls.empty(), "no Resolve call was made");
   const auto req = calls[0].Request<dedupd::ResolveRequest>();
-  ctx.Assert(req.tenant() == "acme" && req.text() == kText, "Resolve must be asked about acme's text, it was asked about %s/%q", req.tenant(), req.text());
+  ctx.Assert(req.tenant() == "acme" && req.text() == kHText, "Resolve must be asked about acme's text, it was asked about %s/%q", req.tenant(), req.text());
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
   HSimilarityPeer& p = h_peer(ctx);
-  p.answers["acme/" + kText] = {{"r-1", 0.96}};
-  fuzzyMatch("acme", kText);
+  p.answers["acme/" + kHText] = {{"r-1", 0.96}};
+  fuzzyMatch("acme", kHText);
   const auto call = ctx.GRPC.CallsTo("Resolve")[0];
   ctx.Assert(call.HasDeadline(), "the Resolve call carries no deadline: a stalled similarity service holds every check open");
   ctx.Assert(0.15 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.25, "the Resolve call carries a %v s deadline, expected kDeadline = 200 ms", call.TimeoutSeconds());
   ctx.GRPC.SetLatency("Resolve", 5.0);  // the similarity service stalls
   const int64_t before = ctx.Clock.Now();
   const size_t calls_before = ctx.GRPC.CallsTo("Resolve").size();
-  const FuzzyResult got = fuzzyMatch("acme", kText);
+  const FuzzyResult got = fuzzyMatch("acme", kHText);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   const size_t calls = ctx.GRPC.CallsTo("Resolve").size() - calls_before;
   ctx.Assert(calls == 1, "a check called the stalled similarity service %d times, expected one call that times out", calls);
@@ -866,12 +866,12 @@ void CheckDeadline(harness::Ctx& ctx) {
 
 void CheckNoRetry(harness::Ctx& ctx) {
   HSimilarityPeer& p = h_peer(ctx);
-  p.answers["acme/" + kText] = {{"r-1", 0.96}};
+  p.answers["acme/" + kHText] = {{"r-1", 0.96}};
   for (const auto& [code, name] : kHFailures) {
     ctx.GRPC.ClearFailures();
     ctx.GRPC.Fail("Resolve", code, "similarity is failing", 3);
     const size_t before = ctx.GRPC.CallsTo("Resolve").size();
-    fuzzyMatch("acme", kText);
+    fuzzyMatch("acme", kHText);
     const size_t calls = ctx.GRPC.CallsTo("Resolve").size() - before;
     ctx.Assert(calls == 1, "one check called Resolve %d times on a service failing with %s: a retry in the request spends the latency the deadline protects and multiplies the load. Make one attempt", calls, name);
   }
@@ -879,11 +879,11 @@ void CheckNoRetry(harness::Ctx& ctx) {
 
 void CheckExactOnly(harness::Ctx& ctx) {
   HSimilarityPeer& p = h_peer(ctx);
-  p.answers["acme/" + kText] = {{"r-1", 0.96}};
+  p.answers["acme/" + kHText] = {{"r-1", 0.96}};
   for (const auto& [code, name] : kHFailures) {
     ctx.GRPC.ClearFailures();
     ctx.GRPC.Fail("Resolve", code, "similarity is failing", 3);
-    const FuzzyResult got = fuzzyMatch("acme", kText);
+    const FuzzyResult got = fuzzyMatch("acme", kHText);
     ctx.Assert(!got.match && got.exact_only, "Resolve failed with %s and fuzzyMatch answered %s: the caller cannot tell \\"no fuzzy duplicate\\" from \\"the fuzzy pass did not run\\". Expected exact_only true for any failed call", name, h_show(got));
   }
   ctx.GRPC.ClearFailures();
@@ -894,15 +894,15 @@ void CheckExactOnly(harness::Ctx& ctx) {
 void CheckThreshold(harness::Ctx& ctx) {
   HSimilarityPeer& p = h_peer(ctx);
   for (const double score : {0.62, 0.89}) {
-    p.answers["acme/" + kText] = {{"r-9", score}};
-    const FuzzyResult got = fuzzyMatch("acme", kText);
+    p.answers["acme/" + kHText] = {{"r-9", score}};
+    const FuzzyResult got = fuzzyMatch("acme", kHText);
     ctx.Assert(!got.match && !got.exact_only, "the best candidate scores %v and fuzzyMatch answered %s: a look-alike below kMatchThreshold = 0.9 is not a duplicate", score, h_show(got));
   }
-  p.answers["acme/" + kText] = {{"r-5", 0.9}};
-  FuzzyResult got = fuzzyMatch("acme", kText);
+  p.answers["acme/" + kHText] = {{"r-5", 0.9}};
+  FuzzyResult got = fuzzyMatch("acme", kHText);
   ctx.Assert(got.match && got.match->record_id == "r-5" && !got.exact_only, "r-5 scores exactly 0.9 and fuzzyMatch answered %s: a candidate at kMatchThreshold is a match", h_show(got));
-  p.answers["acme/" + kText] = {{"r-3", 0.91}, {"r-4", 0.5}};
-  got = fuzzyMatch("acme", kText);
+  p.answers["acme/" + kHText] = {{"r-3", 0.91}, {"r-4", 0.5}};
+  got = fuzzyMatch("acme", kHText);
   ctx.Assert(got.match && got.match->record_id == "r-3" && !got.exact_only, "r-3 scores 0.91 and fuzzyMatch answered %s", h_show(got));
 }
 `,

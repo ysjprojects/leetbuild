@@ -1091,35 +1091,35 @@ import (
 )
 
 const (
-	apiSubject = "Invoice 4471 charged twice"
-	apiBody    = "My card ending 4917 was charged twice for invoice 4471."
-	apiDay     = 24 * 3600
+	kHApiSubject = "Invoice 4471 charged twice"
+	kHApiBody    = "My card ending 4917 was charged twice for invoice 4471."
+	kHApiDay     = 24 * 3600
 )
 
 var (
-	apiR1    = []string{"X-Actor-Id", "R-1", "X-Actor-Role", "requester"}
-	apiR2    = []string{"X-Actor-Id", "R-2", "X-Actor-Role", "requester"}
-	apiAgent = []string{"X-Actor-Id", "A-7", "X-Actor-Role", "agent"}
+	hApiR1    = []string{"X-Actor-Id", "R-1", "X-Actor-Role", "requester"}
+	hApiR2    = []string{"X-Actor-Id", "R-2", "X-Actor-Role", "requester"}
+	hApiAgent = []string{"X-Actor-Id", "A-7", "X-Actor-Role", "agent"}
 )
 
 var (
-	apiGuardTable = map[string]string{"open": "pending,resolved", "pending": "open,resolved", "resolved": "closed,open", "closed": "open"}
-	apiGuardPaths = map[string][]string{"open": nil, "pending": {"pending"}, "resolved": {"resolved"}, "closed": {"resolved", "closed"}}
+	hApiGuardTable = map[string]string{"open": "pending,resolved", "pending": "open,resolved", "resolved": "closed,open", "closed": "open"}
+	hApiGuardPaths = map[string][]string{"open": nil, "pending": {"pending"}, "resolved": {"resolved"}, "closed": {"resolved", "closed"}}
 )
 
-type apiRefusal struct {
+type HApiRefusal struct {
 	From    string   \`json:"from"\`
 	Allowed []string \`json:"allowed"\`
 }
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiOpen(ctx *harness.Ctx, c *harness.HTTP) string {
-	r := c.Post("/v1/tickets", map[string]string{"subject": apiSubject, "body": apiBody}, apiR1...)
+func hApiOpen(ctx *harness.Ctx, c *harness.HTTP) string {
+	r := c.Post("/v1/tickets", map[string]string{"subject": kHApiSubject, "body": kHApiBody}, hApiR1...)
 	ctx.Equal(r.Status, 201, "POST /v1/tickets (%s)", r.Text())
 	var ticket store.Ticket
 	r.Decode(&ticket)
@@ -1127,111 +1127,111 @@ func apiOpen(ctx *harness.Ctx, c *harness.HTTP) string {
 	return ticket.ID
 }
 
-func apiMove(c *harness.HTTP, ticketID, state string, who []string) *harness.Response {
+func hApiMove(c *harness.HTTP, ticketID, state string, who []string) *harness.Response {
 	return c.Patch("/v1/tickets/"+ticketID, map[string]string{"state": state}, who...)
 }
 
-func apiWalk(ctx *harness.Ctx, c *harness.HTTP, ticketID string, states ...string) {
+func hApiWalk(ctx *harness.Ctx, c *harness.HTTP, ticketID string, states ...string) {
 	for _, state := range states {
-		r := apiMove(c, ticketID, state, apiAgent)
+		r := hApiMove(c, ticketID, state, hApiAgent)
 		ctx.Equal(r.Status, 200, "an agent moving %s to %s (%s)", ticketID, state, r.Text())
 	}
 }
 
-func apiState(ticketID string) string { return store.GetTicket(context.Background(), ticketID).State }
+func hApiState(ticketID string) string { return store.GetTicket(context.Background(), ticketID).State }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	ticketID := apiOpen(ctx, c)
-	r := apiMove(c, ticketID, "pending", apiR1)
+	c := hApiClient(ctx)
+	ticketID := hApiOpen(ctx, c)
+	r := hApiMove(c, ticketID, "pending", hApiR1)
 	ctx.Equal(r.Status, 200, "the requester moving their ticket open → pending (%s)", r.Text())
 	ctx.Assert(strings.Contains(r.Text(), \`"pending"\`), "the move must answer the ticket in its new state, got %s", r.Text())
 	stored := store.GetTicket(context.Background(), ticketID)
 	ctx.Assert(stored.State == "pending" && stored.RequesterID == "R-1", "the store holds %+v", stored)
 	notes := store.Page(context.Background(), ticketID, 0, 10)
-	ctx.Assert(len(notes) == 1 && notes[0].Body == apiBody, "the create must append the body as the first note, the ticket has %+v", notes)
+	ctx.Assert(len(notes) == 1 && notes[0].Body == kHApiBody, "the create must append the body as the first note, the ticket has %+v", notes)
 }
 
 func CheckTransitionGuard(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	ticketID := apiOpen(ctx, c)
-	r := apiMove(c, ticketID, "closed", apiR1)
+	c := hApiClient(ctx)
+	ticketID := hApiOpen(ctx, c)
+	r := hApiMove(c, ticketID, "closed", hApiR1)
 	ctx.Equal(r.Status, 409, "open → closed (%s): a ticket closes only from resolved", r.Text())
-	var refusal apiRefusal
+	var refusal HApiRefusal
 	r.Decode(&refusal)
 	sort.Strings(refusal.Allowed)
 	ctx.Assert(refusal.From == "open" && strings.Join(refusal.Allowed, ",") == "pending,resolved", "the 409 must name the current state and the states allowed from it, got %s", r.Text())
-	ctx.Equal(apiState(ticketID), "open", "a refused move must leave the ticket; its state")
-	r = apiMove(c, ticketID, "archived", apiAgent)
+	ctx.Equal(hApiState(ticketID), "open", "a refused move must leave the ticket; its state")
+	r = hApiMove(c, ticketID, "archived", hApiAgent)
 	ctx.Equal(r.Status, 400, "state 'archived' (a state outside states is 400)")
-	apiWalk(ctx, c, ticketID, "resolved", "closed")
-	r = apiMove(c, ticketID, "pending", apiAgent)
-	refusal = apiRefusal{}
+	hApiWalk(ctx, c, ticketID, "resolved", "closed")
+	r = hApiMove(c, ticketID, "pending", hApiAgent)
+	refusal = HApiRefusal{}
 	r.Decode(&refusal)
 	ctx.Assert(r.Status == 409 && strings.Join(refusal.Allowed, ",") == "open", "closed → pending answered %d %s, expected 409 allowing only open", r.Status, r.Text())
 	for _, from := range []string{"open", "pending", "resolved", "closed"} {
 		for _, to := range []string{"open", "pending", "resolved", "closed"} {
-			id := apiOpen(ctx, c)
-			apiWalk(ctx, c, id, apiGuardPaths[from]...)
-			r = apiMove(c, id, to, apiAgent)
-			if strings.Contains(","+apiGuardTable[from]+",", ","+to+",") {
+			id := hApiOpen(ctx, c)
+			hApiWalk(ctx, c, id, hApiGuardPaths[from]...)
+			r = hApiMove(c, id, to, hApiAgent)
+			if strings.Contains(","+hApiGuardTable[from]+",", ","+to+",") {
 				ctx.Equal(r.Status, 200, "%s → %s (%s): allowedTransitions allows it", from, to, r.Text())
 				continue
 			}
 			ctx.Equal(r.Status, 409, "%s → %s (%s): allowedTransitions does not allow it", from, to, r.Text())
-			refusal = apiRefusal{}
+			refusal = HApiRefusal{}
 			r.Decode(&refusal)
 			sort.Strings(refusal.Allowed)
-			ctx.Equal(strings.Join(refusal.Allowed, ","), apiGuardTable[from], "the states the 409 for %s → %s allows", from, to)
+			ctx.Equal(strings.Join(refusal.Allowed, ","), hApiGuardTable[from], "the states the 409 for %s → %s allows", from, to)
 		}
 	}
 }
 
 func CheckActorScope(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	ticketID := apiOpen(ctx, c)
-	r := apiMove(c, ticketID, "pending", apiR2)
+	c := hApiClient(ctx)
+	ticketID := hApiOpen(ctx, c)
+	r := hApiMove(c, ticketID, "pending", hApiR2)
 	ctx.Equal(r.Status, 403, "requester R-2 moving R-1's ticket (a requester moves only their own tickets)")
-	ctx.Equal(apiState(ticketID), "open", "another requester's move must leave the ticket; its state")
-	r = apiMove(c, ticketID, "pending", []string{"X-Actor-Id", "R-1", "X-Actor-Role", "admin"})
+	ctx.Equal(hApiState(ticketID), "open", "another requester's move must leave the ticket; its state")
+	r = hApiMove(c, ticketID, "pending", []string{"X-Actor-Id", "R-1", "X-Actor-Role", "admin"})
 	ctx.Equal(r.Status, 403, "X-Actor-Role admin (a role other than requester or agent is 403)")
-	r = apiMove(c, ticketID, "pending", []string{"X-Actor-Id", "R-1"})
+	r = hApiMove(c, ticketID, "pending", []string{"X-Actor-Id", "R-1"})
 	ctx.Equal(r.Status, 403, "the owner moving without X-Actor-Role (a missing role is not requester or agent)")
-	r = apiMove(c, ticketID, "pending", []string{"X-Actor-Role", "agent"})
+	r = hApiMove(c, ticketID, "pending", []string{"X-Actor-Role", "agent"})
 	ctx.Equal(r.Status, 401, "a move without X-Actor-Id")
-	r = apiMove(c, ticketID, "pending", apiAgent)
+	r = hApiMove(c, ticketID, "pending", hApiAgent)
 	ctx.Equal(r.Status, 200, "an agent moving any ticket (%s)", r.Text())
 }
 
 func CheckReopenWindow(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	ticketID := apiOpen(ctx, c)
-	apiWalk(ctx, c, ticketID, "resolved", "closed")
-	ctx.Clock.Advance(7*apiDay - 60)
-	r := apiMove(c, ticketID, "open", apiR1)
+	c := hApiClient(ctx)
+	ticketID := hApiOpen(ctx, c)
+	hApiWalk(ctx, c, ticketID, "resolved", "closed")
+	ctx.Clock.Advance(7*kHApiDay - 60)
+	r := hApiMove(c, ticketID, "open", hApiR1)
 	ctx.Equal(r.Status, 200, "reopening a minute before 7 days after the close (%s)", r.Text())
-	apiWalk(ctx, c, ticketID, "resolved", "closed")
-	ctx.Clock.Advance(7*apiDay + 60)
-	r = apiMove(c, ticketID, "open", apiR1)
+	hApiWalk(ctx, c, ticketID, "resolved", "closed")
+	ctx.Clock.Advance(7*kHApiDay + 60)
+	r = hApiMove(c, ticketID, "open", hApiR1)
 	ctx.Equal(r.Status, 409, "reopening a minute past 7 days after the close (past reopenWindowSeconds, 7 days, the move is 409)")
-	var refusal apiRefusal
+	var refusal HApiRefusal
 	r.Decode(&refusal)
 	ctx.Assert(refusal.Allowed != nil && len(refusal.Allowed) == 0, "a reopen past the window has nowhere to go: allowed must be empty, got %s", r.Text())
-	ctx.Equal(apiState(ticketID), "closed", "the stale reopen must leave the ticket; its state")
+	ctx.Equal(hApiState(ticketID), "closed", "the stale reopen must leave the ticket; its state")
 }
 
 func CheckNoContentInLogs(ctx *harness.Ctx) {
 	var logged bytes.Buffer
 	log.SetOutput(&logged)
 	defer log.SetOutput(os.Stderr)
-	c := apiClient(ctx)
-	ticketID := apiOpen(ctx, c)
-	apiMove(c, ticketID, "closed", apiR1)
-	apiMove(c, ticketID, "pending", apiR2)
-	apiMove(c, ticketID, "pending", apiR1)
+	c := hApiClient(ctx)
+	ticketID := hApiOpen(ctx, c)
+	hApiMove(c, ticketID, "closed", hApiR1)
+	hApiMove(c, ticketID, "pending", hApiR2)
+	hApiMove(c, ticketID, "pending", hApiR1)
 	text := logged.String()
 	ctx.Assert(strings.Contains(text, ticketID), "the write path must log the ticket id; it logged %q", text)
-	for _, words := range []string{apiSubject, apiBody, "4917"} {
+	for _, words := range []string{kHApiSubject, kHApiBody, "4917"} {
 		ctx.Assert(!strings.Contains(text, words), "a log line carries what the customer wrote (%q): %q. Log ids, roles and states", words, text)
 	}
 }

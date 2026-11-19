@@ -1050,90 +1050,90 @@ import (
 	"leetbuild/harness"
 )
 
-const stateNode = "node:gpu-1"
+const kHStateNode = "node:gpu-1"
 
-func stateLedger(ctx *harness.Ctx) {
+func hStateLedger(ctx *harness.Ctx) {
 	ctx.NoError(registerNode(context.Background(), "gpu-1", "a100", 8), "registerNode")
 }
 
-func stateAllocated(ctx *harness.Ctx) int {
-	v, _ := ctx.Redis.HGet(stateNode, "allocated")
+func hStateAllocated(ctx *harness.Ctx) int {
+	v, _ := ctx.Redis.HGet(kHStateNode, "allocated")
 	n, _ := strconv.Atoi(v)
 	return n
 }
 
-func stateAllocate(ctx *harness.Ctx, pid string, count int) string {
+func hStateAllocate(ctx *harness.Ctx, pid string, count int) string {
 	result, err := allocate(context.Background(), "gpu-1", pid, count)
 	ctx.NoError(err, "allocate(%s, %d)", pid, count)
 	return result
 }
 
-func stateRelease(ctx *harness.Ctx, pid string) bool {
+func hStateRelease(ctx *harness.Ctx, pid string) bool {
 	moved, err := release(context.Background(), "gpu-1", pid)
 	ctx.NoError(err, "release(%s)", pid)
 	return moved
 }
 
-func statePlacements(ctx *harness.Ctx) []string {
+func hStatePlacements(ctx *harness.Ctx) []string {
 	members := ctx.Redis.SMembers("node:gpu-1:placements")
 	sort.Strings(members)
 	return members
 }
 
 func CheckNodeLedgerKeys(ctx *harness.Ctx) {
-	stateLedger(ctx)
+	hStateLedger(ctx)
 	ctx.Assert(ctx.Redis.SIsMember("nodes", "gpu-1"), "registerNode must add the id to the nodes set (keys: %v)", ctx.Redis.Keys("*"))
-	node := ctx.Redis.HGetAll(stateNode)
+	node := ctx.Redis.HGetAll(kHStateNode)
 	ctx.Assert(node["gpu_type"] == "a100" && node["capacity"] == "8" && node["allocated"] == "0", "node:gpu-1 is %v, expected gpu_type a100, capacity 8, allocated 0", node)
 	ctx.Equal(ctx.Redis.Exists("heartbeat:gpu-1"), 1, "registerNode must set heartbeat:gpu-1; its existence")
-	ctx.Equal(stateAllocate(ctx, "p-1", 4), "ALLOCATED", "4 of 8 GPUs on an idle node")
-	ctx.Equal(stateAllocated(ctx), 4, "allocated after booking 4")
+	ctx.Equal(hStateAllocate(ctx, "p-1", 4), "ALLOCATED", "4 of 8 GPUs on an idle node")
+	ctx.Equal(hStateAllocated(ctx), 4, "allocated after booking 4")
 	record := ctx.Redis.HGetAll("placement:p-1")
 	ctx.Assert(record["node_id"] == "gpu-1" && record["count"] == "4" && record["status"] == "allocated", "placement:p-1 is %v, expected node_id gpu-1, count 4, status allocated", record)
-	ctx.Equal(statePlacements(ctx), []string{"p-1"}, "node:gpu-1:placements after one allocation")
-	ctx.Equal(stateRelease(ctx, "p-1"), true, "the first release of p-1 moves the counters and reports true")
-	ctx.Equal(stateAllocated(ctx), 0, "allocated after the release")
+	ctx.Equal(hStatePlacements(ctx), []string{"p-1"}, "node:gpu-1:placements after one allocation")
+	ctx.Equal(hStateRelease(ctx, "p-1"), true, "the first release of p-1 moves the counters and reports true")
+	ctx.Equal(hStateAllocated(ctx), 0, "allocated after the release")
 	status, _ := ctx.Redis.HGet("placement:p-1", "status")
 	ctx.Equal(status, "released", "release must mark placement:p-1 released; its status")
 }
 
 func CheckAtomicAllocation(ctx *harness.Ctx) {
-	stateLedger(ctx)
+	hStateLedger(ctx)
 	// Another scheduler replica books the whole node the instant the first command on node:gpu-1 lands.
 	var rival string
-	ctx.Redis.After(stateNode, func() any {
-		if stateAllocated(ctx)+8 > 8 {
+	ctx.Redis.After(kHStateNode, func() any {
+		if hStateAllocated(ctx)+8 > 8 {
 			rival = "no room"
 			return nil
 		}
-		ctx.Redis.Do("HINCRBY", stateNode, "allocated", 8)
+		ctx.Redis.Do("HINCRBY", kHStateNode, "allocated", 8)
 		ctx.Redis.Do("HSET", "placement:rival", "node_id", "gpu-1", "count", 8, "status", "allocated")
 		ctx.Redis.Do("SADD", "node:gpu-1:placements", "rival")
 		rival = "booked"
 		return nil
 	})
-	result := stateAllocate(ctx, "p-1", 8)
+	result := hStateAllocate(ctx, "p-1", 8)
 	ctx.Assert(rival != "", "allocate never touched node:gpu-1")
-	ctx.Assert(stateAllocated(ctx) <= 8, "node:gpu-1 has %d GPUs allocated of 8: a rival replica booked the node between your read of the counters and your write (%s), and your request answered %s. Compare and HINCRBY inside one EVAL", stateAllocated(ctx), rival, result)
+	ctx.Assert(hStateAllocated(ctx) <= 8, "node:gpu-1 has %d GPUs allocated of 8: a rival replica booked the node between your read of the counters and your write (%s), and your request answered %s. Compare and HINCRBY inside one EVAL", hStateAllocated(ctx), rival, result)
 	if rival == "booked" {
 		ctx.Equal(result, "NO_CAPACITY", "the rival booked the node first, so the request")
 	}
-	ctx.Equal(stateAllocate(ctx, "p-2", 1), "NO_CAPACITY", "with the node full the next placement")
+	ctx.Equal(hStateAllocate(ctx, "p-2", 1), "NO_CAPACITY", "with the node full the next placement")
 }
 
 func CheckHeartbeatLiveness(ctx *harness.Ctx) {
 	// The TTL as it stands right after the first command that wrote the heartbeat.
 	var bornTTL any = "never written"
 	ctx.Redis.After("heartbeat:gpu-1", func() any { bornTTL = ctx.Redis.TTL("heartbeat:gpu-1"); return nil })
-	stateLedger(ctx)
+	hStateLedger(ctx)
 	born, _ := bornTTL.(int64)
 	ctx.Assert(0 < born && born <= 30, "right after the command that wrote heartbeat:gpu-1 its TTL was %v: set it with EX config.HeartbeatTTL in the same command, or a crash before the second command leaves a heartbeat that never lapses", bornTTL)
 	ttl := ctx.Redis.TTL("heartbeat:gpu-1")
 	ctx.Assert(0 < ttl && ttl <= 30, "heartbeat:gpu-1 has TTL %d: registerNode must set it with config.HeartbeatTTL (30 s), or a dead node stays schedulable", ttl)
 	ctx.Clock.Advance(31)
 	ctx.Equal(ctx.Redis.Exists("heartbeat:gpu-1"), 0, "31 s after registration the heartbeat must have lapsed; its existence")
-	ctx.Equal(stateAllocate(ctx, "p-1", 2), "NO_HEARTBEAT", "a node whose heartbeat lapsed")
-	ctx.Assert(stateAllocated(ctx) == 0 && ctx.Redis.Exists("placement:p-1") == 0, "a refused placement must write nothing")
+	ctx.Equal(hStateAllocate(ctx, "p-1", 2), "NO_HEARTBEAT", "a node whose heartbeat lapsed")
+	ctx.Assert(hStateAllocated(ctx) == 0 && ctx.Redis.Exists("placement:p-1") == 0, "a refused placement must write nothing")
 	var beatTTL any = "never written"
 	ctx.Redis.After("heartbeat:gpu-1", func() any { beatTTL = ctx.Redis.TTL("heartbeat:gpu-1"); return nil })
 	ctx.NoError(heartbeat(context.Background(), "gpu-1"), "heartbeat")
@@ -1141,7 +1141,7 @@ func CheckHeartbeatLiveness(ctx *harness.Ctx) {
 	ctx.Assert(0 < beat && beat <= 30, "right after heartbeat() wrote heartbeat:gpu-1 its TTL was %v, expected config.HeartbeatTTL in the same command", beatTTL)
 	ttl = ctx.Redis.TTL("heartbeat:gpu-1")
 	ctx.Assert(0 < ttl && ttl <= 30, "heartbeat() left TTL %d on heartbeat:gpu-1, expected config.HeartbeatTTL", ttl)
-	ctx.Equal(stateAllocate(ctx, "p-1", 2), "ALLOCATED", "once the agent reports in again the node takes placements")
+	ctx.Equal(hStateAllocate(ctx, "p-1", 2), "ALLOCATED", "once the agent reports in again the node takes placements")
 	// The heartbeat lapses the instant allocate first touches it; was p-2 booked by then?
 	fired, booked := false, false
 	ctx.Redis.After("heartbeat:gpu-1", func() any {
@@ -1149,7 +1149,7 @@ func CheckHeartbeatLiveness(ctx *harness.Ctx) {
 		ctx.Redis.Del("heartbeat:gpu-1")
 		return nil
 	})
-	raced := stateAllocate(ctx, "p-2", 2)
+	raced := hStateAllocate(ctx, "p-2", 2)
 	ctx.Assert(fired, "allocate never looked at heartbeat:gpu-1")
 	expected, when := "NO_HEARTBEAT", "not yet"
 	if booked {
@@ -1160,17 +1160,17 @@ func CheckHeartbeatLiveness(ctx *harness.Ctx) {
 }
 
 func CheckIdempotentRelease(ctx *harness.Ctx) {
-	stateLedger(ctx)
-	ctx.Equal(stateAllocate(ctx, "p-1", 4), "ALLOCATED", "booking 4")
-	ctx.Equal(stateRelease(ctx, "p-1"), true, "the first release")
-	second := stateRelease(ctx, "p-1")
-	ctx.Equal(stateAllocated(ctx), 0, "allocated after releasing p-1 twice (a retried release must not move the counters again)")
+	hStateLedger(ctx)
+	ctx.Equal(hStateAllocate(ctx, "p-1", 4), "ALLOCATED", "booking 4")
+	ctx.Equal(hStateRelease(ctx, "p-1"), true, "the first release")
+	second := hStateRelease(ctx, "p-1")
+	ctx.Equal(hStateAllocated(ctx), 0, "allocated after releasing p-1 twice (a retried release must not move the counters again)")
 	ctx.Equal(second, false, "the second release of p-1")
-	ctx.Assert(!stateRelease(ctx, "ghost") && stateAllocated(ctx) == 0, "releasing an unknown placement moves nothing")
-	ctx.Equal(stateAllocate(ctx, "p-2", 8), "ALLOCATED", "the node has all 8 GPUs free after one real release")
+	ctx.Assert(!hStateRelease(ctx, "ghost") && hStateAllocated(ctx) == 0, "releasing an unknown placement moves nothing")
+	ctx.Equal(hStateAllocate(ctx, "p-2", 8), "ALLOCATED", "the node has all 8 GPUs free after one real release")
 	ctx.Redis.Do("HSET", "placement:p-2", "status", "running") // the start path (step 3) marked it running
-	ctx.Assert(stateRelease(ctx, "p-2") && stateAllocated(ctx) == 0, "releasing a running placement left allocated at %d: every id in node:gpu-1:placements is open, whatever its status", stateAllocated(ctx))
-	ctx.Equal(stateAllocate(ctx, "p-3", 4), "ALLOCATED", "booking 4")
+	ctx.Assert(hStateRelease(ctx, "p-2") && hStateAllocated(ctx) == 0, "releasing a running placement left allocated at %d: every id in node:gpu-1:placements is open, whatever its status", hStateAllocated(ctx))
+	ctx.Equal(hStateAllocate(ctx, "p-3", 4), "ALLOCATED", "booking 4")
 	// Another replica's retry of the same release lands the instant this one first touches the open set.
 	other := ""
 	ctx.Redis.After("node:gpu-1:placements", func() any {
@@ -1178,26 +1178,26 @@ func CheckIdempotentRelease(ctx *harness.Ctx) {
 			other = "already released"
 			return nil
 		}
-		ctx.Redis.Do("HINCRBY", stateNode, "allocated", -4)
+		ctx.Redis.Do("HINCRBY", kHStateNode, "allocated", -4)
 		ctx.Redis.Do("HSET", "placement:p-3", "status", "released")
 		ctx.Redis.Do("SREM", "node:gpu-1:placements", "p-3")
 		other = "released"
 		return nil
 	})
-	mine := stateRelease(ctx, "p-3")
+	mine := hStateRelease(ctx, "p-3")
 	ctx.Assert(other != "", "release never touched node:gpu-1:placements")
-	ctx.Equal(stateAllocated(ctx), 0, "allocated after two concurrent releases of p-3 (4 GPUs): the other one (%s) landed between your membership check and your write. Check SISMEMBER and move the counters in one script; allocated", other)
+	ctx.Equal(hStateAllocated(ctx), 0, "allocated after two concurrent releases of p-3 (4 GPUs): the other one (%s) landed between your membership check and your write. Check SISMEMBER and move the counters in one script; allocated", other)
 	ctx.Equal(mine, other == "already released", "release reported %v while the other replica's %s: exactly one of the two moves the counters and reports true; release", mine, other)
 }
 
 func CheckHonestContention(ctx *harness.Ctx) {
-	stateLedger(ctx)
-	ctx.Equal(stateAllocate(ctx, "p-1", 6), "ALLOCATED", "booking 6")
-	ctx.Equal(stateAllocate(ctx, "p-2", 4), "NO_CAPACITY", "4 GPUs on a node with 2 free")
-	ctx.Equal(stateAllocated(ctx), 6, "allocated after a refused placement")
+	hStateLedger(ctx)
+	ctx.Equal(hStateAllocate(ctx, "p-1", 6), "ALLOCATED", "booking 6")
+	ctx.Equal(hStateAllocate(ctx, "p-2", 4), "NO_CAPACITY", "4 GPUs on a node with 2 free")
+	ctx.Equal(hStateAllocated(ctx), 6, "allocated after a refused placement")
 	ctx.Equal(ctx.Redis.Exists("placement:p-2"), 0, "a refused placement must leave no placement:p-2 record; its existence")
-	ctx.Equal(statePlacements(ctx), []string{"p-1"}, "node:gpu-1:placements after a refused placement")
-	ctx.Assert(stateAllocate(ctx, "p-1", 6) == "ALLOCATED" && stateAllocated(ctx) == 6, "a retried allocation of the same placement id is ALLOCATED without booking twice")
+	ctx.Equal(hStatePlacements(ctx), []string{"p-1"}, "node:gpu-1:placements after a refused placement")
+	ctx.Assert(hStateAllocate(ctx, "p-1", 6) == "ALLOCATED" && hStateAllocated(ctx) == 6, "a retried allocation of the same placement id is ALLOCATED without booking twice")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1208,16 +1208,16 @@ func CheckHonestContention(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kStateNode = "node:gpu-1";
+const std::string kHStateNode = "node:gpu-1";
 
-void stateLedger() { register_node("gpu-1", "a100", 8); }
+void hStateLedger() { register_node("gpu-1", "a100", 8); }
 
-int stateAllocated(harness::Ctx& ctx) {
-  const auto v = ctx.Redis.HGet(kStateNode, "allocated");
+int hStateAllocated(harness::Ctx& ctx) {
+  const auto v = ctx.Redis.HGet(kHStateNode, "allocated");
   return v ? std::stoi(*v) : 0;
 }
 
-std::vector<std::string> statePlacements(harness::Ctx& ctx) {
+std::vector<std::string> hStatePlacements(harness::Ctx& ctx) {
   auto members = ctx.Redis.SMembers("node:gpu-1:placements");
   std::sort(members.begin(), members.end());
   return members;
@@ -1226,45 +1226,45 @@ std::vector<std::string> statePlacements(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckNodeLedgerKeys(harness::Ctx& ctx) {
-  stateLedger();
+  hStateLedger();
   ctx.Assert(ctx.Redis.SIsMember("nodes", "gpu-1"), "register_node must add the id to the nodes set (keys: %v)", ctx.Redis.Keys("*"));
-  const auto node = ctx.Redis.HGetAll(kStateNode);
+  const auto node = ctx.Redis.HGetAll(kHStateNode);
   ctx.Assert(node.count("gpu_type") && node.at("gpu_type") == "a100" && node.count("capacity") && node.at("capacity") == "8" &&
                  node.count("allocated") && node.at("allocated") == "0",
              "node:gpu-1 is %v, expected gpu_type a100, capacity 8, allocated 0", node);
   ctx.Equal(ctx.Redis.Exists("heartbeat:gpu-1"), 1, "register_node must set heartbeat:gpu-1; its existence");
   ctx.Equal(allocate("gpu-1", "p-1", 4), "ALLOCATED", "4 of 8 GPUs on an idle node");
-  ctx.Equal(stateAllocated(ctx), 4, "allocated after booking 4");
+  ctx.Equal(hStateAllocated(ctx), 4, "allocated after booking 4");
   const auto record = ctx.Redis.HGetAll("placement:p-1");
   ctx.Assert(record.count("node_id") && record.at("node_id") == "gpu-1" && record.count("count") && record.at("count") == "4" &&
                  record.count("status") && record.at("status") == "allocated",
              "placement:p-1 is %v, expected node_id gpu-1, count 4, status allocated", record);
-  ctx.Equal(statePlacements(ctx), {"p-1"}, "node:gpu-1:placements after one allocation");
+  ctx.Equal(hStatePlacements(ctx), {"p-1"}, "node:gpu-1:placements after one allocation");
   ctx.Equal(release("gpu-1", "p-1"), true, "the first release of p-1 moves the counters and reports true");
-  ctx.Equal(stateAllocated(ctx), 0, "allocated after the release");
+  ctx.Equal(hStateAllocated(ctx), 0, "allocated after the release");
   ctx.Equal(ctx.Redis.HGet("placement:p-1", "status"), "released", "release must mark placement:p-1 released; its status");
 }
 
 void CheckAtomicAllocation(harness::Ctx& ctx) {
-  stateLedger();
+  hStateLedger();
   // Another scheduler replica books the whole node the instant the first command on node:gpu-1 lands.
   std::string rival;
-  ctx.Redis.After(kStateNode, [&] {
-    if (stateAllocated(ctx) + 8 > 8) {
+  ctx.Redis.After(kHStateNode, [&] {
+    if (hStateAllocated(ctx) + 8 > 8) {
       rival = "no room";
       return;
     }
-    ctx.Redis.Do("HINCRBY", kStateNode, "allocated", 8);
+    ctx.Redis.Do("HINCRBY", kHStateNode, "allocated", 8);
     ctx.Redis.Do("HSET", "placement:rival", "node_id", "gpu-1", "count", 8, "status", "allocated");
     ctx.Redis.Do("SADD", "node:gpu-1:placements", "rival");
     rival = "booked";
   });
   const std::string result = allocate("gpu-1", "p-1", 8);
   ctx.Assert(!rival.empty(), "allocate never touched node:gpu-1");
-  ctx.Assert(stateAllocated(ctx) <= 8,
+  ctx.Assert(hStateAllocated(ctx) <= 8,
              "node:gpu-1 has %d GPUs allocated of 8: a rival replica booked the node between your read of the counters and "
              "your write (%s), and your request answered %s. Compare and HINCRBY inside one EVAL",
-             stateAllocated(ctx), rival, result);
+             hStateAllocated(ctx), rival, result);
   if (rival == "booked") ctx.Equal(result, "NO_CAPACITY", "the rival booked the node first, so the request");
   ctx.Equal(allocate("gpu-1", "p-2", 1), "NO_CAPACITY", "with the node full the next placement");
 }
@@ -1273,7 +1273,7 @@ void CheckHeartbeatLiveness(harness::Ctx& ctx) {
   // The TTL as it stands right after the first command that wrote the heartbeat.
   long long born = -3;
   ctx.Redis.After("heartbeat:gpu-1", [&] { born = ctx.Redis.TTL("heartbeat:gpu-1"); });
-  stateLedger();
+  hStateLedger();
   ctx.Assert(0 < born && born <= 30,
              "right after the command that wrote heartbeat:gpu-1 its TTL was %d (-3: never written): set it with EX kHeartbeatTtlS in the same "
              "command, or a crash before the second command leaves a heartbeat that never lapses",
@@ -1283,7 +1283,7 @@ void CheckHeartbeatLiveness(harness::Ctx& ctx) {
   ctx.Clock.Advance(31);
   ctx.Equal(ctx.Redis.Exists("heartbeat:gpu-1"), 0, "31 s after registration the heartbeat must have lapsed; its existence");
   ctx.Equal(allocate("gpu-1", "p-1", 2), "NO_HEARTBEAT", "a node whose heartbeat lapsed");
-  ctx.Assert(stateAllocated(ctx) == 0 && ctx.Redis.Exists("placement:p-1") == 0, "a refused placement must write nothing");
+  ctx.Assert(hStateAllocated(ctx) == 0 && ctx.Redis.Exists("placement:p-1") == 0, "a refused placement must write nothing");
   long long beat = -3;
   ctx.Redis.After("heartbeat:gpu-1", [&] { beat = ctx.Redis.TTL("heartbeat:gpu-1"); });
   heartbeat("gpu-1");
@@ -1308,17 +1308,17 @@ void CheckHeartbeatLiveness(harness::Ctx& ctx) {
 }
 
 void CheckIdempotentRelease(harness::Ctx& ctx) {
-  stateLedger();
+  hStateLedger();
   ctx.Equal(allocate("gpu-1", "p-1", 4), "ALLOCATED", "booking 4");
   ctx.Equal(release("gpu-1", "p-1"), true, "the first release");
   const bool second = release("gpu-1", "p-1");
-  ctx.Equal(stateAllocated(ctx), 0, "allocated after releasing p-1 twice (a retried release must not move the counters again)");
+  ctx.Equal(hStateAllocated(ctx), 0, "allocated after releasing p-1 twice (a retried release must not move the counters again)");
   ctx.Equal(second, false, "the second release of p-1");
-  ctx.Assert(!release("gpu-1", "ghost") && stateAllocated(ctx) == 0, "releasing an unknown placement moves nothing");
+  ctx.Assert(!release("gpu-1", "ghost") && hStateAllocated(ctx) == 0, "releasing an unknown placement moves nothing");
   ctx.Equal(allocate("gpu-1", "p-2", 8), "ALLOCATED", "the node has all 8 GPUs free after one real release");
   ctx.Redis.Do("HSET", "placement:p-2", "status", "running");  // the start path (step 3) marked it running
-  ctx.Assert(release("gpu-1", "p-2") && stateAllocated(ctx) == 0,
-             "releasing a running placement left allocated at %d: every id in node:gpu-1:placements is open, whatever its status", stateAllocated(ctx));
+  ctx.Assert(release("gpu-1", "p-2") && hStateAllocated(ctx) == 0,
+             "releasing a running placement left allocated at %d: every id in node:gpu-1:placements is open, whatever its status", hStateAllocated(ctx));
   ctx.Equal(allocate("gpu-1", "p-3", 4), "ALLOCATED", "booking 4");
   // Another replica's retry of the same release lands the instant this one first touches the open set.
   std::string other;
@@ -1327,14 +1327,14 @@ void CheckIdempotentRelease(harness::Ctx& ctx) {
       other = "already released";
       return;
     }
-    ctx.Redis.Do("HINCRBY", kStateNode, "allocated", -4);
+    ctx.Redis.Do("HINCRBY", kHStateNode, "allocated", -4);
     ctx.Redis.Do("HSET", "placement:p-3", "status", "released");
     ctx.Redis.Do("SREM", "node:gpu-1:placements", "p-3");
     other = "released";
   });
   const bool mine = release("gpu-1", "p-3");
   ctx.Assert(!other.empty(), "release never touched node:gpu-1:placements");
-  ctx.Equal(stateAllocated(ctx), 0,
+  ctx.Equal(hStateAllocated(ctx), 0,
             "allocated after two concurrent releases of p-3 (4 GPUs): the other one (%s) landed between your membership check and your "
             "write. Check SISMEMBER and move the counters in one script; allocated",
             other);
@@ -1342,13 +1342,13 @@ void CheckIdempotentRelease(harness::Ctx& ctx) {
 }
 
 void CheckHonestContention(harness::Ctx& ctx) {
-  stateLedger();
+  hStateLedger();
   ctx.Equal(allocate("gpu-1", "p-1", 6), "ALLOCATED", "booking 6");
   ctx.Equal(allocate("gpu-1", "p-2", 4), "NO_CAPACITY", "4 GPUs on a node with 2 free");
-  ctx.Equal(stateAllocated(ctx), 6, "allocated after a refused placement");
+  ctx.Equal(hStateAllocated(ctx), 6, "allocated after a refused placement");
   ctx.Equal(ctx.Redis.Exists("placement:p-2"), 0, "a refused placement must leave no placement:p-2 record; its existence");
-  ctx.Equal(statePlacements(ctx), {"p-1"}, "node:gpu-1:placements after a refused placement");
-  ctx.Assert(allocate("gpu-1", "p-1", 6) == "ALLOCATED" && stateAllocated(ctx) == 6, "a retried allocation of the same placement id is ALLOCATED without booking twice");
+  ctx.Equal(hStatePlacements(ctx), {"p-1"}, "node:gpu-1:placements after a refused placement");
+  ctx.Assert(allocate("gpu-1", "p-1", 6) == "ALLOCATED" && hStateAllocated(ctx) == 6, "a retried allocation of the same placement id is ALLOCATED without booking twice");
 }
 `,
   },

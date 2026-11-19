@@ -1004,11 +1004,11 @@ import (
 
 // The operator console sends its bearer token; its older builds also send X-Scope, which the service must ignore.
 var (
-	readOperator = []string{"Authorization", "Bearer op-1", "X-Scope", "operator"}
-	readTenant   = []string{"Authorization", "Bearer t-1", "X-Scope", "operator"}
+	hReadOperator = []string{"Authorization", "Bearer op-1", "X-Scope", "operator"}
+	hReadTenant   = []string{"Authorization", "Bearer t-1", "X-Scope", "operator"}
 )
 
-func readWorld(ctx *harness.Ctx) *harness.HTTP {
+func hReadWorld(ctx *harness.Ctx) *harness.HTTP {
 	ctx.Redis.Do("HSET", "token:op-1", "scope", "operator", "tenant", "")
 	ctx.Redis.Do("HSET", "token:t-1", "scope", "tenant", "tenant", "acme")
 	ctx.Redis.Do("HSET", "node:gpu-1", "gpu_type", "a100", "capacity", 8, "allocated", 0)
@@ -1020,13 +1020,13 @@ func readWorld(ctx *harness.Ctx) *harness.HTTP {
 }
 
 // readBook: the ledger (step 2) books a placement on gpu-1.
-func readBook(ctx *harness.Ctx, pid string, count int) {
+func hReadBook(ctx *harness.Ctx, pid string, count int) {
 	ctx.Redis.Do("HINCRBY", "node:gpu-1", "allocated", count)
 	ctx.Redis.Do("HSET", "placement:"+pid, "node_id", "gpu-1", "count", count, "status", "allocated")
 	ctx.Redis.Do("SADD", "node:gpu-1:placements", pid)
 }
 
-func readRelease(ctx *harness.Ctx, pid string) {
+func hReadRelease(ctx *harness.Ctx, pid string) {
 	count, _ := ctx.Redis.HGet("placement:"+pid, "count")
 	n, _ := strconv.Atoi(count)
 	ctx.Redis.Do("HINCRBY", "node:gpu-1", "allocated", -n)
@@ -1034,66 +1034,66 @@ func readRelease(ctx *harness.Ctx, pid string) {
 	ctx.Redis.Do("SREM", "node:gpu-1:placements", pid)
 }
 
-func readGet(c *harness.HTTP, node string, header []string) *harness.Response {
+func hReadGet(c *harness.HTTP, node string, header []string) *harness.Response {
 	return c.Get("/v1/nodes/"+node, header...)
 }
 
-func readBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hReadBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the answer must be a JSON object, got %s", r.Text())
 	return body
 }
 
 func CheckNodeRoute(ctx *harness.Ctx) {
-	c := readWorld(ctx)
-	r := readGet(c, "gpu-1", readOperator)
+	c := hReadWorld(ctx)
+	r := hReadGet(c, "gpu-1", hReadOperator)
 	ctx.Equal(r.Status, 200, "GET /v1/nodes/gpu-1 as an operator (%s)", r.Text())
-	body := readBody(ctx, r)
+	body := hReadBody(ctx, r)
 	for field, want := range map[string]any{"node_id": "gpu-1", "gpu_type": "a100", "capacity": 8, "allocated": 0, "free": 8, "placeable": true, "alive": true} {
 		ctx.Equal(body[field], want, "the answer was %s: %s", r.Text(), field)
 	}
-	r = readGet(c, "gpu-9", readOperator)
+	r = hReadGet(c, "gpu-9", hReadOperator)
 	ctx.Equal(r.Status, 404, "an unknown node")
 	ctx.Redis.Del("heartbeat:gpu-1") // the agent stopped reporting in
-	r = readGet(c, "gpu-1", readOperator)
+	r = hReadGet(c, "gpu-1", hReadOperator)
 	ctx.Equal(r.Status, 200, "with heartbeat:gpu-1 lapsed the node stays readable (%s)", r.Text())
-	ctx.Equal(readBody(ctx, r)["alive"], false, "with heartbeat:gpu-1 lapsed alive (it comes from the heartbeat) in %s", r.Text())
+	ctx.Equal(hReadBody(ctx, r)["alive"], false, "with heartbeat:gpu-1 lapsed alive (it comes from the heartbeat) in %s", r.Text())
 }
 
 func CheckAtomicCapacity(ctx *harness.Ctx) {
-	c := readWorld(ctx)
-	r := readGet(c, "gpu-1", readOperator)
-	ctx.Assert(r.Status == 200 && readBody(ctx, r)["free"] == float64(8), "an idle node answered %d %s", r.Status, r.Text())
-	readBook(ctx, "p-1", 4)
-	r = readGet(c, "gpu-1", readOperator)
-	body := readBody(ctx, r)
+	c := hReadWorld(ctx)
+	r := hReadGet(c, "gpu-1", hReadOperator)
+	ctx.Assert(r.Status == 200 && hReadBody(ctx, r)["free"] == float64(8), "an idle node answered %d %s", r.Status, r.Text())
+	hReadBook(ctx, "p-1", 4)
+	r = hReadGet(c, "gpu-1", hReadOperator)
+	body := hReadBody(ctx, r)
 	ctx.Assert(body["allocated"] == float64(4) && body["free"] == float64(4), "right after the ledger booked 4 GPUs the read answered %s: allocated must be read from node:gpu-1 on every request, not from a snapshot", r.Text())
-	readBook(ctx, "p-2", 4)
-	r = readGet(c, "gpu-1", readOperator)
-	body = readBody(ctx, r)
+	hReadBook(ctx, "p-2", 4)
+	r = hReadGet(c, "gpu-1", hReadOperator)
+	body = hReadBody(ctx, r)
 	ctx.Assert(body["free"] == float64(0) && body["placeable"] == false, "with the node full the read answered %s", r.Text())
-	readRelease(ctx, "p-1")
-	r = readGet(c, "gpu-1", readOperator)
-	body = readBody(ctx, r)
+	hReadRelease(ctx, "p-1")
+	r = hReadGet(c, "gpu-1", hReadOperator)
+	body = hReadBody(ctx, r)
 	ctx.Assert(body["allocated"] == float64(4) && body["free"] == float64(4), "after a release the read answered %s", r.Text())
 }
 
 func CheckFreeClamp(ctx *harness.Ctx) {
-	c := readWorld(ctx)
+	c := hReadWorld(ctx)
 	ctx.Redis.Do("HSET", "node:gpu-1", "allocated", 10) // a counter that drifted past capacity
-	r := readGet(c, "gpu-1", readOperator)
-	body := readBody(ctx, r)
+	r := hReadGet(c, "gpu-1", hReadOperator)
+	body := hReadBody(ctx, r)
 	ctx.Equal(body["allocated"], 10, "the read must report allocated as the ledger holds it (%s)", r.Text())
 	ctx.Equal(body["free"], 0, "with allocated above capacity free (clamp at zero)")
 	ctx.Equal(body["placeable"], false, "a drifted node is not placeable (%s)", r.Text())
 }
 
 func CheckReconcile(ctx *harness.Ctx) {
-	c := readWorld(ctx)
-	readBook(ctx, "p-1", 4)
-	readBook(ctx, "p-2", 2)
-	readRelease(ctx, "p-1")
-	readBook(ctx, "p-3", 1)
+	c := hReadWorld(ctx)
+	hReadBook(ctx, "p-1", 4)
+	hReadBook(ctx, "p-2", 2)
+	hReadRelease(ctx, "p-1")
+	hReadBook(ctx, "p-3", 1)
 	ctx.Redis.Do("HSET", "placement:p-3", "status", "running")                               // the start path (step 3) marked it running
 	ctx.Redis.Do("HSET", "placement:p-4", "node_id", "gpu-1", "count", 3, "status", "allocated") // a record whose booking never landed in the open set
 	ctx.Redis.Do("HSET", "node:gpu-1", "allocated", 0)                                         // the node rebooted and its counter was lost
@@ -1102,26 +1102,26 @@ func CheckReconcile(ctx *harness.Ctx) {
 	ctx.Equal(total, 3, "GPUs reconcileNode summed for gpu-1: the open set holds p-2 (2 GPUs) and p-3 (1 GPU, running); p-1 was released and p-4 is not in node:gpu-1:placements")
 	allocated, _ := ctx.Redis.HGet("node:gpu-1", "allocated")
 	ctx.Equal(allocated, "3", "reconcileNode must write allocated; node:gpu-1 holds")
-	r := readGet(c, "gpu-1", readOperator)
-	body := readBody(ctx, r)
+	r := hReadGet(c, "gpu-1", hReadOperator)
+	body := hReadBody(ctx, r)
 	ctx.Assert(body["allocated"] == float64(3) && body["free"] == float64(5), "after the reconcile the read answered %s", r.Text())
 }
 
 func CheckOperatorScope(ctx *harness.Ctx) {
-	c := readWorld(ctx)
-	r := readGet(c, "gpu-1", readTenant)
+	c := hReadWorld(ctx)
+	r := hReadGet(c, "gpu-1", hReadTenant)
 	ctx.Equal(r.Status, 403, "a tenant's token (with an X-Scope: operator header it wrote itself): the scope comes from token:{token}, not from the client")
-	r = readGet(c, "gpu-1", []string{"X-Scope", "operator"})
+	r = hReadGet(c, "gpu-1", []string{"X-Scope", "operator"})
 	ctx.Equal(r.Status, 401, "no token at all")
-	r = readGet(c, "gpu-1", []string{"Authorization", "Bearer nobody"})
+	r = hReadGet(c, "gpu-1", []string{"Authorization", "Bearer nobody"})
 	ctx.Equal(r.Status, 403, "an unknown token")
-	r = readGet(c, "gpu-1", []string{"Authorization", "Bearer nobody", "X-Scope", "operator"})
+	r = hReadGet(c, "gpu-1", []string{"Authorization", "Bearer nobody", "X-Scope", "operator"})
 	ctx.Equal(r.Status, 403, "an unknown token with an X-Scope: operator header (nothing the client sends decides the scope)")
-	r = readGet(c, "gpu-9", readTenant)
+	r = hReadGet(c, "gpu-9", hReadTenant)
 	ctx.Equal(r.Status, 403, "a tenant's token on an unknown node (the scope is checked before the node is looked up, so a tenant cannot tell which nodes exist)")
-	r = readGet(c, "gpu-9", nil)
+	r = hReadGet(c, "gpu-9", nil)
 	ctx.Equal(r.Status, 401, "no token on an unknown node")
-	r = readGet(c, "gpu-1", []string{"Authorization", "Bearer op-1"})
+	r = hReadGet(c, "gpu-1", []string{"Authorization", "Bearer op-1"})
 	ctx.Equal(r.Status, 200, "an operator token without any X-Scope header")
 }
 `,
@@ -1134,32 +1134,32 @@ func CheckOperatorScope(ctx *harness.Ctx) {
 
 namespace {
 
-struct ReadWorld {
+struct HReadWorld {
   httplib::Server svr;
 };
 
-ReadWorld* readWorld_ = nullptr;
+HReadWorld* hReadWorld_ = nullptr;
 
-harness::HTTP readWorld(harness::Ctx& ctx) {
+harness::HTTP hReadWorld(harness::Ctx& ctx) {
   ctx.Redis.Do("HSET", "token:op-1", "scope", "operator", "tenant", "");
   ctx.Redis.Do("HSET", "token:t-1", "scope", "tenant", "tenant", "acme");
   ctx.Redis.Do("HSET", "node:gpu-1", "gpu_type", "a100", "capacity", 8, "allocated", 0);
   ctx.Redis.Do("SADD", "nodes", "gpu-1");
   ctx.Redis.Do("SET", "heartbeat:gpu-1", "1", "EX", 30);
-  delete readWorld_;
-  readWorld_ = new ReadWorld;
-  register_routes(readWorld_->svr);
-  return ctx.HTTP(readWorld_->svr);
+  delete hReadWorld_;
+  hReadWorld_ = new HReadWorld;
+  register_routes(hReadWorld_->svr);
+  return ctx.HTTP(hReadWorld_->svr);
 }
 
 // The ledger (step 2) books a placement on gpu-1.
-void readBook(harness::Ctx& ctx, const std::string& pid, int count) {
+void hReadBook(harness::Ctx& ctx, const std::string& pid, int count) {
   ctx.Redis.Do("HINCRBY", "node:gpu-1", "allocated", count);
   ctx.Redis.Do("HSET", "placement:" + pid, "node_id", "gpu-1", "count", count, "status", "allocated");
   ctx.Redis.Do("SADD", "node:gpu-1:placements", pid);
 }
 
-void readRelease(harness::Ctx& ctx, const std::string& pid) {
+void hReadRelease(harness::Ctx& ctx, const std::string& pid) {
   const int count = std::stoi(ctx.Redis.HGet("placement:" + pid, "count").value_or("0"));
   ctx.Redis.Do("HINCRBY", "node:gpu-1", "allocated", -count);
   ctx.Redis.Do("HSET", "placement:" + pid, "status", "released");
@@ -1167,11 +1167,11 @@ void readRelease(harness::Ctx& ctx, const std::string& pid) {
 }
 
 // The operator console sends its bearer token; its older builds also send X-Scope, which the service must ignore.
-harness::Response readAsOperator(harness::HTTP& c, const std::string& node = "gpu-1") {
+harness::Response hReadAsOperator(harness::HTTP& c, const std::string& node = "gpu-1") {
   return c.Get("/v1/nodes/" + node, "Authorization", "Bearer op-1", "X-Scope", "operator");
 }
 
-nlohmann::json readBody(harness::Ctx& ctx, const harness::Response& r) {
+nlohmann::json hReadBody(harness::Ctx& ctx, const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the answer must be a JSON object, got %s", r.Text());
   return body;
@@ -1180,10 +1180,10 @@ nlohmann::json readBody(harness::Ctx& ctx, const harness::Response& r) {
 }  // namespace
 
 void CheckNodeRoute(harness::Ctx& ctx) {
-  auto c = readWorld(ctx);
-  auto r = readAsOperator(c);
+  auto c = hReadWorld(ctx);
+  auto r = hReadAsOperator(c);
   ctx.Equal(r.Status, 200, "GET /v1/nodes/gpu-1 as an operator (%s)", r.Text());
-  const auto body = readBody(ctx, r);
+  const auto body = hReadBody(ctx, r);
   ctx.Equal(body.value("node_id", ""), "gpu-1", "the answer was %s: node_id", r.Text());
   ctx.Equal(body.value("gpu_type", ""), "a100", "the answer was %s: gpu_type", r.Text());
   ctx.Equal(body.value("capacity", -1), 8, "the answer was %s: capacity", r.Text());
@@ -1191,49 +1191,49 @@ void CheckNodeRoute(harness::Ctx& ctx) {
   ctx.Equal(body.value("free", -1), 8, "the answer was %s: free", r.Text());
   ctx.Equal(body.value("placeable", false), true, "the answer was %s: placeable", r.Text());
   ctx.Equal(body.value("alive", false), true, "the answer was %s: alive", r.Text());
-  r = readAsOperator(c, "gpu-9");
+  r = hReadAsOperator(c, "gpu-9");
   ctx.Equal(r.Status, 404, "an unknown node");
   ctx.Redis.Del("heartbeat:gpu-1");  // the agent stopped reporting in
-  r = readAsOperator(c);
+  r = hReadAsOperator(c);
   ctx.Equal(r.Status, 200, "with heartbeat:gpu-1 lapsed the node stays readable (%s)", r.Text());
-  ctx.Equal(readBody(ctx, r).value("alive", true), false, "with heartbeat:gpu-1 lapsed alive (it comes from the heartbeat) in %s", r.Text());
+  ctx.Equal(hReadBody(ctx, r).value("alive", true), false, "with heartbeat:gpu-1 lapsed alive (it comes from the heartbeat) in %s", r.Text());
 }
 
 void CheckAtomicCapacity(harness::Ctx& ctx) {
-  auto c = readWorld(ctx);
-  auto r = readAsOperator(c);
-  ctx.Assert(r.Status == 200 && readBody(ctx, r).value("free", -1) == 8, "an idle node answered %d %s", r.Status, r.Text());
-  readBook(ctx, "p-1", 4);
-  r = readAsOperator(c);
-  auto body = readBody(ctx, r);
+  auto c = hReadWorld(ctx);
+  auto r = hReadAsOperator(c);
+  ctx.Assert(r.Status == 200 && hReadBody(ctx, r).value("free", -1) == 8, "an idle node answered %d %s", r.Status, r.Text());
+  hReadBook(ctx, "p-1", 4);
+  r = hReadAsOperator(c);
+  auto body = hReadBody(ctx, r);
   ctx.Assert(body.value("allocated", -1) == 4 && body.value("free", -1) == 4,
              "right after the ledger booked 4 GPUs the read answered %s: allocated must be read from node:gpu-1 on every request, not from a snapshot", r.Text());
-  readBook(ctx, "p-2", 4);
-  r = readAsOperator(c);
-  body = readBody(ctx, r);
+  hReadBook(ctx, "p-2", 4);
+  r = hReadAsOperator(c);
+  body = hReadBody(ctx, r);
   ctx.Assert(body.value("free", -1) == 0 && body.value("placeable", true) == false, "with the node full the read answered %s", r.Text());
-  readRelease(ctx, "p-1");
-  r = readAsOperator(c);
-  body = readBody(ctx, r);
+  hReadRelease(ctx, "p-1");
+  r = hReadAsOperator(c);
+  body = hReadBody(ctx, r);
   ctx.Assert(body.value("allocated", -1) == 4 && body.value("free", -1) == 4, "after a release the read answered %s", r.Text());
 }
 
 void CheckFreeClamp(harness::Ctx& ctx) {
-  auto c = readWorld(ctx);
+  auto c = hReadWorld(ctx);
   ctx.Redis.Do("HSET", "node:gpu-1", "allocated", 10);  // a counter that drifted past capacity
-  auto r = readAsOperator(c);
-  const auto body = readBody(ctx, r);
+  auto r = hReadAsOperator(c);
+  const auto body = hReadBody(ctx, r);
   ctx.Equal(body.value("allocated", -1), 10, "the read must report allocated as the ledger holds it (%s)", r.Text());
   ctx.Equal(body.value("free", -1), 0, "with allocated above capacity free (clamp at zero)");
   ctx.Equal(body.value("placeable", true), false, "a drifted node is not placeable (%s)", r.Text());
 }
 
 void CheckReconcile(harness::Ctx& ctx) {
-  auto c = readWorld(ctx);
-  readBook(ctx, "p-1", 4);
-  readBook(ctx, "p-2", 2);
-  readRelease(ctx, "p-1");
-  readBook(ctx, "p-3", 1);
+  auto c = hReadWorld(ctx);
+  hReadBook(ctx, "p-1", 4);
+  hReadBook(ctx, "p-2", 2);
+  hReadRelease(ctx, "p-1");
+  hReadBook(ctx, "p-3", 1);
   ctx.Redis.Do("HSET", "placement:p-3", "status", "running");                                // the start path (step 3) marked it running
   ctx.Redis.Do("HSET", "placement:p-4", "node_id", "gpu-1", "count", 3, "status", "allocated");  // a record whose booking never landed in the open set
   ctx.Redis.Do("HSET", "node:gpu-1", "allocated", 0);                                          // the node rebooted and its counter was lost
@@ -1242,13 +1242,13 @@ void CheckReconcile(harness::Ctx& ctx) {
             "GPUs reconcile_node summed for gpu-1: the open set holds p-2 (2 GPUs) and p-3 (1 GPU, running); p-1 was released and p-4 is not in "
             "node:gpu-1:placements");
   ctx.Equal(ctx.Redis.HGet("node:gpu-1", "allocated"), "3", "reconcile_node must write allocated; node:gpu-1 holds");
-  auto r = readAsOperator(c);
-  const auto body = readBody(ctx, r);
+  auto r = hReadAsOperator(c);
+  const auto body = hReadBody(ctx, r);
   ctx.Assert(body.value("allocated", -1) == 3 && body.value("free", -1) == 5, "after the reconcile the read answered %s", r.Text());
 }
 
 void CheckOperatorScope(harness::Ctx& ctx) {
-  auto c = readWorld(ctx);
+  auto c = hReadWorld(ctx);
   auto r = c.Get("/v1/nodes/gpu-1", "Authorization", "Bearer t-1", "X-Scope", "operator");
   ctx.Equal(r.Status, 403, "a tenant's token (with an X-Scope: operator header it wrote itself): the scope comes from token:{token}, not from the client");
   r = c.Get("/v1/nodes/gpu-1", "X-Scope", "operator");

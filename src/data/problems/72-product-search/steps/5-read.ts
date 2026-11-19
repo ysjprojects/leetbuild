@@ -580,10 +580,10 @@ import (
 	"leetbuild/harness"
 )
 
-var productKettle = catalog.Product{ID: "p-1", Title: "Steel Kettle", Brand: "acme", Category: "kitchen", PriceCents: 3499, InStock: true, CostCents: 1200}
+var hProductKettle = catalog.Product{ID: "p-1", Title: "Steel Kettle", Brand: "acme", Category: "kitchen", PriceCents: 3499, InStock: true, CostCents: 1200}
 
 func hProductAPI(ctx *harness.Ctx) *harness.HTTP {
-	catalog.PutProduct(context.Background(), "t-1", productKettle)
+	catalog.PutProduct(context.Background(), "t-1", hProductKettle)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
@@ -615,7 +615,7 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	ctx.Equal(revalidated.Status, 404, "t-2 revalidating t-1's p-1 with If-None-Match \\"1\\"; the status")
 	unsigned := c.Get("/v1/products/p-1?tenant=t-1")
 	ctx.Equal(unsigned.Status, 401, "a request without X-Tenant-Id but with ?tenant=t-1 (the tenant comes from the header only, so a missing one is 401); the status")
-	theirs := productKettle
+	theirs := hProductKettle
 	theirs.Title, theirs.PriceCents = "Copper Kettle", 5999
 	catalog.PutProduct(context.Background(), "t-2", theirs)
 	mine := c.Get("/v1/products/p-1", "X-Tenant-Id", "t-2")
@@ -638,7 +638,7 @@ func CheckFreshPrice(ctx *harness.Ctx) {
 	c := hProductAPI(ctx)
 	first := c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1")
 	ctx.Assert(first.Status == 200 && hPageBody(first)["price_cents"] == float64(3499), "the first read answered %d %s", first.Status, first.Text())
-	repriced := productKettle
+	repriced := hProductKettle
 	repriced.PriceCents = 2999
 	catalog.PutProduct(context.Background(), "t-1", repriced)
 	body := hPageBody(c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1"))
@@ -653,7 +653,7 @@ func CheckCacheHeaders(ctx *harness.Ctx) {
 	ctx.Equal(r.Header.Get("ETag"), \`"1"\`, "the ETag must be the price version in quotes")
 	again := c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1", "If-None-Match", \`"1"\`)
 	ctx.Assert(again.Status == 304 && again.Text() == "", "a revalidation with If-None-Match \\"1\\" answered %d %q, expected 304 with no body", again.Status, again.Text())
-	repriced := productKettle
+	repriced := hProductKettle
 	repriced.PriceCents = 2999
 	catalog.PutProduct(context.Background(), "t-1", repriced)
 	stale := c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1", "If-None-Match", \`"1"\`)

@@ -660,39 +660,39 @@ import (
 	"leetbuild/harness"
 )
 
-const stateKey = "billing:run:sub_1:2026-03-01"
+const kHStateKey = "billing:run:sub_1:2026-03-01"
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-type stateLanded struct {
+type HStateLanded struct {
 	reference string
 	total     int64
 }
 
 // stateProcessor keeps what it charged per invoice and answers a repeated idempotency key with the first charge.
 // declines lists invoices the issuer refuses.
-type stateProcessor struct {
+type HStateProcessor struct {
 	pb.UnimplementedProcessorServer
-	charged  map[string]stateLanded
+	charged  map[string]HStateLanded
 	keys     map[string]string
 	charges  int
 	declines map[string]bool
 }
 
-func (p *stateProcessor) Charge(_ context.Context, req *pb.ChargeRequest) (*pb.ChargeResult, error) {
+func (p *HStateProcessor) Charge(_ context.Context, req *pb.ChargeRequest) (*pb.ChargeResult, error) {
 	if p.declines[req.GetInvoiceId()] {
 		return &pb.ChargeResult{Status: "declined", DeclineCode: "card_declined"}, nil
 	}
 	if _, seen := p.keys[req.GetIdempotencyKey()]; !seen {
 		p.charges++
 		reference := fmt.Sprintf("ch_%d", p.charges)
-		p.charged[req.GetInvoiceId()] = stateLanded{reference, p.charged[req.GetInvoiceId()].total + req.GetAmountCents()}
+		p.charged[req.GetInvoiceId()] = HStateLanded{reference, p.charged[req.GetInvoiceId()].total + req.GetAmountCents()}
 		p.keys[req.GetIdempotencyKey()] = reference
 	}
 	return &pb.ChargeResult{Status: "succeeded", Reference: p.keys[req.GetIdempotencyKey()]}, nil
 }
 
-func (p *stateProcessor) GetInvoice(_ context.Context, req *pb.GetInvoiceRequest) (*pb.ProcessorInvoice, error) {
+func (p *HStateProcessor) GetInvoice(_ context.Context, req *pb.GetInvoiceRequest) (*pb.ProcessorInvoice, error) {
 	found, ok := p.charged[req.GetInvoiceId()]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "no charge for %s", req.GetInvoiceId())
@@ -700,79 +700,79 @@ func (p *stateProcessor) GetInvoice(_ context.Context, req *pb.GetInvoiceRequest
 	return &pb.ProcessorInvoice{InvoiceId: req.GetInvoiceId(), State: "charged", Reference: found.reference, TotalCents: found.total}, nil
 }
 
-func stateWorld(ctx *harness.Ctx) (*stateProcessor, string) {
-	p := &stateProcessor{charged: map[string]stateLanded{}, keys: map[string]string{}, declines: map[string]bool{}}
+func hStateWorld(ctx *harness.Ctx) (*HStateProcessor, string) {
+	p := &HStateProcessor{charged: map[string]HStateLanded{}, keys: map[string]string{}, declines: map[string]bool{}}
 	pb.RegisterProcessorServer(ctx.GRPC.Server(""), p)
-	store.PutSubscription(stateBg, "sub_1", "t-acme", "scale", "2026-03-01", "2026-04-01")
-	return p, store.OpenInvoice(stateBg, "sub_1", "2026-03-01", "2026-04-01", 9900).InvoiceID
+	store.PutSubscription(hStateBg, "sub_1", "t-acme", "scale", "2026-03-01", "2026-04-01")
+	return p, store.OpenInvoice(hStateBg, "sub_1", "2026-03-01", "2026-04-01", 9900).InvoiceID
 }
 
-func stateRun(ctx *harness.Ctx, invoiceID string) store.Outcome {
-	outcome, err := runBilling(stateBg, invoiceID)
+func hStateRun(ctx *harness.Ctx, invoiceID string) store.Outcome {
+	outcome, err := runBilling(hStateBg, invoiceID)
 	ctx.NoError(err, "runBilling(%s)", invoiceID)
 	return outcome
 }
 
-func stateCharges(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Charge", "")) }
+func hStateCharges(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Charge", "")) }
 
 func CheckClaim(ctx *harness.Ctx) {
-	_, invoiceID := stateWorld(ctx)
+	_, invoiceID := hStateWorld(ctx)
 	// A second runner for the same period lands right after this run's first marker command.
-	rival := ctx.Redis.After(stateKey, func() any {
-		outcome, _ := runBilling(stateBg, invoiceID)
+	rival := ctx.Redis.After(kHStateKey, func() any {
+		outcome, _ := runBilling(hStateBg, invoiceID)
 		return outcome
 	})
-	first := stateRun(ctx, invoiceID)
-	ctx.Assert(rival.Fired, "runBilling never touched the run marker %s", stateKey)
-	ctx.Equal(stateCharges(ctx), 1, "two runners for one period must make one Charge call (claim the marker with SET NX before charging, and do not charge on a claim you lost); Charge calls")
+	first := hStateRun(ctx, invoiceID)
+	ctx.Assert(rival.Fired, "runBilling never touched the run marker %s", kHStateKey)
+	ctx.Equal(hStateCharges(ctx), 1, "two runners for one period must make one Charge call (claim the marker with SET NX before charging, and do not charge on a claim you lost); Charge calls")
 	second, _ := rival.Result.(store.Outcome)
 	ctx.Assert(first.State == "charged" || second.State == "charged", "neither runner reports the charge: %+v, %+v", first, second)
 }
 
 func CheckConfirmReference(ctx *harness.Ctx) {
-	p, invoiceID := stateWorld(ctx)
-	first := stateRun(ctx, invoiceID)
+	p, invoiceID := hStateWorld(ctx)
+	first := hStateRun(ctx, invoiceID)
 	ctx.Assert(first.State == "charged" && first.Reference == "ch_1", "the first run answered %+v, expected the processor's reference ch_1", first)
-	marker, _ := ctx.Redis.Get(stateKey)
+	marker, _ := ctx.Redis.Get(kHStateKey)
 	ctx.Equal(marker, "charged:ch_1", "after the charge the marker must name the charge that billed the period; the marker")
-	again := stateRun(ctx, invoiceID)
+	again := hStateRun(ctx, invoiceID)
 	ctx.Assert(again.State == "charged" && again.Reference == "ch_1", "a second run answered %+v, expected the recorded reference ch_1", again)
-	ctx.Equal(stateCharges(ctx), 1, "the second run must not call Charge again; Charge calls")
+	ctx.Equal(hStateCharges(ctx), 1, "the second run must not call Charge again; Charge calls")
 	// The issuer declines the next period's card: nothing was charged, so the marker must not say charged.
-	declined := store.OpenInvoice(stateBg, "sub_1", "2026-04-01", "2026-05-01", 9900)
+	declined := store.OpenInvoice(hStateBg, "sub_1", "2026-04-01", "2026-05-01", 9900)
 	p.declines[declined.InvoiceID] = true
-	outcome := stateRun(ctx, declined.InvoiceID)
+	outcome := hStateRun(ctx, declined.InvoiceID)
 	after, _ := ctx.Redis.Get("billing:run:sub_1:2026-04-01")
 	ctx.Equal(outcome.State, "failed", "a declined card; the state")
 	ctx.Assert(!strings.HasPrefix(after, "charged:"), "a declined card left the marker %q: confirm charged:{reference} only after a charge, or the period reads as billed", after)
 }
 
 func CheckReconcileClaim(ctx *harness.Ctx) {
-	p, invoiceID := stateWorld(ctx)
+	p, invoiceID := hStateWorld(ctx)
 	// A run claimed the period, the processor charged, and the run crashed before confirming.
-	ctx.Redis.Set(stateKey, "claimed")
-	p.charged[invoiceID] = stateLanded{"ch_crashed", 9900}
-	outcome := stateRun(ctx, invoiceID)
+	ctx.Redis.Set(kHStateKey, "claimed")
+	p.charged[invoiceID] = HStateLanded{"ch_crashed", 9900}
+	outcome := hStateRun(ctx, invoiceID)
 	ctx.Assert(outcome.State == "charged" && outcome.Reference == "ch_crashed", "a claim left by a crashed run answered %+v: the processor holds ch_crashed for the invoice, ask LookupInvoice and adopt it", outcome)
-	marker, _ := ctx.Redis.Get(stateKey)
+	marker, _ := ctx.Redis.Get(kHStateKey)
 	ctx.Equal(marker, "charged:ch_crashed", "the adopted charge must confirm the marker; the marker")
-	ctx.Equal(stateCharges(ctx), 0, "reconciling a claim must not call Charge; Charge calls")
+	ctx.Equal(hStateCharges(ctx), 0, "reconciling a claim must not call Charge; Charge calls")
 	// A run claimed the period and is still waiting on the processor, which holds nothing yet.
-	other := store.OpenInvoice(stateBg, "sub_1", "2026-04-01", "2026-05-01", 9900)
+	other := store.OpenInvoice(hStateBg, "sub_1", "2026-04-01", "2026-05-01", 9900)
 	ctx.Redis.Set("billing:run:sub_1:2026-04-01", "claimed")
-	outcome = stateRun(ctx, other.InvoiceID)
+	outcome = hStateRun(ctx, other.InvoiceID)
 	ctx.Equal(outcome.State, "in_flight", "a claim the processor knows nothing about belongs to another run; the state")
-	ctx.Equal(stateCharges(ctx), 0, "a runner must not charge on another run's claim; Charge calls")
+	ctx.Equal(hStateCharges(ctx), 0, "a runner must not charge on another run's claim; Charge calls")
 }
 
 func CheckMarkerPersists(ctx *harness.Ctx) {
-	_, invoiceID := stateWorld(ctx)
-	stateRun(ctx, invoiceID)
-	ttl := ctx.Redis.TTL(stateKey)
+	_, invoiceID := hStateWorld(ctx)
+	hStateRun(ctx, invoiceID)
+	ttl := ctx.Redis.TTL(kHStateKey)
 	ctx.Assert(ttl == -1, "the run marker expires in %d s: a retry after that charges the period again. It must not expire", ttl)
 	ctx.Clock.Advance(40 * 24 * 3600)
-	again := stateRun(ctx, invoiceID)
-	ctx.Assert(stateCharges(ctx) == 1, "a retry 40 days later called Charge again and answered %+v", again)
+	again := hStateRun(ctx, invoiceID)
+	ctx.Assert(hStateCharges(ctx) == 1, "a retry 40 days later called Charge again and answered %+v", again)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -788,18 +788,18 @@ func CheckMarkerPersists(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kStateKey = "billing:run:sub_1:2026-03-01";
+const std::string kHStateKey = "billing:run:sub_1:2026-03-01";
 
-struct Landed {
+struct HLanded {
   std::string reference;
   long long total = 0;
 };
 
 // A processor that keeps what it charged per invoice and answers a repeated idempotency key with the first charge.
 // declines lists invoices the issuer refuses.
-class ProcessorPeer final : public subbilling::Processor::Service {
+class HProcessorPeer final : public subbilling::Processor::Service {
  public:
-  std::map<std::string, Landed> charged;
+  std::map<std::string, HLanded> charged;
   std::map<std::string, std::string> keys;
   int charges = 0;
   std::set<std::string> declines;
@@ -832,10 +832,10 @@ class ProcessorPeer final : public subbilling::Processor::Service {
   }
 };
 
-ProcessorPeer& hStateWorld(harness::Ctx& ctx, std::string& invoice_id) {
-  static ProcessorPeer* peer = nullptr;
+HProcessorPeer& hStateWorld(harness::Ctx& ctx, std::string& invoice_id) {
+  static HProcessorPeer* peer = nullptr;
   delete peer;
-  peer = new ProcessorPeer;
+  peer = new HProcessorPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   store::putSubscription("sub_1", "t-acme", "scale", "2026-03-01", "2026-04-01");
   invoice_id = store::openInvoice("sub_1", "2026-03-01", "2026-04-01", 9900).invoice_id;
@@ -854,12 +854,12 @@ void CheckClaim(harness::Ctx& ctx) {
   // Another runner claims the period right after this run's first marker command, if it still can.
   bool fired = false;
   bool rival_claimed = false;
-  ctx.Redis.After(kStateKey, [&] {
+  ctx.Redis.After(kHStateKey, [&] {
     fired = true;
-    rival_claimed = ctx.Redis.Set(kStateKey, "claimed", "NX");
+    rival_claimed = ctx.Redis.Set(kHStateKey, "claimed", "NX");
   });
   const store::Outcome first = runBilling(invoice_id);
-  ctx.Assert(fired, "runBilling never touched the run marker %s", kStateKey);
+  ctx.Assert(fired, "runBilling never touched the run marker %s", kHStateKey);
   if (rival_claimed) {
     ctx.Equal(hCharges(ctx), 0,
               "another runner claimed the period right after runBilling's first marker command, and runBilling charged anyway: claim the marker with SET NX before charging, and do not charge on a claim you lost; Charge calls");
@@ -871,10 +871,10 @@ void CheckClaim(harness::Ctx& ctx) {
 
 void CheckConfirmReference(harness::Ctx& ctx) {
   std::string invoice_id;
-  ProcessorPeer& peer = hStateWorld(ctx, invoice_id);
+  HProcessorPeer& peer = hStateWorld(ctx, invoice_id);
   const store::Outcome first = runBilling(invoice_id);
   ctx.Assert(first.state == "charged" && first.reference == "ch_1", "the first run answered %s, expected the processor's reference ch_1", hShow(first));
-  ctx.Equal(ctx.Redis.Get(kStateKey).value_or(""), "charged:ch_1", "after the charge the marker must name the charge that billed the period; the marker");
+  ctx.Equal(ctx.Redis.Get(kHStateKey).value_or(""), "charged:ch_1", "after the charge the marker must name the charge that billed the period; the marker");
   const store::Outcome again = runBilling(invoice_id);
   ctx.Assert(again.state == "charged" && again.reference == "ch_1", "a second run answered %s, expected the recorded reference ch_1", hShow(again));
   ctx.Equal(hCharges(ctx), 1, "the second run must not call Charge again; Charge calls");
@@ -889,14 +889,14 @@ void CheckConfirmReference(harness::Ctx& ctx) {
 
 void CheckReconcileClaim(harness::Ctx& ctx) {
   std::string invoice_id;
-  ProcessorPeer& peer = hStateWorld(ctx, invoice_id);
+  HProcessorPeer& peer = hStateWorld(ctx, invoice_id);
   // A run claimed the period, the processor charged, and the run crashed before confirming.
-  ctx.Redis.Set(kStateKey, "claimed");
+  ctx.Redis.Set(kHStateKey, "claimed");
   peer.charged[invoice_id] = {"ch_crashed", 9900};
   store::Outcome outcome = runBilling(invoice_id);
   ctx.Assert(outcome.state == "charged" && outcome.reference == "ch_crashed",
              "a claim left by a crashed run answered %s: the processor holds ch_crashed for the invoice, ask lookupInvoice and adopt it", hShow(outcome));
-  ctx.Equal(ctx.Redis.Get(kStateKey).value_or(""), "charged:ch_crashed", "the adopted charge must confirm the marker; the marker");
+  ctx.Equal(ctx.Redis.Get(kHStateKey).value_or(""), "charged:ch_crashed", "the adopted charge must confirm the marker; the marker");
   ctx.Equal(hCharges(ctx), 0, "reconciling a claim must not call Charge; Charge calls");
   // A run claimed the period and is still waiting on the processor, which holds nothing yet.
   const store::Invoice other = store::openInvoice("sub_1", "2026-04-01", "2026-05-01", 9900);
@@ -910,7 +910,7 @@ void CheckMarkerPersists(harness::Ctx& ctx) {
   std::string invoice_id;
   hStateWorld(ctx, invoice_id);
   runBilling(invoice_id);
-  const long long ttl = ctx.Redis.TTL(kStateKey);
+  const long long ttl = ctx.Redis.TTL(kHStateKey);
   ctx.Assert(ttl == -1, "the run marker expires in %d s: a retry after that charges the period again. It must not expire", ttl);
   ctx.Clock.Advance(40 * 24 * 3600);
   const store::Outcome again = runBilling(invoice_id);

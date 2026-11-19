@@ -807,7 +807,7 @@ func hReadHealth(c *harness.HTTP, connectorID, tenant string) *harness.Response 
 	return c.Get("/v1/connectors/"+connectorID+"/health", "X-Tenant-Id", tenant)
 }
 
-func healthBody(ctx *harness.Ctx, c *harness.HTTP, connectorID, what string) map[string]any {
+func hHealthBody(ctx *harness.Ctx, c *harness.HTTP, connectorID, what string) map[string]any {
 	r := hReadHealth(c, connectorID, "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/connectors/%s/health %s (%s)", connectorID, what, r.Text())
 	var body map[string]any
@@ -818,7 +818,7 @@ func healthBody(ctx *harness.Ctx, c *harness.HTTP, connectorID, what string) map
 func CheckRoute(ctx *harness.Ctx) {
 	c, cid, now := hReadWorld(ctx)
 	hSeedHealth(ctx, cid, map[string]int64{"last_run_at": now - 60, "last_success_at": now - 60, "consecutive_failures": 0, "open_until": 0, "pages": 4, "records": 8})
-	body := healthBody(ctx, c, cid, "for a connector synced a minute ago")
+	body := hHealthBody(ctx, c, cid, "for a connector synced a minute ago")
 	ctx.Assert(body["connector_id"] == cid && body["status"] == "healthy", "a connector synced a minute ago must read healthy, got %v", body)
 	var absent []string
 	for _, field := range []string{"connector_id", "status", "disabled_reason", "last_success_at", "cursor_lag_s", "sync_interval_s", "consecutive_failures", "breaker"} {
@@ -858,11 +858,11 @@ func CheckStaleFromSuccess(ctx *harness.Ctx) {
 	hSeedHealth(ctx, edge, map[string]int64{"last_run_at": now - 1800, "last_success_at": now - 1800, "consecutive_failures": 0, "open_until": 0})
 	late := store.Create(hReadBg, "acme", "stripe", "api.stripe.com", "vault:acme/stripe#2", 900).ConnectorID
 	hSeedHealth(ctx, late, map[string]int64{"last_run_at": now - 30, "last_success_at": now - 1801, "consecutive_failures": 0, "open_until": 0})
-	failing := healthBody(ctx, c, cid, "for a connector whose runs fail")
-	quiet := healthBody(ctx, c, daily, "for a daily connector")
-	empty := healthBody(ctx, c, never, "for a connector that never landed a page")
-	onEdge := healthBody(ctx, c, edge, "for a connector whose last page landed two intervals ago")
-	past := healthBody(ctx, c, late, "for a connector whose last page landed two intervals and a second ago")
+	failing := hHealthBody(ctx, c, cid, "for a connector whose runs fail")
+	quiet := hHealthBody(ctx, c, daily, "for a daily connector")
+	empty := hHealthBody(ctx, c, never, "for a connector that never landed a page")
+	onEdge := hHealthBody(ctx, c, edge, "for a connector whose last page landed two intervals ago")
+	past := hHealthBody(ctx, c, late, "for a connector whose last page landed two intervals and a second ago")
 	ctx.Equal(failing["status"], "unhealthy", "no page has landed for 2700 s, three sync intervals of 900 s (%v): a failed run moves last_run_at too. Measure from last_success_at; the status", failing)
 	lag, ok := failing["cursor_lag_s"].(float64)
 	ctx.Assert(ok && math.Abs(lag-2700) <= 5 && failing["sync_interval_s"] == float64(900), "the answer must carry cursor_lag_s (about 2700) and sync_interval_s 900, got %v", failing)
@@ -875,10 +875,10 @@ func CheckStaleFromSuccess(ctx *harness.Ctx) {
 func CheckBreakerState(ctx *harness.Ctx) {
 	c, cid, now := hReadWorld(ctx)
 	hSeedHealth(ctx, cid, map[string]int64{"last_run_at": now - 5, "last_success_at": now - 300, "consecutive_failures": 5, "open_until": now + 20})
-	body := healthBody(ctx, c, cid, "with the breaker open")
+	body := hHealthBody(ctx, c, cid, "with the breaker open")
 	ctx.Assert(body["breaker"] == "open" && body["consecutive_failures"] == float64(5), "five consecutive failures and open_until 20 s ahead read %v: the answer must show breaker open and consecutive_failures 5", body)
 	ctx.Clock.Advance(30)
-	body = healthBody(ctx, c, cid, "after the cooldown")
+	body = hHealthBody(ctx, c, cid, "after the cooldown")
 	ctx.Equal(body["breaker"], "closed", "30 s later open_until has passed (%v); the breaker", fmt.Sprint(body))
 }
 
@@ -890,8 +890,8 @@ func CheckDisabledStatus(ctx *harness.Ctx) {
 	stale := store.Create(hReadBg, "acme", "slack", "slack.com", "vault:acme/slack#1", 900).ConnectorID
 	hSeedHealth(ctx, stale, map[string]int64{"last_run_at": now - 86400, "last_success_at": now - 86400, "consecutive_failures": 0, "open_until": 0})
 	store.Disable(hReadBg, stale, "vendor rejected the OAuth token (401)")
-	body := healthBody(ctx, c, cid, "for a disabled connector")
-	old := healthBody(ctx, c, stale, "for a connector disabled a day ago")
+	body := hHealthBody(ctx, c, cid, "for a disabled connector")
+	old := hHealthBody(ctx, c, stale, "for a connector disabled a day ago")
 	ctx.Equal(body["status"], "disabled", "a connector disabled on a rejected token syncs nothing until a human acts, and must say so (%v); the status", body)
 	ctx.Equal(body["disabled_reason"], "vendor rejected the OAuth token (401)", "the reason the connector was disabled")
 	ctx.Equal(old["status"], "disabled", "a connector disabled a day ago, its last page a day old (%v): disabled says more than unhealthy, a human must act before it syncs again; the status", old)
@@ -932,7 +932,7 @@ harness::Response hReadHealth(harness::HTTP& c, const std::string& connector_id,
   return c.Get("/v1/connectors/" + connector_id + "/health", "X-Tenant-Id", tenant);
 }
 
-nlohmann::json healthBody(harness::Ctx& ctx, harness::HTTP& c, const std::string& connector_id, const std::string& what) {
+nlohmann::json hHealthBody(harness::Ctx& ctx, harness::HTTP& c, const std::string& connector_id, const std::string& what) {
   const auto r = hReadHealth(c, connector_id, "acme");
   ctx.Equal(r.Status, 200, "GET /v1/connectors/%s/health %s (%s)", connector_id, what, r.Text());
   try {
@@ -947,7 +947,7 @@ nlohmann::json healthBody(harness::Ctx& ctx, harness::HTTP& c, const std::string
 void CheckRoute(harness::Ctx& ctx) {
   HWorld w = hReadWorld(ctx);
   hSeedHealth(ctx, w.cid, {{"last_run_at", w.now - 60}, {"last_success_at", w.now - 60}, {"consecutive_failures", 0}, {"open_until", 0}, {"pages", 4}, {"records", 8}});
-  const auto body = healthBody(ctx, w.c, w.cid, "for a connector synced a minute ago");
+  const auto body = hHealthBody(ctx, w.c, w.cid, "for a connector synced a minute ago");
   ctx.Assert(body.value("connector_id", "") == w.cid && body.value("status", "") == "healthy", "a connector synced a minute ago must read healthy, got %s", body.dump());
   std::vector<std::string> absent;
   for (const std::string field : {"connector_id", "status", "disabled_reason", "last_success_at", "cursor_lag_s", "sync_interval_s", "consecutive_failures", "breaker"}) {
@@ -986,11 +986,11 @@ void CheckStaleFromSuccess(harness::Ctx& ctx) {
   hSeedHealth(ctx, edge, {{"last_run_at", w.now - 1800}, {"last_success_at", w.now - 1800}, {"consecutive_failures", 0}, {"open_until", 0}});
   const std::string late = store::create("acme", "stripe", "api.stripe.com", "vault:acme/stripe#2", 900).connector_id;
   hSeedHealth(ctx, late, {{"last_run_at", w.now - 30}, {"last_success_at", w.now - 1801}, {"consecutive_failures", 0}, {"open_until", 0}});
-  const auto failing = healthBody(ctx, w.c, w.cid, "for a connector whose runs fail");
-  const auto quiet = healthBody(ctx, w.c, daily, "for a daily connector");
-  const auto empty = healthBody(ctx, w.c, never, "for a connector that never landed a page");
-  const auto on_edge = healthBody(ctx, w.c, edge, "for a connector whose last page landed two intervals ago");
-  const auto past = healthBody(ctx, w.c, late, "for a connector whose last page landed two intervals and a second ago");
+  const auto failing = hHealthBody(ctx, w.c, w.cid, "for a connector whose runs fail");
+  const auto quiet = hHealthBody(ctx, w.c, daily, "for a daily connector");
+  const auto empty = hHealthBody(ctx, w.c, never, "for a connector that never landed a page");
+  const auto on_edge = hHealthBody(ctx, w.c, edge, "for a connector whose last page landed two intervals ago");
+  const auto past = hHealthBody(ctx, w.c, late, "for a connector whose last page landed two intervals and a second ago");
   ctx.Equal(failing.value("status", ""), "unhealthy", "no page has landed for 2700 s, three sync intervals of 900 s (%s): a failed run moves last_run_at too. Measure from last_success_at; the status", failing.dump());
   const bool lagged = failing.contains("cursor_lag_s") && failing["cursor_lag_s"].is_number() && std::abs(failing["cursor_lag_s"].get<double>() - 2700) <= 5;
   ctx.Assert(lagged && failing.value("sync_interval_s", 0) == 900, "the answer must carry cursor_lag_s (about 2700) and sync_interval_s 900, got %s", failing.dump());
@@ -1004,11 +1004,11 @@ void CheckStaleFromSuccess(harness::Ctx& ctx) {
 void CheckBreakerState(harness::Ctx& ctx) {
   HWorld w = hReadWorld(ctx);
   hSeedHealth(ctx, w.cid, {{"last_run_at", w.now - 5}, {"last_success_at", w.now - 300}, {"consecutive_failures", 5}, {"open_until", w.now + 20}});
-  auto body = healthBody(ctx, w.c, w.cid, "with the breaker open");
+  auto body = hHealthBody(ctx, w.c, w.cid, "with the breaker open");
   ctx.Assert(body.value("breaker", "") == "open" && body.value("consecutive_failures", 0) == 5,
              "five consecutive failures and open_until 20 s ahead read %s: the answer must show breaker open and consecutive_failures 5", body.dump());
   ctx.Clock.Advance(30);
-  body = healthBody(ctx, w.c, w.cid, "after the cooldown");
+  body = hHealthBody(ctx, w.c, w.cid, "after the cooldown");
   ctx.Equal(body.value("breaker", ""), "closed", "30 s later open_until has passed (%s); the breaker", body.dump());
 }
 
@@ -1020,8 +1020,8 @@ void CheckDisabledStatus(harness::Ctx& ctx) {
   const std::string stale = store::create("acme", "slack", "slack.com", "vault:acme/slack#1", 900).connector_id;
   hSeedHealth(ctx, stale, {{"last_run_at", w.now - 86400}, {"last_success_at", w.now - 86400}, {"consecutive_failures", 0}, {"open_until", 0}});
   store::disable(stale, "vendor rejected the OAuth token (401)");
-  const auto body = healthBody(ctx, w.c, w.cid, "for a disabled connector");
-  const auto old = healthBody(ctx, w.c, stale, "for a connector disabled a day ago");
+  const auto body = hHealthBody(ctx, w.c, w.cid, "for a disabled connector");
+  const auto old = hHealthBody(ctx, w.c, stale, "for a connector disabled a day ago");
   ctx.Equal(body.value("status", ""), "disabled", "a connector disabled on a rejected token syncs nothing until a human acts, and must say so (%s); the status", body.dump());
   ctx.Equal(body.value("disabled_reason", ""), "vendor rejected the OAuth token (401)", "the reason the connector was disabled");
   ctx.Equal(old.value("status", ""), "disabled", "a connector disabled a day ago, its last page a day old (%s): disabled says more than unhealthy, a human must act before it syncs again; the status", old.dump());

@@ -822,16 +822,16 @@ import (
 )
 
 var (
-	cacheOld   = []string{"merchant_id", "status"}
-	cacheNew   = []string{"merchant_id", "status", "passport_no"}
-	cacheModelCalls int
+	hCacheOld   = []string{"merchant_id", "status"}
+	hCacheNew   = []string{"merchant_id", "status", "passport_no"}
+	hCacheModelCalls int
 )
 
 // cacheWorld stands step 2 in: passport columns are Personal.ID, the rest None; it counts the model calls.
-func cacheWorld() {
-	cacheModelCalls = 0
+func hCacheWorld() {
+	hCacheModelCalls = 0
 	classifyColumns = func(_ context.Context, _ string, columns []string) (map[string]string, error) {
-		cacheModelCalls++
+		hCacheModelCalls++
 		tags := map[string]string{}
 		for _, c := range columns {
 			tags[c] = "None"
@@ -843,45 +843,45 @@ func cacheWorld() {
 	}
 }
 
-func cacheJob(entity string, columns []string) jobs.Job {
+func hCacheJob(entity string, columns []string) jobs.Job {
 	return jobs.Job{Entity: entity, Owner: "team-logistics", SchemaHash: jobs.SchemaHash(columns), Columns: columns}
 }
 
-func cacheDay(ctx *harness.Ctx) string { return "budget:" + ctx.Clock.Time().UTC().Format("2006-01-02") }
+func hCacheDay(ctx *harness.Ctx) string { return "budget:" + ctx.Clock.Time().UTC().Format("2006-01-02") }
 
-func cacheClassify(ctx *harness.Ctx, job jobs.Job) map[string]string {
+func hCacheClassify(ctx *harness.Ctx, job jobs.Job) map[string]string {
 	tags, err := classifyEntity(context.Background(), job)
 	ctx.NoError(err, "classifyEntity(%s)", job.Entity)
 	return tags
 }
 
 func CheckCacheKey(ctx *harness.Ctx) {
-	cacheWorld()
-	cacheClassify(ctx, cacheJob("deliveries", cacheOld))
-	tags := cacheClassify(ctx, cacheJob("deliveries", cacheNew))
+	hCacheWorld()
+	hCacheClassify(ctx, hCacheJob("deliveries", hCacheOld))
+	tags := hCacheClassify(ctx, hCacheJob("deliveries", hCacheNew))
 	ctx.Equal(tags["passport_no"], "Personal.ID", "after passport_no was added classifyEntity served the cached tags of the old schema (%v); key the cache by schema_hash. passport_no", tags)
-	ctx.Equal(cacheModelCalls, 2, "a changed schema must be classified again; model calls for two schemas")
-	key := "classify:deliveries:" + jobs.SchemaHash(cacheNew)
+	ctx.Equal(hCacheModelCalls, 2, "a changed schema must be classified again; model calls for two schemas")
+	key := "classify:deliveries:" + jobs.SchemaHash(hCacheNew)
 	ctx.Equal(ctx.Redis.Exists(key), 1, "the new tags must be cached under %s (keys: %v)", key, ctx.Redis.Keys("classify:*"))
-	again := cacheClassify(ctx, cacheJob("deliveries", cacheOld))
-	ctx.Assert(cacheModelCalls == 2 && len(again) == 2, "a job for the old schema must be a cache hit: %d model calls, tags %v", cacheModelCalls, again)
-	used, _ := ctx.Redis.Get(cacheDay(ctx))
-	ctx.Equal(used, "2", "%s after two model calls and a cache hit (a hit spends no budget)", cacheDay(ctx))
+	again := hCacheClassify(ctx, hCacheJob("deliveries", hCacheOld))
+	ctx.Assert(hCacheModelCalls == 2 && len(again) == 2, "a job for the old schema must be a cache hit: %d model calls, tags %v", hCacheModelCalls, again)
+	used, _ := ctx.Redis.Get(hCacheDay(ctx))
+	ctx.Equal(used, "2", "%s after two model calls and a cache hit (a hit spends no budget)", hCacheDay(ctx))
 }
 
 func CheckBudgetAtomic(ctx *harness.Ctx) {
-	cacheWorld()
-	day := cacheDay(ctx)
+	hCacheWorld()
+	day := hCacheDay(ctx)
 	ctx.Redis.Set(day, 400)
-	_, err := classifyEntity(context.Background(), cacheJob("orders", cacheOld))
+	_, err := classifyEntity(context.Background(), hCacheJob("orders", hCacheOld))
 	ctx.Assert(errors.Is(err, ErrBudgetExhausted), "with 400 entities classified today classifyEntity must return ErrBudgetExhausted, got %v", err)
-	ctx.Equal(cacheModelCalls, 0, "with today's budget spent the model must not be called; calls")
+	ctx.Equal(hCacheModelCalls, 0, "with today's budget spent the model must not be called; calls")
 	left, _ := ctx.Redis.Get(day)
 	ctx.Equal(left, "400", "a refused reservation must give the slot back over the cap; %s", day)
 	ctx.Redis.Set(day, 399)
-	cacheClassify(ctx, cacheJob("payments", cacheOld)) // the 400th entity of the day still fits
+	hCacheClassify(ctx, hCacheJob("payments", hCacheOld)) // the 400th entity of the day still fits
 	last, _ := ctx.Redis.Get(day)
-	ctx.Assert(cacheModelCalls == 1 && last == "400", "at 399 the 400th entity must get the last slot: %d call(s), %s = %s", cacheModelCalls, day, last)
+	ctx.Assert(hCacheModelCalls == 1 && last == "400", "at 399 the 400th entity must get the last slot: %d call(s), %s = %s", hCacheModelCalls, day, last)
 	ctx.Redis.Set(day, 399)
 	var other []bool
 	// A second worker reserving the same slot the way the task says: INCR, and DECR back over the cap.
@@ -894,7 +894,7 @@ func CheckBudgetAtomic(ctx *harness.Ctx) {
 		}
 		return nil
 	})
-	_, err = classifyEntity(context.Background(), cacheJob("deliveries", cacheOld))
+	_, err = classifyEntity(context.Background(), hCacheJob("deliveries", hCacheOld))
 	ctx.Assert(err == nil || errors.Is(err, ErrBudgetExhausted), "classifyEntity returned %v", err)
 	mine := err == nil
 	raw, _ := ctx.Redis.Get(day)
@@ -906,12 +906,12 @@ func CheckBudgetAtomic(ctx *harness.Ctx) {
 	if mine {
 		want = 2
 	}
-	ctx.Equal(cacheModelCalls, want, "the model calls must match the slot your worker got")
+	ctx.Equal(hCacheModelCalls, want, "the model calls must match the slot your worker got")
 }
 
 // cacheTTLWhenWritten records the TTL of key right after the first command that leaves it existing (a
 // lookup of the missing key before that re-arms the probe).
-func cacheTTLWhenWritten(ctx *harness.Ctx, key string, seen map[string]int64) {
+func hCacheTTLWhenWritten(ctx *harness.Ctx, key string, seen map[string]int64) {
 	var watch func() any
 	watch = func() any {
 		if ctx.Redis.Exists(key) == 1 {
@@ -925,22 +925,22 @@ func cacheTTLWhenWritten(ctx *harness.Ctx, key string, seen map[string]int64) {
 }
 
 func CheckExpiry(ctx *harness.Ctx) {
-	cacheWorld()
+	hCacheWorld()
 	if intoDay := ctx.Clock.Now() / 1000 % 86400; intoDay > 86400-7200 {
 		ctx.Clock.Advance(float64(86400 - intoDay + 60)) // the hour this check waits stays inside one UTC day
 	}
 	atWrite := map[string]int64{}
-	cacheKey := "classify:deliveries:" + jobs.SchemaHash(cacheNew)
-	day := cacheDay(ctx)
-	cacheTTLWhenWritten(ctx, cacheKey, atWrite)
-	cacheTTLWhenWritten(ctx, day, atWrite)
-	cacheClassify(ctx, cacheJob("deliveries", cacheNew))
+	cacheKey := "classify:deliveries:" + jobs.SchemaHash(hCacheNew)
+	day := hCacheDay(ctx)
+	hCacheTTLWhenWritten(ctx, cacheKey, atWrite)
+	hCacheTTLWhenWritten(ctx, day, atWrite)
+	hCacheClassify(ctx, hCacheJob("deliveries", hCacheNew))
 	written := ctx.Redis.Keys("classify:*")
 	ctx.Assert(len(written) > 0, "classifyEntity cached nothing under classify:*")
 	key := written[0]
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(604000 <= ttl && ttl <= 604800, "%s has TTL %d, expected 604800 (7 days)", key, ttl)
-	ctx.Equal(ctx.Redis.HGetAll("verify:deliveries"), map[string]string{"owner": "team-logistics", "schema_hash": jobs.SchemaHash(cacheNew), "state": "pending"}, "verify:deliveries")
+	ctx.Equal(ctx.Redis.HGetAll("verify:deliveries"), map[string]string{"owner": "team-logistics", "schema_hash": jobs.SchemaHash(hCacheNew), "state": "pending"}, "verify:deliveries")
 	ttl = ctx.Redis.TTL("verify:deliveries")
 	ctx.Assert(604000 <= ttl && ttl <= 604800, "verify:deliveries has TTL %d, expected 604800 (7 days)", ttl)
 	ttl = ctx.Redis.TTL(day)
@@ -950,7 +950,7 @@ func CheckExpiry(ctx *harness.Ctx) {
 		ctx.Assert(ok && got > 0, "%s existed without a TTL right after the command that wrote it (TTL %d): a crash before the separate EXPIRE leaves it forever. Write it with its expiry in one command", k, got)
 	}
 	ctx.Clock.Advance(3600)
-	cacheClassify(ctx, cacheJob("orders", cacheOld))
+	hCacheClassify(ctx, hCacheJob("orders", hCacheOld))
 	used, _ := ctx.Redis.Get(day)
 	ctx.Equal(used, "2", "%s after two entities", day)
 	ttl = ctx.Redis.TTL(day)

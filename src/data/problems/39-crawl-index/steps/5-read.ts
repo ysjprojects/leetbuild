@@ -947,13 +947,13 @@ using json = nlohmann::json;
 namespace {
 
 const std::string kHJob = "nightly";
-const std::string kHost = "blog.example.com";
+const std::string kHHost = "blog.example.com";
 
-std::string hReadUrl(int n) { return "https://" + kHost + "/p/" + std::to_string(n); }
+std::string hReadUrl(int n) { return "https://" + kHHost + "/p/" + std::to_string(n); }
 
 harness::HTTP hReadWorld(harness::Ctx& ctx, const std::vector<std::string>& urls) {
   registry::insert(kHJob, hReadUrl(0), "acme");
-  for (const std::string& u : urls) frontier::enqueue(kHJob, kHost, u);
+  for (const std::string& u : urls) frontier::enqueue(kHJob, kHHost, u);
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1015,7 +1015,7 @@ void CheckStalled(harness::Ctx& ctx) {
   ctx.Assert(hNumberIn(ctx, edge, "oldest_pending_age_s") == 600 && edge.contains("stalled") && edge["stalled"] == false,
              "a URL that has waited exactly kStallAfterS = 600 s is not stalled yet (stalled means longer than 600 s), the report says %s", edge.dump());
   ctx.Clock.Advance(100);
-  frontier::enqueue(kHJob, kHost, hReadUrl(2));
+  frontier::enqueue(kHJob, kHHost, hReadUrl(2));
   const json report = hReportOf(ctx, c);
   ctx.Equal(report.value("pending", -1), 2, "two URLs are pending; the report's pending");
   const double age = hNumberIn(ctx, report, "oldest_pending_age_s");
@@ -1047,7 +1047,7 @@ void CheckCoverage(harness::Ctx& ctx) {
   cov = hNumberIn(ctx, hReportOf(ctx, c), "coverage");
   ctx.Assert(std::abs(cov - 0.667) < 1e-9, "2 indexed of 2 fetched + 1 failed is 0.667 rounded to 3 places, the report says %v", cov);
   registry::insert("weekly", hReadUrl(9), "acme");
-  frontier::enqueue("weekly", kHost, hReadUrl(9));
+  frontier::enqueue("weekly", kHHost, hReadUrl(9));
   records::markRefused("weekly", hReadUrl(9), "forbidden");
   const auto r = c.Get("/v1/crawl/jobs/weekly", "X-Tenant-Id", "acme");
   ctx.Equal(r.Status, 200, "a job whose only page was refused (%s)", r.Text());

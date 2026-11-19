@@ -634,24 +634,24 @@ import (
 	"leetbuild/harness"
 )
 
-func rdAPI(ctx *harness.Ctx) *harness.HTTP {
+func hRdAPI(ctx *harness.Ctx) *harness.HTTP {
 	ctx.Clock.Advance(30 * 86400) // a month into the clock, so the window has history behind it
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func rdHour(ctx *harness.Ctx) int64 { return ctx.Clock.Now() / 3600000 }
+func hRdHour(ctx *harness.Ctx) int64 { return ctx.Clock.Now() / 3600000 }
 
-func rdSeed(ctx *harness.Ctx, tenant string, hour int64, counts map[string]int) {
+func hRdSeed(ctx *harness.Ctx, tenant string, hour int64, counts map[string]int) {
 	for term, n := range counts {
 		ctx.Redis.Do("ZADD", fmt.Sprintf("suggest:trend:%s:%d", tenant, hour), n, term)
 	}
 }
 
-func rdRead(c *harness.HTTP) *harness.Response { return c.Get("/v1/trending", "X-Tenant-Id", "acme") }
+func hRdRead(c *harness.HTTP) *harness.Response { return c.Get("/v1/trending", "X-Tenant-Id", "acme") }
 
-func rdEntries(r *harness.Response) []string {
+func hRdEntries(r *harness.Response) []string {
 	var body struct {
 		Entries []struct {
 			Term  string \`json:"term"\`
@@ -667,43 +667,43 @@ func rdEntries(r *harness.Response) []string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := rdAPI(ctx)
-	now := rdHour(ctx)
-	rdSeed(ctx, "acme", now, map[string]int{"kettle": 150, "kettlebell": 120})
-	rdSeed(ctx, "globex", now, map[string]int{"kebab": 500})
-	r := rdRead(c)
+	c := hRdAPI(ctx)
+	now := hRdHour(ctx)
+	hRdSeed(ctx, "acme", now, map[string]int{"kettle": 150, "kettlebell": 120})
+	hRdSeed(ctx, "globex", now, map[string]int{"kebab": 500})
+	r := hRdRead(c)
 	ctx.Equal(r.Status, 200, "GET /v1/trending (%s)", r.Text())
 	var body struct {
 		WindowHours int \`json:"window_hours"\`
 	}
 	r.Decode(&body)
 	ctx.Equal(body.WindowHours, 24, "window_hours")
-	ctx.Equal(rdEntries(r), []string{"kettle 150", "kettlebell 120"}, "acme's trends (globex's kebab is not acme's)")
+	ctx.Equal(hRdEntries(r), []string{"kettle 150", "kettlebell 120"}, "acme's trends (globex's kebab is not acme's)")
 	ctx.Equal(c.Get("/v1/trending").Status, 401, "a request without X-Tenant-Id")
 }
 
 func CheckOccurrenceFloor(ctx *harness.Ctx) {
-	c := rdAPI(ctx)
-	rdSeed(ctx, "acme", rdHour(ctx), map[string]int{"kettle": 150, "jane doe": 1, "rare find": 99, "lamp": 100})
-	ctx.Equal(rdEntries(rdRead(c)), []string{"kettle 150", "lamp 100"}, "a term searched fewer than 100 times is not a trend; the rail")
+	c := hRdAPI(ctx)
+	hRdSeed(ctx, "acme", hRdHour(ctx), map[string]int{"kettle": 150, "jane doe": 1, "rare find": 99, "lamp": 100})
+	ctx.Equal(hRdEntries(hRdRead(c)), []string{"kettle 150", "lamp 100"}, "a term searched fewer than 100 times is not a trend; the rail")
 }
 
 func CheckWindow(ctx *harness.Ctx) {
-	c := rdAPI(ctx)
-	now := rdHour(ctx)
-	rdSeed(ctx, "acme", now, map[string]int{"kettle": 60})
-	rdSeed(ctx, "acme", now-1, map[string]int{"kettle": 60})
-	rdSeed(ctx, "acme", now-23, map[string]int{"kettlebell": 110})
-	rdSeed(ctx, "acme", now-24, map[string]int{"lamp": 500})
-	rdSeed(ctx, "acme", now-48, map[string]int{"lamp": 500})
-	ctx.Equal(rdEntries(rdRead(c)), []string{"kettle 120", "kettlebell 110"}, "only the last 24 hourly buckets count, and lamp's searches are older; the rail")
+	c := hRdAPI(ctx)
+	now := hRdHour(ctx)
+	hRdSeed(ctx, "acme", now, map[string]int{"kettle": 60})
+	hRdSeed(ctx, "acme", now-1, map[string]int{"kettle": 60})
+	hRdSeed(ctx, "acme", now-23, map[string]int{"kettlebell": 110})
+	hRdSeed(ctx, "acme", now-24, map[string]int{"lamp": 500})
+	hRdSeed(ctx, "acme", now-48, map[string]int{"lamp": 500})
+	ctx.Equal(hRdEntries(hRdRead(c)), []string{"kettle 120", "kettlebell 110"}, "only the last 24 hourly buckets count, and lamp's searches are older; the rail")
 }
 
 func CheckSensitiveFilter(ctx *harness.Ctx) {
-	c := rdAPI(ctx)
-	rdSeed(ctx, "acme", rdHour(ctx), map[string]int{"kettle": 150, "clinic near me": 400, "jane doe": 300, "lamp": 200})
+	c := hRdAPI(ctx)
+	hRdSeed(ctx, "acme", hRdHour(ctx), map[string]int{"kettle": 150, "clinic near me": 400, "jane doe": 300, "lamp": 200})
 	ctx.Redis.Do("HSET", "suggest:category:acme", "kettle", "kitchen", "clinic near me", "health", "jane doe", "person", "lamp", "home")
-	ctx.Equal(rdEntries(rdRead(c)), []string{"lamp 200", "kettle 150"}, "a health term and a person's name never trend; the rail")
+	ctx.Equal(hRdEntries(hRdRead(c)), []string{"lamp 200", "kettle 150"}, "a health term and a person's name never trend; the rail")
 	// Thirteen terms over the floor, the two most searched sensitive: the cut to ten comes after the filter.
 	counts := map[string]int{"adult site": 900, "dr jane roe": 800}
 	want := []string{}
@@ -714,16 +714,16 @@ func CheckSensitiveFilter(ctx *harness.Ctx) {
 			want = append(want, fmt.Sprintf("%s %d", term, 600-10*n))
 		}
 	}
-	rdSeed(ctx, "globex", rdHour(ctx), counts)
+	hRdSeed(ctx, "globex", hRdHour(ctx), counts)
 	ctx.Redis.Do("HSET", "suggest:category:globex", "adult site", "adult", "dr jane roe", "person")
-	ctx.Equal(rdEntries(c.Get("/v1/trending", "X-Tenant-Id", "globex")), want, "an adult term never trends, and the top ten are cut after the sensitive terms are dropped; globex's rail")
+	ctx.Equal(hRdEntries(c.Get("/v1/trending", "X-Tenant-Id", "globex")), want, "an adult term never trends, and the top ten are cut after the sensitive terms are dropped; globex's rail")
 }
 
 func CheckNoUserLinkage(ctx *harness.Ctx) {
-	c := rdAPI(ctx)
-	rdSeed(ctx, "acme", rdHour(ctx), map[string]int{"kettle": 150})
+	c := hRdAPI(ctx)
+	hRdSeed(ctx, "acme", hRdHour(ctx), map[string]int{"kettle": 150})
 	ctx.Redis.Do("HSET", "suggest:searcher:acme", "kettle", "u-17")
-	r := rdRead(c)
+	r := hRdRead(c)
 	var body struct {
 		Entries []map[string]any \`json:"entries"\`
 	}
@@ -747,7 +747,7 @@ func CheckNoUserLinkage(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP rdAPI(harness::Ctx& ctx) {
+harness::HTTP hRdAPI(harness::Ctx& ctx) {
   ctx.Clock.Advance(30 * 86400);  // a month into the clock, so the window has history behind it
   static httplib::Server* svr = nullptr;
   delete svr;
@@ -756,15 +756,15 @@ harness::HTTP rdAPI(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-long long rdHour(harness::Ctx& ctx) { return ctx.Clock.Now() / 3600000; }
+long long hRdHour(harness::Ctx& ctx) { return ctx.Clock.Now() / 3600000; }
 
-void rdSeed(harness::Ctx& ctx, long long hour, const std::map<std::string, int>& counts, const std::string& tenant = "acme") {
+void hRdSeed(harness::Ctx& ctx, long long hour, const std::map<std::string, int>& counts, const std::string& tenant = "acme") {
   for (const auto& [term, n] : counts) ctx.Redis.Must({"ZADD", "suggest:trend:" + tenant + ":" + std::to_string(hour), std::to_string(n), term});
 }
 
-harness::Response rdRead(harness::HTTP& c) { return c.Get("/v1/trending", "X-Tenant-Id", "acme"); }
+harness::Response hRdRead(harness::HTTP& c) { return c.Get("/v1/trending", "X-Tenant-Id", "acme"); }
 
-std::vector<std::string> rdEntries(const harness::Response& r) {
+std::vector<std::string> hRdEntries(const harness::Response& r) {
   std::vector<std::string> out;
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   if (!body.is_object() || !body.contains("entries")) return out;
@@ -775,40 +775,40 @@ std::vector<std::string> rdEntries(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = rdAPI(ctx);
-  const long long now = rdHour(ctx);
-  rdSeed(ctx, now, {{"kettle", 150}, {"kettlebell", 120}});
-  rdSeed(ctx, now, {{"kebab", 500}}, "globex");
-  const auto r = rdRead(c);
+  auto c = hRdAPI(ctx);
+  const long long now = hRdHour(ctx);
+  hRdSeed(ctx, now, {{"kettle", 150}, {"kettlebell", 120}});
+  hRdSeed(ctx, now, {{"kebab", 500}}, "globex");
+  const auto r = hRdRead(c);
   ctx.Equal(r.Status, 200, "GET /v1/trending (%s)", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Equal(body.is_object() ? body.value("window_hours", 0) : 0, 24, "window_hours");
-  ctx.Equal(rdEntries(r), {"kettle 150", "kettlebell 120"}, "acme's trends (globex's kebab is not acme's)");
+  ctx.Equal(hRdEntries(r), {"kettle 150", "kettlebell 120"}, "acme's trends (globex's kebab is not acme's)");
   ctx.Equal(c.Get("/v1/trending").Status, 401, "a request without X-Tenant-Id");
 }
 
 void CheckOccurrenceFloor(harness::Ctx& ctx) {
-  auto c = rdAPI(ctx);
-  rdSeed(ctx, rdHour(ctx), {{"kettle", 150}, {"jane doe", 1}, {"rare find", 99}, {"lamp", 100}});
-  ctx.Equal(rdEntries(rdRead(c)), {"kettle 150", "lamp 100"}, "a term searched fewer than 100 times is not a trend; the rail");
+  auto c = hRdAPI(ctx);
+  hRdSeed(ctx, hRdHour(ctx), {{"kettle", 150}, {"jane doe", 1}, {"rare find", 99}, {"lamp", 100}});
+  ctx.Equal(hRdEntries(hRdRead(c)), {"kettle 150", "lamp 100"}, "a term searched fewer than 100 times is not a trend; the rail");
 }
 
 void CheckWindow(harness::Ctx& ctx) {
-  auto c = rdAPI(ctx);
-  const long long now = rdHour(ctx);
-  rdSeed(ctx, now, {{"kettle", 60}});
-  rdSeed(ctx, now - 1, {{"kettle", 60}});
-  rdSeed(ctx, now - 23, {{"kettlebell", 110}});
-  rdSeed(ctx, now - 24, {{"lamp", 500}});
-  rdSeed(ctx, now - 48, {{"lamp", 500}});
-  ctx.Equal(rdEntries(rdRead(c)), {"kettle 120", "kettlebell 110"}, "only the last 24 hourly buckets count, and lamp's searches are older; the rail");
+  auto c = hRdAPI(ctx);
+  const long long now = hRdHour(ctx);
+  hRdSeed(ctx, now, {{"kettle", 60}});
+  hRdSeed(ctx, now - 1, {{"kettle", 60}});
+  hRdSeed(ctx, now - 23, {{"kettlebell", 110}});
+  hRdSeed(ctx, now - 24, {{"lamp", 500}});
+  hRdSeed(ctx, now - 48, {{"lamp", 500}});
+  ctx.Equal(hRdEntries(hRdRead(c)), {"kettle 120", "kettlebell 110"}, "only the last 24 hourly buckets count, and lamp's searches are older; the rail");
 }
 
 void CheckSensitiveFilter(harness::Ctx& ctx) {
-  auto c = rdAPI(ctx);
-  rdSeed(ctx, rdHour(ctx), {{"kettle", 150}, {"clinic near me", 400}, {"jane doe", 300}, {"lamp", 200}});
+  auto c = hRdAPI(ctx);
+  hRdSeed(ctx, hRdHour(ctx), {{"kettle", 150}, {"clinic near me", 400}, {"jane doe", 300}, {"lamp", 200}});
   ctx.Redis.Must({"HSET", "suggest:category:acme", "kettle", "kitchen", "clinic near me", "health", "jane doe", "person", "lamp", "home"});
-  ctx.Equal(rdEntries(rdRead(c)), {"lamp 200", "kettle 150"}, "a health term and a person's name never trend; the rail");
+  ctx.Equal(hRdEntries(hRdRead(c)), {"lamp 200", "kettle 150"}, "a health term and a person's name never trend; the rail");
   // Thirteen terms over the floor, the two most searched sensitive: the cut to ten comes after the filter.
   std::map<std::string, int> counts = {{"adult site", 900}, {"dr jane roe", 800}};
   std::vector<std::string> want;
@@ -817,16 +817,16 @@ void CheckSensitiveFilter(harness::Ctx& ctx) {
     counts[term] = 600 - 10 * n;
     if (n <= 10) want.push_back(term + " " + std::to_string(600 - 10 * n));
   }
-  rdSeed(ctx, rdHour(ctx), counts, "globex");
+  hRdSeed(ctx, hRdHour(ctx), counts, "globex");
   ctx.Redis.Must({"HSET", "suggest:category:globex", "adult site", "adult", "dr jane roe", "person"});
-  ctx.Equal(rdEntries(c.Get("/v1/trending", "X-Tenant-Id", "globex")), want, "an adult term never trends, and the top ten are cut after the sensitive terms are dropped; globex's rail");
+  ctx.Equal(hRdEntries(c.Get("/v1/trending", "X-Tenant-Id", "globex")), want, "an adult term never trends, and the top ten are cut after the sensitive terms are dropped; globex's rail");
 }
 
 void CheckNoUserLinkage(harness::Ctx& ctx) {
-  auto c = rdAPI(ctx);
-  rdSeed(ctx, rdHour(ctx), {{"kettle", 150}});
+  auto c = hRdAPI(ctx);
+  hRdSeed(ctx, hRdHour(ctx), {{"kettle", 150}});
   ctx.Redis.Must({"HSET", "suggest:searcher:acme", "kettle", "u-17"});
-  const auto r = rdRead(c);
+  const auto r = hRdRead(c);
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object() && body.contains("entries") && !body["entries"].empty(), "the rail is empty: %s", r.Text());
   for (const auto& e : body["entries"]) {

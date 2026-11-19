@@ -814,38 +814,38 @@ import (
 	"leetbuild/harness"
 )
 
-const stateQueue = "assign:queue"
+const kHStateQueue = "assign:queue"
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func stateTicket(subject string) string { return store.CreateTicket(stateBg, "R-1", subject).ID }
+func hStateTicket(subject string) string { return store.CreateTicket(hStateBg, "R-1", subject).ID }
 
-func stateAssign(ctx *harness.Ctx, ticketID, agent string) string {
-	holder, err := assign(stateBg, ticketID, agent)
+func hStateAssign(ctx *harness.Ctx, ticketID, agent string) string {
+	holder, err := assign(hStateBg, ticketID, agent)
 	ctx.NoError(err, "assign(%s, %s) failed", ticketID, agent)
 	return holder
 }
 
-func stateRelease(ctx *harness.Ctx, ticketID, agent string) bool {
-	released, err := release(stateBg, ticketID, agent)
+func hStateRelease(ctx *harness.Ctx, ticketID, agent string) bool {
+	released, err := release(hStateBg, ticketID, agent)
 	ctx.NoError(err, "release(%s, %s) failed", ticketID, agent)
 	return released
 }
 
-func stateLease(ctx *harness.Ctx, ticketID string) string {
+func hStateLease(ctx *harness.Ctx, ticketID string) string {
 	holder, _ := ctx.Redis.Get("lease:" + ticketID)
 	return holder
 }
 
 func CheckLeaseExclusive(ctx *harness.Ctx) {
-	t := stateTicket("Printer on fire")
-	ctx.Equal(stateAssign(ctx, t, "A-1"), "A-1", "a free ticket must go to the first agent who asks; assign answered")
-	ctx.Equal(stateAssign(ctx, t, "A-2"), "A-1", "the ticket is A-1's, so a second agent's assign must answer its holder; it answered")
-	ctx.Equal(stateLease(ctx, t), "A-1", "lease:%s after a second agent's assign (taking it from A-1 means both agents answer the customer)", t)
+	t := hStateTicket("Printer on fire")
+	ctx.Equal(hStateAssign(ctx, t, "A-1"), "A-1", "a free ticket must go to the first agent who asks; assign answered")
+	ctx.Equal(hStateAssign(ctx, t, "A-2"), "A-1", "the ticket is A-1's, so a second agent's assign must answer its holder; it answered")
+	ctx.Equal(hStateLease(ctx, t), "A-1", "lease:%s after a second agent's assign (taking it from A-1 means both agents answer the customer)", t)
 	// Two agents click Assign on another ticket at the same instant.
-	t2 := stateTicket("Second printer on fire")
+	t2 := hStateTicket("Second printer on fire")
 	rival := ctx.Redis.After("lease:"+t2, func() any { return ctx.Redis.Set("lease:"+t2, "A-2", "NX", "EX", 120) })
-	mine := stateAssign(ctx, t2, "A-1")
+	mine := hStateAssign(ctx, t2, "A-1")
 	ctx.Assert(rival.Fired, "nothing touched lease:%s", t2)
 	rivalWon := rival.Result == true
 	var owners []string
@@ -856,86 +856,86 @@ func CheckLeaseExclusive(ctx *harness.Ctx) {
 		owners = append(owners, "A-2")
 	}
 	ctx.Assert(len(owners) == 1, "two agents assigning %s at once: A-1's assign answered %q and A-2's SET NX won=%t, so %d agents own it. Take the lease in one SET NX", t2, mine, rivalWon, len(owners))
-	ctx.Equal(stateLease(ctx, t2), owners[0], "lease:%s must name the one owner", t2)
+	ctx.Equal(hStateLease(ctx, t2), owners[0], "lease:%s must name the one owner", t2)
 }
 
 func CheckLeaseExpiry(ctx *harness.Ctx) {
-	t := stateTicket("Printer on fire")
+	t := hStateTicket("Printer on fire")
 	// Read the TTL the instant the lease is written, before any follow-up command can set one.
 	first := ctx.Redis.After("lease:"+t, func() any { return ctx.Redis.TTL("lease:" + t) })
-	stateAssign(ctx, t, "A-1")
+	hStateAssign(ctx, t, "A-1")
 	ctx.Assert(first.Fired, "assign never touched lease:%s", t)
 	early, _ := first.Result.(int64)
 	ctx.Assert(early == -2 || (early > 0 && early <= 120), "lease:%s had TTL %d right after the command that wrote it: the lease must carry EX leaseTTL = 120 s in the same SET NX, or the ticket of an agent who went home stays theirs", t, early)
 	ttl := ctx.Redis.TTL("lease:" + t)
 	ctx.Assert(ttl > 0 && ttl <= 120, "lease:%s has TTL %d: a lease must expire after leaseTTL = 120 s, or the ticket of an agent who went home stays theirs", t, ttl)
 	ctx.Clock.Advance(119)
-	ctx.Equal(stateAssign(ctx, t, "A-2"), "A-1", "119 s after A-1 took the lease it is still A-1's (the lease lasts 120 s); A-2's assign answered")
+	ctx.Equal(hStateAssign(ctx, t, "A-2"), "A-1", "119 s after A-1 took the lease it is still A-1's (the lease lasts 120 s); A-2's assign answered")
 	ctx.Clock.Advance(2)
-	ctx.Equal(stateAssign(ctx, t, "A-2"), "A-2", "121 s after A-1 took the lease and went silent, the lease must have expired; A-2's assign answered")
+	ctx.Equal(hStateAssign(ctx, t, "A-2"), "A-2", "121 s after A-1 took the lease and went silent, the lease must have expired; A-2's assign answered")
 }
 
 func CheckReleaseHolder(ctx *harness.Ctx) {
-	t := stateTicket("Printer on fire")
+	t := hStateTicket("Printer on fire")
 	lease := "lease:" + t
-	stateAssign(ctx, t, "A-1")
-	ctx.Equal(stateRelease(ctx, t, "A-2"), false, "A-2 released A-1's ticket: only the lease's holder may release it; release answered")
-	ctx.Equal(stateLease(ctx, t), "A-1", "%s after A-2's release (A-1 must keep it)", lease)
+	hStateAssign(ctx, t, "A-1")
+	ctx.Equal(hStateRelease(ctx, t, "A-2"), false, "A-2 released A-1's ticket: only the lease's holder may release it; release answered")
+	ctx.Equal(hStateLease(ctx, t), "A-1", "%s after A-2's release (A-1 must keep it)", lease)
 	// A-1's lease runs out while its release is in flight, and A-2 takes the ticket.
 	rival := ctx.Redis.After(lease, func() any {
 		ctx.Redis.Del(lease)
 		return ctx.Redis.Set(lease, "A-2", "NX", "EX", 120)
 	})
-	stateRelease(ctx, t, "A-1")
+	hStateRelease(ctx, t, "A-1")
 	ctx.Assert(rival.Fired, "nothing touched %s", lease)
-	ctx.Equal(stateLease(ctx, t), "A-2", "after A-1's late release, %s (A-1 deleted the lease A-2 had just taken: compare the holder and delete in one script)", lease)
+	ctx.Equal(hStateLease(ctx, t), "A-2", "after A-1's late release, %s (A-1 deleted the lease A-2 had just taken: compare the holder and delete in one script)", lease)
 }
 
 func CheckQueueReturn(ctx *harness.Ctx) {
-	t := stateTicket("Printer on fire")
-	ctx.Redis.Do("ZADD", stateQueue, 1, t)
-	stateAssign(ctx, t, "A-1")
-	_, queued := ctx.Redis.ZScore(stateQueue, t)
-	ctx.Assert(!queued, "%s is still on %s after A-1 took it: the next agent would pick it up too", t, stateQueue)
+	t := hStateTicket("Printer on fire")
+	ctx.Redis.Do("ZADD", kHStateQueue, 1, t)
+	hStateAssign(ctx, t, "A-1")
+	_, queued := ctx.Redis.ZScore(kHStateQueue, t)
+	ctx.Assert(!queued, "%s is still on %s after A-1 took it: the next agent would pick it up too", t, kHStateQueue)
 	ctx.Clock.Advance(30)
-	ctx.Equal(stateRelease(ctx, t, "A-1"), true, "the holder's release; it answered")
+	ctx.Equal(hStateRelease(ctx, t, "A-1"), true, "the holder's release; it answered")
 	ctx.Equal(ctx.Redis.Exists("lease:"+t), int64(0), "lease:%s after its holder released it; exists", t)
-	score, queued := ctx.Redis.ZScore(stateQueue, t)
-	ctx.Assert(queued, "%s is not on %s after its release: a ticket nobody holds must be back in the queue", t, stateQueue)
+	score, queued := ctx.Redis.ZScore(kHStateQueue, t)
+	ctx.Assert(queued, "%s is not on %s after its release: a ticket nobody holds must be back in the queue", t, kHStateQueue)
 	now := float64(ctx.Clock.Now()) / 1000
-	ctx.Assert(score >= now-2 && score <= now+2, "%s went back on %s with score %v, the release ran at %d: the score is the time of the release", t, stateQueue, score, int64(now))
-	ctx.Equal(stateAssign(ctx, t, "A-2"), "A-2", "a released ticket must go to the next agent who asks; assign answered")
+	ctx.Assert(score >= now-2 && score <= now+2, "%s went back on %s with score %v, the release ran at %d: the score is the time of the release", t, kHStateQueue, score, int64(now))
+	ctx.Equal(hStateAssign(ctx, t, "A-2"), "A-2", "a released ticket must go to the next agent who asks; assign answered")
 	// A-3 takes the ticket the instant A-2's release has touched the lease.
 	lease := "lease:" + t
 	rival := ctx.Redis.After(lease, func() any {
 		won := ctx.Redis.Set(lease, "A-3", "NX", "EX", 120)
 		if won {
-			ctx.Redis.Do("ZREM", stateQueue, t)
+			ctx.Redis.Do("ZREM", kHStateQueue, t)
 		}
 		return won
 	})
-	stateRelease(ctx, t, "A-2")
+	hStateRelease(ctx, t, "A-2")
 	ctx.Assert(rival.Fired, "A-2's release never touched %s", lease)
-	_, queued = ctx.Redis.ZScore(stateQueue, t)
+	_, queued = ctx.Redis.ZScore(kHStateQueue, t)
 	if rival.Result == true {
-		ctx.Assert(!queued, "A-3 took %s right after A-2's release deleted the lease, and %s is back on %s anyway: delete the lease and ZADD in the same script", t, t, stateQueue)
+		ctx.Assert(!queued, "A-3 took %s right after A-2's release deleted the lease, and %s is back on %s anyway: delete the lease and ZADD in the same script", t, t, kHStateQueue)
 	} else {
-		ctx.Assert(queued && ctx.Redis.Exists(lease) == 0, "after A-2's release %s must be off its lease and back on %s", t, stateQueue)
+		ctx.Assert(queued && ctx.Redis.Exists(lease) == 0, "after A-2's release %s must be off its lease and back on %s", t, kHStateQueue)
 	}
 }
 
 func CheckUnreadAtomic(ctx *harness.Ctx) {
-	t := stateTicket("Printer on fire")
+	t := hStateTicket("Printer on fire")
 	key := "unread:R-1"
 	// Another replica posts a reply on the same ticket the instant this post first touches the badge.
 	rival := ctx.Redis.After(key, func() any { return ctx.Redis.Do("HINCRBY", key, t, 1) })
-	got, err := postMessage(stateBg, t, "A-1", "We refunded the second charge.")
+	got, err := postMessage(hStateBg, t, "A-1", "We refunded the second charge.")
 	ctx.NoError(err, "postMessage failed")
 	ctx.Assert(rival.Fired, "postMessage never touched %s", key)
 	count, _ := ctx.Redis.HGet(key, t)
 	ctx.Equal(count, "2", "two replies were posted on %s: one increment was lost between a read and a write (increment with HINCRBY); the badge", t)
 	ctx.Equal(got, int64(1), "postMessage returns the count its own HINCRBY produced, not a later read that includes another reply; it answered")
-	notes := store.Page(stateBg, t, 0, 10)
+	notes := store.Page(hStateBg, t, 0, 10)
 	ctx.Assert(len(notes) == 1 && notes[0].Body == "We refunded the second charge.", "postMessage must append the reply as a note, the ticket has %+v", notes)
 }
 `,

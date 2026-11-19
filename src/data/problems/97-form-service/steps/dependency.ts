@@ -971,17 +971,17 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
-// handlerPeer upserts on idempotency_key: one record per key it has seen.
-type handlerPeer struct {
+// HHandlerPeer upserts on idempotency_key: one record per key it has seen.
+type HHandlerPeer struct {
 	pb.UnimplementedHandlerServer
 	name    string
 	records map[string]string
 	down    bool
 }
 
-func (h *handlerPeer) Deliver(_ context.Context, req *pb.DeliverRequest) (*pb.DeliverReply, error) {
+func (h *HHandlerPeer) Deliver(_ context.Context, req *pb.DeliverRequest) (*pb.DeliverReply, error) {
 	if h.down {
 		return nil, status.Errorf(codes.Unavailable, "%s is down", h.name)
 	}
@@ -991,9 +991,9 @@ func (h *handlerPeer) Deliver(_ context.Context, req *pb.DeliverRequest) (*pb.De
 	return &pb.DeliverReply{Receipt: h.records[req.GetIdempotencyKey()]}, nil
 }
 
-func clientSetup(ctx *harness.Ctx) map[string]*handlerPeer {
-	ctx.NoError(store.DefineForm(clientBg, "f-1", "u-owner", store.Schema{"name": 40, "email": 80}, store.Schema{"name": 40, "email": 80}), "DefineForm")
-	peers := map[string]*handlerPeer{
+func hClientSetup(ctx *harness.Ctx) map[string]*HHandlerPeer {
+	ctx.NoError(store.DefineForm(hClientBg, "f-1", "u-owner", store.Schema{"name": 40, "email": 80}, store.Schema{"name": 40, "email": 80}), "DefineForm")
+	peers := map[string]*HHandlerPeer{
 		"webhook": {name: "webhook", records: map[string]string{}},
 		"crm":     {name: "crm", records: map[string]string{}},
 		"queue":   {name: "queue", records: map[string]string{}},
@@ -1004,32 +1004,32 @@ func clientSetup(ctx *harness.Ctx) map[string]*handlerPeer {
 	return peers
 }
 
-func clientSubmission(ctx *harness.Ctx) string {
-	id, err := store.InsertSubmission(clientBg, "f-1", map[string]string{"name": "Ada", "email": "ada@example.com"})
+func hClientSubmission(ctx *harness.Ctx) string {
+	id, err := store.InsertSubmission(hClientBg, "f-1", map[string]string{"name": "Ada", "email": "ada@example.com"})
 	ctx.NoError(err, "InsertSubmission")
 	return id
 }
 
-func clientDeliver(ctx *harness.Ctx, id string) Delivery {
-	d, err := deliver(clientBg, id)
+func hClientDeliver(ctx *harness.Ctx, id string) Delivery {
+	d, err := deliver(hClientBg, id)
 	ctx.NoError(err, "deliver(%s)", id)
 	return d
 }
 
-func clientKeyOf(c any) string { return c.(*pb.DeliverRequest).GetIdempotencyKey() }
+func hClientKeyOf(c any) string { return c.(*pb.DeliverRequest).GetIdempotencyKey() }
 
 func CheckStableKey(ctx *harness.Ctx) {
-	peers := clientSetup(ctx)
-	sid := clientSubmission(ctx)
+	peers := hClientSetup(ctx)
+	sid := hClientSubmission(ctx)
 	ctx.GRPC.Fail("Deliver", codes.Unavailable, "", 1, "crm:9000") // the crm's first answer is lost
-	first := clientDeliver(ctx, sid)
+	first := hClientDeliver(ctx, sid)
 	ctx.Equal(first.Outcomes["crm"], "ok", "the crm failed once: one lost answer must be retried within ATTEMPTS, not left to the retry job; the crm's outcome")
-	clientDeliver(ctx, sid) // the retry job replays it
+	hClientDeliver(ctx, sid) // the retry job replays it
 	calls := ctx.GRPC.CallsTo("Deliver", "crm:9000")
 	ctx.Assert(len(calls) >= 2, "the crm failed once and was called %d times: it must be retried", len(calls))
 	seen := map[string]bool{}
 	for _, c := range calls {
-		seen[clientKeyOf(c.Request)] = true
+		seen[hClientKeyOf(c.Request)] = true
 	}
 	keys := []string{}
 	for k := range seen {
@@ -1039,23 +1039,23 @@ func CheckStableKey(ctx *harness.Ctx) {
 	ctx.Assert(len(keys) == 1, "the crm was called with %d idempotency keys %q for one submission: each retry looks like a new lead. Send %s:crm every time", len(keys), keys, sid)
 	ctx.Equal(keys[0], sid+":crm", "the key names the submission and the handler; the crm's key")
 	ctx.Equal(len(peers["crm"].records), 1, "the crm must hold one lead for one submission; leads")
-	other := clientSubmission(ctx)
-	clientDeliver(ctx, other)
+	other := hClientSubmission(ctx)
+	hClientDeliver(ctx, other)
 	var otherKeys []string
 	for _, c := range ctx.GRPC.CallsTo("Deliver", "crm:9000") {
 		if c.Request.(*pb.DeliverRequest).GetSubmissionId() == other {
-			otherKeys = append(otherKeys, clientKeyOf(c.Request))
+			otherKeys = append(otherKeys, hClientKeyOf(c.Request))
 		}
 	}
 	ctx.Assert(len(otherKeys) > 0 && !seen[otherKeys[0]], "a second submission was sent with the key %q: each submission needs its own", otherKeys)
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientSetup(ctx)
-	sid := clientSubmission(ctx)
+	hClientSetup(ctx)
+	sid := hClientSubmission(ctx)
 	ctx.GRPC.SetLatency("Deliver", 10.0, "webhook:9000") // the webhook hangs
 	start := ctx.Clock.Now()
-	clientDeliver(ctx, sid)
+	hClientDeliver(ctx, sid)
 	elapsed := float64(ctx.Clock.Now()-start) / 1000
 	for _, call := range ctx.GRPC.CallsTo("Deliver", "") {
 		ctx.Assert(call.HasDeadline(), "a Deliver call to %s carries no deadline: a hung handler holds the delivery open", call.Target)
@@ -1066,10 +1066,10 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckPerHandlerOutcomes(ctx *harness.Ctx) {
-	peers := clientSetup(ctx)
-	sid := clientSubmission(ctx)
+	peers := hClientSetup(ctx)
+	sid := hClientSubmission(ctx)
 	peers["queue"].down = true
-	result := clientDeliver(ctx, sid)
+	result := hClientDeliver(ctx, sid)
 	expected := map[string]string{"webhook": "ok", "crm": "ok", "queue": "failed"}
 	ctx.Equal(result.Outcomes, expected, "with the queue down, deliver's outcomes")
 	stored := ctx.Redis.HGetAll("delivery:" + sid)
@@ -1081,28 +1081,28 @@ func CheckPerHandlerOutcomes(ctx *harness.Ctx) {
 }
 
 func CheckPartialStatus(ctx *harness.Ctx) {
-	peers := clientSetup(ctx)
+	peers := hClientSetup(ctx)
 	peers["queue"].down = true
-	sid := clientSubmission(ctx)
-	ctx.Equal(clientDeliver(ctx, sid).Status, "partial", "with the queue down, deliver's status")
+	sid := hClientSubmission(ctx)
+	ctx.Equal(hClientDeliver(ctx, sid).Status, "partial", "with the queue down, deliver's status")
 	stored, _ := ctx.Redis.HGet("delivery:"+sid, "status")
 	ctx.Equal(stored, "partial", "delivery:%s's status while the queue never got it", sid)
 	peers["queue"].down = false
-	ctx.Equal(clientDeliver(ctx, clientSubmission(ctx)).Status, "delivered", "with every handler up, the status")
+	ctx.Equal(hClientDeliver(ctx, hClientSubmission(ctx)).Status, "delivered", "with every handler up, the status")
 	for _, p := range peers {
 		p.down = true
 	}
-	ctx.Equal(clientDeliver(ctx, clientSubmission(ctx)).Status, "failed", "with every handler down, the status")
+	ctx.Equal(hClientDeliver(ctx, hClientSubmission(ctx)).Status, "failed", "with every handler down, the status")
 }
 
 func CheckReplayFailedOnly(ctx *harness.Ctx) {
-	peers := clientSetup(ctx)
-	sid := clientSubmission(ctx)
+	peers := hClientSetup(ctx)
+	sid := hClientSubmission(ctx)
 	peers["queue"].down = true
-	clientDeliver(ctx, sid)
+	hClientDeliver(ctx, sid)
 	peers["queue"].down = false
 	before := len(ctx.GRPC.CallsTo("Deliver", ""))
-	result := clientDeliver(ctx, sid) // the retry job replays the partial delivery
+	result := hClientDeliver(ctx, sid) // the retry job replays the partial delivery
 	targets := map[string]bool{}
 	for _, c := range ctx.GRPC.CallsTo("Deliver", "")[before:] {
 		targets[c.Target] = true
@@ -1115,10 +1115,10 @@ func CheckReplayFailedOnly(ctx *harness.Ctx) {
 	ctx.Equal(called, []string{"queue:9000"}, "the replay must call only the handler that failed (queue); it called")
 	ctx.Equal(result.Status, "delivered", "after the queue took it on the replay, the status")
 	ctx.Assert(len(peers["webhook"].records) == 1 && len(peers["crm"].records) == 1, "the replay re-sent the submission to a handler that already had it")
-	still := clientSubmission(ctx)
+	still := hClientSubmission(ctx)
 	peers["queue"].down = true
-	clientDeliver(ctx, still)
-	again := clientDeliver(ctx, still) // replayed while the queue is still down
+	hClientDeliver(ctx, still)
+	again := hClientDeliver(ctx, still) // replayed while the queue is still down
 	ctx.Equal(again.Status, "partial", "a replay with the queue still down: the handlers that took it on the first run still count; the status")
 	ctx.Equal(again.Outcomes, map[string]string{"webhook": "ok", "crm": "ok", "queue": "failed"}, "a replay with the queue still down, deliver's outcomes")
 	stillStatus, _ := ctx.Redis.HGet("delivery:"+still, "status")
@@ -1139,9 +1139,9 @@ func CheckReplayFailedOnly(ctx *harness.Ctx) {
 namespace {
 
 // A downstream handler that upserts on idempotency_key: one record per key it has seen.
-class HandlerPeer final : public formd::Handler::Service {
+class HHandlerPeer final : public formd::Handler::Service {
  public:
-  explicit HandlerPeer(std::string name) : name_(std::move(name)) {}
+  explicit HHandlerPeer(std::string name) : name_(std::move(name)) {}
   std::map<std::string, std::string> records;
   bool down = false;
   grpc::Status Deliver(grpc::ServerContext*, const formd::DeliverRequest* req, formd::DeliverReply* out) override {
@@ -1155,17 +1155,17 @@ class HandlerPeer final : public formd::Handler::Service {
   std::string name_;
 };
 
-struct Peers {
-  HandlerPeer webhook{"webhook"};
-  HandlerPeer crm{"crm"};
-  HandlerPeer queue{"queue"};
+struct HPeers {
+  HHandlerPeer webhook{"webhook"};
+  HHandlerPeer crm{"crm"};
+  HHandlerPeer queue{"queue"};
 };
 
-Peers& hSetup(harness::Ctx& ctx) {
+HPeers& hSetup(harness::Ctx& ctx) {
   store::defineForm("f-1", "u-owner", {{"name", 40}, {"email", 80}}, {{"name", 40}, {"email", 80}});
-  static Peers* peers = nullptr;
+  static HPeers* peers = nullptr;
   delete peers;
-  peers = new Peers;
+  peers = new HPeers;
   ctx.GRPC.Server("webhook:9000")->RegisterService(&peers->webhook);
   ctx.GRPC.Server("crm:9000")->RegisterService(&peers->crm);
   ctx.GRPC.Server("queue:9000")->RegisterService(&peers->queue);
@@ -1179,7 +1179,7 @@ std::string hKeyOf(const harness::Call& c) { return c.Request<formd::DeliverRequ
 }  // namespace
 
 void CheckStableKey(harness::Ctx& ctx) {
-  Peers& peers = hSetup(ctx);
+  HPeers& peers = hSetup(ctx);
   const std::string sid = hNewSubmission();
   ctx.GRPC.Fail("Deliver", grpc::StatusCode::UNAVAILABLE, "", 1, "crm:9000");  // the crm's first answer is lost
   const Delivery first = deliver(sid);
@@ -1217,7 +1217,7 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckPerHandlerOutcomes(harness::Ctx& ctx) {
-  Peers& peers = hSetup(ctx);
+  HPeers& peers = hSetup(ctx);
   const std::string sid = hNewSubmission();
   peers.queue.down = true;
   const Delivery result = deliver(sid);
@@ -1230,7 +1230,7 @@ void CheckPerHandlerOutcomes(harness::Ctx& ctx) {
 }
 
 void CheckPartialStatus(harness::Ctx& ctx) {
-  Peers& peers = hSetup(ctx);
+  HPeers& peers = hSetup(ctx);
   peers.queue.down = true;
   const std::string sid = hNewSubmission();
   ctx.Equal(deliver(sid).status, "partial", "with the queue down, deliver's status");
@@ -1242,7 +1242,7 @@ void CheckPartialStatus(harness::Ctx& ctx) {
 }
 
 void CheckReplayFailedOnly(harness::Ctx& ctx) {
-  Peers& peers = hSetup(ctx);
+  HPeers& peers = hSetup(ctx);
   const std::string sid = hNewSubmission();
   peers.queue.down = true;
   deliver(sid);

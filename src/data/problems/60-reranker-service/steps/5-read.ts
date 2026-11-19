@@ -810,29 +810,29 @@ import (
 	"leetbuild/harness"
 )
 
-const readStats = "/v1/rerank/cache/stats"
+const kHReadStats = "/v1/rerank/cache/stats"
 
-type readPercentiles struct {
+type HReadPercentiles struct {
 	P50 int \`json:"p50"\`
 	P95 int \`json:"p95"\`
 }
 
-type readEntry struct {
+type HReadEntry struct {
 	ModelVersion  string                     \`json:"model_version"\`
 	HitRatio      *float64                   \`json:"hit_ratio"\`
 	UnscoredShare *float64                   \`json:"unscored_share"\`
 	FallbackShare *float64                   \`json:"fallback_share"\`
-	LatencyMs     map[string]readPercentiles \`json:"latency_ms"\`
+	LatencyMs     map[string]HReadPercentiles \`json:"latency_ms"\`
 }
 
-func readClient(ctx *harness.Ctx) *harness.HTTP {
+func hReadClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
 // readSeed: two builds as the stats consumer recorded them, xenc-v7 healthy, xenc-v8 failing batches behind a deep queue.
-func readSeed(ctx *harness.Ctx) {
+func hReadSeed(ctx *harness.Ctx) {
 	ctx.Redis.Do("SADD", "rerank:versions", "xenc-v8", "xenc-v7")
 	ctx.Redis.Do("HSET", "rerank:stats:xenc-v7", "requests", 10, "hits", 90, "misses", 10, "batches", 40, "unscored_batches", 2, "fallback_requests", 0)
 	ctx.Redis.Do("HSET", "rerank:stats:xenc-v8", "requests", 20, "hits", 20, "misses", 80, "batches", 50, "unscored_batches", 25, "fallback_requests", 8)
@@ -847,13 +847,13 @@ func readSeed(ctx *harness.Ctx) {
 }
 
 // readIdle: a build just rolled out, in rerank:versions with every counter at 0 and no latency samples yet.
-func readIdle(ctx *harness.Ctx) (readEntry, string) {
+func hReadIdle(ctx *harness.Ctx) (HReadEntry, string) {
 	ctx.Redis.Do("SADD", "rerank:versions", "xenc-v9")
 	ctx.Redis.Do("HSET", "rerank:stats:xenc-v9", "requests", 0, "hits", 0, "misses", 0, "batches", 0, "unscored_batches", 0, "fallback_requests", 0)
-	r := readClient(ctx).Get(readStats)
-	ctx.Equal(r.Status, 200, "GET %s with xenc-v9 at zero counters (%s)", readStats, r.Text())
+	r := hReadClient(ctx).Get(kHReadStats)
+	ctx.Equal(r.Status, 200, "GET %s with xenc-v9 at zero counters (%s)", kHReadStats, r.Text())
 	var body struct {
-		Versions []readEntry \`json:"versions"\`
+		Versions []HReadEntry \`json:"versions"\`
 	}
 	r.Decode(&body)
 	for _, v := range body.Versions {
@@ -862,19 +862,19 @@ func readIdle(ctx *harness.Ctx) (readEntry, string) {
 		}
 	}
 	ctx.Assert(false, "xenc-v9 is in rerank:versions and must have an entry, got %s", r.Text())
-	return readEntry{}, r.Text()
+	return HReadEntry{}, r.Text()
 }
 
-func readVersions(ctx *harness.Ctx) (map[string]readEntry, []string, string) {
-	readSeed(ctx)
-	r := readClient(ctx).Get(readStats)
-	ctx.Equal(r.Status, 200, "GET %s (%s)", readStats, r.Text())
+func hReadVersions(ctx *harness.Ctx) (map[string]HReadEntry, []string, string) {
+	hReadSeed(ctx)
+	r := hReadClient(ctx).Get(kHReadStats)
+	ctx.Equal(r.Status, 200, "GET %s (%s)", kHReadStats, r.Text())
 	var body struct {
-		Versions []readEntry \`json:"versions"\`
+		Versions []HReadEntry \`json:"versions"\`
 	}
 	r.Decode(&body)
 	ctx.Assert(body.Versions != nil, "the answer must carry versions, one entry per model version, got %s", r.Text())
-	byVersion := map[string]readEntry{}
+	byVersion := map[string]HReadEntry{}
 	order := []string{}
 	for _, v := range body.Versions {
 		byVersion[v.ModelVersion] = v
@@ -883,48 +883,48 @@ func readVersions(ctx *harness.Ctx) (map[string]readEntry, []string, string) {
 	return byVersion, order, r.Text()
 }
 
-func readNear(got *float64, want float64) bool { return got != nil && math.Abs(*got-want) < 1e-6 }
+func hReadNear(got *float64, want float64) bool { return got != nil && math.Abs(*got-want) < 1e-6 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	r := readClient(ctx).Get(readStats)
-	ctx.Equal(r.Status, 200, "GET %s before any stats exist (%s)", readStats, r.Text())
+	r := hReadClient(ctx).Get(kHReadStats)
+	ctx.Equal(r.Status, 200, "GET %s before any stats exist (%s)", kHReadStats, r.Text())
 	_, isObject := r.JSON().(map[string]any)
 	ctx.Assert(isObject, "the answer must be a JSON object, got %s", r.Text())
 }
 
 func CheckPerVersion(ctx *harness.Ctx) {
-	byVersion, order, text := readVersions(ctx)
+	byVersion, order, text := hReadVersions(ctx)
 	ctx.Equal(order, []string{"xenc-v7", "xenc-v8"}, "one entry per version in rerank:versions, sorted; the versions")
-	ctx.Assert(readNear(byVersion["xenc-v7"].HitRatio, 0.9) && readNear(byVersion["xenc-v8"].HitRatio, 0.2), "the hit ratios must be each version's own (0.9 and 0.2): %s", text)
-	idle, text := readIdle(ctx)
-	ctx.Assert(readNear(idle.HitRatio, 0), "a version with no hits and no misses has hit_ratio 0 (a share with a zero denominator is 0): %s", text)
+	ctx.Assert(hReadNear(byVersion["xenc-v7"].HitRatio, 0.9) && hReadNear(byVersion["xenc-v8"].HitRatio, 0.2), "the hit ratios must be each version's own (0.9 and 0.2): %s", text)
+	idle, text := hReadIdle(ctx)
+	ctx.Assert(hReadNear(idle.HitRatio, 0), "a version with no hits and no misses has hit_ratio 0 (a share with a zero denominator is 0): %s", text)
 }
 
 func CheckUnscoredShare(ctx *harness.Ctx) {
-	byVersion, _, text := readVersions(ctx)
-	ctx.Assert(readNear(byVersion["xenc-v7"].UnscoredShare, 0.05) && readNear(byVersion["xenc-v8"].UnscoredShare, 0.5), "unscored_share must be unscored_batches / batches (0.05 and 0.5): %s", text)
-	idle, text := readIdle(ctx)
-	ctx.Assert(readNear(idle.UnscoredShare, 0), "a version with no batches has unscored_share 0 (a share with a zero denominator is 0): %s", text)
+	byVersion, _, text := hReadVersions(ctx)
+	ctx.Assert(hReadNear(byVersion["xenc-v7"].UnscoredShare, 0.05) && hReadNear(byVersion["xenc-v8"].UnscoredShare, 0.5), "unscored_share must be unscored_batches / batches (0.05 and 0.5): %s", text)
+	idle, text := hReadIdle(ctx)
+	ctx.Assert(hReadNear(idle.UnscoredShare, 0), "a version with no batches has unscored_share 0 (a share with a zero denominator is 0): %s", text)
 }
 
 func CheckFallbackShare(ctx *harness.Ctx) {
-	byVersion, _, text := readVersions(ctx)
-	ctx.Assert(readNear(byVersion["xenc-v7"].FallbackShare, 0) && readNear(byVersion["xenc-v8"].FallbackShare, 0.4), "fallback_share must be fallback_requests / requests (0 and 0.4): %s", text)
-	idle, text := readIdle(ctx)
-	ctx.Assert(readNear(idle.FallbackShare, 0), "a version with no requests has fallback_share 0 (a share with a zero denominator is 0): %s", text)
+	byVersion, _, text := hReadVersions(ctx)
+	ctx.Assert(hReadNear(byVersion["xenc-v7"].FallbackShare, 0) && hReadNear(byVersion["xenc-v8"].FallbackShare, 0.4), "fallback_share must be fallback_requests / requests (0 and 0.4): %s", text)
+	idle, text := hReadIdle(ctx)
+	ctx.Assert(hReadNear(idle.FallbackShare, 0), "a version with no requests has fallback_share 0 (a share with a zero denominator is 0): %s", text)
 }
 
 func CheckBoundaryLatency(ctx *harness.Ctx) {
-	byVersion, _, text := readVersions(ctx)
-	want := map[string]map[string]readPercentiles{
+	byVersion, _, text := hReadVersions(ctx)
+	want := map[string]map[string]HReadPercentiles{
 		"xenc-v7": {"queue": {P50: 10, P95: 20}, "model": {P50: 60, P95: 300}},
 		"xenc-v8": {"queue": {P50: 900, P95: 1200}, "model": {P50: 45, P95: 55}},
 	}
 	for _, version := range []string{"xenc-v7", "xenc-v8"} {
 		ctx.Equal(byVersion[version].LatencyMs, want[version], "%s's latency_ms must be the queue and model boundaries apart, nearest-rank p50/p95 (%s)", version, text)
 	}
-	idle, text := readIdle(ctx)
-	ctx.Equal(idle.LatencyMs, map[string]readPercentiles{"queue": {}, "model": {}}, "a version with no latency samples reports 0 at both boundaries (%s)", text)
+	idle, text := hReadIdle(ctx)
+	ctx.Equal(idle.LatencyMs, map[string]HReadPercentiles{"queue": {}, "model": {}}, "a version with no latency samples reports 0 at both boundaries (%s)", text)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -939,9 +939,9 @@ func CheckBoundaryLatency(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kStats = "/v1/rerank/cache/stats";
+const std::string kHStats = "/v1/rerank/cache/stats";
 
-harness::HTTP readClient(harness::Ctx& ctx) {
+harness::HTTP hReadClient(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -950,7 +950,7 @@ harness::HTTP readClient(harness::Ctx& ctx) {
 }
 
 // Two builds as the stats consumer recorded them: xenc-v7 healthy, xenc-v8 failing batches behind a deep queue.
-void readSeed(harness::Ctx& ctx) {
+void hReadSeed(harness::Ctx& ctx) {
   ctx.Redis.Do("SADD", "rerank:versions", "xenc-v8", "xenc-v7");
   ctx.Redis.Do("HSET", "rerank:stats:xenc-v7", "requests", 10, "hits", 90, "misses", 10, "batches", 40, "unscored_batches", 2, "fallback_requests", 0);
   ctx.Redis.Do("HSET", "rerank:stats:xenc-v8", "requests", 20, "hits", 20, "misses", 80, "batches", 50, "unscored_batches", 25, "fallback_requests", 8);
@@ -964,20 +964,20 @@ void readSeed(harness::Ctx& ctx) {
   ctx.Redis.Do("HSET", "rerank:stats:xenc-v6", "requests", 5, "hits", 1, "misses", 4);  // a retired build, no longer in rerank:versions
 }
 
-struct Versions {
+struct HVersions {
   std::map<std::string, nlohmann::json> by_version;
   std::vector<std::string> order;
   std::string text;
 };
 
-Versions readVersions(harness::Ctx& ctx) {
-  readSeed(ctx);
-  auto c = readClient(ctx);
-  const auto r = c.Get(kStats);
-  ctx.Equal(r.Status, 200, "GET %s (%s)", kStats, r.Text());
+HVersions hReadVersions(harness::Ctx& ctx) {
+  hReadSeed(ctx);
+  auto c = hReadClient(ctx);
+  const auto r = c.Get(kHStats);
+  ctx.Equal(r.Status, 200, "GET %s (%s)", kHStats, r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object() && body.contains("versions") && body["versions"].is_array(), "the answer must carry versions, one entry per model version, got %s", r.Text());
-  Versions out;
+  HVersions out;
   out.text = r.Text();
   for (const auto& v : body["versions"]) {
     const std::string name = v.value("model_version", "");
@@ -992,12 +992,12 @@ bool hNear(const nlohmann::json& entry, const std::string& field, double want) {
 }
 
 // A build just rolled out: in rerank:versions with every counter at 0 and no latency samples yet.
-std::pair<nlohmann::json, std::string> readIdle(harness::Ctx& ctx) {
+std::pair<nlohmann::json, std::string> hReadIdle(harness::Ctx& ctx) {
   ctx.Redis.Do("SADD", "rerank:versions", "xenc-v9");
   ctx.Redis.Do("HSET", "rerank:stats:xenc-v9", "requests", 0, "hits", 0, "misses", 0, "batches", 0, "unscored_batches", 0, "fallback_requests", 0);
-  auto c = readClient(ctx);
-  const auto r = c.Get(kStats);
-  ctx.Equal(r.Status, 200, "GET %s with xenc-v9 at zero counters (%s)", kStats, r.Text());
+  auto c = hReadClient(ctx);
+  const auto r = c.Get(kHStats);
+  ctx.Equal(r.Status, 200, "GET %s with xenc-v9 at zero counters (%s)", kHStats, r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   if (body.is_object() && body.contains("versions") && body["versions"].is_array()) {
     for (const auto& v : body["versions"]) {
@@ -1011,36 +1011,36 @@ std::pair<nlohmann::json, std::string> readIdle(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readClient(ctx);
-  const auto r = c.Get(kStats);
-  ctx.Equal(r.Status, 200, "GET %s before any stats exist (%s)", kStats, r.Text());
+  auto c = hReadClient(ctx);
+  const auto r = c.Get(kHStats);
+  ctx.Equal(r.Status, 200, "GET %s before any stats exist (%s)", kHStats, r.Text());
   ctx.Assert(nlohmann::json::parse(r.Text(), nullptr, false).is_object(), "the answer must be a JSON object, got %s", r.Text());
 }
 
 void CheckPerVersion(harness::Ctx& ctx) {
-  auto v = readVersions(ctx);
+  auto v = hReadVersions(ctx);
   ctx.Equal(v.order, std::vector<std::string>{"xenc-v7", "xenc-v8"}, "one entry per version in rerank:versions, sorted; the versions");
   ctx.Assert(hNear(v.by_version["xenc-v7"], "hit_ratio", 0.9) && hNear(v.by_version["xenc-v8"], "hit_ratio", 0.2), "the hit ratios must be each version's own (0.9 and 0.2): %s", v.text);
-  const auto [idle, text] = readIdle(ctx);
+  const auto [idle, text] = hReadIdle(ctx);
   ctx.Assert(hNear(idle, "hit_ratio", 0), "a version with no hits and no misses has hit_ratio 0 (a share with a zero denominator is 0): %s", text);
 }
 
 void CheckUnscoredShare(harness::Ctx& ctx) {
-  auto v = readVersions(ctx);
+  auto v = hReadVersions(ctx);
   ctx.Assert(hNear(v.by_version["xenc-v7"], "unscored_share", 0.05) && hNear(v.by_version["xenc-v8"], "unscored_share", 0.5), "unscored_share must be unscored_batches / batches (0.05 and 0.5): %s", v.text);
-  const auto [idle, text] = readIdle(ctx);
+  const auto [idle, text] = hReadIdle(ctx);
   ctx.Assert(hNear(idle, "unscored_share", 0), "a version with no batches has unscored_share 0 (a share with a zero denominator is 0): %s", text);
 }
 
 void CheckFallbackShare(harness::Ctx& ctx) {
-  auto v = readVersions(ctx);
+  auto v = hReadVersions(ctx);
   ctx.Assert(hNear(v.by_version["xenc-v7"], "fallback_share", 0) && hNear(v.by_version["xenc-v8"], "fallback_share", 0.4), "fallback_share must be fallback_requests / requests (0 and 0.4): %s", v.text);
-  const auto [idle, text] = readIdle(ctx);
+  const auto [idle, text] = hReadIdle(ctx);
   ctx.Assert(hNear(idle, "fallback_share", 0), "a version with no requests has fallback_share 0 (a share with a zero denominator is 0): %s", text);
 }
 
 void CheckBoundaryLatency(harness::Ctx& ctx) {
-  auto v = readVersions(ctx);
+  auto v = hReadVersions(ctx);
   const std::map<std::string, nlohmann::json> want = {
       {"xenc-v7", {{"queue", {{"p50", 10}, {"p95", 20}}}, {"model", {{"p50", 60}, {"p95", 300}}}}},
       {"xenc-v8", {{"queue", {{"p50", 900}, {"p95", 1200}}}, {"model", {{"p50", 45}, {"p95", 55}}}}},
@@ -1050,7 +1050,7 @@ void CheckBoundaryLatency(harness::Ctx& ctx) {
     ctx.Equal(entry.is_object() && entry.contains("latency_ms") ? entry["latency_ms"] : nlohmann::json(), latency,
               "%s's latency_ms must be the queue and model boundaries apart, nearest-rank p50/p95 (%s)", version, v.text);
   }
-  const auto [idle, text] = readIdle(ctx);
+  const auto [idle, text] = hReadIdle(ctx);
   const nlohmann::json zero = {{"queue", {{"p50", 0}, {"p95", 0}}}, {"model", {{"p50", 0}, {"p95", 0}}}};
   ctx.Equal(idle.is_object() && idle.contains("latency_ms") ? idle["latency_ms"] : nlohmann::json(), zero, "a version with no latency samples reports 0 at both boundaries (%s)", text);
 }

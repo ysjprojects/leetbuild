@@ -606,14 +606,14 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
 func hNewSession(maxSteps int) string {
-	return sessions.CreateSession(stateBg, "acme", "public-web", "buy a kettle", maxSteps, "https://www.example.com/").ID
+	return sessions.CreateSession(hStateBg, "acme", "public-web", "buy a kettle", maxSteps, "https://www.example.com/").ID
 }
 
 func hStep(ctx *harness.Ctx, sid, worker string) int {
-	n, err := beginStep(stateBg, sid, worker)
+	n, err := beginStep(hStateBg, sid, worker)
 	ctx.NoError(err, "beginStep(%s, %s) failed", sid, worker)
 	return n
 }
@@ -622,7 +622,7 @@ func CheckLeaseGuard(ctx *harness.Ctx) {
 	sid := hNewSession(10)
 	// Worker B picks the session up right after worker A's first command on its lease.
 	rival := ctx.Redis.After("browser:lease:"+sid, func() any {
-		n, err := beginStep(stateBg, sid, "worker-b")
+		n, err := beginStep(hStateBg, sid, "worker-b")
 		ctx.NoError(err, "worker-b's beginStep failed")
 		return n
 	})
@@ -631,7 +631,7 @@ func CheckLeaseGuard(ctx *harness.Ctx) {
 	ctx.NoError(rival.Err, "worker-b's beginStep")
 	theirs := rival.Result.(int)
 	ctx.Assert((mine == 1 && theirs == leaseHeld) || (mine == leaseHeld && theirs == 1), "two workers began a step on one session at the same moment and got %d and %d: exactly one may win (step 1), the other must get leaseHeld (%d)", mine, theirs, leaseHeld)
-	s := sessions.LoadSession(stateBg, sid)
+	s := sessions.LoadSession(hStateBg, sid)
 	ctx.Assert(s.StepIndex == 1 && s.BudgetRemaining == 9, "after one won step the session holds step_index %d, budget_remaining %d, expected 1 and 9", s.StepIndex, s.BudgetRemaining)
 	winner, loser := "worker-a", "worker-b"
 	if mine != 1 {
@@ -679,14 +679,14 @@ func CheckBudget(ctx *harness.Ctx) {
 	sid := hNewSession(2)
 	ctx.Equal([]int{hStep(ctx, sid, "worker-a"), hStep(ctx, sid, "worker-a")}, []int{1, 2}, "a 2-step session must take steps 1 and 2")
 	ctx.Equal(hStep(ctx, sid, "worker-a"), budgetExhausted, "a third step on a 2-step budget must be refused with budgetExhausted")
-	s := sessions.LoadSession(stateBg, sid)
+	s := sessions.LoadSession(hStateBg, sid)
 	ctx.Assert(s.StepIndex == 2 && s.BudgetRemaining == 0, "the refused step was charged: step_index %d, budget_remaining %d, expected 2 and 0", s.StepIndex, s.BudgetRemaining)
 	ctx.Equal(s.Status, "budget_exhausted", "the session's status after its budget ran out")
 	ctx.Equal(hStep(ctx, "s-404", "worker-a"), noSession, "a step on a session that does not exist")
 	// The same worker's two steps on the last unit of budget: exactly one is charged.
 	last := hNewSession(1)
 	rival := ctx.Redis.After(sessions.SessionKey(last), func() any {
-		n, err := beginStep(stateBg, last, "worker-a")
+		n, err := beginStep(hStateBg, last, "worker-a")
 		ctx.NoError(err, "the concurrent beginStep failed")
 		return n
 	})
@@ -694,7 +694,7 @@ func CheckBudget(ctx *harness.Ctx) {
 	ctx.Assert(rival.Fired, "beginStep never touched %s", sessions.SessionKey(last))
 	ctx.NoError(rival.Err, "the concurrent beginStep")
 	theirs := rival.Result.(int)
-	after := sessions.LoadSession(stateBg, last)
+	after := sessions.LoadSession(hStateBg, last)
 	ctx.Assert(((mine == 1 && theirs == budgetExhausted) || (mine == budgetExhausted && theirs == 1)) && after.BudgetRemaining == 0, "two steps at once on a 1-step budget got %d and %d and left budget_remaining %d: compare the budget in the script that charges it, so exactly one step is taken", mine, theirs, after.BudgetRemaining)
 }
 `,

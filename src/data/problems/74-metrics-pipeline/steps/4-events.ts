@@ -909,21 +909,21 @@ import (
 )
 
 const (
-	eventsTopic = "metrics.rolled"
-	eventsStart = 1793747840
+	kHEventsTopic = "metrics.rolled"
+	kHEventsStart = 1793747840
 )
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
 // eventsShard accepts every window; it notes how many events were on the topic when it was asked.
-type eventsShard struct {
+type HEventsShard struct {
 	pb.UnimplementedMetricsWriterServer
 	ctx     *harness.Ctx
 	onTopic *[]int
 }
 
-func (s *eventsShard) WriteWindows(_ context.Context, req *pb.WriteRequest) (*pb.WriteReply, error) {
-	*s.onTopic = append(*s.onTopic, len(s.ctx.Kafka.Records(eventsTopic)))
+func (s *HEventsShard) WriteWindows(_ context.Context, req *pb.WriteRequest) (*pb.WriteReply, error) {
+	*s.onTopic = append(*s.onTopic, len(s.ctx.Kafka.Records(kHEventsTopic)))
 	accepted := []string{}
 	for _, w := range req.GetWindows() {
 		accepted = append(accepted, w.GetWindowId())
@@ -931,34 +931,34 @@ func (s *eventsShard) WriteWindows(_ context.Context, req *pb.WriteRequest) (*pb
 	return &pb.WriteReply{Accepted: accepted}, nil
 }
 
-func eventsSetup(ctx *harness.Ctx) *[]int {
+func hEventsSetup(ctx *harness.Ctx) *[]int {
 	onTopic := &[]int{}
 	for _, target := range model.Shards {
-		pb.RegisterMetricsWriterServer(ctx.GRPC.Server(target), &eventsShard{ctx: ctx, onTopic: onTopic})
+		pb.RegisterMetricsWriterServer(ctx.GRPC.Server(target), &HEventsShard{ctx: ctx, onTopic: onTopic})
 	}
 	return onTopic
 }
 
-func eventsWindow(tenant, host string, start, count int64) model.Window {
+func hEventsWindow(tenant, host string, start, count int64) model.Window {
 	return model.Window{Tenant: tenant, Series: fmt.Sprintf("cpu_seconds{host=%s}", host), Start: start, Count: count, Sum: float64(count) * 0.5}
 }
 
-func eventsPublish(ctx *harness.Ctx, windows ...model.Window) int {
-	n, err := publishRollups(eventsBg, windows)
+func hEventsPublish(ctx *harness.Ctx, windows ...model.Window) int {
+	n, err := publishRollups(hEventsBg, windows)
 	ctx.NoError(err, "publishRollups")
 	return n
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	rows := []eventsRow{}
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	rows := []HEventsRow{}
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -966,11 +966,11 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckKeyBySeries(ctx *harness.Ctx) {
-	eventsSetup(ctx)
-	windows := []model.Window{eventsWindow("acme", "a", eventsStart, 3), eventsWindow("acme", "b", eventsStart, 3), eventsWindow("acme", "a", eventsStart+10, 3), eventsWindow("globex", "a", eventsStart, 3)}
-	eventsPublish(ctx, windows...)
+	hEventsSetup(ctx)
+	windows := []model.Window{hEventsWindow("acme", "a", kHEventsStart, 3), hEventsWindow("acme", "b", kHEventsStart, 3), hEventsWindow("acme", "a", kHEventsStart+10, 3), hEventsWindow("globex", "a", kHEventsStart, 3)}
+	hEventsPublish(ctx, windows...)
 	ctx.Settle()
-	keys := ctx.Kafka.Keys(eventsTopic)
+	keys := ctx.Kafka.Keys(kHEventsTopic)
 	sort.Strings(keys)
 	want := []string{}
 	for _, w := range windows {
@@ -979,7 +979,7 @@ func CheckKeyBySeries(ctx *harness.Ctx) {
 	sort.Strings(want)
 	ctx.Equal(keys, want, "one series' windows must share a key, and so a partition; the event keys")
 	partitions := map[int]bool{}
-	for _, r := range ctx.Kafka.Records(eventsTopic) {
+	for _, r := range ctx.Kafka.Records(kHEventsTopic) {
 		if string(r.Key) == "acme/cpu_seconds{host=a}" {
 			partitions[int(r.Partition)] = true
 		}
@@ -988,26 +988,26 @@ func CheckKeyBySeries(ctx *harness.Ctx) {
 }
 
 func CheckPublishAfterConfirm(ctx *harness.Ctx) {
-	onTopic := eventsSetup(ctx)
+	onTopic := hEventsSetup(ctx)
 	windows := []model.Window{}
 	want := []string{}
 	down := model.Shards[2]
 	for i := 0; i < 12; i++ {
-		w := eventsWindow("acme", fmt.Sprintf("h%d", i), eventsStart, 3)
+		w := hEventsWindow("acme", fmt.Sprintf("h%d", i), kHEventsStart, 3)
 		windows = append(windows, w)
 		if model.ShardFor(w.Series) != down {
 			want = append(want, model.WindowID(w))
 		}
 	}
 	ctx.GRPC.Stop(down)
-	eventsPublish(ctx, windows...)
+	hEventsPublish(ctx, windows...)
 	ctx.Settle()
 	ctx.Assert(len(*onTopic) > 0, "publishRollups never asked the shard writers (flush.FlushWindows)")
 	for _, n := range *onTopic {
 		ctx.Assert(n == 0, "when the shards were asked the topic already held %d events: an event must follow the shard's acceptance, not precede it", n)
 	}
 	published := []string{}
-	for _, v := range ctx.Kafka.Values(eventsTopic) {
+	for _, v := range ctx.Kafka.Values(kHEventsTopic) {
 		var event map[string]any
 		json.Unmarshal([]byte(v), &event)
 		published = append(published, fmt.Sprint(event["window_id"]))
@@ -1015,23 +1015,23 @@ func CheckPublishAfterConfirm(ctx *harness.Ctx) {
 	sort.Strings(published)
 	sort.Strings(want)
 	ctx.Equal(published, want, "with %s down only the windows the other shards accepted are rolled up; its windows are pending. The events' window ids", down)
-	ctx.Equal(len(eventsOutbox(ctx)), 0, "pending windows are resent by the next tick, not written to the outbox; the outbox rows")
+	ctx.Equal(len(hEventsOutbox(ctx)), 0, "pending windows are resent by the next tick, not written to the outbox; the outbox rows")
 }
 
 func CheckWindowBoundaries(ctx *harness.Ctx) {
-	eventsSetup(ctx)
-	w := eventsWindow("acme", "a", eventsStart, 4)
-	eventsPublish(ctx, w)
+	hEventsSetup(ctx)
+	w := hEventsWindow("acme", "a", kHEventsStart, 4)
+	hEventsPublish(ctx, w)
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one accepted window must produce one event; the events")
 	var event map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &event), "the event must be JSON")
-	want := map[string]any{"window_id": model.WindowID(w), "tenant": "acme", "series": w.Series, "window_start": eventsStart, "window_end": eventsStart + 10, "count": 4, "sum": 2}
+	want := map[string]any{"window_id": model.WindowID(w), "tenant": "acme", "series": w.Series, "window_start": kHEventsStart, "window_end": kHEventsStart + 10, "count": 4, "sum": 2}
 	ctx.Equal(event, want, "a consumer needs both boundaries and the count to fold the window; the event")
 }
 
-func eventsIDs(values []string) []string {
+func hEventsIDs(values []string) []string {
 	ids := []string{}
 	for _, v := range values {
 		var event map[string]any
@@ -1042,7 +1042,7 @@ func eventsIDs(values []string) []string {
 	return ids
 }
 
-func eventsBoxed(rows []eventsRow) []string {
+func hEventsBoxed(rows []HEventsRow) []string {
 	ids := []string{}
 	for _, row := range rows {
 		ids = append(ids, fmt.Sprint(row.Payload["window_id"]))
@@ -1052,23 +1052,23 @@ func eventsBoxed(rows []eventsRow) []string {
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	eventsSetup(ctx)
-	w := eventsWindow("acme", "a", eventsStart, 3)
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	n := eventsPublish(ctx, w)
+	hEventsSetup(ctx)
+	w := hEventsWindow("acme", "a", kHEventsStart, 3)
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	n := hEventsPublish(ctx, w)
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the rollup is lost; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "acme/cpu_seconds{host=a}" && rows[0].Payload["window_id"] == model.WindowID(w), "the outbox row is %+v, expected the topic, the key acme/cpu_seconds{host=a} and the event", rows[0])
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == "acme/cpu_seconds{host=a}" && rows[0].Payload["window_id"] == model.WindowID(w), "the outbox row is %+v, expected the topic, the key acme/cpu_seconds{host=a} and the event", rows[0])
 	ctx.Equal(n, 0, "publishRollups' count after a failed delivery")
 	// One tick, three events, the first delivery fails: two windows of one series and one of another.
-	tick := []model.Window{eventsWindow("acme", "a", eventsStart+20, 3), eventsWindow("acme", "a", eventsStart+30, 3), eventsWindow("acme", "b", eventsStart+20, 3)}
-	seen := len(ctx.Kafka.Values(eventsTopic))
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	n = eventsPublish(ctx, tick...)
+	tick := []model.Window{hEventsWindow("acme", "a", kHEventsStart+20, 3), hEventsWindow("acme", "a", kHEventsStart+30, 3), hEventsWindow("acme", "b", kHEventsStart+20, 3)}
+	seen := len(ctx.Kafka.Values(kHEventsTopic))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	n = hEventsPublish(ctx, tick...)
 	ctx.Settle()
-	onTopic := eventsIDs(ctx.Kafka.Values(eventsTopic)[seen:])
-	boxed := eventsBoxed(eventsOutbox(ctx)[1:])
+	onTopic := hEventsIDs(ctx.Kafka.Values(kHEventsTopic)[seen:])
+	boxed := hEventsBoxed(hEventsOutbox(ctx)[1:])
 	missing := []string{}
 	firstBoxed := false
 	for _, t := range tick {
@@ -1086,31 +1086,31 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	sort.Strings(missing)
 	ctx.Assert(firstBoxed && fmt.Sprint(boxed) == fmt.Sprint(missing), "in a tick of 3 events whose first delivery failed, the topic got %v and the outbox %v, expected the outbox to hold exactly the events not on the topic, %v: track each event's own delivery report", onTopic, boxed, missing)
 	ctx.Equal(n, len(onTopic), "publishRollups' count must be the events the broker acknowledged")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
-	stalled := []model.Window{eventsWindow("acme", "a", eventsStart+40, 3), eventsWindow("acme", "b", eventsStart+40, 3)}
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
+	stalled := []model.Window{hEventsWindow("acme", "a", kHEventsStart+40, 3), hEventsWindow("acme", "b", kHEventsStart+40, 3)}
 	before := ctx.Clock.Now()
-	n = eventsPublish(ctx, stalled...)
+	n = hEventsPublish(ctx, stalled...)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishRollups waited %.1f s for a broker that does not answer: wait at most ackTimeout (2 s) for all the delivery reports together, then write the outbox rows", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	got := []string{}
 	if len(rows) >= 1+len(boxed) {
-		got = eventsBoxed(rows[1+len(boxed):])
+		got = hEventsBoxed(rows[1+len(boxed):])
 	}
 	ctx.Equal(got, []string{model.WindowID(stalled[0]), model.WindowID(stalled[1])}, "no acknowledgement within the window: the window ids the outbox gained")
 	ctx.Equal(n, 0, "publishRollups' count without an acknowledgement")
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	eventsSetup(ctx)
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, eventsWindow("acme", "a", eventsStart, 3))
+	hEventsSetup(ctx)
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish(ctx, hEventsWindow("acme", "a", kHEventsStart, 3))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the retry must not write the rollup twice (enable.idempotence); the events")
-	eventsPublish(ctx, eventsWindow("acme", "a", eventsStart+10, 3))
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the retry must not write the rollup twice (enable.idempotence); the events")
+	hEventsPublish(ctx, hEventsWindow("acme", "a", kHEventsStart+10, 3))
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose an acknowledged event (acks=all); the events")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose an acknowledged event (acks=all); the events")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1128,27 +1128,27 @@ func CheckIdempotentProducer(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "metrics.rolled";
-constexpr long long kEventsStart = 1793747840;
+const std::string kHEventsTopic = "metrics.rolled";
+constexpr long long kHEventsStart = 1793747840;
 
 // Accepts every window; notes how many events were on the topic when it was asked.
-class EventsShard final : public metricsd::MetricsWriter::Service {
+class HEventsShard final : public metricsd::MetricsWriter::Service {
  public:
   harness::Ctx* ctx = nullptr;
   std::vector<size_t>* onTopic = nullptr;
   grpc::Status WriteWindows(grpc::ServerContext*, const metricsd::WriteRequest* req, metricsd::WriteReply* out) override {
-    onTopic->push_back(ctx->Kafka.Records(kEventsTopic).size());
+    onTopic->push_back(ctx->Kafka.Records(kHEventsTopic).size());
     for (const auto& w : req->windows()) out->add_accepted(w.window_id());
     return grpc::Status::OK;
   }
 };
 
-std::vector<size_t>& eventsSetup(harness::Ctx& ctx) {
-  static std::array<EventsShard, 3>* peers = nullptr;
+std::vector<size_t>& hEventsSetup(harness::Ctx& ctx) {
+  static std::array<HEventsShard, 3>* peers = nullptr;
   static std::vector<size_t>* onTopic = nullptr;
   delete peers;
   delete onTopic;
-  peers = new std::array<EventsShard, 3>;
+  peers = new std::array<HEventsShard, 3>;
   onTopic = new std::vector<size_t>;
   for (size_t i = 0; i < metrics::kShards.size(); i++) {
     (*peers)[i].ctx = &ctx;
@@ -1158,11 +1158,11 @@ std::vector<size_t>& eventsSetup(harness::Ctx& ctx) {
   return *onTopic;
 }
 
-metrics::Window eventsWindow(const std::string& tenant = "acme", const std::string& host = "a", long long start = kEventsStart, long long count = 3) {
+metrics::Window hEventsWindow(const std::string& tenant = "acme", const std::string& host = "a", long long start = kHEventsStart, long long count = 3) {
   return metrics::Window{tenant, "cpu_seconds{host=" + host + "}", start, count, count * 0.5};
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -1177,14 +1177,14 @@ std::string hField(const nlohmann::json& j, const std::string& name) {
 }
 
 // The sorted window ids of the events (JSON text) from index from on; eventsBoxed is the same for outbox rows.
-std::vector<std::string> eventsIds(const std::vector<std::string>& values, size_t from = 0) {
+std::vector<std::string> hEventsIds(const std::vector<std::string>& values, size_t from = 0) {
   std::vector<std::string> ids;
   for (size_t i = from; i < values.size(); i++) ids.push_back(hField(nlohmann::json::parse(values[i], nullptr, false), "window_id"));
   std::sort(ids.begin(), ids.end());
   return ids;
 }
 
-std::vector<std::string> eventsBoxed(const std::vector<nlohmann::json>& rows, size_t from) {
+std::vector<std::string> hEventsBoxed(const std::vector<nlohmann::json>& rows, size_t from) {
   std::vector<std::string> ids;
   for (size_t i = from; i < rows.size(); i++) ids.push_back(rows[i].contains("payload") ? hField(rows[i]["payload"], "window_id") : "");
   std::sort(ids.begin(), ids.end());
@@ -1194,31 +1194,31 @@ std::vector<std::string> eventsBoxed(const std::vector<nlohmann::json>& rows, si
 }  // namespace
 
 void CheckKeyBySeries(harness::Ctx& ctx) {
-  eventsSetup(ctx);
-  const std::vector<metrics::Window> windows = {eventsWindow("acme", "a"), eventsWindow("acme", "b"), eventsWindow("acme", "a", kEventsStart + 10),
-                                                eventsWindow("globex", "a")};
+  hEventsSetup(ctx);
+  const std::vector<metrics::Window> windows = {hEventsWindow("acme", "a"), hEventsWindow("acme", "b"), hEventsWindow("acme", "a", kHEventsStart + 10),
+                                                hEventsWindow("globex", "a")};
   publishRollups(windows);
   ctx.Settle();
-  auto keys = ctx.Kafka.Keys(kEventsTopic);
+  auto keys = ctx.Kafka.Keys(kHEventsTopic);
   std::sort(keys.begin(), keys.end());
   std::vector<std::string> want;
   for (const auto& w : windows) want.push_back(w.tenant + "/" + w.series);
   std::sort(want.begin(), want.end());
   ctx.Equal(keys, want, "one series' windows must share a key, and so a partition; the event keys");
   std::set<int> partitions;
-  for (const auto& r : ctx.Kafka.Records(kEventsTopic)) {
+  for (const auto& r : ctx.Kafka.Records(kHEventsTopic)) {
     if (r.Key && *r.Key == "acme/cpu_seconds{host=a}") partitions.insert(r.Partition);
   }
   ctx.Equal(partitions.size(), 1, "the two windows of acme/cpu_seconds{host=a} must land on one partition; the partitions");
 }
 
 void CheckPublishAfterConfirm(harness::Ctx& ctx) {
-  auto& onTopic = eventsSetup(ctx);
+  auto& onTopic = hEventsSetup(ctx);
   const std::string down = metrics::kShards[2];
   std::vector<metrics::Window> windows;
   std::vector<std::string> want;
   for (int i = 0; i < 12; i++) {
-    const auto w = eventsWindow("acme", "h" + std::to_string(i));
+    const auto w = hEventsWindow("acme", "h" + std::to_string(i));
     windows.push_back(w);
     if (metrics::shardFor(w.series) != down) want.push_back(metrics::windowId(w));
   }
@@ -1228,46 +1228,46 @@ void CheckPublishAfterConfirm(harness::Ctx& ctx) {
   ctx.Assert(!onTopic.empty(), "publishRollups never asked the shard writers (metrics::flushWindows)");
   for (size_t n : onTopic) ctx.Assert(n == 0, "when the shards were asked the topic already held %d events: an event must follow the shard's acceptance, not precede it", n);
   std::vector<std::string> published;
-  for (const auto& v : ctx.Kafka.Values(kEventsTopic)) published.push_back(hField(nlohmann::json::parse(v, nullptr, false), "window_id"));
+  for (const auto& v : ctx.Kafka.Values(kHEventsTopic)) published.push_back(hField(nlohmann::json::parse(v, nullptr, false), "window_id"));
   std::sort(published.begin(), published.end());
   std::sort(want.begin(), want.end());
   ctx.Equal(published, want, "with %s down only the windows the other shards accepted are rolled up; its windows are pending. The events' window ids", down);
-  ctx.Equal(eventsOutbox(ctx).size(), 0, "pending windows are resent by the next tick, not written to the outbox; the outbox rows");
+  ctx.Equal(hEventsOutbox(ctx).size(), 0, "pending windows are resent by the next tick, not written to the outbox; the outbox rows");
 }
 
 void CheckWindowBoundaries(harness::Ctx& ctx) {
-  eventsSetup(ctx);
-  const auto w = eventsWindow("acme", "a", kEventsStart, 4);
+  hEventsSetup(ctx);
+  const auto w = hEventsWindow("acme", "a", kHEventsStart, 4);
   publishRollups({w});
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one accepted window must produce one event; the events");
   const auto event = nlohmann::json::parse(values[0], nullptr, false);
-  const nlohmann::json want = {{"window_id", metrics::windowId(w)}, {"tenant", "acme"}, {"series", w.series}, {"window_start", kEventsStart},
-                               {"window_end", kEventsStart + 10}, {"count", 4}, {"sum", 2.0}};
+  const nlohmann::json want = {{"window_id", metrics::windowId(w)}, {"tenant", "acme"}, {"series", w.series}, {"window_start", kHEventsStart},
+                               {"window_end", kHEventsStart + 10}, {"count", 4}, {"sum", 2.0}};
   ctx.Assert(event == want, "the event is %s, expected %s: a consumer needs both boundaries and the count to fold the window", values[0], want.dump());
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  eventsSetup(ctx);
-  const auto w = eventsWindow();
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  hEventsSetup(ctx);
+  const auto w = hEventsWindow();
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   int n = publishRollups({w});
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the rollup is lost; the rows");
-  ctx.Assert(hField(rows[0], "topic") == kEventsTopic && hField(rows[0], "key") == "acme/cpu_seconds{host=a}" && rows[0].contains("payload") &&
+  ctx.Assert(hField(rows[0], "topic") == kHEventsTopic && hField(rows[0], "key") == "acme/cpu_seconds{host=a}" && rows[0].contains("payload") &&
                  hField(rows[0]["payload"], "window_id") == metrics::windowId(w),
              "the outbox row is %s, expected the topic, the key acme/cpu_seconds{host=a} and the event", rows[0].dump());
   ctx.Equal(n, 0, "publishRollups' count after a failed delivery");
   // One tick, three events, the first delivery fails: two windows of one series and one of another.
-  const std::vector<metrics::Window> tick = {eventsWindow("acme", "a", kEventsStart + 20), eventsWindow("acme", "a", kEventsStart + 30), eventsWindow("acme", "b", kEventsStart + 20)};
-  const size_t seen = ctx.Kafka.Values(kEventsTopic).size();
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  const std::vector<metrics::Window> tick = {hEventsWindow("acme", "a", kHEventsStart + 20), hEventsWindow("acme", "a", kHEventsStart + 30), hEventsWindow("acme", "b", kHEventsStart + 20)};
+  const size_t seen = ctx.Kafka.Values(kHEventsTopic).size();
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   n = publishRollups(tick);
   ctx.Settle();
-  const auto onTopic = eventsIds(ctx.Kafka.Values(kEventsTopic), seen);
-  const auto boxed = eventsBoxed(eventsOutbox(ctx), 1);
+  const auto onTopic = hEventsIds(ctx.Kafka.Values(kHEventsTopic), seen);
+  const auto boxed = hEventsBoxed(hEventsOutbox(ctx), 1);
   std::vector<std::string> missing;
   for (const auto& t : tick) {
     if (std::find(onTopic.begin(), onTopic.end(), metrics::windowId(t)) == onTopic.end()) missing.push_back(metrics::windowId(t));
@@ -1276,27 +1276,27 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   ctx.Assert(std::find(boxed.begin(), boxed.end(), metrics::windowId(tick[0])) != boxed.end() && boxed == missing,
              "in a tick of 3 events whose first delivery failed, the topic got %v and the outbox %v, expected the outbox to hold exactly the events not on the topic, %v: track each event's own delivery report", onTopic, boxed, missing);
   ctx.Equal(static_cast<size_t>(n), onTopic.size(), "publishRollups' count must be the events the broker acknowledged");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
-  const std::vector<metrics::Window> stalled = {eventsWindow("acme", "a", kEventsStart + 40), eventsWindow("acme", "b", kEventsStart + 40)};
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
+  const std::vector<metrics::Window> stalled = {hEventsWindow("acme", "a", kHEventsStart + 40), hEventsWindow("acme", "b", kHEventsStart + 40)};
   const int64_t before = ctx.Clock.Now();
   n = publishRollups(stalled);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publishRollups waited %.1f s for a broker that does not answer: wait at most kAckTimeoutMs (2 s) for all the delivery reports together, then write the outbox rows", waited);
-  ctx.Equal(eventsBoxed(eventsOutbox(ctx), 1 + boxed.size()), std::vector<std::string>{metrics::windowId(stalled[0]), metrics::windowId(stalled[1])},
+  ctx.Equal(hEventsBoxed(hEventsOutbox(ctx), 1 + boxed.size()), std::vector<std::string>{metrics::windowId(stalled[0]), metrics::windowId(stalled[1])},
             "no acknowledgement within the window: the window ids the outbox gained");
   ctx.Equal(n, 0, "publishRollups' count without an acknowledgement");
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  eventsSetup(ctx);
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishRollups({eventsWindow()});
+  hEventsSetup(ctx);
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishRollups({hEventsWindow()});
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the retry must not write the rollup twice (enable.idempotence); the events");
-  publishRollups({eventsWindow("acme", "a", kEventsStart + 10)});
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the retry must not write the rollup twice (enable.idempotence); the events");
+  publishRollups({hEventsWindow("acme", "a", kHEventsStart + 10)});
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose an acknowledged event (acks=all); the events");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose an acknowledged event (acks=all); the events");
 }
 `,
   },

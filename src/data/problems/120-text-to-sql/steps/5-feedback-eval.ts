@@ -1171,17 +1171,17 @@ import (
 	"leetbuild/harness"
 )
 
-const feedbackTopic = "query.feedback"
+const kHFeedbackTopic = "query.feedback"
 
-var feedbackSignals = []string{"has_output", "query_id", "rating", "run_ok", "tables_acked", "tables_proposed", "user", "workspace"}
+var hFeedbackSignals = []string{"has_output", "query_id", "rating", "run_ok", "tables_acked", "tables_proposed", "user", "workspace"}
 
-func feedbackRecord(id, user string, hasOutput bool) queries.Record {
+func hFeedbackRecord(id, user string, hasOutput bool) queries.Record {
 	return queries.Record{QueryID: id, User: user, Workspace: "mobility", Question: "How many trips yesterday?", Status: "ran", TablesProposed: []string{"trips", "drivers"}, TablesAcked: []string{"trips"}, SQL: "SELECT 1", RunOK: true, HasOutput: hasOutput}
 }
 
-func feedbackEvents(ctx *harness.Ctx) []map[string]any {
+func hFeedbackEvents(ctx *harness.Ctx) []map[string]any {
 	var events []map[string]any
-	for _, r := range ctx.Kafka.Records(feedbackTopic) {
+	for _, r := range ctx.Kafka.Records(kHFeedbackTopic) {
 		var event map[string]any
 		json.Unmarshal(r.Value, &event)
 		events = append(events, event)
@@ -1189,7 +1189,7 @@ func feedbackEvents(ctx *harness.Ctx) []map[string]any {
 	return events
 }
 
-func feedbackSeed(ctx *harness.Ctx) {
+func hFeedbackSeed(ctx *harness.Ctx) {
 	events := []map[string]any{
 		{"query_id": "q1", "user": "ana", "workspace": "mobility", "rating": 5, "tables_proposed": []string{"trips", "drivers"}, "tables_acked": []string{"trips"}, "run_ok": true, "has_output": true},
 		{"query_id": "q2", "user": "ben", "workspace": "mobility", "rating": 2, "tables_proposed": []string{"trips"}, "tables_acked": []string{"trips", "cities"}, "run_ok": true, "has_output": false},
@@ -1198,11 +1198,11 @@ func feedbackSeed(ctx *harness.Ctx) {
 	}
 	for _, event := range events {
 		raw, _ := json.Marshal(event)
-		ctx.Kafka.Seed(feedbackTopic, event["user"], string(raw))
+		ctx.Kafka.Seed(kHFeedbackTopic, event["user"], string(raw))
 	}
 }
 
-func feedbackCounters(ctx *harness.Ctx, workspace string) map[string]int64 {
+func hFeedbackCounters(ctx *harness.Ctx, workspace string) map[string]int64 {
 	out := map[string]int64{}
 	for k, v := range ctx.Redis.HGetAll("eval:" + workspace) {
 		n, _ := strconv.ParseInt(v, 10, 64)
@@ -1213,12 +1213,12 @@ func feedbackCounters(ctx *harness.Ctx, workspace string) map[string]int64 {
 
 func CheckUserKey(ctx *harness.Ctx) {
 	for _, r := range [][2]string{{"q1", "ana"}, {"q2", "ben"}, {"q3", "ana"}} {
-		ctx.Equal(publishFeedback(context.Background(), feedbackRecord(r[0], r[1], true), 4), true, "publishFeedback for %s once the broker acknowledged it", r[0])
+		ctx.Equal(publishFeedback(context.Background(), hFeedbackRecord(r[0], r[1], true), 4), true, "publishFeedback for %s once the broker acknowledged it", r[0])
 	}
 	ctx.Settle()
-	records := ctx.Kafka.Records(feedbackTopic)
-	ctx.Equal(len(records), 3, "three ratings; records on %s", feedbackTopic)
-	keys := ctx.Kafka.Keys(feedbackTopic)
+	records := ctx.Kafka.Records(kHFeedbackTopic)
+	ctx.Equal(len(records), 3, "three ratings; records on %s", kHFeedbackTopic)
+	keys := ctx.Kafka.Keys(kHFeedbackTopic)
 	sort.Strings(keys)
 	ctx.Equal(keys, []string{"ana", "ana", "ben"}, "records must be keyed by the user")
 	var ana []int
@@ -1231,16 +1231,16 @@ func CheckUserKey(ctx *harness.Ctx) {
 }
 
 func CheckSignals(ctx *harness.Ctx) {
-	ctx.Equal(publishFeedback(context.Background(), feedbackRecord("q9", "ana", false), 2), true, "publishFeedback once the broker acknowledged it")
+	ctx.Equal(publishFeedback(context.Background(), hFeedbackRecord("q9", "ana", false), 2), true, "publishFeedback once the broker acknowledged it")
 	ctx.Settle()
-	events := feedbackEvents(ctx)
+	events := hFeedbackEvents(ctx)
 	ctx.Equal(len(events), 1, "one rating; events")
 	var fields []string
 	for k := range events[0] {
 		fields = append(fields, k)
 	}
 	sort.Strings(fields)
-	ctx.Equal(fields, feedbackSignals, "the event's fields")
+	ctx.Equal(fields, hFeedbackSignals, "the event's fields")
 	event := events[0]
 	ctx.Equal(event["tables_proposed"], []any{"trips", "drivers"}, "tables_proposed comes from the record")
 	ctx.Equal(event["tables_acked"], []any{"trips"}, "tables_acked comes from the record")
@@ -1248,43 +1248,43 @@ func CheckSignals(ctx *harness.Ctx) {
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(feedbackTopic, 1)
-	ctx.Equal(publishFeedback(context.Background(), feedbackRecord("q1", "ana", true), 5), true, "a lost acknowledgement is retried by the client, not reported; publishFeedback")
+	ctx.Kafka.LoseAcks(kHFeedbackTopic, 1)
+	ctx.Equal(publishFeedback(context.Background(), hFeedbackRecord("q1", "ana", true), 5), true, "a lost acknowledgement is retried by the client, not reported; publishFeedback")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(feedbackTopic)), 1, "after one lost acknowledgement the retry wrote the rating twice (enable.idempotence); the records")
-	publishFeedback(context.Background(), feedbackRecord("q2", "ana", true), 3)
+	ctx.Equal(len(ctx.Kafka.Records(kHFeedbackTopic)), 1, "after one lost acknowledgement the retry wrote the rating twice (enable.idempotence); the records")
+	publishFeedback(context.Background(), hFeedbackRecord("q2", "ana", true), 3)
 	ctx.Settle()
-	ctx.Kafka.Failover(feedbackTopic)
-	ctx.Equal(len(ctx.Kafka.Records(feedbackTopic)), 2, "after a leader failover both ratings must still be on the topic (acks=all); the records")
-	ctx.Kafka.Stall(feedbackTopic)
+	ctx.Kafka.Failover(kHFeedbackTopic)
+	ctx.Equal(len(ctx.Kafka.Records(kHFeedbackTopic)), 2, "after a leader failover both ratings must still be on the topic (acks=all); the records")
+	ctx.Kafka.Stall(kHFeedbackTopic)
 	started := ctx.Clock.Now()
-	delivered := publishFeedback(context.Background(), feedbackRecord("q3", "ana", true), 4)
+	delivered := publishFeedback(context.Background(), hFeedbackRecord("q3", "ana", true), 4)
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Equal(delivered, false, "with the broker stalled publishFeedback must report the record undelivered (true only once the broker acknowledged it)")
 	ctx.Assert(waited <= 2.5, "with the broker stalled publishFeedback waited %.1f s: it waits up to 2 s for the delivery report", waited)
 }
 
 func CheckEvalCounters(ctx *harness.Ctx) {
-	feedbackSeed(ctx)
+	hFeedbackSeed(ctx)
 	for _, event := range []map[string]any{
 		{"query_id": "q5", "user": "dee", "workspace": "it", "rating": 3, "tables_proposed": []string{"riders"}, "tables_acked": []string{}, "run_ok": false, "has_output": false},
 		{"query_id": "q6", "user": "dee", "workspace": "it", "rating": 4, "tables_proposed": []string{"riders", "trips"}, "tables_acked": []string{"riders", "trips", "cities"}, "run_ok": true, "has_output": true},
 	} {
 		raw, _ := json.Marshal(event)
-		ctx.Kafka.Seed(feedbackTopic, event["user"], string(raw))
+		ctx.Kafka.Seed(kHFeedbackTopic, event["user"], string(raw))
 	}
 	ctx.Drain(func() { runEval(context.Background()) })
-	ctx.Equal(feedbackCounters(ctx, "mobility"), map[string]int64{"queries": 3, "run_ok": 2, "has_output": 1, "rating_sum": 8, "overlap_milli": 2500}, "eval:mobility (overlaps 1, 0.5 and 1)")
-	ctx.Equal(feedbackCounters(ctx, "ads")["queries"], int64(1), "the Ads event counts in eval:ads; queries")
-	it := feedbackCounters(ctx, "it")
+	ctx.Equal(hFeedbackCounters(ctx, "mobility"), map[string]int64{"queries": 3, "run_ok": 2, "has_output": 1, "rating_sum": 8, "overlap_milli": 2500}, "eval:mobility (overlaps 1, 0.5 and 1)")
+	ctx.Equal(hFeedbackCounters(ctx, "ads")["queries"], int64(1), "the Ads event counts in eval:ads; queries")
+	it := hFeedbackCounters(ctx, "it")
 	ctx.Assert(it["queries"] == 2 && it["overlap_milli"] == 667, "eval:it is %v: nothing ACKed is an overlap of 0, and 2 of 3 ACKed tables proposed is round(1000 * 2/3) = 667", it)
 }
 
 func CheckWriteBeforeCommit(ctx *harness.Ctx) {
-	feedbackSeed(ctx)
+	hFeedbackSeed(ctx)
 	var totals [][]int64
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
-		mobility, ads := feedbackCounters(ctx, "mobility"), feedbackCounters(ctx, "ads")
+		mobility, ads := hFeedbackCounters(ctx, "mobility"), hFeedbackCounters(ctx, "ads")
 		var row []int64
 		for _, f := range []string{"queries", "run_ok", "has_output", "rating_sum", "overlap_milli"} {
 			row = append(row, mobility[f]+ads[f])
@@ -1294,7 +1294,7 @@ func CheckWriteBeforeCommit(ctx *harness.Ctx) {
 	ctx.Drain(func() { runEval(context.Background()) })
 	ctx.Assert(len(totals) > 0, "the consumer never committed an offset")
 	ctx.Equal(totals, [][]int64{{1, 1, 1, 5, 1000}, {2, 2, 1, 7, 1500}, {3, 2, 1, 8, 2500}, {4, 3, 2, 12, 3500}}, "(queries, run_ok, has_output, rating_sum, overlap_milli) at each commit (write every counter before the commit, or a crash in between loses part of the rating)")
-	ctx.Equal(ctx.Kafka.Lag("eval", feedbackTopic), int64(0), "records the consumer left uncommitted")
+	ctx.Equal(ctx.Kafka.Lag("eval", kHFeedbackTopic), int64(0), "records the consumer left uncommitted")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1312,30 +1312,30 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kFeedbackTopic = "query.feedback";
+const std::string kHFeedbackTopic = "query.feedback";
 
-json feedbackRecord(const std::string& id, const std::string& user, bool has_output = true) {
+json hFeedbackRecord(const std::string& id, const std::string& user, bool has_output = true) {
   return {{"query_id", id}, {"user", user}, {"workspace", "mobility"}, {"question", "How many trips yesterday?"}, {"status", "ran"},
           {"tables_proposed", {"trips", "drivers"}}, {"tables_acked", {"trips"}}, {"sql", "SELECT 1"}, {"run_ok", true}, {"has_output", has_output}};
 }
 
-std::vector<json> feedbackEvents(harness::Ctx& ctx) {
+std::vector<json> hFeedbackEvents(harness::Ctx& ctx) {
   std::vector<json> events;
-  for (const auto& r : ctx.Kafka.Records(kFeedbackTopic)) events.push_back(json::parse(r.Value.value_or(""), nullptr, false));
+  for (const auto& r : ctx.Kafka.Records(kHFeedbackTopic)) events.push_back(json::parse(r.Value.value_or(""), nullptr, false));
   return events;
 }
 
-void feedbackSeed(harness::Ctx& ctx) {
+void hFeedbackSeed(harness::Ctx& ctx) {
   const std::vector<json> events = {
       {{"query_id", "q1"}, {"user", "ana"}, {"workspace", "mobility"}, {"rating", 5}, {"tables_proposed", {"trips", "drivers"}}, {"tables_acked", {"trips"}}, {"run_ok", true}, {"has_output", true}},
       {{"query_id", "q2"}, {"user", "ben"}, {"workspace", "mobility"}, {"rating", 2}, {"tables_proposed", {"trips"}}, {"tables_acked", {"trips", "cities"}}, {"run_ok", true}, {"has_output", false}},
       {{"query_id", "q3"}, {"user", "ana"}, {"workspace", "mobility"}, {"rating", 1}, {"tables_proposed", {"trips"}}, {"tables_acked", {"trips"}}, {"run_ok", false}, {"has_output", false}},
       {{"query_id", "q4"}, {"user", "cy"}, {"workspace", "ads"}, {"rating", 4}, {"tables_proposed", {"ad_campaigns"}}, {"tables_acked", {"ad_campaigns"}}, {"run_ok", true}, {"has_output", true}},
   };
-  for (const auto& event : events) ctx.Kafka.Seed(kFeedbackTopic, event["user"].get<std::string>(), event.dump());
+  for (const auto& event : events) ctx.Kafka.Seed(kHFeedbackTopic, event["user"].get<std::string>(), event.dump());
 }
 
-std::map<std::string, long long> feedbackCounters(harness::Ctx& ctx, const std::string& workspace) {
+std::map<std::string, long long> hFeedbackCounters(harness::Ctx& ctx, const std::string& workspace) {
   std::map<std::string, long long> out;
   for (const auto& [k, v] : ctx.Redis.HGetAll("eval:" + workspace)) out[k] = std::atoll(v.c_str());
   return out;
@@ -1345,19 +1345,19 @@ std::map<std::string, long long> feedbackCounters(harness::Ctx& ctx, const std::
 
 void CheckUserKey(harness::Ctx& ctx) {
   for (const auto& [id, user] : std::vector<std::pair<std::string, std::string>>{{"q1", "ana"}, {"q2", "ben"}, {"q3", "ana"}}) {
-    ctx.Equal(publish_feedback(feedbackRecord(id, user), 4), true, "publish_feedback for %s once the broker acknowledged it", id);
+    ctx.Equal(publish_feedback(hFeedbackRecord(id, user), 4), true, "publish_feedback for %s once the broker acknowledged it", id);
   }
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kFeedbackTopic);
+  const auto records = ctx.Kafka.Records(kHFeedbackTopic);
   ctx.Equal(records.size(), 3, "three ratings; records on query.feedback");
-  ctx.Equal(ctx.Kafka.Keys(kFeedbackTopic), {"ana", "ben", "ana"}, "records must be keyed by the user");
+  ctx.Equal(ctx.Kafka.Keys(kHFeedbackTopic), {"ana", "ben", "ana"}, "records must be keyed by the user");
   ctx.Equal(records[0].Partition, records[2].Partition, "one user's feedback must land on one partition so it stays in order; ana's partitions");
 }
 
 void CheckSignals(harness::Ctx& ctx) {
-  ctx.Equal(publish_feedback(feedbackRecord("q9", "ana", false), 2), true, "publish_feedback once the broker acknowledged it");
+  ctx.Equal(publish_feedback(hFeedbackRecord("q9", "ana", false), 2), true, "publish_feedback once the broker acknowledged it");
   ctx.Settle();
-  const auto events = feedbackEvents(ctx);
+  const auto events = hFeedbackEvents(ctx);
   ctx.Equal(events.size(), 1, "one rating; events");
   const json& event = events[0];
   std::vector<std::string> fields;
@@ -1370,43 +1370,43 @@ void CheckSignals(harness::Ctx& ctx) {
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kFeedbackTopic, 1);
-  ctx.Equal(publish_feedback(feedbackRecord("q1", "ana"), 5), true, "a lost acknowledgement is retried by the client, not reported; publish_feedback");
+  ctx.Kafka.LoseAcks(kHFeedbackTopic, 1);
+  ctx.Equal(publish_feedback(hFeedbackRecord("q1", "ana"), 5), true, "a lost acknowledgement is retried by the client, not reported; publish_feedback");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kFeedbackTopic).size(), 1, "after one lost acknowledgement the retry wrote the rating twice (enable.idempotence); the records");
-  publish_feedback(feedbackRecord("q2", "ana"), 3);
+  ctx.Equal(ctx.Kafka.Records(kHFeedbackTopic).size(), 1, "after one lost acknowledgement the retry wrote the rating twice (enable.idempotence); the records");
+  publish_feedback(hFeedbackRecord("q2", "ana"), 3);
   ctx.Settle();
-  ctx.Kafka.Failover(kFeedbackTopic);
-  ctx.Equal(ctx.Kafka.Records(kFeedbackTopic).size(), 2, "after a leader failover both ratings must still be on the topic (acks=all); the records");
-  ctx.Kafka.Stall(kFeedbackTopic);
+  ctx.Kafka.Failover(kHFeedbackTopic);
+  ctx.Equal(ctx.Kafka.Records(kHFeedbackTopic).size(), 2, "after a leader failover both ratings must still be on the topic (acks=all); the records");
+  ctx.Kafka.Stall(kHFeedbackTopic);
   const int64_t started = ctx.Clock.Now();
-  const bool delivered = publish_feedback(feedbackRecord("q3", "ana"), 4);
+  const bool delivered = publish_feedback(hFeedbackRecord("q3", "ana"), 4);
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Equal(delivered, false, "with the broker stalled publish_feedback must report the record undelivered (true only once the broker acknowledged it)");
   ctx.Assert(waited <= 2.5, "with the broker stalled publish_feedback waited %.1f s: it waits up to 2 s for the delivery report", waited);
 }
 
 void CheckEvalCounters(harness::Ctx& ctx) {
-  feedbackSeed(ctx);
+  hFeedbackSeed(ctx);
   const std::vector<json> more = {
       {{"query_id", "q5"}, {"user", "dee"}, {"workspace", "it"}, {"rating", 3}, {"tables_proposed", {"riders"}}, {"tables_acked", json::array()}, {"run_ok", false}, {"has_output", false}},
       {{"query_id", "q6"}, {"user", "dee"}, {"workspace", "it"}, {"rating", 4}, {"tables_proposed", {"riders", "trips"}}, {"tables_acked", {"riders", "trips", "cities"}}, {"run_ok", true}, {"has_output", true}},
   };
-  for (const auto& event : more) ctx.Kafka.Seed(kFeedbackTopic, event["user"].get<std::string>(), event.dump());
+  for (const auto& event : more) ctx.Kafka.Seed(kHFeedbackTopic, event["user"].get<std::string>(), event.dump());
   ctx.Drain([] { run_eval(); });
   const std::map<std::string, long long> expected = {{"queries", 3}, {"run_ok", 2}, {"has_output", 1}, {"rating_sum", 8}, {"overlap_milli", 2500}};
-  ctx.Equal(feedbackCounters(ctx, "mobility"), expected, "eval:mobility (overlaps 1, 0.5 and 1)");
-  ctx.Equal(feedbackCounters(ctx, "ads")["queries"], 1, "the Ads event counts in eval:ads; queries");
-  auto it = feedbackCounters(ctx, "it");
+  ctx.Equal(hFeedbackCounters(ctx, "mobility"), expected, "eval:mobility (overlaps 1, 0.5 and 1)");
+  ctx.Equal(hFeedbackCounters(ctx, "ads")["queries"], 1, "the Ads event counts in eval:ads; queries");
+  auto it = hFeedbackCounters(ctx, "it");
   ctx.Assert(it["queries"] == 2 && it["overlap_milli"] == 667, "eval:it has queries %d and overlap_milli %d: nothing ACKed is an overlap of 0, and 2 of 3 ACKed tables proposed is round(1000 * 2/3) = 667", it["queries"], it["overlap_milli"]);
 }
 
 void CheckWriteBeforeCommit(harness::Ctx& ctx) {
-  feedbackSeed(ctx);
+  hFeedbackSeed(ctx);
   auto totals = std::make_shared<std::vector<std::vector<long long>>>();
   ctx.Kafka.OnCommit([&ctx, totals](const std::string&, const harness::KafkaOffsets&) {
-    auto mobility = feedbackCounters(ctx, "mobility");
-    auto ads = feedbackCounters(ctx, "ads");
+    auto mobility = hFeedbackCounters(ctx, "mobility");
+    auto ads = hFeedbackCounters(ctx, "ads");
     std::vector<long long> row;
     for (const char* f : {"queries", "run_ok", "has_output", "rating_sum", "overlap_milli"}) row.push_back(mobility[f] + ads[f]);
     totals->push_back(row);
@@ -1415,7 +1415,7 @@ void CheckWriteBeforeCommit(harness::Ctx& ctx) {
   ctx.Assert(!totals->empty(), "the consumer never committed an offset");
   const std::vector<std::vector<long long>> expected = {{1, 1, 1, 5, 1000}, {2, 2, 1, 7, 1500}, {3, 2, 1, 8, 2500}, {4, 3, 2, 12, 3500}};
   ctx.Equal(*totals, expected, "(queries, run_ok, has_output, rating_sum, overlap_milli) at each commit (write every counter before the commit, or a crash in between loses part of the rating)");
-  ctx.Equal(ctx.Kafka.Lag("eval", kFeedbackTopic), 0, "records the consumer left uncommitted");
+  ctx.Equal(ctx.Kafka.Lag("eval", kHFeedbackTopic), 0, "records the consumer left uncommitted");
 }
 `,
   },

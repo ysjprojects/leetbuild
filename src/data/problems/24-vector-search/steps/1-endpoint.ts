@@ -900,7 +900,7 @@ std::string hIds(const harness::Response& r) {
   return out;
 }
 
-bool has(const harness::Response& r, const std::string& needle) { return r.Text().find(needle) != std::string::npos; }
+bool hHas(const harness::Response& r, const std::string& needle) { return r.Text().find(needle) != std::string::npos; }
 
 harness::Response hSearchAs(harness::HTTP& c, const std::string& body, const std::string& tenant) {
   if (tenant.empty()) return c.Post("/v1/search", body, "Content-Type", "application/json");
@@ -925,8 +925,8 @@ void CheckTenantHeader(harness::Ctx& ctx) {
   const auto empty = c.Post("/v1/search", R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2})", "Content-Type", "application/json", "X-Tenant-Id", "");
   const auto forged = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "tenant": "globex"})", "acme");
   const auto agreeing = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "tenant": "acme"})", "acme");
-  ctx.Assert(!has(forged, "g1"), "a caller authenticated as acme read globex's document g1 by naming globex in the body: %d %s", forged.Status, forged.Text());
-  ctx.Assert(!has(anonymous, "g1"), "a caller with no X-Tenant-Id read globex's document g1 by naming globex in the body: %d %s", anonymous.Status, anonymous.Text());
+  ctx.Assert(!hHas(forged, "g1"), "a caller authenticated as acme read globex's document g1 by naming globex in the body: %d %s", forged.Status, forged.Text());
+  ctx.Assert(!hHas(anonymous, "g1"), "a caller with no X-Tenant-Id read globex's document g1 by naming globex in the body: %d %s", anonymous.Status, anonymous.Text());
   ctx.Equal(anonymous.Status, 401, "a search without X-Tenant-Id");
   ctx.Equal(bare.Status, 401, "a search with neither X-Tenant-Id nor a body tenant (%s)", bare.Text());
   ctx.Equal(empty.Status, 401, "a search with an empty X-Tenant-Id names no tenant (%s)", empty.Text());
@@ -953,7 +953,7 @@ void CheckDimension(harness::Ctx& ctx) {
   const auto narrow = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0], "k": 2})", "acme");
   const auto wide = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0, 0.0], "k": 2})", "acme");
   ctx.Equal(narrow.Status, 400, "a 3-number query against the 4-dimension index answered %s: it was scored against vectors of another width. Reject it with 400; the status", narrow.Text());
-  ctx.Assert(has(narrow, "idx-42"), "the 400 must name the active index version it compared against (idx-42), got %s", narrow.Text());
+  ctx.Assert(hHas(narrow, "idx-42"), "the 400 must name the active index version it compared against (idx-42), got %s", narrow.Text());
   ctx.Equal(wide.Status, 400, "a 5-number query against the 4-dimension index (%s)", wide.Text());
 }
 
@@ -965,11 +965,11 @@ void CheckActiveVersion(harness::Ctx& ctx) {
   corpus::putDocument("acme", "idx-43", "n1", {1, 0, 0, 0});
   const auto switched = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2})", "acme");
   const auto pinned = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "index_version": "idx-42"})", "acme");
-  ctx.Assert(!has(retired, "old-1"), "a caller searched the retired version idx-41 by naming it in the body: %d %s", retired.Status, retired.Text());
-  ctx.Assert(retired.Status == 409 && has(retired, "idx-42"), "a body index_version idx-41 must be 409 naming the active idx-42, got %d %s", retired.Status, retired.Text());
+  ctx.Assert(!hHas(retired, "old-1"), "a caller searched the retired version idx-41 by naming it in the body: %d %s", retired.Status, retired.Text());
+  ctx.Assert(retired.Status == 409 && hHas(retired, "idx-42"), "a body index_version idx-41 must be 409 naming the active idx-42, got %d %s", retired.Status, retired.Text());
   ctx.Assert(current.Status == 200 && hIds(current) == "a1,a2", "a body index_version equal to the active one is allowed, got %d %s", current.Status, current.Text());
   ctx.Assert(switched.Status == 200 && hIds(switched) == "n1" && hParsed(switched).value("index_version", std::string()) == "idx-43", "after the switch to idx-43 a search must run in idx-43 (acme's n1) and say so, got %d %s: the active version is read on every request", switched.Status, switched.Text());
-  ctx.Assert(pinned.Status == 409 && has(pinned, "idx-43"), "after the switch to idx-43 a body index_version idx-42 must be 409 naming idx-43, got %d %s", pinned.Status, pinned.Text());
+  ctx.Assert(pinned.Status == 409 && hHas(pinned, "idx-43"), "after the switch to idx-43 a body index_version idx-42 must be 409 naming idx-43, got %d %s", pinned.Status, pinned.Text());
 }
 `,
   },

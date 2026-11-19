@@ -751,32 +751,32 @@ import (
 	"leetbuild/harness"
 )
 
-const stateWindow = 60
+const kHStateWindow = 60
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func stateReserve(ctx *harness.Ctx, formID, ip string) Reservation {
-	r, err := reserve(stateBg, formID, ip)
+func hStateReserve(ctx *harness.Ctx, formID, ip string) Reservation {
+	r, err := reserve(hStateBg, formID, ip)
 	ctx.NoError(err, "reserve(%s, %s)", formID, ip)
 	return r
 }
 
-func stateConsume(ctx *harness.Ctx, token string) bool {
-	ok, err := consumeCaptcha(stateBg, token)
+func hStateConsume(ctx *harness.Ctx, token string) bool {
+	ok, err := consumeCaptcha(hStateBg, token)
 	ctx.NoError(err, "consumeCaptcha(%s)", token)
 	return ok
 }
 
-func stateNow(ctx *harness.Ctx) int64 { return ctx.Clock.Now() / 1000 }
+func hStateNow(ctx *harness.Ctx) int64 { return ctx.Clock.Now() / 1000 }
 
 func CheckCaptchaOnce(ctx *harness.Ctx) {
 	ctx.Redis.Set("captcha:t-1", "1")
 	// A second tab replays the same token while the first request is consuming it.
 	rival := ctx.Redis.After("captcha:t-1", func() any {
-		ok, _ := consumeCaptcha(stateBg, "t-1")
+		ok, _ := consumeCaptcha(hStateBg, "t-1")
 		return ok
 	})
-	first := stateConsume(ctx, "t-1")
+	first := hStateConsume(ctx, "t-1")
 	ctx.Assert(rival.Fired, "nothing touched captcha:t-1")
 	second, _ := rival.Result.(bool)
 	passed := 0
@@ -787,26 +787,26 @@ func CheckCaptchaOnce(ctx *harness.Ctx) {
 	}
 	ctx.Equal(passed, 1, "two parallel replays of one captcha token answered %t and %t: the replay landed between the GET and the DEL. Consume it with one GETDEL; tokens passed", first, second)
 	ctx.Equal(ctx.Redis.Exists("captcha:t-1"), 0, "the token must be gone once used")
-	ctx.Equal(stateConsume(ctx, "t-1"), false, "a used token passed again")
-	ctx.Equal(stateConsume(ctx, "never-issued"), false, "a token nobody issued passed")
+	ctx.Equal(hStateConsume(ctx, "t-1"), false, "a used token passed again")
+	ctx.Equal(hStateConsume(ctx, "never-issued"), false, "a token nobody issued passed")
 }
 
 func CheckBothDimensions(ctx *harness.Ctx) {
 	allowed := 0
 	for i := 0; i < 25; i++ {
-		if stateReserve(ctx, "f-1", fmt.Sprintf("10.0.0.%d", i)).Allowed {
+		if hStateReserve(ctx, "f-1", fmt.Sprintf("10.0.0.%d", i)).Allowed {
 			allowed++
 		}
 	}
 	ctx.Equal(allowed, 20, "25 submissions to form f-1 from 25 addresses must allow FORM_LIMIT = 20 per window (a botnet sweeps one form from many addresses); allowed")
 	var tries []bool
 	for i := 0; i < 8; i++ {
-		tries = append(tries, stateReserve(ctx, "f-2", "10.9.9.9").Allowed)
+		tries = append(tries, hStateReserve(ctx, "f-2", "10.9.9.9").Allowed)
 	}
 	ctx.Equal(tries, []bool{true, true, true, true, true, false, false, false}, "eight submissions to f-2 from one address: five allowed (IP_LIMIT = 5), then refused")
 	others := 0
 	for i := 0; i < 20; i++ {
-		if stateReserve(ctx, "f-2", fmt.Sprintf("10.1.0.%d", i)).Allowed {
+		if hStateReserve(ctx, "f-2", fmt.Sprintf("10.1.0.%d", i)).Allowed {
 			others++
 		}
 	}
@@ -814,14 +814,14 @@ func CheckBothDimensions(ctx *harness.Ctx) {
 }
 
 func CheckWindowBucket(ctx *harness.Ctx) {
-	createdWindow := stateNow(ctx) / stateWindow
+	createdWindow := hStateNow(ctx) / kHStateWindow
 	formKey := fmt.Sprintf("limit:form:f-1:%d", createdWindow)
 	ipKey := fmt.Sprintf("limit:ip:10.0.0.1:%d", createdWindow)
 	// Another replica reads the TTL the moment the counter is created.
 	formTTL := ctx.Redis.After(formKey, func() any { return ctx.Redis.TTL(formKey) })
 	ipTTL := ctx.Redis.After(ipKey, func() any { return ctx.Redis.TTL(ipKey) })
 	for i := 0; i < 5; i++ {
-		stateReserve(ctx, "f-1", "10.0.0.1")
+		hStateReserve(ctx, "f-1", "10.0.0.1")
 	}
 	for _, created := range []struct {
 		key    string
@@ -836,56 +836,56 @@ func CheckWindowBucket(ctx *harness.Ctx) {
 		ttl, _ := created.result.(int64)
 		ctx.Assert(ttl > 0, "%s had TTL %d right after the command that created it: a crash before the separate EXPIRE leaves a counter that never resets. Set the TTL in the same script", created.key, ttl)
 	}
-	ctx.Equal(stateReserve(ctx, "f-1", "10.0.0.1").Allowed, false, "the sixth submission from one address in a window must be refused (IP_LIMIT = 5)")
+	ctx.Equal(hStateReserve(ctx, "f-1", "10.0.0.1").Allowed, false, "the sixth submission from one address in a window must be refused (IP_LIMIT = 5)")
 	keys := ctx.Redis.Keys("limit:*")
 	ctx.Assert(len(keys) > 0, "reserve wrote no limit:* key")
 	for _, key := range keys {
 		ttl := ctx.Redis.TTL(key)
-		ctx.Assert(ttl > 0 && ttl <= 2*stateWindow, "%s has TTL %d: a limit key must expire with its window, or one busy minute blocks the address forever", key, ttl)
+		ctx.Assert(ttl > 0 && ttl <= 2*kHStateWindow, "%s has TTL %d: a limit key must expire with its window, or one busy minute blocks the address forever", key, ttl)
 	}
-	window := stateNow(ctx) / stateWindow
+	window := hStateNow(ctx) / kHStateWindow
 	sort.Strings(keys)
 	want := []string{fmt.Sprintf("limit:form:f-1:%d", window), fmt.Sprintf("limit:ip:10.0.0.1:%d", window)}
 	ctx.Equal(keys, want, "the limit keys must carry the window in their names")
-	ctx.Clock.Advance(stateWindow)
-	ctx.Equal(stateReserve(ctx, "f-1", "10.0.0.1").Allowed, true, "a minute later the address must be allowed again: the next window has keys of its own")
+	ctx.Clock.Advance(kHStateWindow)
+	ctx.Equal(hStateReserve(ctx, "f-1", "10.0.0.1").Allowed, true, "a minute later the address must be allowed again: the next window has keys of its own")
 }
 
 func CheckAtomicReserve(ctx *harness.Ctx) {
 	for i := 0; i < 4; i++ {
-		ctx.Equal(stateReserve(ctx, "f-1", "10.0.0.1").Allowed, true, "the first four submissions from one address must be allowed")
+		ctx.Equal(hStateReserve(ctx, "f-1", "10.0.0.1").Allowed, true, "the first four submissions from one address must be allowed")
 	}
-	window := stateNow(ctx) / stateWindow
+	window := hStateNow(ctx) / kHStateWindow
 	// A second request from the same address lands while this one is reserving the fifth slot.
 	var rivals []Reservation
 	for _, key := range []string{"limit:ip:10.0.0.1", fmt.Sprintf("limit:ip:10.0.0.1:%d", window)} {
 		ctx.Redis.After(key, func() any {
-			r, _ := reserve(stateBg, "f-1", "10.0.0.1")
+			r, _ := reserve(hStateBg, "f-1", "10.0.0.1")
 			rivals = append(rivals, r)
 			return nil
 		})
 	}
-	mine := stateReserve(ctx, "f-1", "10.0.0.1")
+	mine := hStateReserve(ctx, "f-1", "10.0.0.1")
 	ctx.Assert(len(rivals) > 0, "reserve never touched the address's counter")
 	both := []bool{mine.Allowed, rivals[0].Allowed}
 	ctx.Assert(mine.Allowed != rivals[0].Allowed, "with 4 of 5 slots used, two parallel submissions answered allowed=%v: the read, the comparison and the INCR are separate round trips and the other request landed between them. Reserve in one Lua script", both)
-	ctx.Equal(stateReserve(ctx, "f-1", "10.0.0.1").Allowed, false, "the address's sixth submission must be refused")
+	ctx.Equal(hStateReserve(ctx, "f-1", "10.0.0.1").Allowed, false, "the address's sixth submission must be refused")
 }
 
 func CheckRetryAfter(ctx *harness.Ctx) {
-	ctx.Clock.Advance(float64(((45-stateNow(ctx)%stateWindow)%stateWindow + stateWindow) % stateWindow))
-	left := stateWindow - stateNow(ctx)%stateWindow
+	ctx.Clock.Advance(float64(((45-hStateNow(ctx)%kHStateWindow)%kHStateWindow + kHStateWindow) % kHStateWindow))
+	left := kHStateWindow - hStateNow(ctx)%kHStateWindow
 	for _, expected := range []int64{4, 3, 2, 1, 0} {
-		got := stateReserve(ctx, "f-1", "10.0.0.1")
+		got := hStateReserve(ctx, "f-1", "10.0.0.1")
 		ctx.Assert(got.Allowed && got.Remaining == expected, "a submission with %d slots left answered %+v, expected allowed with remaining %d", expected+1, got, expected)
 	}
-	refused := stateReserve(ctx, "f-1", "10.0.0.1")
+	refused := hStateReserve(ctx, "f-1", "10.0.0.1")
 	ctx.Equal(refused.Allowed, false, "the sixth submission in a window must be refused")
 	ctx.Equal(refused.RetryAfter, left, "the refusal's RetryAfter must be the seconds until this window ends")
 	for i := 0; i < 18; i++ {
-		stateReserve(ctx, "f-3", fmt.Sprintf("10.3.0.%d", i))
+		hStateReserve(ctx, "f-3", fmt.Sprintf("10.3.0.%d", i))
 	}
-	got := stateReserve(ctx, "f-3", "10.3.9.9")
+	got := hStateReserve(ctx, "f-3", "10.3.9.9")
 	ctx.Assert(got.Allowed && got.Remaining == 1, "form f-3 with 18 of 20 slots used answered %+v to a fresh address, expected remaining 1: remaining is the smaller room left, here the form's", got)
 }
 `,

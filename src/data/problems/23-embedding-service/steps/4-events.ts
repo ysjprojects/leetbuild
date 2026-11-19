@@ -830,7 +830,7 @@ std::vector<config::Chunk> hChunksOf(const std::vector<std::string>& texts) {
   return out;
 }
 
-std::vector<std::string> hashesOf(const std::vector<std::string>& texts) {
+std::vector<std::string> hHashesOf(const std::vector<std::string>& texts) {
   std::vector<std::string> out;
   for (const auto& t : texts) out.push_back(config::contentHash(t));
   return out;
@@ -861,7 +861,7 @@ void CheckDocumentEvent(harness::Ctx& ctx) {
   ctx.Equal(event.value("tenant", ""), kHTenant, "the event's tenant (%v)", event);
   ctx.Equal(event.value("document_id", ""), kHDoc, "the event's document_id (%v)", event);
   ctx.Equal(event.value("model_version", ""), config::kModelVersion, "the event's model_version (%v)", event);
-  ctx.Equal(event.value("content_hashes", nlohmann::json::array()), nlohmann::json(hashesOf(kHTexts)), "the event must list every chunk's content hash in order");
+  ctx.Equal(event.value("content_hashes", nlohmann::json::array()), nlohmann::json(hHashesOf(kHTexts)), "the event must list every chunk's content hash in order");
   ctx.Equal(event.value("chunk_count", 0), 3, "the event's chunk_count");
   for (const auto& t : kHTexts) ctx.Assert(records[0].Value.value_or("").find(t) == std::string::npos, "the event carries chunk text (%q): it names the chunks by content hash, and the text stays with the tenant's data", t);
 }

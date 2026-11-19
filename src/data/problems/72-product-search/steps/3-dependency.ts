@@ -818,17 +818,17 @@ import (
 )
 
 var (
-	shardBg      = context.Background()
-	shardTargets = []string{"shard-0:9000", "shard-1:9000", "shard-2:9000"}
+	hShardBg      = context.Background()
+	hShardTargets = []string{"shard-0:9000", "shard-1:9000", "shard-2:9000"}
 )
 
 // shardPeer is one shard: its fixed page for any query, cut to the requested size.
-type shardPeer struct {
+type HShardPeer struct {
 	pb.UnimplementedShardServer
 	hits []*pb.Hit
 }
 
-func (s *shardPeer) Search(_ context.Context, req *pb.ShardQuery) (*pb.ShardPage, error) {
+func (s *HShardPeer) Search(_ context.Context, req *pb.ShardQuery) (*pb.ShardPage, error) {
 	hits := s.hits
 	if int(req.GetPageSize()) < len(hits) {
 		hits = hits[:req.GetPageSize()]
@@ -836,15 +836,15 @@ func (s *shardPeer) Search(_ context.Context, req *pb.ShardQuery) (*pb.ShardPage
 	return &pb.ShardPage{Hits: hits}, nil
 }
 
-func serveShards(ctx *harness.Ctx) {
+func hServeShards(ctx *harness.Ctx) {
 	// One peer per literal target: the harness keys a stand-in by the target string it is given here.
-	pb.RegisterShardServer(ctx.GRPC.Server("shard-0:9000"), &shardPeer{hits: []*pb.Hit{{ProductId: "p-1", Title: "Steel Kettle", Score: 0.9}, {ProductId: "p-2", Title: "Glass Kettle", Score: 0.7}}})
-	pb.RegisterShardServer(ctx.GRPC.Server("shard-1:9000"), &shardPeer{hits: []*pb.Hit{{ProductId: "p-1", Title: "Steel Kettle", Score: 0.8}, {ProductId: "p-3", Title: "Kettle Descaler", Score: 0.4}}})
-	pb.RegisterShardServer(ctx.GRPC.Server("shard-2:9000"), &shardPeer{hits: []*pb.Hit{{ProductId: "p-0", Title: "Camp Kettle", Score: 0.7}, {ProductId: "p-3", Title: "Kettle Descaler", Score: 0.6}, {ProductId: "p-4", Title: "Travel Kettle", Score: 0.6}}})
+	pb.RegisterShardServer(ctx.GRPC.Server("shard-0:9000"), &HShardPeer{hits: []*pb.Hit{{ProductId: "p-1", Title: "Steel Kettle", Score: 0.9}, {ProductId: "p-2", Title: "Glass Kettle", Score: 0.7}}})
+	pb.RegisterShardServer(ctx.GRPC.Server("shard-1:9000"), &HShardPeer{hits: []*pb.Hit{{ProductId: "p-1", Title: "Steel Kettle", Score: 0.8}, {ProductId: "p-3", Title: "Kettle Descaler", Score: 0.4}}})
+	pb.RegisterShardServer(ctx.GRPC.Server("shard-2:9000"), &HShardPeer{hits: []*pb.Hit{{ProductId: "p-0", Title: "Camp Kettle", Score: 0.7}, {ProductId: "p-3", Title: "Kettle Descaler", Score: 0.6}, {ProductId: "p-4", Title: "Travel Kettle", Score: 0.6}}})
 }
 
 func hMerged(ctx *harness.Ctx, pageSize int) *Page {
-	page, err := fanOut(shardBg, "t-1", "kettle", pageSize)
+	page, err := fanOut(hShardBg, "t-1", "kettle", pageSize)
 	ctx.NoError(err, "fanOut failed")
 	return page
 }
@@ -858,7 +858,7 @@ func hPageIDs(page *Page) string {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	serveShards(ctx)
+	hServeShards(ctx)
 	hMerged(ctx, 10)
 	calls := ctx.GRPC.CallsTo("Search", "")
 	ctx.Equal(len(calls), 3, "fanOut must make one Search call per shard; the calls")
@@ -871,16 +871,16 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Assert(!strings.Contains(hPageIDs(page), "p-4"), "the search waited for a shard 5 s slow and answered [%s]: shard-2 must miss the 350 ms deadline", hPageIDs(page))
 	ctx.Assert(page.Partial && len(page.Missed) == 1 && page.Missed[0] == "shard-2:9000", "shard-2 missed its deadline and the page answered Partial=%v Missed=%q, expected Partial=true Missed=[shard-2:9000]", page.Partial, page.Missed)
 	// Every shard answers in 300 ms: each call has its own 350 ms, so the third shard is as welcome as the first.
-	for _, target := range shardTargets {
+	for _, target := range hShardTargets {
 		ctx.GRPC.SetLatency("Search", 0.3, target)
 	}
-	page, err := fanOut(shardBg, "t-1", "kettle", 10)
+	page, err := fanOut(hShardBg, "t-1", "kettle", 10)
 	ctx.NoError(err, "with every shard answering in 300 ms fanOut failed: each Search call carries its own shardDeadline, not what is left of one budget shared by the three")
 	ctx.Assert(!page.Partial && strings.Contains(hPageIDs(page), "p-4"), "with every shard answering in 300 ms the page answered [%s] Partial=%v Missed=%q: each Search call carries its own shardDeadline, not what is left of one budget shared by the three", hPageIDs(page), page.Partial, page.Missed)
 }
 
 func CheckPartial(ctx *harness.Ctx) {
-	serveShards(ctx)
+	hServeShards(ctx)
 	page := hMerged(ctx, 10)
 	ctx.Assert(!page.Partial && len(page.Missed) == 0, "with every shard healthy the page must not be partial, got Partial=%v Missed=%q", page.Partial, page.Missed)
 	for _, failure := range []struct {
@@ -888,7 +888,7 @@ func CheckPartial(ctx *harness.Ctx) {
 		code   codes.Code
 	}{{"shard-1:9000", codes.Internal}, {"shard-0:9000", codes.ResourceExhausted}} {
 		ctx.GRPC.Fail("Search", failure.code, "shard error", 1, failure.target)
-		page, err := fanOut(shardBg, "t-1", "kettle", 10)
+		page, err := fanOut(hShardBg, "t-1", "kettle", 10)
 		ctx.NoError(err, "%s failing with %v made fanOut fail: a shard whose call fails goes into missed", failure.target, failure.code)
 		ctx.Assert(page.Partial && len(page.Missed) == 1 && page.Missed[0] == failure.target, "%s failed with %v and the page answered Partial=%v Missed=%q, expected Partial=true Missed=[%s]", failure.target, failure.code, page.Partial, page.Missed, failure.target)
 	}
@@ -900,11 +900,11 @@ func CheckPartial(ctx *harness.Ctx) {
 }
 
 func CheckQuorum(ctx *harness.Ctx) {
-	serveShards(ctx)
+	hServeShards(ctx)
 	ctx.GRPC.Stop("shard-2:9000")
 	ctx.Assert(hPageIDs(hMerged(ctx, 10)) != "", "with two of three shards answering the search must answer a page")
 	ctx.GRPC.Stop("shard-1:9000")
-	page, err := fanOut(shardBg, "t-1", "kettle", 10)
+	page, err := fanOut(hShardBg, "t-1", "kettle", 10)
 	if err == nil {
 		ctx.Fatalf("with one shard of three answering fanOut returned [%s] (Partial=%v): below a majority it must return ErrSearchUnavailable", hPageIDs(page), page.Partial)
 	}
@@ -912,7 +912,7 @@ func CheckQuorum(ctx *harness.Ctx) {
 }
 
 func CheckDedupe(ctx *harness.Ctx) {
-	serveShards(ctx)
+	hServeShards(ctx)
 	page := hMerged(ctx, 10)
 	ctx.Equal(hPageIDs(page), "p-1,p-0,p-2,p-3,p-4", "the merged page must hold one entry per product at its highest score, highest first, ties by product id")
 	ctx.Assert(math.Abs(page.Hits[0].GetScore()-0.9) < 1e-9, "p-1 kept score %v, expected its best, 0.9", page.Hits[0].GetScore())
@@ -932,7 +932,7 @@ func CheckDedupe(ctx *harness.Ctx) {
 namespace {
 
 // One shard: its fixed page for any query, cut to the requested size.
-class ShardPeer final : public productsearch::Shard::Service {
+class HShardPeer final : public productsearch::Shard::Service {
  public:
   std::vector<std::tuple<std::string, std::string, double>> hits;
   grpc::Status Search(grpc::ServerContext*, const productsearch::ShardQuery* req, productsearch::ShardPage* out) override {
@@ -946,10 +946,10 @@ class ShardPeer final : public productsearch::Shard::Service {
   }
 };
 
-void serveShards(harness::Ctx& ctx) {
-  static std::map<std::string, ShardPeer>* peers = nullptr;
+void hServeShards(harness::Ctx& ctx) {
+  static std::map<std::string, HShardPeer>* peers = nullptr;
   delete peers;
-  peers = new std::map<std::string, ShardPeer>;
+  peers = new std::map<std::string, HShardPeer>;
   (*peers)["shard-0:9000"].hits = {{"p-1", "Steel Kettle", 0.9}, {"p-2", "Glass Kettle", 0.7}};
   (*peers)["shard-1:9000"].hits = {{"p-1", "Steel Kettle", 0.8}, {"p-3", "Kettle Descaler", 0.4}};
   (*peers)["shard-2:9000"].hits = {{"p-0", "Camp Kettle", 0.7}, {"p-3", "Kettle Descaler", 0.6}, {"p-4", "Travel Kettle", 0.6}};
@@ -974,7 +974,7 @@ Page hMerged(harness::Ctx& ctx, int page_size, const char* when = "") {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  serveShards(ctx);
+  hServeShards(ctx);
   hMerged(ctx, 10);
   const auto calls = ctx.GRPC.CallsTo("Search");
   ctx.Equal(calls.size(), 3, "fanOut must make one Search call per shard; the calls");
@@ -993,7 +993,7 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckPartial(harness::Ctx& ctx) {
-  serveShards(ctx);
+  hServeShards(ctx);
   Page page = hMerged(ctx, 10);
   ctx.Assert(!page.partial && page.missed.empty(), "with every shard healthy the page must not be partial, got partial=%t missed=%q", page.partial, page.missed);
   const std::vector<std::pair<std::string, grpc::StatusCode>> failures = {{"shard-1:9000", grpc::StatusCode::INTERNAL}, {"shard-0:9000", grpc::StatusCode::RESOURCE_EXHAUSTED}};
@@ -1010,7 +1010,7 @@ void CheckPartial(harness::Ctx& ctx) {
 }
 
 void CheckQuorum(harness::Ctx& ctx) {
-  serveShards(ctx);
+  hServeShards(ctx);
   ctx.GRPC.Stop("shard-2:9000");
   ctx.Assert(!hPageIDs(hMerged(ctx, 10)).empty(), "with two of three shards answering the search must answer a page");
   ctx.GRPC.Stop("shard-1:9000");
@@ -1026,7 +1026,7 @@ void CheckQuorum(harness::Ctx& ctx) {
 }
 
 void CheckDedupe(harness::Ctx& ctx) {
-  serveShards(ctx);
+  hServeShards(ctx);
   const Page page = hMerged(ctx, 10);
   ctx.Equal(hPageIDs(page), "p-1,p-0,p-2,p-3,p-4", "the merged page must hold one entry per product at its highest score, highest first, ties by product id");
   ctx.Assert(!page.hits.empty() && std::fabs(page.hits.front().score() - 0.9) < 1e-9, "p-1 kept score %v, expected its best, 0.9", page.hits.empty() ? 0.0 : page.hits.front().score());

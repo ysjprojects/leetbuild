@@ -638,40 +638,40 @@ import (
 	"leetbuild/harness"
 )
 
-type acBody struct {
+type HAcBody struct {
 	Prefix      string   \`json:"prefix"\`
 	Suggestions []string \`json:"suggestions"\`
 }
 
-func acSeed(ctx *harness.Ctx, tenant string, counts map[string]int) {
+func hAcSeed(ctx *harness.Ctx, tenant string, counts map[string]int) {
 	for term, n := range counts {
 		ctx.Redis.Do("ZADD", "suggest:terms:"+tenant, n, term)
 	}
 }
 
-func acAPI(ctx *harness.Ctx) *harness.HTTP {
+func hAcAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func acAsk(c *harness.HTTP, prefix string) *harness.Response {
+func hAcAsk(c *harness.HTTP, prefix string) *harness.Response {
 	return c.Get("/v1/autocomplete?prefix="+url.QueryEscape(prefix), "X-Tenant-Id", "acme")
 }
 
-func acDecode(r *harness.Response) acBody {
-	var body acBody
+func hAcDecode(r *harness.Response) HAcBody {
+	var body HAcBody
 	r.Decode(&body)
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	acSeed(ctx, "acme", map[string]int{"kettle": 50, "kettlebell": 40, "keyboard": 30, "lamp": 20})
-	acSeed(ctx, "globex", map[string]int{"kebab": 90})
-	c := acAPI(ctx)
-	r := acAsk(c, "ke")
+	hAcSeed(ctx, "acme", map[string]int{"kettle": 50, "kettlebell": 40, "keyboard": 30, "lamp": 20})
+	hAcSeed(ctx, "globex", map[string]int{"kebab": 90})
+	c := hAcAPI(ctx)
+	r := hAcAsk(c, "ke")
 	ctx.Equal(r.Status, 200, "GET /v1/autocomplete?prefix=ke (%s)", r.Text())
-	body := acDecode(r)
+	body := hAcDecode(r)
 	ctx.Equal(body.Prefix, "ke", "the answered prefix")
 	ctx.Equal(body.Suggestions, []string{"kettle", "kettlebell", "keyboard"}, "acme's completions for ke (globex's kebab is not acme's)")
 	r = c.Get("/v1/autocomplete?prefix=ke")
@@ -679,31 +679,31 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckFoldPrefix(ctx *harness.Ctx) {
-	acSeed(ctx, "acme", map[string]int{"Crème brûlée": 60, "creme fraiche": 50, "cream": 40, "crepe": 30})
-	c := acAPI(ctx)
+	hAcSeed(ctx, "acme", map[string]int{"Crème brûlée": 60, "creme fraiche": 50, "cream": 40, "crepe": 30})
+	c := hAcAPI(ctx)
 	for _, raw := range []string{"CRÈME", "crème", "Creme", "  crème  "} {
-		r := acAsk(c, raw)
+		r := hAcAsk(c, raw)
 		ctx.Equal(r.Status, 200, "prefix %q (%s)", raw, r.Text())
-		body := acDecode(r)
+		body := hAcDecode(r)
 		ctx.Equal(body.Prefix, "creme", "prefix %q must be answered as the folded prefix", raw)
 		ctx.Equal(body.Suggestions, []string{"Crème brûlée", "creme fraiche"}, "prefix %q: the store folds every term, so the prefix must be folded the same way (terms.Fold); the suggestions", raw)
 	}
-	body := acDecode(acAsk(c, "crème   BR"))
+	body := hAcDecode(hAcAsk(c, "crème   BR"))
 	ctx.Assert(body.Prefix == "creme br" && fmt.Sprint(body.Suggestions) == "[Crème brûlée]", "prefix \\"crème   BR\\" gave %q %q, expected \\"creme br\\" and Crème brûlée", body.Prefix, body.Suggestions)
 }
 
 func CheckBoundedPrefix(ctx *harness.Ctx) {
-	acSeed(ctx, "acme", map[string]int{"kettle": 50, "kettlebell": 40, "lamp": 20})
-	c := acAPI(ctx)
+	hAcSeed(ctx, "acme", map[string]int{"kettle": 50, "kettlebell": 40, "lamp": 20})
+	c := hAcAPI(ctx)
 	for _, raw := range []string{"", "   ", strings.Repeat("k", 65), strings.Repeat("ß", 65)} {
-		r := acAsk(c, raw)
+		r := hAcAsk(c, raw)
 		ctx.Equal(r.Status, 400, "prefix %q (%d bytes) must be 400: an empty prefix walks the tenant's whole index", raw, len(raw))
 	}
 	for _, raw := range []string{strings.Repeat("k", 64), "  " + strings.Repeat("k", 64) + "  ", strings.Repeat("ß", 64), strings.Repeat("k", 60) + strings.Repeat("😀", 4)} {
-		ctx.Equal(acAsk(c, raw).Status, 200, "prefix %q folds to 64 characters (the bound is characters of the folded prefix, not bytes)", raw)
+		ctx.Equal(hAcAsk(c, raw).Status, 200, "prefix %q folds to 64 characters (the bound is characters of the folded prefix, not bytes)", raw)
 	}
 	for _, raw := range []string{"ke\\x00", "ke\\x1b[2J", "ke\\x7f", "ke\\nlamp", "\\tke", "ke\\r\\n"} {
-		ctx.Equal(acAsk(c, raw).Status, 400, "prefix %q must be rejected before any lookup (a control character in the raw prefix)", raw)
+		ctx.Equal(hAcAsk(c, raw).Status, 400, "prefix %q must be rejected before any lookup (a control character in the raw prefix)", raw)
 	}
 }
 
@@ -717,10 +717,10 @@ func CheckDedupeThenCap(ctx *harness.Ctx) {
 			want = append(want, term)
 		}
 	}
-	acSeed(ctx, "acme", counts)
-	r := acAsk(acAPI(ctx), "caf")
+	hAcSeed(ctx, "acme", counts)
+	r := hAcAsk(hAcAPI(ctx), "caf")
 	ctx.Equal(r.Status, 200, "prefix caf (%s)", r.Text())
-	ctx.Equal(acDecode(r).Suggestions, want, "spellings that fold alike are one suggestion (the first is kept), and the cap of 10 applies after the dedupe; prefix caf")
+	ctx.Equal(hAcDecode(r).Suggestions, want, "spellings that fold alike are one suggestion (the first is kept), and the cap of 10 applies after the dedupe; prefix caf")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -735,11 +735,11 @@ func CheckDedupeThenCap(ctx *harness.Ctx) {
 
 namespace {
 
-void acSeed(harness::Ctx& ctx, const std::string& tenant, const std::map<std::string, int>& counts) {
+void hAcSeed(harness::Ctx& ctx, const std::string& tenant, const std::map<std::string, int>& counts) {
   for (const auto& [term, n] : counts) ctx.Redis.Must({"ZADD", "suggest:terms:" + tenant, std::to_string(n), term});
 }
 
-harness::HTTP acAPI(harness::Ctx& ctx) {
+harness::HTTP hAcAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -747,7 +747,7 @@ harness::HTTP acAPI(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string acEscape(const std::string& text) {
+std::string hAcEscape(const std::string& text) {
   std::string out;
   char hex[4];
   for (const unsigned char c : text) {
@@ -761,62 +761,62 @@ std::string acEscape(const std::string& text) {
   return out;
 }
 
-harness::Response acAsk(harness::HTTP& c, const std::string& prefix) {
-  return c.Get("/v1/autocomplete?prefix=" + acEscape(prefix), "X-Tenant-Id", "acme");
+harness::Response hAcAsk(harness::HTTP& c, const std::string& prefix) {
+  return c.Get("/v1/autocomplete?prefix=" + hAcEscape(prefix), "X-Tenant-Id", "acme");
 }
 
-nlohmann::json acBody(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hAcBody(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
-std::vector<std::string> acSuggestions(const harness::Response& r) {
-  const auto body = acBody(r);
+std::vector<std::string> hAcSuggestions(const harness::Response& r) {
+  const auto body = hAcBody(r);
   return body.is_object() && body.contains("suggestions") ? body["suggestions"].get<std::vector<std::string>>() : std::vector<std::string>{};
 }
 
-std::string acPrefix(const harness::Response& r) {
-  const auto body = acBody(r);
+std::string hAcPrefix(const harness::Response& r) {
+  const auto body = hAcBody(r);
   return body.is_object() ? body.value("prefix", "") : "";
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  acSeed(ctx, "acme", {{"kettle", 50}, {"kettlebell", 40}, {"keyboard", 30}, {"lamp", 20}});
-  acSeed(ctx, "globex", {{"kebab", 90}});
-  auto c = acAPI(ctx);
-  const auto r = acAsk(c, "ke");
+  hAcSeed(ctx, "acme", {{"kettle", 50}, {"kettlebell", 40}, {"keyboard", 30}, {"lamp", 20}});
+  hAcSeed(ctx, "globex", {{"kebab", 90}});
+  auto c = hAcAPI(ctx);
+  const auto r = hAcAsk(c, "ke");
   ctx.Equal(r.Status, 200, "GET /v1/autocomplete?prefix=ke (%s)", r.Text());
-  ctx.Equal(acPrefix(r), "ke", "the answered prefix");
-  ctx.Equal(acSuggestions(r), {"kettle", "kettlebell", "keyboard"}, "acme's completions for ke (globex's kebab is not acme's)");
+  ctx.Equal(hAcPrefix(r), "ke", "the answered prefix");
+  ctx.Equal(hAcSuggestions(r), {"kettle", "kettlebell", "keyboard"}, "acme's completions for ke (globex's kebab is not acme's)");
   ctx.Equal(c.Get("/v1/autocomplete?prefix=ke").Status, 401, "a request without X-Tenant-Id");
 }
 
 void CheckFoldPrefix(harness::Ctx& ctx) {
-  acSeed(ctx, "acme", {{"Crème brûlée", 60}, {"creme fraiche", 50}, {"cream", 40}, {"crepe", 30}});
-  auto c = acAPI(ctx);
+  hAcSeed(ctx, "acme", {{"Crème brûlée", 60}, {"creme fraiche", 50}, {"cream", 40}, {"crepe", 30}});
+  auto c = hAcAPI(ctx);
   for (const std::string raw : {"CRÈME", "crème", "Creme", "  crème  "}) {
-    const auto r = acAsk(c, raw);
+    const auto r = hAcAsk(c, raw);
     ctx.Equal(r.Status, 200, "prefix %q (%s)", raw, r.Text());
-    ctx.Equal(acPrefix(r), "creme", "prefix %q must be answered as the folded prefix", raw);
-    ctx.Equal(acSuggestions(r), {"Crème brûlée", "creme fraiche"}, "prefix %q: the store folds every term, so the prefix must be folded the same way (terms::fold); the suggestions", raw);
+    ctx.Equal(hAcPrefix(r), "creme", "prefix %q must be answered as the folded prefix", raw);
+    ctx.Equal(hAcSuggestions(r), {"Crème brûlée", "creme fraiche"}, "prefix %q: the store folds every term, so the prefix must be folded the same way (terms::fold); the suggestions", raw);
   }
-  const auto r = acAsk(c, "crème   BR");
-  ctx.Assert(acPrefix(r) == "creme br" && acSuggestions(r) == std::vector<std::string>{"Crème brûlée"}, "prefix \\"crème   BR\\" gave %s, expected \\"creme br\\" and Crème brûlée", r.Text());
+  const auto r = hAcAsk(c, "crème   BR");
+  ctx.Assert(hAcPrefix(r) == "creme br" && hAcSuggestions(r) == std::vector<std::string>{"Crème brûlée"}, "prefix \\"crème   BR\\" gave %s, expected \\"creme br\\" and Crème brûlée", r.Text());
 }
 
 void CheckBoundedPrefix(harness::Ctx& ctx) {
-  acSeed(ctx, "acme", {{"kettle", 50}, {"kettlebell", 40}, {"lamp", 20}});
-  auto c = acAPI(ctx);
+  hAcSeed(ctx, "acme", {{"kettle", 50}, {"kettlebell", 40}, {"lamp", 20}});
+  auto c = hAcAPI(ctx);
   std::string ess;
   for (int i = 0; i < 65; ++i) ess += "ß";
   for (const std::string raw : {std::string(), std::string("   "), std::string(65, 'k'), ess}) {
-    ctx.Equal(acAsk(c, raw).Status, 400, "prefix %q (%d bytes) must be 400: an empty prefix walks the tenant's whole index", raw, raw.size());
+    ctx.Equal(hAcAsk(c, raw).Status, 400, "prefix %q (%d bytes) must be 400: an empty prefix walks the tenant's whole index", raw, raw.size());
   }
   const std::string ess64 = ess.substr(2);
   for (const std::string raw : {std::string(64, 'k'), "  " + std::string(64, 'k') + "  ", ess64, std::string(60, 'k') + "😀😀😀😀"}) {
-    ctx.Equal(acAsk(c, raw).Status, 200, "prefix %q folds to 64 characters (the bound is characters of the folded prefix, not bytes)", raw);
+    ctx.Equal(hAcAsk(c, raw).Status, 200, "prefix %q folds to 64 characters (the bound is characters of the folded prefix, not bytes)", raw);
   }
   for (const std::string raw : {std::string("ke\\0", 3), std::string("ke\\x1b[2J"), std::string("ke\\x7f"), std::string("ke\\nlamp"), std::string("\\tke"), std::string("ke\\r\\n")}) {
-    ctx.Equal(acAsk(c, raw).Status, 400, "prefix %q must be rejected before any lookup (a control character in the raw prefix)", raw);
+    ctx.Equal(hAcAsk(c, raw).Status, 400, "prefix %q must be rejected before any lookup (a control character in the raw prefix)", raw);
   }
 }
 
@@ -829,11 +829,11 @@ void CheckDedupeThenCap(harness::Ctx& ctx) {
     counts[term] = 150 - n;
     if (n <= 9) want.push_back(term);
   }
-  acSeed(ctx, "acme", counts);
-  auto c = acAPI(ctx);
-  const auto r = acAsk(c, "caf");
+  hAcSeed(ctx, "acme", counts);
+  auto c = hAcAPI(ctx);
+  const auto r = hAcAsk(c, "caf");
   ctx.Equal(r.Status, 200, "prefix caf (%s)", r.Text());
-  ctx.Equal(acSuggestions(r), want, "spellings that fold alike are one suggestion (the first is kept), and the cap of 10 applies after the dedupe; prefix caf");
+  ctx.Equal(hAcSuggestions(r), want, "spellings that fold alike are one suggestion (the first is kept), and the cap of 10 applies after the dedupe; prefix caf");
 }
 `,
   },

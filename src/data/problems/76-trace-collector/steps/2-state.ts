@@ -636,96 +636,96 @@ import (
 )
 
 const (
-	stTrace  = "4bf92f3577b34da6a3ce929d0e0e4736"
-	stKey    = "trace:" + stTrace
-	stRootA  = "00f067aa0ba902b7"
-	stRootB  = "00f067aa0ba902c1"
-	stParent = "00f067aa0ba902c4"
-	stChild1 = "00f067aa0ba902c2"
-	stChild2 = "00f067aa0ba902c3"
-	stOrphan = "00f067aa0ba902c5"
-	stAbsent = "00f067aa0ba902c6"
+	kHStTrace  = "4bf92f3577b34da6a3ce929d0e0e4736"
+	kHStKey    = "trace:" + kHStTrace
+	kHStRootA  = "00f067aa0ba902b7"
+	kHStRootB  = "00f067aa0ba902c1"
+	kHStParent = "00f067aa0ba902c4"
+	kHStChild1 = "00f067aa0ba902c2"
+	kHStChild2 = "00f067aa0ba902c3"
+	kHStOrphan = "00f067aa0ba902c5"
+	kHStAbsent = "00f067aa0ba902c6"
 )
 
-func stSpan(spanID, parent string, start int64) assembly.Span {
-	return assembly.Span{TraceID: stTrace, SpanID: spanID, ParentSpanID: parent, Service: "checkout", StartMs: start, DurationMs: 412}
+func hStSpan(spanID, parent string, start int64) assembly.Span {
+	return assembly.Span{TraceID: kHStTrace, SpanID: spanID, ParentSpanID: parent, Service: "checkout", StartMs: start, DurationMs: 412}
 }
 
-func stApply(ctx *harness.Ctx, span assembly.Span) assembly.Inserted {
+func hStApply(ctx *harness.Ctx, span assembly.Span) assembly.Inserted {
 	result, err := insertSpan(context.Background(), "acme", span)
 	ctx.NoError(err, "insertSpan(%s)", span.SpanID)
 	return result
 }
 
-func stField(ctx *harness.Ctx, name string) string {
-	v, _ := ctx.Redis.HGet(stKey, name)
+func hStField(ctx *harness.Ctx, name string) string {
+	v, _ := ctx.Redis.HGet(kHStKey, name)
 	return v
 }
 
 func CheckAtomic(ctx *harness.Ctx) {
 	// A second root span of the same trace lands while the first is being applied.
-	rival := ctx.Redis.After(stKey, func() any {
-		result, err := insertSpan(context.Background(), "acme", stSpan(stRootB, "", 1712345678902))
+	rival := ctx.Redis.After(kHStKey, func() any {
+		result, err := insertSpan(context.Background(), "acme", hStSpan(kHStRootB, "", 1712345678902))
 		ctx.NoError(err, "the rival insertSpan")
 		return result
 	})
-	stApply(ctx, stSpan(stRootA, "", 1712345678901))
-	ctx.Assert(rival.Fired, "nothing touched %s", stKey)
+	hStApply(ctx, hStSpan(kHStRootA, "", 1712345678901))
+	ctx.Assert(rival.Fired, "nothing touched %s", kHStKey)
 	ctx.Assert(rival.Err == nil, "the rival insert failed: %v", rival.Err)
-	ctx.Equal(stField(ctx, "count"), "2", "two spans were applied; count")
-	root, extra := stField(ctx, "root"), stField(ctx, "extra_roots")
-	ctx.Assert((root == stRootA || root == stRootB) && extra == "1", "two root spans arrived together: root is %q and extra_roots %q. The first to land keeps the root and the second is counted in extra_roots; run the whole insert as one Lua script so nothing lands between the read of root and its write", root, extra)
+	ctx.Equal(hStField(ctx, "count"), "2", "two spans were applied; count")
+	root, extra := hStField(ctx, "root"), hStField(ctx, "extra_roots")
+	ctx.Assert((root == kHStRootA || root == kHStRootB) && extra == "1", "two root spans arrived together: root is %q and extra_roots %q. The first to land keeps the root and the second is counted in extra_roots; run the whole insert as one Lua script so nothing lands between the read of root and its write", root, extra)
 }
 
 func CheckDedupe(ctx *harness.Ctx) {
 	// An exporter retries the span while the first copy is being applied.
-	retry := ctx.Redis.After(stKey, func() any {
-		result, err := insertSpan(context.Background(), "acme", stSpan(stChild1, stParent, 1712345678901))
+	retry := ctx.Redis.After(kHStKey, func() any {
+		result, err := insertSpan(context.Background(), "acme", hStSpan(kHStChild1, kHStParent, 1712345678901))
 		ctx.NoError(err, "the retried insertSpan")
 		return result
 	})
-	first := stApply(ctx, stSpan(stChild1, stParent, 1712345678901))
-	ctx.Assert(retry.Fired, "nothing touched %s", stKey)
+	first := hStApply(ctx, hStSpan(kHStChild1, kHStParent, 1712345678901))
+	ctx.Assert(retry.Fired, "nothing touched %s", kHStKey)
 	ctx.Assert(retry.Err == nil, "the retried insert failed: %v", retry.Err)
 	retried, _ := retry.Result.(assembly.Inserted)
-	ctx.Assert(!retried.Inserted && stField(ctx, "count") == "1", "a retry of the span landed while the first copy was being applied: insertSpan answered %+v and then %+v, count is %q. Exactly one copy may be inserted: claim span:%s inside the script that applies the span", first, retried, stField(ctx, "count"), stChild1)
-	second := stApply(ctx, stSpan(stChild1, stParent, 1712345678901))
+	ctx.Assert(!retried.Inserted && hStField(ctx, "count") == "1", "a retry of the span landed while the first copy was being applied: insertSpan answered %+v and then %+v, count is %q. Exactly one copy may be inserted: claim span:%s inside the script that applies the span", first, retried, hStField(ctx, "count"), kHStChild1)
+	second := hStApply(ctx, hStSpan(kHStChild1, kHStParent, 1712345678901))
 	ctx.Assert(first.Inserted, "the first insert of a span must answer Inserted true, got %+v", first)
 	ctx.Assert(!second.Inserted, "an exporter retried the same span and insertSpan answered %+v: a span already stored must answer Inserted false", second)
-	ctx.Equal(stField(ctx, "count"), "1", "after one span and its retry; count")
-	ctx.Assert(stField(ctx, "refs:"+stParent) == "1" && stField(ctx, "missing") == "1", "the retry moved the gap counters: refs:%s %q, missing %q, expected 1 and 1", stParent, stField(ctx, "refs:"+stParent), stField(ctx, "missing"))
+	ctx.Equal(hStField(ctx, "count"), "1", "after one span and its retry; count")
+	ctx.Assert(hStField(ctx, "refs:"+kHStParent) == "1" && hStField(ctx, "missing") == "1", "the retry moved the gap counters: refs:%s %q, missing %q, expected 1 and 1", kHStParent, hStField(ctx, "refs:"+kHStParent), hStField(ctx, "missing"))
 	ctx.Assert(second.Count == 1 && second.Missing == 1, "the retry must answer the trace's current count and missing (1, 1), got %+v", second)
 }
 
 func CheckLateParent(ctx *harness.Ctx) {
-	stApply(ctx, stSpan(stChild1, stParent, 1712345678901))
-	stApply(ctx, stSpan(stChild2, stParent, 1712345678901))
-	ctx.Assert(stField(ctx, "missing") == "1" && stField(ctx, "refs:"+stParent) == "2", "two children of an absent parent: missing must be 1 and refs:%s 2, got %q and %q", stParent, stField(ctx, "missing"), stField(ctx, "refs:"+stParent))
-	result := stApply(ctx, stSpan(stParent, "", 1712345678800))
-	ctx.Assert(result.Missing == 0 && stField(ctx, "missing") == "0", "the parent the two children waited for arrived, yet missing is %q (insertSpan answered %+v): its arrival must close the gap", stField(ctx, "missing"), result)
-	_, waiting := ctx.Redis.HGet(stKey, "refs:"+stParent)
-	ctx.Assert(!waiting, "refs:%s must be deleted once %s arrived", stParent, stParent)
-	ctx.Equal(stField(ctx, "root"), stParent, "the late root must become the root; root")
-	stApply(ctx, stSpan(stOrphan, stAbsent, 1712345678901))
-	ctx.Equal(stField(ctx, "missing"), "1", "a new child of an absent parent opens a new gap; missing")
-	stApply(ctx, stSpan(stAbsent, stChild1, 1712345678901))
-	_, waiting = ctx.Redis.HGet(stKey, "refs:"+stAbsent)
-	ctx.Assert(stField(ctx, "missing") == "0" && !waiting, "%s, the span %s waited for, arrived as a child of the stored span %s: missing is %q and refs:%s %q, expected 0 and deleted. Any awaited span closes its gap, root or not, and a parent already stored opens none", stAbsent, stOrphan, stChild1, stField(ctx, "missing"), stAbsent, stField(ctx, "refs:"+stAbsent))
+	hStApply(ctx, hStSpan(kHStChild1, kHStParent, 1712345678901))
+	hStApply(ctx, hStSpan(kHStChild2, kHStParent, 1712345678901))
+	ctx.Assert(hStField(ctx, "missing") == "1" && hStField(ctx, "refs:"+kHStParent) == "2", "two children of an absent parent: missing must be 1 and refs:%s 2, got %q and %q", kHStParent, hStField(ctx, "missing"), hStField(ctx, "refs:"+kHStParent))
+	result := hStApply(ctx, hStSpan(kHStParent, "", 1712345678800))
+	ctx.Assert(result.Missing == 0 && hStField(ctx, "missing") == "0", "the parent the two children waited for arrived, yet missing is %q (insertSpan answered %+v): its arrival must close the gap", hStField(ctx, "missing"), result)
+	_, waiting := ctx.Redis.HGet(kHStKey, "refs:"+kHStParent)
+	ctx.Assert(!waiting, "refs:%s must be deleted once %s arrived", kHStParent, kHStParent)
+	ctx.Equal(hStField(ctx, "root"), kHStParent, "the late root must become the root; root")
+	hStApply(ctx, hStSpan(kHStOrphan, kHStAbsent, 1712345678901))
+	ctx.Equal(hStField(ctx, "missing"), "1", "a new child of an absent parent opens a new gap; missing")
+	hStApply(ctx, hStSpan(kHStAbsent, kHStChild1, 1712345678901))
+	_, waiting = ctx.Redis.HGet(kHStKey, "refs:"+kHStAbsent)
+	ctx.Assert(hStField(ctx, "missing") == "0" && !waiting, "%s, the span %s waited for, arrived as a child of the stored span %s: missing is %q and refs:%s %q, expected 0 and deleted. Any awaited span closes its gap, root or not, and a parent already stored opens none", kHStAbsent, kHStOrphan, kHStChild1, hStField(ctx, "missing"), kHStAbsent, hStField(ctx, "refs:"+kHStAbsent))
 }
 
 func CheckTtl(ctx *harness.Ctx) {
 	// The TTL is read right after the first command that touches the hash.
-	seen := ctx.Redis.After(stKey, func() any { return ctx.Redis.TTL(stKey) })
-	stApply(ctx, stSpan(stRootA, "", 1712345678901))
-	ctx.Assert(seen.Fired, "nothing touched %s", stKey)
+	seen := ctx.Redis.After(kHStKey, func() any { return ctx.Redis.TTL(kHStKey) })
+	hStApply(ctx, hStSpan(kHStRootA, "", 1712345678901))
+	ctx.Assert(seen.Fired, "nothing touched %s", kHStKey)
 	first, _ := seen.Result.(int64)
-	ctx.Assert(890 <= first && first <= 900, "right after the first command that touched %s its TTL was %d (-1: no expiry, -2: no key yet), expected 900 s: the one script that writes the span sets the expiry, so the trace never exists without one", stKey, first)
-	ttl := ctx.Redis.TTL(stKey)
-	ctx.Assert(890 <= ttl && ttl <= 900, "%s has TTL %d after its first span, expected 900 s (ASSEMBLY_TTL_S): a trace that stops half way would stay forever", stKey, ttl)
-	ctx.Redis.Do("EXPIRE", stKey, 5)
-	stApply(ctx, stSpan(stChild1, stRootA, 1712345678901))
-	ttl = ctx.Redis.TTL(stKey)
-	ctx.Assert(890 <= ttl && ttl <= 900, "a new span arrived 5 s before %s expired and its TTL is %d: every new span must set it to 900 s again", stKey, ttl)
+	ctx.Assert(890 <= first && first <= 900, "right after the first command that touched %s its TTL was %d (-1: no expiry, -2: no key yet), expected 900 s: the one script that writes the span sets the expiry, so the trace never exists without one", kHStKey, first)
+	ttl := ctx.Redis.TTL(kHStKey)
+	ctx.Assert(890 <= ttl && ttl <= 900, "%s has TTL %d after its first span, expected 900 s (ASSEMBLY_TTL_S): a trace that stops half way would stay forever", kHStKey, ttl)
+	ctx.Redis.Do("EXPIRE", kHStKey, 5)
+	hStApply(ctx, hStSpan(kHStChild1, kHStRootA, 1712345678901))
+	ttl = ctx.Redis.TTL(kHStKey)
+	ctx.Assert(890 <= ttl && ttl <= 900, "a new span arrived 5 s before %s expired and its TTL is %d: every new span must set it to 900 s again", kHStKey, ttl)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -738,23 +738,23 @@ func CheckTtl(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTrace = "4bf92f3577b34da6a3ce929d0e0e4736";
-const std::string kKey = "trace:" + kTrace;
-const std::string kRootA = "00f067aa0ba902b7";
-const std::string kRootB = "00f067aa0ba902c1";
-const std::string kParent = "00f067aa0ba902c4";
-const std::string kChild1 = "00f067aa0ba902c2";
-const std::string kChild2 = "00f067aa0ba902c3";
-const std::string kOrphan = "00f067aa0ba902c5";
-const std::string kAbsent = "00f067aa0ba902c6";
+const std::string kHTrace = "4bf92f3577b34da6a3ce929d0e0e4736";
+const std::string kHKey = "trace:" + kHTrace;
+const std::string kHRootA = "00f067aa0ba902b7";
+const std::string kHRootB = "00f067aa0ba902c1";
+const std::string kHParent = "00f067aa0ba902c4";
+const std::string kHChild1 = "00f067aa0ba902c2";
+const std::string kHChild2 = "00f067aa0ba902c3";
+const std::string kHOrphan = "00f067aa0ba902c5";
+const std::string kHAbsent = "00f067aa0ba902c6";
 
-assembly::Span stSpan(const std::string& span_id, const std::string& parent, long long start = 1712345678901LL) {
-  return assembly::Span{kTrace, span_id, parent, "checkout", start, 412};
+assembly::Span hStSpan(const std::string& span_id, const std::string& parent, long long start = 1712345678901LL) {
+  return assembly::Span{kHTrace, span_id, parent, "checkout", start, 412};
 }
 
-std::string stField(harness::Ctx& ctx, const std::string& name) { return ctx.Redis.HGet(kKey, name).value_or(""); }
+std::string hStField(harness::Ctx& ctx, const std::string& name) { return ctx.Redis.HGet(kHKey, name).value_or(""); }
 
-struct Rival {
+struct HRival {
   bool fired = false;
   bool inserted = false;
   std::optional<std::string> err;
@@ -764,83 +764,83 @@ struct Rival {
 
 void CheckAtomic(harness::Ctx& ctx) {
   // A second root span of the same trace lands while the first is being applied.
-  auto rival = std::make_shared<Rival>();
-  ctx.Redis.After(kKey, [rival] {
+  auto rival = std::make_shared<HRival>();
+  ctx.Redis.After(kHKey, [rival] {
     rival->fired = true;
     try {
-      ::insertSpan("acme", stSpan(kRootB, "", 1712345678902LL));
+      ::insertSpan("acme", hStSpan(kHRootB, "", 1712345678902LL));
     } catch (const std::exception& e) {
       rival->err = e.what();
     }
   });
-  ::insertSpan("acme", stSpan(kRootA, ""));
-  ctx.Assert(rival->fired, "nothing touched %s", kKey);
+  ::insertSpan("acme", hStSpan(kHRootA, ""));
+  ctx.Assert(rival->fired, "nothing touched %s", kHKey);
   ctx.Assert(!rival->err, "the rival insert failed: %s", rival->err.value_or(""));
-  ctx.Equal(stField(ctx, "count"), "2", "two spans were applied; count");
-  const std::string root = stField(ctx, "root");
-  const std::string extra = stField(ctx, "extra_roots");
-  ctx.Assert((root == kRootA || root == kRootB) && extra == "1",
+  ctx.Equal(hStField(ctx, "count"), "2", "two spans were applied; count");
+  const std::string root = hStField(ctx, "root");
+  const std::string extra = hStField(ctx, "extra_roots");
+  ctx.Assert((root == kHRootA || root == kHRootB) && extra == "1",
              "two root spans arrived together: root is %q and extra_roots %q. The first to land keeps the root and the second is counted in extra_roots; run the whole insert as one Lua script so nothing lands between the read of root and its write",
              root, extra);
 }
 
 void CheckDedupe(harness::Ctx& ctx) {
   // An exporter retries the span while the first copy is being applied.
-  auto retry = std::make_shared<Rival>();
-  ctx.Redis.After(kKey, [retry] {
+  auto retry = std::make_shared<HRival>();
+  ctx.Redis.After(kHKey, [retry] {
     retry->fired = true;
     try {
-      retry->inserted = ::insertSpan("acme", stSpan(kChild1, kParent)).inserted;
+      retry->inserted = ::insertSpan("acme", hStSpan(kHChild1, kHParent)).inserted;
     } catch (const std::exception& e) {
       retry->err = e.what();
     }
   });
-  const auto first = ::insertSpan("acme", stSpan(kChild1, kParent));
-  ctx.Assert(retry->fired, "nothing touched %s", kKey);
+  const auto first = ::insertSpan("acme", hStSpan(kHChild1, kHParent));
+  ctx.Assert(retry->fired, "nothing touched %s", kHKey);
   ctx.Assert(!retry->err, "the retried insert failed: %s", retry->err.value_or(""));
-  ctx.Assert(!retry->inserted && stField(ctx, "count") == "1",
+  ctx.Assert(!retry->inserted && hStField(ctx, "count") == "1",
              "a retry of the span landed while the first copy was being applied: insertSpan answered inserted %v and then %v, count is %q. Exactly one copy may be inserted: claim span:%s inside the script that applies the span",
-             first.inserted, retry->inserted, stField(ctx, "count"), kChild1);
-  const auto second = ::insertSpan("acme", stSpan(kChild1, kParent));
+             first.inserted, retry->inserted, hStField(ctx, "count"), kHChild1);
+  const auto second = ::insertSpan("acme", hStSpan(kHChild1, kHParent));
   ctx.Assert(first.inserted, "the first insert of a span must answer inserted true");
   ctx.Assert(!second.inserted, "an exporter retried the same span and insertSpan answered inserted true: a span already stored must answer inserted false");
-  ctx.Equal(stField(ctx, "count"), "1", "after one span and its retry; count");
-  ctx.Assert(stField(ctx, "refs:" + kParent) == "1" && stField(ctx, "missing") == "1", "the retry moved the gap counters: refs:%s %q, missing %q, expected 1 and 1", kParent,
-             stField(ctx, "refs:" + kParent), stField(ctx, "missing"));
+  ctx.Equal(hStField(ctx, "count"), "1", "after one span and its retry; count");
+  ctx.Assert(hStField(ctx, "refs:" + kHParent) == "1" && hStField(ctx, "missing") == "1", "the retry moved the gap counters: refs:%s %q, missing %q, expected 1 and 1", kHParent,
+             hStField(ctx, "refs:" + kHParent), hStField(ctx, "missing"));
   ctx.Assert(second.count == 1 && second.missing == 1, "the retry must answer the trace's current count and missing (1, 1), got %v and %v", second.count, second.missing);
 }
 
 void CheckLateParent(harness::Ctx& ctx) {
-  ::insertSpan("acme", stSpan(kChild1, kParent));
-  ::insertSpan("acme", stSpan(kChild2, kParent));
-  ctx.Assert(stField(ctx, "missing") == "1" && stField(ctx, "refs:" + kParent) == "2", "two children of an absent parent: missing must be 1 and refs:%s 2, got %q and %q", kParent,
-             stField(ctx, "missing"), stField(ctx, "refs:" + kParent));
-  const auto result = ::insertSpan("acme", stSpan(kParent, "", 1712345678800LL));
-  ctx.Assert(result.missing == 0 && stField(ctx, "missing") == "0", "the parent the two children waited for arrived, yet missing is %q (insertSpan answered %v): its arrival must close the gap",
-             stField(ctx, "missing"), result.missing);
-  ctx.Assert(!ctx.Redis.HGet(kKey, "refs:" + kParent), "refs:%s must be deleted once %s arrived", kParent, kParent);
-  ctx.Equal(stField(ctx, "root"), kParent, "the late root must become the root; root");
-  ::insertSpan("acme", stSpan(kOrphan, kAbsent));
-  ctx.Equal(stField(ctx, "missing"), "1", "a new child of an absent parent opens a new gap; missing");
-  ::insertSpan("acme", stSpan(kAbsent, kChild1));
-  ctx.Assert(stField(ctx, "missing") == "0" && !ctx.Redis.HGet(kKey, "refs:" + kAbsent),
+  ::insertSpan("acme", hStSpan(kHChild1, kHParent));
+  ::insertSpan("acme", hStSpan(kHChild2, kHParent));
+  ctx.Assert(hStField(ctx, "missing") == "1" && hStField(ctx, "refs:" + kHParent) == "2", "two children of an absent parent: missing must be 1 and refs:%s 2, got %q and %q", kHParent,
+             hStField(ctx, "missing"), hStField(ctx, "refs:" + kHParent));
+  const auto result = ::insertSpan("acme", hStSpan(kHParent, "", 1712345678800LL));
+  ctx.Assert(result.missing == 0 && hStField(ctx, "missing") == "0", "the parent the two children waited for arrived, yet missing is %q (insertSpan answered %v): its arrival must close the gap",
+             hStField(ctx, "missing"), result.missing);
+  ctx.Assert(!ctx.Redis.HGet(kHKey, "refs:" + kHParent), "refs:%s must be deleted once %s arrived", kHParent, kHParent);
+  ctx.Equal(hStField(ctx, "root"), kHParent, "the late root must become the root; root");
+  ::insertSpan("acme", hStSpan(kHOrphan, kHAbsent));
+  ctx.Equal(hStField(ctx, "missing"), "1", "a new child of an absent parent opens a new gap; missing");
+  ::insertSpan("acme", hStSpan(kHAbsent, kHChild1));
+  ctx.Assert(hStField(ctx, "missing") == "0" && !ctx.Redis.HGet(kHKey, "refs:" + kHAbsent),
              "%s, the span %s waited for, arrived as a child of the stored span %s: missing is %q and refs:%s %q, expected 0 and deleted. Any awaited span closes its gap, root or not, and a parent already stored opens none",
-             kAbsent, kOrphan, kChild1, stField(ctx, "missing"), kAbsent, stField(ctx, "refs:" + kAbsent));
+             kHAbsent, kHOrphan, kHChild1, hStField(ctx, "missing"), kHAbsent, hStField(ctx, "refs:" + kHAbsent));
 }
 
 void CheckTtl(harness::Ctx& ctx) {
   // The TTL is read right after the first command that touches the hash.
   auto seen = std::make_shared<std::optional<long long>>();
-  ctx.Redis.After(kKey, [seen, &ctx] { *seen = ctx.Redis.TTL(kKey); });
-  ::insertSpan("acme", stSpan(kRootA, ""));
-  ctx.Assert(seen->has_value(), "nothing touched %s", kKey);
-  ctx.Assert(890 <= **seen && **seen <= 900, "right after the first command that touched %s its TTL was %v (-1: no expiry, -2: no key yet), expected 900 s: the one script that writes the span sets the expiry, so the trace never exists without one", kKey, **seen);
-  long long ttl = ctx.Redis.TTL(kKey);
-  ctx.Assert(890 <= ttl && ttl <= 900, "%s has TTL %v after its first span, expected 900 s (ASSEMBLY_TTL_S): a trace that stops half way would stay forever", kKey, ttl);
-  ctx.Redis.Do("EXPIRE", kKey, "5");
-  ::insertSpan("acme", stSpan(kChild1, kRootA));
-  ttl = ctx.Redis.TTL(kKey);
-  ctx.Assert(890 <= ttl && ttl <= 900, "a new span arrived 5 s before %s expired and its TTL is %v: every new span must set it to 900 s again", kKey, ttl);
+  ctx.Redis.After(kHKey, [seen, &ctx] { *seen = ctx.Redis.TTL(kHKey); });
+  ::insertSpan("acme", hStSpan(kHRootA, ""));
+  ctx.Assert(seen->has_value(), "nothing touched %s", kHKey);
+  ctx.Assert(890 <= **seen && **seen <= 900, "right after the first command that touched %s its TTL was %v (-1: no expiry, -2: no key yet), expected 900 s: the one script that writes the span sets the expiry, so the trace never exists without one", kHKey, **seen);
+  long long ttl = ctx.Redis.TTL(kHKey);
+  ctx.Assert(890 <= ttl && ttl <= 900, "%s has TTL %v after its first span, expected 900 s (ASSEMBLY_TTL_S): a trace that stops half way would stay forever", kHKey, ttl);
+  ctx.Redis.Do("EXPIRE", kHKey, "5");
+  ::insertSpan("acme", hStSpan(kHChild1, kHRootA));
+  ttl = ctx.Redis.TTL(kHKey);
+  ctx.Assert(890 <= ttl && ttl <= 900, "a new span arrived 5 s before %s expired and its TTL is %v: every new span must set it to 900 s again", kHKey, ttl);
 }
 `,
   },

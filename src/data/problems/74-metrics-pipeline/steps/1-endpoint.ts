@@ -904,22 +904,22 @@ import (
 	"leetbuild/harness"
 )
 
-var apiHost = map[string]string{"host": "a", "region": "eu"}
+var hApiHost = map[string]string{"host": "a", "region": "eu"}
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiSample(ctx *harness.Ctx, metric string, labels map[string]string, ago int64, value float64) model.Sample {
+func hApiSample(ctx *harness.Ctx, metric string, labels map[string]string, ago int64, value float64) model.Sample {
 	if labels == nil {
-		labels = apiHost
+		labels = hApiHost
 	}
 	return model.Sample{Metric: metric, Labels: labels, Timestamp: ctx.Clock.Now()/1000 - ago, Value: value}
 }
 
-func apiPost(c *harness.HTTP, samples []model.Sample, batchID, tenant string) *harness.Response {
+func hApiPost(c *harness.HTTP, samples []model.Sample, batchID, tenant string) *harness.Response {
 	body := map[string]any{"batch_id": batchID, "samples": samples}
 	if tenant == "" {
 		return c.Post("/v1/metrics", body)
@@ -927,44 +927,44 @@ func apiPost(c *harness.HTTP, samples []model.Sample, batchID, tenant string) *h
 	return c.Post("/v1/metrics", body, "X-Tenant-Id", tenant)
 }
 
-func apiKey(s model.Sample) string {
+func hApiKey(s model.Sample) string {
 	return windows.WindowKey("acme", model.SeriesID(s.Metric, s.Labels), model.WindowStart(s.Timestamp))
 }
 
-func apiWritten(ctx *harness.Ctx) []string {
+func hApiWritten(ctx *harness.Ctx) []string {
 	return append(ctx.Redis.Keys("win:*"), ctx.Redis.Keys("batch:*")...)
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	a, b := apiSample(ctx, "http_requests", nil, 5, 2), apiSample(ctx, "http_requests", nil, 5, 3)
-	r := apiPost(c, []model.Sample{a, b}, "b-1", "acme")
+	c := hApiClient(ctx)
+	a, b := hApiSample(ctx, "http_requests", nil, 5, 2), hApiSample(ctx, "http_requests", nil, 5, 3)
+	r := hApiPost(c, []model.Sample{a, b}, "b-1", "acme")
 	ctx.Equal(r.Status, 200, "a valid batch (%s)", r.Text())
 	ctx.Equal(r.JSON(), map[string]any{"accepted": 2, "applied": true}, "a valid batch of 2 samples must answer {accepted: 2, applied: true}")
-	stored := ctx.Redis.HGetAll(apiKey(a))
-	ctx.Assert(stored["count"] == "2" && stored["sum"] == "5", "%s holds %v after the batch, expected count 2 and sum 5", apiKey(a), stored)
-	r = apiPost(c, []model.Sample{a, b}, "b-1", "acme")
+	stored := ctx.Redis.HGetAll(hApiKey(a))
+	ctx.Assert(stored["count"] == "2" && stored["sum"] == "5", "%s holds %v after the batch, expected count 2 and sum 5", hApiKey(a), stored)
+	r = hApiPost(c, []model.Sample{a, b}, "b-1", "acme")
 	ctx.Assert(r.Status == 200 && strings.Contains(r.Text(), \`"applied":false\`), "a redelivery of batch b-1 answered %d %s, expected 200 with applied false: applied reports what MergeBatch did", r.Status, r.Text())
-	count, _ := ctx.Redis.HGet(apiKey(a), "count")
+	count, _ := ctx.Redis.HGet(hApiKey(a), "count")
 	ctx.Equal(count, "2", "the redelivered batch b-1 must not be counted again; the window's count")
-	r = apiPost(c, []model.Sample{a}, "b-2", "")
+	r = hApiPost(c, []model.Sample{a}, "b-2", "")
 	ctx.Equal(r.Status, 401, "a batch without X-Tenant-Id")
 }
 
 func CheckBatchLimit(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	big := []model.Sample{}
 	for i := 0; i < 501; i++ {
-		big = append(big, apiSample(ctx, "http_requests", nil, 5, float64(i)))
+		big = append(big, hApiSample(ctx, "http_requests", nil, 5, float64(i)))
 	}
-	r := apiPost(c, big, "b-1", "acme")
+	r := hApiPost(c, big, "b-1", "acme")
 	ctx.Assert(r.Status == 400 && strings.Contains(r.Text(), "batch_too_large"), "a batch of 501 samples answered %d %s, expected 400 batch_too_large", r.Status, r.Text())
-	ctx.Equal(len(apiWritten(ctx)), 0, "a rejected batch must merge nothing; keys written")
-	r = apiPost(c, big[:500], "b-2", "acme")
+	ctx.Equal(len(hApiWritten(ctx)), 0, "a rejected batch must merge nothing; keys written")
+	r = hApiPost(c, big[:500], "b-2", "acme")
 	ctx.Equal(r.Status, 200, "a batch of exactly 500 samples (%s)", r.Text())
 }
 
-func apiLabelsOf(names ...string) map[string]string {
+func hApiLabelsOf(names ...string) map[string]string {
 	out := map[string]string{}
 	for _, n := range names {
 		out[n] = "x"
@@ -973,45 +973,45 @@ func apiLabelsOf(names ...string) map[string]string {
 }
 
 func CheckLabelBudget(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, []model.Sample{apiSample(ctx, "http_requests", nil, 5, 1), apiSample(ctx, "http_requests", map[string]string{"host": "a", "region": "eu", "user_id": "u-81"}, 5, 1)}, "b-1", "acme")
+	c := hApiClient(ctx)
+	r := hApiPost(c, []model.Sample{hApiSample(ctx, "http_requests", nil, 5, 1), hApiSample(ctx, "http_requests", map[string]string{"host": "a", "region": "eu", "user_id": "u-81"}, 5, 1)}, "b-1", "acme")
 	ctx.Assert(r.Status == 422 && strings.Contains(r.Text(), "user_id"), "a sample labelled user_id answered %d %s, expected 422 naming user_id: every user id would mint a series", r.Status, r.Text())
-	ctx.Equal(apiWritten(ctx), []string{}, "a batch with a label outside the allowlist must write nothing; keys written")
-	r = apiPost(c, []model.Sample{apiSample(ctx, "http_requests", map[string]string{"host": "a", "pod": "p-1"}, 5, 1)}, "b-2", "globex")
+	ctx.Equal(hApiWritten(ctx), []string{}, "a batch with a label outside the allowlist must write nothing; keys written")
+	r = hApiPost(c, []model.Sample{hApiSample(ctx, "http_requests", map[string]string{"host": "a", "pod": "p-1"}, 5, 1)}, "b-2", "globex")
 	ctx.Assert(r.Status == 422 && strings.Contains(r.Text(), "pod"), "globex sent the label pod, which only acme may send, and got %d %s: the allowlist is per tenant", r.Status, r.Text())
-	nine := apiLabelsOf("env", "host", "job", "method", "pod", "region", "route", "service", "status")
-	r = apiPost(c, []model.Sample{apiSample(ctx, "http_requests", nine, 5, 1)}, "b-3", "acme")
+	nine := hApiLabelsOf("env", "host", "job", "method", "pod", "region", "route", "service", "status")
+	r = hApiPost(c, []model.Sample{hApiSample(ctx, "http_requests", nine, 5, 1)}, "b-3", "acme")
 	ctx.Assert(r.Status == 422 && strings.Contains(r.Text(), "too_many_labels"), "a sample with 9 labels answered %d %s, expected 422 too_many_labels", r.Status, r.Text())
-	eight := apiLabelsOf("env", "host", "job", "method", "pod", "region", "route", "service")
-	r = apiPost(c, []model.Sample{apiSample(ctx, "http_requests", eight, 5, 1)}, "b-4", "acme")
+	eight := hApiLabelsOf("env", "host", "job", "method", "pod", "region", "route", "service")
+	r = hApiPost(c, []model.Sample{hApiSample(ctx, "http_requests", eight, 5, 1)}, "b-4", "acme")
 	ctx.Equal(r.Status, 200, "a sample with 8 allowed labels (%s)", r.Text())
 }
 
 func CheckTimestampSkew(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	ctx.Clock.Advance(float64((15000-ctx.Clock.Now()%10000)%10000) / 1000) // now is a whole second ending in 5: no window starts exactly 3600 s ago
 	for _, ago := range []int64{7200, -7200, 3601, -3601} {
-		r := apiPost(c, []model.Sample{apiSample(ctx, "http_requests", nil, 5, 1), apiSample(ctx, "http_requests", nil, ago, 1)}, fmt.Sprintf("b%d", ago), "acme")
+		r := hApiPost(c, []model.Sample{hApiSample(ctx, "http_requests", nil, 5, 1), hApiSample(ctx, "http_requests", nil, ago, 1)}, fmt.Sprintf("b%d", ago), "acme")
 		ctx.Assert(r.Status == 400 && strings.Contains(r.Text(), "timestamp_out_of_skew"), "a sample %d s old (negative: in the future) answered %d %s, expected 400 timestamp_out_of_skew: it would rewrite a window readers already saw", ago, r.Status, r.Text())
 	}
-	ctx.Equal(apiWritten(ctx), []string{}, "a batch with a stale sample must write nothing; keys written")
-	edge := []model.Sample{apiSample(ctx, "http_requests", nil, 3600, 1), apiSample(ctx, "http_requests", nil, -3600, 1)}
-	r := apiPost(c, edge, "b-ok", "acme")
+	ctx.Equal(hApiWritten(ctx), []string{}, "a batch with a stale sample must write nothing; keys written")
+	edge := []model.Sample{hApiSample(ctx, "http_requests", nil, 3600, 1), hApiSample(ctx, "http_requests", nil, -3600, 1)}
+	r := hApiPost(c, edge, "b-ok", "acme")
 	ctx.Equal(r.Status, 200, "samples exactly 3600 s old and 3600 s ahead are within the skew, more than 3600 s away is out (%s)", r.Text())
 	for _, s := range edge {
-		ctx.Equal(ctx.Redis.Exists(apiKey(s)), 1, "the sample at %d (now %d) must be merged into %s", s.Timestamp, ctx.Clock.Now()/1000, apiKey(s))
+		ctx.Equal(ctx.Redis.Exists(hApiKey(s)), 1, "the sample at %d (now %d) must be merged into %s", s.Timestamp, ctx.Clock.Now()/1000, hApiKey(s))
 	}
 }
 
 func CheckValidateBeforeAck(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	good := apiSample(ctx, "http_requests", nil, 5, 1)
-	r := apiPost(c, []model.Sample{good, apiSample(ctx, "http requests", nil, 5, 1)}, "b-1", "acme")
+	c := hApiClient(ctx)
+	good := hApiSample(ctx, "http_requests", nil, 5, 1)
+	r := hApiPost(c, []model.Sample{good, hApiSample(ctx, "http requests", nil, 5, 1)}, "b-1", "acme")
 	ctx.Assert(r.Status == 400 && strings.Contains(r.Text(), "invalid_metric"), "a batch with a malformed metric name answered %d %s, expected 400 invalid_metric: a 200 tells the sender to drop a sample that was never stored", r.Status, r.Text())
-	ctx.Equal(apiWritten(ctx), []string{}, "the rejected batch must write nothing (validate the whole batch before MergeBatch); keys written")
-	r = apiPost(c, []model.Sample{good}, "b-1", "acme")
+	ctx.Equal(hApiWritten(ctx), []string{}, "the rejected batch must write nothing (validate the whole batch before MergeBatch); keys written")
+	r = hApiPost(c, []model.Sample{good}, "b-1", "acme")
 	ctx.Assert(r.Status == 200 && strings.Contains(r.Text(), \`"applied":true\`), "the corrected retry of batch b-1 answered %d %s: the rejected attempt must leave the batch id unclaimed", r.Status, r.Text())
-	count, _ := ctx.Redis.HGet(apiKey(good), "count")
+	count, _ := ctx.Redis.HGet(hApiKey(good), "count")
 	ctx.Equal(count, "1", "after the corrected retry, the window's count")
 }
 `,
@@ -1029,10 +1029,10 @@ func CheckValidateBeforeAck(ctx *harness.Ctx) {
 
 namespace {
 
-using ApiLabels = std::map<std::string, std::string>;
-const ApiLabels kHost = {{"host", "a"}, {"region", "eu"}};
+using HApiLabels = std::map<std::string, std::string>;
+const HApiLabels kHHost = {{"host", "a"}, {"region", "eu"}};
 
-harness::HTTP apiClient(harness::Ctx& ctx) {
+harness::HTTP hApiClient(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1040,12 +1040,12 @@ harness::HTTP apiClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-metrics::Sample apiSample(harness::Ctx& ctx, const std::string& metric = "http_requests", const ApiLabels& labels = kHost, long long ago = 5,
+metrics::Sample hApiSample(harness::Ctx& ctx, const std::string& metric = "http_requests", const HApiLabels& labels = kHHost, long long ago = 5,
                           double value = 1) {
   return metrics::Sample{metric, labels, ctx.Clock.Now() / 1000 - ago, value};
 }
 
-harness::Response apiPost(harness::HTTP& c, const std::vector<metrics::Sample>& samples, const std::string& batch_id = "b-1",
+harness::Response hApiPost(harness::HTTP& c, const std::vector<metrics::Sample>& samples, const std::string& batch_id = "b-1",
                           const std::string& tenant = "acme") {
   nlohmann::json body = {{"batch_id", batch_id}, {"samples", nlohmann::json::array()}};
   for (const auto& s : samples) {
@@ -1055,20 +1055,20 @@ harness::Response apiPost(harness::HTTP& c, const std::vector<metrics::Sample>& 
   return c.Post("/v1/metrics", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
 }
 
-std::string apiKey(const metrics::Sample& s) {
+std::string hApiKey(const metrics::Sample& s) {
   return metrics::windowKey("acme", metrics::seriesId(s.metric, s.labels), metrics::windowStart(s.timestamp));
 }
 
-std::vector<std::string> apiWritten(harness::Ctx& ctx) {
+std::vector<std::string> hApiWritten(harness::Ctx& ctx) {
   auto keys = ctx.Redis.Keys("win:*");
   for (const auto& k : ctx.Redis.Keys("batch:*")) keys.push_back(k);
   return keys;
 }
 
-bool apiHas(const harness::Response& r, const std::string& text) { return r.Text().find(text) != std::string::npos; }
+bool hApiHas(const harness::Response& r, const std::string& text) { return r.Text().find(text) != std::string::npos; }
 
-ApiLabels apiLabelsOf(const std::vector<std::string>& names) {
-  ApiLabels out;
+HApiLabels hApiLabelsOf(const std::vector<std::string>& names) {
+  HApiLabels out;
   for (const auto& n : names) out[n] = "x";
   return out;
 }
@@ -1076,75 +1076,75 @@ ApiLabels apiLabelsOf(const std::vector<std::string>& names) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto a = apiSample(ctx, "http_requests", kHost, 5, 2);
-  const auto b = apiSample(ctx, "http_requests", kHost, 5, 3);
-  auto r = apiPost(c, {a, b});
+  auto c = hApiClient(ctx);
+  const auto a = hApiSample(ctx, "http_requests", kHHost, 5, 2);
+  const auto b = hApiSample(ctx, "http_requests", kHHost, 5, 3);
+  auto r = hApiPost(c, {a, b});
   ctx.Equal(r.Status, 200, "a valid batch (%s)", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object() && body.value("accepted", 0) == 2 && body.value("applied", false), "a valid batch of 2 samples must answer {accepted: 2, applied: true}, got %s", r.Text());
-  const auto stored = ctx.Redis.HGetAll(apiKey(a));
+  const auto stored = ctx.Redis.HGetAll(hApiKey(a));
   ctx.Assert(stored.count("count") && stored.at("count") == "2" && stored.count("sum") && std::stod(stored.at("sum")) == 5.0,
-             "%s holds %v after the batch, expected count 2 and sum 5", apiKey(a), stored);
-  r = apiPost(c, {a, b});
+             "%s holds %v after the batch, expected count 2 and sum 5", hApiKey(a), stored);
+  r = hApiPost(c, {a, b});
   const auto again = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(r.Status == 200 && again.is_object() && again.contains("applied") && again["applied"] == false,
              "a redelivery of batch b-1 answered %d %s, expected 200 with applied false: applied reports what mergeBatch did", r.Status, r.Text());
-  ctx.Equal(ctx.Redis.HGet(apiKey(a), "count"), std::optional<std::string>("2"), "the redelivered batch b-1 must not be counted again; the window's count");
-  r = apiPost(c, {a}, "b-2", "");
+  ctx.Equal(ctx.Redis.HGet(hApiKey(a), "count"), std::optional<std::string>("2"), "the redelivered batch b-1 must not be counted again; the window's count");
+  r = hApiPost(c, {a}, "b-2", "");
   ctx.Equal(r.Status, 401, "a batch without X-Tenant-Id");
 }
 
 void CheckBatchLimit(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
+  auto c = hApiClient(ctx);
   std::vector<metrics::Sample> big;
-  for (int i = 0; i < 501; i++) big.push_back(apiSample(ctx, "http_requests", kHost, 5, i));
-  auto r = apiPost(c, big);
-  ctx.Assert(r.Status == 400 && apiHas(r, "batch_too_large"), "a batch of 501 samples answered %d %s, expected 400 batch_too_large", r.Status, r.Text());
-  ctx.Equal(apiWritten(ctx).size(), 0, "a rejected batch must merge nothing; keys written");
+  for (int i = 0; i < 501; i++) big.push_back(hApiSample(ctx, "http_requests", kHHost, 5, i));
+  auto r = hApiPost(c, big);
+  ctx.Assert(r.Status == 400 && hApiHas(r, "batch_too_large"), "a batch of 501 samples answered %d %s, expected 400 batch_too_large", r.Status, r.Text());
+  ctx.Equal(hApiWritten(ctx).size(), 0, "a rejected batch must merge nothing; keys written");
   big.pop_back();
-  r = apiPost(c, big, "b-2");
+  r = hApiPost(c, big, "b-2");
   ctx.Equal(r.Status, 200, "a batch of exactly 500 samples (%s)", r.Text());
 }
 
 void CheckLabelBudget(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  auto r = apiPost(c, {apiSample(ctx), apiSample(ctx, "http_requests", {{"host", "a"}, {"region", "eu"}, {"user_id", "u-81"}})});
-  ctx.Assert(r.Status == 422 && apiHas(r, "user_id"), "a sample labelled user_id answered %d %s, expected 422 naming user_id: every user id would mint a series", r.Status, r.Text());
-  ctx.Equal(apiWritten(ctx).size(), 0, "a batch with a label outside the allowlist must write nothing; keys written");
-  r = apiPost(c, {apiSample(ctx, "http_requests", {{"host", "a"}, {"pod", "p-1"}})}, "b-2", "globex");
-  ctx.Assert(r.Status == 422 && apiHas(r, "pod"), "globex sent the label pod, which only acme may send, and got %d %s: the allowlist is per tenant", r.Status, r.Text());
-  r = apiPost(c, {apiSample(ctx, "http_requests", apiLabelsOf({"env", "host", "job", "method", "pod", "region", "route", "service", "status"}))}, "b-3");
-  ctx.Assert(r.Status == 422 && apiHas(r, "too_many_labels"), "a sample with 9 labels answered %d %s, expected 422 too_many_labels", r.Status, r.Text());
-  r = apiPost(c, {apiSample(ctx, "http_requests", apiLabelsOf({"env", "host", "job", "method", "pod", "region", "route", "service"}))}, "b-4");
+  auto c = hApiClient(ctx);
+  auto r = hApiPost(c, {hApiSample(ctx), hApiSample(ctx, "http_requests", {{"host", "a"}, {"region", "eu"}, {"user_id", "u-81"}})});
+  ctx.Assert(r.Status == 422 && hApiHas(r, "user_id"), "a sample labelled user_id answered %d %s, expected 422 naming user_id: every user id would mint a series", r.Status, r.Text());
+  ctx.Equal(hApiWritten(ctx).size(), 0, "a batch with a label outside the allowlist must write nothing; keys written");
+  r = hApiPost(c, {hApiSample(ctx, "http_requests", {{"host", "a"}, {"pod", "p-1"}})}, "b-2", "globex");
+  ctx.Assert(r.Status == 422 && hApiHas(r, "pod"), "globex sent the label pod, which only acme may send, and got %d %s: the allowlist is per tenant", r.Status, r.Text());
+  r = hApiPost(c, {hApiSample(ctx, "http_requests", hApiLabelsOf({"env", "host", "job", "method", "pod", "region", "route", "service", "status"}))}, "b-3");
+  ctx.Assert(r.Status == 422 && hApiHas(r, "too_many_labels"), "a sample with 9 labels answered %d %s, expected 422 too_many_labels", r.Status, r.Text());
+  r = hApiPost(c, {hApiSample(ctx, "http_requests", hApiLabelsOf({"env", "host", "job", "method", "pod", "region", "route", "service"}))}, "b-4");
   ctx.Equal(r.Status, 200, "a sample with 8 allowed labels (%s)", r.Text());
 }
 
 void CheckTimestampSkew(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
+  auto c = hApiClient(ctx);
   ctx.Clock.Advance(double((15000 - ctx.Clock.Now() % 10000) % 10000) / 1000);  // now is a whole second ending in 5: no window starts exactly 3600 s ago
   for (long long ago : {7200LL, -7200LL, 3601LL, -3601LL}) {
-    const auto r = apiPost(c, {apiSample(ctx), apiSample(ctx, "http_requests", kHost, ago)}, "b" + std::to_string(ago));
-    ctx.Assert(r.Status == 400 && apiHas(r, "timestamp_out_of_skew"), "a sample %d s old (negative: in the future) answered %d %s, expected 400 timestamp_out_of_skew: it would rewrite a window readers already saw", ago, r.Status, r.Text());
+    const auto r = hApiPost(c, {hApiSample(ctx), hApiSample(ctx, "http_requests", kHHost, ago)}, "b" + std::to_string(ago));
+    ctx.Assert(r.Status == 400 && hApiHas(r, "timestamp_out_of_skew"), "a sample %d s old (negative: in the future) answered %d %s, expected 400 timestamp_out_of_skew: it would rewrite a window readers already saw", ago, r.Status, r.Text());
   }
-  ctx.Equal(apiWritten(ctx).size(), 0, "a batch with a stale sample must write nothing; keys written");
-  const std::vector<metrics::Sample> edge = {apiSample(ctx, "http_requests", kHost, 3600), apiSample(ctx, "http_requests", kHost, -3600)};
-  const auto r = apiPost(c, edge, "b-ok");
+  ctx.Equal(hApiWritten(ctx).size(), 0, "a batch with a stale sample must write nothing; keys written");
+  const std::vector<metrics::Sample> edge = {hApiSample(ctx, "http_requests", kHHost, 3600), hApiSample(ctx, "http_requests", kHHost, -3600)};
+  const auto r = hApiPost(c, edge, "b-ok");
   ctx.Equal(r.Status, 200, "samples exactly 3600 s old and 3600 s ahead are within the skew, more than 3600 s away is out (%s)", r.Text());
   for (const auto& s : edge) {
-    ctx.Equal(ctx.Redis.Exists(apiKey(s)), 1, "the sample at %d (now %d) must be merged into %s", s.timestamp, ctx.Clock.Now() / 1000, apiKey(s));
+    ctx.Equal(ctx.Redis.Exists(hApiKey(s)), 1, "the sample at %d (now %d) must be merged into %s", s.timestamp, ctx.Clock.Now() / 1000, hApiKey(s));
   }
 }
 
 void CheckValidateBeforeAck(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto good = apiSample(ctx);
-  auto r = apiPost(c, {good, apiSample(ctx, "http requests")});
-  ctx.Assert(r.Status == 400 && apiHas(r, "invalid_metric"), "a batch with a malformed metric name answered %d %s, expected 400 invalid_metric: a 200 tells the sender to drop a sample that was never stored", r.Status, r.Text());
-  ctx.Equal(apiWritten(ctx).size(), 0, "the rejected batch must write nothing (validate the whole batch before mergeBatch); keys written");
-  r = apiPost(c, {good});
-  ctx.Assert(r.Status == 200 && apiHas(r, "\\"applied\\":true"), "the corrected retry of batch b-1 answered %d %s: the rejected attempt must leave the batch id unclaimed", r.Status, r.Text());
-  ctx.Equal(ctx.Redis.HGet(apiKey(good), "count"), std::optional<std::string>("1"), "after the corrected retry, the window's count");
+  auto c = hApiClient(ctx);
+  const auto good = hApiSample(ctx);
+  auto r = hApiPost(c, {good, hApiSample(ctx, "http requests")});
+  ctx.Assert(r.Status == 400 && hApiHas(r, "invalid_metric"), "a batch with a malformed metric name answered %d %s, expected 400 invalid_metric: a 200 tells the sender to drop a sample that was never stored", r.Status, r.Text());
+  ctx.Equal(hApiWritten(ctx).size(), 0, "the rejected batch must write nothing (validate the whole batch before mergeBatch); keys written");
+  r = hApiPost(c, {good});
+  ctx.Assert(r.Status == 200 && hApiHas(r, "\\"applied\\":true"), "the corrected retry of batch b-1 answered %d %s: the rejected attempt must leave the batch id unclaimed", r.Status, r.Text());
+  ctx.Equal(ctx.Redis.HGet(hApiKey(good), "count"), std::optional<std::string>("1"), "after the corrected retry, the window's count");
 }
 `,
   },

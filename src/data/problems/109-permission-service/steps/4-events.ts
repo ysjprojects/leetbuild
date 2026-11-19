@@ -872,13 +872,13 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "permission.event"
+const kHEventsTopic = "permission.event"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func eventValues(ctx *harness.Ctx) []map[string]any {
+func hEventValues(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
-	for _, v := range ctx.Kafka.Values(eventsTopic) {
+	for _, v := range ctx.Kafka.Values(kHEventsTopic) {
 		var e map[string]any
 		ctx.NoError(json.Unmarshal([]byte(v), &e), "a permission.event value must be JSON, got %s", v)
 		out = append(out, e)
@@ -886,9 +886,9 @@ func eventValues(ctx *harness.Ctx) []map[string]any {
 	return out
 }
 
-func typesOf(ctx *harness.Ctx, subject string) []string {
+func hTypesOf(ctx *harness.Ctx, subject string) []string {
 	out := []string{}
-	for _, e := range eventValues(ctx) {
+	for _, e := range hEventValues(ctx) {
 		if e["subject"] == subject {
 			out = append(out, fmt.Sprint(e["type"]))
 		}
@@ -902,35 +902,35 @@ func hEventJSON(version int) []byte {
 }
 
 // stalledRelay: bob's row meets a broker that stops answering; relay gives up after the report window, the row pending.
-func stalledRelay(ctx *harness.Ctx) {
-	mustCommit(ctx, "bob", "viewer")
-	ctx.Kafka.Stall(eventsTopic)
+func hStalledRelay(ctx *harness.Ctx) {
+	hMustCommit(ctx, "bob", "viewer")
+	ctx.Kafka.Stall(kHEventsTopic)
 	before := ctx.Clock.Now()
-	relay(eventsBg)
+	relay(hEventsBg)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "relay waited %.1f s for a broker that does not answer, expected the 2 s delivery-report window", waited)
 	held := []string{}
-	for _, row := range grants.Pending(eventsBg) {
+	for _, row := range grants.Pending(hEventsBg) {
 		held = append(held, row.Subject)
 	}
 	ctx.Equal(held, []string{"bob"}, "no delivery report came for bob's row: a row without a report stays pending; the subjects of the pending rows")
 }
 
-func mustCommit(ctx *harness.Ctx, subject, role string) *grants.OutboxRow {
-	row, err := grants.CommitGrant(eventsBg, subject, role, "team:eng", "olu")
+func hMustCommit(ctx *harness.Ctx, subject, role string) *grants.OutboxRow {
+	row, err := grants.CommitGrant(hEventsBg, subject, role, "team:eng", "olu")
 	ctx.NoError(err, "CommitGrant(%s, %s)", subject, role)
 	return row
 }
 
 func CheckSubjectKey(ctx *harness.Ctx) {
-	ada := mustCommit(ctx, "ada", "viewer")
-	mustCommit(ctx, "bob", "viewer")
-	grants.CommitRevoke(eventsBg, ada.GrantID)
-	relay(eventsBg)
+	ada := hMustCommit(ctx, "ada", "viewer")
+	hMustCommit(ctx, "bob", "viewer")
+	grants.CommitRevoke(hEventsBg, ada.GrantID)
+	relay(hEventsBg)
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three committed changes must produce three records on permission.event; the records")
-	keys := ctx.Kafka.Keys(eventsTopic)
+	keys := ctx.Kafka.Keys(kHEventsTopic)
 	sorted := append([]string{}, keys...)
 	sort.Strings(sorted)
 	ctx.Equal(sorted, []string{"ada", "ada", "bob"}, "the records must be keyed by the subjects")
@@ -942,61 +942,61 @@ func CheckSubjectKey(ctx *harness.Ctx) {
 	}
 	ctx.Equal(len(partitions), 1, "ada's grant and revoke must share a partition, or a consumer can apply the revoke first; the partitions")
 	var granted []map[string]any
-	for _, e := range eventValues(ctx) {
+	for _, e := range hEventValues(ctx) {
 		if e["type"] == "granted" && e["subject"] == "ada" {
 			granted = append(granted, e)
 		}
 	}
 	ctx.Equal(granted, []map[string]any{{"type": "granted", "grant_id": "g-1", "subject": "ada", "role": "viewer", "scope": "team:eng", "grant_version": 1}}, "ada's granted event (type, grant_id, subject, role, scope, grant_version)")
-	ctx.Equal(len(grants.Pending(eventsBg)), 0, "every delivered row must be marked sent; the pending rows")
+	ctx.Equal(len(grants.Pending(hEventsBg)), 0, "every delivered row must be marked sent; the pending rows")
 }
 
 func CheckSentAfterAck(ctx *harness.Ctx) {
-	mustCommit(ctx, "ada", "viewer")
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	relay(eventsBg)
+	hMustCommit(ctx, "ada", "viewer")
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	relay(hEventsBg)
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "the broker rejected the record; the records on the topic")
-	ctx.Equal(len(grants.Pending(eventsBg)), 1, "the broker rejected ada's granted event: a row marked sent anyway is lost for good, mark it sent only after its delivery report; the pending rows")
-	relay(eventsBg)
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 0, "the broker rejected the record; the records on the topic")
+	ctx.Equal(len(grants.Pending(hEventsBg)), 1, "the broker rejected ada's granted event: a row marked sent anyway is lost for good, mark it sent only after its delivery report; the pending rows")
+	relay(hEventsBg)
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the next relay must publish the row the broker rejected; the records")
-	ctx.Equal(len(grants.Pending(eventsBg)), 0, "once delivered the row must be marked sent; the pending rows")
-	stalledRelay(ctx)
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "the next relay must publish the row the broker rejected; the records")
+	ctx.Equal(len(grants.Pending(hEventsBg)), 0, "once delivered the row must be marked sent; the pending rows")
+	hStalledRelay(ctx)
 }
 
 func CheckStopAtFailure(ctx *harness.Ctx) {
-	g := mustCommit(ctx, "ada", "team_admin")
-	grants.CommitRevoke(eventsBg, g.GrantID)
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	relay(eventsBg)
+	g := hMustCommit(ctx, "ada", "team_admin")
+	grants.CommitRevoke(hEventsBg, g.GrantID)
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	relay(hEventsBg)
 	ctx.Settle()
-	seen := typesOf(ctx, "ada")
+	seen := hTypesOf(ctx, "ada")
 	ctx.Assert(len(seen) == 0 || seen[0] == "granted", "the broker rejected ada's grant and relay published the revoke behind it (%v): a consumer applies the revoke, then the grant, and ada keeps team_admin. Stop at the first failed row", seen)
-	relay(eventsBg)
+	relay(hEventsBg)
 	ctx.Settle()
-	ctx.Equal(typesOf(ctx, "ada"), []string{"granted", "revoked"}, "after a rejected delivery and a second relay, ada's events in order")
+	ctx.Equal(hTypesOf(ctx, "ada"), []string{"granted", "revoked"}, "after a rejected delivery and a second relay, ada's events in order")
 }
 
 func CheckMonotonicRebuild(ctx *harness.Ctx) {
 	// Records of different subjects come off different partitions in any order.
 	for _, v := range []int{5, 3, 6, 2} {
-		ctx.NoError(applyEvent(eventsBg, hEventJSON(v)), "applyEvent(grant_version %d)", v)
+		ctx.NoError(applyEvent(hEventsBg, hEventJSON(v)), "applyEvent(grant_version %d)", v)
 	}
 	got, _ := ctx.Redis.Get("perm:grant_version")
 	ctx.Equal(got, "6", "after records with grant_version 5, 3, 6, 2 the counter must be 6 (a counter wound back makes cache entries stamped since look current again)")
 	ctx.Redis.Set("perm:grant_version", "9")
-	ctx.NoError(applyEvent(eventsBg, hEventJSON(7)), "applyEvent(grant_version 7)")
+	ctx.NoError(applyEvent(hEventsBg, hEventJSON(7)), "applyEvent(grant_version 7)")
 	got, _ = ctx.Redis.Get("perm:grant_version")
 	ctx.Equal(got, "9", "a record with grant_version 7 must leave a counter of 9 alone: the projector only ever raises it")
-	ctx.NoError(applyEvent(eventsBg, hEventJSON(10)), "applyEvent(grant_version 10)")
+	ctx.NoError(applyEvent(hEventsBg, hEventJSON(10)), "applyEvent(grant_version 10)")
 	got, _ = ctx.Redis.Get("perm:grant_version")
 	ctx.Equal(got, "10", "a record with grant_version 10 must raise a counter of 9: versions compare as numbers; the counter")
 	ctx.Redis.After("perm:grant_version", func() any {
 		ctx.Redis.Set("perm:grant_version", "20")
 		return nil
 	})
-	ctx.NoError(applyEvent(eventsBg, hEventJSON(11)), "applyEvent(grant_version 11)")
+	ctx.NoError(applyEvent(hEventsBg, hEventJSON(11)), "applyEvent(grant_version 11)")
 	got, _ = ctx.Redis.Get("perm:grant_version")
 	ctx.Equal(got, "20", "another projector raised the counter to 20 while this one applied grant_version 11: read and raise it in one atomic step; the counter")
 }
@@ -1014,11 +1014,11 @@ func CheckMonotonicRebuild(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "permission.event";
+const std::string kHEventsTopic = "permission.event";
 
-std::vector<nlohmann::json> eventValues(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventValues(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
-  for (const auto& v : ctx.Kafka.Values(kEventsTopic)) {
+  for (const auto& v : ctx.Kafka.Values(kHEventsTopic)) {
     const auto e = nlohmann::json::parse(v, nullptr, false);
     ctx.Assert(e.is_object(), "a permission.event value must be JSON, got %s", v);
     out.push_back(e);
@@ -1026,9 +1026,9 @@ std::vector<nlohmann::json> eventValues(harness::Ctx& ctx) {
   return out;
 }
 
-std::vector<std::string> typesOf(harness::Ctx& ctx, const std::string& subject) {
+std::vector<std::string> hTypesOf(harness::Ctx& ctx, const std::string& subject) {
   std::vector<std::string> out;
-  for (const auto& e : eventValues(ctx)) {
+  for (const auto& e : hEventValues(ctx)) {
     if (e.value("subject", "") == subject) out.push_back(e.value("type", ""));
   }
   return out;
@@ -1039,9 +1039,9 @@ std::string hEventJson(int version) {
 }
 
 // bob's row meets a broker that stops answering: relay gives up after the report window, the row pending.
-void stalledRelay(harness::Ctx& ctx) {
+void hStalledRelay(harness::Ctx& ctx) {
   grants::commitGrant("bob", "viewer", "team:eng", "olu");
-  ctx.Kafka.Stall(kEventsTopic);
+  ctx.Kafka.Stall(kHEventsTopic);
   const int64_t before = ctx.Clock.Now();
   relay();
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
@@ -1059,9 +1059,9 @@ void CheckSubjectKey(harness::Ctx& ctx) {
   grants::commitRevoke(ada.grant_id);
   relay();
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three committed changes must produce three records on permission.event; the records");
-  const auto keys = ctx.Kafka.Keys(kEventsTopic);
+  const auto keys = ctx.Kafka.Keys(kHEventsTopic);
   std::vector<std::string> sorted(keys.begin(), keys.end());
   std::sort(sorted.begin(), sorted.end());
   ctx.Equal(sorted, {"ada", "ada", "bob"}, "the records must be keyed by the subjects");
@@ -1071,7 +1071,7 @@ void CheckSubjectKey(harness::Ctx& ctx) {
   }
   ctx.Equal(partitions.size(), 1, "ada's grant and revoke must share a partition, or a consumer can apply the revoke first; the partitions");
   std::vector<nlohmann::json> granted;
-  for (const auto& e : eventValues(ctx)) {
+  for (const auto& e : hEventValues(ctx)) {
     if (e.value("type", "") == "granted" && e.value("subject", "") == "ada") granted.push_back(e);
   }
   const nlohmann::json want = {{"type", "granted"}, {"grant_id", "g-1"}, {"subject", "ada"}, {"role", "viewer"}, {"scope", "team:eng"}, {"grant_version", 1}};
@@ -1081,29 +1081,29 @@ void CheckSubjectKey(harness::Ctx& ctx) {
 
 void CheckSentAfterAck(harness::Ctx& ctx) {
   grants::commitGrant("ada", "viewer", "team:eng", "olu");
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   relay();
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "the broker rejected the record; the records on the topic");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 0, "the broker rejected the record; the records on the topic");
   ctx.Equal(grants::pending().size(), 1, "the broker rejected ada's granted event: a row marked sent anyway is lost for good, mark it sent only after its delivery report; the pending rows");
   relay();
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the next relay must publish the row the broker rejected; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "the next relay must publish the row the broker rejected; the records");
   ctx.Equal(grants::pending().size(), 0, "once delivered the row must be marked sent; the pending rows");
-  stalledRelay(ctx);
+  hStalledRelay(ctx);
 }
 
 void CheckStopAtFailure(harness::Ctx& ctx) {
   const grants::OutboxRow g = grants::commitGrant("ada", "team_admin", "team:eng", "olu");
   grants::commitRevoke(g.grant_id);
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   relay();
   ctx.Settle();
-  const auto seen = typesOf(ctx, "ada");
+  const auto seen = hTypesOf(ctx, "ada");
   ctx.Assert(seen.empty() || seen[0] == "granted", "the broker rejected ada's grant and relay published the revoke behind it (%v): a consumer applies the revoke, then the grant, and ada keeps team_admin. Stop at the first failed row", seen);
   relay();
   ctx.Settle();
-  ctx.Equal(typesOf(ctx, "ada"), {"granted", "revoked"}, "after a rejected delivery and a second relay, ada's events in order");
+  ctx.Equal(hTypesOf(ctx, "ada"), {"granted", "revoked"}, "after a rejected delivery and a second relay, ada's events in order");
 }
 
 void CheckMonotonicRebuild(harness::Ctx& ctx) {

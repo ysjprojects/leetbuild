@@ -986,17 +986,17 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
 // encoderPeer encodes whatever span it is asked for; with drainNext set, the next call runs 4 s of
 // the encode and then loses its worker (UNAVAILABLE).
-type encoderPeer struct {
+type HEncoderPeer struct {
 	pb.UnimplementedEncoderServer
 	ctx       *harness.Ctx
 	drainNext *bool
 }
 
-func (p encoderPeer) EncodeSegment(_ context.Context, req *pb.SegmentRequest) (*pb.SegmentResult, error) {
+func (p HEncoderPeer) EncodeSegment(_ context.Context, req *pb.SegmentRequest) (*pb.SegmentResult, error) {
 	if *p.drainNext {
 		*p.drainNext = false
 		p.ctx.Clock.Advance(4)
@@ -1005,30 +1005,30 @@ func (p encoderPeer) EncodeSegment(_ context.Context, req *pb.SegmentRequest) (*
 	return &pb.SegmentResult{Index: req.GetIndex(), OutputKey: fmt.Sprintf("talks/42/%s/seg-%05d.ts", req.GetPreset(), req.GetIndex()), DurationS: req.GetDurationS()}, nil
 }
 
-var encoderDrainNext bool
+var hEncoderDrainNext bool
 
-func encoderClient(ctx *harness.Ctx, duration float64) *jobs.Job {
-	encoderDrainNext = false
-	pb.RegisterEncoderServer(ctx.GRPC.Server(""), encoderPeer{ctx: ctx, drainNext: &encoderDrainNext})
+func hEncoderClient(ctx *harness.Ctx, duration float64) *jobs.Job {
+	hEncoderDrainNext = false
+	pb.RegisterEncoderServer(ctx.GRPC.Server(""), HEncoderPeer{ctx: ctx, drainNext: &hEncoderDrainNext})
 	args, _ := presets.EncoderArgs("h264-720p")
-	return jobs.Create(clientBg, "t-1", "s3://uploads/talk.mov", "9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f", duration, "h264-720p", args, "renditions", "talks/42")
+	return jobs.Create(hClientBg, "t-1", "s3://uploads/talk.mov", "9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f", duration, "h264-720p", args, "renditions", "talks/42")
 }
 
-func encodeCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("EncodeSegment", "") }
+func hEncodeCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("EncodeSegment", "") }
 
-func spanOf(c harness.Call) (float64, float64) {
+func hSpanOf(c harness.Call) (float64, float64) {
 	req := c.Request.(*pb.SegmentRequest)
 	return req.GetStartS(), req.GetDurationS()
 }
 
-func mustEncode(ctx *harness.Ctx, job *jobs.Job, index int, why string) SegmentOutput {
-	out, err := encodeSegment(clientBg, job, index)
+func hMustEncode(ctx *harness.Ctx, job *jobs.Job, index int, why string) SegmentOutput {
+	out, err := encodeSegment(hClientBg, job, index)
 	ctx.NoError(err, "%s: encodeSegment(%d) failed", why, index)
 	return out
 }
 
-func mustFailSegment(ctx *harness.Ctx, job *jobs.Job, index int, why string) *SegmentFailed {
-	out, err := encodeSegment(clientBg, job, index)
+func hMustFailSegment(ctx *harness.Ctx, job *jobs.Job, index int, why string) *SegmentFailed {
+	out, err := encodeSegment(hClientBg, job, index)
 	ctx.Assert(err != nil, "%s: encodeSegment returned %+v instead of a *SegmentFailed", why, out)
 	var failed *SegmentFailed
 	ctx.Assert(errors.As(err, &failed), "%s: encodeSegment returned %v (%T), expected a *SegmentFailed carrying the segment index", why, err, err)
@@ -1036,79 +1036,79 @@ func mustFailSegment(ctx *harness.Ctx, job *jobs.Job, index int, why string) *Se
 }
 
 func CheckSegmentRange(ctx *harness.Ctx) {
-	job := encoderClient(ctx, 14)
+	job := hEncoderClient(ctx, 14)
 	var outs []SegmentOutput
 	for i := 0; i < 3; i++ {
-		outs = append(outs, mustEncode(ctx, job, i, "a healthy encoder"))
+		outs = append(outs, hMustEncode(ctx, job, i, "a healthy encoder"))
 	}
 	var spans [][]float64
-	for _, c := range encodeCalls(ctx) {
-		start, length := spanOf(c)
+	for _, c := range hEncodeCalls(ctx) {
+		start, length := hSpanOf(c)
 		spans = append(spans, []float64{start, length})
 	}
 	ctx.Equal(spans, [][]float64{{0, 6}, {6, 6}, {12, 2}}, "the three segments of a 14-second source must each ask for their own span (start_s, duration_s), not the whole file")
-	first := encodeCalls(ctx)[0].Request.(*pb.SegmentRequest)
+	first := hEncodeCalls(ctx)[0].Request.(*pb.SegmentRequest)
 	ctx.Assert(first.GetJobId() == job.JobID && first.GetPreset() == "h264-720p" && len(first.GetEncoderArgs()) == len(job.EncoderArgs), "the request must carry the job id, preset and encoder arguments, got %v", first)
 	ctx.Assert(outs[2].Index == 2 && outs[2].DurationS == 2, "encodeSegment answered %+v for the tail segment", outs[2])
 }
 
 func CheckScaledDeadline(ctx *harness.Ctx) {
-	job := encoderClient(ctx, 14)
+	job := hEncoderClient(ctx, 14)
 	for i := 0; i < 3; i++ {
-		mustEncode(ctx, job, i, "a healthy encoder")
+		hMustEncode(ctx, job, i, "a healthy encoder")
 	}
-	for _, c := range encodeCalls(ctx) {
-		_, length := spanOf(c)
+	for _, c := range hEncodeCalls(ctx) {
+		_, length := hSpanOf(c)
 		want := 2 + 0.5*length
 		ctx.Assert(c.HasDeadline() && math.Abs(c.Timeout.Seconds()-want) < 0.1, "a call for a %v s span carries a %v deadline, expected deadlineBase + deadlinePerSecond × length = %v s", length, c.Timeout, want)
 	}
 	ctx.GRPC.Fail("EncodeSegment", codes.Unavailable, "worker drained", 1, "")
-	mustEncode(ctx, job, 1, "one UNAVAILABLE then success")
-	calls := encodeCalls(ctx)
+	hMustEncode(ctx, job, 1, "one UNAVAILABLE then success")
+	calls := hEncodeCalls(ctx)
 	retry := calls[len(calls)-1]
-	_, length := spanOf(retry)
+	_, length := hSpanOf(retry)
 	ctx.Assert(math.Abs(retry.Timeout.Seconds()-(2+0.5*length)) < 0.1, "the second attempt carries a %v deadline: every attempt gets the scaled deadline", retry.Timeout)
 	// The first attempt fails late, 4 s into its 5 s: the retry still gets a deadline of its own.
-	encoderDrainNext = true
-	before := len(encodeCalls(ctx))
-	_, err := encodeSegment(clientBg, job, 0)
+	hEncoderDrainNext = true
+	before := len(hEncodeCalls(ctx))
+	_, err := encodeSegment(hClientBg, job, 0)
 	ctx.NoError(err, "segment 0's first attempt lost its worker 4 s into its 5 s deadline and the retry failed: every attempt carries the full scaled deadline, not what is left of the first one")
-	late := encodeCalls(ctx)[before:]
+	late := hEncodeCalls(ctx)[before:]
 	ctx.Assert(len(late) == 2 && math.Abs(late[len(late)-1].Timeout.Seconds()-5) < 0.1, "after a first attempt that failed 4 s in, the retry of a 6 s segment carried a %v deadline over %d calls: every attempt gets the full 5 s", late[len(late)-1].Timeout, len(late))
 }
 
 func CheckBoundedAttempts(ctx *harness.Ctx) {
-	job := encoderClient(ctx, 14)
+	job := hEncoderClient(ctx, 14)
 	ctx.GRPC.Fail("EncodeSegment", codes.Unavailable, "worker drained", 1, "")
-	out := mustEncode(ctx, job, 0, "one UNAVAILABLE then success")
-	ctx.Assert(len(encodeCalls(ctx)) == 2 && out.Index == 0, "one UNAVAILABLE then success took %d calls and answered %+v: a lost worker earns one retry", len(encodeCalls(ctx)), out)
+	out := hMustEncode(ctx, job, 0, "one UNAVAILABLE then success")
+	ctx.Assert(len(hEncodeCalls(ctx)) == 2 && out.Index == 0, "one UNAVAILABLE then success took %d calls and answered %+v: a lost worker earns one retry", len(hEncodeCalls(ctx)), out)
 	ctx.GRPC.Fail("EncodeSegment", codes.Unavailable, "worker drained", 2, "")
-	mustFailSegment(ctx, job, 1, "after two UNAVAILABLE answers for segment 1")
-	ctx.Equal(len(encodeCalls(ctx))-2, 2, "segment 1 may be attempted at most maxAttempts = 2 times; attempts")
+	hMustFailSegment(ctx, job, 1, "after two UNAVAILABLE answers for segment 1")
+	ctx.Equal(len(hEncodeCalls(ctx))-2, 2, "segment 1 may be attempted at most maxAttempts = 2 times; attempts")
 }
 
 func CheckClassify(ctx *harness.Ctx) {
-	job := encoderClient(ctx, 14)
+	job := hEncoderClient(ctx, 14)
 	ctx.GRPC.Fail("EncodeSegment", codes.DeadlineExceeded, "slow worker", 1, "")
-	mustEncode(ctx, job, 0, "one DEADLINE_EXCEEDED then success")
-	ctx.Equal(len(encodeCalls(ctx)), 2, "a DEADLINE_EXCEEDED is retryable, once; calls")
+	hMustEncode(ctx, job, 0, "one DEADLINE_EXCEEDED then success")
+	ctx.Equal(len(hEncodeCalls(ctx)), 2, "a DEADLINE_EXCEEDED is retryable, once; calls")
 	ctx.GRPC.Fail("EncodeSegment", codes.InvalidArgument, "invalid NAL unit at 00:00:07", 1, "")
-	failed := mustFailSegment(ctx, job, 1, "with corrupt bytes in segment 1 (INVALID_ARGUMENT)")
-	ctx.Equal(len(encodeCalls(ctx))-2, 1, "INVALID_ARGUMENT is terminal, the first answer decides; times corrupt input was sent")
+	failed := hMustFailSegment(ctx, job, 1, "with corrupt bytes in segment 1 (INVALID_ARGUMENT)")
+	ctx.Equal(len(hEncodeCalls(ctx))-2, 1, "INVALID_ARGUMENT is terminal, the first answer decides; times corrupt input was sent")
 	ctx.Equal(failed.Code, codes.InvalidArgument, "the failure's code")
 	// Only UNAVAILABLE and DEADLINE_EXCEEDED earn a second attempt: every other status is terminal.
 	for _, code := range []codes.Code{codes.Internal, codes.Unknown, codes.ResourceExhausted, codes.FailedPrecondition, codes.NotFound} {
-		before := len(encodeCalls(ctx))
+		before := len(hEncodeCalls(ctx))
 		ctx.GRPC.Fail("EncodeSegment", code, "encoder refused the segment", 1, "")
-		terminal := mustFailSegment(ctx, job, 2, fmt.Sprintf("with the encoder answering %v for segment 2", code))
-		ctx.Assert(len(encodeCalls(ctx))-before == 1 && terminal.Code == code, "a %v answer took %d calls and failed with %v: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, %v fails on the first answer", code, len(encodeCalls(ctx))-before, terminal.Code, code)
+		terminal := hMustFailSegment(ctx, job, 2, fmt.Sprintf("with the encoder answering %v for segment 2", code))
+		ctx.Assert(len(hEncodeCalls(ctx))-before == 1 && terminal.Code == code, "a %v answer took %d calls and failed with %v: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, %v fails on the first answer", code, len(hEncodeCalls(ctx))-before, terminal.Code, code)
 	}
 }
 
 func CheckFailWithIndex(ctx *harness.Ctx) {
-	job := encoderClient(ctx, 30)
+	job := hEncoderClient(ctx, 30)
 	ctx.GRPC.Fail("EncodeSegment", codes.Unavailable, "worker drained", 5, "")
-	failed := mustFailSegment(ctx, job, 4, "with every worker gone while encoding segment 4")
+	failed := hMustFailSegment(ctx, job, 4, "with every worker gone while encoding segment 4")
 	ctx.Assert(failed.Index == 4 && failed.Code == codes.Unavailable, "the failure says segment %d, %v: it must name segment 4 and UNAVAILABLE", failed.Index, failed.Code)
 }
 `,
@@ -1127,7 +1127,7 @@ namespace {
 
 // Encodes whatever span it is asked for; with drain_next set, the next call runs 4 s of the encode
 // and then loses its worker (UNAVAILABLE).
-class EncoderPeer final : public transcoderd::Encoder::Service {
+class HEncoderPeer final : public transcoderd::Encoder::Service {
  public:
   harness::Ctx* ctx = nullptr;
   bool drain_next = false;
@@ -1147,19 +1147,19 @@ class EncoderPeer final : public transcoderd::Encoder::Service {
   }
 };
 
-EncoderPeer* encoder_peer = nullptr;
+HEncoderPeer* hEncoder_peer = nullptr;
 
-jobs::Job encoderClient(harness::Ctx& ctx, double duration) {
-  delete encoder_peer;
-  encoder_peer = new EncoderPeer;
-  encoder_peer->ctx = &ctx;
-  ctx.GRPC.Server("")->RegisterService(encoder_peer);
+jobs::Job hEncoderClient(harness::Ctx& ctx, double duration) {
+  delete hEncoder_peer;
+  hEncoder_peer = new HEncoderPeer;
+  hEncoder_peer->ctx = &ctx;
+  ctx.GRPC.Server("")->RegisterService(hEncoder_peer);
   return jobs::create("t-1", "s3://uploads/talk.mov", std::string(64, 'f'), duration, "h264-720p", *presets::encoderArgs("h264-720p"), "renditions", "talks/42");
 }
 
-std::vector<harness::Call> encodeCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("EncodeSegment"); }
+std::vector<harness::Call> hEncodeCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("EncodeSegment"); }
 
-SegmentOutput mustEncode(harness::Ctx& ctx, const jobs::Job& job, int index, const std::string& why) {
+SegmentOutput hMustEncode(harness::Ctx& ctx, const jobs::Job& job, int index, const std::string& why) {
   try {
     return encodeSegment(job, index);
   } catch (const std::exception& e) {
@@ -1167,7 +1167,7 @@ SegmentOutput mustEncode(harness::Ctx& ctx, const jobs::Job& job, int index, con
   }
 }
 
-SegmentFailed mustFailSegment(harness::Ctx& ctx, const jobs::Job& job, int index, const std::string& why) {
+SegmentFailed hMustFailSegment(harness::Ctx& ctx, const jobs::Job& job, int index, const std::string& why) {
   try {
     const SegmentOutput out = encodeSegment(job, index);
     ctx.Fatalf("%s: encodeSegment returned segment %d instead of throwing SegmentFailed", why, out.index);
@@ -1181,64 +1181,64 @@ SegmentFailed mustFailSegment(harness::Ctx& ctx, const jobs::Job& job, int index
 }  // namespace
 
 void CheckSegmentRange(harness::Ctx& ctx) {
-  const jobs::Job job = encoderClient(ctx, 14);
+  const jobs::Job job = hEncoderClient(ctx, 14);
   std::vector<SegmentOutput> outs;
-  for (int i = 0; i < 3; i++) outs.push_back(mustEncode(ctx, job, i, "a healthy encoder"));
+  for (int i = 0; i < 3; i++) outs.push_back(hMustEncode(ctx, job, i, "a healthy encoder"));
   std::vector<std::vector<double>> spans;
-  for (const auto& c : encodeCalls(ctx)) {
+  for (const auto& c : hEncodeCalls(ctx)) {
     const auto& req = c.Request<transcoderd::SegmentRequest>();
     spans.push_back({req.start_s(), req.duration_s()});
   }
   ctx.Equal(spans, std::vector<std::vector<double>>{{0, 6}, {6, 6}, {12, 2}}, "the three segments of a 14-second source must each ask for their own span (start_s, duration_s), not the whole file");
-  const auto first = encodeCalls(ctx)[0].Request<transcoderd::SegmentRequest>();
+  const auto first = hEncodeCalls(ctx)[0].Request<transcoderd::SegmentRequest>();
   ctx.Assert(first.job_id() == job.job_id && first.preset() == "h264-720p" && first.encoder_args_size() == static_cast<int>(job.encoder_args.size()), "the request must carry the job id, preset and encoder arguments");
   ctx.Assert(outs[2].index == 2 && outs[2].duration_s == 2, "encodeSegment answered segment %d of %v s for the tail segment", outs[2].index, outs[2].duration_s);
 }
 
 void CheckScaledDeadline(harness::Ctx& ctx) {
-  const jobs::Job job = encoderClient(ctx, 14);
-  for (int i = 0; i < 3; i++) mustEncode(ctx, job, i, "a healthy encoder");
-  for (const auto& c : encodeCalls(ctx)) {
+  const jobs::Job job = hEncoderClient(ctx, 14);
+  for (int i = 0; i < 3; i++) hMustEncode(ctx, job, i, "a healthy encoder");
+  for (const auto& c : hEncodeCalls(ctx)) {
     const double length = c.Request<transcoderd::SegmentRequest>().duration_s();
     const double want = 2 + 0.5 * length;
     ctx.Assert(c.HasDeadline() && std::abs(c.TimeoutSeconds() - want) < 0.1, "a call for a %v s span carries a %v s deadline, expected kDeadlineBaseMs + kDeadlinePerSecondMs × length = %v s", length, c.TimeoutSeconds(), want);
   }
   ctx.GRPC.Fail("EncodeSegment", grpc::StatusCode::UNAVAILABLE, "worker drained", 1);
-  mustEncode(ctx, job, 1, "one UNAVAILABLE then success");
-  const auto calls = encodeCalls(ctx);
+  hMustEncode(ctx, job, 1, "one UNAVAILABLE then success");
+  const auto calls = hEncodeCalls(ctx);
   const auto& retry = calls.back();
   const double length = retry.Request<transcoderd::SegmentRequest>().duration_s();
   ctx.Assert(std::abs(retry.TimeoutSeconds() - (2 + 0.5 * length)) < 0.1, "the second attempt carries a %v s deadline: every attempt gets the scaled deadline", retry.TimeoutSeconds());
   // The first attempt fails late, 4 s into its 5 s: the retry still gets a deadline of its own.
-  encoder_peer->drain_next = true;
-  const size_t before = encodeCalls(ctx).size();
+  hEncoder_peer->drain_next = true;
+  const size_t before = hEncodeCalls(ctx).size();
   try {
     encodeSegment(job, 0);
   } catch (const std::exception& e) {
     ctx.Fatalf("segment 0's first attempt lost its worker 4 s into its 5 s deadline and the retry threw %s: %s: every attempt carries the full scaled deadline, not what is left of the first one", harness::CurrentExceptionType(), e.what());
   }
-  const auto late = encodeCalls(ctx);
+  const auto late = hEncodeCalls(ctx);
   ctx.Assert(late.size() - before == 2 && std::abs(late.back().TimeoutSeconds() - 5) < 0.1, "after a first attempt that failed 4 s in, the retry of a 6 s segment carried a %v s deadline over %d calls: every attempt gets the full 5 s", late.back().TimeoutSeconds(), late.size() - before);
 }
 
 void CheckBoundedAttempts(harness::Ctx& ctx) {
-  const jobs::Job job = encoderClient(ctx, 14);
+  const jobs::Job job = hEncoderClient(ctx, 14);
   ctx.GRPC.Fail("EncodeSegment", grpc::StatusCode::UNAVAILABLE, "worker drained", 1);
-  const SegmentOutput out = mustEncode(ctx, job, 0, "one UNAVAILABLE then success");
-  ctx.Assert(encodeCalls(ctx).size() == 2 && out.index == 0, "one UNAVAILABLE then success took %d calls: a lost worker earns one retry", encodeCalls(ctx).size());
+  const SegmentOutput out = hMustEncode(ctx, job, 0, "one UNAVAILABLE then success");
+  ctx.Assert(hEncodeCalls(ctx).size() == 2 && out.index == 0, "one UNAVAILABLE then success took %d calls: a lost worker earns one retry", hEncodeCalls(ctx).size());
   ctx.GRPC.Fail("EncodeSegment", grpc::StatusCode::UNAVAILABLE, "worker drained", 2);
-  mustFailSegment(ctx, job, 1, "after two UNAVAILABLE answers for segment 1");
-  ctx.Equal(encodeCalls(ctx).size() - 2, size_t{2}, "segment 1 may be attempted at most kMaxAttempts = 2 times; attempts");
+  hMustFailSegment(ctx, job, 1, "after two UNAVAILABLE answers for segment 1");
+  ctx.Equal(hEncodeCalls(ctx).size() - 2, size_t{2}, "segment 1 may be attempted at most kMaxAttempts = 2 times; attempts");
 }
 
 void CheckClassify(harness::Ctx& ctx) {
-  const jobs::Job job = encoderClient(ctx, 14);
+  const jobs::Job job = hEncoderClient(ctx, 14);
   ctx.GRPC.Fail("EncodeSegment", grpc::StatusCode::DEADLINE_EXCEEDED, "slow worker", 1);
-  mustEncode(ctx, job, 0, "one DEADLINE_EXCEEDED then success");
-  ctx.Equal(encodeCalls(ctx).size(), size_t{2}, "a DEADLINE_EXCEEDED is retryable, once; calls");
+  hMustEncode(ctx, job, 0, "one DEADLINE_EXCEEDED then success");
+  ctx.Equal(hEncodeCalls(ctx).size(), size_t{2}, "a DEADLINE_EXCEEDED is retryable, once; calls");
   ctx.GRPC.Fail("EncodeSegment", grpc::StatusCode::INVALID_ARGUMENT, "invalid NAL unit at 00:00:07", 1);
-  const SegmentFailed failed = mustFailSegment(ctx, job, 1, "with corrupt bytes in segment 1 (INVALID_ARGUMENT)");
-  ctx.Equal(encodeCalls(ctx).size() - 2, size_t{1}, "INVALID_ARGUMENT is terminal, the first answer decides; times corrupt input was sent");
+  const SegmentFailed failed = hMustFailSegment(ctx, job, 1, "with corrupt bytes in segment 1 (INVALID_ARGUMENT)");
+  ctx.Equal(hEncodeCalls(ctx).size() - 2, size_t{1}, "INVALID_ARGUMENT is terminal, the first answer decides; times corrupt input was sent");
   ctx.Assert(failed.code == grpc::StatusCode::INVALID_ARGUMENT, "the failure carries code %d, expected INVALID_ARGUMENT", static_cast<int>(failed.code));
   // Only UNAVAILABLE and DEADLINE_EXCEEDED earn a second attempt: every other status is terminal.
   const std::vector<std::pair<grpc::StatusCode, std::string>> terminal_codes = {
@@ -1249,17 +1249,17 @@ void CheckClassify(harness::Ctx& ctx) {
       {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"},
   };
   for (const auto& [code, name] : terminal_codes) {
-    const size_t before = encodeCalls(ctx).size();
+    const size_t before = hEncodeCalls(ctx).size();
     ctx.GRPC.Fail("EncodeSegment", code, "encoder refused the segment", 1);
-    const SegmentFailed terminal = mustFailSegment(ctx, job, 2, "with the encoder answering " + name + " for segment 2");
-    ctx.Assert(encodeCalls(ctx).size() - before == 1 && terminal.code == code, "a %s answer took %d calls and failed with code %d: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, %s fails on the first answer", name, encodeCalls(ctx).size() - before, static_cast<int>(terminal.code), name);
+    const SegmentFailed terminal = hMustFailSegment(ctx, job, 2, "with the encoder answering " + name + " for segment 2");
+    ctx.Assert(hEncodeCalls(ctx).size() - before == 1 && terminal.code == code, "a %s answer took %d calls and failed with code %d: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, %s fails on the first answer", name, hEncodeCalls(ctx).size() - before, static_cast<int>(terminal.code), name);
   }
 }
 
 void CheckFailWithIndex(harness::Ctx& ctx) {
-  const jobs::Job job = encoderClient(ctx, 30);
+  const jobs::Job job = hEncoderClient(ctx, 30);
   ctx.GRPC.Fail("EncodeSegment", grpc::StatusCode::UNAVAILABLE, "worker drained", 5);
-  const SegmentFailed failed = mustFailSegment(ctx, job, 4, "with every worker gone while encoding segment 4");
+  const SegmentFailed failed = hMustFailSegment(ctx, job, 4, "with every worker gone while encoding segment 4");
   ctx.Assert(failed.index == 4 && failed.code == grpc::StatusCode::UNAVAILABLE, "the failure says segment %d, code %d: it must name segment 4 and UNAVAILABLE", failed.index, static_cast<int>(failed.code));
 }
 `,

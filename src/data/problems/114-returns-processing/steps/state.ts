@@ -790,43 +790,43 @@ import (
 )
 
 var (
-	stateBg     = context.Background()
-	stateFields = map[string]string{"tenant": "t-1", "reason_code": "changed_mind", "photo_ref": ""}
+	hStateBg     = context.Background()
+	hStateFields = map[string]string{"tenant": "t-1", "reason_code": "changed_mind", "photo_ref": ""}
 )
 
-func stateUnits(ctx *harness.Ctx, n int) { ctx.Redis.Set("line:L1:returnable", n) }
+func hStateUnits(ctx *harness.Ctx, n int) { ctx.Redis.Set("line:L1:returnable", n) }
 
-func stateLeft(ctx *harness.Ctx) int {
+func hStateLeft(ctx *harness.Ctx) int {
 	v, _ := ctx.Redis.Get("line:L1:returnable")
 	n, _ := strconv.Atoi(v)
 	return n
 }
 
-func stateMustRegister(ctx *harness.Ctx, returnID string, quantity int64) bool {
-	ok, err := registerReturn(stateBg, "L1", returnID, quantity, stateFields)
+func hStateMustRegister(ctx *harness.Ctx, returnID string, quantity int64) bool {
+	ok, err := registerReturn(hStateBg, "L1", returnID, quantity, hStateFields)
 	ctx.NoError(err, "registerReturn(L1, %s, %d) failed", returnID, quantity)
 	return ok
 }
 
-func stateMustCancel(ctx *harness.Ctx, returnID string) int64 {
-	n, err := cancelReturn(stateBg, "L1", returnID)
+func hStateMustCancel(ctx *harness.Ctx, returnID string) int64 {
+	n, err := cancelReturn(hStateBg, "L1", returnID)
 	ctx.NoError(err, "cancelReturn(L1, %s) failed", returnID)
 	return n
 }
 
 func CheckAtomicRegister(ctx *harness.Ctx) {
-	stateUnits(ctx, 1)
+	hStateUnits(ctx, 1)
 	// A second return for the last unit lands right after this one first touches the counter.
 	rival := ctx.Redis.After("line:L1:returnable", func() any {
-		ok, err := registerReturn(stateBg, "L1", "ret-2", 1, stateFields)
+		ok, err := registerReturn(hStateBg, "L1", "ret-2", 1, hStateFields)
 		ctx.NoError(err, "the rival registerReturn failed")
 		return ok
 	})
-	mine := stateMustRegister(ctx, "ret-1", 1)
+	mine := hStateMustRegister(ctx, "ret-1", 1)
 	ctx.Assert(rival.Fired, "nothing touched line:L1:returnable")
 	theirs, _ := rival.Result.(bool)
 	ctx.Assert(mine != theirs, "two returns raced for the last unit and registerReturn answered %v and %v: exactly one may take it", mine, theirs)
-	ctx.Equal(stateLeft(ctx), 0, "line:L1:returnable after the race for its last unit")
+	ctx.Equal(hStateLeft(ctx), 0, "line:L1:returnable after the race for its last unit")
 	var records []string
 	for _, key := range []string{"return:ret-1", "return:ret-2"} {
 		if ctx.Redis.Exists(key) == 1 {
@@ -836,14 +836,14 @@ func CheckAtomicRegister(ctx *harness.Ctx) {
 	ctx.Equal(len(records), 1, "the race must leave one record, the winner's (records %v)", records)
 	record := ctx.Redis.HGetAll(records[0])
 	ctx.Assert(record["order_line_id"] == "L1" && record["quantity"] == "1" && record["state"] == "registered" && record["tenant"] == "t-1" && record["reason_code"] == "changed_mind", "%s holds %v", records[0], record)
-	ctx.Equal(stateMustRegister(ctx, "ret-3", 1), false, "a return of 1 unit on a line with none left must be refused; registered")
-	ctx.Assert(ctx.Redis.Exists("return:ret-3") == 0 && stateLeft(ctx) == 0, "a refused return must write nothing")
+	ctx.Equal(hStateMustRegister(ctx, "ret-3", 1), false, "a return of 1 unit on a line with none left must be refused; registered")
+	ctx.Assert(ctx.Redis.Exists("return:ret-3") == 0 && hStateLeft(ctx) == 0, "a refused return must write nothing")
 	// 2 of 10: compared as numbers, and the counter and the record change in the same execution.
-	stateUnits(ctx, 10)
+	hStateUnits(ctx, 10)
 	recordSeen := ctx.Redis.After("line:L1:returnable", func() any { return ctx.Redis.HGetAll("return:ret-4") })
-	leftSeen := ctx.Redis.After("return:ret-4", func() any { return stateLeft(ctx) })
-	ctx.Equal(stateMustRegister(ctx, "ret-4", 2), true, "a return of 2 units on a line with 10 left; registered")
-	ctx.Equal(stateLeft(ctx), 8, "line:L1:returnable after a return of 2 of 10")
+	leftSeen := ctx.Redis.After("return:ret-4", func() any { return hStateLeft(ctx) })
+	ctx.Equal(hStateMustRegister(ctx, "ret-4", 2), true, "a return of 2 units on a line with 10 left; registered")
+	ctx.Equal(hStateLeft(ctx), 8, "line:L1:returnable after a return of 2 of 10")
 	ctx.Assert(recordSeen.Fired, "nothing touched line:L1:returnable")
 	seen, _ := recordSeen.Result.(map[string]string)
 	ctx.Assert(seen["quantity"] == "2" && seen["state"] == "registered", "right after the counter moved, return:ret-4 held %v: the decrement and its record are written in one script", seen)
@@ -853,42 +853,42 @@ func CheckAtomicRegister(ctx *harness.Ctx) {
 }
 
 func CheckCancelExact(ctx *harness.Ctx) {
-	stateUnits(ctx, 5)
-	ctx.Equal(stateMustRegister(ctx, "ret-1", 3), true, "a return of 3 of 5 units; registered")
-	ctx.Equal(stateMustRegister(ctx, "ret-2", 1), true, "a return of 1 of the 2 units left; registered")
-	restored := stateMustCancel(ctx, "ret-1")
-	ctx.Assert(restored == 3 && stateLeft(ctx) == 4, "canceling the return of 3 units restored %d and left the line at %d, expected 3 restored and 4 left: a cancel gives back exactly what its return took", restored, stateLeft(ctx))
+	hStateUnits(ctx, 5)
+	ctx.Equal(hStateMustRegister(ctx, "ret-1", 3), true, "a return of 3 of 5 units; registered")
+	ctx.Equal(hStateMustRegister(ctx, "ret-2", 1), true, "a return of 1 of the 2 units left; registered")
+	restored := hStateMustCancel(ctx, "ret-1")
+	ctx.Assert(restored == 3 && hStateLeft(ctx) == 4, "canceling the return of 3 units restored %d and left the line at %d, expected 3 restored and 4 left: a cancel gives back exactly what its return took", restored, hStateLeft(ctx))
 	state, _ := ctx.Redis.HGet("return:ret-1", "state")
 	ctx.Equal(state, "canceled", "return:ret-1's state after its cancel")
 	state, _ = ctx.Redis.HGet("return:ret-2", "state")
 	ctx.Equal(state, "registered", "return:ret-2's state (canceling ret-1 must not touch it)")
-	restored = stateMustCancel(ctx, "ret-404")
-	ctx.Assert(restored == 0 && stateLeft(ctx) == 4, "canceling a return that does not exist restored %d units", restored)
+	restored = hStateMustCancel(ctx, "ret-404")
+	ctx.Assert(restored == 0 && hStateLeft(ctx) == 4, "canceling a return that does not exist restored %d units", restored)
 }
 
 func CheckCancelOnce(ctx *harness.Ctx) {
-	stateUnits(ctx, 4)
-	stateMustRegister(ctx, "ret-1", 1)
-	first := stateMustCancel(ctx, "ret-1")
-	again := stateMustCancel(ctx, "ret-1")
-	ctx.Assert(first == 1 && again == 0 && stateLeft(ctx) == 4, "a cancel and its replay restored %d and %d, and the line now has %d returnable units of the 4 ordered: a return is canceled once", first, again, stateLeft(ctx))
-	stateMustRegister(ctx, "ret-2", 1)
+	hStateUnits(ctx, 4)
+	hStateMustRegister(ctx, "ret-1", 1)
+	first := hStateMustCancel(ctx, "ret-1")
+	again := hStateMustCancel(ctx, "ret-1")
+	ctx.Assert(first == 1 && again == 0 && hStateLeft(ctx) == 4, "a cancel and its replay restored %d and %d, and the line now has %d returnable units of the 4 ordered: a return is canceled once", first, again, hStateLeft(ctx))
+	hStateMustRegister(ctx, "ret-2", 1)
 	// Two cancels of the same return land together: the second right after the first touches the record.
 	rival := ctx.Redis.After("return:ret-2", func() any {
-		n, err := cancelReturn(stateBg, "L1", "ret-2")
+		n, err := cancelReturn(hStateBg, "L1", "ret-2")
 		ctx.NoError(err, "the rival cancelReturn failed")
 		return n
 	})
-	mine := stateMustCancel(ctx, "ret-2")
+	mine := hStateMustCancel(ctx, "ret-2")
 	ctx.Assert(rival.Fired, "nothing touched return:ret-2")
 	theirs, _ := rival.Result.(int64)
-	ctx.Assert(mine+theirs == 1 && stateLeft(ctx) == 4, "two concurrent cancels of a return of 1 unit restored %d and %d, leaving %d returnable units of the 4 ordered", mine, theirs, stateLeft(ctx))
+	ctx.Assert(mine+theirs == 1 && hStateLeft(ctx) == 4, "two concurrent cancels of a return of 1 unit restored %d and %d, leaving %d returnable units of the 4 ordered", mine, theirs, hStateLeft(ctx))
 	// A return that has moved past registered (graded and refunded) is no longer cancelable.
-	stateMustRegister(ctx, "ret-3", 1)
+	hStateMustRegister(ctx, "ret-3", 1)
 	ctx.Redis.Do("HSET", "return:ret-3", "state", "refunded")
-	restored := stateMustCancel(ctx, "ret-3")
+	restored := hStateMustCancel(ctx, "ret-3")
 	state, _ := ctx.Redis.HGet("return:ret-3", "state")
-	ctx.Assert(restored == 0 && stateLeft(ctx) == 3 && state == "refunded", "canceling a refunded return restored %d units, left the line at %d of 3 and its state %q: only a registered return is canceled", restored, stateLeft(ctx), state)
+	ctx.Assert(restored == 0 && hStateLeft(ctx) == 3 && state == "refunded", "canceling a refunded return restored %d units, left the line at %d of 3 and its state %q: only a registered return is canceled", restored, hStateLeft(ctx), state)
 }
 `,
     cpp: `#include <leetbuild/harness.h>

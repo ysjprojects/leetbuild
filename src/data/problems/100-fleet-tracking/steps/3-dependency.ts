@@ -916,14 +916,14 @@ import (
 	"fleet/position"
 )
 
-// dispatchPeer is dispatch: the warehouse geofence is north of latitude 48; the first sight of a key raises the alert.
-type dispatchPeer struct {
+// HDispatchPeer is dispatch: the warehouse geofence is north of latitude 48; the first sight of a key raises the alert.
+type HDispatchPeer struct {
 	pb.UnimplementedDispatchServer
 	mu     sync.Mutex
 	alerts []string
 }
 
-func (d *dispatchPeer) CheckGeofence(_ context.Context, req *pb.GeofenceCheckRequest) (*pb.GeofenceCheckResponse, error) {
+func (d *HDispatchPeer) CheckGeofence(_ context.Context, req *pb.GeofenceCheckRequest) (*pb.GeofenceCheckResponse, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	inside := req.GetLat() > 48.0
@@ -938,90 +938,90 @@ func (d *dispatchPeer) CheckGeofence(_ context.Context, req *pb.GeofenceCheckReq
 	return &pb.GeofenceCheckResponse{Alert: alert, Zone: zone}, nil
 }
 
-func startDispatchPeer(ctx *harness.Ctx) *dispatchPeer {
-	peer := &dispatchPeer{}
+func hStartDispatchPeer(ctx *harness.Ctx) *HDispatchPeer {
+	peer := &HDispatchPeer{}
 	pb.RegisterDispatchServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func geofencePos(ts, seq int64, lat float64, vehicleID string) position.Position {
+func hGeofencePos(ts, seq int64, lat float64, vehicleID string) position.Position {
 	return position.Position{VehicleID: vehicleID, DeviceTimestampMs: ts, Sequence: seq, Lat: lat, Lon: -122.3}
 }
 
-func geofenceCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("CheckGeofence", "") }
+func hGeofenceCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("CheckGeofence", "") }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	startDispatchPeer(ctx)
-	ctx.Equal(checkGeofence(context.Background(), "v-1", geofencePos(1000, 42, 47.6, "v-1")), true, "a check dispatch answers must return true; checked")
-	calls := geofenceCalls(ctx)
+	hStartDispatchPeer(ctx)
+	ctx.Equal(checkGeofence(context.Background(), "v-1", hGeofencePos(1000, 42, 47.6, "v-1")), true, "a check dispatch answers must return true; checked")
+	calls := hGeofenceCalls(ctx)
 	call := calls[len(calls)-1]
 	ctx.Assert(call.HasDeadline(), "the CheckGeofence call carries no deadline: a stalled dispatch would hold ingest forever")
 	ctx.Assert(1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "the deadline must be about 2 s, got %v", call.Timeout)
 	ctx.GRPC.SetLatency("CheckGeofence", 5.0, "")
 	before := ctx.Clock.Now()
-	checked := checkGeofence(context.Background(), "v-1", geofencePos(2000, 43, 47.6, "v-1"))
+	checked := checkGeofence(context.Background(), "v-1", hGeofencePos(2000, 43, 47.6, "v-1"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited < 3, "checkGeofence waited %.1f s for a dispatch that answers after 5 s: the 2 s deadline must end the call", waited)
 	ctx.Equal(checked, false, "a dispatch slower than the deadline is a failed check, not an answered one; checked")
-	ctx.Equal(checkGeofence(context.Background(), "v-2", geofencePos(2000, 7, 47.6, "v-2")), false, "a second check against the slow dispatch must fail on its deadline too; checked")
+	ctx.Equal(checkGeofence(context.Background(), "v-2", hGeofencePos(2000, 7, 47.6, "v-2")), false, "a second check against the slow dispatch must fail on its deadline too; checked")
 	// Both timed-out checks are retried against a dispatch that answers in 1.5 s: each attempt has its own 2 s.
 	ctx.GRPC.SetLatency("CheckGeofence", 1.5, "")
-	sent := len(geofenceCalls(ctx))
+	sent := len(hGeofenceCalls(ctx))
 	retryPending(context.Background())
-	retries := geofenceCalls(ctx)[sent:]
+	retries := hGeofenceCalls(ctx)[sent:]
 	ctx.Equal(len(retries), 2, "retryPending's calls for the two timed-out checks")
 	for _, retry := range retries {
 		ctx.Assert(retry.HasDeadline() && 1500*time.Millisecond <= retry.Timeout && retry.Timeout <= 2500*time.Millisecond, "a retry carried a deadline of %v, expected about 2 s: every attempt has its own full deadline, not what is left of a shared one", retry.Timeout)
 	}
 	retryPending(context.Background())
-	ctx.Equal(len(geofenceCalls(ctx)), sent+2, "both retries answered within 1.5 s, so the next retryPending has nothing to send (each retry has its own 2 s deadline); the calls")
+	ctx.Equal(len(hGeofenceCalls(ctx)), sent+2, "both retries answered within 1.5 s, so the next retryPending has nothing to send (each retry has its own 2 s deadline); the calls")
 }
 
 func CheckEnqueueOnFailure(ctx *harness.Ctx) {
-	startDispatchPeer(ctx)
+	hStartDispatchPeer(ctx)
 	ctx.GRPC.Fail("CheckGeofence", codes.DeadlineExceeded, "deadline exceeded", 1, "")
-	ctx.Equal(checkGeofence(context.Background(), "v-1", geofencePos(1000, 42, 47.6, "v-1")), false, "a timed-out check must return false; checked")
-	ctx.Equal(len(geofenceCalls(ctx)), 1, "the first attempt's calls")
+	ctx.Equal(checkGeofence(context.Background(), "v-1", hGeofencePos(1000, 42, 47.6, "v-1")), false, "a timed-out check must return false; checked")
+	ctx.Equal(len(hGeofenceCalls(ctx)), 1, "the first attempt's calls")
 	retryPending(context.Background())
-	ctx.Equal(len(geofenceCalls(ctx)), 2, "after a check timed out, retryPending must make one new call: a timed-out check is queued and retried, not dropped (a warehouse alert would never fire); the calls so far")
-	calls := geofenceCalls(ctx)
+	ctx.Equal(len(hGeofenceCalls(ctx)), 2, "after a check timed out, retryPending must make one new call: a timed-out check is queued and retried, not dropped (a warehouse alert would never fire); the calls so far")
+	calls := hGeofenceCalls(ctx)
 	last, _ := calls[len(calls)-1].Request.(*pb.GeofenceCheckRequest)
 	ctx.Assert(last.GetVehicleId() == "v-1" && last.GetSequence() == 42, "the retry carried vehicle %q sequence %d, expected the queued position v-1 / 42", last.GetVehicleId(), last.GetSequence())
 	retryPending(context.Background())
-	ctx.Equal(len(geofenceCalls(ctx)), 2, "once the retry succeeded the queue is empty: nothing to send again; the calls")
+	ctx.Equal(len(hGeofenceCalls(ctx)), 2, "once the retry succeeded the queue is empty: nothing to send again; the calls")
 	// Any failed call is queued, whatever its code.
 	for _, tc := range []struct {
 		vehicle string
 		code    codes.Code
 	}{{"v-2", codes.Internal}, {"v-3", codes.ResourceExhausted}} {
 		ctx.GRPC.Fail("CheckGeofence", tc.code, "dispatch failed", 1, "")
-		ctx.Equal(checkGeofence(context.Background(), tc.vehicle, geofencePos(1000, 5, 47.6, tc.vehicle)), false, "a check failed with %v must return false; checked", tc.code)
-		sent := len(geofenceCalls(ctx))
+		ctx.Equal(checkGeofence(context.Background(), tc.vehicle, hGeofencePos(1000, 5, 47.6, tc.vehicle)), false, "a check failed with %v must return false; checked", tc.code)
+		sent := len(hGeofenceCalls(ctx))
 		retryPending(context.Background())
-		calls = geofenceCalls(ctx)
+		calls = hGeofenceCalls(ctx)
 		req, _ := calls[len(calls)-1].Request.(*pb.GeofenceCheckRequest)
 		ctx.Assert(len(calls) == sent+1 && req.GetVehicleId() == tc.vehicle, "after a check failed with %v, retryPending made %d calls, expected one for %s: any failed call is queued, not only Unavailable and DeadlineExceeded", tc.code, len(calls)-sent, tc.vehicle)
 	}
 	// A retry that fails again stays owed.
 	ctx.GRPC.Fail("CheckGeofence", codes.Unavailable, "dispatch restarting", 2, "")
-	ctx.Equal(checkGeofence(context.Background(), "v-4", geofencePos(1000, 5, 47.6, "v-4")), false, "a failed check must return false; checked")
-	sent := len(geofenceCalls(ctx))
+	ctx.Equal(checkGeofence(context.Background(), "v-4", hGeofencePos(1000, 5, 47.6, "v-4")), false, "a failed check must return false; checked")
+	sent := len(hGeofenceCalls(ctx))
 	retryPending(context.Background())
 	retryPending(context.Background())
-	calls = geofenceCalls(ctx)
+	calls = hGeofenceCalls(ctx)
 	req, _ := calls[len(calls)-1].Request.(*pb.GeofenceCheckRequest)
 	ctx.Assert(len(calls) == sent+2 && req.GetVehicleId() == "v-4", "a check whose first retry failed too got %d retries over two retryPending calls, expected 2: a failed retry goes back to retryQueue", len(calls)-sent)
 	retryPending(context.Background())
-	ctx.Equal(len(geofenceCalls(ctx)), sent+2, "once the second retry succeeded the queue is empty: nothing to send again; the calls")
+	ctx.Equal(len(hGeofenceCalls(ctx)), sent+2, "once the second retry succeeded the queue is empty: nothing to send again; the calls")
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	peer := startDispatchPeer(ctx)
+	peer := hStartDispatchPeer(ctx)
 	ctx.GRPC.Fail("CheckGeofence", codes.Unavailable, "dispatch restarting", 1, "")
-	checkGeofence(context.Background(), "v-1", geofencePos(1000, 42, 48.5, "v-1"))
+	checkGeofence(context.Background(), "v-1", hGeofencePos(1000, 42, 48.5, "v-1"))
 	retryPending(context.Background())
 	var keys []string
-	for _, c := range geofenceCalls(ctx) {
+	for _, c := range hGeofenceCalls(ctx) {
 		req, _ := c.Request.(*pb.GeofenceCheckRequest)
 		keys = append(keys, req.GetIdempotencyKey())
 	}
@@ -1029,36 +1029,36 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 	ctx.Equal(keys[0], "geofence:v-1:42", "the first attempt's idempotency_key (dispatch dedupes alerts by this key)")
 	ctx.Equal(keys[1], keys[0], "the retry's idempotency_key must repeat the first attempt's: a fresh key makes dispatch treat the retry as a new alert")
 	ctx.GRPC.Fail("CheckGeofence", codes.Unavailable, "dispatch restarting", 1, "")
-	checkGeofence(context.Background(), "v-2", geofencePos(1000, 7, 48.5, "v-2"))
+	checkGeofence(context.Background(), "v-2", hGeofencePos(1000, 7, 48.5, "v-2"))
 	retryPending(context.Background())
-	calls := geofenceCalls(ctx)
+	calls := hGeofenceCalls(ctx)
 	req, _ := calls[len(calls)-1].Request.(*pb.GeofenceCheckRequest)
 	ctx.Equal(req.GetIdempotencyKey(), "geofence:v-2:7", "another vehicle's retry's idempotency_key")
 	ctx.Equal(len(peer.alerts), 2, "dispatch's alerts for two vehicles inside the geofence (one each)")
 }
 
 func CheckNoStaleDispatch(ctx *harness.Ctx) {
-	startDispatchPeer(ctx)
+	hStartDispatchPeer(ctx)
 	ctx.GRPC.Fail("CheckGeofence", codes.Unavailable, "dispatch restarting", 1, "")
-	ctx.Equal(checkGeofence(context.Background(), "v-1", geofencePos(1000, 42, 47.6, "v-1")), false, "a failed check must return false; checked")
-	ctx.Equal(checkGeofence(context.Background(), "v-1", geofencePos(2000, 43, 47.6, "v-1")), true, "the next position must be checked while the older one waits in the queue; checked")
+	ctx.Equal(checkGeofence(context.Background(), "v-1", hGeofencePos(1000, 42, 47.6, "v-1")), false, "a failed check must return false; checked")
+	ctx.Equal(checkGeofence(context.Background(), "v-1", hGeofencePos(2000, 43, 47.6, "v-1")), true, "the next position must be checked while the older one waits in the queue; checked")
 	retryPending(context.Background())
-	ctx.Equal(len(geofenceCalls(ctx)), 2, "retryPending sent the position at ts 1000 after dispatch had answered for ts 2000: a queued position older than the last one dispatch saw is stale, drop it; the calls")
+	ctx.Equal(len(hGeofenceCalls(ctx)), 2, "retryPending sent the position at ts 1000 after dispatch had answered for ts 2000: a queued position older than the last one dispatch saw is stale, drop it; the calls")
 	retryPending(context.Background())
-	ctx.Equal(len(geofenceCalls(ctx)), 2, "the stale position must leave the queue, not stay for the next retry; the calls")
-	ctx.Equal(checkGeofence(context.Background(), "v-1", geofencePos(3000, 44, 47.6, "v-1")), true, "a newer position after the stale one must still be checked; checked")
+	ctx.Equal(len(hGeofenceCalls(ctx)), 2, "the stale position must leave the queue, not stay for the next retry; the calls")
+	ctx.Equal(checkGeofence(context.Background(), "v-1", hGeofencePos(3000, 44, 47.6, "v-1")), true, "a newer position after the stale one must still be checked; checked")
 	// Not newer is stale: an equal timestamp is dropped too.
 	ctx.GRPC.Fail("CheckGeofence", codes.Unavailable, "dispatch restarting", 1, "")
-	ctx.Equal(checkGeofence(context.Background(), "v-1", geofencePos(4000, 45, 47.6, "v-1")), false, "a failed check must return false; checked")
-	ctx.Equal(checkGeofence(context.Background(), "v-1", geofencePos(4000, 46, 47.6, "v-1")), true, "the next position must be checked while the other one waits in the queue; checked")
-	sent := len(geofenceCalls(ctx))
+	ctx.Equal(checkGeofence(context.Background(), "v-1", hGeofencePos(4000, 45, 47.6, "v-1")), false, "a failed check must return false; checked")
+	ctx.Equal(checkGeofence(context.Background(), "v-1", hGeofencePos(4000, 46, 47.6, "v-1")), true, "the next position must be checked while the other one waits in the queue; checked")
+	sent := len(hGeofenceCalls(ctx))
 	retryPending(context.Background())
-	ctx.Equal(len(geofenceCalls(ctx)), sent, "retryPending sent a queued position at ts 4000 after dispatch had answered for ts 4000: a timestamp that is not newer than the last checked one is dropped; the calls")
+	ctx.Equal(len(hGeofenceCalls(ctx)), sent, "retryPending sent a queued position at ts 4000 after dispatch had answered for ts 4000: a timestamp that is not newer than the last checked one is dropped; the calls")
 	// The watermark is per vehicle: another vehicle's older timestamp is still owed.
 	ctx.GRPC.Fail("CheckGeofence", codes.Unavailable, "dispatch restarting", 1, "")
-	ctx.Equal(checkGeofence(context.Background(), "v-2", geofencePos(1500, 3, 47.6, "v-2")), false, "a failed check must return false; checked")
+	ctx.Equal(checkGeofence(context.Background(), "v-2", hGeofencePos(1500, 3, 47.6, "v-2")), false, "a failed check must return false; checked")
 	retryPending(context.Background())
-	calls := geofenceCalls(ctx)
+	calls := hGeofenceCalls(ctx)
 	req, _ := calls[len(calls)-1].Request.(*pb.GeofenceCheckRequest)
 	ctx.Assert(len(calls) == sent+2 && req.GetVehicleId() == "v-2", "retryPending dropped v-2's queued position at ts 1500 because v-1 was checked at ts 4000: the last checked timestamp is per vehicle")
 }
@@ -1074,7 +1074,7 @@ func CheckNoStaleDispatch(ctx *harness.Ctx) {
 namespace {
 
 // Dispatch: the warehouse geofence is north of latitude 48; the first sight of a key raises the alert.
-class DispatchPeer final : public fleet::Dispatch::Service {
+class HDispatchPeer final : public fleet::Dispatch::Service {
  public:
   std::mutex mu;
   std::vector<std::string> alerts;
@@ -1091,23 +1091,23 @@ class DispatchPeer final : public fleet::Dispatch::Service {
   }
 };
 
-DispatchPeer* startDispatchPeer(harness::Ctx& ctx) {
-  static DispatchPeer* peer = nullptr;
+HDispatchPeer* hStartDispatchPeer(harness::Ctx& ctx) {
+  static HDispatchPeer* peer = nullptr;
   delete peer;
-  peer = new DispatchPeer;
+  peer = new HDispatchPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   return peer;
 }
 
-Position geofencePos(long long ts, long long seq, double lat = 47.6, const std::string& vehicle_id = "v-1") {
+Position hGeofencePos(long long ts, long long seq, double lat = 47.6, const std::string& vehicle_id = "v-1") {
   return Position{vehicle_id, ts, seq, lat, -122.3};
 }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  startDispatchPeer(ctx);
-  ctx.Equal(check_geofence("v-1", geofencePos(1000, 42)), true, "a check dispatch answers must return true; checked");
+  hStartDispatchPeer(ctx);
+  ctx.Equal(check_geofence("v-1", hGeofencePos(1000, 42)), true, "a check dispatch answers must return true; checked");
   const auto calls = ctx.GRPC.CallsTo("CheckGeofence");
   const auto& call = calls.back();
   ctx.Assert(call.HasDeadline(), "the CheckGeofence call carries no deadline: a stalled dispatch would hold ingest forever");
@@ -1115,12 +1115,12 @@ void CheckDeadline(harness::Ctx& ctx) {
              call.TimeoutSeconds());
   ctx.GRPC.SetLatency("CheckGeofence", 5.0);
   const int64_t before = ctx.Clock.Now();
-  const bool checked = check_geofence("v-1", geofencePos(2000, 43));
+  const bool checked = check_geofence("v-1", hGeofencePos(2000, 43));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited < 3, "check_geofence waited %.1f s for a dispatch that answers after 5 s: the 2 s deadline must end the call",
              waited);
   ctx.Equal(checked, false, "a dispatch slower than the deadline is a failed check, not an answered one; checked");
-  ctx.Equal(check_geofence("v-2", geofencePos(2000, 7, 47.6, "v-2")), false, "a second check against the slow dispatch must fail on its deadline too; checked");
+  ctx.Equal(check_geofence("v-2", hGeofencePos(2000, 7, 47.6, "v-2")), false, "a second check against the slow dispatch must fail on its deadline too; checked");
   // Both timed-out checks are retried against a dispatch that answers in 1.5 s: each attempt has its own 2 s.
   ctx.GRPC.SetLatency("CheckGeofence", 1.5);
   const size_t sent = ctx.GRPC.CallsTo("CheckGeofence").size();
@@ -1140,9 +1140,9 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckEnqueueOnFailure(harness::Ctx& ctx) {
-  startDispatchPeer(ctx);
+  hStartDispatchPeer(ctx);
   ctx.GRPC.Fail("CheckGeofence", grpc::StatusCode::DEADLINE_EXCEEDED, "deadline exceeded", 1);
-  ctx.Equal(check_geofence("v-1", geofencePos(1000, 42)), false, "a timed-out check must return false; checked");
+  ctx.Equal(check_geofence("v-1", hGeofencePos(1000, 42)), false, "a timed-out check must return false; checked");
   ctx.Equal(ctx.GRPC.CallsTo("CheckGeofence").size(), 1, "the first attempt's calls");
   retry_pending();
   ctx.Equal(ctx.GRPC.CallsTo("CheckGeofence").size(), 2,
@@ -1159,7 +1159,7 @@ void CheckEnqueueOnFailure(harness::Ctx& ctx) {
                                                                           {"v-3", grpc::StatusCode::RESOURCE_EXHAUSTED}};
   for (const auto& [vehicle, code] : terminal) {
     ctx.GRPC.Fail("CheckGeofence", code, "dispatch failed", 1);
-    ctx.Equal(check_geofence(vehicle, geofencePos(1000, 5, 47.6, vehicle)), false, "a check failed with status %d must return false; checked",
+    ctx.Equal(check_geofence(vehicle, hGeofencePos(1000, 5, 47.6, vehicle)), false, "a check failed with status %d must return false; checked",
               static_cast<int>(code));
     const size_t sent = ctx.GRPC.CallsTo("CheckGeofence").size();
     retry_pending();
@@ -1171,7 +1171,7 @@ void CheckEnqueueOnFailure(harness::Ctx& ctx) {
   }
   // A retry that fails again stays owed.
   ctx.GRPC.Fail("CheckGeofence", grpc::StatusCode::UNAVAILABLE, "dispatch restarting", 2);
-  ctx.Equal(check_geofence("v-4", geofencePos(1000, 5, 47.6, "v-4")), false, "a failed check must return false; checked");
+  ctx.Equal(check_geofence("v-4", hGeofencePos(1000, 5, 47.6, "v-4")), false, "a failed check must return false; checked");
   const size_t sent = ctx.GRPC.CallsTo("CheckGeofence").size();
   retry_pending();
   retry_pending();
@@ -1185,9 +1185,9 @@ void CheckEnqueueOnFailure(harness::Ctx& ctx) {
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  auto* peer = startDispatchPeer(ctx);
+  auto* peer = hStartDispatchPeer(ctx);
   ctx.GRPC.Fail("CheckGeofence", grpc::StatusCode::UNAVAILABLE, "dispatch restarting", 1);
-  check_geofence("v-1", geofencePos(1000, 42, 48.5));
+  check_geofence("v-1", hGeofencePos(1000, 42, 48.5));
   retry_pending();
   std::vector<std::string> keys;
   for (const auto& c : ctx.GRPC.CallsTo("CheckGeofence")) keys.push_back(c.Request<fleet::GeofenceCheckRequest>().idempotency_key());
@@ -1196,7 +1196,7 @@ void CheckIdempotencyKey(harness::Ctx& ctx) {
   ctx.Equal(keys[1], keys[0],
             "the retry's idempotency_key must repeat the first attempt's: a fresh key makes dispatch treat the retry as a new alert");
   ctx.GRPC.Fail("CheckGeofence", grpc::StatusCode::UNAVAILABLE, "dispatch restarting", 1);
-  check_geofence("v-2", geofencePos(1000, 7, 48.5, "v-2"));
+  check_geofence("v-2", hGeofencePos(1000, 7, 48.5, "v-2"));
   retry_pending();
   ctx.Equal(ctx.GRPC.CallsTo("CheckGeofence").back().Request<fleet::GeofenceCheckRequest>().idempotency_key(), "geofence:v-2:7",
             "another vehicle's retry's idempotency_key");
@@ -1204,21 +1204,21 @@ void CheckIdempotencyKey(harness::Ctx& ctx) {
 }
 
 void CheckNoStaleDispatch(harness::Ctx& ctx) {
-  startDispatchPeer(ctx);
+  hStartDispatchPeer(ctx);
   ctx.GRPC.Fail("CheckGeofence", grpc::StatusCode::UNAVAILABLE, "dispatch restarting", 1);
-  ctx.Equal(check_geofence("v-1", geofencePos(1000, 42)), false, "a failed check must return false; checked");
-  ctx.Equal(check_geofence("v-1", geofencePos(2000, 43)), true, "the next position must be checked while the older one waits in the queue; checked");
+  ctx.Equal(check_geofence("v-1", hGeofencePos(1000, 42)), false, "a failed check must return false; checked");
+  ctx.Equal(check_geofence("v-1", hGeofencePos(2000, 43)), true, "the next position must be checked while the older one waits in the queue; checked");
   retry_pending();
   ctx.Equal(ctx.GRPC.CallsTo("CheckGeofence").size(), 2,
             "retry_pending sent the position at ts 1000 after dispatch had answered for ts 2000: a queued position older "
             "than the last one dispatch saw is stale, drop it; the calls");
   retry_pending();
   ctx.Equal(ctx.GRPC.CallsTo("CheckGeofence").size(), 2, "the stale position must leave the queue, not stay for the next retry; the calls");
-  ctx.Equal(check_geofence("v-1", geofencePos(3000, 44)), true, "a newer position after the stale one must still be checked; checked");
+  ctx.Equal(check_geofence("v-1", hGeofencePos(3000, 44)), true, "a newer position after the stale one must still be checked; checked");
   // Not newer is stale: an equal timestamp is dropped too.
   ctx.GRPC.Fail("CheckGeofence", grpc::StatusCode::UNAVAILABLE, "dispatch restarting", 1);
-  ctx.Equal(check_geofence("v-1", geofencePos(4000, 45)), false, "a failed check must return false; checked");
-  ctx.Equal(check_geofence("v-1", geofencePos(4000, 46)), true, "the next position must be checked while the other one waits in the queue; checked");
+  ctx.Equal(check_geofence("v-1", hGeofencePos(4000, 45)), false, "a failed check must return false; checked");
+  ctx.Equal(check_geofence("v-1", hGeofencePos(4000, 46)), true, "the next position must be checked while the other one waits in the queue; checked");
   const size_t sent = ctx.GRPC.CallsTo("CheckGeofence").size();
   retry_pending();
   ctx.Equal(ctx.GRPC.CallsTo("CheckGeofence").size(), sent,
@@ -1226,7 +1226,7 @@ void CheckNoStaleDispatch(harness::Ctx& ctx) {
             "not newer than the last checked one is dropped; the calls");
   // The watermark is per vehicle: another vehicle's older timestamp is still owed.
   ctx.GRPC.Fail("CheckGeofence", grpc::StatusCode::UNAVAILABLE, "dispatch restarting", 1);
-  ctx.Equal(check_geofence("v-2", geofencePos(1500, 3, 47.6, "v-2")), false, "a failed check must return false; checked");
+  ctx.Equal(check_geofence("v-2", hGeofencePos(1500, 3, 47.6, "v-2")), false, "a failed check must return false; checked");
   retry_pending();
   const auto calls = ctx.GRPC.CallsTo("CheckGeofence");
   ctx.Assert(calls.size() == sent + 2 && calls.back().Request<fleet::GeofenceCheckRequest>().vehicle_id() == "v-2",

@@ -772,48 +772,48 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
-const clientKey = "approval:r-1:state"
+const kHClientKey = "approval:r-1:state"
 
 // directoryPeer is the HR directory behind the eligibility service: everybody is active and
 // eligible unless listed in people.
-type directoryPeer struct {
+type HDirectoryPeer struct {
 	pb.UnimplementedEligibilityServer
 	people map[string]*pb.EligibilityReply
 }
 
-func (d *directoryPeer) CheckEligibility(_ context.Context, req *pb.EligibilityRequest) (*pb.EligibilityReply, error) {
+func (d *HDirectoryPeer) CheckEligibility(_ context.Context, req *pb.EligibilityRequest) (*pb.EligibilityReply, error) {
 	if reply, ok := d.people[req.GetActor()]; ok {
 		return reply, nil
 	}
 	return &pb.EligibilityReply{Active: true, Eligible: true}, nil
 }
 
-func clientSetup(ctx *harness.Ctx) *directoryPeer {
-	directory := &directoryPeer{people: map[string]*pb.EligibilityReply{}}
+func hClientSetup(ctx *harness.Ctx) *HDirectoryPeer {
+	directory := &HDirectoryPeer{people: map[string]*pb.EligibilityReply{}}
 	pb.RegisterEligibilityServer(ctx.GRPC.Server(""), directory)
-	ctx.NoError(chain.StartChain(clientBg, "r-1", []string{"u-mgr", "u-dir"}), "chain.StartChain(r-1)")
+	ctx.NoError(chain.StartChain(hClientBg, "r-1", []string{"u-mgr", "u-dir"}), "chain.StartChain(r-1)")
 	return directory
 }
 
-func clientDecide(ctx *harness.Ctx, step int, actor string) chain.Outcome {
-	o, err := decide(clientBg, "r-1", step, actor, "approved")
+func hClientDecide(ctx *harness.Ctx, step int, actor string) chain.Outcome {
+	o, err := decide(hClientBg, "r-1", step, actor, "approved")
 	ctx.NoError(err, "decide(r-1, %d, %s)", step, actor)
 	return o
 }
 
-func clientDenied(ctx *harness.Ctx, o chain.Outcome, reason, why string) {
+func hClientDenied(ctx *harness.Ctx, o chain.Outcome, reason, why string) {
 	ctx.Assert(o.Status == "denied" && o.Reason == reason, "%s: decide answered %+v, expected status denied with reason %q", why, o, reason)
 	ctx.Assert(!o.Advanced && o.StepIndex == 0, "%s: a denied decision answered advanced %t step_index %d, expected advanced false on step 0", why, o.Advanced, o.StepIndex)
-	f := ctx.Redis.HGetAll(clientKey)
+	f := ctx.Redis.HGetAll(kHClientKey)
 	_, decided := f["decision:0"]
 	ctx.Assert(f["step_index"] == "0" && !decided, "%s: the denied decision still moved the chain: %v", why, f)
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientSetup(ctx)
-	ok := clientDecide(ctx, 0, "u-mgr")
+	hClientSetup(ctx)
+	ok := hClientDecide(ctx, 0, "u-mgr")
 	ctx.Assert(ok.Advanced, "with the eligibility service healthy the manager's approval answered %+v", ok)
 	calls := ctx.GRPC.CallsTo("CheckEligibility", "")
 	ctx.Assert(len(calls) > 0, "decide made no CheckEligibility call")
@@ -823,11 +823,11 @@ func CheckDeadline(ctx *harness.Ctx) {
 	}
 	ctx.GRPC.SetLatency("CheckEligibility", 30, "")
 	before := ctx.Clock.Now()
-	late := clientDecide(ctx, 1, "u-dir")
+	late := hClientDecide(ctx, 1, "u-dir")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "decide waited %.1f s on a hung eligibility service: each attempt gets 1 s", waited)
 	ctx.Assert(late.Status == "denied" && late.Reason == "eligibility_unverified", "with the eligibility service hung the director's approval answered %+v, expected a denial", late)
-	index, _ := ctx.Redis.HGet(clientKey, "step_index")
+	index, _ := ctx.Redis.HGet(kHClientKey, "step_index")
 	ctx.Equal(index, "1", "a decision eligibility never confirmed must not move the chain; step_index")
 	hung := ctx.GRPC.CallsTo("CheckEligibility", "")[len(calls):]
 	ctx.Equal(len(hung), 2, "on a hung eligibility service decide must make MAX_ATTEMPTS = 2 calls (DEADLINE_EXCEEDED is retried); the CheckEligibility calls")
@@ -837,45 +837,45 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckFailClosed(ctx *harness.Ctx) {
-	clientSetup(ctx)
+	hClientSetup(ctx)
 	ctx.GRPC.Fail("CheckEligibility", codes.Unavailable, "eligibility is down", 2, "")
-	clientDenied(ctx, clientDecide(ctx, 0, "u-mgr"), "eligibility_unverified", "with the eligibility service down")
+	hClientDenied(ctx, hClientDecide(ctx, 0, "u-mgr"), "eligibility_unverified", "with the eligibility service down")
 	ctx.Equal(len(ctx.GRPC.CallsTo("CheckEligibility", "")), 2, "on an outage decide must stop after MAX_ATTEMPTS; the CheckEligibility calls")
 	ctx.GRPC.Fail("CheckEligibility", codes.PermissionDenied, "caller not allowed", 1, "")
-	clientDenied(ctx, clientDecide(ctx, 0, "u-mgr"), "eligibility_unverified", "with CheckEligibility refused (PERMISSION_DENIED)")
+	hClientDenied(ctx, hClientDecide(ctx, 0, "u-mgr"), "eligibility_unverified", "with CheckEligibility refused (PERMISSION_DENIED)")
 	ctx.Equal(len(ctx.GRPC.CallsTo("CheckEligibility", "")), 3, "a PERMISSION_DENIED is not retried; the CheckEligibility calls")
 	for n, code := range []codes.Code{codes.Internal, codes.InvalidArgument, codes.NotFound} {
 		ctx.GRPC.Fail("CheckEligibility", code, "eligibility failed", 1, "")
-		clientDenied(ctx, clientDecide(ctx, 0, "u-mgr"), "eligibility_unverified", "with CheckEligibility failing "+code.String())
+		hClientDenied(ctx, hClientDecide(ctx, 0, "u-mgr"), "eligibility_unverified", "with CheckEligibility failing "+code.String())
 		ctx.Equal(len(ctx.GRPC.CallsTo("CheckEligibility", "")), 4+n, "only DEADLINE_EXCEEDED and UNAVAILABLE are retried; after a %v, the CheckEligibility calls", code)
 	}
 	ctx.GRPC.Fail("CheckEligibility", codes.Unavailable, "eligibility blipped", 1, "")
-	ok := clientDecide(ctx, 0, "u-mgr")
+	ok := hClientDecide(ctx, 0, "u-mgr")
 	ctx.Assert(ok.Advanced, "one UNAVAILABLE and then a yes answered %+v: the second attempt's answer counts", ok)
 }
 
 func CheckDepartedApprover(ctx *harness.Ctx) {
-	directory := clientSetup(ctx)
+	directory := hClientSetup(ctx)
 	directory.people["u-mgr"] = &pb.EligibilityReply{Active: false, Eligible: true}
-	clientDenied(ctx, clientDecide(ctx, 0, "u-mgr"), "approver_departed", "with the manager marked inactive")
+	hClientDenied(ctx, hClientDecide(ctx, 0, "u-mgr"), "approver_departed", "with the manager marked inactive")
 }
 
 func CheckDelegation(ctx *harness.Ctx) {
-	directory := clientSetup(ctx)
+	directory := hClientSetup(ctx)
 	directory.people["u-mgr"] = &pb.EligibilityReply{Active: true, Eligible: true, DelegatedTo: "u-deputy"}
-	clientDenied(ctx, clientDecide(ctx, 0, "u-mgr"), "delegation_mismatch", "with the manager's approvals delegated to u-deputy")
+	hClientDenied(ctx, hClientDecide(ctx, 0, "u-mgr"), "delegation_mismatch", "with the manager's approvals delegated to u-deputy")
 	directory.people["u-mgr"] = &pb.EligibilityReply{Active: true, Eligible: true, DelegatedTo: "u-mgr"}
-	ok := clientDecide(ctx, 0, "u-mgr")
+	ok := hClientDecide(ctx, 0, "u-mgr")
 	ctx.Assert(ok.Advanced, "a delegated_to naming the actor themselves is no hand-off, but decide answered %+v", ok)
 }
 
 func CheckVerifyFirst(ctx *harness.Ctx) {
-	directory := clientSetup(ctx)
+	directory := hClientSetup(ctx)
 	directory.people["u-mgr"] = &pb.EligibilityReply{Active: true, Eligible: false}
-	clientDenied(ctx, clientDecide(ctx, 0, "u-mgr"), "approver_ineligible", "with the manager not eligible for this request")
+	hClientDenied(ctx, hClientDecide(ctx, 0, "u-mgr"), "approver_ineligible", "with the manager not eligible for this request")
 	delete(directory.people, "u-mgr")
-	asked := ctx.Redis.After(clientKey, func() any { return len(ctx.GRPC.CallsTo("CheckEligibility", "")) })
-	ok := clientDecide(ctx, 0, "u-mgr")
+	asked := ctx.Redis.After(kHClientKey, func() any { return len(ctx.GRPC.CallsTo("CheckEligibility", "")) })
+	ok := hClientDecide(ctx, 0, "u-mgr")
 	ctx.Assert(ok.Advanced, "with the manager eligible again the approval answered %+v", ok)
 	ctx.Assert(asked.Fired && asked.Result == 2, "when decide touched the chain, eligibility had answered %v of 2 questions: verify first, then record", asked.Result)
 }
@@ -891,10 +891,10 @@ func CheckVerifyFirst(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kClientKey = "approval:r-1:state";
+const std::string kHClientKey = "approval:r-1:state";
 
 // The HR directory behind the eligibility service: everybody is active and eligible unless listed in people.
-class DirectoryPeer final : public approvalwf::Eligibility::Service {
+class HDirectoryPeer final : public approvalwf::Eligibility::Service {
  public:
   std::map<std::string, approvalwf::EligibilityReply> people;
   grpc::Status CheckEligibility(grpc::ServerContext*, const approvalwf::EligibilityRequest* req, approvalwf::EligibilityReply* out) override {
@@ -909,7 +909,7 @@ class DirectoryPeer final : public approvalwf::Eligibility::Service {
   }
 };
 
-approvalwf::EligibilityReply clientPerson(bool active, bool eligible, const std::string& delegated_to) {
+approvalwf::EligibilityReply hClientPerson(bool active, bool eligible, const std::string& delegated_to) {
   approvalwf::EligibilityReply reply;
   reply.set_active(active);
   reply.set_eligible(eligible);
@@ -917,32 +917,32 @@ approvalwf::EligibilityReply clientPerson(bool active, bool eligible, const std:
   return reply;
 }
 
-DirectoryPeer& clientSetup(harness::Ctx& ctx) {
-  static DirectoryPeer* directory = nullptr;
+HDirectoryPeer& hClientSetup(harness::Ctx& ctx) {
+  static HDirectoryPeer* directory = nullptr;
   delete directory;
-  directory = new DirectoryPeer;
+  directory = new HDirectoryPeer;
   ctx.GRPC.Server("")->RegisterService(directory);
   chain::startChain("r-1", {"u-mgr", "u-dir"});
   return *directory;
 }
 
-std::string clientShow(const chain::Outcome& o) {
+std::string hClientShow(const chain::Outcome& o) {
   return "{advanced " + std::string(o.advanced ? "true" : "false") + ", step_index " + std::to_string(o.step_index) + ", status " + o.status + ", reason " + o.reason + "}";
 }
 
-void clientDenied(harness::Ctx& ctx, const chain::Outcome& o, const std::string& reason, const std::string& why) {
-  ctx.Assert(o.status == "denied" && o.reason == reason, "%s: decide answered %s, expected status denied with reason %q", why, clientShow(o), reason);
-  ctx.Assert(!o.advanced && o.step_index == 0, "%s: a denied decision answered %s, expected advanced false on step 0", why, clientShow(o));
-  auto f = ctx.Redis.HGetAll(kClientKey);
+void hClientDenied(harness::Ctx& ctx, const chain::Outcome& o, const std::string& reason, const std::string& why) {
+  ctx.Assert(o.status == "denied" && o.reason == reason, "%s: decide answered %s, expected status denied with reason %q", why, hClientShow(o), reason);
+  ctx.Assert(!o.advanced && o.step_index == 0, "%s: a denied decision answered %s, expected advanced false on step 0", why, hClientShow(o));
+  auto f = ctx.Redis.HGetAll(kHClientKey);
   ctx.Assert(f["step_index"] == "0" && f.count("decision:0") == 0, "%s: the denied decision still moved the chain: %v", why, f);
 }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  clientSetup(ctx);
+  hClientSetup(ctx);
   const chain::Outcome ok = decide("r-1", 0, "u-mgr", "approved");
-  ctx.Assert(ok.advanced, "with the eligibility service healthy the manager's approval answered %s", clientShow(ok));
+  ctx.Assert(ok.advanced, "with the eligibility service healthy the manager's approval answered %s", hClientShow(ok));
   const auto calls = ctx.GRPC.CallsTo("CheckEligibility");
   ctx.Assert(!calls.empty(), "decide made no CheckEligibility call");
   for (const auto& call : calls) {
@@ -954,8 +954,8 @@ void CheckDeadline(harness::Ctx& ctx) {
   const chain::Outcome late = decide("r-1", 1, "u-dir", "approved");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "decide waited %.1f s on a hung eligibility service: each attempt gets 1 s", waited);
-  ctx.Assert(late.status == "denied" && late.reason == "eligibility_unverified", "with the eligibility service hung the director's approval answered %s, expected a denial", clientShow(late));
-  ctx.Equal(ctx.Redis.HGet(kClientKey, "step_index"), std::optional<std::string>("1"), "a decision eligibility never confirmed must not move the chain; step_index");
+  ctx.Assert(late.status == "denied" && late.reason == "eligibility_unverified", "with the eligibility service hung the director's approval answered %s, expected a denial", hClientShow(late));
+  ctx.Equal(ctx.Redis.HGet(kHClientKey, "step_index"), std::optional<std::string>("1"), "a decision eligibility never confirmed must not move the chain; step_index");
   const auto all = ctx.GRPC.CallsTo("CheckEligibility");
   ctx.Equal(all.size() - calls.size(), size_t{2}, "on a hung eligibility service decide must make MAX_ATTEMPTS = 2 calls (DEADLINE_EXCEEDED is retried); the CheckEligibility calls");
   for (size_t i = calls.size(); i < all.size(); i++) {
@@ -964,48 +964,48 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckFailClosed(harness::Ctx& ctx) {
-  clientSetup(ctx);
+  hClientSetup(ctx);
   ctx.GRPC.Fail("CheckEligibility", grpc::StatusCode::UNAVAILABLE, "eligibility is down", 2);
-  clientDenied(ctx, decide("r-1", 0, "u-mgr", "approved"), "eligibility_unverified", "with the eligibility service down");
+  hClientDenied(ctx, decide("r-1", 0, "u-mgr", "approved"), "eligibility_unverified", "with the eligibility service down");
   ctx.Equal(ctx.GRPC.CallsTo("CheckEligibility").size(), 2, "on an outage decide must stop after MAX_ATTEMPTS; the CheckEligibility calls");
   ctx.GRPC.Fail("CheckEligibility", grpc::StatusCode::PERMISSION_DENIED, "caller not allowed", 1);
-  clientDenied(ctx, decide("r-1", 0, "u-mgr", "approved"), "eligibility_unverified", "with CheckEligibility refused (PERMISSION_DENIED)");
+  hClientDenied(ctx, decide("r-1", 0, "u-mgr", "approved"), "eligibility_unverified", "with CheckEligibility refused (PERMISSION_DENIED)");
   ctx.Equal(ctx.GRPC.CallsTo("CheckEligibility").size(), 3, "a PERMISSION_DENIED is not retried; the CheckEligibility calls");
   const grpc::StatusCode terminal[] = {grpc::StatusCode::INTERNAL, grpc::StatusCode::INVALID_ARGUMENT, grpc::StatusCode::NOT_FOUND};
   for (size_t n = 0; n < 3; n++) {
     ctx.GRPC.Fail("CheckEligibility", terminal[n], "eligibility failed", 1);
-    clientDenied(ctx, decide("r-1", 0, "u-mgr", "approved"), "eligibility_unverified", "with CheckEligibility failing status " + std::to_string(static_cast<int>(terminal[n])));
+    hClientDenied(ctx, decide("r-1", 0, "u-mgr", "approved"), "eligibility_unverified", "with CheckEligibility failing status " + std::to_string(static_cast<int>(terminal[n])));
     ctx.Equal(ctx.GRPC.CallsTo("CheckEligibility").size(), 4 + n, "only DEADLINE_EXCEEDED and UNAVAILABLE are retried; after status %d, the CheckEligibility calls", static_cast<int>(terminal[n]));
   }
   ctx.GRPC.Fail("CheckEligibility", grpc::StatusCode::UNAVAILABLE, "eligibility blipped", 1);
   const chain::Outcome ok = decide("r-1", 0, "u-mgr", "approved");
-  ctx.Assert(ok.advanced, "one UNAVAILABLE and then a yes answered %s: the second attempt's answer counts", clientShow(ok));
+  ctx.Assert(ok.advanced, "one UNAVAILABLE and then a yes answered %s: the second attempt's answer counts", hClientShow(ok));
 }
 
 void CheckDepartedApprover(harness::Ctx& ctx) {
-  DirectoryPeer& directory = clientSetup(ctx);
-  directory.people["u-mgr"] = clientPerson(false, true, "");
-  clientDenied(ctx, decide("r-1", 0, "u-mgr", "approved"), "approver_departed", "with the manager marked inactive");
+  HDirectoryPeer& directory = hClientSetup(ctx);
+  directory.people["u-mgr"] = hClientPerson(false, true, "");
+  hClientDenied(ctx, decide("r-1", 0, "u-mgr", "approved"), "approver_departed", "with the manager marked inactive");
 }
 
 void CheckDelegation(harness::Ctx& ctx) {
-  DirectoryPeer& directory = clientSetup(ctx);
-  directory.people["u-mgr"] = clientPerson(true, true, "u-deputy");
-  clientDenied(ctx, decide("r-1", 0, "u-mgr", "approved"), "delegation_mismatch", "with the manager's approvals delegated to u-deputy");
-  directory.people["u-mgr"] = clientPerson(true, true, "u-mgr");
+  HDirectoryPeer& directory = hClientSetup(ctx);
+  directory.people["u-mgr"] = hClientPerson(true, true, "u-deputy");
+  hClientDenied(ctx, decide("r-1", 0, "u-mgr", "approved"), "delegation_mismatch", "with the manager's approvals delegated to u-deputy");
+  directory.people["u-mgr"] = hClientPerson(true, true, "u-mgr");
   const chain::Outcome ok = decide("r-1", 0, "u-mgr", "approved");
-  ctx.Assert(ok.advanced, "a delegated_to naming the actor themselves is no hand-off, but decide answered %s", clientShow(ok));
+  ctx.Assert(ok.advanced, "a delegated_to naming the actor themselves is no hand-off, but decide answered %s", hClientShow(ok));
 }
 
 void CheckVerifyFirst(harness::Ctx& ctx) {
-  DirectoryPeer& directory = clientSetup(ctx);
-  directory.people["u-mgr"] = clientPerson(true, false, "");
-  clientDenied(ctx, decide("r-1", 0, "u-mgr", "approved"), "approver_ineligible", "with the manager not eligible for this request");
+  HDirectoryPeer& directory = hClientSetup(ctx);
+  directory.people["u-mgr"] = hClientPerson(true, false, "");
+  hClientDenied(ctx, decide("r-1", 0, "u-mgr", "approved"), "approver_ineligible", "with the manager not eligible for this request");
   directory.people.clear();
   auto asked = std::make_shared<long>(-1);
-  ctx.Redis.After(kClientKey, [&ctx, asked] { *asked = static_cast<long>(ctx.GRPC.CallsTo("CheckEligibility").size()); });
+  ctx.Redis.After(kHClientKey, [&ctx, asked] { *asked = static_cast<long>(ctx.GRPC.CallsTo("CheckEligibility").size()); });
   const chain::Outcome ok = decide("r-1", 0, "u-mgr", "approved");
-  ctx.Assert(ok.advanced, "with the manager eligible again the approval answered %s", clientShow(ok));
+  ctx.Assert(ok.advanced, "with the manager eligible again the approval answered %s", hClientShow(ok));
   ctx.Equal(*asked, 2, "verify first, then record: the CheckEligibility calls answered when decide touched the chain");
 }
 `,

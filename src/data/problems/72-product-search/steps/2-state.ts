@@ -596,24 +596,24 @@ import (
 )
 
 var (
-	cacheBg      = context.Background()
-	cacheKettles = []catalog.Product{
+	hCacheBg      = context.Background()
+	hCacheKettles = []catalog.Product{
 		{ID: "p-1", Title: "Steel Kettle", Brand: "acme", Category: "kitchen", PriceCents: 3499, InStock: true, CostCents: 1200},
 		{ID: "p-2", Title: "Glass Kettle", Brand: "brew", Category: "kitchen", PriceCents: 2999, InStock: true, CostCents: 900},
 	}
-	cacheCopper = catalog.Product{ID: "p-9", Title: "Copper Kettle", Brand: "acme", Category: "kitchen", PriceCents: 5999, InStock: true, CostCents: 3000}
-	cacheTravel = catalog.Product{ID: "p-4", Title: "Travel Kettle", Brand: "acme", Category: "kitchen", PriceCents: 1999, InStock: true, CostCents: 700}
+	hCacheCopper = catalog.Product{ID: "p-9", Title: "Copper Kettle", Brand: "acme", Category: "kitchen", PriceCents: 5999, InStock: true, CostCents: 3000}
+	hCacheTravel = catalog.Product{ID: "p-4", Title: "Travel Kettle", Brand: "acme", Category: "kitchen", PriceCents: 1999, InStock: true, CostCents: 700}
 )
 
 func hSeedCache() {
-	for _, p := range cacheKettles {
-		catalog.PutProduct(cacheBg, "t-1", p)
+	for _, p := range hCacheKettles {
+		catalog.PutProduct(hCacheBg, "t-1", p)
 	}
-	catalog.PutProduct(cacheBg, "t-2", cacheCopper)
+	catalog.PutProduct(hCacheBg, "t-2", hCacheCopper)
 }
 
 func hHits(ctx *harness.Ctx, tenant, q string, filters map[string]string, pageSize int) []catalog.Hit {
-	hits, err := cachedSearch(cacheBg, tenant, q, filters, pageSize)
+	hits, err := cachedSearch(hCacheBg, tenant, q, filters, pageSize)
 	ctx.NoError(err, "cachedSearch(%s, %q) failed", tenant, q)
 	return hits
 }
@@ -682,7 +682,7 @@ func CheckIndexVersion(ctx *harness.Ctx) {
 	if len(again) == 2 {
 		ctx.Equal(again[1].Title, "Steel Kettle", "the repeated search must answer from the cache entry the first search stored, not run the engine again; p-1's title")
 	}
-	catalog.PutProduct(cacheBg, "t-1", cacheTravel)
+	catalog.PutProduct(hCacheBg, "t-1", hCacheTravel)
 	ctx.Equal(hPage(ctx, "t-1", "kettle", nil, 10), "p-4,p-2,p-1", "after PutProduct indexed p-4 the next search must miss (the key carries catalog.IndexVersion, read on every call); the page")
 	// Another writer indexes p-5 while this search runs the engine.
 	write := ctx.Redis.After("catalog:t-1:ids", func() any {

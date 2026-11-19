@@ -718,9 +718,9 @@ import (
 	"leetbuild/harness"
 )
 
-var apiBg = context.Background()
+var hApiBg = context.Background()
 
-func apiBody(key string, deflt any, rules []map[string]any, rollout int) map[string]any {
+func hApiBody(key string, deflt any, rules []map[string]any, rollout int) map[string]any {
 	body := map[string]any{"key": key, "rules": rules, "rollout": rollout}
 	if deflt != nil {
 		body["default"] = deflt
@@ -728,82 +728,82 @@ func apiBody(key string, deflt any, rules []map[string]any, rollout int) map[str
 	return body
 }
 
-var usRules = []map[string]any{{"attribute": "country", "operator": "eq", "value": "US"}}
+var hUsRules = []map[string]any{{"attribute": "country", "operator": "eq", "value": "US"}}
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiCreate(c *harness.HTTP, body map[string]any, key string) *harness.Response {
+func hApiCreate(c *harness.HTTP, body map[string]any, key string) *harness.Response {
 	return c.Post("/v1/flags", body, "Idempotency-Key", key)
 }
 
-func apiVersion(r *harness.Response) float64 {
+func hApiVersion(r *harness.Response) float64 {
 	m, _ := r.JSON().(map[string]any)
 	v, _ := m["version"].(float64)
 	return v
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiCreate(c, apiBody("checkout", false, usRules, 25), "k-1")
+	c := hApiClient(ctx)
+	r := hApiCreate(c, hApiBody("checkout", false, hUsRules, 25), "k-1")
 	ctx.Equal(r.Status, 201, "POST /v1/flags (%s)", r.Text())
 	m, _ := r.JSON().(map[string]any)
-	ctx.Assert(m["key"] == "checkout" && apiVersion(r) == 1, "a first create must answer the key and version 1, got %s", r.Text())
-	stored := store.Load(apiBg, "checkout")
+	ctx.Assert(m["key"] == "checkout" && hApiVersion(r) == 1, "a first create must answer the key and version 1, got %s", r.Text())
+	stored := store.Load(hApiBg, "checkout")
 	ctx.Assert(stored != nil && stored.Version == 1, "after the create the store holds %+v", stored)
 	ctx.Assert(len(stored.Rules) == 1 && stored.Rules[0].Attribute == "country" && stored.Rollout == 25 && !stored.Default, "the store holds %+v, expected the posted definition", stored)
 }
 
 func CheckRegistry(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiCreate(c, apiBody("plan-gate", false, []map[string]any{{"attribute": "plan_tier", "operator": "eq", "value": "gold"}}, 25), "k-1")
+	c := hApiClient(ctx)
+	r := hApiCreate(c, hApiBody("plan-gate", false, []map[string]any{{"attribute": "plan_tier", "operator": "eq", "value": "gold"}}, 25), "k-1")
 	ctx.Equal(r.Status, 422, "a rule on plan_tier, an attribute the registry does not know, is stored and never matches anyone (%s); the status", r.Text())
 	ctx.Assert(strings.Contains(r.Text(), "plan_tier"), "the 422 must name the refused attribute, got %s", r.Text())
-	ctx.Assert(store.Load(apiBg, "plan-gate") == nil, "a flag with a refused rule was stored")
-	r = apiCreate(c, apiBody("country-gt", false, []map[string]any{{"attribute": "country", "operator": "gt", "value": "US"}}, 25), "k-2")
+	ctx.Assert(store.Load(hApiBg, "plan-gate") == nil, "a flag with a refused rule was stored")
+	r = hApiCreate(c, hApiBody("country-gt", false, []map[string]any{{"attribute": "country", "operator": "gt", "value": "US"}}, 25), "k-2")
 	ctx.Equal(r.Status, 422, "gt on the string attribute country: the registry has no gt for strings; the status")
-	r = apiCreate(c, apiBody("two-rules", false, []map[string]any{usRules[0], {"attribute": "plan_tier", "operator": "eq", "value": "gold"}}, 25), "k-4")
+	r = hApiCreate(c, hApiBody("two-rules", false, []map[string]any{hUsRules[0], {"attribute": "plan_tier", "operator": "eq", "value": "gold"}}, 25), "k-4")
 	ctx.Assert(r.Status == 422 && strings.Contains(r.Text(), "plan_tier"), "a flag whose second rule targets plan_tier answered %d %s: every rule must pass the registry, expected a 422 naming plan_tier", r.Status, r.Text())
-	ctx.Assert(store.Load(apiBg, "two-rules") == nil, "a flag with a refused second rule was stored")
-	r = apiCreate(c, apiBody("new-app", false, []map[string]any{{"attribute": "app_version", "operator": "gt", "value": 5}}, 25), "k-3")
+	ctx.Assert(store.Load(hApiBg, "two-rules") == nil, "a flag with a refused second rule was stored")
+	r = hApiCreate(c, hApiBody("new-app", false, []map[string]any{{"attribute": "app_version", "operator": "gt", "value": 5}}, 25), "k-3")
 	ctx.Equal(r.Status, 201, "gt on the number attribute app_version is registered (%s); the status", r.Text())
 }
 
 func CheckDefault(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiCreate(c, apiBody("checkout", nil, usRules, 25), "k-1")
+	c := hApiClient(ctx)
+	r := hApiCreate(c, hApiBody("checkout", nil, hUsRules, 25), "k-1")
 	ctx.Equal(r.Status, 422, "a create with no default would serve false to everyone without anyone choosing it (%s); the status", r.Text())
 	ctx.Assert(strings.Contains(r.Text(), "default"), "the 422 must name default, got %s", r.Text())
-	ctx.Assert(store.Load(apiBg, "checkout") == nil, "a flag with no default was stored")
-	nullDefault := apiBody("checkout", nil, usRules, 25)
+	ctx.Assert(store.Load(hApiBg, "checkout") == nil, "a flag with no default was stored")
+	nullDefault := hApiBody("checkout", nil, hUsRules, 25)
 	nullDefault["default"] = nil
-	r = apiCreate(c, nullDefault, "k-3")
+	r = hApiCreate(c, nullDefault, "k-3")
 	ctx.Assert(r.Status == 422 && strings.Contains(r.Text(), "default"), "a create with default null answered %d %s: null is no default either, expected a 422 naming default", r.Status, r.Text())
-	ctx.Assert(store.Load(apiBg, "checkout") == nil, "a flag with a null default was stored")
-	r = apiCreate(c, apiBody("checkout", true, usRules, 25), "k-2")
+	ctx.Assert(store.Load(hApiBg, "checkout") == nil, "a flag with a null default was stored")
+	r = hApiCreate(c, hApiBody("checkout", true, hUsRules, 25), "k-2")
 	ctx.Equal(r.Status, 201, "a create with default true (%s)", r.Text())
-	ctx.Equal(store.Load(apiBg, "checkout").Default, true, "the stored default")
+	ctx.Equal(store.Load(hApiBg, "checkout").Default, true, "the stored default")
 }
 
 func CheckIdempotency(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	first := apiCreate(c, apiBody("checkout", false, usRules, 25), "k-1")
+	c := hApiClient(ctx)
+	first := hApiCreate(c, hApiBody("checkout", false, hUsRules, 25), "k-1")
 	ctx.Equal(first.Status, 201, "the first create (%s)", first.Text())
-	replay := apiCreate(c, apiBody("checkout", false, usRules, 25), "k-1")
-	ctx.Assert(replay.Status == 201 && apiVersion(replay) == apiVersion(first), "a replay of Idempotency-Key k-1 must answer the first result %s, got %d %s", first.Text(), replay.Status, replay.Text())
-	ctx.Equal(store.Load(apiBg, "checkout").Version, int64(1), "a client retry must not fork the flag; the stored version")
-	fresh := apiCreate(c, apiBody("checkout", false, usRules, 50), "k-2")
-	ctx.Assert(fresh.Status == 201 && apiVersion(fresh) == 2, "a create with a new Idempotency-Key must save version 2, got %d %s", fresh.Status, fresh.Text())
-	other := apiCreate(c, apiBody("pricing", false, usRules, 25), "k-1")
+	replay := hApiCreate(c, hApiBody("checkout", false, hUsRules, 25), "k-1")
+	ctx.Assert(replay.Status == 201 && hApiVersion(replay) == hApiVersion(first), "a replay of Idempotency-Key k-1 must answer the first result %s, got %d %s", first.Text(), replay.Status, replay.Text())
+	ctx.Equal(store.Load(hApiBg, "checkout").Version, int64(1), "a client retry must not fork the flag; the stored version")
+	fresh := hApiCreate(c, hApiBody("checkout", false, hUsRules, 50), "k-2")
+	ctx.Assert(fresh.Status == 201 && hApiVersion(fresh) == 2, "a create with a new Idempotency-Key must save version 2, got %d %s", fresh.Status, fresh.Text())
+	other := hApiCreate(c, hApiBody("pricing", false, hUsRules, 25), "k-1")
 	otherBody, _ := other.JSON().(map[string]any)
-	ctx.Assert(other.Status == 201 && otherBody["key"] == "pricing" && apiVersion(other) == 1, "Idempotency-Key k-1 on another flag, pricing, answered %d %s: a create is keyed by (key, Idempotency-Key), so it must save pricing version 1", other.Status, other.Text())
-	ctx.Assert(store.Load(apiBg, "pricing") != nil, "the create of pricing with k-1 stored nothing")
-	missing := c.Post("/v1/flags", apiBody("checkout", false, usRules, 25))
+	ctx.Assert(other.Status == 201 && otherBody["key"] == "pricing" && hApiVersion(other) == 1, "Idempotency-Key k-1 on another flag, pricing, answered %d %s: a create is keyed by (key, Idempotency-Key), so it must save pricing version 1", other.Status, other.Text())
+	ctx.Assert(store.Load(hApiBg, "pricing") != nil, "the create of pricing with k-1 stored nothing")
+	missing := c.Post("/v1/flags", hApiBody("checkout", false, hUsRules, 25))
 	ctx.Equal(missing.Status, 400, "a create without Idempotency-Key")
-	ctx.Equal(store.Load(apiBg, "checkout").Version, int64(2), "a create without Idempotency-Key must be refused before the save; the stored version")
+	ctx.Equal(store.Load(hApiBg, "checkout").Version, int64(2), "a create without Idempotency-Key must be refused before the save; the stored version")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -816,13 +816,13 @@ func CheckIdempotency(ctx *harness.Ctx) {
 
 namespace {
 
-const nlohmann::json kUsRules = nlohmann::json::parse(R"([{"attribute": "country", "operator": "eq", "value": "US"}])");
+const nlohmann::json kHUsRules = nlohmann::json::parse(R"([{"attribute": "country", "operator": "eq", "value": "US"}])");
 
-nlohmann::json apiBody(const std::string& key, const nlohmann::json& rules, int rollout) {
+nlohmann::json hApiBody(const std::string& key, const nlohmann::json& rules, int rollout) {
   return nlohmann::json{{"key", key}, {"default", false}, {"rules", rules}, {"rollout", rollout}};
 }
 
-harness::HTTP apiClient(harness::Ctx& ctx) {
+harness::HTTP hApiClient(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -830,11 +830,11 @@ harness::HTTP apiClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response apiCreate(harness::HTTP& c, const nlohmann::json& body, const std::string& key) {
+harness::Response hApiCreate(harness::HTTP& c, const nlohmann::json& body, const std::string& key) {
   return c.Post("/v1/flags", body.dump(), "Content-Type", "application/json", "Idempotency-Key", key);
 }
 
-long apiVersion(const harness::Response& r) {
+long hApiVersion(const harness::Response& r) {
   const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
   return j.is_object() ? j.value("version", 0L) : 0L;
 }
@@ -842,62 +842,62 @@ long apiVersion(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto r = apiCreate(c, apiBody("checkout", kUsRules, 25), "k-1");
+  auto c = hApiClient(ctx);
+  const auto r = hApiCreate(c, hApiBody("checkout", kHUsRules, 25), "k-1");
   ctx.Equal(r.Status, 201, "POST /v1/flags (%s)", r.Text());
-  ctx.Assert(r.Text().find("checkout") != std::string::npos && apiVersion(r) == 1, "a first create must answer the key and version 1, got %s", r.Text());
+  ctx.Assert(r.Text().find("checkout") != std::string::npos && hApiVersion(r) == 1, "a first create must answer the key and version 1, got %s", r.Text());
   const auto stored = store::load("checkout");
   ctx.Assert(stored && stored->value("version", 0L) == 1, "after the create the store holds %s", stored ? stored->dump() : "nothing");
-  ctx.Assert(stored->at("rules") == kUsRules && stored->value("rollout", 0) == 25 && stored->value("default", true) == false, "the store holds %s, expected the posted definition", stored->dump());
+  ctx.Assert(stored->at("rules") == kHUsRules && stored->value("rollout", 0) == 25 && stored->value("default", true) == false, "the store holds %s, expected the posted definition", stored->dump());
 }
 
 void CheckRegistry(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  auto r = apiCreate(c, apiBody("plan-gate", nlohmann::json::parse(R"([{"attribute": "plan_tier", "operator": "eq", "value": "gold"}])"), 25), "k-1");
+  auto c = hApiClient(ctx);
+  auto r = hApiCreate(c, hApiBody("plan-gate", nlohmann::json::parse(R"([{"attribute": "plan_tier", "operator": "eq", "value": "gold"}])"), 25), "k-1");
   ctx.Equal(r.Status, 422, "a rule on plan_tier, an attribute the registry does not know, is stored and never matches anyone (%s); the status", r.Text());
   ctx.Assert(r.Text().find("plan_tier") != std::string::npos, "the 422 must name the refused attribute, got %s", r.Text());
   ctx.Assert(!store::load("plan-gate"), "a flag with a refused rule was stored");
-  r = apiCreate(c, apiBody("country-gt", nlohmann::json::parse(R"([{"attribute": "country", "operator": "gt", "value": "US"}])"), 25), "k-2");
+  r = hApiCreate(c, hApiBody("country-gt", nlohmann::json::parse(R"([{"attribute": "country", "operator": "gt", "value": "US"}])"), 25), "k-2");
   ctx.Equal(r.Status, 422, "gt on the string attribute country: the registry has no gt for strings; the status");
-  r = apiCreate(c, apiBody("two-rules", nlohmann::json::parse(R"([{"attribute": "country", "operator": "eq", "value": "US"}, {"attribute": "plan_tier", "operator": "eq", "value": "gold"}])"), 25), "k-4");
+  r = hApiCreate(c, hApiBody("two-rules", nlohmann::json::parse(R"([{"attribute": "country", "operator": "eq", "value": "US"}, {"attribute": "plan_tier", "operator": "eq", "value": "gold"}])"), 25), "k-4");
   ctx.Assert(r.Status == 422 && r.Text().find("plan_tier") != std::string::npos, "a flag whose second rule targets plan_tier answered %d %s: every rule must pass the registry, expected a 422 naming plan_tier", r.Status, r.Text());
   ctx.Assert(!store::load("two-rules"), "a flag with a refused second rule was stored");
-  r = apiCreate(c, apiBody("new-app", nlohmann::json::parse(R"([{"attribute": "app_version", "operator": "gt", "value": 5}])"), 25), "k-3");
+  r = hApiCreate(c, hApiBody("new-app", nlohmann::json::parse(R"([{"attribute": "app_version", "operator": "gt", "value": 5}])"), 25), "k-3");
   ctx.Equal(r.Status, 201, "gt on the number attribute app_version is registered (%s); the status", r.Text());
 }
 
 void CheckDefault(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  nlohmann::json body = apiBody("checkout", kUsRules, 25);
+  auto c = hApiClient(ctx);
+  nlohmann::json body = hApiBody("checkout", kHUsRules, 25);
   body.erase("default");
-  auto r = apiCreate(c, body, "k-1");
+  auto r = hApiCreate(c, body, "k-1");
   ctx.Equal(r.Status, 422, "a create with no default would serve false to everyone without anyone choosing it (%s); the status", r.Text());
   ctx.Assert(r.Text().find("default") != std::string::npos, "the 422 must name default, got %s", r.Text());
   ctx.Assert(!store::load("checkout"), "a flag with no default was stored");
   body["default"] = nullptr;
-  r = apiCreate(c, body, "k-3");
+  r = hApiCreate(c, body, "k-3");
   ctx.Assert(r.Status == 422 && r.Text().find("default") != std::string::npos, "a create with default null answered %d %s: null is no default either, expected a 422 naming default", r.Status, r.Text());
   ctx.Assert(!store::load("checkout"), "a flag with a null default was stored");
   body["default"] = true;
-  r = apiCreate(c, body, "k-2");
+  r = hApiCreate(c, body, "k-2");
   ctx.Equal(r.Status, 201, "a create with default true (%s)", r.Text());
   ctx.Equal(store::load("checkout")->value("default", false), true, "the stored default");
 }
 
 void CheckIdempotency(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto first = apiCreate(c, apiBody("checkout", kUsRules, 25), "k-1");
+  auto c = hApiClient(ctx);
+  const auto first = hApiCreate(c, hApiBody("checkout", kHUsRules, 25), "k-1");
   ctx.Equal(first.Status, 201, "the first create (%s)", first.Text());
-  const auto replay = apiCreate(c, apiBody("checkout", kUsRules, 25), "k-1");
-  ctx.Assert(replay.Status == 201 && apiVersion(replay) == apiVersion(first), "a replay of Idempotency-Key k-1 must answer the first result %s, got %d %s", first.Text(), replay.Status, replay.Text());
+  const auto replay = hApiCreate(c, hApiBody("checkout", kHUsRules, 25), "k-1");
+  ctx.Assert(replay.Status == 201 && hApiVersion(replay) == hApiVersion(first), "a replay of Idempotency-Key k-1 must answer the first result %s, got %d %s", first.Text(), replay.Status, replay.Text());
   ctx.Equal(store::load("checkout")->value("version", 0L), 1L, "a client retry must not fork the flag; the stored version");
-  const auto fresh = apiCreate(c, apiBody("checkout", kUsRules, 50), "k-2");
-  ctx.Assert(fresh.Status == 201 && apiVersion(fresh) == 2, "a create with a new Idempotency-Key must save version 2, got %d %s", fresh.Status, fresh.Text());
-  const auto other = apiCreate(c, apiBody("pricing", kUsRules, 25), "k-1");
+  const auto fresh = hApiCreate(c, hApiBody("checkout", kHUsRules, 50), "k-2");
+  ctx.Assert(fresh.Status == 201 && hApiVersion(fresh) == 2, "a create with a new Idempotency-Key must save version 2, got %d %s", fresh.Status, fresh.Text());
+  const auto other = hApiCreate(c, hApiBody("pricing", kHUsRules, 25), "k-1");
   const auto otherBody = nlohmann::json::parse(other.Text(), nullptr, false);
-  ctx.Assert(other.Status == 201 && otherBody.is_object() && otherBody.value("key", "") == "pricing" && apiVersion(other) == 1, "Idempotency-Key k-1 on another flag, pricing, answered %d %s: a create is keyed by (key, Idempotency-Key), so it must save pricing version 1", other.Status, other.Text());
+  ctx.Assert(other.Status == 201 && otherBody.is_object() && otherBody.value("key", "") == "pricing" && hApiVersion(other) == 1, "Idempotency-Key k-1 on another flag, pricing, answered %d %s: a create is keyed by (key, Idempotency-Key), so it must save pricing version 1", other.Status, other.Text());
   ctx.Assert(store::load("pricing").has_value(), "the create of pricing with k-1 stored nothing");
-  const auto missing = c.Post("/v1/flags", apiBody("checkout", kUsRules, 25).dump(), "Content-Type", "application/json");
+  const auto missing = c.Post("/v1/flags", hApiBody("checkout", kHUsRules, 25).dump(), "Content-Type", "application/json");
   ctx.Equal(missing.Status, 400, "a create without Idempotency-Key");
   ctx.Equal(store::load("checkout")->value("version", 0L), 2L, "a create without Idempotency-Key must be refused before the save; the stored version");
 }

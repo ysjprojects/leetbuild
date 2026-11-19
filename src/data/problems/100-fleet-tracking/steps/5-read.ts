@@ -1072,11 +1072,11 @@ import (
 	"leetbuild/harness"
 )
 
-const snapshotFleet = "fleet:t-1:f-1"
+const kHSnapshotFleet = "fleet:t-1:f-1"
 
-// snapshotSeed is a fleet of the given vehicles: id → device timestamp of its latest record (-1: no record).
-func snapshotSeed(ctx *harness.Ctx, vehicles map[string]int64) {
-	args := []any{"SADD", snapshotFleet}
+// hSnapshotSeed is a fleet of the given vehicles: id → device timestamp of its latest record (-1: no record).
+func hSnapshotSeed(ctx *harness.Ctx, vehicles map[string]int64) {
+	args := []any{"SADD", kHSnapshotFleet}
 	for id := range vehicles {
 		args = append(args, id)
 	}
@@ -1088,13 +1088,13 @@ func snapshotSeed(ctx *harness.Ctx, vehicles map[string]int64) {
 	}
 }
 
-func snapshotAPI(ctx *harness.Ctx) *harness.HTTP {
+func hSnapshotAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-type snapshotBody struct {
+type HSnapshotBody struct {
 	FleetID      string           \`json:"fleet_id"\`
 	SnapshotAtMs int64            \`json:"snapshot_at_ms"\`
 	Vehicles     []map[string]any \`json:"vehicles"\`
@@ -1104,15 +1104,15 @@ type snapshotBody struct {
 	Truncated    *bool            \`json:"truncated"\`
 }
 
-func snapshotGet(ctx *harness.Ctx, c *harness.HTTP, path string) (*harness.Response, snapshotBody) {
+func hSnapshotGet(ctx *harness.Ctx, c *harness.HTTP, path string) (*harness.Response, HSnapshotBody) {
 	r := c.Get(path, "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 200, "GET %s (%s)", path, r.Text())
-	var body snapshotBody
+	var body HSnapshotBody
 	r.Decode(&body)
 	return r, body
 }
 
-func (b snapshotBody) ids() []string {
+func (b HSnapshotBody) ids() []string {
 	out := make([]string, 0, len(b.Vehicles))
 	for _, v := range b.Vehicles {
 		out = append(out, fmt.Sprint(v["vehicle_id"]))
@@ -1120,8 +1120,8 @@ func (b snapshotBody) ids() []string {
 	return out
 }
 
-// snapshotShow is what a pointer field of the answer held, for a message: its value, or nil when absent.
-func snapshotShow(p any) any {
+// hSnapshotShow is what a pointer field of the answer held, for a message: its value, or nil when absent.
+func hSnapshotShow(p any) any {
 	switch v := p.(type) {
 	case *string:
 		if v != nil {
@@ -1139,7 +1139,7 @@ func snapshotShow(p any) any {
 	return nil
 }
 
-func (b snapshotBody) stale() []any {
+func (b HSnapshotBody) stale() []any {
 	out := make([]any, 0, len(b.Vehicles))
 	for _, v := range b.Vehicles {
 		out = append(out, v["stale"])
@@ -1149,9 +1149,9 @@ func (b snapshotBody) stale() []any {
 
 func CheckRoute(ctx *harness.Ctx) {
 	now := ctx.Clock.Now()
-	snapshotSeed(ctx, map[string]int64{"v-1": now - 1000, "v-2": now - 2000})
-	c := snapshotAPI(ctx)
-	r, body := snapshotGet(ctx, c, "/v1/fleets/f-1/positions")
+	hSnapshotSeed(ctx, map[string]int64{"v-1": now - 1000, "v-2": now - 2000})
+	c := hSnapshotAPI(ctx)
+	r, body := hSnapshotGet(ctx, c, "/v1/fleets/f-1/positions")
 	ctx.Assert(body.FleetID == "f-1" && body.SnapshotAtMs > 0, "the response must carry fleet_id and snapshot_at_ms: %s", r.Text())
 	ctx.Equal(body.ids(), []string{"v-1", "v-2"}, "the fleet's vehicles in id order")
 	v1 := body.Vehicles[0]
@@ -1160,29 +1160,29 @@ func CheckRoute(ctx *harness.Ctx) {
 
 func CheckTenantScope(ctx *harness.Ctx) {
 	now := ctx.Clock.Now()
-	snapshotSeed(ctx, map[string]int64{"v-1": now - 1000})
-	c := snapshotAPI(ctx)
+	hSnapshotSeed(ctx, map[string]int64{"v-1": now - 1000})
+	c := hSnapshotAPI(ctx)
 	r := c.Get("/v1/fleets/f-1/positions")
 	ctx.Equal(r.Status, 401, "a read without X-Tenant-Id")
 	r = c.Get("/v1/fleets/f-1/positions", "X-Tenant-Id", "t-2")
 	ctx.Equal(r.Status, 404, "tenant t-2 reading t-1's fleet f-1 (the fleet is read from fleet:{tenant}:{fleet_id}, and t-2 has no f-1)")
-	ctx.Assert(!snapshotContains(r.Text(), "v-1"), "tenant t-2's read of t-1's fleet leaked v-1: %s", r.Text())
-	_, body := snapshotGet(ctx, c, "/v1/fleets/f-1/positions")
+	ctx.Assert(!hSnapshotContains(r.Text(), "v-1"), "tenant t-2's read of t-1's fleet leaked v-1: %s", r.Text())
+	_, body := hSnapshotGet(ctx, c, "/v1/fleets/f-1/positions")
 	ctx.Equal(body.ids(), []string{"v-1"}, "t-1 reading its own fleet")
 }
 
 func CheckFreshness(ctx *harness.Ctx) {
 	now := ctx.Clock.Now()
-	snapshotSeed(ctx, map[string]int64{"v-1": now - 1000, "v-2": now - 120_000, "v-3": -1, "v-4": now - 60_000, "v-5": now - 60_001})
-	c := snapshotAPI(ctx)
-	_, body := snapshotGet(ctx, c, "/v1/fleets/f-1/positions")
+	hSnapshotSeed(ctx, map[string]int64{"v-1": now - 1000, "v-2": now - 120_000, "v-3": -1, "v-4": now - 60_000, "v-5": now - 60_001})
+	c := hSnapshotAPI(ctx)
+	_, body := hSnapshotGet(ctx, c, "/v1/fleets/f-1/positions")
 	ctx.Equal(body.stale(), []any{false, true, true, false, true}, "stale flags for (1 s old, 2 min old, no record, exactly 60 000 ms old, 60 001 ms old): a position older than freshnessBoundMs (60 000 ms) at snapshot_at_ms, or missing, is not current; one exactly at the bound still is")
-	ctx.Assert(body.Stale != nil && *body.Stale == 3, "the response's stale count is %v, expected 3", snapshotShow(body.Stale))
+	ctx.Assert(body.Stale != nil && *body.Stale == 3, "the response's stale count is %v, expected 3", hSnapshotShow(body.Stale))
 	ctx.Assert(body.SnapshotAtMs-now < 1000 && now-body.SnapshotAtMs < 1000, "snapshot_at_ms is %d, expected the server clock (%d)", body.SnapshotAtMs, now)
 	ctx.Clock.Advance(120)
-	_, body = snapshotGet(ctx, c, "/v1/fleets/f-1/positions")
+	_, body = hSnapshotGet(ctx, c, "/v1/fleets/f-1/positions")
 	ctx.Equal(body.stale(), []any{true, true, true, true, true}, "two minutes later every record is older than the bound")
-	ctx.Assert(body.Stale != nil && *body.Stale == 5, "the stale count two minutes later is %v, expected 5", snapshotShow(body.Stale))
+	ctx.Assert(body.Stale != nil && *body.Stale == 5, "the stale count two minutes later is %v, expected 5", hSnapshotShow(body.Stale))
 }
 
 func CheckCap(ctx *harness.Ctx) {
@@ -1190,18 +1190,18 @@ func CheckCap(ctx *harness.Ctx) {
 	for i := 0; i < 5002; i++ {
 		vehicles[fmt.Sprintf("v-%04d", i)] = -1
 	}
-	snapshotSeed(ctx, vehicles)
-	c := snapshotAPI(ctx)
+	hSnapshotSeed(ctx, vehicles)
+	c := hSnapshotAPI(ctx)
 	var seen []string
 	cursor := ""
 	pages := 0
-	var body snapshotBody
+	var body HSnapshotBody
 	for {
 		path := "/v1/fleets/f-1/positions?limit=1000"
 		if cursor != "" {
 			path += "&cursor=" + cursor
 		}
-		_, body = snapshotGet(ctx, c, path)
+		_, body = hSnapshotGet(ctx, c, path)
 		seen = append(seen, body.ids()...)
 		pages++
 		cursor = ""
@@ -1215,34 +1215,34 @@ func CheckCap(ctx *harness.Ctx) {
 	}
 	ctx.Equal(len(seen), 5000, "a fleet of 5 002 vehicles over %d pages must answer maxVehicles = 5 000 (the first 5 000 in id order); the vehicles answered", pages)
 	ctx.Assert(sort.StringsAreSorted(seen) && seen[len(seen)-1] == "v-4999", "the pages must cover v-0000 … v-4999 in order (last was %s)", seen[len(seen)-1])
-	ctx.Assert(body.Truncated != nil && *body.Truncated, "the last page says truncated %v, expected true: the caller must learn the fleet is larger than the cap", snapshotShow(body.Truncated))
-	ctx.Assert(body.MaxVehicles != nil && *body.MaxVehicles == 5000, "max_vehicles is %v, expected 5000", snapshotShow(body.MaxVehicles))
+	ctx.Assert(body.Truncated != nil && *body.Truncated, "the last page says truncated %v, expected true: the caller must learn the fleet is larger than the cap", hSnapshotShow(body.Truncated))
+	ctx.Assert(body.MaxVehicles != nil && *body.MaxVehicles == 5000, "max_vehicles is %v, expected 5000", hSnapshotShow(body.MaxVehicles))
 	ctx.Equal(pages, 5, "5 000 vehicles at limit=1000 must take 5 pages: the page that reaches the cap carries cursor null, not a cursor to an empty page; the pages")
-	ctx.Redis.Do("SREM", snapshotFleet, "v-5000", "v-5001")
-	_, last := snapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=1000&cursor=v-3999")
-	ctx.Assert(len(last.ids()) == 1000 && last.Cursor == nil, "the last page of a fleet of exactly 5 000 holds %d vehicles with cursor %v, expected 1000 and null", len(last.ids()), snapshotShow(last.Cursor))
-	ctx.Assert(last.Truncated != nil && !*last.Truncated, "a fleet of exactly maxVehicles says truncated %v, expected false: nothing was left out", snapshotShow(last.Truncated))
+	ctx.Redis.Do("SREM", kHSnapshotFleet, "v-5000", "v-5001")
+	_, last := hSnapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=1000&cursor=v-3999")
+	ctx.Assert(len(last.ids()) == 1000 && last.Cursor == nil, "the last page of a fleet of exactly 5 000 holds %d vehicles with cursor %v, expected 1000 and null", len(last.ids()), hSnapshotShow(last.Cursor))
+	ctx.Assert(last.Truncated != nil && !*last.Truncated, "a fleet of exactly maxVehicles says truncated %v, expected false: nothing was left out", hSnapshotShow(last.Truncated))
 }
 
 func CheckPagination(ctx *harness.Ctx) {
 	now := ctx.Clock.Now()
-	snapshotSeed(ctx, map[string]int64{"v-1": now - 1000, "v-2": now - 1000, "v-3": now - 1000, "v-4": now - 1000, "v-5": now - 1000})
-	c := snapshotAPI(ctx)
-	_, first := snapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=2")
+	hSnapshotSeed(ctx, map[string]int64{"v-1": now - 1000, "v-2": now - 1000, "v-3": now - 1000, "v-4": now - 1000, "v-5": now - 1000})
+	c := hSnapshotAPI(ctx)
+	_, first := hSnapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=2")
 	ctx.Equal(first.ids(), []string{"v-1", "v-2"}, "the first page with limit=2")
-	ctx.Assert(first.Cursor != nil && *first.Cursor != "", "with three vehicles left the first page carries cursor %v, expected the last vehicle id of the page", snapshotShow(first.Cursor))
-	_, second := snapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=2&cursor="+*first.Cursor)
+	ctx.Assert(first.Cursor != nil && *first.Cursor != "", "with three vehicles left the first page carries cursor %v, expected the last vehicle id of the page", hSnapshotShow(first.Cursor))
+	_, second := hSnapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=2&cursor="+*first.Cursor)
 	ctx.Equal(second.ids(), []string{"v-3", "v-4"}, "the second page (pages must chain without gap or overlap)")
-	_, third := snapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=2&cursor="+*second.Cursor)
+	_, third := hSnapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=2&cursor="+*second.Cursor)
 	ctx.Equal(third.ids(), []string{"v-5"}, "the last page")
-	ctx.Assert(third.Cursor == nil, "the last page's cursor is %v, expected null", snapshotShow(third.Cursor))
-	_, all := snapshotGet(ctx, c, "/v1/fleets/f-1/positions")
-	ctx.Assert(len(all.ids()) == 5 && all.Cursor == nil, "without a limit the default (500) covers all five: got %v cursor %v", all.ids(), snapshotShow(all.Cursor))
-	_, exact := snapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=5")
-	ctx.Assert(len(exact.ids()) == 5 && exact.Cursor == nil, "limit=5 over five vehicles answered %v with cursor %v, expected all five and cursor null: a page that reaches the end has no next page", exact.ids(), snapshotShow(exact.Cursor))
+	ctx.Assert(third.Cursor == nil, "the last page's cursor is %v, expected null", hSnapshotShow(third.Cursor))
+	_, all := hSnapshotGet(ctx, c, "/v1/fleets/f-1/positions")
+	ctx.Assert(len(all.ids()) == 5 && all.Cursor == nil, "without a limit the default (500) covers all five: got %v cursor %v", all.ids(), hSnapshotShow(all.Cursor))
+	_, exact := hSnapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=5")
+	ctx.Assert(len(exact.ids()) == 5 && exact.Cursor == nil, "limit=5 over five vehicles answered %v with cursor %v, expected all five and cursor null: a page that reaches the end has no next page", exact.ids(), hSnapshotShow(exact.Cursor))
 	// The vehicle a cursor names leaves the fleet between two pages: the next page still starts after it.
-	ctx.Redis.Do("SREM", snapshotFleet, "v-2")
-	_, after := snapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=2&cursor=v-2")
+	ctx.Redis.Do("SREM", kHSnapshotFleet, "v-2")
+	_, after := hSnapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=2&cursor=v-2")
 	ctx.Equal(after.ids(), []string{"v-3", "v-4"}, "with v-2 removed from the fleet, the page after cursor v-2 (the cursor is a position in id order, not a member to look up)")
 	for _, bad := range []string{"0", "1001", "-1", "abc"} {
 		r := c.Get("/v1/fleets/f-1/positions?limit="+bad, "X-Tenant-Id", "t-1")
@@ -1252,14 +1252,14 @@ func CheckPagination(ctx *harness.Ctx) {
 
 func CheckOneInstant(ctx *harness.Ctx) {
 	now := ctx.Clock.Now()
-	snapshotSeed(ctx, map[string]int64{"v-1": now - 1000, "v-2": now - 1000, "v-3": now - 1000})
-	c := snapshotAPI(ctx)
+	hSnapshotSeed(ctx, map[string]int64{"v-1": now - 1000, "v-2": now - 1000, "v-3": now - 1000})
+	c := hSnapshotAPI(ctx)
 	// A position for v-3 lands while the page is being read, right after v-1's record was fetched.
 	probe := ctx.Redis.After("vehicle:v-1:latest", func() any {
 		return ctx.Redis.Do("HSET", "vehicle:v-3:latest", "ts", now, "seq", 2, "lat", 9.0, "lon", 9.0)
 	})
 	before := len(ctx.Redis.RoundTrips())
-	_, body := snapshotGet(ctx, c, "/v1/fleets/f-1/positions")
+	_, body := hSnapshotGet(ctx, c, "/v1/fleets/f-1/positions")
 	trips := len(ctx.Redis.RoundTrips()) - before
 	ctx.Assert(probe.Fired, "the read touched no vehicle:v-1:latest")
 	var v3 map[string]any
@@ -1272,7 +1272,7 @@ func CheckOneInstant(ctx *harness.Ctx) {
 	ctx.Assert(trips <= 3, "the read cost %d Redis round trips for three vehicles, expected the members and one MULTI/EXEC: a 5 000-vehicle fleet must not cost 5 000 round trips", trips)
 }
 
-func snapshotContains(s, sub string) bool {
+func hSnapshotContains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {
 			return true
@@ -1293,11 +1293,11 @@ func snapshotContains(s, sub string) bool {
 
 namespace {
 
-const std::string kSnapshotFleet = "fleet:t-1:f-1";
+const std::string kHSnapshotFleet = "fleet:t-1:f-1";
 
 // A fleet of the given vehicles: id → device timestamp of its latest record (-1: no record).
-void snapshotSeed(harness::Ctx& ctx, const std::map<std::string, long long>& vehicles) {
-  std::vector<std::string> args = {"SADD", kSnapshotFleet};
+void hSnapshotSeed(harness::Ctx& ctx, const std::map<std::string, long long>& vehicles) {
+  std::vector<std::string> args = {"SADD", kHSnapshotFleet};
   for (auto it = vehicles.rbegin(); it != vehicles.rend(); ++it) args.push_back(it->first);  // reverse id order
   ctx.Redis.Must(args);
   for (const auto& [id, ts] : vehicles) {
@@ -1305,19 +1305,19 @@ void snapshotSeed(harness::Ctx& ctx, const std::map<std::string, long long>& veh
   }
 }
 
-struct SnapshotApi {
+struct HSnapshotApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit SnapshotApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  explicit HSnapshotApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
 };
 
-nlohmann::json snapshotGet(harness::Ctx& ctx, SnapshotApi& api, const std::string& path) {
+nlohmann::json hSnapshotGet(harness::Ctx& ctx, HSnapshotApi& api, const std::string& path) {
   const auto r = api.http.Get(path, "X-Tenant-Id", "t-1");
   ctx.Equal(r.Status, 200, "GET %s (%s)", path, r.Text());
   return nlohmann::json::parse(r.Text(), nullptr, false);
 }
 
-std::vector<std::string> snapshotIds(const nlohmann::json& body) {
+std::vector<std::string> hSnapshotIds(const nlohmann::json& body) {
   std::vector<std::string> out;
   if (body.contains("vehicles")) {
     for (const auto& v : body["vehicles"]) out.push_back(v.value("vehicle_id", ""));
@@ -1325,7 +1325,7 @@ std::vector<std::string> snapshotIds(const nlohmann::json& body) {
   return out;
 }
 
-std::vector<nlohmann::json> snapshotStale(const nlohmann::json& body) {
+std::vector<nlohmann::json> hSnapshotStale(const nlohmann::json& body) {
   std::vector<nlohmann::json> out;
   for (const auto& v : body["vehicles"]) out.push_back(v.value("stale", nlohmann::json()));
   return out;
@@ -1335,12 +1335,12 @@ std::vector<nlohmann::json> snapshotStale(const nlohmann::json& body) {
 
 void CheckRoute(harness::Ctx& ctx) {
   const long long now = ctx.Clock.Now();
-  snapshotSeed(ctx, {{"v-1", now - 1000}, {"v-2", now - 2000}});
-  SnapshotApi api(ctx);
-  const auto body = snapshotGet(ctx, api, "/v1/fleets/f-1/positions");
+  hSnapshotSeed(ctx, {{"v-1", now - 1000}, {"v-2", now - 2000}});
+  HSnapshotApi api(ctx);
+  const auto body = hSnapshotGet(ctx, api, "/v1/fleets/f-1/positions");
   ctx.Assert(body.value("fleet_id", "") == "f-1" && body.contains("snapshot_at_ms"),
              "the response must carry fleet_id and snapshot_at_ms: %s", body.dump());
-  ctx.Equal(snapshotIds(body), {"v-1", "v-2"}, "the fleet's vehicles in id order");
+  ctx.Equal(hSnapshotIds(body), {"v-1", "v-2"}, "the fleet's vehicles in id order");
   const auto v1 = body["vehicles"][0];
   ctx.Assert(v1.value("lat", 0.0) == 47.6 && v1.value("lon", 0.0) == -122.3 && v1.value("device_timestamp_ms", 0LL) == now - 1000 &&
                  v1.value("sequence", 0LL) == 1,
@@ -1349,22 +1349,22 @@ void CheckRoute(harness::Ctx& ctx) {
 
 void CheckTenantScope(harness::Ctx& ctx) {
   const long long now = ctx.Clock.Now();
-  snapshotSeed(ctx, {{"v-1", now - 1000}});
-  SnapshotApi api(ctx);
+  hSnapshotSeed(ctx, {{"v-1", now - 1000}});
+  HSnapshotApi api(ctx);
   auto r = api.http.Get("/v1/fleets/f-1/positions");
   ctx.Equal(r.Status, 401, "a read without X-Tenant-Id");
   r = api.http.Get("/v1/fleets/f-1/positions", "X-Tenant-Id", "t-2");
   ctx.Equal(r.Status, 404, "tenant t-2 reading t-1's fleet f-1 (the fleet is read from fleet:{tenant}:{fleet_id}, and t-2 has no f-1)");
   ctx.Assert(r.Text().find("v-1") == std::string::npos, "tenant t-2's read of t-1's fleet leaked v-1: %s", r.Text());
-  ctx.Equal(snapshotIds(snapshotGet(ctx, api, "/v1/fleets/f-1/positions")), {"v-1"}, "t-1 reading its own fleet");
+  ctx.Equal(hSnapshotIds(hSnapshotGet(ctx, api, "/v1/fleets/f-1/positions")), {"v-1"}, "t-1 reading its own fleet");
 }
 
 void CheckFreshness(harness::Ctx& ctx) {
   const long long now = ctx.Clock.Now();
-  snapshotSeed(ctx, {{"v-1", now - 1000}, {"v-2", now - 120000}, {"v-3", -1}, {"v-4", now - 60000}, {"v-5", now - 60001}});
-  SnapshotApi api(ctx);
-  auto body = snapshotGet(ctx, api, "/v1/fleets/f-1/positions");
-  ctx.Equal(snapshotStale(body),
+  hSnapshotSeed(ctx, {{"v-1", now - 1000}, {"v-2", now - 120000}, {"v-3", -1}, {"v-4", now - 60000}, {"v-5", now - 60001}});
+  HSnapshotApi api(ctx);
+  auto body = hSnapshotGet(ctx, api, "/v1/fleets/f-1/positions");
+  ctx.Equal(hSnapshotStale(body),
             {nlohmann::json(false), nlohmann::json(true), nlohmann::json(true), nlohmann::json(false), nlohmann::json(true)},
             "stale flags for (1 s old, 2 min old, no record, exactly 60 000 ms old, 60 001 ms old): a position older than "
             "kFreshnessBoundMs (60 000 ms) at snapshot_at_ms, or missing, is not current; one exactly at the bound still is");
@@ -1372,8 +1372,8 @@ void CheckFreshness(harness::Ctx& ctx) {
   const long long at = body.value("snapshot_at_ms", 0LL);
   ctx.Assert(at - now < 1000 && now - at < 1000, "snapshot_at_ms is %d, expected the server clock (%d)", at, now);
   ctx.Clock.Advance(120);
-  body = snapshotGet(ctx, api, "/v1/fleets/f-1/positions");
-  ctx.Equal(snapshotStale(body), std::vector<nlohmann::json>(5, nlohmann::json(true)), "two minutes later every record is older than the bound");
+  body = hSnapshotGet(ctx, api, "/v1/fleets/f-1/positions");
+  ctx.Equal(hSnapshotStale(body), std::vector<nlohmann::json>(5, nlohmann::json(true)), "two minutes later every record is older than the bound");
   ctx.Equal(body.value("stale", nlohmann::json()), nlohmann::json(5), "the stale count two minutes later");
 }
 
@@ -1384,8 +1384,8 @@ void CheckCap(harness::Ctx& ctx) {
     std::snprintf(id, sizeof id, "v-%04d", i);
     vehicles[id] = -1;
   }
-  snapshotSeed(ctx, vehicles);
-  SnapshotApi api(ctx);
+  hSnapshotSeed(ctx, vehicles);
+  HSnapshotApi api(ctx);
   std::vector<std::string> seen;
   std::string cursor;
   int pages = 0;
@@ -1393,8 +1393,8 @@ void CheckCap(harness::Ctx& ctx) {
   for (;;) {
     std::string path = "/v1/fleets/f-1/positions?limit=1000";
     if (!cursor.empty()) path += "&cursor=" + cursor;
-    body = snapshotGet(ctx, api, path);
-    const auto page = snapshotIds(body);
+    body = hSnapshotGet(ctx, api, path);
+    const auto page = hSnapshotIds(body);
     seen.insert(seen.end(), page.begin(), page.end());
     pages++;
     cursor = body.contains("cursor") && body["cursor"].is_string() ? body["cursor"].get<std::string>() : "";
@@ -1413,11 +1413,11 @@ void CheckCap(harness::Ctx& ctx) {
   ctx.Equal(pages, 5,
             "5 000 vehicles at limit=1000 must take 5 pages: the page that reaches the cap carries cursor null, not a cursor "
             "to an empty page; the pages");
-  ctx.Redis.Do("SREM", kSnapshotFleet, "v-5000", "v-5001");
-  const auto last = snapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=1000&cursor=v-3999");
-  ctx.Assert(snapshotIds(last).size() == 1000 && last.contains("cursor") && last["cursor"].is_null(),
+  ctx.Redis.Do("SREM", kHSnapshotFleet, "v-5000", "v-5001");
+  const auto last = hSnapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=1000&cursor=v-3999");
+  ctx.Assert(hSnapshotIds(last).size() == 1000 && last.contains("cursor") && last["cursor"].is_null(),
              "the last page of a fleet of exactly 5 000 holds %d vehicles with cursor %s, expected 1000 and null",
-             static_cast<int>(snapshotIds(last).size()), last.value("cursor", nlohmann::json()).dump());
+             static_cast<int>(hSnapshotIds(last).size()), last.value("cursor", nlohmann::json()).dump());
   ctx.Assert(last.contains("truncated") && last["truncated"] == false,
              "a fleet of exactly kMaxVehicles says truncated %s, expected false: nothing was left out",
              last.value("truncated", nlohmann::json()).dump());
@@ -1425,31 +1425,31 @@ void CheckCap(harness::Ctx& ctx) {
 
 void CheckPagination(harness::Ctx& ctx) {
   const long long now = ctx.Clock.Now();
-  snapshotSeed(ctx, {{"v-1", now - 1000}, {"v-2", now - 1000}, {"v-3", now - 1000}, {"v-4", now - 1000}, {"v-5", now - 1000}});
-  SnapshotApi api(ctx);
-  const auto first = snapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=2");
-  ctx.Equal(snapshotIds(first), {"v-1", "v-2"}, "the first page with limit=2");
+  hSnapshotSeed(ctx, {{"v-1", now - 1000}, {"v-2", now - 1000}, {"v-3", now - 1000}, {"v-4", now - 1000}, {"v-5", now - 1000}});
+  HSnapshotApi api(ctx);
+  const auto first = hSnapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=2");
+  ctx.Equal(hSnapshotIds(first), {"v-1", "v-2"}, "the first page with limit=2");
   ctx.Assert(first.contains("cursor") && first["cursor"].is_string() && !first["cursor"].get<std::string>().empty(),
              "with three vehicles left the first page carries cursor %s, expected the last vehicle id of the page",
              first.value("cursor", nlohmann::json()).dump());
-  const auto second = snapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=2&cursor=" + first["cursor"].get<std::string>());
-  ctx.Equal(snapshotIds(second), {"v-3", "v-4"}, "the second page (pages must chain without gap or overlap)");
+  const auto second = hSnapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=2&cursor=" + first["cursor"].get<std::string>());
+  ctx.Equal(hSnapshotIds(second), {"v-3", "v-4"}, "the second page (pages must chain without gap or overlap)");
   ctx.Assert(second.contains("cursor") && second["cursor"].is_string(), "the second page carries no cursor: %s", second.dump());
-  const auto third = snapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=2&cursor=" + second["cursor"].get<std::string>());
-  ctx.Equal(snapshotIds(third), {"v-5"}, "the last page");
+  const auto third = hSnapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=2&cursor=" + second["cursor"].get<std::string>());
+  ctx.Equal(hSnapshotIds(third), {"v-5"}, "the last page");
   ctx.Assert(third.contains("cursor") && third["cursor"].is_null(), "the last page's cursor is %s, expected null",
              third.value("cursor", nlohmann::json()).dump());
-  const auto all = snapshotGet(ctx, api, "/v1/fleets/f-1/positions");
-  ctx.Assert(snapshotIds(all).size() == 5 && all.contains("cursor") && all["cursor"].is_null(),
-             "without a limit the default (500) covers all five: got %v cursor %s", snapshotIds(all), all.value("cursor", nlohmann::json()).dump());
-  const auto exact = snapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=5");
-  ctx.Assert(snapshotIds(exact).size() == 5 && exact.contains("cursor") && exact["cursor"].is_null(),
+  const auto all = hSnapshotGet(ctx, api, "/v1/fleets/f-1/positions");
+  ctx.Assert(hSnapshotIds(all).size() == 5 && all.contains("cursor") && all["cursor"].is_null(),
+             "without a limit the default (500) covers all five: got %v cursor %s", hSnapshotIds(all), all.value("cursor", nlohmann::json()).dump());
+  const auto exact = hSnapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=5");
+  ctx.Assert(hSnapshotIds(exact).size() == 5 && exact.contains("cursor") && exact["cursor"].is_null(),
              "limit=5 over five vehicles answered %v with cursor %s, expected all five and cursor null: a page that reaches "
              "the end has no next page",
-             snapshotIds(exact), exact.value("cursor", nlohmann::json()).dump());
+             hSnapshotIds(exact), exact.value("cursor", nlohmann::json()).dump());
   // The vehicle a cursor names leaves the fleet between two pages: the next page still starts after it.
-  ctx.Redis.Do("SREM", kSnapshotFleet, "v-2");
-  ctx.Equal(snapshotIds(snapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=2&cursor=v-2")), {"v-3", "v-4"},
+  ctx.Redis.Do("SREM", kHSnapshotFleet, "v-2");
+  ctx.Equal(hSnapshotIds(hSnapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=2&cursor=v-2")), {"v-3", "v-4"},
             "with v-2 removed from the fleet, the page after cursor v-2 (the cursor is a position in id order, not a member "
             "to look up)");
   for (const std::string bad : {"0", "1001", "-1", "abc"}) {
@@ -1460,8 +1460,8 @@ void CheckPagination(harness::Ctx& ctx) {
 
 void CheckOneInstant(harness::Ctx& ctx) {
   const long long now = ctx.Clock.Now();
-  snapshotSeed(ctx, {{"v-1", now - 1000}, {"v-2", now - 1000}, {"v-3", now - 1000}});
-  SnapshotApi api(ctx);
+  hSnapshotSeed(ctx, {{"v-1", now - 1000}, {"v-2", now - 1000}, {"v-3", now - 1000}});
+  HSnapshotApi api(ctx);
   // A position for v-3 lands while the page is being read, right after v-1's record was fetched.
   bool fired = false;
   ctx.Redis.After("vehicle:v-1:latest", [&] {
@@ -1469,7 +1469,7 @@ void CheckOneInstant(harness::Ctx& ctx) {
     ctx.Redis.Do("HSET", "vehicle:v-3:latest", "ts", now, "seq", 2, "lat", 9.0, "lon", 9.0);
   });
   const size_t before = ctx.Redis.RoundTrips().size();
-  const auto body = snapshotGet(ctx, api, "/v1/fleets/f-1/positions");
+  const auto body = hSnapshotGet(ctx, api, "/v1/fleets/f-1/positions");
   const size_t trips = ctx.Redis.RoundTrips().size() - before;
   ctx.Assert(fired, "the read touched no vehicle:v-1:latest");
   nlohmann::json v3;

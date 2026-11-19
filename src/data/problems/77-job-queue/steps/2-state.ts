@@ -896,15 +896,15 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func stateJob(ctx *harness.Ctx, n int) string {
+func hStateJob(ctx *harness.Ctx, n int) string {
 	jobID := fmt.Sprintf("job-%d", n)
-	ctx.NoError(store.CreateJob(stateBg, jobID, "t-1", "email.send", map[string]any{"to": "ada@example.com", "template": "welcome"}), "CreateJob")
+	ctx.NoError(store.CreateJob(hStateBg, jobID, "t-1", "email.send", map[string]any{"to": "ada@example.com", "template": "welcome"}), "CreateJob")
 	return jobID
 }
 
-func stateWhere(ctx *harness.Ctx, jobID string) []string {
+func hStateWhere(ctx *harness.Ctx, jobID string) []string {
 	places := []string{}
 	for _, id := range ctx.Redis.LRange("jobs:queue", 0, -1) {
 		if id == jobID {
@@ -918,13 +918,13 @@ func stateWhere(ctx *harness.Ctx, jobID string) []string {
 	return places
 }
 
-func stateClaim(ctx *harness.Ctx, worker string) string {
-	jobID, err := claim(stateBg, worker)
+func hStateClaim(ctx *harness.Ctx, worker string) string {
+	jobID, err := claim(hStateBg, worker)
 	ctx.NoError(err, "claim(%s)", worker)
 	return jobID
 }
 
-func stateCopies(ctx *harness.Ctx, jobID string) int {
+func hStateCopies(ctx *harness.Ctx, jobID string) int {
 	n := 0
 	for _, id := range ctx.Redis.LRange("jobs:queue", 0, -1) {
 		if id == jobID {
@@ -935,37 +935,37 @@ func stateCopies(ctx *harness.Ctx, jobID string) int {
 }
 
 func CheckClaimDeadline(ctx *harness.Ctx) {
-	a, b := stateJob(ctx, 1), stateJob(ctx, 2)
-	ctx.Equal(stateClaim(ctx, "w-1"), a, "the first claim must hand out the head of jobs:queue")
+	a, b := hStateJob(ctx, 1), hStateJob(ctx, 2)
+	ctx.Equal(hStateClaim(ctx, "w-1"), a, "the first claim must hand out the head of jobs:queue")
 	deadline := ctx.Clock.Now() + 60000
 	score, ok := ctx.Redis.ZScore("jobs:inflight", a)
 	ctx.Assert(ok && int64(score) == deadline, "%s is in jobs:inflight with score %v, expected its deadline %d (now + visibilityTimeoutS in ms)", a, score, deadline)
-	job := store.GetJob(stateBg, a)
+	job := store.GetJob(hStateBg, a)
 	ctx.Assert(job.State == "running" && job.Worker == "w-1" && job.DeadlineMs == deadline, "job:%s after the claim is %+v", a, job)
-	ctx.Equal(stateClaim(ctx, "w-2"), b, "the second claim")
-	ctx.Equal(stateClaim(ctx, "w-3"), "", "a claim on an empty queue must return \\"\\"; the claim")
+	ctx.Equal(hStateClaim(ctx, "w-2"), b, "the second claim")
+	ctx.Equal(hStateClaim(ctx, "w-3"), "", "a claim on an empty queue must return \\"\\"; the claim")
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
-	a := stateJob(ctx, 1)
+	a := hStateJob(ctx, 1)
 	var record map[string]string
 	probe := ctx.Redis.After("jobs:queue", func() any {
 		record = ctx.Redis.HGetAll("job:" + a)
-		return stateWhere(ctx, a)
+		return hStateWhere(ctx, a)
 	})
-	ctx.Equal(stateClaim(ctx, "w-1"), a, "the claim")
+	ctx.Equal(hStateClaim(ctx, "w-1"), a, "the claim")
 	ctx.Assert(probe.Fired, "claim never touched jobs:queue")
 	places, _ := probe.Result.([]string)
 	ctx.Assert(len(places) > 0, "right after your first command on jobs:queue, %s was on neither jobs:queue nor jobs:inflight: a worker that dies there loses the job with no trace. Pop and record the claim in one script", a)
 	if len(places) == 1 && places[0] == "jobs:inflight" {
 		ctx.Assert(record["state"] == "running" && record["worker"] == "w-1", "right after your first command on jobs:queue, %s was in jobs:inflight but job:%s was %v: a worker that dies there leaves a claimed job the record calls queued. Write the record in the claim's script", a, a, record)
 	}
-	ctx.Equal(stateWhere(ctx, a), []string{"jobs:inflight"}, "where the job is after the claim")
+	ctx.Equal(hStateWhere(ctx, a), []string{"jobs:inflight"}, "where the job is after the claim")
 }
 
 func CheckSingleReturn(ctx *harness.Ctx) {
-	a := stateJob(ctx, 1)
-	ctx.Equal(stateClaim(ctx, "w-1"), a, "the claim")
+	a := hStateJob(ctx, 1)
+	ctx.Equal(hStateClaim(ctx, "w-1"), a, "the claim")
 	ctx.Clock.Advance(61)
 	probe := ctx.Redis.After("jobs:inflight", func() any {
 		if ctx.Redis.Do("ZREM", "jobs:inflight", a).(int64) == 1 {
@@ -975,13 +975,13 @@ func CheckSingleReturn(ctx *harness.Ctx) {
 		}
 		return nil
 	})
-	_, err := returnExpired(stateBg)
+	_, err := returnExpired(hStateBg)
 	ctx.NoError(err, "returnExpired")
 	ctx.Assert(probe.Fired, "returnExpired never touched jobs:inflight")
-	copies := stateCopies(ctx, a)
+	copies := hStateCopies(ctx, a)
 	ctx.Assert(copies == 1, "two reapers returned one expired claim and jobs:queue now holds %s %d times: two workers will run it at once. Requeue a member only when your ZREM removed it", a, copies)
-	ctx.Equal(stateClaim(ctx, "w-2"), a, "the returned job must be claimable again; the claim")
-	b := stateJob(ctx, 2)
+	ctx.Equal(hStateClaim(ctx, "w-2"), a, "the returned job must be claimable again; the claim")
+	b := hStateJob(ctx, 2)
 	ctx.Clock.Advance(61)
 	var seen [][]string
 	watching := true
@@ -989,13 +989,13 @@ func CheckSingleReturn(ctx *harness.Ctx) {
 	watch = func() any {
 		// Where the job is right after each of the reaper's commands on jobs:inflight.
 		if watching {
-			seen = append(seen, stateWhere(ctx, a))
+			seen = append(seen, hStateWhere(ctx, a))
 			ctx.Redis.After("jobs:inflight", watch)
 		}
 		return nil
 	}
 	ctx.Redis.After("jobs:inflight", watch)
-	first, _ := returnExpired(stateBg)
+	first, _ := returnExpired(hStateBg)
 	watching = false
 	ctx.Equal(first, []string{a}, "one expired claim must be returned once")
 	lost := false
@@ -1004,27 +1004,27 @@ func CheckSingleReturn(ctx *harness.Ctx) {
 	}
 	ctx.Assert(!lost, "right after one of your commands on jobs:inflight, %s was on neither jobs:queue nor jobs:inflight (places seen %v): a reaper that dies there loses the job. Remove and requeue in one script", a, seen)
 	ctx.Equal(ctx.Redis.LRange("jobs:queue", 0, -1), []string{a, b}, "an expired claim goes back at the head, ahead of "+b+"; jobs:queue after the return")
-	second, _ := returnExpired(stateBg)
+	second, _ := returnExpired(hStateBg)
 	ctx.Equal(len(second), 0, "a second pass must find nothing to return; returned")
-	job := store.GetJob(stateBg, a)
+	job := store.GetJob(hStateBg, a)
 	ctx.Assert(job.State == "queued" && job.Worker == "" && job.DeadlineMs == 0, "a returned job must be queued with no worker and no deadline_ms, got %+v", job)
 }
 
 func CheckAckClearsClaim(ctx *harness.Ctx) {
-	a := stateJob(ctx, 1)
-	ctx.Equal(stateClaim(ctx, "w-1"), a, "the claim")
-	wrong, err := ack(stateBg, a, "w-2")
+	a := hStateJob(ctx, 1)
+	ctx.Equal(hStateClaim(ctx, "w-1"), a, "the claim")
+	wrong, err := ack(hStateBg, a, "w-2")
 	ctx.NoError(err, "ack")
 	ctx.Equal(wrong, false, "an ack from a worker that does not hold the claim")
-	right, err := ack(stateBg, a, "w-1")
+	right, err := ack(hStateBg, a, "w-1")
 	ctx.NoError(err, "ack")
 	ctx.Equal(right, true, "the ack of the worker holding the claim")
-	ctx.Equal(store.GetJob(stateBg, a).State, "completed", "the job's state after the ack")
+	ctx.Equal(store.GetJob(hStateBg, a).State, "completed", "the job's state after the ack")
 	score, ok := ctx.Redis.ZScore("jobs:inflight", a)
 	ctx.Assert(!ok, "after the ack %s is still in jobs:inflight (score %v): the reaper will return a finished job at its deadline", a, score)
 	ctx.Clock.Advance(61)
-	returnExpired(stateBg)
-	ctx.Equal(stateCopies(ctx, a), 0, "the completed job was put back on jobs:queue and will run again; its copies on the queue")
+	returnExpired(hStateBg)
+	ctx.Equal(hStateCopies(ctx, a), 0, "the completed job was put back on jobs:queue and will run again; its copies on the queue")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1039,13 +1039,13 @@ func CheckAckClearsClaim(ctx *harness.Ctx) {
 
 namespace {
 
-std::string stateJob(int n) {
+std::string hStateJob(int n) {
   const std::string job_id = "job-" + std::to_string(n);
   store::createJob(job_id, "t-1", "email.send", nlohmann::json{{"to", "ada@example.com"}, {"template", "welcome"}});
   return job_id;
 }
 
-std::vector<std::string> stateWhere(harness::Ctx& ctx, const std::string& job_id) {
+std::vector<std::string> hStateWhere(harness::Ctx& ctx, const std::string& job_id) {
   std::vector<std::string> places;
   const auto queued = ctx.Redis.LRange("jobs:queue", 0, -1);
   if (std::find(queued.begin(), queued.end(), job_id) != queued.end()) places.push_back("jobs:queue");
@@ -1053,7 +1053,7 @@ std::vector<std::string> stateWhere(harness::Ctx& ctx, const std::string& job_id
   return places;
 }
 
-long stateCopies(harness::Ctx& ctx, const std::string& job_id) {
+long hStateCopies(harness::Ctx& ctx, const std::string& job_id) {
   const auto queued = ctx.Redis.LRange("jobs:queue", 0, -1);
   return static_cast<long>(std::count(queued.begin(), queued.end(), job_id));
 }
@@ -1061,8 +1061,8 @@ long stateCopies(harness::Ctx& ctx, const std::string& job_id) {
 }  // namespace
 
 void CheckClaimDeadline(harness::Ctx& ctx) {
-  const std::string a = stateJob(1);
-  const std::string b = stateJob(2);
+  const std::string a = hStateJob(1);
+  const std::string b = hStateJob(2);
   ctx.Equal(claim("w-1").value_or(""), a, "the first claim must hand out the head of jobs:queue");
   const long long deadline = ctx.Clock.Now() + 60000;
   const auto score = ctx.Redis.ZScore("jobs:inflight", a);
@@ -1074,13 +1074,13 @@ void CheckClaimDeadline(harness::Ctx& ctx) {
 }
 
 void CheckAtomicClaim(harness::Ctx& ctx) {
-  const std::string a = stateJob(1);
+  const std::string a = hStateJob(1);
   bool fired = false;
   std::vector<std::string> places;
   std::map<std::string, std::string> record;
   ctx.Redis.After("jobs:queue", [&] {
     fired = true;
-    places = stateWhere(ctx, a);
+    places = hStateWhere(ctx, a);
     record = ctx.Redis.HGetAll("job:" + a);
   });
   ctx.Equal(claim("w-1").value_or(""), a, "the claim");
@@ -1089,11 +1089,11 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
   if (places == std::vector<std::string>{"jobs:inflight"}) {
     ctx.Assert(record["state"] == "running" && record["worker"] == "w-1", "right after your first command on jobs:queue, %s was in jobs:inflight but job:%s was %s by '%s': a worker that dies there leaves a claimed job the record calls queued. Write the record in the claim's script", a, a, record["state"], record["worker"]);
   }
-  ctx.Equal(stateWhere(ctx, a), std::vector<std::string>{"jobs:inflight"}, "where the job is after the claim");
+  ctx.Equal(hStateWhere(ctx, a), std::vector<std::string>{"jobs:inflight"}, "where the job is after the claim");
 }
 
 void CheckSingleReturn(harness::Ctx& ctx) {
-  const std::string a = stateJob(1);
+  const std::string a = hStateJob(1);
   ctx.Equal(claim("w-1").value_or(""), a, "the claim");
   ctx.Clock.Advance(61);
   bool fired = false;
@@ -1107,17 +1107,17 @@ void CheckSingleReturn(harness::Ctx& ctx) {
   });
   returnExpired();
   ctx.Assert(fired, "returnExpired never touched jobs:inflight");
-  const long copies = stateCopies(ctx, a);
+  const long copies = hStateCopies(ctx, a);
   ctx.Assert(copies == 1, "two reapers returned one expired claim and jobs:queue now holds %s %d times: two workers will run it at once. Requeue a member only when your ZREM removed it", a, copies);
   ctx.Equal(claim("w-2").value_or(""), a, "the returned job must be claimable again; the claim");
-  const std::string b = stateJob(2);
+  const std::string b = hStateJob(2);
   ctx.Clock.Advance(61);
   std::vector<std::vector<std::string>> seen;
   bool watching = true;
   std::function<void()> watch = [&] {
     // Where the job is right after each of the reaper's commands on jobs:inflight.
     if (!watching) return;
-    seen.push_back(stateWhere(ctx, a));
+    seen.push_back(hStateWhere(ctx, a));
     ctx.Redis.After("jobs:inflight", watch);
   };
   ctx.Redis.After("jobs:inflight", watch);
@@ -1138,7 +1138,7 @@ void CheckSingleReturn(harness::Ctx& ctx) {
 }
 
 void CheckAckClearsClaim(harness::Ctx& ctx) {
-  const std::string a = stateJob(1);
+  const std::string a = hStateJob(1);
   ctx.Equal(claim("w-1").value_or(""), a, "the claim");
   ctx.Equal(ack(a, "w-2"), false, "an ack from a worker that does not hold the claim");
   ctx.Equal(ack(a, "w-1"), true, "the ack of the worker holding the claim");
@@ -1147,7 +1147,7 @@ void CheckAckClearsClaim(harness::Ctx& ctx) {
   ctx.Assert(!score, "after the ack %s is still in jobs:inflight (score %v): the reaper will return a finished job at its deadline", a, score.value_or(0));
   ctx.Clock.Advance(61);
   returnExpired();
-  ctx.Equal(stateCopies(ctx, a), 0, "the completed job was put back on jobs:queue and will run again; its copies on the queue");
+  ctx.Equal(hStateCopies(ctx, a), 0, "the completed job was put back on jobs:queue and will run again; its copies on the queue");
 }
 `,
   },

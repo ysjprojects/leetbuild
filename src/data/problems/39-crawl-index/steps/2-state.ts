@@ -960,7 +960,7 @@ func hMustTake(ctx *harness.Ctx, host string, rate int) string {
 	return url
 }
 
-func hostQueue(ctx *harness.Ctx, host string) []string {
+func hHostQueue(ctx *harness.Ctx, host string) []string {
 	return ctx.Redis.LRange("frontier:"+kHStateJob+":"+host, 0, -1)
 }
 
@@ -970,7 +970,7 @@ func CheckPerHostQueue(ctx *harness.Ctx) {
 	hMustEnqueue(ctx, kHBlogHost, 2)
 	got := hMustTake(ctx, kHDocsHost, 60)
 	ctx.Equal(got, hPageURL(kHDocsHost, 1), "a take for %s must pop that host's URL, from frontier:%s:%s; take answered", kHDocsHost, kHStateJob, kHDocsHost)
-	ctx.Equal(hostQueue(ctx, kHBlogHost), []string{hPageURL(kHBlogHost, 1), hPageURL(kHBlogHost, 2)}, "frontier:%s:%s must hold the blog's two URLs in order", kHStateJob, kHBlogHost)
+	ctx.Equal(hHostQueue(ctx, kHBlogHost), []string{hPageURL(kHBlogHost, 1), hPageURL(kHBlogHost, 2)}, "frontier:%s:%s must hold the blog's two URLs in order", kHStateJob, kHBlogHost)
 	ctx.Equal(hMustTake(ctx, kHBlogHost, 60), hPageURL(kHBlogHost, 1), "a take for the blog must pop the blog's first URL")
 	ctx.Equal(ctx.Redis.ZCard("pending:"+kHStateJob), 3, "pending:%s must hold the 3 enqueued URLs", kHStateJob)
 }
@@ -995,7 +995,7 @@ func CheckAtomicTake(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Assert(len(taken) == 1, "one token was left and two workers took %q: the bucket was read, then written, with the other worker in between. Read, refill, spend and pop in one Lua script", taken)
-	ctx.Equal(hostQueue(ctx, kHBlogHost), []string{hPageURL(kHBlogHost, 2)}, "frontier:%s:%s must keep the one URL nobody had a token for", kHStateJob, kHBlogHost)
+	ctx.Equal(hHostQueue(ctx, kHBlogHost), []string{hPageURL(kHBlogHost, 2)}, "frontier:%s:%s must keep the one URL nobody had a token for", kHStateJob, kHBlogHost)
 }
 
 func CheckRefillCap(ctx *harness.Ctx) {
@@ -1068,7 +1068,7 @@ const std::string kHDocs = "docs.example.com";
 
 std::string hPageUrl(const std::string& host, int n) { return "https://" + host + "/p/" + std::to_string(n); }
 
-std::vector<std::string> hostQueue(harness::Ctx& ctx, const std::string& host) {
+std::vector<std::string> hHostQueue(harness::Ctx& ctx, const std::string& host) {
   return ctx.Redis.LRange("frontier:" + kHJob + ":" + host, 0, -1);
 }
 
@@ -1081,7 +1081,7 @@ void CheckPerHostQueue(harness::Ctx& ctx) {
   enqueue(kHJob, kHDocs, hPageUrl(kHDocs, 1));
   enqueue(kHJob, kHBlog, hPageUrl(kHBlog, 2));
   ctx.Equal(hTaken(take(kHJob, kHDocs, 60)), hPageUrl(kHDocs, 1), "a take for %s must pop that host's URL, from frontier:%s:%s; take answered", kHDocs, kHJob, kHDocs);
-  ctx.Equal(hostQueue(ctx, kHBlog), {hPageUrl(kHBlog, 1), hPageUrl(kHBlog, 2)}, "frontier:%s:%s must hold the blog's two URLs in order", kHJob, kHBlog);
+  ctx.Equal(hHostQueue(ctx, kHBlog), {hPageUrl(kHBlog, 1), hPageUrl(kHBlog, 2)}, "frontier:%s:%s must hold the blog's two URLs in order", kHJob, kHBlog);
   ctx.Equal(hTaken(take(kHJob, kHBlog, 60)), hPageUrl(kHBlog, 1), "a take for the blog must pop the blog's first URL");
   ctx.Equal(ctx.Redis.ZCard("pending:" + kHJob), 3, "pending:%s must hold the 3 enqueued URLs", kHJob);
 }
@@ -1103,7 +1103,7 @@ void CheckAtomicTake(harness::Ctx& ctx) {
     if (!u.empty()) both.push_back(u);
   }
   ctx.Assert(both.size() == 1, "one token was left and two workers took %q: the bucket was read, then written, with the other worker in between. Read, refill, spend and pop in one Lua script", both);
-  ctx.Equal(hostQueue(ctx, kHBlog), {hPageUrl(kHBlog, 2)}, "frontier:%s:%s must keep the one URL nobody had a token for", kHJob, kHBlog);
+  ctx.Equal(hHostQueue(ctx, kHBlog), {hPageUrl(kHBlog, 2)}, "frontier:%s:%s must keep the one URL nobody had a token for", kHJob, kHBlog);
 }
 
 void CheckRefillCap(harness::Ctx& ctx) {

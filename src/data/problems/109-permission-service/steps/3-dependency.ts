@@ -920,16 +920,16 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
 // enginePeer allows what is in allowed; a permission without a "kind:" prefix is unknown (InvalidArgument).
-type enginePeer struct {
+type HEnginePeer struct {
 	pb.UnimplementedPolicyEngineServer
 	allowed       map[string]bool
 	afterDecision func() // runs once, after the engine decided and before it answers
 }
 
-func (e *enginePeer) Check(_ context.Context, req *pb.CheckRequest) (*pb.Decision, error) {
+func (e *HEnginePeer) Check(_ context.Context, req *pb.CheckRequest) (*pb.Decision, error) {
 	if !strings.Contains(req.GetPermission(), ":") {
 		return nil, status.Errorf(codes.InvalidArgument, "unknown permission %q", req.GetPermission())
 	}
@@ -945,26 +945,26 @@ func (e *enginePeer) Check(_ context.Context, req *pb.CheckRequest) (*pb.Decisio
 	return &pb.Decision{Allowed: ok, Reason: reason}, nil
 }
 
-func startEngine(ctx *harness.Ctx) *enginePeer {
-	e := &enginePeer{allowed: map[string]bool{"ada|team:read|team:eng": true, "ada|team:write|team:eng": true}}
+func hStartEngine(ctx *harness.Ctx) *HEnginePeer {
+	e := &HEnginePeer{allowed: map[string]bool{"ada|team:read|team:eng": true, "ada|team:write|team:eng": true}}
 	pb.RegisterPolicyEngineServer(ctx.GRPC.Server(""), e)
 	return e
 }
 
-func mustAllow(ctx *harness.Ctx, permission, why string) {
-	ok, err := authorize(clientBg, "ada", permission, "team:eng")
+func hMustAllow(ctx *harness.Ctx, permission, why string) {
+	ok, err := authorize(hClientBg, "ada", permission, "team:eng")
 	ctx.NoError(err, "%s: authorize failed", why)
 	ctx.Equal(ok, true, "%s: ada must be allowed %s at team:eng; allowed", why, permission)
 }
 
-func mustBeUnavailable(ctx *harness.Ctx, permission, why string) {
-	ok, err := authorize(clientBg, "ada", permission, "team:eng")
+func hMustBeUnavailable(ctx *harness.Ctx, permission, why string) {
+	ok, err := authorize(hClientBg, "ada", permission, "team:eng")
 	ctx.Assert(errors.Is(err, ErrPolicyUnavailable), "%s: authorize answered %v (error %v), expected an error wrapping ErrPolicyUnavailable (the route answers 503): nothing verified this request", why, ok, err)
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	startEngine(ctx)
-	mustAllow(ctx, "team:read", "with a healthy engine")
+	hStartEngine(ctx)
+	hMustAllow(ctx, "team:read", "with a healthy engine")
 	for _, call := range ctx.GRPC.CallsTo("Check", "") {
 		ctx.Assert(call.HasDeadline(), "a Check call carries no deadline: a stalled engine holds the request open as long as it stalls")
 		ctx.Assert(350*time.Millisecond <= call.Timeout && call.Timeout <= 450*time.Millisecond, "a Check call carries a %v deadline, expected 400 ms", call.Timeout)
@@ -972,7 +972,7 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.GRPC.SetLatency("Check", 5.0, "")
 	before := ctx.Clock.Now()
 	callsBefore := len(ctx.GRPC.CallsTo("Check", ""))
-	mustBeUnavailable(ctx, "team:write", "with the engine taking 5 s per call")
+	hMustBeUnavailable(ctx, "team:write", "with the engine taking 5 s per call")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	stalled := ctx.GRPC.CallsTo("Check", "")[callsBefore:]
 	ctx.Equal(len(stalled), 2, "a stalled engine must be asked twice, DEADLINE_EXCEEDED is a transport failure retried once; the calls")
@@ -983,52 +983,52 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckRetryTransient(ctx *harness.Ctx) {
-	startEngine(ctx)
+	hStartEngine(ctx)
 	ctx.GRPC.Fail("Check", codes.Unavailable, "engine restarting", 1, "")
-	mustAllow(ctx, "team:read", "one UNAVAILABLE is a transport failure, the second attempt gets the engine's answer")
+	hMustAllow(ctx, "team:read", "one UNAVAILABLE is a transport failure, the second attempt gets the engine's answer")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Check", "")), 2, "one UNAVAILABLE must take two calls; the calls")
 	before := len(ctx.GRPC.CallsTo("Check", ""))
-	ok, err := authorize(clientBg, "ada", "deploy", "team:eng")
+	ok, err := authorize(hClientBg, "ada", "deploy", "team:eng")
 	ctx.Assert(!ok && err == nil, "an unknown permission (InvalidArgument) answered %v, %v, expected a denial", ok, err)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Check", ""))-before, 1, "an unknown permission is the engine's answer, not a transport failure; the calls it took")
 	for _, code := range []codes.Code{codes.PermissionDenied, codes.NotFound, codes.FailedPrecondition, codes.Internal} {
 		ctx.GRPC.Fail("Check", code, "the engine refused", 1, "")
 		before = len(ctx.GRPC.CallsTo("Check", ""))
-		ok, err = authorize(clientBg, "ada", "team:write", "team:eng")
+		ok, err = authorize(hClientBg, "ada", "team:write", "team:eng")
 		calls := len(ctx.GRPC.CallsTo("Check", "")) - before
 		ctx.Assert(!ok && err == nil && calls == 1, "the engine answering %v gave %v, %v after %d calls, expected a denial after 1: only Unavailable and DeadlineExceeded are transport failures", code, ok, err, calls)
 	}
 	ctx.GRPC.Fail("Check", codes.Unavailable, "engine down", 10, "")
 	before = len(ctx.GRPC.CallsTo("Check", ""))
-	authorize(clientBg, "ada", "team:write", "team:eng")
+	authorize(hClientBg, "ada", "team:write", "team:eng")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Check", ""))-before, 2, "an engine that stays UNAVAILABLE must be asked maxAttempts = 2 times; the calls")
 }
 
 func CheckFailClosed(ctx *harness.Ctx) {
-	startEngine(ctx)
-	mustAllow(ctx, "team:read", "with a healthy engine")
+	hStartEngine(ctx)
+	hMustAllow(ctx, "team:read", "with a healthy engine")
 	ctx.Clock.Advance(61)                     // the 60 s allow has lapsed
 	ctx.Redis.Do("INCR", "perm:grant_version") // and a grant changed since
 	ctx.GRPC.Fail("Check", codes.Unavailable, "engine down", 10, "")
-	mustBeUnavailable(ctx, "team:read", "with the engine down after the cached allow lapsed")
+	hMustBeUnavailable(ctx, "team:read", "with the engine down after the cached allow lapsed")
 }
 
 func CheckCachedAllowVersion(ctx *harness.Ctx) {
-	e := startEngine(ctx)
-	mustAllow(ctx, "team:write", "with a healthy engine")
-	mustAllow(ctx, "team:write", "the same check again")
+	e := hStartEngine(ctx)
+	hMustAllow(ctx, "team:write", "with a healthy engine")
+	hMustAllow(ctx, "team:write", "the same check again")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Check", "")), 1, "the same check at the same grant version must be served from the cached allow; the calls")
 	delete(e.allowed, "ada|team:write|team:eng")
 	ctx.Redis.Do("INCR", "perm:grant_version") // ada's team_admin grant was revoked
-	ok, err := authorize(clientBg, "ada", "team:write", "team:eng")
+	ok, err := authorize(hClientBg, "ada", "team:write", "team:eng")
 	ctx.Assert(!ok && err == nil, "after ada's grant was revoked (perm:grant_version moved) authorize answered %v, %v from the cached allow: an allow counts only at the grant version it was given at", ok, err)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Check", "")), 2, "after the grant version moved the engine must be asked again; the calls")
 	e.afterDecision = func() { // ada's team:read is revoked while the engine's allow is on its way back
 		delete(e.allowed, "ada|team:read|team:eng")
 		ctx.Redis.Do("INCR", "perm:grant_version")
 	}
-	authorize(clientBg, "ada", "team:read", "team:eng")
-	ok, err = authorize(clientBg, "ada", "team:read", "team:eng")
+	authorize(hClientBg, "ada", "team:read", "team:eng")
+	ok, err = authorize(hClientBg, "ada", "team:read", "team:eng")
 	ctx.Assert(!ok && err == nil, "a revocation committed while the engine's allow was in flight, and the next check answered %v, %v: the allow must carry the version read before the call, so it is already stale", ok, err)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Check", "")), 4, "after a revocation committed during the call the engine must be asked again; the calls in all")
 	stamped := []string{}
@@ -1055,7 +1055,7 @@ func CheckCachedAllowVersion(ctx *harness.Ctx) {
 namespace {
 
 // Allows what is in allowed; a permission without a "kind:" prefix is unknown (INVALID_ARGUMENT).
-class EnginePeer final : public policyd::PolicyEngine::Service {
+class HEnginePeer final : public policyd::PolicyEngine::Service {
  public:
   std::set<std::string> allowed = {"ada|team:read|team:eng", "ada|team:write|team:eng"};
   std::function<void()> after_decision;  // runs once, after the engine decided and before it answers
@@ -1075,15 +1075,15 @@ class EnginePeer final : public policyd::PolicyEngine::Service {
   }
 };
 
-EnginePeer& startEngine(harness::Ctx& ctx) {
-  static EnginePeer* peer = nullptr;
+HEnginePeer& hStartEngine(harness::Ctx& ctx) {
+  static HEnginePeer* peer = nullptr;
   delete peer;
-  peer = new EnginePeer;
+  peer = new HEnginePeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-void mustAllow(harness::Ctx& ctx, const std::string& permission, const std::string& why) {
+void hMustAllow(harness::Ctx& ctx, const std::string& permission, const std::string& why) {
   bool ok = false;
   try {
     ok = authorize("ada", permission, "team:eng");
@@ -1093,7 +1093,7 @@ void mustAllow(harness::Ctx& ctx, const std::string& permission, const std::stri
   ctx.Equal(ok, true, "%s: ada must be allowed %s at team:eng; allowed", why, permission);
 }
 
-void mustBeUnavailable(harness::Ctx& ctx, const std::string& permission, const std::string& why) {
+void hMustBeUnavailable(harness::Ctx& ctx, const std::string& permission, const std::string& why) {
   bool ok = false;
   try {
     ok = authorize("ada", permission, "team:eng");
@@ -1106,8 +1106,8 @@ void mustBeUnavailable(harness::Ctx& ctx, const std::string& permission, const s
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  startEngine(ctx);
-  mustAllow(ctx, "team:read", "with a healthy engine");
+  hStartEngine(ctx);
+  hMustAllow(ctx, "team:read", "with a healthy engine");
   for (const auto& call : ctx.GRPC.CallsTo("Check")) {
     ctx.Assert(call.HasDeadline(), "a Check call carries no deadline: a stalled engine holds the request open as long as it stalls");
     ctx.Assert(0.35 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.45, "a Check call carries a %v s deadline, expected 400 ms", call.TimeoutSeconds());
@@ -1115,7 +1115,7 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.GRPC.SetLatency("Check", 5.0);
   const int64_t before = ctx.Clock.Now();
   const size_t calls_before = ctx.GRPC.CallsTo("Check").size();
-  mustBeUnavailable(ctx, "team:write", "with the engine taking 5 s per call");
+  hMustBeUnavailable(ctx, "team:write", "with the engine taking 5 s per call");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   const auto calls = ctx.GRPC.CallsTo("Check");
   ctx.Equal(calls.size() - calls_before, 2, "a stalled engine must be asked twice, DEADLINE_EXCEEDED is a transport failure retried once; the calls");
@@ -1127,9 +1127,9 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckRetryTransient(harness::Ctx& ctx) {
-  startEngine(ctx);
+  hStartEngine(ctx);
   ctx.GRPC.Fail("Check", grpc::StatusCode::UNAVAILABLE, "engine restarting", 1);
-  mustAllow(ctx, "team:read", "one UNAVAILABLE is a transport failure, the second attempt gets the engine's answer");
+  hMustAllow(ctx, "team:read", "one UNAVAILABLE is a transport failure, the second attempt gets the engine's answer");
   ctx.Equal(ctx.GRPC.CallsTo("Check").size(), 2, "one UNAVAILABLE must take two calls; the calls");
   size_t before = ctx.GRPC.CallsTo("Check").size();
   bool ok = true;
@@ -1168,18 +1168,18 @@ void CheckRetryTransient(harness::Ctx& ctx) {
 }
 
 void CheckFailClosed(harness::Ctx& ctx) {
-  startEngine(ctx);
-  mustAllow(ctx, "team:read", "with a healthy engine");
+  hStartEngine(ctx);
+  hMustAllow(ctx, "team:read", "with a healthy engine");
   ctx.Clock.Advance(61);                      // the 60 s allow has lapsed
   ctx.Redis.Do("INCR", "perm:grant_version");  // and a grant changed since
   ctx.GRPC.Fail("Check", grpc::StatusCode::UNAVAILABLE, "engine down", 10);
-  mustBeUnavailable(ctx, "team:read", "with the engine down after the cached allow lapsed");
+  hMustBeUnavailable(ctx, "team:read", "with the engine down after the cached allow lapsed");
 }
 
 void CheckCachedAllowVersion(harness::Ctx& ctx) {
-  EnginePeer& engine_peer = startEngine(ctx);
-  mustAllow(ctx, "team:write", "with a healthy engine");
-  mustAllow(ctx, "team:write", "the same check again");
+  HEnginePeer& engine_peer = hStartEngine(ctx);
+  hMustAllow(ctx, "team:write", "with a healthy engine");
+  hMustAllow(ctx, "team:write", "the same check again");
   ctx.Equal(ctx.GRPC.CallsTo("Check").size(), 1, "the same check at the same grant version must be served from the cached allow; the calls");
   engine_peer.allowed.erase("ada|team:write|team:eng");
   ctx.Redis.Do("INCR", "perm:grant_version");  // ada's team_admin grant was revoked

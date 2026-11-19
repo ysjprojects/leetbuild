@@ -852,14 +852,14 @@ import (
 )
 
 const (
-	eventsTopic = "rerank.done"
-	eventsQ1    = "how do I reset my router password"
-	eventsQ2    = "router firmware update steps"
+	kHEventsTopic = "rerank.done"
+	kHEventsQ1    = "how do I reset my router password"
+	kHEventsQ2    = "router firmware update steps"
 )
 
-var eventsPassages = []string{"Hold the reset button for ten seconds.", "Router firmware release notes", "Billing questions", "Admin page password rules"}
+var hEventsPassages = []string{"Hold the reset button for ten seconds.", "Router firmware release notes", "Billing questions", "Admin page password rules"}
 
-func eventsOutcome(query, tenant string, scores ...float64) outcome.RerankOutcome {
+func hEventsOutcome(query, tenant string, scores ...float64) outcome.RerankOutcome {
 	if scores == nil {
 		scores = []float64{0.05, 0.15, -1, 1.0}
 	}
@@ -869,16 +869,16 @@ func eventsOutcome(query, tenant string, scores ...float64) outcome.RerankOutcom
 			ptrs[i] = &scores[i]
 		}
 	}
-	return outcome.RerankOutcome{Tenant: tenant, Query: query, Passages: append([]string{}, eventsPassages...), Scores: ptrs, ModelVersion: "xenc-v7", LatencyMs: 84}
+	return outcome.RerankOutcome{Tenant: tenant, Query: query, Passages: append([]string{}, hEventsPassages...), Scores: ptrs, ModelVersion: "xenc-v7", LatencyMs: 84}
 }
 
-func eventsPublish(ctx *harness.Ctx, o outcome.RerankOutcome) bool {
+func hEventsPublish(ctx *harness.Ctx, o outcome.RerankOutcome) bool {
 	ok, err := publishOutcome(context.Background(), o)
 	ctx.NoError(err, "publishOutcome")
 	return ok
 }
 
-func eventsOutbox(ctx *harness.Ctx) []outbox.Row {
+func hEventsOutbox(ctx *harness.Ctx) []outbox.Row {
 	var rows []outbox.Row
 	for _, text := range ctx.Redis.LRange("rerank:outbox", 0, -1) {
 		var row outbox.Row
@@ -889,23 +889,23 @@ func eventsOutbox(ctx *harness.Ctx) []outbox.Row {
 }
 
 func CheckFingerprintKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsOutcome(eventsQ1, "t-acme"))
-	eventsPublish(ctx, eventsOutcome(eventsQ2, "t-acme"))
-	eventsPublish(ctx, eventsOutcome(eventsQ1, "t-globex"))
+	hEventsPublish(ctx, hEventsOutcome(kHEventsQ1, "t-acme"))
+	hEventsPublish(ctx, hEventsOutcome(kHEventsQ2, "t-acme"))
+	hEventsPublish(ctx, hEventsOutcome(kHEventsQ1, "t-globex"))
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three outcomes must produce three records on rerank.done; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{config.Fingerprint(eventsQ1), config.Fingerprint(eventsQ2), config.Fingerprint(eventsQ1)}, "the records must be keyed by the query fingerprints (keyed by tenant, one query's events scatter)")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{config.Fingerprint(kHEventsQ1), config.Fingerprint(kHEventsQ2), config.Fingerprint(kHEventsQ1)}, "the records must be keyed by the query fingerprints (keyed by tenant, one query's events scatter)")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both reranks of one query must land on one partition; the partitions")
 }
 
 func CheckNoContent(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsOutcome(eventsQ1, "t-acme"))
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	eventsPublish(ctx, eventsOutcome(eventsQ2, "t-acme"))
+	hEventsPublish(ctx, hEventsOutcome(kHEventsQ1, "t-acme"))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	hEventsPublish(ctx, hEventsOutcome(kHEventsQ2, "t-acme"))
 	ctx.Settle()
-	texts := append([]string{eventsQ1, eventsQ2}, eventsPassages...)
-	for _, value := range ctx.Kafka.Values(eventsTopic) {
+	texts := append([]string{kHEventsQ1, kHEventsQ2}, hEventsPassages...)
+	for _, value := range ctx.Kafka.Values(kHEventsTopic) {
 		var event map[string]any
 		json.Unmarshal([]byte(value), &event)
 		_, hasQuery := event["query"]
@@ -920,13 +920,13 @@ func CheckNoContent(ctx *harness.Ctx) {
 			ctx.Assert(!strings.Contains(row, text), "the outbox row carries tenant text %q: %s", text, row)
 		}
 	}
-	ctx.Assert(len(ctx.Kafka.Records(eventsTopic)) > 0, "the healthy outcome must still be published")
+	ctx.Assert(len(ctx.Kafka.Records(kHEventsTopic)) > 0, "the healthy outcome must still be published")
 }
 
 func CheckScoreHistogram(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsOutcome(eventsQ1, "t-acme"))
+	hEventsPublish(ctx, hEventsOutcome(kHEventsQ1, "t-acme"))
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one outcome must produce one record; the records")
 	var event struct {
 		QueryFingerprint string  \`json:"query_fingerprint"\`
@@ -938,12 +938,12 @@ func CheckScoreHistogram(ctx *harness.Ctx) {
 		ScoreHistogram   []int   \`json:"score_histogram"\`
 	}
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &event), "the event must be JSON")
-	ctx.Assert(event.QueryFingerprint == config.Fingerprint(eventsQ1) && event.Tenant == "t-acme" && event.ModelVersion == "xenc-v7" && event.CandidateCount == 4 && event.LatencyMs == 84, "the event must carry query_fingerprint, tenant, model_version, candidate_count 4 and latency_ms 84, got %s", values[0])
+	ctx.Assert(event.QueryFingerprint == config.Fingerprint(kHEventsQ1) && event.Tenant == "t-acme" && event.ModelVersion == "xenc-v7" && event.CandidateCount == 4 && event.LatencyMs == 84, "the event must carry query_fingerprint, tenant, model_version, candidate_count 4 and latency_ms 84, got %s", values[0])
 	ctx.Assert(event.UnscoredCount != nil && *event.UnscoredCount == 1, "the event's unscored_count must be 1 (one passage unscored), got %s", values[0])
 	ctx.Equal(event.ScoreHistogram, []int{1, 1, 0, 0, 0, 0, 0, 0, 0, 1}, "the event's score_histogram for scores 0.05, 0.15, unscored, 1.0")
-	eventsPublish(ctx, eventsOutcome(eventsQ2, "t-acme", 0.0, 0.3, -1, 0.1))
+	hEventsPublish(ctx, hEventsOutcome(kHEventsQ2, "t-acme", 0.0, 0.3, -1, 0.1))
 	ctx.Settle()
-	values = ctx.Kafka.Values(eventsTopic)
+	values = ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 2, "two outcomes must produce two records; the records")
 	var edge struct {
 		UnscoredCount  *int  \`json:"unscored_count"\`
@@ -955,31 +955,31 @@ func CheckScoreHistogram(ctx *harness.Ctx) {
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, eventsOutcome(eventsQ1, "t-acme"))
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish(ctx, hEventsOutcome(kHEventsQ1, "t-acme"))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the outcome twice (enable.idempotence); the records")
-	eventsPublish(ctx, eventsOutcome(eventsQ2, "t-acme"))
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the outcome twice (enable.idempotence); the records")
+	hEventsPublish(ctx, hEventsOutcome(kHEventsQ2, "t-acme"))
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsPublish(ctx, eventsOutcome(eventsQ1, "t-acme"))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok := hEventsPublish(ctx, hEventsOutcome(kHEventsQ1, "t-acme"))
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused the produce: without an outbox row the outcome is gone; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == config.Fingerprint(eventsQ1) && rows[0].Payload["query_fingerprint"] == config.Fingerprint(eventsQ1), "the outbox row is %v, expected the topic, the query fingerprint as key and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == config.Fingerprint(kHEventsQ1) && rows[0].Payload["query_fingerprint"] == config.Fingerprint(kHEventsQ1), "the outbox row is %v, expected the topic, the query fingerprint as key and the payload", rows[0])
 	ctx.Equal(ok, false, "publishOutcome's result after a refused produce")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsPublish(ctx, eventsOutcome(eventsQ2, "t-acme"))
+	ok = hEventsPublish(ctx, hEventsOutcome(kHEventsQ2, "t-acme"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishOutcome waited %.1f s for a broker that does not answer: wait for the delivery report at most 2 s", waited)
-	rows = eventsOutbox(ctx)
-	ctx.Assert(len(rows) == 2 && rows[1].Key == config.Fingerprint(eventsQ2), "no acknowledgement within the window and the outbox holds %v", rows)
+	rows = hEventsOutbox(ctx)
+	ctx.Assert(len(rows) == 2 && rows[1].Key == config.Fingerprint(kHEventsQ2), "no acknowledgement within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishOutcome's result without an acknowledgement")
 }
 `,
@@ -994,17 +994,17 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "rerank.done";
-const std::string kQ1 = "how do I reset my router password";
-const std::string kQ2 = "router firmware update steps";
-const std::vector<std::string> kPassages = {"Hold the reset button for ten seconds.", "Router firmware release notes", "Billing questions", "Admin page password rules"};
+const std::string kHEventsTopic = "rerank.done";
+const std::string kHQ1 = "how do I reset my router password";
+const std::string kHQ2 = "router firmware update steps";
+const std::vector<std::string> kHPassages = {"Hold the reset button for ten seconds.", "Router firmware release notes", "Billing questions", "Admin page password rules"};
 
-outcome::RerankOutcome eventsOutcome(const std::string& query, const std::string& tenant = "t-acme",
+outcome::RerankOutcome hEventsOutcome(const std::string& query, const std::string& tenant = "t-acme",
                                      std::vector<std::optional<double>> scores = {0.05, 0.15, std::nullopt, 1.0}) {
-  return outcome::RerankOutcome{tenant, query, kPassages, std::move(scores), "xenc-v7", 84};
+  return outcome::RerankOutcome{tenant, query, kHPassages, std::move(scores), "xenc-v7", 84};
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("rerank:outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -1021,25 +1021,25 @@ std::string hField(const nlohmann::json& j, const std::string& name) {
 }  // namespace
 
 void CheckFingerprintKey(harness::Ctx& ctx) {
-  publishOutcome(eventsOutcome(kQ1, "t-acme"));
-  publishOutcome(eventsOutcome(kQ2, "t-acme"));
-  publishOutcome(eventsOutcome(kQ1, "t-globex"));
+  publishOutcome(hEventsOutcome(kHQ1, "t-acme"));
+  publishOutcome(hEventsOutcome(kHQ2, "t-acme"));
+  publishOutcome(hEventsOutcome(kHQ1, "t-globex"));
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three outcomes must produce three records on rerank.done; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {config::fingerprint(kQ1), config::fingerprint(kQ2), config::fingerprint(kQ1)},
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {config::fingerprint(kHQ1), config::fingerprint(kHQ2), config::fingerprint(kHQ1)},
             "the records must be keyed by the query fingerprints (keyed by tenant, one query's events scatter)");
   ctx.Equal(records[0].Partition, records[2].Partition, "both reranks of one query must land on one partition; the partitions");
 }
 
 void CheckNoContent(harness::Ctx& ctx) {
-  publishOutcome(eventsOutcome(kQ1));
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  publishOutcome(eventsOutcome(kQ2));
+  publishOutcome(hEventsOutcome(kHQ1));
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  publishOutcome(hEventsOutcome(kHQ2));
   ctx.Settle();
-  std::vector<std::string> texts = {kQ1, kQ2};
-  texts.insert(texts.end(), kPassages.begin(), kPassages.end());
-  for (const auto& value : ctx.Kafka.Values(kEventsTopic)) {
+  std::vector<std::string> texts = {kHQ1, kHQ2};
+  texts.insert(texts.end(), kHPassages.begin(), kHPassages.end());
+  for (const auto& value : ctx.Kafka.Values(kHEventsTopic)) {
     const auto event = nlohmann::json::parse(value, nullptr, false);
     ctx.Assert(!event.is_object() || (!event.contains("query") && !event.contains("passages")), "the event has a query or passages field: %s; the topic is retained and replicated, numbers only", value);
     for (const auto& text : texts) ctx.Assert(value.find(text) == std::string::npos, "the event carries tenant text %q: %s", text, value);
@@ -1047,25 +1047,25 @@ void CheckNoContent(harness::Ctx& ctx) {
   for (const auto& row : ctx.Redis.LRange("rerank:outbox", 0, -1)) {
     for (const auto& text : texts) ctx.Assert(row.find(text) == std::string::npos, "the outbox row carries tenant text %q: %s", text, row);
   }
-  ctx.Assert(!ctx.Kafka.Records(kEventsTopic).empty(), "the healthy outcome must still be published");
+  ctx.Assert(!ctx.Kafka.Records(kHEventsTopic).empty(), "the healthy outcome must still be published");
 }
 
 void CheckScoreHistogram(harness::Ctx& ctx) {
-  publishOutcome(eventsOutcome(kQ1));
+  publishOutcome(hEventsOutcome(kHQ1));
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one outcome must produce one record; the records");
   const auto event = nlohmann::json::parse(values[0], nullptr, false);
   ctx.Assert(event.is_object(), "the event must be JSON, got %s", values[0]);
-  ctx.Assert(hField(event, "query_fingerprint") == config::fingerprint(kQ1) && hField(event, "tenant") == "t-acme" && hField(event, "model_version") == "xenc-v7" &&
+  ctx.Assert(hField(event, "query_fingerprint") == config::fingerprint(kHQ1) && hField(event, "tenant") == "t-acme" && hField(event, "model_version") == "xenc-v7" &&
                  event.value("candidate_count", -1) == 4 && event.value("latency_ms", -1) == 84,
              "the event must carry query_fingerprint, tenant, model_version, candidate_count 4 and latency_ms 84, got %s", values[0]);
   ctx.Equal(event.value("unscored_count", -1), 1, "the event's unscored_count (one passage unscored)");
   ctx.Equal(event.contains("score_histogram") ? event["score_histogram"] : nlohmann::json(), nlohmann::json({1, 1, 0, 0, 0, 0, 0, 0, 0, 1}),
             "the event's score_histogram for scores 0.05, 0.15, unscored, 1.0");
-  publishOutcome(eventsOutcome(kQ2, "t-acme", {0.0, 0.3, std::nullopt, 0.1}));
+  publishOutcome(hEventsOutcome(kHQ2, "t-acme", {0.0, 0.3, std::nullopt, 0.1}));
   ctx.Settle();
-  const auto both = ctx.Kafka.Values(kEventsTopic);
+  const auto both = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(both.size(), 2, "two outcomes must produce two records; the records");
   const auto edge = both.size() == 2 ? nlohmann::json::parse(both[1], nullptr, false) : nlohmann::json();
   ctx.Equal(edge.is_object() ? edge.value("unscored_count", -1) : -1, 1, "scores 0.0, 0.3, unscored, 0.1 have one unscored passage (a score of 0.0 is a score); the event's unscored_count");
@@ -1074,33 +1074,33 @@ void CheckScoreHistogram(harness::Ctx& ctx) {
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishOutcome(eventsOutcome(kQ1));
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishOutcome(hEventsOutcome(kHQ1));
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the outcome twice (enable.idempotence); the records");
-  publishOutcome(eventsOutcome(kQ2));
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the outcome twice (enable.idempotence); the records");
+  publishOutcome(hEventsOutcome(kHQ2));
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = publishOutcome(eventsOutcome(kQ1));
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  bool ok = publishOutcome(hEventsOutcome(kHQ1));
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused the produce: without an outbox row the outcome is gone; the rows");
-  ctx.Assert(!rows.empty() && hField(rows[0], "topic") == kEventsTopic && hField(rows[0], "key") == config::fingerprint(kQ1) && rows[0].contains("payload") &&
-                 hField(rows[0]["payload"], "query_fingerprint") == config::fingerprint(kQ1),
+  ctx.Assert(!rows.empty() && hField(rows[0], "topic") == kHEventsTopic && hField(rows[0], "key") == config::fingerprint(kHQ1) && rows[0].contains("payload") &&
+                 hField(rows[0]["payload"], "query_fingerprint") == config::fingerprint(kHQ1),
              "the outbox row is %s, expected the topic, the query fingerprint as key and the payload", rows.empty() ? "none" : rows[0].dump());
   ctx.Equal(ok, false, "publishOutcome's result after a refused produce");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publishOutcome(eventsOutcome(kQ2));
+  ok = publishOutcome(hEventsOutcome(kHQ2));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publishOutcome waited %.1f s for a broker that does not answer: wait for the delivery report at most 2 s", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && hField(rows[1], "key") == config::fingerprint(kQ2), "no acknowledgement within the window and the outbox holds %d rows", rows.size());
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && hField(rows[1], "key") == config::fingerprint(kHQ2), "no acknowledgement within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishOutcome's result without an acknowledgement");
 }
 `,

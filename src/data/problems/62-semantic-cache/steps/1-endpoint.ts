@@ -1007,45 +1007,45 @@ import (
 )
 
 const (
-	apiMV     = "2024-06"
-	apiAnswer = "Refunds take five business days."
+	kHApiMV     = "2024-06"
+	kHApiAnswer = "Refunds take five business days."
 )
 
 var (
-	apiV          = []float64{1, 0, 0, 0}
-	apiNear       = []float64{0.9, 0.1, 0, 0}       // cosine 0.99388 to apiV
-	apiSoSo       = []float64{0.6, 0.8, 0, 0}       // cosine 0.6 to apiV
-	apiUnderFloor = []float64{0.815, 0.5795, 0, 0}  // cosine 0.81498 to apiV
-	apiOverFloor  = []float64{0.825, 0.5651, 0, 0}  // cosine 0.82502 to apiV
-	apiUnderCap   = []float64{0.9895, 0.1446, 0, 0} // cosine 0.98949 to apiV
-	apiOverCap    = []float64{0.9905, 0.1375, 0, 0} // cosine 0.99050 to apiV
+	hApiV          = []float64{1, 0, 0, 0}
+	hApiNear       = []float64{0.9, 0.1, 0, 0}       // cosine 0.99388 to apiV
+	hApiSoSo       = []float64{0.6, 0.8, 0, 0}       // cosine 0.6 to apiV
+	hApiUnderFloor = []float64{0.815, 0.5795, 0, 0}  // cosine 0.81498 to apiV
+	hApiOverFloor  = []float64{0.825, 0.5651, 0, 0}  // cosine 0.82502 to apiV
+	hApiUnderCap   = []float64{0.9895, 0.1446, 0, 0} // cosine 0.98949 to apiV
+	hApiOverCap    = []float64{0.9905, 0.1375, 0, 0} // cosine 0.99050 to apiV
 	// apiEvents records every result the lookup published, in order.
-	apiEvents []ResultEvent
+	hApiEvents []ResultEvent
 )
 
-type apiSeedOptions struct {
+type HApiSeedOptions struct {
 	answer         string
 	age, expiresIn float64
 }
 
 // apiSeedEntry writes an entry as the store writes it, from another worker: created age seconds ago, no TTL on the key.
-func apiSeedEntry(ctx *harness.Ctx, entryID string, embedding []float64, o apiSeedOptions) {
+func hApiSeedEntry(ctx *harness.Ctx, entryID string, embedding []float64, o HApiSeedOptions) {
 	if o.expiresIn == 0 {
 		o.expiresIn = 86400
 	}
 	if o.answer == "" {
-		o.answer = apiAnswer
+		o.answer = kHApiAnswer
 	}
-	key := fmt.Sprintf("entry:acme:%s:%s", apiMV, entryID)
+	key := fmt.Sprintf("entry:acme:%s:%s", kHApiMV, entryID)
 	now := float64(ctx.Clock.Now()) / 1000
 	vec, _ := json.Marshal(embedding)
 	ctx.Redis.Do("HSET", key, "embedding", string(vec), "answer", o.answer, "created_at", now-o.age, "expires_at", now+o.expiresIn, "policy_version", "2024-06-1")
-	ctx.Redis.Do("SADD", "semantic:acme:"+apiMV, key)
+	ctx.Redis.Do("SADD", "semantic:acme:"+kHApiMV, key)
 }
 
 // apiNeighbours stands in for the store (step 2) and the result stream (step 4): the nearest entry
 // in the tenant's set, expired or not, and a publish that records the event.
-func apiNeighbours(ctx *harness.Ctx) *harness.HTTP {
+func hApiNeighbours(ctx *harness.Ctx) *harness.HTTP {
 	searchEntries = func(_ context.Context, tenant, modelVersion string, embedding []float64, threshold float64) (*Entry, error) {
 		var best *Entry
 		for _, key := range ctx.Redis.SMembers("semantic:" + tenant + ":" + modelVersion) {
@@ -1065,9 +1065,9 @@ func apiNeighbours(ctx *harness.Ctx) *harness.HTTP {
 		}
 		return best, nil
 	}
-	apiEvents = nil
+	hApiEvents = nil
 	publishResult = func(_ context.Context, tenant string, result ResultEvent) error {
-		apiEvents = append(apiEvents, result)
+		hApiEvents = append(hApiEvents, result)
 		return nil
 	}
 	mux := http.NewServeMux()
@@ -1075,21 +1075,21 @@ func apiNeighbours(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func apiLookup(c *harness.HTTP, embedding []float64, threshold float64, header ...string) *harness.Response {
-	return c.Post("/v1/semantic-cache/lookup", map[string]any{"query_embedding": embedding, "model_version": apiMV, "threshold": threshold}, header...)
+func hApiLookup(c *harness.HTTP, embedding []float64, threshold float64, header ...string) *harness.Response {
+	return c.Post("/v1/semantic-cache/lookup", map[string]any{"query_embedding": embedding, "model_version": kHApiMV, "threshold": threshold}, header...)
 }
 
-func apiBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hApiBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the lookup must answer a JSON object, got %s", r.Text())
 	return body
 }
 
 // apiServed is the answer a lookup of apiV served, or "" when it served nothing.
-func apiServed(ctx *harness.Ctx, c *harness.HTTP, threshold float64) string {
-	r := apiLookup(c, apiV, threshold, "X-Tenant-Id", "acme")
+func hApiServed(ctx *harness.Ctx, c *harness.HTTP, threshold float64) string {
+	r := hApiLookup(c, hApiV, threshold, "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "lookup (%s)", r.Text())
-	body := apiBody(ctx, r)
+	body := hApiBody(ctx, r)
 	answer, _ := body["answer"].(string)
 	if body["hit"] == false {
 		return ""
@@ -1098,51 +1098,51 @@ func apiServed(ctx *harness.Ctx, c *harness.HTTP, threshold float64) string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiNeighbours(ctx)
-	apiSeedEntry(ctx, "e1", apiV, apiSeedOptions{})
-	r := apiLookup(c, apiV, 0.9, "X-Tenant-Id", "acme")
+	c := hApiNeighbours(ctx)
+	hApiSeedEntry(ctx, "e1", hApiV, HApiSeedOptions{})
+	r := hApiLookup(c, hApiV, 0.9, "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "POST /v1/semantic-cache/lookup (%s)", r.Text())
 	ctx.Assert(strings.HasPrefix(r.Header.Get("Content-Type"), "application/json"), "the answer must be JSON, got Content-Type %q", r.Header.Get("Content-Type"))
-	ctx.Equal(apiBody(ctx, r)["answer"], apiAnswer, "a lookup of the stored question must answer the stored answer")
-	r = apiLookup(c, apiV, 0.9)
+	ctx.Equal(hApiBody(ctx, r)["answer"], kHApiAnswer, "a lookup of the stored question must answer the stored answer")
+	r = hApiLookup(c, hApiV, 0.9)
 	ctx.Equal(r.Status, 401, "a lookup without X-Tenant-Id")
 }
 
 func CheckFloor(ctx *harness.Ctx) {
-	c := apiNeighbours(ctx)
-	apiSeedEntry(ctx, "e1", apiSoSo, apiSeedOptions{answer: "answer at 0.6"})
-	got := apiServed(ctx, c, 0)
+	c := hApiNeighbours(ctx)
+	hApiSeedEntry(ctx, "e1", hApiSoSo, HApiSeedOptions{answer: "answer at 0.6"})
+	got := hApiServed(ctx, c, 0)
 	ctx.Assert(got == "", "with threshold 0 an entry at similarity 0.6 was served (%q). The caller's threshold is a hint; clamp it to the floor (0.82)", got)
-	apiSeedEntry(ctx, "e2", apiUnderFloor, apiSeedOptions{answer: "answer at 0.815"})
-	got = apiServed(ctx, c, 0)
+	hApiSeedEntry(ctx, "e2", hApiUnderFloor, HApiSeedOptions{answer: "answer at 0.815"})
+	got = hApiServed(ctx, c, 0)
 	ctx.Assert(got == "", "with threshold 0 an entry at similarity 0.815 was served (%q): the floor is 0.82", got)
-	apiSeedEntry(ctx, "e3", apiOverFloor, apiSeedOptions{answer: "answer at 0.825"})
-	got = apiServed(ctx, c, 0)
+	hApiSeedEntry(ctx, "e3", hApiOverFloor, HApiSeedOptions{answer: "answer at 0.825"})
+	got = hApiServed(ctx, c, 0)
 	ctx.Assert(got == "answer at 0.825", "with threshold 0 an entry at similarity 0.825 must hit (the floor is 0.82), got %q", got)
-	got = apiServed(ctx, c, 0.85)
+	got = hApiServed(ctx, c, 0.85)
 	ctx.Assert(got == "", "with threshold 0.85 an entry at similarity 0.825 was served (%q): a threshold inside [0.82, 0.99] is the caller's to keep", got)
-	apiSeedEntry(ctx, "e4", apiUnderCap, apiSeedOptions{answer: "answer at 0.9895"})
-	got = apiServed(ctx, c, 0.9995)
+	hApiSeedEntry(ctx, "e4", hApiUnderCap, HApiSeedOptions{answer: "answer at 0.9895"})
+	got = hApiServed(ctx, c, 0.9995)
 	ctx.Assert(got == "", "with threshold 0.9995 an entry at similarity 0.9895 was served (%q): the ceiling is 0.99, so the threshold becomes 0.99", got)
-	apiSeedEntry(ctx, "e5", apiOverCap, apiSeedOptions{answer: "answer at 0.9905"})
-	got = apiServed(ctx, c, 0.9995)
+	hApiSeedEntry(ctx, "e5", hApiOverCap, HApiSeedOptions{answer: "answer at 0.9905"})
+	got = hApiServed(ctx, c, 0.9995)
 	ctx.Assert(got == "answer at 0.9905", "with threshold 0.9995 an entry at similarity 0.9905 must hit (the ceiling is 0.99), got %q", got)
 }
 
 func CheckExpiry(ctx *harness.Ctx) {
-	c := apiNeighbours(ctx)
-	apiSeedEntry(ctx, "e1", apiV, apiSeedOptions{expiresIn: 100}) // restored from a dump: expires_at in 100 s, no TTL on the key
-	r := apiLookup(c, apiV, 0.9, "X-Tenant-Id", "acme")
-	ctx.Equal(apiBody(ctx, r)["answer"], apiAnswer, "a live entry must be served")
+	c := hApiNeighbours(ctx)
+	hApiSeedEntry(ctx, "e1", hApiV, HApiSeedOptions{expiresIn: 100}) // restored from a dump: expires_at in 100 s, no TTL on the key
+	r := hApiLookup(c, hApiV, 0.9, "X-Tenant-Id", "acme")
+	ctx.Equal(hApiBody(ctx, r)["answer"], kHApiAnswer, "a live entry must be served")
 	ctx.Clock.Advance(100)
 	ctx.Equal(ctx.Redis.Exists("entry:acme:2024-06:e1"), 1, "the hash is still there: nothing but expires_at says the entry is over; EXISTS")
-	got := apiServed(ctx, c, 0.9)
+	got := hApiServed(ctx, c, 0.9)
 	ctx.Assert(got == "", "an entry whose expires_at is now was served (%q). An entry is live only while expires_at > now", got)
 	ctx.Clock.Advance(1)
-	got = apiServed(ctx, c, 0.9)
+	got = hApiServed(ctx, c, 0.9)
 	ctx.Assert(got == "", "an entry whose expires_at passed one second ago was served (%q). Compare expires_at to now before serving", got)
-	outcomes := make([]string, 0, len(apiEvents))
-	for _, e := range apiEvents {
+	outcomes := make([]string, 0, len(hApiEvents))
+	for _, e := range hApiEvents {
 		outcomes = append(outcomes, e.Outcome)
 	}
 	ctx.Assert(len(outcomes) == 3, "three lookups published %d result events: every lookup publishes one, a miss on an expired entry too", len(outcomes))
@@ -1150,25 +1150,25 @@ func CheckExpiry(ctx *harness.Ctx) {
 }
 
 func CheckHitShape(ctx *harness.Ctx) {
-	c := apiNeighbours(ctx)
-	apiSeedEntry(ctx, "e1", apiNear, apiSeedOptions{age: 41})
-	r := apiLookup(c, apiV, 0.9, "X-Tenant-Id", "acme")
+	c := hApiNeighbours(ctx)
+	hApiSeedEntry(ctx, "e1", hApiNear, HApiSeedOptions{age: 41})
+	r := hApiLookup(c, hApiV, 0.9, "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "lookup (%s)", r.Text())
-	body := apiBody(ctx, r)
+	body := hApiBody(ctx, r)
 	ctx.Equal(body["hit"], true, "a hit must say hit: true (%s)", r.Text())
-	ctx.Assert(body["answer"] == apiAnswer && body["entry_id"] == "e1", "a hit carries the answer and its entry_id: %s", r.Text())
+	ctx.Assert(body["answer"] == kHApiAnswer && body["entry_id"] == "e1", "a hit carries the answer and its entry_id: %s", r.Text())
 	similarity, ok := body["similarity"].(float64)
-	want := vectors.Cosine(apiV, apiNear)
+	want := vectors.Cosine(hApiV, hApiNear)
 	ctx.Assert(ok && similarity-want < 1e-9 && want-similarity < 1e-9, "similarity is %v, expected the cosine %v as the store measured it, so the caller can judge the hit", body["similarity"], want)
 	ctx.Equal(body["age_seconds"], 41, "age_seconds (now - created_at)")
 	ctx.Equal(body["policy_version"], "2024-06-1", "policy_version must be the entry's")
 }
 
 func CheckMiss(ctx *harness.Ctx) {
-	c := apiNeighbours(ctx)
-	r := apiLookup(c, apiV, 0.9, "X-Tenant-Id", "acme")
+	c := hApiNeighbours(ctx)
+	r := hApiLookup(c, hApiV, 0.9, "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "a lookup with nothing stored (%s)", r.Text())
-	body := apiBody(ctx, r)
+	body := hApiBody(ctx, r)
 	ctx.Equal(body["hit"], false, "a miss must say hit: false (%s)", r.Text())
 	similarity, has := body["similarity"]
 	ctx.Assert(has && similarity == nil, "a miss carries similarity: null, got %s", r.Text())

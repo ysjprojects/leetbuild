@@ -769,50 +769,50 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
 // readStepView and readView decode the answer; the harness keeps its own types so a fix may shape its own.
-type readStepView struct {
+type HReadStepView struct {
 	Step     int    \`json:"step"\`
 	Approver string \`json:"approver"\`
 	State    string \`json:"state"\`
 	Actor    string \`json:"actor"\`
 }
 
-type readView struct {
+type HReadView struct {
 	RequestID    string         \`json:"request_id"\`
 	ChainID      string         \`json:"chain_id"\`
 	ChainVersion int            \`json:"chain_version"\`
 	Status       string         \`json:"status"\`
 	StepIndex    int            \`json:"step_index"\`
-	Steps        []readStepView \`json:"steps"\`
+	Steps        []HReadStepView \`json:"steps"\`
 }
 
-func readServe(ctx *harness.Ctx) *harness.HTTP {
-	ctx.NoError(policy.DefineChain(readBg, "spend", 3, []string{"u-mgr", "u-dir"}), "defining the spend chain")
+func hReadServe(ctx *harness.Ctx) *harness.HTTP {
+	ctx.NoError(policy.DefineChain(hReadBg, "spend", 3, []string{"u-mgr", "u-dir"}), "defining the spend chain")
 	record := &store.Request{RequestID: "r-1", Tenant: "t-acme", Requester: "u-req", ChainID: "spend", ChainVersion: 3, Approvers: []string{"u-mgr", "u-dir"}, Why: "new laptop", AmountCents: 420000}
-	ctx.NoError(store.Put(readBg, record, "k-1"), "store.Put(r-1)")
-	ctx.NoError(chain.StartChain(readBg, "r-1", record.Approvers), "chain.StartChain(r-1)")
+	ctx.NoError(store.Put(hReadBg, record, "k-1"), "store.Put(r-1)")
+	ctx.NoError(chain.StartChain(hReadBg, "r-1", record.Approvers), "chain.StartChain(r-1)")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readGet(ctx *harness.Ctx, c *harness.HTTP) readView {
+func hReadGet(ctx *harness.Ctx, c *harness.HTTP) HReadView {
 	r := c.Get("/v1/requests/r-1", "X-Tenant-Id", "t-acme")
 	ctx.Equal(r.Status, 200, "GET /v1/requests/r-1 (%s)", r.Text())
-	var view readView
+	var view HReadView
 	r.Decode(&view)
 	return view
 }
 
-func readAdvance(ctx *harness.Ctx, step int, actor string) chain.Outcome {
-	o, err := chain.Advance(readBg, "r-1", step, actor, "approved")
+func hReadAdvance(ctx *harness.Ctx, step int, actor string) chain.Outcome {
+	o, err := chain.Advance(hReadBg, "r-1", step, actor, "approved")
 	ctx.NoError(err, "chain.Advance(r-1, %d, %s)", step, actor)
 	return o
 }
 
-func readApproved(view readView) int {
+func hReadApproved(view HReadView) int {
 	approved := 0
 	for _, s := range view.Steps {
 		if s.State == "approved" {
@@ -823,19 +823,19 @@ func readApproved(view readView) int {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readServe(ctx)
-	view := readGet(ctx, c)
+	c := hReadServe(ctx)
+	view := hReadGet(ctx, c)
 	ctx.Assert(view.RequestID == "r-1" && view.Status == "pending" && view.StepIndex == 0, "a fresh request reads as %+v", view)
-	ctx.Equal(view.Steps, []readStepView{{0, "u-mgr", "pending", ""}, {1, "u-dir", "pending", ""}}, "a fresh request's steps")
-	readAdvance(ctx, 0, "u-mgr")
-	view = readGet(ctx, c)
+	ctx.Equal(view.Steps, []HReadStepView{{0, "u-mgr", "pending", ""}, {1, "u-dir", "pending", ""}}, "a fresh request's steps")
+	hReadAdvance(ctx, 0, "u-mgr")
+	view = hReadGet(ctx, c)
 	ctx.Equal(view.StepIndex, 1, "after the manager's approval, step_index")
-	ctx.Equal(view.Steps, []readStepView{{0, "u-mgr", "approved", "u-mgr"}, {1, "u-dir", "pending", ""}}, "after the manager's approval, the steps")
+	ctx.Equal(view.Steps, []HReadStepView{{0, "u-mgr", "approved", "u-mgr"}, {1, "u-dir", "pending", ""}}, "after the manager's approval, the steps")
 	ctx.Equal(c.Get("/v1/requests/r-404", "X-Tenant-Id", "t-acme").Status, 404, "a request that does not exist")
 }
 
 func CheckTenant404(ctx *harness.Ctx) {
-	c := readServe(ctx)
+	c := hReadServe(ctx)
 	ctx.Equal(c.Get("/v1/requests/r-1").Status, 401, "a read without X-Tenant-Id")
 	foreign := c.Get("/v1/requests/r-1", "X-Tenant-Id", "t-globex")
 	ctx.Equal(foreign.Status, 404, "tenant t-globex reading t-acme's request (%s): another tenant's request is 404", foreign.Text())
@@ -845,9 +845,9 @@ func CheckTenant404(ctx *harness.Ctx) {
 }
 
 func CheckPinnedChain(ctx *harness.Ctx) {
-	c := readServe(ctx)
-	ctx.NoError(policy.DefineChain(readBg, "spend", 4, []string{"u-mgr", "u-cfo", "u-ceo"}), "redefining the spend chain")
-	view := readGet(ctx, c)
+	c := hReadServe(ctx)
+	ctx.NoError(policy.DefineChain(hReadBg, "spend", 4, []string{"u-mgr", "u-cfo", "u-ceo"}), "redefining the spend chain")
+	view := hReadGet(ctx, c)
 	ctx.Equal(view.ChainVersion, 3, "after a policy edit the read must report the pinned chain_version")
 	var approvers []string
 	for _, s := range view.Steps {
@@ -857,29 +857,29 @@ func CheckPinnedChain(ctx *harness.Ctx) {
 }
 
 func CheckOneSnapshot(ctx *harness.Ctx) {
-	c := readServe(ctx)
+	c := hReadServe(ctx)
 	// The manager approves while the read is in flight, right after its first command on the state.
-	rival := ctx.Redis.After("approval:r-1:state", func() any { return readAdvance(ctx, 0, "u-mgr") })
-	view := readGet(ctx, c)
+	rival := ctx.Redis.After("approval:r-1:state", func() any { return hReadAdvance(ctx, 0, "u-mgr") })
+	view := hReadGet(ctx, c)
 	ctx.Assert(rival.Fired, "the read never touched approval:r-1:state")
-	approved := readApproved(view)
+	approved := hReadApproved(view)
 	ctx.Assert(approved == view.StepIndex, "the read mixed two moments: step_index %d with %d approved step(s) in %+v. Read the state in one command", view.StepIndex, approved, view.Steps)
-	after := readGet(ctx, c)
+	after := hReadGet(ctx, c)
 	ctx.Assert(after.StepIndex == 1 && len(after.Steps) > 0 && after.Steps[0].State == "approved", "after the approval the trail reads %+v", after)
 	// The director approves the last step mid-read: status, step_index and steps must still agree.
-	last := ctx.Redis.After("approval:r-1:state", func() any { return readAdvance(ctx, 1, "u-dir") })
-	view = readGet(ctx, c)
+	last := ctx.Redis.After("approval:r-1:state", func() any { return hReadAdvance(ctx, 1, "u-dir") })
+	view = hReadGet(ctx, c)
 	lastOutcome, _ := last.Result.(chain.Outcome)
 	ctx.Assert(last.Fired && lastOutcome.Status == "approved", "the director's approval during the read answered %+v", lastOutcome)
 	status := "pending"
 	if view.StepIndex == 2 {
 		status = "approved"
 	}
-	ctx.Assert(readApproved(view) == view.StepIndex && view.Status == status, "the read mixed two moments: status %s, step_index %d, %d approved step(s). Read the state in one command", view.Status, view.StepIndex, readApproved(view))
+	ctx.Assert(hReadApproved(view) == view.StepIndex && view.Status == status, "the read mixed two moments: status %s, step_index %d, %d approved step(s). Read the state in one command", view.Status, view.StepIndex, hReadApproved(view))
 }
 
 func CheckNoStore(ctx *harness.Ctx) {
-	c := readServe(ctx)
+	c := hReadServe(ctx)
 	r := c.Get("/v1/requests/r-1", "X-Tenant-Id", "t-acme")
 	cache := r.Header.Get("Cache-Control")
 	ctx.Assert(strings.Contains(cache, "no-store") && !strings.Contains(cache, "public"), "the trail is served with Cache-Control %q: a shared cache would hand one tenant's trail, stale, to the next caller. Send private, no-store", cache)
@@ -899,7 +899,7 @@ func CheckNoStore(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP readServe(harness::Ctx& ctx) {
+harness::HTTP hReadServe(harness::Ctx& ctx) {
   policy::defineChain("spend", 3, {"u-mgr", "u-dir"});
   store::put(store::Request{"r-1", "t-acme", "u-req", "spend", 3, {"u-mgr", "u-dir"}, "new laptop", 420000}, "k-1");
   chain::startChain("r-1", {"u-mgr", "u-dir"});
@@ -910,32 +910,32 @@ harness::HTTP readServe(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json readGet(harness::Ctx& ctx, harness::HTTP& c) {
+nlohmann::json hReadGet(harness::Ctx& ctx, harness::HTTP& c) {
   const auto r = c.Get("/v1/requests/r-1", "X-Tenant-Id", "t-acme");
   ctx.Equal(r.Status, 200, "GET /v1/requests/r-1 (%s)", r.Text());
   return nlohmann::json::parse(r.Text(), nullptr, false);
 }
 
-nlohmann::json stepOf(long i, const std::string& approver, const std::string& state, const std::string& actor) {
+nlohmann::json hStepOf(long i, const std::string& approver, const std::string& state, const std::string& actor) {
   return {{"step", i}, {"approver", approver}, {"state", state}, {"actor", actor}};
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readServe(ctx);
-  auto body = readGet(ctx, c);
+  auto c = hReadServe(ctx);
+  auto body = hReadGet(ctx, c);
   ctx.Assert(body.value("request_id", "") == "r-1" && body.value("status", "") == "pending" && body.value("step_index", -1L) == 0, "a fresh request reads as %s", body.dump());
-  ctx.Equal(body["steps"], nlohmann::json{stepOf(0, "u-mgr", "pending", ""), stepOf(1, "u-dir", "pending", "")}, "a fresh request's steps");
+  ctx.Equal(body["steps"], nlohmann::json{hStepOf(0, "u-mgr", "pending", ""), hStepOf(1, "u-dir", "pending", "")}, "a fresh request's steps");
   chain::advance("r-1", 0, "u-mgr", "approved");
-  body = readGet(ctx, c);
+  body = hReadGet(ctx, c);
   ctx.Equal(body.value("step_index", -1L), 1, "after the manager's approval, step_index");
-  ctx.Equal(body["steps"], nlohmann::json{stepOf(0, "u-mgr", "approved", "u-mgr"), stepOf(1, "u-dir", "pending", "")}, "after the manager's approval, the steps");
+  ctx.Equal(body["steps"], nlohmann::json{hStepOf(0, "u-mgr", "approved", "u-mgr"), hStepOf(1, "u-dir", "pending", "")}, "after the manager's approval, the steps");
   ctx.Equal(c.Get("/v1/requests/r-404", "X-Tenant-Id", "t-acme").Status, 404, "a request that does not exist");
 }
 
 void CheckTenant404(harness::Ctx& ctx) {
-  auto c = readServe(ctx);
+  auto c = hReadServe(ctx);
   ctx.Equal(c.Get("/v1/requests/r-1").Status, 401, "a read without X-Tenant-Id");
   const auto foreign = c.Get("/v1/requests/r-1", "X-Tenant-Id", "t-globex");
   ctx.Equal(foreign.Status, 404, "tenant t-globex reading t-acme's request (%s): another tenant's request is 404", foreign.Text());
@@ -950,9 +950,9 @@ void CheckTenant404(harness::Ctx& ctx) {
 }
 
 void CheckPinnedChain(harness::Ctx& ctx) {
-  auto c = readServe(ctx);
+  auto c = hReadServe(ctx);
   policy::defineChain("spend", 4, {"u-mgr", "u-cfo", "u-ceo"});
-  const auto body = readGet(ctx, c);
+  const auto body = hReadGet(ctx, c);
   ctx.Equal(body.value("chain_version", -1L), 3, "after a policy edit the read must report the pinned chain_version");
   std::vector<std::string> approvers;
   for (const auto& s : body["steps"]) approvers.push_back(s.value("approver", ""));
@@ -960,24 +960,24 @@ void CheckPinnedChain(harness::Ctx& ctx) {
 }
 
 void CheckOneSnapshot(harness::Ctx& ctx) {
-  auto c = readServe(ctx);
+  auto c = hReadServe(ctx);
   // The manager approves while the read is in flight, right after its first command on the state.
   auto fired = std::make_shared<bool>(false);
   ctx.Redis.After("approval:r-1:state", [fired] {
     *fired = true;
     chain::advance("r-1", 0, "u-mgr", "approved");
   });
-  const auto body = readGet(ctx, c);
+  const auto body = hReadGet(ctx, c);
   ctx.Assert(*fired, "the read never touched approval:r-1:state");
   long approved = 0;
   for (const auto& s : body["steps"]) approved += s.value("state", "") == "approved" ? 1 : 0;
   ctx.Assert(approved == body.value("step_index", -1L), "the read mixed two moments: step_index %d with %d approved step(s) in %s. Read the state in one command", body.value("step_index", -1L), approved, body["steps"].dump());
-  const auto after = readGet(ctx, c);
+  const auto after = hReadGet(ctx, c);
   ctx.Assert(after.value("step_index", -1L) == 1 && after["steps"][0].value("state", "") == "approved", "after the approval the trail reads %s", after.dump());
   // The director approves the last step mid-read: status, step_index and steps must still agree.
   auto last = std::make_shared<std::string>();
   ctx.Redis.After("approval:r-1:state", [last] { *last = chain::advance("r-1", 1, "u-dir", "approved").status; });
-  const auto closing = readGet(ctx, c);
+  const auto closing = hReadGet(ctx, c);
   ctx.Equal(*last, std::string("approved"), "the director's approval during the read; its status");
   long finalApproved = 0;
   for (const auto& s : closing["steps"]) finalApproved += s.value("state", "") == "approved" ? 1 : 0;
@@ -987,7 +987,7 @@ void CheckOneSnapshot(harness::Ctx& ctx) {
 }
 
 void CheckNoStore(harness::Ctx& ctx) {
-  auto c = readServe(ctx);
+  auto c = hReadServe(ctx);
   const auto r = c.Get("/v1/requests/r-1", "X-Tenant-Id", "t-acme");
   const std::string cache = r.HeaderValue("Cache-Control");
   ctx.Assert(cache.find("no-store") != std::string::npos && cache.find("public") == std::string::npos,

@@ -517,7 +517,7 @@ func hLoad(ctx *harness.Ctx, table string) (int64, bool) {
 	return lsn, ok
 }
 
-func mustConfirm(ctx *harness.Ctx, table string, lsn int64) bool {
+func hMustConfirm(ctx *harness.Ctx, table string, lsn int64) bool {
 	moved, err := confirm(hBg, hSub, table, lsn)
 	ctx.NoError(err, "confirm(%s, %s, %d) failed", hSub, table, lsn)
 	return moved
@@ -526,7 +526,7 @@ func mustConfirm(ctx *harness.Ctx, table string, lsn int64) bool {
 func CheckConfirmLoad(ctx *harness.Ctx) {
 	_, ok := hLoad(ctx, "orders")
 	ctx.Assert(!ok, "before any confirmation loadCursor must report no cursor")
-	ctx.Equal(mustConfirm(ctx, "orders", 120), true, "the first confirmation must move the cursor; moved")
+	ctx.Equal(hMustConfirm(ctx, "orders", 120), true, "the first confirmation must move the cursor; moved")
 	lsn, ok := hLoad(ctx, "orders")
 	ctx.Assert(ok && lsn == 120, "after confirming 120 loadCursor gave %d (found %t)", lsn, ok)
 	_, ok, _ = loadCursor(hBg, "sub-2", "orders")
@@ -534,20 +534,20 @@ func CheckConfirmLoad(ctx *harness.Ctx) {
 }
 
 func CheckDurableCursor(ctx *harness.Ctx) {
-	mustConfirm(ctx, "orders", 120)
+	hMustConfirm(ctx, "orders", 120)
 	key := cursorKey(hSub, "orders")
 	ttl := ctx.Redis.TTL(key)
 	ctx.Equal(ttl, int64(-1), "%s has an expiry: a table quiet for longer forgets where its sink stopped. Write the cursor without expiry; the TTL", key)
 	ctx.Clock.Advance(3 * 24 * 3600)
 	lsn, ok := hLoad(ctx, "orders")
 	ctx.Assert(ok && lsn == 120, "three quiet days later loadCursor gives %d (found %t), expected 120", lsn, ok)
-	ctx.Equal(mustConfirm(ctx, "orders", 130), true, "confirming 130 after 120 must move the cursor; moved")
+	ctx.Equal(hMustConfirm(ctx, "orders", 130), true, "confirming 130 after 120 must move the cursor; moved")
 	ctx.Equal(ctx.Redis.TTL(key), int64(-1), "after a later confirmation %s has an expiry: write the cursor without expiry on every confirmation; the TTL", key)
 }
 
 func CheckPerTableKey(ctx *harness.Ctx) {
-	mustConfirm(ctx, "orders", 120)
-	mustConfirm(ctx, "customers", 80)
+	hMustConfirm(ctx, "orders", 120)
+	hMustConfirm(ctx, "customers", 80)
 	orders, _ := hLoad(ctx, "orders")
 	customers, _ := hLoad(ctx, "customers")
 	ctx.Assert(orders == 120 && customers == 80, "after confirming orders at 120 and customers at 80 the cursors are %d and %d: the two tables share one position, so one resumes from the other's LSN", orders, customers)
@@ -556,20 +556,20 @@ func CheckPerTableKey(ctx *harness.Ctx) {
 }
 
 func CheckMonotonic(ctx *harness.Ctx) {
-	ctx.Equal(mustConfirm(ctx, "orders", 200), true, "confirming 200 on a new cursor must move it; moved")
-	moved := mustConfirm(ctx, "orders", 150)
+	ctx.Equal(hMustConfirm(ctx, "orders", 200), true, "confirming 200 on a new cursor must move it; moved")
+	moved := hMustConfirm(ctx, "orders", 150)
 	lsn, _ := hLoad(ctx, "orders")
 	ctx.Equal(lsn, int64(200), "a late confirmation of 150 (a retried batch) must not move the cursor back, or the sink gets every change after 150 again; the cursor")
 	ctx.Equal(moved, false, "a confirmation that did not move the cursor; moved")
-	ctx.Equal(mustConfirm(ctx, "orders", 200), false, "confirming 200 again, where the cursor already is, did not move it; moved")
+	ctx.Equal(hMustConfirm(ctx, "orders", 200), false, "confirming 200 again, where the cursor already is, did not move it; moved")
 	key := cursorKey(hSub, "orders")
 	// Another replica confirms 300 right after this confirm's first command reached Redis.
 	probe := ctx.Redis.After(key, func() any { return ctx.Redis.Set(key, 300) })
-	mustConfirm(ctx, "orders", 250)
+	hMustConfirm(ctx, "orders", 250)
 	ctx.Assert(probe.Fired, "confirm(250) never touched %s", key)
 	lsn, _ = hLoad(ctx, "orders")
 	ctx.Equal(lsn, int64(300), "a replica confirmed 300 while confirm(250) was running: compare and set in one Lua script; the cursor")
-	moved = mustConfirm(ctx, "orders", 1000)
+	moved = hMustConfirm(ctx, "orders", 1000)
 	lsn, _ = hLoad(ctx, "orders")
 	ctx.Assert(moved && lsn == 1000, "confirming 1000 after 300 reported moved=%t and left the cursor at %d: compare the LSNs as numbers, not as text", moved, lsn)
 }
@@ -582,58 +582,58 @@ func CheckMonotonic(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kSub = "sub-1";
+const std::string kHSub = "sub-1";
 
 }  // namespace
 
 void CheckConfirmLoad(harness::Ctx& ctx) {
-  ctx.Assert(!loadCursor(kSub, "orders"), "before any confirmation loadCursor must give none");
-  ctx.Equal(confirm(kSub, "orders", 120), true, "the first confirmation must move the cursor; moved");
-  ctx.Equal(loadCursor(kSub, "orders"), std::optional<int64_t>(120), "after confirming 120, loadCursor");
+  ctx.Assert(!loadCursor(kHSub, "orders"), "before any confirmation loadCursor must give none");
+  ctx.Equal(confirm(kHSub, "orders", 120), true, "the first confirmation must move the cursor; moved");
+  ctx.Equal(loadCursor(kHSub, "orders"), std::optional<int64_t>(120), "after confirming 120, loadCursor");
   ctx.Assert(!loadCursor("sub-2", "orders"), "another subscription must not see sub-1's cursor");
 }
 
 void CheckDurableCursor(harness::Ctx& ctx) {
-  confirm(kSub, "orders", 120);
-  const std::string key = cursorKey(kSub, "orders");
+  confirm(kHSub, "orders", 120);
+  const std::string key = cursorKey(kHSub, "orders");
   ctx.Equal(ctx.Redis.TTL(key), -1, "%s has an expiry: a table quiet for longer forgets where its sink stopped. Write the cursor without expiry; the TTL", key);
   ctx.Clock.Advance(3 * 24 * 3600);
-  ctx.Equal(loadCursor(kSub, "orders"), std::optional<int64_t>(120), "three quiet days later, loadCursor");
-  ctx.Equal(confirm(kSub, "orders", 130), true, "confirming 130 after 120 must move the cursor; moved");
+  ctx.Equal(loadCursor(kHSub, "orders"), std::optional<int64_t>(120), "three quiet days later, loadCursor");
+  ctx.Equal(confirm(kHSub, "orders", 130), true, "confirming 130 after 120 must move the cursor; moved");
   ctx.Equal(ctx.Redis.TTL(key), -1, "after a later confirmation %s has an expiry: write the cursor without expiry on every confirmation; the TTL", key);
 }
 
 void CheckPerTableKey(harness::Ctx& ctx) {
-  confirm(kSub, "orders", 120);
-  confirm(kSub, "customers", 80);
-  const auto orders = loadCursor(kSub, "orders").value_or(0);
-  const auto customers = loadCursor(kSub, "customers").value_or(0);
+  confirm(kHSub, "orders", 120);
+  confirm(kHSub, "customers", 80);
+  const auto orders = loadCursor(kHSub, "orders").value_or(0);
+  const auto customers = loadCursor(kHSub, "customers").value_or(0);
   ctx.Assert(orders == 120 && customers == 80,
              "after confirming orders at 120 and customers at 80 the cursors are %d and %d: the two tables share one position, so one resumes from the other's LSN",
              orders, customers);
-  ctx.Equal(ctx.Redis.Get("cdc:cursor:" + kSub + ":orders"), std::optional<std::string>("120"), "the orders cursor must live at cdc:cursor:%s:orders", kSub);
+  ctx.Equal(ctx.Redis.Get("cdc:cursor:" + kHSub + ":orders"), std::optional<std::string>("120"), "the orders cursor must live at cdc:cursor:%s:orders", kHSub);
 }
 
 void CheckMonotonic(harness::Ctx& ctx) {
-  ctx.Equal(confirm(kSub, "orders", 200), true, "confirming 200 on a new cursor must move it; moved");
-  const bool moved = confirm(kSub, "orders", 150);
-  ctx.Equal(loadCursor(kSub, "orders"), std::optional<int64_t>(200),
+  ctx.Equal(confirm(kHSub, "orders", 200), true, "confirming 200 on a new cursor must move it; moved");
+  const bool moved = confirm(kHSub, "orders", 150);
+  ctx.Equal(loadCursor(kHSub, "orders"), std::optional<int64_t>(200),
             "a late confirmation of 150 (a retried batch) must not move the cursor back, or the sink gets every change after 150 again; the cursor");
   ctx.Equal(moved, false, "a confirmation that did not move the cursor; moved");
-  ctx.Equal(confirm(kSub, "orders", 200), false, "confirming 200 again, where the cursor already is, did not move it; moved");
-  const std::string key = cursorKey(kSub, "orders");
+  ctx.Equal(confirm(kHSub, "orders", 200), false, "confirming 200 again, where the cursor already is, did not move it; moved");
+  const std::string key = cursorKey(kHSub, "orders");
   // Another replica confirms 300 right after this confirm's first command reached Redis.
   bool fired = false;
   ctx.Redis.After(key, [&ctx, &fired, key] {
     fired = true;
     ctx.Redis.Set(key, "300");
   });
-  confirm(kSub, "orders", 250);
+  confirm(kHSub, "orders", 250);
   ctx.Assert(fired, "confirm(250) never touched %s", key);
-  ctx.Equal(loadCursor(kSub, "orders"), std::optional<int64_t>(300),
+  ctx.Equal(loadCursor(kHSub, "orders"), std::optional<int64_t>(300),
             "a replica confirmed 300 while confirm(250) was running: compare and set in one Lua script; the cursor");
-  const bool big = confirm(kSub, "orders", 1000);
-  const auto at = loadCursor(kSub, "orders").value_or(0);
+  const bool big = confirm(kHSub, "orders", 1000);
+  const auto at = loadCursor(kHSub, "orders").value_or(0);
   ctx.Assert(big && at == 1000, "confirming 1000 after 300 reported moved=%v and left the cursor at %d: compare the LSNs as numbers, not as text", big, at);
 }
 `,

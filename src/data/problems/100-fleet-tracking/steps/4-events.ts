@@ -661,16 +661,16 @@ import (
 	"fleet/position"
 )
 
-const positionTopic = "fleet.position"
+const kHPositionTopic = "fleet.position"
 
-// eventsState stands in for step 2's updateLatest: the compare-and-set on vehicle:{id}:latest,
+// HEventsState stands in for step 2's updateLatest: the compare-and-set on vehicle:{id}:latest,
 // noting how many events were on the topic each time a position was written.
-type eventsState struct {
+type HEventsState struct {
 	eventsAtWrite []int
 }
 
-func newEvents(ctx *harness.Ctx) *eventsState {
-	s := &eventsState{}
+func hNewEvents(ctx *harness.Ctx) *HEventsState {
+	s := &HEventsState{}
 	updateLatest = func(_ context.Context, vehicleID string, p position.Position) (bool, error) {
 		key := "vehicle:" + vehicleID + ":latest"
 		cur := ctx.Redis.HGetAll(key)
@@ -681,27 +681,27 @@ func newEvents(ctx *harness.Ctx) *eventsState {
 				return false, nil
 			}
 		}
-		s.eventsAtWrite = append(s.eventsAtWrite, len(ctx.Kafka.Records(positionTopic)))
+		s.eventsAtWrite = append(s.eventsAtWrite, len(ctx.Kafka.Records(kHPositionTopic)))
 		ctx.Redis.Do("HSET", key, "ts", p.DeviceTimestampMs, "seq", p.Sequence, "lat", p.Lat, "lon", p.Lon)
 		return true, nil
 	}
 	return s
 }
 
-func eventsPos(ts, seq int64, vehicleID string) position.Position {
+func hEventsPos(ts, seq int64, vehicleID string) position.Position {
 	return position.Position{VehicleID: vehicleID, DeviceTimestampMs: ts, Sequence: seq, Lat: 47.6, Lon: -122.3}
 }
 
-func eventsRecord(ctx *harness.Ctx, vehicleID string, p position.Position) bool {
+func hEventsRecord(ctx *harness.Ctx, vehicleID string, p position.Position) bool {
 	applied, err := recordPosition(context.Background(), vehicleID, p)
 	ctx.NoError(err, "recordPosition(%s, %v)", vehicleID, p)
 	return applied
 }
 
 func CheckPayload(ctx *harness.Ctx) {
-	newEvents(ctx)
-	ctx.Equal(eventsRecord(ctx, "v-1", eventsPos(1000, 42, "v-1")), true, "a new position must be applied; applied")
-	records := ctx.Kafka.Records(positionTopic)
+	hNewEvents(ctx)
+	ctx.Equal(hEventsRecord(ctx, "v-1", hEventsPos(1000, 42, "v-1")), true, "a new position must be applied; applied")
+	records := ctx.Kafka.Records(kHPositionTopic)
 	ctx.Equal(len(records), 1, "one applied position must produce one record on fleet.position; the records")
 	var event map[string]any
 	ctx.NoError(json.Unmarshal(records[0].Value, &event), "the event must be JSON: %s", records[0].Value)
@@ -712,14 +712,14 @@ func CheckPayload(ctx *harness.Ctx) {
 }
 
 func CheckTopicAndKey(ctx *harness.Ctx) {
-	newEvents(ctx)
+	hNewEvents(ctx)
 	for i, ts := range []int64{1000, 2000, 3000} {
-		eventsRecord(ctx, "v-1", eventsPos(ts, int64(i+1), "v-1"))
+		hEventsRecord(ctx, "v-1", hEventsPos(ts, int64(i+1), "v-1"))
 	}
-	eventsRecord(ctx, "v-2", eventsPos(1000, 1, "v-2"))
-	records := ctx.Kafka.Records(positionTopic)
+	hEventsRecord(ctx, "v-2", hEventsPos(1000, 1, "v-2"))
+	records := ctx.Kafka.Records(kHPositionTopic)
 	ctx.Equal(len(records), 4, "four applied positions; the records")
-	ctx.Equal(ctx.Kafka.Keys(positionTopic), []string{"v-1", "v-1", "v-1", "v-2"}, "records must be keyed by the vehicle id: without the key the producer spreads one vehicle's track over every partition and consumers read it out of order")
+	ctx.Equal(ctx.Kafka.Keys(kHPositionTopic), []string{"v-1", "v-1", "v-1", "v-2"}, "records must be keyed by the vehicle id: without the key the producer spreads one vehicle's track over every partition and consumers read it out of order")
 	ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition, "v-1's three events landed on partitions %d, %d, %d: one vehicle must stay on one partition", records[0].Partition, records[1].Partition, records[2].Partition)
 	var seqs []int64
 	for _, r := range records[:3] {
@@ -734,30 +734,30 @@ func CheckTopicAndKey(ctx *harness.Ctx) {
 
 func CheckNoDriverId(ctx *harness.Ctx) {
 	ctx.Redis.Set("vehicle:v-1:driver", "d-77")
-	newEvents(ctx)
-	eventsRecord(ctx, "v-1", eventsPos(1000, 42, "v-1"))
-	records := ctx.Kafka.Records(positionTopic)
+	hNewEvents(ctx)
+	hEventsRecord(ctx, "v-1", hEventsPos(1000, 42, "v-1"))
+	records := ctx.Kafka.Records(kHPositionTopic)
 	ctx.Equal(len(records), 1, "one applied position; the records")
 	value := string(records[0].Value)
 	ctx.Assert(!strings.Contains(value, "d-77") && !strings.Contains(strings.ToLower(value), "driver"), "the event %s names the driver: a retained, replicated position topic must not be joinable to a person. Carry the vehicle, not who drives it", value)
 }
 
 func CheckPublishAfterWrite(ctx *harness.Ctx) {
-	s := newEvents(ctx)
-	ctx.Equal(eventsRecord(ctx, "v-1", eventsPos(1000, 42, "v-1")), true, "a new position must be applied; applied")
+	s := hNewEvents(ctx)
+	ctx.Equal(hEventsRecord(ctx, "v-1", hEventsPos(1000, 42, "v-1")), true, "a new position must be applied; applied")
 	ctx.Assert(len(s.eventsAtWrite) == 1, "recordPosition wrote no latest record: updateLatest was called %d times", len(s.eventsAtWrite))
 	ctx.Equal(s.eventsAtWrite[0], 0, "when the latest record was written, events were already on fleet.position: a consumer could act on a position the state did not have yet. Write first, publish second; the events at the write")
-	ctx.Equal(len(ctx.Kafka.Records(positionTopic)), 1, "one applied position; the records")
-	ctx.Equal(eventsRecord(ctx, "v-1", eventsPos(500, 41, "v-1")), false, "an older position is ignored by the state and recordPosition returns false; applied")
-	ctx.Equal(len(ctx.Kafka.Records(positionTopic)), 1, "an ignored (older) position was published: only an applied position is an event; the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHPositionTopic)), 1, "one applied position; the records")
+	ctx.Equal(hEventsRecord(ctx, "v-1", hEventsPos(500, 41, "v-1")), false, "an older position is ignored by the state and recordPosition returns false; applied")
+	ctx.Equal(len(ctx.Kafka.Records(kHPositionTopic)), 1, "an ignored (older) position was published: only an applied position is an event; the records")
 }
 
 func CheckAcksAll(ctx *harness.Ctx) {
-	newEvents(ctx)
-	eventsRecord(ctx, "v-1", eventsPos(1000, 42, "v-1"))
-	ctx.Equal(len(ctx.Kafka.Records(positionTopic)), 1, "one applied position; the records")
-	ctx.Kafka.Failover(positionTopic) // the partition leader fails right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(positionTopic)), 1, "the partition leader failed right after acknowledging the event and the event is gone: with RequireOne the leader answers before the followers have it. Produce with RequireAll; the records")
+	hNewEvents(ctx)
+	hEventsRecord(ctx, "v-1", hEventsPos(1000, 42, "v-1"))
+	ctx.Equal(len(ctx.Kafka.Records(kHPositionTopic)), 1, "one applied position; the records")
+	ctx.Kafka.Failover(kHPositionTopic) // the partition leader fails right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHPositionTopic)), 1, "the partition leader failed right after acknowledging the event and the event is gone: with RequireOne the leader answers before the followers have it. Produce with RequireAll; the records")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -772,18 +772,18 @@ func CheckAcksAll(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kPositionTopic = "fleet.position";
+const std::string kHPositionTopic = "fleet.position";
 
 // Stands in for step 2's update_latest: the compare-and-set on vehicle:{id}:latest, noting how many
 // events were on the topic each time a position was written.
-harness::Ctx* eventsCtx = nullptr;
-std::vector<int> eventsAtWrite;
+harness::Ctx* hEventsCtx = nullptr;
+std::vector<int> hEventsAtWrite;
 
-Position eventsPos(long long ts, long long seq, const std::string& vehicle_id = "v-1") {
+Position hEventsPos(long long ts, long long seq, const std::string& vehicle_id = "v-1") {
   return Position{vehicle_id, ts, seq, 47.6, -122.3};
 }
 
-std::string eventsLower(std::string s) {
+std::string hEventsLower(std::string s) {
   std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
   return s;
 }
@@ -792,21 +792,21 @@ std::string eventsLower(std::string s) {
 
 bool update_latest(const std::string& vehicle_id, const Position& p) {
   const std::string key = "vehicle:" + vehicle_id + ":latest";
-  const auto cur = eventsCtx->Redis.HGetAll(key);
+  const auto cur = hEventsCtx->Redis.HGetAll(key);
   if (!cur.empty()) {
     const long long ts = std::atoll(cur.at("ts").c_str());
     const long long seq = std::atoll(cur.at("seq").c_str());
     if (p.device_timestamp_ms < ts || (p.device_timestamp_ms == ts && p.sequence <= seq)) return false;
   }
-  eventsAtWrite.push_back(static_cast<int>(eventsCtx->Kafka.Records(kPositionTopic).size()));
-  eventsCtx->Redis.Do("HSET", key, "ts", p.device_timestamp_ms, "seq", p.sequence, "lat", p.lat, "lon", p.lon);
+  hEventsAtWrite.push_back(static_cast<int>(hEventsCtx->Kafka.Records(kHPositionTopic).size()));
+  hEventsCtx->Redis.Do("HSET", key, "ts", p.device_timestamp_ms, "seq", p.sequence, "lat", p.lat, "lon", p.lon);
   return true;
 }
 
 void CheckPayload(harness::Ctx& ctx) {
-  eventsCtx = &ctx;
-  ctx.Equal(record_position("v-1", eventsPos(1000, 42)), true, "a new position must be applied; applied");
-  const auto records = ctx.Kafka.Records(kPositionTopic);
+  hEventsCtx = &ctx;
+  ctx.Equal(record_position("v-1", hEventsPos(1000, 42)), true, "a new position must be applied; applied");
+  const auto records = ctx.Kafka.Records(kHPositionTopic);
   ctx.Equal(records.size(), 1, "one applied position must produce one record on fleet.position; the records");
   const std::string value = records[0].Value.value_or("");
   nlohmann::json event;
@@ -824,13 +824,13 @@ void CheckPayload(harness::Ctx& ctx) {
 }
 
 void CheckTopicAndKey(harness::Ctx& ctx) {
-  eventsCtx = &ctx;
+  hEventsCtx = &ctx;
   long long seq = 1;
-  for (const long long ts : {1000, 2000, 3000}) record_position("v-1", eventsPos(ts, seq++));
-  record_position("v-2", eventsPos(1000, 1, "v-2"));
-  const auto records = ctx.Kafka.Records(kPositionTopic);
+  for (const long long ts : {1000, 2000, 3000}) record_position("v-1", hEventsPos(ts, seq++));
+  record_position("v-2", hEventsPos(1000, 1, "v-2"));
+  const auto records = ctx.Kafka.Records(kHPositionTopic);
   ctx.Equal(records.size(), 4, "four applied positions; the records");
-  ctx.Equal(ctx.Kafka.Keys(kPositionTopic), {"v-1", "v-1", "v-1", "v-2"},
+  ctx.Equal(ctx.Kafka.Keys(kHPositionTopic), {"v-1", "v-1", "v-1", "v-2"},
             "records must be keyed by the vehicle id: without the key the producer spreads one vehicle's track over "
             "every partition and consumers read it out of order");
   ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition,
@@ -842,39 +842,39 @@ void CheckTopicAndKey(harness::Ctx& ctx) {
 }
 
 void CheckNoDriverId(harness::Ctx& ctx) {
-  eventsCtx = &ctx;
+  hEventsCtx = &ctx;
   ctx.Redis.Set("vehicle:v-1:driver", "d-77");
-  record_position("v-1", eventsPos(1000, 42));
-  const auto records = ctx.Kafka.Records(kPositionTopic);
+  record_position("v-1", hEventsPos(1000, 42));
+  const auto records = ctx.Kafka.Records(kHPositionTopic);
   ctx.Equal(records.size(), 1, "one applied position; the records");
   const std::string value = records[0].Value.value_or("");
-  ctx.Assert(value.find("d-77") == std::string::npos && eventsLower(value).find("driver") == std::string::npos,
+  ctx.Assert(value.find("d-77") == std::string::npos && hEventsLower(value).find("driver") == std::string::npos,
              "the event %s names the driver: a retained, replicated position topic must not be joinable to a person. "
              "Carry the vehicle, not who drives it",
              value);
 }
 
 void CheckPublishAfterWrite(harness::Ctx& ctx) {
-  eventsCtx = &ctx;
-  ctx.Equal(record_position("v-1", eventsPos(1000, 42)), true, "a new position must be applied; applied");
-  ctx.Assert(eventsAtWrite.size() == 1, "record_position wrote no latest record: update_latest was called %d times",
-             static_cast<int>(eventsAtWrite.size()));
-  ctx.Equal(eventsAtWrite[0], 0,
+  hEventsCtx = &ctx;
+  ctx.Equal(record_position("v-1", hEventsPos(1000, 42)), true, "a new position must be applied; applied");
+  ctx.Assert(hEventsAtWrite.size() == 1, "record_position wrote no latest record: update_latest was called %d times",
+             static_cast<int>(hEventsAtWrite.size()));
+  ctx.Equal(hEventsAtWrite[0], 0,
             "when the latest record was written, events were already on fleet.position: a consumer could act on a "
             "position the state did not have yet. Write first, publish second; the events at the write");
-  ctx.Equal(ctx.Kafka.Records(kPositionTopic).size(), 1, "one applied position; the records");
-  ctx.Equal(record_position("v-1", eventsPos(500, 41)), false,
+  ctx.Equal(ctx.Kafka.Records(kHPositionTopic).size(), 1, "one applied position; the records");
+  ctx.Equal(record_position("v-1", hEventsPos(500, 41)), false,
             "an older position is ignored by the state and record_position returns false; applied");
-  ctx.Equal(ctx.Kafka.Records(kPositionTopic).size(), 1,
+  ctx.Equal(ctx.Kafka.Records(kHPositionTopic).size(), 1,
             "an ignored (older) position was published: only an applied position is an event; the records");
 }
 
 void CheckAcksAll(harness::Ctx& ctx) {
-  eventsCtx = &ctx;
-  record_position("v-1", eventsPos(1000, 42));
-  ctx.Equal(ctx.Kafka.Records(kPositionTopic).size(), 1, "one applied position; the records");
-  ctx.Kafka.Failover(kPositionTopic);  // the partition leader fails right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kPositionTopic).size(), 1,
+  hEventsCtx = &ctx;
+  record_position("v-1", hEventsPos(1000, 42));
+  ctx.Equal(ctx.Kafka.Records(kHPositionTopic).size(), 1, "one applied position; the records");
+  ctx.Kafka.Failover(kHPositionTopic);  // the partition leader fails right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHPositionTopic).size(), 1,
             "the partition leader failed right after acknowledging the event and the event is gone: with acks=1 the "
             "leader answers before the followers have it. Produce with acks=all; the records");
 }

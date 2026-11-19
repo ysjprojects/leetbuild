@@ -770,12 +770,12 @@ import (
 	"leetbuild/harness"
 )
 
-const telemetryTopic = "search.event"
+const kHTelemetryTopic = "search.event"
 
-var telemetryBg = context.Background()
+var hTelemetryBg = context.Background()
 
 func hRecord(ctx *harness.Ctx, tenant, q string, filters map[string]string) {
-	recordSearch(telemetryBg, tenant, q, filters, 3, false, 12)
+	recordSearch(hTelemetryBg, tenant, q, filters, 3, false, 12)
 	ctx.Settle()
 }
 
@@ -783,16 +783,16 @@ func CheckTenantKey(ctx *harness.Ctx) {
 	hRecord(ctx, "t-1", "kettle", nil)
 	hRecord(ctx, "t-2", "kettle", nil)
 	hRecord(ctx, "t-1", "steel kettle", map[string]string{"brand": "acme"})
-	records := ctx.Kafka.Records(telemetryTopic)
-	ctx.Equal(len(records), 3, "three searches must produce three records on %s; the records", telemetryTopic)
-	ctx.Equal(ctx.Kafka.Keys(telemetryTopic), []string{"t-1", "t-2", "t-1"}, "the records must be keyed by tenant (keyed by anything else, one tenant's events scatter across partitions)")
+	records := ctx.Kafka.Records(kHTelemetryTopic)
+	ctx.Equal(len(records), 3, "three searches must produce three records on %s; the records", kHTelemetryTopic)
+	ctx.Equal(ctx.Kafka.Keys(kHTelemetryTopic), []string{"t-1", "t-2", "t-1"}, "the records must be keyed by tenant (keyed by anything else, one tenant's events scatter across partitions)")
 	ctx.Equal(records[0].Partition, records[2].Partition, "t-1's events must stay on one partition, in order; the partitions")
 }
 
 func CheckNoRawQuery(ctx *harness.Ctx) {
-	recordSearch(telemetryBg, "t-1", "  Steel KETTLE ", map[string]string{"max_price": "5000", "brand": "acme"}, 2, true, 41)
+	recordSearch(hTelemetryBg, "t-1", "  Steel KETTLE ", map[string]string{"max_price": "5000", "brand": "acme"}, 2, true, 41)
 	ctx.Settle()
-	values := ctx.Kafka.Values(telemetryTopic)
+	values := ctx.Kafka.Values(kHTelemetryTopic)
 	ctx.Equal(len(values), 1, "one search must produce one record; the records")
 	text := strings.ToLower(values[0])
 	for _, leaked := range []string{"steel", "kettle", "acme", "5000"} {
@@ -810,28 +810,28 @@ func CheckNoRawQuery(ctx *harness.Ctx) {
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(telemetryTopic, 1)
+	ctx.Kafka.LoseAcks(kHTelemetryTopic, 1)
 	hRecord(ctx, "t-1", "kettle", nil)
-	ctx.Equal(len(ctx.Kafka.Records(telemetryTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHTelemetryTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
 	hRecord(ctx, "t-1", "kettle", nil)
-	ctx.Kafka.Failover(telemetryTopic)
-	ctx.Equal(len(ctx.Kafka.Records(telemetryTopic)), 2, "a leader failover must not lose an acknowledged event (acks=all); the records")
+	ctx.Kafka.Failover(kHTelemetryTopic)
+	ctx.Equal(len(ctx.Kafka.Records(kHTelemetryTopic)), 2, "a leader failover must not lose an acknowledged event (acks=all); the records")
 }
 
 func CheckDroppedCount(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(telemetryTopic, 1)
+	ctx.Kafka.FailNext(kHTelemetryTopic, 1)
 	hRecord(ctx, "t-1", "kettle", nil)
 	dropped, _ := ctx.Redis.Get("telemetry:dropped:t-1")
 	ctx.Equal(dropped, "1", "a search event the broker refused must be counted in telemetry:dropped:t-1 (the delivery report's error)")
 	hRecord(ctx, "t-1", "kettle", nil)
 	dropped, _ = ctx.Redis.Get("telemetry:dropped:t-1")
 	ctx.Equal(dropped, "1", "a delivered event must not be counted as dropped; telemetry:dropped:t-1")
-	ctx.Equal(len(ctx.Kafka.Records(telemetryTopic)), 1, "after one refused and one delivered event, the records")
-	ctx.Kafka.FailNext(telemetryTopic, 1)
+	ctx.Equal(len(ctx.Kafka.Records(kHTelemetryTopic)), 1, "after one refused and one delivered event, the records")
+	ctx.Kafka.FailNext(kHTelemetryTopic, 1)
 	hRecord(ctx, "t-1", "kettle", nil)
 	dropped, _ = ctx.Redis.Get("telemetry:dropped:t-1")
 	ctx.Equal(dropped, "2", "a second refused event must be counted too (the counter counts every lost event); telemetry:dropped:t-1")
-	ctx.Kafka.FailNext(telemetryTopic, 1)
+	ctx.Kafka.FailNext(kHTelemetryTopic, 1)
 	hRecord(ctx, "t-2", "kettle", nil)
 	first, _ := ctx.Redis.Get("telemetry:dropped:t-1")
 	second, _ := ctx.Redis.Get("telemetry:dropped:t-2")

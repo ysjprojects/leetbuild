@@ -650,7 +650,7 @@ import (
 )
 
 // readFlight is adv-1's campaign with a goal of 1000 impressions over the flight [start, end].
-func readFlight(id string, start, end int64) store.Campaign {
+func hReadFlight(id string, start, end int64) store.Campaign {
 	return store.Campaign{
 		CampaignID: id, AdvertiserID: "adv-1", Version: 3, State: "active", Placement: "home-top", CreativeID: "cr-" + id,
 		BidMicros: 1500, FreqCap: 3, FreqWindowS: 3600, PacedBudgetMicros: 10000000, GoalImpressions: 1000,
@@ -659,34 +659,34 @@ func readFlight(id string, start, end int64) store.Campaign {
 }
 
 // readClient serves campaign c-1, half-way through a one-day flight.
-func readClient(ctx *harness.Ctx) *harness.HTTP {
+func hReadClient(ctx *harness.Ctx) *harness.HTTP {
 	now := ctx.Clock.Now() / 1000
-	store.PutCampaign(context.Background(), readFlight("c-1", now-43200, now+43200))
+	store.PutCampaign(context.Background(), hReadFlight("c-1", now-43200, now+43200))
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readReport(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hReadReport(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	ctx.Equal(r.Status, 200, "the owner's delivery read (%s)", r.Text())
 	body, _ := r.JSON().(map[string]any)
 	return body
 }
 
-func readShortfall(ctx *harness.Ctx, c *harness.HTTP) any {
-	return readReport(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"))["under_delivery_impressions"]
+func hReadShortfall(ctx *harness.Ctx, c *harness.HTTP) any {
+	return hReadReport(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"))["under_delivery_impressions"]
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	body := readReport(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"))
+	c := hReadClient(ctx)
+	body := hReadReport(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"))
 	ctx.Assert(body["campaign_id"] == "c-1" && body["campaign_version"] == float64(3), "the report must name c-1 and its version 3, got %v", body)
 	r := c.Get("/v1/campaigns/c-404/delivery", "X-Advertiser-Id", "adv-1")
 	ctx.Equal(r.Status, 404, "an unknown campaign (%s)", r.Text())
 }
 
 func CheckAdvertiserScope(ctx *harness.Ctx) {
-	c := readClient(ctx)
+	c := hReadClient(ctx)
 	anonymous := c.Get("/v1/campaigns/c-1/delivery")
 	ctx.Equal(anonymous.Status, 401, "a request without X-Advertiser-Id answered %s; the status", anonymous.Text())
 	queried := c.Get("/v1/campaigns/c-1/delivery?advertiser_id=adv-1")
@@ -698,26 +698,26 @@ func CheckAdvertiserScope(ctx *harness.Ctx) {
 }
 
 func CheckRenderCounts(ctx *harness.Ctx) {
-	c := readClient(ctx)
+	c := hReadClient(ctx)
 	ctx.Redis.Set("pace:c-1", "9000")                                         // six serves reserved at 1500 micros
 	ctx.Redis.Do("HSET", "render:c-1", "impressions", "4", "spend_micros", "5800") // four of them rendered, one cleared at 1300
-	body := readReport(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"))
+	body := hReadReport(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"))
 	got := map[string]any{"counted_at": body["counted_at"], "impressions": body["impressions"], "spend_micros": body["spend_micros"]}
 	ctx.Equal(got, map[string]any{"counted_at": "render", "impressions": 4, "spend_micros": 5800}, "six ads were served and four rendered for 5800 micros: the advertiser pays for what rendered, at the prices the render counter holds; the report")
 }
 
 func CheckUnderDelivery(ctx *harness.Ctx) {
-	c := readClient(ctx)
+	c := hReadClient(ctx)
 	ctx.Redis.Do("HSET", "render:c-1", "impressions", "500", "spend_micros", "750000")
-	ctx.Equal(readShortfall(ctx, c), 0, "half-way through the flight with 500 of 1000 impressions the campaign is on pace; under_delivery_impressions")
+	ctx.Equal(hReadShortfall(ctx, c), 0, "half-way through the flight with 500 of 1000 impressions the campaign is on pace; under_delivery_impressions")
 	ctx.Redis.Do("HSET", "render:c-1", "impressions", "600", "spend_micros", "900000")
-	ctx.Equal(readShortfall(ctx, c), 0, "half-way through with 600 of 1000 the campaign projects 1200 and the shortfall is floored at 0; under_delivery_impressions")
+	ctx.Equal(hReadShortfall(ctx, c), 0, "half-way through with 600 of 1000 the campaign projects 1200 and the shortfall is floored at 0; under_delivery_impressions")
 	ctx.Redis.Do("HSET", "render:c-1", "impressions", "400", "spend_micros", "600000")
-	ctx.Equal(readShortfall(ctx, c), 200, "half-way through with 400 of 1000 the campaign projects 800; under_delivery_impressions")
+	ctx.Equal(hReadShortfall(ctx, c), 200, "half-way through with 400 of 1000 the campaign projects 800; under_delivery_impressions")
 	ctx.Clock.Advance(86400) // the flight is over
-	ctx.Equal(readShortfall(ctx, c), 600, "after the flight ended with 400 of 1000 the projection stops at end_ts; under_delivery_impressions")
+	ctx.Equal(hReadShortfall(ctx, c), 600, "after the flight ended with 400 of 1000 the projection stops at end_ts; under_delivery_impressions")
 	now := ctx.Clock.Now() / 1000
-	store.PutCampaign(context.Background(), readFlight("c-2", now, now+86400)) // starts this second, nothing rendered yet
+	store.PutCampaign(context.Background(), hReadFlight("c-2", now, now+86400)) // starts this second, nothing rendered yet
 	r := c.Get("/v1/campaigns/c-2/delivery", "X-Advertiser-Id", "adv-1")
 	body, _ := r.JSON().(map[string]any)
 	ctx.Assert(r.Status == 200 && body["under_delivery_impressions"] == float64(1000), "a campaign starting this very second answered %d %s, expected 1000 short: elapsed is at least 1 s, never a division by zero", r.Status, r.Text())
@@ -734,7 +734,7 @@ func CheckUnderDelivery(ctx *harness.Ctx) {
 namespace {
 
 // adv-1's campaign with a goal of 1000 impressions over the flight [start, end].
-store::Campaign readFlight(const std::string& id, long long start, long long end) {
+store::Campaign hReadFlight(const std::string& id, long long start, long long end) {
   store::Campaign c;
   c.campaign_id = id;
   c.advertiser_id = "adv-1";
@@ -753,9 +753,9 @@ store::Campaign readFlight(const std::string& id, long long start, long long end
 }
 
 // Serves campaign c-1, half-way through a one-day flight.
-harness::HTTP readClient(harness::Ctx& ctx) {
+harness::HTTP hReadClient(harness::Ctx& ctx) {
   const long long now = ctx.Clock.Now() / 1000;
-  store::putCampaign(readFlight("c-1", now - 43200, now + 43200));
+  store::putCampaign(hReadFlight("c-1", now - 43200, now + 43200));
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -763,15 +763,15 @@ harness::HTTP readClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json readReport(harness::Ctx& ctx, const harness::Response& r) {
+nlohmann::json hReadReport(harness::Ctx& ctx, const harness::Response& r) {
   ctx.Equal(r.Status, 200, "the owner's delivery read (%s)", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the delivery read must answer a JSON object, got %s", r.Text());
   return body;
 }
 
-long long readShortfall(harness::Ctx& ctx, harness::HTTP& c, const std::string& id = "c-1") {
-  const auto body = readReport(ctx, c.Get("/v1/campaigns/" + id + "/delivery", "X-Advertiser-Id", "adv-1"));
+long long hReadShortfall(harness::Ctx& ctx, harness::HTTP& c, const std::string& id = "c-1") {
+  const auto body = hReadReport(ctx, c.Get("/v1/campaigns/" + id + "/delivery", "X-Advertiser-Id", "adv-1"));
   const auto shortfall = body.find("under_delivery_impressions");
   return shortfall != body.end() && shortfall->is_number_integer() ? shortfall->get<long long>() : -1;
 }
@@ -779,15 +779,15 @@ long long readShortfall(harness::Ctx& ctx, harness::HTTP& c, const std::string& 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readClient(ctx);
-  const auto body = readReport(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"));
+  auto c = hReadClient(ctx);
+  const auto body = hReadReport(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"));
   ctx.Assert(body.value("campaign_id", std::string()) == "c-1" && body.value("campaign_version", 0LL) == 3, "the report must name c-1 and its version 3, got %s", body.dump());
   const auto r = c.Get("/v1/campaigns/c-404/delivery", "X-Advertiser-Id", "adv-1");
   ctx.Equal(r.Status, 404, "an unknown campaign (%s)", r.Text());
 }
 
 void CheckAdvertiserScope(harness::Ctx& ctx) {
-  auto c = readClient(ctx);
+  auto c = hReadClient(ctx);
   const auto anonymous = c.Get("/v1/campaigns/c-1/delivery");
   ctx.Equal(anonymous.Status, 401, "a request without X-Advertiser-Id answered %s; the status", anonymous.Text());
   const auto queried = c.Get("/v1/campaigns/c-1/delivery?advertiser_id=adv-1");
@@ -799,28 +799,28 @@ void CheckAdvertiserScope(harness::Ctx& ctx) {
 }
 
 void CheckRenderCounts(harness::Ctx& ctx) {
-  auto c = readClient(ctx);
+  auto c = hReadClient(ctx);
   ctx.Redis.Set("pace:c-1", "9000");                                             // six serves reserved at 1500 micros
   ctx.Redis.Do("HSET", "render:c-1", "impressions", "4", "spend_micros", "5800");  // four of them rendered, one cleared at 1300
-  const auto body = readReport(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"));
+  const auto body = hReadReport(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"));
   ctx.Assert(body.value("counted_at", std::string()) == "render" && body.value("impressions", -1LL) == 4 && body.value("spend_micros", -1LL) == 5800,
              "six ads were served and four rendered for 5800 micros; the report says %s, expected counted_at render, impressions 4, spend_micros 5800: the advertiser pays for what rendered, at the prices the render counter holds",
              body.dump());
 }
 
 void CheckUnderDelivery(harness::Ctx& ctx) {
-  auto c = readClient(ctx);
+  auto c = hReadClient(ctx);
   ctx.Redis.Do("HSET", "render:c-1", "impressions", "500", "spend_micros", "750000");
-  ctx.Equal(readShortfall(ctx, c), 0, "half-way through the flight with 500 of 1000 impressions the campaign is on pace; under_delivery_impressions");
+  ctx.Equal(hReadShortfall(ctx, c), 0, "half-way through the flight with 500 of 1000 impressions the campaign is on pace; under_delivery_impressions");
   ctx.Redis.Do("HSET", "render:c-1", "impressions", "600", "spend_micros", "900000");
-  ctx.Equal(readShortfall(ctx, c), 0, "half-way through with 600 of 1000 the campaign projects 1200 and the shortfall is floored at 0; under_delivery_impressions");
+  ctx.Equal(hReadShortfall(ctx, c), 0, "half-way through with 600 of 1000 the campaign projects 1200 and the shortfall is floored at 0; under_delivery_impressions");
   ctx.Redis.Do("HSET", "render:c-1", "impressions", "400", "spend_micros", "600000");
-  ctx.Equal(readShortfall(ctx, c), 200, "half-way through with 400 of 1000 the campaign projects 800; under_delivery_impressions");
+  ctx.Equal(hReadShortfall(ctx, c), 200, "half-way through with 400 of 1000 the campaign projects 800; under_delivery_impressions");
   ctx.Clock.Advance(86400);  // the flight is over
-  ctx.Equal(readShortfall(ctx, c), 600, "after the flight ended with 400 of 1000 the projection stops at end_ts; under_delivery_impressions");
+  ctx.Equal(hReadShortfall(ctx, c), 600, "after the flight ended with 400 of 1000 the projection stops at end_ts; under_delivery_impressions");
   const long long now = ctx.Clock.Now() / 1000;
-  store::putCampaign(readFlight("c-2", now, now + 86400));  // starts this second, nothing rendered yet
-  ctx.Equal(readShortfall(ctx, c, "c-2"), 1000, "a campaign starting this very second: elapsed is at least 1 s, never a division by zero; under_delivery_impressions");
+  store::putCampaign(hReadFlight("c-2", now, now + 86400));  // starts this second, nothing rendered yet
+  ctx.Equal(hReadShortfall(ctx, c, "c-2"), 1000, "a campaign starting this very second: elapsed is at least 1 s, never a division by zero; under_delivery_impressions");
 }
 `,
   },

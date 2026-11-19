@@ -603,10 +603,10 @@ import (
 	"leetbuild/harness"
 )
 
-var cacheBg = context.Background()
+var hCacheBg = context.Background()
 
-func cacheRead(ctx *harness.Ctx, tenant, prefix string) []string {
-	got, hit := getSuggestions(cacheBg, tenant, prefix)
+func hCacheRead(ctx *harness.Ctx, tenant, prefix string) []string {
+	got, hit := getSuggestions(hCacheBg, tenant, prefix)
 	if !hit {
 		return nil
 	}
@@ -617,60 +617,60 @@ func cacheRead(ctx *harness.Ctx, tenant, prefix string) []string {
 }
 
 func CheckTenantKey(ctx *harness.Ctx) {
-	putSuggestions(cacheBg, "acme", "ke", []string{"kettle", "kettlebell"})
-	seen := cacheRead(ctx, "globex", "ke")
+	putSuggestions(hCacheBg, "acme", "ke", []string{"kettle", "kettlebell"})
+	seen := hCacheRead(ctx, "globex", "ke")
 	ctx.Assert(seen == nil, "globex read %q for ke: acme's completions, cached under a key without the tenant", seen)
-	putSuggestions(cacheBg, "globex", "ke", []string{"kebab"})
-	ctx.Equal(cacheRead(ctx, "acme", "ke"), []string{"kettle", "kettlebell"}, "acme's completions for ke after globex cached its own")
-	ctx.Equal(cacheRead(ctx, "globex", "ke"), []string{"kebab"}, "globex's completions for ke")
+	putSuggestions(hCacheBg, "globex", "ke", []string{"kebab"})
+	ctx.Equal(hCacheRead(ctx, "acme", "ke"), []string{"kettle", "kettlebell"}, "acme's completions for ke after globex cached its own")
+	ctx.Equal(hCacheRead(ctx, "globex", "ke"), []string{"kebab"}, "globex's completions for ke")
 	keys := ctx.Redis.Keys("suggest:cache:*")
 	ctx.Assert(len(keys) == 2 && strings.HasPrefix(keys[0], "suggest:cache:acme:") && strings.HasPrefix(keys[1], "suggest:cache:globex:"), "the cache holds %q: every key must start suggest:cache:{tenant}:", keys)
 }
 
 func CheckCatalogVersion(ctx *harness.Ctx) {
-	putSuggestions(cacheBg, "acme", "ke", []string{"kettle"})
-	ctx.Equal(cacheRead(ctx, "acme", "ke"), []string{"kettle"}, "a fresh entry must read back")
+	putSuggestions(hCacheBg, "acme", "ke", []string{"kettle"})
+	ctx.Equal(hCacheRead(ctx, "acme", "ke"), []string{"kettle"}, "a fresh entry must read back")
 	ctx.Redis.Do("INCR", "suggest:catalog:acme") // a catalog change: version 0 → 1
-	got := cacheRead(ctx, "acme", "ke")
+	got := hCacheRead(ctx, "acme", "ke")
 	ctx.Assert(got == nil, "after acme's catalog moved to version 1 the cache still answered %q: the version belongs in the key, so the old entry is not read", got)
-	putSuggestions(cacheBg, "acme", "ke", []string{"kettle pro"})
-	ctx.Equal(cacheRead(ctx, "acme", "ke"), []string{"kettle pro"}, "the refill under version 1 must read back")
+	putSuggestions(hCacheBg, "acme", "ke", []string{"kettle pro"})
+	ctx.Equal(hCacheRead(ctx, "acme", "ke"), []string{"kettle pro"}, "the refill under version 1 must read back")
 	ctx.Equal(ctx.Redis.Exists("suggest:cache:acme:v1:ke"), 1, "suggest:cache:acme:v1:ke must exist (the cache holds %q)", ctx.Redis.Keys("suggest:cache:*"))
 }
 
 func CheckTtl(ctx *harness.Ctx) {
 	// -2: the first command on the key only read it; -1: it exists without an expiry.
 	created := ctx.Redis.After("suggest:cache:acme:v0:ke", func() any { return ctx.Redis.TTL("suggest:cache:acme:v0:ke") })
-	putSuggestions(cacheBg, "acme", "ke", []string{"kettle"})
+	putSuggestions(hCacheBg, "acme", "ke", []string{"kettle"})
 	ctx.Assert(created.Fired, "putSuggestions(acme, ke, ...) never touched suggest:cache:acme:v0:ke")
 	createdTTL, _ := created.Result.(int64)
 	ctx.Assert(createdTTL == -2 || (createdTTL > 0 && createdTTL <= 300), "right after the command that wrote suggest:cache:acme:v0:ke its TTL was %d: the expiry comes with the SET that writes the entry, or a crash in between leaves an entry served forever", createdTTL)
 	ctx.Clock.Advance(299)
-	ctx.Equal(cacheRead(ctx, "acme", "ke"), []string{"kettle"}, "an entry must still be served 299 s after it was written")
+	ctx.Equal(hCacheRead(ctx, "acme", "ke"), []string{"kettle"}, "an entry must still be served 299 s after it was written")
 	ctx.Clock.Advance(2)
-	got := cacheRead(ctx, "acme", "ke")
+	got := hCacheRead(ctx, "acme", "ke")
 	ctx.Assert(got == nil, "301 s after it was written the entry is still served (%q): write it with a 300 s expiry (ttl)", got)
 }
 
 func CheckColdestCap(ctx *harness.Ctx) {
-	putSuggestions(cacheBg, "acme", "kettle", []string{"kettle"})
+	putSuggestions(hCacheBg, "acme", "kettle", []string{"kettle"})
 	for n := 0; n < 100; n++ {
 		// Written out of name order, so the coldest prefix is never simply the first by name.
-		putSuggestions(cacheBg, "globex", fmt.Sprintf("p%03d", n*37%100), []string{fmt.Sprintf("t%d", n)})
+		putSuggestions(hCacheBg, "globex", fmt.Sprintf("p%03d", n*37%100), []string{fmt.Sprintf("t%d", n)})
 		ctx.Clock.Advance(1)
 	}
-	ctx.Equal(cacheRead(ctx, "globex", "p000"), []string{"t0"}, "at the cap of 100 prefixes every entry must still be cached")
+	ctx.Equal(hCacheRead(ctx, "globex", "p000"), []string{"t0"}, "at the cap of 100 prefixes every entry must still be cached")
 	ctx.Clock.Advance(1)
-	putSuggestions(cacheBg, "globex", "p100", []string{"t100"})
+	putSuggestions(hCacheBg, "globex", "p100", []string{"t100"})
 	ctx.Equal(len(ctx.Redis.Keys("suggest:cache:*")), 101, "the cache entries after acme's one and globex's 101 writes (globex capped at 100)")
-	ctx.Assert(cacheRead(ctx, "globex", "p037") == nil, "p037, written second, was the coldest prefix when the 101st arrived and must have been evicted (the coldest is the least recently read or written)")
-	ctx.Equal(cacheRead(ctx, "globex", "p000"), []string{"t0"}, "p000 was read just before the cap was crossed: the coldest prefix is the least recently read or written, not the oldest written; p000")
-	ctx.Equal(cacheRead(ctx, "globex", "p100"), []string{"t100"}, "the newest prefix must be cached")
+	ctx.Assert(hCacheRead(ctx, "globex", "p037") == nil, "p037, written second, was the coldest prefix when the 101st arrived and must have been evicted (the coldest is the least recently read or written)")
+	ctx.Equal(hCacheRead(ctx, "globex", "p000"), []string{"t0"}, "p000 was read just before the cap was crossed: the coldest prefix is the least recently read or written, not the oldest written; p000")
+	ctx.Equal(hCacheRead(ctx, "globex", "p100"), []string{"t100"}, "the newest prefix must be cached")
 	ctx.Clock.Advance(1)
-	putSuggestions(cacheBg, "globex", "p100", []string{"t100", "t100b"})
+	putSuggestions(hCacheBg, "globex", "p100", []string{"t100", "t100b"})
 	ctx.Equal(len(ctx.Redis.Keys("suggest:cache:*")), 101, "the cache entries after rewriting p100, a prefix already cached (it adds nothing, so nothing is evicted)")
-	ctx.Equal(cacheRead(ctx, "globex", "p074"), []string{"t2"}, "rewriting a prefix already cached must not evict p074 (only a prefix over the cap of 100 evicts); p074")
-	ctx.Equal(cacheRead(ctx, "acme", "kettle"), []string{"kettle"}, "globex's flood must not evict acme's entry (the cap is per tenant)")
+	ctx.Equal(hCacheRead(ctx, "globex", "p074"), []string{"t2"}, "rewriting a prefix already cached must not evict p074 (only a prefix over the cap of 100 evicts); p074")
+	ctx.Equal(hCacheRead(ctx, "acme", "kettle"), []string{"kettle"}, "globex's flood must not evict acme's entry (the cap is per tenant)")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -683,9 +683,9 @@ func CheckColdestCap(ctx *harness.Ctx) {
 
 namespace {
 
-using Strings = std::vector<std::string>;
+using HStrings = std::vector<std::string>;
 
-std::string cacheName(const char* format, int n) {
+std::string hCacheName(const char* format, int n) {
   char out[16];
   std::snprintf(out, sizeof out, format, n);
   return out;
@@ -696,10 +696,10 @@ std::string cacheName(const char* format, int n) {
 void CheckTenantKey(harness::Ctx& ctx) {
   putSuggestions("acme", "ke", {"kettle", "kettlebell"});
   const auto seen = getSuggestions("globex", "ke");
-  ctx.Assert(!seen, "globex read %q for ke: acme's completions, cached under a key without the tenant", seen.value_or(Strings{}));
+  ctx.Assert(!seen, "globex read %q for ke: acme's completions, cached under a key without the tenant", seen.value_or(HStrings{}));
   putSuggestions("globex", "ke", {"kebab"});
-  ctx.Equal(getSuggestions("acme", "ke"), Strings{"kettle", "kettlebell"}, "acme's completions for ke after globex cached its own");
-  ctx.Equal(getSuggestions("globex", "ke"), Strings{"kebab"}, "globex's completions for ke");
+  ctx.Equal(getSuggestions("acme", "ke"), HStrings{"kettle", "kettlebell"}, "acme's completions for ke after globex cached its own");
+  ctx.Equal(getSuggestions("globex", "ke"), HStrings{"kebab"}, "globex's completions for ke");
   const auto keys = ctx.Redis.Keys("suggest:cache:*");
   ctx.Assert(keys.size() == 2 && keys[0].rfind("suggest:cache:acme:", 0) == 0 && keys[1].rfind("suggest:cache:globex:", 0) == 0,
              "the cache holds %q: every key must start suggest:cache:{tenant}:", keys);
@@ -707,12 +707,12 @@ void CheckTenantKey(harness::Ctx& ctx) {
 
 void CheckCatalogVersion(harness::Ctx& ctx) {
   putSuggestions("acme", "ke", {"kettle"});
-  ctx.Equal(getSuggestions("acme", "ke"), Strings{"kettle"}, "a fresh entry must read back");
+  ctx.Equal(getSuggestions("acme", "ke"), HStrings{"kettle"}, "a fresh entry must read back");
   ctx.Redis.Must({"INCR", "suggest:catalog:acme"});  // a catalog change: version 0 → 1
   const auto got = getSuggestions("acme", "ke");
-  ctx.Assert(!got, "after acme's catalog moved to version 1 the cache still answered %q: the version belongs in the key, so the old entry is not read", got.value_or(Strings{}));
+  ctx.Assert(!got, "after acme's catalog moved to version 1 the cache still answered %q: the version belongs in the key, so the old entry is not read", got.value_or(HStrings{}));
   putSuggestions("acme", "ke", {"kettle pro"});
-  ctx.Equal(getSuggestions("acme", "ke"), Strings{"kettle pro"}, "the refill under version 1 must read back");
+  ctx.Equal(getSuggestions("acme", "ke"), HStrings{"kettle pro"}, "the refill under version 1 must read back");
   ctx.Equal(ctx.Redis.Exists("suggest:cache:acme:v1:ke"), 1, "suggest:cache:acme:v1:ke must exist (the cache holds %q)", ctx.Redis.Keys("suggest:cache:*"));
 }
 
@@ -725,31 +725,31 @@ void CheckTtl(harness::Ctx& ctx) {
   const long long createdTtl = created->value_or(0);
   ctx.Assert(createdTtl == -2 || (createdTtl > 0 && createdTtl <= 300), "right after the command that wrote suggest:cache:acme:v0:ke its TTL was %d: the expiry comes with the SET that writes the entry, or a crash in between leaves an entry served forever", createdTtl);
   ctx.Clock.Advance(299);
-  ctx.Equal(getSuggestions("acme", "ke"), Strings{"kettle"}, "an entry must still be served 299 s after it was written");
+  ctx.Equal(getSuggestions("acme", "ke"), HStrings{"kettle"}, "an entry must still be served 299 s after it was written");
   ctx.Clock.Advance(2);
   const auto got = getSuggestions("acme", "ke");
-  ctx.Assert(!got, "301 s after it was written the entry is still served (%q): write it with a 300 s expiry (kTtlSeconds)", got.value_or(Strings{}));
+  ctx.Assert(!got, "301 s after it was written the entry is still served (%q): write it with a 300 s expiry (kTtlSeconds)", got.value_or(HStrings{}));
 }
 
 void CheckColdestCap(harness::Ctx& ctx) {
   putSuggestions("acme", "kettle", {"kettle"});
   for (int n = 0; n < 100; ++n) {
     // Written out of name order, so the coldest prefix is never simply the first by name.
-    putSuggestions("globex", cacheName("p%03d", n * 37 % 100), {cacheName("t%d", n)});
+    putSuggestions("globex", hCacheName("p%03d", n * 37 % 100), {hCacheName("t%d", n)});
     ctx.Clock.Advance(1);
   }
-  ctx.Equal(getSuggestions("globex", "p000"), Strings{"t0"}, "at the cap of 100 prefixes every entry must still be cached");
+  ctx.Equal(getSuggestions("globex", "p000"), HStrings{"t0"}, "at the cap of 100 prefixes every entry must still be cached");
   ctx.Clock.Advance(1);
   putSuggestions("globex", "p100", {"t100"});
   ctx.Equal(ctx.Redis.Keys("suggest:cache:*").size(), 101, "the cache entries after acme's one and globex's 101 writes (globex capped at 100)");
   ctx.Assert(!getSuggestions("globex", "p037"), "p037, written second, was the coldest prefix when the 101st arrived and must have been evicted (the coldest is the least recently read or written)");
-  ctx.Equal(getSuggestions("globex", "p000"), Strings{"t0"}, "p000 was read just before the cap was crossed: the coldest prefix is the least recently read or written, not the oldest written; p000");
-  ctx.Equal(getSuggestions("globex", "p100"), Strings{"t100"}, "the newest prefix must be cached");
+  ctx.Equal(getSuggestions("globex", "p000"), HStrings{"t0"}, "p000 was read just before the cap was crossed: the coldest prefix is the least recently read or written, not the oldest written; p000");
+  ctx.Equal(getSuggestions("globex", "p100"), HStrings{"t100"}, "the newest prefix must be cached");
   ctx.Clock.Advance(1);
   putSuggestions("globex", "p100", {"t100", "t100b"});
   ctx.Equal(ctx.Redis.Keys("suggest:cache:*").size(), 101, "the cache entries after rewriting p100, a prefix already cached (it adds nothing, so nothing is evicted)");
-  ctx.Equal(getSuggestions("globex", "p074"), Strings{"t2"}, "rewriting a prefix already cached must not evict p074 (only a prefix over the cap of 100 evicts); p074");
-  ctx.Equal(getSuggestions("acme", "kettle"), Strings{"kettle"}, "globex's flood must not evict acme's entry (the cap is per tenant)");
+  ctx.Equal(getSuggestions("globex", "p074"), HStrings{"t2"}, "rewriting a prefix already cached must not evict p074 (only a prefix over the cap of 100 evicts); p074");
+  ctx.Equal(getSuggestions("acme", "kettle"), HStrings{"kettle"}, "globex's flood must not evict acme's entry (the cap is per tenant)");
 }
 `,
   },

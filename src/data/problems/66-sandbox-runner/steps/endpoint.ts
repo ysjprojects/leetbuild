@@ -872,7 +872,7 @@ func CheckIdempotency(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kSubmitCode = "print('hello from the sandbox')";
+const std::string kHSubmitCode = "print('hello from the sandbox')";
 
 harness::HTTP hSubmitAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
@@ -907,18 +907,18 @@ long hJobsCreated(harness::Ctx& ctx) {
 
 void CheckRoute(harness::Ctx& ctx) {
   auto c = hSubmitAPI(ctx);
-  const auto r = hSubmitJob(c, hSubmitBody(kSubmitCode, "gvisor", {"filesystem"}), "t1", "k-1");
+  const auto r = hSubmitJob(c, hSubmitBody(kHSubmitCode, "gvisor", {"filesystem"}), "t1", "k-1");
   ctx.Equal(r.Status, 202, "POST /v1/sandbox/jobs (%s)", r.Text());
   const auto job = jobs::get(hSubmitField(r, "job_id"));
   ctx.Assert(job && job->status == "queued", "the answered job_id %q is not a queued job in the store", hSubmitField(r, "job_id"));
   ctx.Equal(hSubmitField(r, "profile"), "gvisor", "the submit asked for gvisor; the answered profile");
-  ctx.Equal(hSubmitField(r, "code_digest"), jobs::digest(kSubmitCode), "code_digest must be the SHA-256 of the code");
-  ctx.Assert(r.Text().find(kSubmitCode) == std::string::npos, "the response echoes the code: %s", r.Text());
+  ctx.Equal(hSubmitField(r, "code_digest"), jobs::digest(kHSubmitCode), "code_digest must be the SHA-256 of the code");
+  ctx.Assert(r.Text().find(kHSubmitCode) == std::string::npos, "the response echoes the code: %s", r.Text());
 }
 
 void CheckLimits(harness::Ctx& ctx) {
   auto c = hSubmitAPI(ctx);
-  auto r = hSubmitJob(c, hSubmitBody(kSubmitCode, "gvisor", {}), "", "k-1");
+  auto r = hSubmitJob(c, hSubmitBody(kHSubmitCode, "gvisor", {}), "", "k-1");
   ctx.Equal(r.Status, 401, "a submit without X-Tenant-Id");
   r = hSubmitJob(c, hSubmitBody(std::string((1 << 18) + 1, 'x'), "gvisor", {}), "t1", "k-1");
   ctx.Equal(r.Status, 413, "a submit of 256 KiB + 1 byte of code");
@@ -945,21 +945,21 @@ void CheckCapabilities(harness::Ctx& ctx) {
                                         {"gvisor", {"filesystem", "network"}, "network after a granted need"},
                                         {"kata", {"gpu"}, "a capability no profile grants"}};
   for (size_t i = 0; i < refused.size(); i++) {
-    const auto r = hSubmitJob(c, hSubmitBody(kSubmitCode, refused[i].profile, refused[i].needs), "t1", "r-" + std::to_string(i));
+    const auto r = hSubmitJob(c, hSubmitBody(kHSubmitCode, refused[i].profile, refused[i].needs), "t1", "r-" + std::to_string(i));
     ctx.Equal(r.Status, 400, "%s (%s): a declared need is granted only by the profile", refused[i].why, refused[i].profile);
   }
   ctx.Equal(hJobsCreated(ctx), 0, "jobs created by refused submits");
   const std::vector<std::pair<std::string, std::vector<std::string>>> granted = {
       {"kata", {"network"}}, {"gvisor", {"filesystem", "subprocess"}}, {"runc", {}}};
   for (size_t i = 0; i < granted.size(); i++) {
-    const auto r = hSubmitJob(c, hSubmitBody(kSubmitCode, granted[i].first, granted[i].second), "t1", "g-" + std::to_string(i));
+    const auto r = hSubmitJob(c, hSubmitBody(kHSubmitCode, granted[i].first, granted[i].second), "t1", "g-" + std::to_string(i));
     ctx.Equal(r.Status, 202, "%s with the needs its profile grants (%s)", granted[i].first, r.Text());
   }
 }
 
 void CheckIdempotency(harness::Ctx& ctx) {
   auto c = hSubmitAPI(ctx);
-  const auto plain = hSubmitBody(kSubmitCode, "gvisor", {});
+  const auto plain = hSubmitBody(kHSubmitCode, "gvisor", {});
   const auto first = hSubmitJob(c, plain, "t1", "k-1");
   ctx.Equal(first.Status, 202, "the first submit (%s)", first.Text());
   const auto replay = hSubmitJob(c, plain, "t1", "k-1");

@@ -962,16 +962,16 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
 // warehousePeer grades every item sellable, except those in grades; those in missing have not arrived.
-type warehousePeer struct {
+type HWarehousePeer struct {
 	pb.UnimplementedWarehouseServer
 	grades  map[string]string
 	missing map[string]bool
 }
 
-func (w *warehousePeer) GradeItem(_ context.Context, req *pb.GradeRequest) (*pb.GradeReply, error) {
+func (w *HWarehousePeer) GradeItem(_ context.Context, req *pb.GradeRequest) (*pb.GradeReply, error) {
 	if w.missing[req.GetReturnId()] {
 		return nil, status.Errorf(codes.NotFound, "%s has not arrived at the warehouse", req.GetReturnId())
 	}
@@ -982,39 +982,39 @@ func (w *warehousePeer) GradeItem(_ context.Context, req *pb.GradeRequest) (*pb.
 	return &pb.GradeReply{ReturnId: req.GetReturnId(), Grade: grade}, nil
 }
 
-type refundsPeer struct {
+type HRefundsPeer struct {
 	pb.UnimplementedRefundsServer
 }
 
-func (refundsPeer) IssueRefund(_ context.Context, req *pb.RefundRequest) (*pb.RefundReply, error) {
+func (HRefundsPeer) IssueRefund(_ context.Context, req *pb.RefundRequest) (*pb.RefundReply, error) {
 	return &pb.RefundReply{RefundId: "rf-" + req.GetReturnId(), State: "initiated"}, nil
 }
 
-func clientWorld(ctx *harness.Ctx) *warehousePeer {
-	w := &warehousePeer{grades: map[string]string{}, missing: map[string]bool{}}
+func hClientWorld(ctx *harness.Ctx) *HWarehousePeer {
+	w := &HWarehousePeer{grades: map[string]string{}, missing: map[string]bool{}}
 	pb.RegisterWarehouseServer(ctx.GRPC.Server("warehouse:9000"), w)
-	pb.RegisterRefundsServer(ctx.GRPC.Server("refunds:9000"), refundsPeer{})
-	store.PutLine(clientBg, store.OrderLine{OrderLineID: "L1", Tenant: "t-1", SKU: "KETTLE-2L", OrderedQuantity: 9, UnitPriceCents: 4000, DeliveredAt: store.Today(), PolicyWindow: "standard"})
+	pb.RegisterRefundsServer(ctx.GRPC.Server("refunds:9000"), HRefundsPeer{})
+	store.PutLine(hClientBg, store.OrderLine{OrderLineID: "L1", Tenant: "t-1", SKU: "KETTLE-2L", OrderedQuantity: 9, UnitPriceCents: 4000, DeliveredAt: store.Today(), PolicyWindow: "standard"})
 	return w
 }
 
-func clientOpen(ctx *harness.Ctx, returnID string, quantity int64) {
-	_, err := ledger.RegisterReturn(clientBg, "L1", returnID, quantity, map[string]string{"tenant": "t-1", "reason_code": "damaged", "photo_ref": "photos/kettle.jpg"})
+func hClientOpen(ctx *harness.Ctx, returnID string, quantity int64) {
+	_, err := ledger.RegisterReturn(hClientBg, "L1", returnID, quantity, map[string]string{"tenant": "t-1", "reason_code": "damaged", "photo_ref": "photos/kettle.jpg"})
 	ctx.NoError(err, "registering %s", returnID)
 }
 
-func clientSettle(ctx *harness.Ctx, returnID string) string {
-	state, err := settleReturn(clientBg, returnID)
+func hClientSettle(ctx *harness.Ctx, returnID string) string {
+	state, err := settleReturn(hClientBg, returnID)
 	ctx.NoError(err, "settleReturn(%s) failed", returnID)
 	return state
 }
 
-func clientGradeCalls(ctx *harness.Ctx, returnID string) int {
-	return len(clientGradeDeadlines(ctx, returnID))
+func hClientGradeCalls(ctx *harness.Ctx, returnID string) int {
+	return len(hClientGradeDeadlines(ctx, returnID))
 }
 
 // clientGradeDeadlines is the deadline, in seconds, each GradeItem call for returnID carried (-1 for none).
-func clientGradeDeadlines(ctx *harness.Ctx, returnID string) []float64 {
+func hClientGradeDeadlines(ctx *harness.Ctx, returnID string) []float64 {
 	var out []float64
 	for _, c := range ctx.GRPC.CallsTo("GradeItem", "") {
 		if c.Request.(*pb.GradeRequest).GetReturnId() != returnID {
@@ -1029,7 +1029,7 @@ func clientGradeDeadlines(ctx *harness.Ctx, returnID string) []float64 {
 	return out
 }
 
-func clientRefundAmounts(ctx *harness.Ctx, returnID string) []int64 {
+func hClientRefundAmounts(ctx *harness.Ctx, returnID string) []int64 {
 	var out []int64
 	for _, c := range ctx.GRPC.CallsTo("IssueRefund", "") {
 		if req := c.Request.(*pb.RefundRequest); req.GetReturnId() == returnID {
@@ -1040,20 +1040,20 @@ func clientRefundAmounts(ctx *harness.Ctx, returnID string) []int64 {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	clientOpen(ctx, "ret-1", 1)
-	ctx.Equal(clientSettle(ctx, "ret-1"), "refund_pending", "with a healthy warehouse the return must move on to its refund; the state")
+	hClientWorld(ctx)
+	hClientOpen(ctx, "ret-1", 1)
+	ctx.Equal(hClientSettle(ctx, "ret-1"), "refund_pending", "with a healthy warehouse the return must move on to its refund; the state")
 	for _, call := range ctx.GRPC.CallsTo("GradeItem", "") {
 		ctx.Assert(call.HasDeadline(), "a GradeItem call carries no deadline: a stalled warehouse holds the settlement open")
 		ctx.Assert(call.Timeout.Seconds() >= 2.5 && call.Timeout.Seconds() <= 3.5, "a GradeItem call carries a %v deadline, expected gradeDeadline = 3 s", call.Timeout)
 	}
-	clientOpen(ctx, "ret-2", 1)
+	hClientOpen(ctx, "ret-2", 1)
 	ctx.GRPC.SetLatency("GradeItem", 60.0, "")
 	before := ctx.Clock.Now()
-	state, _ := settleReturn(clientBg, "ret-2")
+	state, _ := settleReturn(hClientBg, "ret-2")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 10, "settleReturn waited %.0f s on a stalled warehouse: three attempts of 3 s each is the most it may spend", waited)
-	deadlines := clientGradeDeadlines(ctx, "ret-2")
+	deadlines := hClientGradeDeadlines(ctx, "ret-2")
 	ctx.Equal(len(deadlines), 3, "a stalled warehouse: an attempt that runs out its deadline is asked again, up to MAX_ATTEMPTS; the GradeItem calls")
 	for _, d := range deadlines {
 		ctx.Assert(d >= 2.5 && d <= 3.5, "the attempts on a stalled warehouse carried deadlines %v s, expected 3 s each: every attempt gets its own gradeDeadline, not what is left of the first", deadlines)
@@ -1062,54 +1062,54 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckHoldOnOutage(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	clientOpen(ctx, "ret-1", 1)
+	hClientWorld(ctx)
+	hClientOpen(ctx, "ret-1", 1)
 	ctx.GRPC.Fail("GradeItem", codes.Unavailable, "", 3, "")
-	state := clientSettle(ctx, "ret-1")
-	paid := clientRefundAmounts(ctx, "ret-1")
+	state := hClientSettle(ctx, "ret-1")
+	paid := hClientRefundAmounts(ctx, "ret-1")
 	ctx.Assert(len(paid) == 0, "with the warehouse unavailable on every attempt the refund processor was asked to pay %v: an item nobody graded was refunded", paid)
 	ctx.Equal(state, "awaiting_inspection", "with no grade, settleReturn's state")
-	record := store.ReturnOf(clientBg, "ret-1")
+	record := store.ReturnOf(hClientBg, "ret-1")
 	ctx.Assert(record.State == "awaiting_inspection" && record.RefundID == "" && record.RefundCents == 0, "the return holds %+v, expected state awaiting_inspection and no refund", *record)
-	clientOpen(ctx, "ret-2", 1)
+	hClientOpen(ctx, "ret-2", 1)
 	ctx.GRPC.Fail("GradeItem", codes.Unavailable, "", 1, "")
-	ctx.Equal(clientSettle(ctx, "ret-2"), "refund_pending", "after one UNAVAILABLE the next attempt gets the grade: the return must move on to its refund; the state")
-	ctx.Equal(clientGradeCalls(ctx, "ret-2"), 2, "one UNAVAILABLE then a grade; the GradeItem calls")
-	clientOpen(ctx, "ret-3", 1)
+	ctx.Equal(hClientSettle(ctx, "ret-2"), "refund_pending", "after one UNAVAILABLE the next attempt gets the grade: the return must move on to its refund; the state")
+	ctx.Equal(hClientGradeCalls(ctx, "ret-2"), 2, "one UNAVAILABLE then a grade; the GradeItem calls")
+	hClientOpen(ctx, "ret-3", 1)
 	ctx.GRPC.Fail("GradeItem", codes.Unavailable, "", 2, "")
-	ctx.Equal(clientSettle(ctx, "ret-3"), "refund_pending", "after two UNAVAILABLE the third attempt gets the grade: the return must move on to its refund; the state")
-	ctx.Equal(clientGradeCalls(ctx, "ret-3"), 3, "two UNAVAILABLE then a grade (MAX_ATTEMPTS); the GradeItem calls")
+	ctx.Equal(hClientSettle(ctx, "ret-3"), "refund_pending", "after two UNAVAILABLE the third attempt gets the grade: the return must move on to its refund; the state")
+	ctx.Equal(hClientGradeCalls(ctx, "ret-3"), 3, "two UNAVAILABLE then a grade (MAX_ATTEMPTS); the GradeItem calls")
 }
 
 func CheckDamagedAmount(ctx *harness.Ctx) {
-	w := clientWorld(ctx)
-	clientOpen(ctx, "ret-1", 2)
+	w := hClientWorld(ctx)
+	hClientOpen(ctx, "ret-1", 2)
 	w.grades["ret-1"] = "damaged"
-	ctx.Equal(clientSettle(ctx, "ret-1"), "refund_pending", "a graded return must move on to its refund; the state")
-	ctx.Equal(clientRefundAmounts(ctx, "ret-1"), []int64{4000}, "a damaged return of 2 units at 4000 cents must ask for DAMAGED_REFUND_PERCENT (50) of the line value; the IssueRefund amounts")
-	record := store.ReturnOf(clientBg, "ret-1")
+	ctx.Equal(hClientSettle(ctx, "ret-1"), "refund_pending", "a graded return must move on to its refund; the state")
+	ctx.Equal(hClientRefundAmounts(ctx, "ret-1"), []int64{4000}, "a damaged return of 2 units at 4000 cents must ask for DAMAGED_REFUND_PERCENT (50) of the line value; the IssueRefund amounts")
+	record := store.ReturnOf(hClientBg, "ret-1")
 	ctx.Assert(record.Grade == "damaged" && record.RefundCents == 4000 && record.RefundID == "rf-ret-1", "the return holds %+v, expected grade damaged, refund_cents 4000, refund_id rf-ret-1", *record)
-	clientOpen(ctx, "ret-2", 1)
-	clientSettle(ctx, "ret-2")
-	record = store.ReturnOf(clientBg, "ret-2")
+	hClientOpen(ctx, "ret-2", 1)
+	hClientSettle(ctx, "ret-2")
+	record = store.ReturnOf(hClientBg, "ret-2")
 	ctx.Assert(record.Grade == "sellable" && record.RefundCents == 4000, "a sellable return of 1 unit at 4000 cents holds %+v, expected the full 4000", *record)
 }
 
 func CheckTerminalNotRetried(ctx *harness.Ctx) {
-	w := clientWorld(ctx)
-	clientOpen(ctx, "ret-1", 1)
+	w := hClientWorld(ctx)
+	hClientOpen(ctx, "ret-1", 1)
 	w.missing["ret-1"] = true
-	state := clientSettle(ctx, "ret-1")
-	ctx.Equal(clientGradeCalls(ctx, "ret-1"), 1, "the warehouse answered NOT_FOUND (the item has not arrived): only UNAVAILABLE and DEADLINE_EXCEEDED are asked again; the GradeItem calls")
+	state := hClientSettle(ctx, "ret-1")
+	ctx.Equal(hClientGradeCalls(ctx, "ret-1"), 1, "the warehouse answered NOT_FOUND (the item has not arrived): only UNAVAILABLE and DEADLINE_EXCEEDED are asked again; the GradeItem calls")
 	ctx.Equal(state, "awaiting_inspection", "an item that has not arrived; the state")
-	clientOpen(ctx, "ret-2", 1)
+	hClientOpen(ctx, "ret-2", 1)
 	w.grades["ret-2"] = "damaged"
-	clientSettle(ctx, "ret-2")
-	ctx.Equal(clientGradeCalls(ctx, "ret-2"), 1, "the warehouse graded the item damaged, and a grade is an answer; the GradeItem calls")
-	clientOpen(ctx, "ret-3", 1)
+	hClientSettle(ctx, "ret-2")
+	ctx.Equal(hClientGradeCalls(ctx, "ret-2"), 1, "the warehouse graded the item damaged, and a grade is an answer; the GradeItem calls")
+	hClientOpen(ctx, "ret-3", 1)
 	ctx.GRPC.Fail("GradeItem", codes.InvalidArgument, "", 3, "")
-	clientSettle(ctx, "ret-3")
-	ctx.Equal(clientGradeCalls(ctx, "ret-3"), 1, "INVALID_ARGUMENT: the same request gets the same refusal; the GradeItem calls")
+	hClientSettle(ctx, "ret-3")
+	ctx.Equal(hClientGradeCalls(ctx, "ret-3"), 1, "INVALID_ARGUMENT: the same request gets the same refusal; the GradeItem calls")
 	ctx.GRPC.ClearFailures()
 	terminal := []struct {
 		name string
@@ -1117,11 +1117,11 @@ func CheckTerminalNotRetried(ctx *harness.Ctx) {
 	}{{"PERMISSION_DENIED", codes.PermissionDenied}, {"FAILED_PRECONDITION", codes.FailedPrecondition}, {"INTERNAL", codes.Internal}}
 	for i, t := range terminal {
 		returnID := "ret-" + string(rune('4'+i))
-		clientOpen(ctx, returnID, 1)
+		hClientOpen(ctx, returnID, 1)
 		ctx.GRPC.Fail("GradeItem", t.code, "", 1, "")
-		after := clientSettle(ctx, returnID)
-		ctx.Equal(clientGradeCalls(ctx, returnID), 1, "%s: only UNAVAILABLE and DEADLINE_EXCEEDED are asked again; the GradeItem calls", t.name)
-		paid := clientRefundAmounts(ctx, returnID)
+		after := hClientSettle(ctx, returnID)
+		ctx.Equal(hClientGradeCalls(ctx, returnID), 1, "%s: only UNAVAILABLE and DEADLINE_EXCEEDED are asked again; the GradeItem calls", t.name)
+		paid := hClientRefundAmounts(ctx, returnID)
 		ctx.Assert(after == "awaiting_inspection" && len(paid) == 0, "after %s the return is %q and the refund processor was asked for %v: no grade holds it in awaiting_inspection", t.name, after, paid)
 	}
 }

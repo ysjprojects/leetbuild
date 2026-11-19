@@ -1001,18 +1001,18 @@ import (
 )
 
 const (
-	eventsTopic  = "gpu.placement"
-	eventsOutbox = "outbox:gpu.placement"
+	kHEventsTopic  = "gpu.placement"
+	kHEventsOutbox = "outbox:gpu.placement"
 )
 
-func eventsNode(ctx *harness.Ctx, id string) {
+func hEventsNode(ctx *harness.Ctx, id string) {
 	ctx.Redis.Do("HSET", "node:"+id, "gpu_type", "a100", "capacity", 8, "allocated", 0)
 	ctx.Redis.Do("SADD", "nodes", id)
 	ctx.Redis.Do("SET", "heartbeat:"+id, "1", "EX", 30)
 }
 
 // eventsLedger stands in for allocate and release (state.go, step 2).
-func eventsLedger(ctx *harness.Ctx) {
+func hEventsLedger(ctx *harness.Ctx) {
 	allocate = func(_ context.Context, nodeID, placementID string, count int) (string, error) {
 		if ctx.Redis.Exists("heartbeat:"+nodeID) == 0 {
 			return "NO_HEARTBEAT", nil
@@ -1044,21 +1044,21 @@ func eventsLedger(ctx *harness.Ctx) {
 	}
 }
 
-func eventsWorld(ctx *harness.Ctx) {
-	eventsNode(ctx, "gpu-1")
-	eventsNode(ctx, "gpu-2")
-	eventsLedger(ctx)
+func hEventsWorld(ctx *harness.Ctx) {
+	hEventsNode(ctx, "gpu-1")
+	hEventsNode(ctx, "gpu-2")
+	hEventsLedger(ctx)
 }
 
-func eventsAllocated(ctx *harness.Ctx, id string) int {
+func hEventsAllocated(ctx *harness.Ctx, id string) int {
 	v, _ := ctx.Redis.HGet("node:"+id, "allocated")
 	n, _ := strconv.Atoi(v)
 	return n
 }
 
-func eventsAll(ctx *harness.Ctx) []map[string]any {
+func hEventsAll(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
-	for _, r := range ctx.Kafka.Records(eventsTopic) {
+	for _, r := range ctx.Kafka.Records(kHEventsTopic) {
 		var e map[string]any
 		json.Unmarshal(r.Value, &e)
 		out = append(out, e)
@@ -1067,9 +1067,9 @@ func eventsAll(ctx *harness.Ctx) []map[string]any {
 }
 
 // eventsFolded is the node's occupancy as a consumer rebuilds it from its events.
-func eventsFolded(ctx *harness.Ctx, id string) int {
+func hEventsFolded(ctx *harness.Ctx, id string) int {
 	total := 0
-	for _, e := range eventsAll(ctx) {
+	for _, e := range hEventsAll(ctx) {
 		nodeID, _ := e["node_id"].(string)
 		if nodeID != id {
 			continue
@@ -1085,7 +1085,7 @@ func eventsFolded(ctx *harness.Ctx, id string) int {
 	return total
 }
 
-func eventsBook(ctx *harness.Ctx, nodeID, pid, tenant string, count int, memoryGB float64) string {
+func hEventsBook(ctx *harness.Ctx, nodeID, pid, tenant string, count int, memoryGB float64) string {
 	result, err := allocateAndPublish(context.Background(), nodeID, pid, tenant, count, memoryGB)
 	ctx.NoError(err, "allocateAndPublish(%s, %s)", nodeID, pid)
 	ctx.Settle()
@@ -1093,20 +1093,20 @@ func eventsBook(ctx *harness.Ctx, nodeID, pid, tenant string, count int, memoryG
 }
 
 func CheckNodeKey(ctx *harness.Ctx) {
-	eventsWorld(ctx)
-	ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1")
-	ctx.Equal(eventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2")
-	ctx.Equal(eventsBook(ctx, "gpu-2", "p-3", "acme", 1, 20), "ALLOCATED", "booking p-3")
-	records := ctx.Kafka.Records(eventsTopic)
+	hEventsWorld(ctx)
+	ctx.Equal(hEventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1")
+	ctx.Equal(hEventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2")
+	ctx.Equal(hEventsBook(ctx, "gpu-2", "p-3", "acme", 1, 20), "ALLOCATED", "booking p-3")
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three bookings must produce three records on gpu.placement; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"gpu-1", "gpu-1", "gpu-2"}, "records must be keyed by the node id")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"gpu-1", "gpu-1", "gpu-2"}, "records must be keyed by the node id")
 	ctx.Equal(records[0].Partition, records[1].Partition, "one node's events must share a partition so a consumer folds them in order; gpu-1's partitions")
 }
 
 func CheckEventFields(ctx *harness.Ctx) {
-	eventsWorld(ctx)
-	ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1")
-	all := eventsAll(ctx)
+	hEventsWorld(ctx)
+	ctx.Equal(hEventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1")
+	all := hEventsAll(ctx)
 	ctx.Equal(len(all), 1, "one booking's records")
 	e := all[0]
 	for field, want := range map[string]any{"type": "allocation", "placement_id": "p-1", "node_id": "gpu-1", "tenant": "acme", "gpu_count": 4, "memory_gb": 80} {
@@ -1117,23 +1117,23 @@ func CheckEventFields(ctx *harness.Ctx) {
 }
 
 func CheckPublishAfterCommit(ctx *harness.Ctx) {
-	eventsWorld(ctx)
-	ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 8, 80), "ALLOCATED", "booking 8")
-	ctx.Equal(eventsBook(ctx, "gpu-1", "p-2", "beta", 4, 40), "NO_CAPACITY", "4 GPUs on a full node")
-	ctx.Equal(len(eventsAll(ctx)), 1, "a refused placement must produce nothing: the stream holds %v; the records", eventsAll(ctx))
+	hEventsWorld(ctx)
+	ctx.Equal(hEventsBook(ctx, "gpu-1", "p-1", "acme", 8, 80), "ALLOCATED", "booking 8")
+	ctx.Equal(hEventsBook(ctx, "gpu-1", "p-2", "beta", 4, 40), "NO_CAPACITY", "4 GPUs on a full node")
+	ctx.Equal(len(hEventsAll(ctx)), 1, "a refused placement must produce nothing: the stream holds %v; the records", hEventsAll(ctx))
 	ctx.Redis.Del("heartbeat:gpu-2")
-	ctx.Equal(eventsBook(ctx, "gpu-2", "p-3", "acme", 1, 20), "NO_HEARTBEAT", "a node whose heartbeat lapsed")
-	ctx.Equal(len(eventsAll(ctx)), 1, "a placement refused for a lapsed heartbeat must produce nothing; the records")
-	ctx.Equal(eventsFolded(ctx, "gpu-1"), eventsAllocated(ctx, "gpu-1"), "the stream folded for gpu-1 against the ledger")
+	ctx.Equal(hEventsBook(ctx, "gpu-2", "p-3", "acme", 1, 20), "NO_HEARTBEAT", "a node whose heartbeat lapsed")
+	ctx.Equal(len(hEventsAll(ctx)), 1, "a placement refused for a lapsed heartbeat must produce nothing; the records")
+	ctx.Equal(hEventsFolded(ctx, "gpu-1"), hEventsAllocated(ctx, "gpu-1"), "the stream folded for gpu-1 against the ledger")
 }
 
 func CheckOutboxRelay(ctx *harness.Ctx) {
-	eventsWorld(ctx)
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "the booking stands whatever the broker says")
-	ctx.Equal(len(eventsAll(ctx)), 0, "the broker refused the record: nothing is on the topic; the records")
-	rows := ctx.Redis.LRange(eventsOutbox, 0, -1)
-	ctx.Equal(len(rows), 1, "a refused delivery must leave one row in %s, found %q (on a write error, RPUSH the key and value); the rows", eventsOutbox, rows)
+	hEventsWorld(ctx)
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ctx.Equal(hEventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "the booking stands whatever the broker says")
+	ctx.Equal(len(hEventsAll(ctx)), 0, "the broker refused the record: nothing is on the topic; the records")
+	rows := ctx.Redis.LRange(kHEventsOutbox, 0, -1)
+	ctx.Equal(len(rows), 1, "a refused delivery must leave one row in %s, found %q (on a write error, RPUSH the key and value); the rows", kHEventsOutbox, rows)
 	var row map[string]any
 	json.Unmarshal([]byte(rows[0]), &row)
 	key, _ := row["key"].(string)
@@ -1143,42 +1143,42 @@ func CheckOutboxRelay(ctx *harness.Ctx) {
 	ctx.NoError(err, "relayOutbox")
 	ctx.Settle()
 	ctx.Equal(sent, 1, "rows relayOutbox sent")
-	all := eventsAll(ctx)
+	all := hEventsAll(ctx)
 	relayedPid := ""
 	if len(all) == 1 {
 		relayedPid, _ = all[0]["placement_id"].(string)
 	}
 	ctx.Assert(relayedPid == "p-1", "after the relay the stream must hold p-1's allocation, got %v", all)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"gpu-1"}, "the relayed record keeps its node key")
-	ctx.Equal(ctx.Redis.LLen(eventsOutbox), 0, "a relayed row leaves the outbox; rows left")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"gpu-1"}, "the relayed record keeps its node key")
+	ctx.Equal(ctx.Redis.LLen(kHEventsOutbox), 0, "a relayed row leaves the outbox; rows left")
 	sent, _ = relayOutbox(context.Background())
-	ctx.Assert(sent == 0 && len(eventsAll(ctx)) == 1, "an empty outbox relays nothing")
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ctx.Equal(eventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2")
-	ctx.Equal(ctx.Redis.LLen(eventsOutbox), 1, "a second refused delivery must leave one row in %s; the rows", eventsOutbox)
-	ctx.Kafka.FailNext(eventsTopic, 1)
+	ctx.Assert(sent == 0 && len(hEventsAll(ctx)) == 1, "an empty outbox relays nothing")
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ctx.Equal(hEventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2")
+	ctx.Equal(ctx.Redis.LLen(kHEventsOutbox), 1, "a second refused delivery must leave one row in %s; the rows", kHEventsOutbox)
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
 	relayOutbox(context.Background()) // the broker refuses the relayed record once
 	ctx.Settle()
 	relayOutbox(context.Background())
 	ctx.Settle()
 	p2 := 0
-	for _, e := range eventsAll(ctx) {
+	for _, e := range hEventsAll(ctx) {
 		if e["placement_id"] == "p-2" {
 			p2++
 		}
 	}
-	ctx.Assert(p2 == 1 && ctx.Redis.LLen(eventsOutbox) == 0, "the broker refused p-2's relayed record once; after two relays the stream holds %d allocations of p-2 and the outbox %d rows, expected 1 and 0: a relayed write that fails goes back to the outbox like any other", p2, ctx.Redis.LLen(eventsOutbox))
+	ctx.Assert(p2 == 1 && ctx.Redis.LLen(kHEventsOutbox) == 0, "the broker refused p-2's relayed record once; after two relays the stream holds %d allocations of p-2 and the outbox %d rows, expected 1 and 0: a relayed write that fails goes back to the outbox like any other", p2, ctx.Redis.LLen(kHEventsOutbox))
 }
 
 func CheckReleaseReconcile(ctx *harness.Ctx) {
-	eventsWorld(ctx)
-	ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1")
-	ctx.Equal(eventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2")
+	hEventsWorld(ctx)
+	ctx.Equal(hEventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1")
+	ctx.Equal(hEventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2")
 	moved, err := releaseAndPublish(context.Background(), "gpu-1", "p-1")
 	ctx.NoError(err, "releaseAndPublish")
 	ctx.Settle()
 	ctx.Equal(moved, true, "the first release moves the counters")
-	all := eventsAll(ctx)
+	all := hEventsAll(ctx)
 	ctx.Equal(len(all), 3, "two bookings and one release must produce three records (a release is an event too); the records")
 	rel := all[2]
 	kind, _ := rel["type"].(string)
@@ -1186,21 +1186,21 @@ func CheckReleaseReconcile(ctx *harness.Ctx) {
 	ctx.Assert(kind == "release" && pid == "p-1" && rel["gpu_count"] == float64(4), "the third event must be p-1's release with gpu_count 4, got %v", rel)
 	_, relTS := rel["ts"]
 	ctx.Assert(rel["node_id"] == "gpu-1" && rel["tenant"] == "acme" && rel["memory_gb"] == float64(80) && relTS, "p-1's release must carry node_id gpu-1, tenant acme, memory_gb 80 and ts, as its allocation did, got %v", rel)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic)[2], "gpu-1", "the release is keyed by the node id too")
-	ctx.Assert(eventsFolded(ctx, "gpu-1") == 2 && eventsAllocated(ctx, "gpu-1") == 2, "the stream folds to %d GPUs on gpu-1, the ledger says %d", eventsFolded(ctx, "gpu-1"), eventsAllocated(ctx, "gpu-1"))
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic)[2], "gpu-1", "the release is keyed by the node id too")
+	ctx.Assert(hEventsFolded(ctx, "gpu-1") == 2 && hEventsAllocated(ctx, "gpu-1") == 2, "the stream folds to %d GPUs on gpu-1, the ledger says %d", hEventsFolded(ctx, "gpu-1"), hEventsAllocated(ctx, "gpu-1"))
 	moved, _ = releaseAndPublish(context.Background(), "gpu-1", "p-1")
 	ctx.Settle()
-	ctx.Assert(!moved && len(eventsAll(ctx)) == 3, "a repeated release moves nothing and produces nothing")
-	ctx.Kafka.FailNext(eventsTopic, 1)
+	ctx.Assert(!moved && len(hEventsAll(ctx)) == 3, "a repeated release moves nothing and produces nothing")
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
 	moved, err = releaseAndPublish(context.Background(), "gpu-1", "p-2")
 	ctx.NoError(err, "releaseAndPublish")
 	ctx.Settle()
 	ctx.Equal(moved, true, "the first release of p-2 moves the counters")
-	rows := ctx.Redis.LRange(eventsOutbox, 0, -1)
-	ctx.Assert(len(rows) == 1 && strings.Contains(rows[0], "p-2"), "the broker refused p-2's release, so it must wait in %s, found %q: a release reports a failed write like an allocation", eventsOutbox, rows)
+	rows := ctx.Redis.LRange(kHEventsOutbox, 0, -1)
+	ctx.Assert(len(rows) == 1 && strings.Contains(rows[0], "p-2"), "the broker refused p-2's release, so it must wait in %s, found %q: a release reports a failed write like an allocation", kHEventsOutbox, rows)
 	relayOutbox(context.Background())
 	ctx.Settle()
-	ctx.Assert(eventsFolded(ctx, "gpu-1") == 0 && eventsAllocated(ctx, "gpu-1") == 0, "after relaying p-2's release the stream folds to %d GPUs on gpu-1, the ledger says %d", eventsFolded(ctx, "gpu-1"), eventsAllocated(ctx, "gpu-1"))
+	ctx.Assert(hEventsFolded(ctx, "gpu-1") == 0 && hEventsAllocated(ctx, "gpu-1") == 0, "after relaying p-2's release the stream folds to %d GPUs on gpu-1, the ledger says %d", hEventsFolded(ctx, "gpu-1"), hEventsAllocated(ctx, "gpu-1"))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1212,38 +1212,38 @@ func CheckReleaseReconcile(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "gpu.placement";
-const std::string kEventsOutbox = "outbox:gpu.placement";
+const std::string kHEventsTopic = "gpu.placement";
+const std::string kHEventsOutbox = "outbox:gpu.placement";
 
-harness::Ctx* eventsCtx = nullptr;
+harness::Ctx* hEventsCtx = nullptr;
 
-void eventsNode(harness::Ctx& ctx, const std::string& id) {
+void hEventsNode(harness::Ctx& ctx, const std::string& id) {
   ctx.Redis.Do("HSET", "node:" + id, "gpu_type", "a100", "capacity", 8, "allocated", 0);
   ctx.Redis.Do("SADD", "nodes", id);
   ctx.Redis.Do("SET", "heartbeat:" + id, "1", "EX", 30);
 }
 
-void eventsWorld(harness::Ctx& ctx) {
-  eventsCtx = &ctx;
-  eventsNode(ctx, "gpu-1");
-  eventsNode(ctx, "gpu-2");
+void hEventsWorld(harness::Ctx& ctx) {
+  hEventsCtx = &ctx;
+  hEventsNode(ctx, "gpu-1");
+  hEventsNode(ctx, "gpu-2");
 }
 
-int eventsAllocated(harness::Ctx& ctx, const std::string& id) {
+int hEventsAllocated(harness::Ctx& ctx, const std::string& id) {
   const auto v = ctx.Redis.HGet("node:" + id, "allocated");
   return v ? std::stoi(*v) : 0;
 }
 
-std::vector<nlohmann::json> eventsAll(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsAll(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
-  for (const auto& r : ctx.Kafka.Records(kEventsTopic)) out.push_back(nlohmann::json::parse(r.Value.value_or(""), nullptr, false));
+  for (const auto& r : ctx.Kafka.Records(kHEventsTopic)) out.push_back(nlohmann::json::parse(r.Value.value_or(""), nullptr, false));
   return out;
 }
 
 // The node's occupancy as a consumer rebuilds it from its events.
-int eventsFolded(harness::Ctx& ctx, const std::string& id) {
+int hEventsFolded(harness::Ctx& ctx, const std::string& id) {
   int total = 0;
-  for (const auto& e : eventsAll(ctx)) {
+  for (const auto& e : hEventsAll(ctx)) {
     if (!e.is_object() || e.value("node_id", "") != id) continue;
     const int count = e.value("gpu_count", 0);
     const std::string type = e.value("type", "");
@@ -1252,7 +1252,7 @@ int eventsFolded(harness::Ctx& ctx, const std::string& id) {
   return total;
 }
 
-std::string eventsBook(harness::Ctx& ctx, const std::string& node, const std::string& pid, const std::string& tenant, int count, double memory_gb) {
+std::string hEventsBook(harness::Ctx& ctx, const std::string& node, const std::string& pid, const std::string& tenant, int count, double memory_gb) {
   const std::string result = allocate_and_publish(node, pid, tenant, count, memory_gb);
   ctx.Settle();
   return result;
@@ -1262,7 +1262,7 @@ std::string eventsBook(harness::Ctx& ctx, const std::string& node, const std::st
 
 // The ledger (state.cpp, step 2) as the harness stands in for it.
 std::string allocate(const std::string& node_id, const std::string& placement_id, int count) {
-  harness::Ctx& ctx = *eventsCtx;
+  harness::Ctx& ctx = *hEventsCtx;
   if (ctx.Redis.Exists("heartbeat:" + node_id) == 0) return "NO_HEARTBEAT";
   if (ctx.Redis.SIsMember("node:" + node_id + ":placements", placement_id)) return "ALLOCATED";
   const auto fields = ctx.Redis.HGetAll("node:" + node_id);
@@ -1276,7 +1276,7 @@ std::string allocate(const std::string& node_id, const std::string& placement_id
 }
 
 bool release(const std::string& node_id, const std::string& placement_id) {
-  harness::Ctx& ctx = *eventsCtx;
+  harness::Ctx& ctx = *hEventsCtx;
   if (!ctx.Redis.SIsMember("node:" + node_id + ":placements", placement_id)) return false;
   const auto count = ctx.Redis.HGet("placement:" + placement_id, "count");
   ctx.Redis.Do("HINCRBY", "node:" + node_id, "allocated", -(count ? std::stoi(*count) : 0));
@@ -1286,23 +1286,23 @@ bool release(const std::string& node_id, const std::string& placement_id) {
 }
 
 void CheckNodeKey(harness::Ctx& ctx) {
-  eventsWorld(ctx);
-  ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1");
-  ctx.Equal(eventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2");
-  ctx.Equal(eventsBook(ctx, "gpu-2", "p-3", "acme", 1, 20), "ALLOCATED", "booking p-3");
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  hEventsWorld(ctx);
+  ctx.Equal(hEventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1");
+  ctx.Equal(hEventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2");
+  ctx.Equal(hEventsBook(ctx, "gpu-2", "p-3", "acme", 1, 20), "ALLOCATED", "booking p-3");
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three bookings must produce three records on gpu.placement; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"gpu-1", "gpu-1", "gpu-2"}, "records must be keyed by the node id");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"gpu-1", "gpu-1", "gpu-2"}, "records must be keyed by the node id");
   ctx.Equal(records[0].Partition, records[1].Partition, "one node's events must share a partition so a consumer folds them in order; gpu-1's partitions");
 }
 
 void CheckEventFields(harness::Ctx& ctx) {
-  eventsWorld(ctx);
-  ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1");
-  const auto all = eventsAll(ctx);
+  hEventsWorld(ctx);
+  ctx.Equal(hEventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1");
+  const auto all = hEventsAll(ctx);
   ctx.Equal(all.size(), 1, "one booking's records");
   const nlohmann::json& e = all[0];
-  ctx.Assert(e.is_object(), "the event is not a JSON object: %s", ctx.Kafka.Values(kEventsTopic)[0]);
+  ctx.Assert(e.is_object(), "the event is not a JSON object: %s", ctx.Kafka.Values(kHEventsTopic)[0]);
   ctx.Equal(e.value("type", ""), "allocation", "the event's type (%s)", e.dump());
   ctx.Equal(e.value("placement_id", ""), "p-1", "the event's placement_id (%s)", e.dump());
   ctx.Equal(e.value("node_id", ""), "gpu-1", "the event's node_id (%s)", e.dump());
@@ -1313,79 +1313,79 @@ void CheckEventFields(harness::Ctx& ctx) {
 }
 
 void CheckPublishAfterCommit(harness::Ctx& ctx) {
-  eventsWorld(ctx);
-  ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 8, 80), "ALLOCATED", "booking 8");
-  ctx.Equal(eventsBook(ctx, "gpu-1", "p-2", "beta", 4, 40), "NO_CAPACITY", "4 GPUs on a full node");
-  ctx.Equal(eventsAll(ctx).size(), 1, "a refused placement must produce nothing; the records");
+  hEventsWorld(ctx);
+  ctx.Equal(hEventsBook(ctx, "gpu-1", "p-1", "acme", 8, 80), "ALLOCATED", "booking 8");
+  ctx.Equal(hEventsBook(ctx, "gpu-1", "p-2", "beta", 4, 40), "NO_CAPACITY", "4 GPUs on a full node");
+  ctx.Equal(hEventsAll(ctx).size(), 1, "a refused placement must produce nothing; the records");
   ctx.Redis.Del("heartbeat:gpu-2");
-  ctx.Equal(eventsBook(ctx, "gpu-2", "p-3", "acme", 1, 20), "NO_HEARTBEAT", "a node whose heartbeat lapsed");
-  ctx.Equal(eventsAll(ctx).size(), 1, "a placement refused for a lapsed heartbeat must produce nothing; the records");
-  ctx.Equal(eventsFolded(ctx, "gpu-1"), eventsAllocated(ctx, "gpu-1"), "the stream folded for gpu-1 against the ledger");
+  ctx.Equal(hEventsBook(ctx, "gpu-2", "p-3", "acme", 1, 20), "NO_HEARTBEAT", "a node whose heartbeat lapsed");
+  ctx.Equal(hEventsAll(ctx).size(), 1, "a placement refused for a lapsed heartbeat must produce nothing; the records");
+  ctx.Equal(hEventsFolded(ctx, "gpu-1"), hEventsAllocated(ctx, "gpu-1"), "the stream folded for gpu-1 against the ledger");
 }
 
 void CheckOutboxRelay(harness::Ctx& ctx) {
-  eventsWorld(ctx);
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "the booking stands whatever the broker says");
-  ctx.Equal(eventsAll(ctx).size(), 0, "the broker refused the record: nothing is on the topic; the records");
-  const auto rows = ctx.Redis.LRange(kEventsOutbox, 0, -1);
-  ctx.Equal(rows.size(), 1, "a refused delivery must leave one row in %s, found %q (in the delivery report, on error, RPUSH the key and value); the rows", kEventsOutbox, rows);
+  hEventsWorld(ctx);
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  ctx.Equal(hEventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "the booking stands whatever the broker says");
+  ctx.Equal(hEventsAll(ctx).size(), 0, "the broker refused the record: nothing is on the topic; the records");
+  const auto rows = ctx.Redis.LRange(kHEventsOutbox, 0, -1);
+  ctx.Equal(rows.size(), 1, "a refused delivery must leave one row in %s, found %q (in the delivery report, on error, RPUSH the key and value); the rows", kHEventsOutbox, rows);
   const auto row = nlohmann::json::parse(rows[0], nullptr, false);
   ctx.Assert(row.is_object() && row.value("key", "") == "gpu-1" && row.value("value", "").find("p-1") != std::string::npos,
              "the outbox row must hold the key and the value, got %s", rows[0]);
   const int sent = relay_outbox();
   ctx.Settle();
   ctx.Equal(sent, 1, "rows relay_outbox sent");
-  const auto all = eventsAll(ctx);
-  ctx.Assert(all.size() == 1 && all[0].is_object() && all[0].value("placement_id", "") == "p-1", "after the relay the stream must hold p-1's allocation, got %v", ctx.Kafka.Values(kEventsTopic));
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"gpu-1"}, "the relayed record keeps its node key");
-  ctx.Equal(ctx.Redis.LLen(kEventsOutbox), 0, "a relayed row leaves the outbox; rows left");
-  ctx.Assert(relay_outbox() == 0 && eventsAll(ctx).size() == 1, "an empty outbox relays nothing");
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  ctx.Equal(eventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2");
-  ctx.Equal(ctx.Redis.LLen(kEventsOutbox), 1, "a second refused delivery must leave one row in %s; the rows", kEventsOutbox);
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  const auto all = hEventsAll(ctx);
+  ctx.Assert(all.size() == 1 && all[0].is_object() && all[0].value("placement_id", "") == "p-1", "after the relay the stream must hold p-1's allocation, got %v", ctx.Kafka.Values(kHEventsTopic));
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"gpu-1"}, "the relayed record keeps its node key");
+  ctx.Equal(ctx.Redis.LLen(kHEventsOutbox), 0, "a relayed row leaves the outbox; rows left");
+  ctx.Assert(relay_outbox() == 0 && hEventsAll(ctx).size() == 1, "an empty outbox relays nothing");
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  ctx.Equal(hEventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2");
+  ctx.Equal(ctx.Redis.LLen(kHEventsOutbox), 1, "a second refused delivery must leave one row in %s; the rows", kHEventsOutbox);
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   relay_outbox();  // the broker refuses the relayed record once
   ctx.Settle();
   relay_outbox();
   ctx.Settle();
   int p2 = 0;
-  for (const auto& e : eventsAll(ctx)) p2 += e.is_object() && e.value("placement_id", "") == "p-2" ? 1 : 0;
-  ctx.Assert(p2 == 1 && ctx.Redis.LLen(kEventsOutbox) == 0,
+  for (const auto& e : hEventsAll(ctx)) p2 += e.is_object() && e.value("placement_id", "") == "p-2" ? 1 : 0;
+  ctx.Assert(p2 == 1 && ctx.Redis.LLen(kHEventsOutbox) == 0,
              "the broker refused p-2's relayed record once; after two relays the stream holds %d allocations of p-2 and the outbox %d rows, expected 1 and "
              "0: a relayed record reports its delivery like any other, and a refused one goes back to the outbox",
-             p2, ctx.Redis.LLen(kEventsOutbox));
+             p2, ctx.Redis.LLen(kHEventsOutbox));
 }
 
 void CheckReleaseReconcile(harness::Ctx& ctx) {
-  eventsWorld(ctx);
-  ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1");
-  ctx.Equal(eventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2");
+  hEventsWorld(ctx);
+  ctx.Equal(hEventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1");
+  ctx.Equal(hEventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2");
   const bool moved = release_and_publish("gpu-1", "p-1");
   ctx.Settle();
   ctx.Equal(moved, true, "the first release moves the counters");
-  const auto all = eventsAll(ctx);
+  const auto all = hEventsAll(ctx);
   ctx.Equal(all.size(), 3, "two bookings and one release must produce three records (a release is an event too); the records");
   const nlohmann::json& rel = all[2];
   ctx.Assert(rel.is_object() && rel.value("type", "") == "release" && rel.value("placement_id", "") == "p-1" && rel.value("gpu_count", 0) == 4,
              "the third event must be p-1's release with gpu_count 4, got %s", rel.dump());
   ctx.Assert(rel.value("node_id", "") == "gpu-1" && rel.value("tenant", "") == "acme" && rel.value("memory_gb", -1.0) == 80.0 && rel.contains("ts"),
              "p-1's release must carry node_id gpu-1, tenant acme, memory_gb 80 and ts, as its allocation did, got %s", rel.dump());
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic)[2], "gpu-1", "the release is keyed by the node id too");
-  ctx.Assert(eventsFolded(ctx, "gpu-1") == 2 && eventsAllocated(ctx, "gpu-1") == 2, "the stream folds to %d GPUs on gpu-1, the ledger says %d", eventsFolded(ctx, "gpu-1"), eventsAllocated(ctx, "gpu-1"));
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic)[2], "gpu-1", "the release is keyed by the node id too");
+  ctx.Assert(hEventsFolded(ctx, "gpu-1") == 2 && hEventsAllocated(ctx, "gpu-1") == 2, "the stream folds to %d GPUs on gpu-1, the ledger says %d", hEventsFolded(ctx, "gpu-1"), hEventsAllocated(ctx, "gpu-1"));
   const bool again = release_and_publish("gpu-1", "p-1");
   ctx.Settle();
-  ctx.Assert(!again && eventsAll(ctx).size() == 3, "a repeated release moves nothing and produces nothing");
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ctx.Assert(!again && hEventsAll(ctx).size() == 3, "a repeated release moves nothing and produces nothing");
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   ctx.Equal(release_and_publish("gpu-1", "p-2"), true, "the first release of p-2 moves the counters");
   ctx.Settle();
-  const auto rows = ctx.Redis.LRange(kEventsOutbox, 0, -1);
+  const auto rows = ctx.Redis.LRange(kHEventsOutbox, 0, -1);
   ctx.Assert(rows.size() == 1 && rows[0].find("p-2") != std::string::npos,
-             "the broker refused p-2's release, so it must wait in %s, found %q: a release reports its delivery like an allocation", kEventsOutbox, rows);
+             "the broker refused p-2's release, so it must wait in %s, found %q: a release reports its delivery like an allocation", kHEventsOutbox, rows);
   relay_outbox();
   ctx.Settle();
-  ctx.Assert(eventsFolded(ctx, "gpu-1") == 0 && eventsAllocated(ctx, "gpu-1") == 0, "after relaying p-2's release the stream folds to %d GPUs on gpu-1, the ledger says %d",
-             eventsFolded(ctx, "gpu-1"), eventsAllocated(ctx, "gpu-1"));
+  ctx.Assert(hEventsFolded(ctx, "gpu-1") == 0 && hEventsAllocated(ctx, "gpu-1") == 0, "after relaying p-2's release the stream folds to %d GPUs on gpu-1, the ledger says %d",
+             hEventsFolded(ctx, "gpu-1"), hEventsAllocated(ctx, "gpu-1"));
 }
 `,
   },

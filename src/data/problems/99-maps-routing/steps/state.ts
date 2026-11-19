@@ -673,11 +673,11 @@ import (
 
 var (
 	hBg         = context.Background()
-	sf          = geo.Point{Lat: 37.77412, Lng: -122.41942}
-	sfJitter    = geo.Point{Lat: 37.77415, Lng: -122.41945} // 4 m away, in the same cell
-	sfTwoBlocks = geo.Point{Lat: 37.77612, Lng: -122.41942} // 220 m north
-	oakland     = geo.Point{Lat: 37.80418, Lng: -122.27112}
-	berkeley    = geo.Point{Lat: 37.87159, Lng: -122.27275}
+	hSf          = geo.Point{Lat: 37.77412, Lng: -122.41942}
+	hSfJitter    = geo.Point{Lat: 37.77415, Lng: -122.41945} // 4 m away, in the same cell
+	hSfTwoBlocks = geo.Point{Lat: 37.77612, Lng: -122.41942} // 220 m north
+	hOakland     = geo.Point{Lat: 37.80418, Lng: -122.27112}
+	hBerkeley    = geo.Point{Lat: 37.87159, Lng: -122.27275}
 )
 
 // hEngine: a road route is 1.3 times the great-circle legs.
@@ -718,37 +718,37 @@ func hCells(points ...geo.Point) string {
 
 func CheckCellKey(ctx *harness.Ctx) {
 	hServeEngine(ctx)
-	first := hRoute(ctx, sf, oakland)
-	keys, want := ctx.Redis.Keys("route:*"), hCells(sf, oakland)
+	first := hRoute(ctx, hSf, hOakland)
+	keys, want := ctx.Redis.Keys("route:*"), hCells(hSf, hOakland)
 	ctx.Assert(len(keys) == 1 && strings.HasSuffix(keys[0], ":"+want), "the trip's entry is %v, expected a key ending in %q: each point is floor(lat / CELL_DEGREES),floor(lng / CELL_DEGREES)", keys, want)
-	again := hRoute(ctx, sfJitter, oakland)
+	again := hRoute(ctx, hSfJitter, hOakland)
 	ctx.Equal(hSolves(ctx), 1, "two requests 4 m apart must land in the same cell and hit the cache; the engine solves")
 	ctx.Equal(again.DistanceM, first.DistanceM, "the cached answer's distance")
-	hRoute(ctx, sfTwoBlocks, oakland)
+	hRoute(ctx, hSfTwoBlocks, hOakland)
 	ctx.Equal(hSolves(ctx), 2, "a request starting two blocks away is another trip: it must be solved, not served from the cache; the engine solves")
 }
 
 func CheckWaypointKey(ctx *harness.Ctx) {
 	hServeEngine(ctx)
-	direct := hRoute(ctx, sf, oakland)
-	via := hRoute(ctx, sf, oakland, berkeley)
+	direct := hRoute(ctx, hSf, hOakland)
+	via := hRoute(ctx, hSf, hOakland, hBerkeley)
 	ctx.Equal(hSolves(ctx), 2, "a trip through Berkeley was served the direct route from the cache (the waypoints are part of the trip and of the key); the engine solves")
 	ctx.Assert(via.DistanceM > direct.DistanceM, "the trip through Berkeley answered %.0f m, the direct one %.0f m", via.DistanceM, direct.DistanceM)
-	want := hCells(sf, berkeley, oakland)
+	want := hCells(hSf, hBerkeley, hOakland)
 	found := false
 	for _, k := range ctx.Redis.Keys("route:*") {
 		found = found || strings.HasSuffix(k, ":"+want)
 	}
 	ctx.Assert(found, "the trip through Berkeley is stored as %v, expected a key ending in %q: the origin, each waypoint, then the destination", ctx.Redis.Keys("route:*"), want)
-	again := hRoute(ctx, sf, oakland, berkeley)
+	again := hRoute(ctx, hSf, hOakland, hBerkeley)
 	ctx.Assert(hSolves(ctx) == 2 && again.DistanceM == via.DistanceM, "the same trip through Berkeley, asked again, must hit the cache")
 }
 
 func CheckEpochKey(ctx *harness.Ctx) {
 	hServeEngine(ctx)
-	before := hRoute(ctx, sf, oakland)
+	before := hRoute(ctx, hSf, hOakland)
 	ctx.Clock.Advance(geo.EpochS)
-	after := hRoute(ctx, sf, oakland)
+	after := hRoute(ctx, hSf, hOakland)
 	ctx.Equal(hSolves(ctx), 2, "after the traffic epoch moved, the route solved for the previous epoch was served from the cache (the epoch must be part of the key); the engine solves")
 	now := geo.CurrentEpoch()
 	ctx.Assert(before.Epoch == now-1 && after.Epoch == now, "the answers carry epochs %d and %d, expected %d and %d", before.Epoch, after.Epoch, now-1, now)
@@ -762,7 +762,7 @@ func CheckEpochKey(ctx *harness.Ctx) {
 
 func CheckTtl(ctx *harness.Ctx) {
 	hServeEngine(ctx)
-	hRoute(ctx, sf, oakland)
+	hRoute(ctx, hSf, hOakland)
 	keys := ctx.Redis.Keys("route:*")
 	ctx.Equal(len(keys), 1, "one solved trip must leave one route:* entry; the entries %v", keys)
 	ttl := ctx.Redis.TTL(keys[0])
@@ -780,7 +780,7 @@ func CheckTtl(ctx *harness.Ctx) {
 		return nil
 	}
 	ctx.Redis.After(keys[0], watch)
-	hRoute(ctx, sf, oakland)
+	hRoute(ctx, hSf, hOakland)
 	ctx.Assert(len(seen) > 0 && seen[0] > 0, "%s was written with no expiry (TTL right after the write %v): set the value and its expiry atomically", keys[0], seen)
 	ctx.Clock.Advance(601)
 	ctx.Equal(ctx.Redis.Exists(keys[0]), int64(0), "%s 601 s after it was written; still in Redis", keys[0])
@@ -789,10 +789,10 @@ func CheckTtl(ctx *harness.Ctx) {
 func CheckDegradedUncached(ctx *harness.Ctx) {
 	hServeEngine(ctx)
 	ctx.GRPC.Fail("ComputeRoute", codes.Unavailable, "engine restarting", 3, "")
-	down := hRoute(ctx, sf, oakland)
+	down := hRoute(ctx, hSf, hOakland)
 	ctx.Assert(down.Degraded, "with the engine unavailable for three attempts the answer must be the degraded estimate, got %+v", down)
 	ctx.Equal(len(ctx.Redis.Keys("route:*")), 0, "the degraded estimate was stored and would be served after the engine recovers; the route:* entries")
-	up := hRoute(ctx, sf, oakland)
+	up := hRoute(ctx, hSf, hOakland)
 	ctx.Assert(!up.Degraded, "the engine is back, but the next request got the straight-line estimate from the cache")
 }
 `,
@@ -808,11 +808,11 @@ func CheckDegradedUncached(ctx *harness.Ctx) {
 
 namespace {
 
-const geo::Point kSf{37.77412, -122.41942};
-const geo::Point kSfJitter{37.77415, -122.41945};    // 4 m away, in the same cell
-const geo::Point kSfTwoBlocks{37.77612, -122.41942};  // 220 m north
-const geo::Point kOakland{37.80418, -122.27112};
-const geo::Point kBerkeley{37.87159, -122.27275};
+const geo::Point kHSf{37.77412, -122.41942};
+const geo::Point kHSfJitter{37.77415, -122.41945};    // 4 m away, in the same cell
+const geo::Point kHSfTwoBlocks{37.77612, -122.41942};  // 220 m north
+const geo::Point kHOakland{37.80418, -122.27112};
+const geo::Point kHBerkeley{37.87159, -122.27275};
 
 // A road route is 1.3 times the great-circle legs.
 class HEnginePeer final : public mapsrouting::RoutingEngine::Service {
@@ -856,36 +856,36 @@ bool hEndsWith(const std::string& s, const std::string& tail) { return s.size() 
 
 void CheckCellKey(harness::Ctx& ctx) {
   hServeEngine(ctx);
-  const geo::Route first = cachedRoute(kSf, kOakland, {});
+  const geo::Route first = cachedRoute(kHSf, kHOakland, {});
   const auto keys = ctx.Redis.Keys("route:*");
-  const std::string want = hCells({kSf, kOakland});
+  const std::string want = hCells({kHSf, kHOakland});
   ctx.Assert(keys.size() == 1 && hEndsWith(keys[0], ":" + want), "the trip's entry is %v, expected a key ending in %q: each point is floor(lat / kCellDegrees),floor(lng / kCellDegrees)", keys, want);
-  const geo::Route again = cachedRoute(kSfJitter, kOakland, {});
+  const geo::Route again = cachedRoute(kHSfJitter, kHOakland, {});
   ctx.Equal(hSolves(ctx), 1, "two requests 4 m apart must land in the same cell and hit the cache; the engine solves");
   ctx.Equal(again.distance_m, first.distance_m, "the cached answer's distance");
-  cachedRoute(kSfTwoBlocks, kOakland, {});
+  cachedRoute(kHSfTwoBlocks, kHOakland, {});
   ctx.Equal(hSolves(ctx), 2, "a request starting two blocks away is another trip: it must be solved, not served from the cache; the engine solves");
 }
 
 void CheckWaypointKey(harness::Ctx& ctx) {
   hServeEngine(ctx);
-  const geo::Route direct = cachedRoute(kSf, kOakland, {});
-  const geo::Route via = cachedRoute(kSf, kOakland, {kBerkeley});
+  const geo::Route direct = cachedRoute(kHSf, kHOakland, {});
+  const geo::Route via = cachedRoute(kHSf, kHOakland, {kHBerkeley});
   ctx.Equal(hSolves(ctx), 2, "a trip through Berkeley was served the direct route from the cache (the waypoints are part of the trip and of the key); the engine solves");
   ctx.Assert(via.distance_m > direct.distance_m, "the trip through Berkeley answered %v m, the direct one %v m", via.distance_m, direct.distance_m);
-  const std::string want = hCells({kSf, kBerkeley, kOakland});
+  const std::string want = hCells({kHSf, kHBerkeley, kHOakland});
   bool found = false;
   for (const auto& k : ctx.Redis.Keys("route:*")) found = found || hEndsWith(k, ":" + want);
   ctx.Assert(found, "the trip through Berkeley is stored as %v, expected a key ending in %q: the origin, each waypoint, then the destination", ctx.Redis.Keys("route:*"), want);
-  const geo::Route again = cachedRoute(kSf, kOakland, {kBerkeley});
+  const geo::Route again = cachedRoute(kHSf, kHOakland, {kHBerkeley});
   ctx.Assert(hSolves(ctx) == 2 && again.distance_m == via.distance_m, "the same trip through Berkeley, asked again, must hit the cache");
 }
 
 void CheckEpochKey(harness::Ctx& ctx) {
   hServeEngine(ctx);
-  const geo::Route before = cachedRoute(kSf, kOakland, {});
+  const geo::Route before = cachedRoute(kHSf, kHOakland, {});
   ctx.Clock.Advance(geo::kEpochS);
-  const geo::Route after = cachedRoute(kSf, kOakland, {});
+  const geo::Route after = cachedRoute(kHSf, kHOakland, {});
   ctx.Equal(hSolves(ctx), 2, "after the traffic epoch moved, the route solved for the previous epoch was served from the cache (the epoch must be part of the key); the engine solves");
   const long long now = geo::currentEpoch();
   ctx.Assert(before.epoch == now - 1 && after.epoch == now, "the answers carry epochs %d and %d, expected %d and %d", before.epoch, after.epoch, now - 1, now);
@@ -897,7 +897,7 @@ void CheckEpochKey(harness::Ctx& ctx) {
 
 void CheckTtl(harness::Ctx& ctx) {
   hServeEngine(ctx);
-  cachedRoute(kSf, kOakland, {});
+  cachedRoute(kHSf, kHOakland, {});
   const auto keys = ctx.Redis.Keys("route:*");
   ctx.Equal(keys.size(), 1, "one solved trip must leave one route:* entry; the entries");
   const long long ttl = ctx.Redis.TTL(keys[0]);
@@ -913,7 +913,7 @@ void CheckTtl(harness::Ctx& ctx) {
     }
   };
   ctx.Redis.After(keys[0], watch);
-  cachedRoute(kSf, kOakland, {});
+  cachedRoute(kHSf, kHOakland, {});
   ctx.Assert(!seen.empty() && seen[0] > 0, "%s was written with no expiry (TTL right after the write %v): set the value and its expiry atomically", keys[0], seen);
   ctx.Clock.Advance(601);
   ctx.Equal(ctx.Redis.Exists(keys[0]), 0, "%s 601 s after it was written; still in Redis", keys[0]);
@@ -922,10 +922,10 @@ void CheckTtl(harness::Ctx& ctx) {
 void CheckDegradedUncached(harness::Ctx& ctx) {
   hServeEngine(ctx);
   ctx.GRPC.Fail("ComputeRoute", grpc::StatusCode::UNAVAILABLE, "engine restarting", 3);
-  const geo::Route down = cachedRoute(kSf, kOakland, {});
+  const geo::Route down = cachedRoute(kHSf, kHOakland, {});
   ctx.Assert(down.degraded, "with the engine unavailable for three attempts the answer must be the degraded estimate, got engine_version %q", down.engine_version);
   ctx.Equal(ctx.Redis.Keys("route:*").size(), 0, "the degraded estimate was stored and would be served after the engine recovers; the route:* entries");
-  const geo::Route up = cachedRoute(kSf, kOakland, {});
+  const geo::Route up = cachedRoute(kHSf, kHOakland, {});
   ctx.Assert(!up.degraded, "the engine is back, but the next request got the straight-line estimate from the cache");
 }
 `,

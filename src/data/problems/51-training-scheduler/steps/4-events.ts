@@ -1046,43 +1046,43 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "training.run"
+const kHEventsTopic = "training.run"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
 // startPeer is a worker agent that launches every run on n3 and n4, except those in reject.
-type startPeer struct {
+type HStartPeer struct {
 	pb.UnimplementedWorkerServer
 	reject map[string]bool
 }
 
-func (w *startPeer) StartRun(_ context.Context, req *pb.StartRunRequest) (*pb.StartRunReply, error) {
+func (w *HStartPeer) StartRun(_ context.Context, req *pb.StartRunRequest) (*pb.StartRunReply, error) {
 	if w.reject[req.GetRunId()] {
 		return &pb.StartRunReply{Accepted: false, Reason: "no free GPUs on this node"}, nil
 	}
 	return &pb.StartRunReply{Accepted: true, Nodes: []string{"n3", "n4"}}, nil
 }
 
-func eventsSetup(ctx *harness.Ctx) *startPeer {
-	w := &startPeer{reject: map[string]bool{}}
+func hEventsSetup(ctx *harness.Ctx) *HStartPeer {
+	w := &HStartPeer{reject: map[string]bool{}}
 	pb.RegisterWorkerServer(ctx.GRPC.Server(""), w)
 	return w
 }
 
-func eventsQueued(ctx *harness.Ctx, runID string) int64 {
+func hEventsQueued(ctx *harness.Ctx, runID string) int64 {
 	now := ctx.Clock.Now()
-	ctx.NoError(runs.Put(eventsBg, &runs.Run{RunID: runID, Tenant: "t1", RecipeVersion: "llama-ft-v3", DatasetVersion: "ds-1", Priority: 5, Band: 1, State: "queued", EnqueuedAtMs: now, CheckpointID: "ckpt-7"}), "runs.Put")
-	ctx.NoError(queue.Enqueue(eventsBg, runID, 1, now), "queue.Enqueue")
+	ctx.NoError(runs.Put(hEventsBg, &runs.Run{RunID: runID, Tenant: "t1", RecipeVersion: "llama-ft-v3", DatasetVersion: "ds-1", Priority: 5, Band: 1, State: "queued", EnqueuedAtMs: now, CheckpointID: "ckpt-7"}), "runs.Put")
+	ctx.NoError(queue.Enqueue(hEventsBg, runID, 1, now), "queue.Enqueue")
 	return now
 }
 
-func eventsPublish(ctx *harness.Ctx, runID, transition string) bool {
-	ok, err := publishTransition(eventsBg, runID, transition)
+func hEventsPublish(ctx *harness.Ctx, runID, transition string) bool {
+	ok, err := publishTransition(hEventsBg, runID, transition)
 	ctx.NoError(err, "publishTransition(%s, %s)", runID, transition)
 	return ok
 }
 
-type transitionRecord struct {
+type HTransitionRecord struct {
 	RunID        string   \`json:"run_id"\`
 	Transition   string   \`json:"transition"\`
 	Band         int      \`json:"band"\`
@@ -1091,8 +1091,8 @@ type transitionRecord struct {
 }
 
 // decodeTransition reads one payload, which carries those five fields and no other; a null nodes list reads as an empty one.
-func decodeTransition(ctx *harness.Ctx, raw []byte) transitionRecord {
-	var r transitionRecord
+func hDecodeTransition(ctx *harness.Ctx, raw []byte) HTransitionRecord {
+	var r HTransitionRecord
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	ctx.NoError(dec.Decode(&r), "a training.run payload must be JSON with run_id, transition, band, nodes and checkpoint_id only (%s)", raw)
@@ -1102,17 +1102,17 @@ func decodeTransition(ctx *harness.Ctx, raw []byte) transitionRecord {
 	return r
 }
 
-func transitionRecords(ctx *harness.Ctx) []transitionRecord {
-	out := []transitionRecord{}
-	for _, v := range ctx.Kafka.Values(eventsTopic) {
-		out = append(out, decodeTransition(ctx, []byte(v)))
+func hTransitionRecords(ctx *harness.Ctx) []HTransitionRecord {
+	out := []HTransitionRecord{}
+	for _, v := range ctx.Kafka.Values(kHEventsTopic) {
+		out = append(out, hDecodeTransition(ctx, []byte(v)))
 	}
 	return out
 }
 
-func startedRecords(ctx *harness.Ctx) []transitionRecord {
-	out := []transitionRecord{}
-	for _, r := range transitionRecords(ctx) {
+func hStartedRecords(ctx *harness.Ctx) []HTransitionRecord {
+	out := []HTransitionRecord{}
+	for _, r := range hTransitionRecords(ctx) {
 		if r.Transition == "started" {
 			out = append(out, r)
 		}
@@ -1120,16 +1120,16 @@ func startedRecords(ctx *harness.Ctx) []transitionRecord {
 	return out
 }
 
-type outboxRow struct {
+type HOutboxRow struct {
 	Topic   string          \`json:"topic"\`
 	Key     string          \`json:"key"\`
 	Payload json.RawMessage \`json:"payload"\`
 }
 
-func outboxRows(ctx *harness.Ctx) []outboxRow {
-	rows := []outboxRow{}
+func hOutboxRows(ctx *harness.Ctx) []HOutboxRow {
+	rows := []HOutboxRow{}
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row outboxRow
+		var row HOutboxRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -1137,93 +1137,93 @@ func outboxRows(ctx *harness.Ctx) []outboxRow {
 }
 
 func CheckRunKey(ctx *harness.Ctx) {
-	eventsSetup(ctx)
-	eventsQueued(ctx, "run-a")
-	eventsQueued(ctx, "run-b")
-	eventsPublish(ctx, "run-a", "queued")
-	eventsPublish(ctx, "run-b", "queued")
-	eventsPublish(ctx, "run-a", "preempted")
+	hEventsSetup(ctx)
+	hEventsQueued(ctx, "run-a")
+	hEventsQueued(ctx, "run-b")
+	hEventsPublish(ctx, "run-a", "queued")
+	hEventsPublish(ctx, "run-b", "queued")
+	hEventsPublish(ctx, "run-a", "preempted")
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three publishTransition calls must produce three records on training.run; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"run-a", "run-b", "run-a"}, "the records must be keyed by the run ids")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"run-a", "run-b", "run-a"}, "the records must be keyed by the run ids")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both run-a records must land on one partition, or a consumer reads one run's history out of order; the partitions")
-	ctx.Equal(transitionRecords(ctx)[0], transitionRecord{RunID: "run-a", Transition: "queued", Band: 1, Nodes: []string{}, CheckpointID: "ckpt-7"}, "the first record's payload")
+	ctx.Equal(hTransitionRecords(ctx)[0], HTransitionRecord{RunID: "run-a", Transition: "queued", Band: 1, Nodes: []string{}, CheckpointID: "ckpt-7"}, "the first record's payload")
 }
 
 func CheckStartedAfterConfirm(ctx *harness.Ctx) {
-	w := eventsSetup(ctx)
-	now := eventsQueued(ctx, "run-a")
-	eventsQueued(ctx, "run-b")
-	first, _ := queue.ClaimNext(eventsBg, "w-1", now)
-	second, _ := queue.ClaimNext(eventsBg, "w-2", now)
+	w := hEventsSetup(ctx)
+	now := hEventsQueued(ctx, "run-a")
+	hEventsQueued(ctx, "run-b")
+	first, _ := queue.ClaimNext(hEventsBg, "w-1", now)
+	second, _ := queue.ClaimNext(hEventsBg, "w-2", now)
 	ctx.Assert(first == "run-a" && second == "run-b", "both runs must be claimable")
 	w.reject["run-a"] = true
-	refused, err := startRun(eventsBg, "run-a", "w-1")
+	refused, err := startRun(hEventsBg, "run-a", "w-1")
 	ctx.NoError(err, "startRun(run-a)")
 	ctx.Settle()
 	ctx.Equal(refused, false, "startRun's result for a run the worker refused")
-	for _, r := range startedRecords(ctx) {
+	for _, r := range hStartedRecords(ctx) {
 		ctx.Assert(r.RunID != "run-a", "training.run says run-a started, but the worker refused it")
 	}
-	ctx.Equal(runs.Get(eventsBg, "run-a").State, "starting", "a refused run stays starting until its lease runs out; its state")
-	accepted, err := startRun(eventsBg, "run-b", "w-2")
+	ctx.Equal(runs.Get(hEventsBg, "run-a").State, "starting", "a refused run stays starting until its lease runs out; its state")
+	accepted, err := startRun(hEventsBg, "run-b", "w-2")
 	ctx.NoError(err, "startRun(run-b)")
 	ctx.Settle()
 	ctx.Equal(accepted, true, "startRun's result for a run the worker accepted")
-	started := startedRecords(ctx)
+	started := hStartedRecords(ctx)
 	ctx.Assert(len(started) == 1 && started[0].RunID == "run-b", "one accepted start must publish one started record for run-b, got %+v", started)
 	ctx.Equal(started[0].Nodes, []string{"n3", "n4"}, "the started record's nodes (the worker placed it on n3, n4)")
-	ctx.Equal(runs.Get(eventsBg, "run-b").State, "running", "an accepted run's state")
-	ctx.Equal(started[0], transitionRecord{RunID: "run-b", Transition: "started", Band: 1, Nodes: []string{"n3", "n4"}, CheckpointID: "ckpt-7"}, "the started record")
+	ctx.Equal(runs.Get(hEventsBg, "run-b").State, "running", "an accepted run's state")
+	ctx.Equal(started[0], HTransitionRecord{RunID: "run-b", Transition: "started", Band: 1, Nodes: []string{"n3", "n4"}, CheckpointID: "ckpt-7"}, "the started record")
 	// The worker accepts run-c, but w-3's lease now names another worker: confirmStart answers false.
-	eventsQueued(ctx, "run-c")
-	third, _ := queue.ClaimNext(eventsBg, "w-3", now)
+	hEventsQueued(ctx, "run-c")
+	third, _ := queue.ClaimNext(hEventsBg, "w-3", now)
 	ctx.Equal(third, "run-c", "run-c must be claimable")
-	lost, err := startRun(eventsBg, "run-c", "w-9")
+	lost, err := startRun(hEventsBg, "run-c", "w-9")
 	ctx.NoError(err, "startRun(run-c)")
 	ctx.Settle()
 	ctx.Equal(lost, false, "startRun's result for run-c, whose lease names w-3 and not w-9")
 	ids := []string{}
-	for _, r := range startedRecords(ctx) {
+	for _, r := range hStartedRecords(ctx) {
 		ids = append(ids, r.RunID)
 	}
 	ctx.Equal(ids, []string{"run-b"}, "confirmStart refused w-9's start of run-c: publish started only after a confirm that returned true; the runs training.run says started")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	eventsSetup(ctx)
-	eventsQueued(ctx, "run-a")
-	eventsQueued(ctx, "run-b")
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsPublish(ctx, "run-a", "queued")
+	hEventsSetup(ctx)
+	hEventsQueued(ctx, "run-a")
+	hEventsQueued(ctx, "run-b")
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok := hEventsPublish(ctx, "run-a", "queued")
 	ctx.Settle()
-	rows := outboxRows(ctx)
+	rows := hOutboxRows(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the transition is missing from every run history; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "run-a", "the outbox row is %+v, expected the topic and the key run-a", rows[0])
-	ctx.Equal(decodeTransition(ctx, rows[0].Payload), transitionRecord{RunID: "run-a", Transition: "queued", Band: 1, Nodes: []string{}, CheckpointID: "ckpt-7"}, "the relay publishes exactly what the broker did not take; the outbox row's payload")
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == "run-a", "the outbox row is %+v, expected the topic and the key run-a", rows[0])
+	ctx.Equal(hDecodeTransition(ctx, rows[0].Payload), HTransitionRecord{RunID: "run-a", Transition: "queued", Band: 1, Nodes: []string{}, CheckpointID: "ckpt-7"}, "the relay publishes exactly what the broker did not take; the outbox row's payload")
 	ctx.Equal(ok, false, "publishTransition's result after a failed delivery")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsPublish(ctx, "run-b", "queued")
+	ok = hEventsPublish(ctx, "run-b", "queued")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishTransition waited %.1f s for a broker that does not answer: wait for the ack at most ACK_TIMEOUT_S (2 s), then write the outbox row", waited)
-	rows = outboxRows(ctx)
+	rows = hOutboxRows(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Key == "run-b", "no acknowledgement within the window and the outbox holds %+v", rows)
 	ctx.Equal(ok, false, "publishTransition's result without an acknowledgement")
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	eventsSetup(ctx)
-	eventsQueued(ctx, "run-a")
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, "run-a", "queued")
+	hEventsSetup(ctx)
+	hEventsQueued(ctx, "run-a")
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish(ctx, "run-a", "queued")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the transition twice (enable.idempotence); the records")
-	eventsPublish(ctx, "run-a", "preempted")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the transition twice (enable.idempotence); the records")
+	hEventsPublish(ctx, "run-a", "preempted")
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1236,10 +1236,10 @@ func CheckAcksIdempotent(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "training.run";
+const std::string kHEventsTopic = "training.run";
 
 // A worker agent that launches every run on n3 and n4, except those in reject.
-class StartPeer final : public trainsched::Worker::Service {
+class HStartPeer final : public trainsched::Worker::Service {
  public:
   std::set<std::string> reject;
   grpc::Status StartRun(grpc::ServerContext*, const trainsched::StartRunRequest* req, trainsched::StartRunReply* out) override {
@@ -1255,15 +1255,15 @@ class StartPeer final : public trainsched::Worker::Service {
   }
 };
 
-StartPeer& eventsSetup(harness::Ctx& ctx) {
-  static StartPeer* peer = nullptr;
+HStartPeer& hEventsSetup(harness::Ctx& ctx) {
+  static HStartPeer* peer = nullptr;
   delete peer;
-  peer = new StartPeer;
+  peer = new HStartPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-long long eventsQueued(harness::Ctx& ctx, const std::string& run_id) {
+long long hEventsQueued(harness::Ctx& ctx, const std::string& run_id) {
   const long long now = ctx.Clock.Now();
   runs::Run run;
   run.run_id = run_id;
@@ -1289,16 +1289,16 @@ nlohmann::json hPayload(const std::string& run_id, const std::string& transition
   return nlohmann::json{{"run_id", run_id}, {"transition", transition}, {"band", 1}, {"nodes", nodes}, {"checkpoint_id", "ckpt-7"}};
 }
 
-std::vector<nlohmann::json> startedRecords(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hStartedRecords(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
-  for (const auto& v : ctx.Kafka.Values(kEventsTopic)) {
+  for (const auto& v : ctx.Kafka.Values(kHEventsTopic)) {
     const auto record = nlohmann::json::parse(v, nullptr, false);
     if (hText(record, "transition") == "started") out.push_back(record);
   }
   return out;
 }
 
-std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hOutboxRows(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& row : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto parsed = nlohmann::json::parse(row, nullptr, false);
@@ -1311,24 +1311,24 @@ std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckRunKey(harness::Ctx& ctx) {
-  eventsSetup(ctx);
-  eventsQueued(ctx, "run-a");
-  eventsQueued(ctx, "run-b");
+  hEventsSetup(ctx);
+  hEventsQueued(ctx, "run-a");
+  hEventsQueued(ctx, "run-b");
   publishTransition("run-a", "queued");
   publishTransition("run-b", "queued");
   publishTransition("run-a", "preempted");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three publishTransition calls must produce three records on training.run; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"run-a", "run-b", "run-a"}, "the records must be keyed by the run ids");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"run-a", "run-b", "run-a"}, "the records must be keyed by the run ids");
   ctx.Equal(records[0].Partition, records[2].Partition, "both run-a records must land on one partition, or a consumer reads one run's history out of order; the partitions");
-  ctx.Equal(nlohmann::json::parse(ctx.Kafka.Values(kEventsTopic)[0], nullptr, false), hPayload("run-a", "queued", nlohmann::json::array()), "the first record's payload");
+  ctx.Equal(nlohmann::json::parse(ctx.Kafka.Values(kHEventsTopic)[0], nullptr, false), hPayload("run-a", "queued", nlohmann::json::array()), "the first record's payload");
 }
 
 void CheckStartedAfterConfirm(harness::Ctx& ctx) {
-  auto& w = eventsSetup(ctx);
-  const long long now = eventsQueued(ctx, "run-a");
-  eventsQueued(ctx, "run-b");
+  auto& w = hEventsSetup(ctx);
+  const long long now = hEventsQueued(ctx, "run-a");
+  hEventsQueued(ctx, "run-b");
   const auto first = queue::claimNext("w-1", now);
   const auto second = queue::claimNext("w-2", now);
   ctx.Assert(first == std::optional<std::string>("run-a") && second == std::optional<std::string>("run-b"), "both runs must be claimable");
@@ -1336,59 +1336,59 @@ void CheckStartedAfterConfirm(harness::Ctx& ctx) {
   const bool refused = startRun("run-a", "w-1");
   ctx.Settle();
   ctx.Equal(refused, false, "startRun's result for a run the worker refused");
-  for (const auto& r : startedRecords(ctx)) ctx.Assert(hText(r, "run_id") != "run-a", "training.run says run-a started, but the worker refused it");
+  for (const auto& r : hStartedRecords(ctx)) ctx.Assert(hText(r, "run_id") != "run-a", "training.run says run-a started, but the worker refused it");
   ctx.Equal(runs::get("run-a")->state, "starting", "a refused run stays starting until its lease runs out; its state");
   ctx.Equal(startRun("run-b", "w-2"), true, "startRun's result for a run the worker accepted");
   ctx.Settle();
-  const auto started = startedRecords(ctx);
+  const auto started = hStartedRecords(ctx);
   ctx.Assert(started.size() == 1 && hText(started[0], "run_id") == "run-b", "one accepted start must publish one started record for run-b, got %d", started.size());
   ctx.Equal(started[0]["nodes"], nlohmann::json{"n3", "n4"}, "the started record's nodes (the worker placed it on n3, n4)");
   ctx.Equal(runs::get("run-b")->state, "running", "an accepted run's state");
   ctx.Equal(started[0], hPayload("run-b", "started", nlohmann::json{"n3", "n4"}), "the started record");
   // The worker accepts run-c, but w-3's lease now names another worker: confirmStart answers false.
-  eventsQueued(ctx, "run-c");
+  hEventsQueued(ctx, "run-c");
   ctx.Equal(queue::claimNext("w-3", now).value_or(""), "run-c", "run-c must be claimable");
   const bool lost = startRun("run-c", "w-9");
   ctx.Settle();
   ctx.Equal(lost, false, "startRun's result for run-c, whose lease names w-3 and not w-9");
   std::vector<std::string> ids;
-  for (const auto& r : startedRecords(ctx)) ids.push_back(hText(r, "run_id"));
+  for (const auto& r : hStartedRecords(ctx)) ids.push_back(hText(r, "run_id"));
   ctx.Equal(ids, {"run-b"}, "confirmStart refused w-9's start of run-c: publish started only after a confirm that returned true; the runs training.run says started");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  eventsSetup(ctx);
-  eventsQueued(ctx, "run-a");
-  eventsQueued(ctx, "run-b");
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  hEventsSetup(ctx);
+  hEventsQueued(ctx, "run-a");
+  hEventsQueued(ctx, "run-b");
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   bool ok = publishTransition("run-a", "queued");
   ctx.Settle();
-  auto rows = outboxRows(ctx);
+  auto rows = hOutboxRows(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the transition is missing from every run history; the rows");
-  ctx.Assert(hText(rows[0], "topic") == kEventsTopic && hText(rows[0], "key") == "run-a", "the outbox row is %s, expected the topic and the key run-a", rows[0].dump());
+  ctx.Assert(hText(rows[0], "topic") == kHEventsTopic && hText(rows[0], "key") == "run-a", "the outbox row is %s, expected the topic and the key run-a", rows[0].dump());
   ctx.Equal(rows[0].value("payload", nlohmann::json()), hPayload("run-a", "queued", nlohmann::json::array()), "the relay publishes exactly what the broker did not take; the outbox row's payload");
   ctx.Equal(ok, false, "publishTransition's result after a failed delivery");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const long long before = ctx.Clock.Now();
   ok = publishTransition("run-b", "queued");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publishTransition waited %.1f s for a broker that does not answer: wait for the ack at most ACK_TIMEOUT_S (2 s), then write the outbox row", waited);
-  rows = outboxRows(ctx);
+  rows = hOutboxRows(ctx);
   ctx.Assert(rows.size() == 2 && hText(rows[1], "key") == "run-b", "no acknowledgement within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishTransition's result without an acknowledgement");
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  eventsSetup(ctx);
-  eventsQueued(ctx, "run-a");
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  hEventsSetup(ctx);
+  hEventsQueued(ctx, "run-a");
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
   publishTransition("run-a", "queued");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the transition twice (enable.idempotence); the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the transition twice (enable.idempotence); the records");
   publishTransition("run-a", "preempted");
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 `,
   },

@@ -1088,7 +1088,7 @@ namespace {
 const std::string kHT = "t1";
 const std::string kHN = "support-reply";
 const std::string kHLive = "prompts:live:" + kHT + ":" + kHN;
-const std::string kHistory = "prompts:history:" + kHT + ":" + kHN;
+const std::string kHHistory = "prompts:history:" + kHT + ":" + kHN;
 const std::string kHAudit = "prompts:audit:" + kHT + ":" + kHN;
 
 void hStateRegister(harness::Ctx& ctx, std::initializer_list<int> versions) {
@@ -1111,7 +1111,7 @@ std::vector<std::string> hSplit(const std::string& entry) {
 
 std::string hSnapshot(harness::Ctx& ctx) {
   std::string out = hLiveNow(ctx) + " [";
-  for (const auto& v : ctx.Redis.LRange(kHistory, 0, -1)) out += v + " ";
+  for (const auto& v : ctx.Redis.LRange(kHHistory, 0, -1)) out += v + " ";
   out += "] [";
   for (const auto& e : ctx.Redis.LRange(kHAudit, 0, -1)) out += e + " ";
   return out + "]";
@@ -1128,7 +1128,7 @@ void CheckAtomicPromote(harness::Ctx& ctx) {
     fired = true;
     const std::string previous = ctx.Redis.Get(kHLive).value_or("0");
     ctx.Redis.Set(kHLive, "5");
-    ctx.Redis.Do("RPUSH", kHistory, "5");
+    ctx.Redis.Do("RPUSH", kHHistory, "5");
     ctx.Redis.Do("RPUSH", kHAudit, "promote|" + previous + "|5|bob|0");
   });
   promote(kHT, kHN, 4, "alice");
@@ -1142,7 +1142,7 @@ void CheckAtomicPromote(harness::Ctx& ctx) {
   }
   const std::string live = hLiveNow(ctx);
   ctx.Equal(hSplit(raw.back())[2], live, "the last audit entry's version against the live one");
-  const auto history = ctx.Redis.LRange(kHistory, -1, -1);
+  const auto history = ctx.Redis.LRange(kHHistory, -1, -1);
   ctx.Assert(history.size() == 1 && history[0] == live, "the history ends at %v but version %s is live: a rollback would restore the wrong version", history, live);
 }
 
@@ -1168,7 +1168,7 @@ void CheckRollbackPrevious(harness::Ctx& ctx) {
   ctx.Equal(hLiveNow(ctx), "1", "a second rollback must restore 1, the version live before 4; the live version");
   const auto third = rollback(kHT, kHN, "oncall");
   ctx.Assert(!third && hLiveNow(ctx) == "1", "with nothing earlier a rollback returns nullopt and leaves 1 live: live %s", hLiveNow(ctx));
-  ctx.Equal(ctx.Redis.LRange(kHistory, 0, -1), std::vector<std::string>{"1"}, "a rollback with nothing earlier must change nothing (the next promotion has no version to roll back to); the history");
+  ctx.Equal(ctx.Redis.LRange(kHHistory, 0, -1), std::vector<std::string>{"1"}, "a rollback with nothing earlier must change nothing (the next promotion has no version to roll back to); the history");
   const auto tail = ctx.Redis.LRange(kHAudit, -2, -1);
   ctx.Assert(tail.size() == 2 && tail[0].rfind("rollback|7|4|oncall|", 0) == 0 && tail[1].rfind("rollback|4|1|oncall|", 0) == 0,
              "each rollback is audited as rollback|from|to|actor: %v", ctx.Redis.LRange(kHAudit, 0, -1));
@@ -1182,7 +1182,7 @@ void CheckLiveUncached(harness::Ctx& ctx) {
   ctx.Equal(live_version(kHT, kHN).value_or(0), 4, "after promoting 4 the reader must see 4");
   // another replica rolls back to 1
   ctx.Redis.Set(kHLive, "1");
-  ctx.Redis.Do("RPOP", kHistory);
+  ctx.Redis.Do("RPOP", kHHistory);
   ctx.Redis.Do("RPUSH", kHAudit, "rollback|4|1|oncall|0");
   ctx.Equal(live_version(kHT, kHN).value_or(0), 1, "the next read after a rollback: a cached pointer keeps the bad version live for minutes on every replica; the version served");
 }

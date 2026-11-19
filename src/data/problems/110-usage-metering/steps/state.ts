@@ -653,25 +653,25 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func mustApply(ctx *harness.Ctx, requestID string, units int64, gateway string) ledger.Applied {
-	applied, err := applyUsage(stateBg, "acct_1", requestID, "/v1/generate", units, gateway)
+func hMustApply(ctx *harness.Ctx, requestID string, units int64, gateway string) ledger.Applied {
+	applied, err := applyUsage(hStateBg, "acct_1", requestID, "/v1/generate", units, gateway)
 	ctx.NoError(err, "applyUsage(acct_1, %s) failed", requestID)
 	return applied
 }
 
 func CheckCounts(ctx *harness.Ctx) {
 	w := ledger.CurrentWindow()
-	first := mustApply(ctx, "req_1", 1200, "gw-eu-1")
+	first := hMustApply(ctx, "req_1", 1200, "gw-eu-1")
 	ctx.Assert(first.Counted && first.Total == 1200 && first.Window == w, "the first report must be counted into window %d with total 1200, got %+v", w, first)
-	second := mustApply(ctx, "req_2", 300, "gw-eu-1")
+	second := hMustApply(ctx, "req_2", 300, "gw-eu-1")
 	ctx.Equal(second.Total, int64(1500), "a second report of 300 units must bring the window to 1500; the total")
-	ctx.Equal(ledger.ReadWindow(stateBg, "acct_1", w).Units, int64(1500), "usage:acct_1:%d units", w)
-	record := ledger.FindRecord(stateBg, "acct_1", "req_1")
+	ctx.Equal(ledger.ReadWindow(hStateBg, "acct_1", w).Units, int64(1500), "usage:acct_1:%d units", w)
+	record := ledger.FindRecord(hStateBg, "acct_1", "req_1")
 	ctx.Assert(record != nil && record.Gateway == "gw-eu-1" && record.Units == 1200 && record.Window == w, "usage:record:acct_1:req_1 holds %+v", record)
 	ctx.Clock.Advance(ledger.WindowSeconds)
-	later := mustApply(ctx, "req_3", 50, "gw-eu-1")
+	later := hMustApply(ctx, "req_3", 50, "gw-eu-1")
 	ctx.Assert(later.Window == w+1 && later.Total == 50, "a report an hour later must open window %d with 50 units, got %+v", w+1, later)
 }
 
@@ -679,14 +679,14 @@ func CheckAtomic(ctx *harness.Ctx) {
 	w := ledger.CurrentWindow()
 	// Another gateway delivers the same retry while this one is between its commands.
 	rival := ctx.Redis.After(ledger.RecordKey("acct_1", "req_1"), func() any {
-		applied, err := applyUsage(stateBg, "acct_1", "req_1", "/v1/generate", 1200, "gw-us-2")
+		applied, err := applyUsage(hStateBg, "acct_1", "req_1", "/v1/generate", 1200, "gw-us-2")
 		ctx.NoError(err, "the rival delivery failed")
 		return applied
 	})
-	mine := mustApply(ctx, "req_1", 1200, "gw-eu-1")
+	mine := hMustApply(ctx, "req_1", 1200, "gw-eu-1")
 	ctx.Assert(rival.Fired, "nothing touched the record key")
 	ctx.Assert(rival.Err == nil, "the rival delivery failed: %v", rival.Err)
-	units := ledger.ReadWindow(stateBg, "acct_1", w).Units
+	units := ledger.ReadWindow(hStateBg, "acct_1", w).Units
 	ctx.Assert(units == 1200, "two deliveries of req_1 landing together left %d units in the window: the dedupe and the count must run in one script", units)
 	theirs, _ := rival.Result.(ledger.Applied)
 	counted := []bool{mine.Counted, theirs.Counted}
@@ -696,24 +696,24 @@ func CheckAtomic(ctx *harness.Ctx) {
 
 func CheckOverage(ctx *harness.Ctx) {
 	w := ledger.CurrentWindow()
-	ledger.SetPlanCap(stateBg, "acct_1", 1000)
-	first := mustApply(ctx, "req_1", 600, "gw-eu-1")
+	ledger.SetPlanCap(hStateBg, "acct_1", 1000)
+	first := hMustApply(ctx, "req_1", 600, "gw-eu-1")
 	ctx.Assert(first.Counted && !first.Over, "600 of a 1000-unit plan must be counted and not over, got %+v", first)
-	atCap := mustApply(ctx, "req_2", 400, "gw-eu-1")
+	atCap := hMustApply(ctx, "req_2", 400, "gw-eu-1")
 	ctx.Assert(atCap.Counted && atCap.Total == 1000 && !atCap.Over, "a window at exactly its 1000-unit cap is not over it, got %+v", atCap)
-	past := mustApply(ctx, "req_3", 200, "gw-eu-1")
+	past := hMustApply(ctx, "req_3", 200, "gw-eu-1")
 	ctx.Assert(past.Counted && past.Total == 1200, "a report past the plan cap was refused (%+v): metering counts what was used and flags it, it does not block", past)
 	ctx.Assert(past.Over && past.Cap == 1000, "a window at 1200 of a 1000-unit plan must answer over true with cap 1000, got %+v", past)
 	flags := ctx.Redis.HGetAll(ledger.WindowKey("acct_1", w))
 	ctx.Assert(flags["overage"] == "1" && flags["cap"] == "1000", "usage:acct_1:%d holds %v: the window must carry cap 1000 and overage 1", w, flags)
 	// Another gateway's report lands right after this one's count: the flag must describe the window's final total.
-	ledger.SetPlanCap(stateBg, "acct_2", 1000)
+	ledger.SetPlanCap(hStateBg, "acct_2", 1000)
 	rival := ctx.Redis.After(ledger.WindowKey("acct_2", w), func() any {
-		applied, err := applyUsage(stateBg, "acct_2", "req_b", "/v1/generate", 600, "gw-us-2")
+		applied, err := applyUsage(hStateBg, "acct_2", "req_b", "/v1/generate", 600, "gw-us-2")
 		ctx.NoError(err, "the rival report failed")
 		return applied
 	})
-	_, err := applyUsage(stateBg, "acct_2", "req_a", "/v1/generate", 600, "gw-eu-1")
+	_, err := applyUsage(hStateBg, "acct_2", "req_a", "/v1/generate", 600, "gw-eu-1")
 	ctx.NoError(err, "applyUsage(acct_2, req_a) failed")
 	ctx.Assert(rival.Fired, "nothing touched the window key of acct_2")
 	ctx.Assert(rival.Err == nil, "the rival report failed: %v", rival.Err)
@@ -731,7 +731,7 @@ func CheckExpire(ctx *harness.Ctx) {
 	// The TTL the moment each key is created: a key without one in between lives forever if the process dies.
 	windowAt := ctx.Redis.After(windowKey, func() any { return ctx.Redis.TTL(windowKey) })
 	recordAt := ctx.Redis.After(recordKey, func() any { return ctx.Redis.TTL(recordKey) })
-	mustApply(ctx, "req_1", 1200, "gw-eu-1")
+	hMustApply(ctx, "req_1", 1200, "gw-eu-1")
 	for _, key := range []string{windowKey, recordKey} {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(ttl > 0 && ttl <= ledger.RetainSeconds, "%s has TTL %d: it must expire within RetainSeconds (%d s), or Redis keeps every hour of every account", key, ttl, ledger.RetainSeconds)
@@ -743,8 +743,8 @@ func CheckExpire(ctx *harness.Ctx) {
 	ctx.Assert(windowTTL > 0 && windowTTL <= ledger.RetainSeconds, "right after the command that created %s its TTL was %d: the expiry must be set by the same script that writes the key", windowKey, windowTTL)
 	ctx.Assert(recordTTL > 0 && recordTTL <= ledger.RetainSeconds, "right after the command that created %s its TTL was %d: the expiry must be set by the same script that writes the key", recordKey, recordTTL)
 	ctx.Clock.Advance(60)
-	mustApply(ctx, "req_2", 300, "gw-eu-1")
-	ctx.Equal(ledger.ReadWindow(stateBg, "acct_1", w).Units, int64(1500), "a report a minute later must land in window %d; its units", w)
+	hMustApply(ctx, "req_2", 300, "gw-eu-1")
+	ctx.Equal(ledger.ReadWindow(hStateBg, "acct_1", w).Units, int64(1500), "a report a minute later must land in window %d; its units", w)
 	ttl := ctx.Redis.TTL(windowKey)
 	ctx.Assert(ttl > 0 && ttl <= ledger.RetainSeconds-60, "a minute after the window opened another report left %s with TTL %d: the expiry is set on a new window key only, or a busy hour never expires", windowKey, ttl)
 }
@@ -762,7 +762,7 @@ func CheckExpire(ctx *harness.Ctx) {
 namespace {
 
 // The rival delivery's outcome: whether it ran, what it answered, what it threw.
-struct Rival {
+struct HRival {
   bool fired = false;
   ledger::Applied applied;
   std::optional<std::string> err;
@@ -787,7 +787,7 @@ void CheckCounts(harness::Ctx& ctx) {
 void CheckAtomic(harness::Ctx& ctx) {
   const long long w = ledger::currentWindow();
   // Another gateway delivers the same retry while this one is between its commands.
-  auto rival = std::make_shared<Rival>();
+  auto rival = std::make_shared<HRival>();
   ctx.Redis.After(ledger::recordKey("acct_1", "req_1"), [rival] {
     rival->fired = true;
     try {
@@ -818,7 +818,7 @@ void CheckOverage(harness::Ctx& ctx) {
   ctx.Assert(flags.count("overage") && flags.at("overage") == "1" && flags.count("cap") && flags.at("cap") == "1000", "usage:acct_1:%d holds %v: the window must carry cap 1000 and overage 1", w, flags);
   // Another gateway's report lands right after this one's count: the flag must describe the window's final total.
   ledger::setPlanCap("acct_2", 1000);
-  auto rival = std::make_shared<Rival>();
+  auto rival = std::make_shared<HRival>();
   ctx.Redis.After(ledger::windowKey("acct_2", w), [rival] {
     rival->fired = true;
     try {

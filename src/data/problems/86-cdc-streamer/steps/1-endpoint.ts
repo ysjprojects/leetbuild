@@ -857,7 +857,7 @@ func CheckIdempotentCreate(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kOrders = R"({"table": "orders", "columns": ["id", "status"], "sink": "warehouse-1"})";
+const std::string kHOrders = R"({"table": "orders", "columns": ["id", "status"], "sink": "warehouse-1"})";
 
 harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
@@ -885,7 +885,7 @@ size_t hSubscriptions(harness::Ctx& ctx) { return ctx.Redis.Keys("cdc:sub:sub-*"
 
 void CheckRoute(harness::Ctx& ctx) {
   auto c = hApi(ctx);
-  auto r = hCreate(c, kOrders, "acme", "k-1");
+  auto r = hCreate(c, kHOrders, "acme", "k-1");
   ctx.Equal(r.Status, 201, "POST /v1/subscriptions (%s)", r.Text());
   const auto body = hParse(r);
   ctx.Assert(body.value("tenant", "") == "acme" && body.value("table", "") == "orders" &&
@@ -894,7 +894,7 @@ void CheckRoute(harness::Ctx& ctx) {
              "the create answered %s, expected the acme subscription to orders (id, status) into warehouse-1, active", r.Text());
   const auto stored = store::findSubscription(body.value("id", ""));
   ctx.Assert(stored && store::toJson(*stored) == body, "the response %s is not the subscription the store holds", r.Text());
-  r = hCreate(c, kOrders, "", "k-2");
+  r = hCreate(c, kHOrders, "", "k-2");
   ctx.Equal(r.Status, 401, "a create without X-Tenant-Id");
 }
 
@@ -930,18 +930,18 @@ void CheckSensitiveColumns(harness::Ctx& ctx) {
 
 void CheckIdempotentCreate(harness::Ctx& ctx) {
   auto c = hApi(ctx);
-  const auto first = hCreate(c, kOrders, "acme", "k-1");
+  const auto first = hCreate(c, kHOrders, "acme", "k-1");
   ctx.Equal(first.Status, 201, "the first create (%s)", first.Text());
-  const auto replay = hCreate(c, kOrders, "acme", "k-1");
+  const auto replay = hCreate(c, kHOrders, "acme", "k-1");
   ctx.Assert(replay.Status == 200 || replay.Status == 201, "a replay answered %d: %s", replay.Status, replay.Text());
   ctx.Equal(hParse(replay).value("id", ""), hParse(first).value("id", ""),
             "a retry with the same Idempotency-Key must answer the first subscription, not open a second slot; the id");
   ctx.Assert(hParse(replay) == hParse(first), "a replay answered %s, expected the subscription the first attempt created: %s", replay.Text(), first.Text());
   ctx.Equal(hSubscriptions(ctx), 1, "after a create and its replay; the subscriptions");
-  const auto other = hCreate(c, kOrders, "globex", "k-1");
+  const auto other = hCreate(c, kHOrders, "globex", "k-1");
   ctx.Assert(other.Status == 201 && hParse(other).value("id", "") != hParse(first).value("id", ""),
              "globex reusing acme's key k-1 must get its own subscription, got %d %s", other.Status, other.Text());
-  const auto missing = hCreate(c, kOrders, "acme", "");
+  const auto missing = hCreate(c, kHOrders, "acme", "");
   ctx.Equal(missing.Status, 400, "a create without Idempotency-Key");
 }
 `,

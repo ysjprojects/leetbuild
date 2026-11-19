@@ -765,37 +765,37 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "checkpoint.event"
+const kHEventsTopic = "checkpoint.event"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
 // eventsUpload opens an upload of run's checkpoint at step in 2 chunks and stages the first staged of them.
-func eventsUpload(runID string, step int64, staged int) string {
-	store.CreateRun(eventsBg, runID, "t1")
-	upload := store.OpenUpload(eventsBg, runID, "t1", step, 2)
+func hEventsUpload(runID string, step int64, staged int) string {
+	store.CreateRun(hEventsBg, runID, "t1")
+	upload := store.OpenUpload(hEventsBg, runID, "t1", step, 2)
 	for i := 0; i < staged; i++ {
 		payload := []byte(fmt.Sprintf("%s step %d layer %d", runID, step, i))
-		store.PutChunk(eventsBg, upload.UploadID, int64(i), payload, store.Digest(payload))
+		store.PutChunk(hEventsBg, upload.UploadID, int64(i), payload, store.Digest(payload))
 	}
 	return upload.UploadID
 }
 
-func eventsFinish(ctx *harness.Ctx, uploadID string) *store.Record {
-	record, err := finishUpload(eventsBg, uploadID)
+func hEventsFinish(ctx *harness.Ctx, uploadID string) *store.Record {
+	record, err := finishUpload(hEventsBg, uploadID)
 	ctx.NoError(err, "finishUpload(%s)", uploadID)
 	return record
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	var rows []HEventsRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -803,74 +803,74 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckRunKey(ctx *harness.Ctx) {
-	for _, uploadID := range []string{eventsUpload("r1", 1200, 2), eventsUpload("r2", 300, 2), eventsUpload("r1", 1300, 2)} {
-		ctx.Assert(eventsFinish(ctx, uploadID) != nil, "finishUpload(%s) did not commit a complete upload", uploadID)
+	for _, uploadID := range []string{hEventsUpload("r1", 1200, 2), hEventsUpload("r2", 300, 2), hEventsUpload("r1", 1300, 2)} {
+		ctx.Assert(hEventsFinish(ctx, uploadID) != nil, "finishUpload(%s) did not commit a complete upload", uploadID)
 	}
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three finished uploads must produce three records on checkpoint.event; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"r1", "r2", "r1"}, "the records must be keyed by the runs")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"r1", "r2", "r1"}, "the records must be keyed by the runs")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both r1 checkpoints must land on one partition, or a consumer sees step 1300 before step 1200; the partitions")
 }
 
 func CheckEventPayload(ctx *harness.Ctx) {
-	uploadID := eventsUpload("r1", 1200, 2)
-	eventsFinish(ctx, uploadID)
+	uploadID := hEventsUpload("r1", 1200, 2)
+	hEventsFinish(ctx, uploadID)
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one finished upload must produce one record; the records")
 	var value map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the payload must be JSON")
-	expected := map[string]any{"type": "checkpoint.committed", "run_id": "r1", "upload_id": uploadID, "step": 1200.0, "chunks": 2.0, "digest": store.Manifest(eventsBg, uploadID)}
+	expected := map[string]any{"type": "checkpoint.committed", "run_id": "r1", "upload_id": uploadID, "step": 1200.0, "chunks": 2.0, "digest": store.Manifest(hEventsBg, uploadID)}
 	ctx.Equal(value, expected, "the payload (a consumer needs the step, the chunk count and the digest without reading the weights)")
-	ctx.Equal(len(eventsOutbox(ctx)), 0, "the broker took the event: write an outbox row only when the delivery fails or no report comes, or the relay publishes the checkpoint twice; the outbox rows")
+	ctx.Equal(len(hEventsOutbox(ctx)), 0, "the broker took the event: write an outbox row only when the delivery fails or no report comes, or the relay publishes the checkpoint twice; the outbox rows")
 }
 
 func CheckCommitBeforeEvent(ctx *harness.Ctx) {
-	partial := eventsUpload("r1", 1200, 1)
-	ctx.Assert(eventsFinish(ctx, partial) == nil, "an upload with a chunk missing must not commit")
+	partial := hEventsUpload("r1", 1200, 1)
+	ctx.Assert(hEventsFinish(ctx, partial) == nil, "an upload with a chunk missing must not commit")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "an upload with a chunk missing must produce no checkpoint.committed record (a consumer would resume from a checkpoint that does not exist; commit first, then produce); the records")
-	full := eventsUpload("r1", 1300, 2)
-	probe := ctx.Redis.After("checkpoint:"+full, func() any { return len(ctx.Kafka.Records(eventsTopic)) })
-	ctx.Assert(eventsFinish(ctx, full) != nil, "a complete upload must commit")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 0, "an upload with a chunk missing must produce no checkpoint.committed record (a consumer would resume from a checkpoint that does not exist; commit first, then produce); the records")
+	full := hEventsUpload("r1", 1300, 2)
+	probe := ctx.Redis.After("checkpoint:"+full, func() any { return len(ctx.Kafka.Records(kHEventsTopic)) })
+	ctx.Assert(hEventsFinish(ctx, full) != nil, "a complete upload must commit")
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "finishUpload never wrote checkpoint:%s", full)
 	ctx.Equal(probe.Result, 0, "when the checkpoint record was written the topic must still be empty (produce after the commit); the records at commit time")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the committed checkpoint must still be announced; the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "the committed checkpoint must still be announced; the records")
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsFinish(ctx, eventsUpload("r1", 1200, 2))
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsFinish(ctx, hEventsUpload("r1", 1200, 2))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	eventsFinish(ctx, eventsUpload("r1", 1300, 2))
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hEventsFinish(ctx, hEventsUpload("r1", 1300, 2))
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	first := eventsUpload("r1", 1200, 2)
-	record := eventsFinish(ctx, first)
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	first := hEventsUpload("r1", 1200, 2)
+	record := hEventsFinish(ctx, first)
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row no consumer ever learns of the checkpoint; the rows")
-	firstPayload := map[string]any{"type": "checkpoint.committed", "run_id": "r1", "upload_id": first, "step": 1200.0, "chunks": 2.0, "digest": store.Manifest(eventsBg, first)}
-	ctx.Equal(rows[0], eventsRow{Topic: eventsTopic, Key: "r1", Payload: firstPayload}, "the outbox row must hold the topic, the key r1 and the event's payload")
-	ctx.Assert(record != nil && store.GetRecord(eventsBg, first) != nil, "the checkpoint must stay committed when only the produce failed")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
-	second := eventsUpload("r1", 1300, 2)
+	firstPayload := map[string]any{"type": "checkpoint.committed", "run_id": "r1", "upload_id": first, "step": 1200.0, "chunks": 2.0, "digest": store.Manifest(hEventsBg, first)}
+	ctx.Equal(rows[0], HEventsRow{Topic: kHEventsTopic, Key: "r1", Payload: firstPayload}, "the outbox row must hold the topic, the key r1 and the event's payload")
+	ctx.Assert(record != nil && store.GetRecord(hEventsBg, first) != nil, "the checkpoint must stay committed when only the produce failed")
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
+	second := hEventsUpload("r1", 1300, 2)
 	before := ctx.Clock.Now()
-	eventsFinish(ctx, second)
+	hEventsFinish(ctx, second)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "finishUpload waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 2, "no delivery report within the window: the outbox must hold a second row; the rows")
-	secondPayload := map[string]any{"type": "checkpoint.committed", "run_id": "r1", "upload_id": second, "step": 1300.0, "chunks": 2.0, "digest": store.Manifest(eventsBg, second)}
-	ctx.Equal(rows[1], eventsRow{Topic: eventsTopic, Key: "r1", Payload: secondPayload}, "the outbox row for the stalled broker must hold the topic, the key r1 and the event's payload")
+	secondPayload := map[string]any{"type": "checkpoint.committed", "run_id": "r1", "upload_id": second, "step": 1300.0, "chunks": 2.0, "digest": store.Manifest(hEventsBg, second)}
+	ctx.Equal(rows[1], HEventsRow{Topic: kHEventsTopic, Key: "r1", Payload: secondPayload}, "the outbox row for the stalled broker must hold the topic, the key r1 and the event's payload")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -884,10 +884,10 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "checkpoint.event";
+const std::string kHEventsTopic = "checkpoint.event";
 
 // An upload of run's checkpoint at step in 2 chunks, the first staged of them staged.
-std::string eventsUpload(const std::string& run_id, long step, int staged = 2) {
+std::string hEventsUpload(const std::string& run_id, long step, int staged = 2) {
   store::createRun(run_id, "t1");
   const store::Upload upload = store::openUpload(run_id, "t1", step, 2);
   for (int i = 0; i < staged; i++) {
@@ -897,7 +897,7 @@ std::string eventsUpload(const std::string& run_id, long step, int staged = 2) {
   return upload.upload_id;
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -910,86 +910,86 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckRunKey(harness::Ctx& ctx) {
-  for (const std::string& upload_id : {eventsUpload("r1", 1200), eventsUpload("r2", 300), eventsUpload("r1", 1300)}) {
+  for (const std::string& upload_id : {hEventsUpload("r1", 1200), hEventsUpload("r2", 300), hEventsUpload("r1", 1300)}) {
     ctx.Assert(finishUpload(upload_id).has_value(), "finishUpload(%s) did not commit a complete upload", upload_id);
   }
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three finished uploads must produce three records on checkpoint.event; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"r1", "r2", "r1"}, "the records must be keyed by the runs");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"r1", "r2", "r1"}, "the records must be keyed by the runs");
   ctx.Equal(records[0].Partition, records[2].Partition,
             "both r1 checkpoints must land on one partition, or a consumer sees step 1300 before step 1200; the partitions");
 }
 
 void CheckEventPayload(harness::Ctx& ctx) {
-  const std::string upload_id = eventsUpload("r1", 1200);
+  const std::string upload_id = hEventsUpload("r1", 1200);
   finishUpload(upload_id);
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one finished upload must produce one record; the records");
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
   const nlohmann::json expected = {{"type", "checkpoint.committed"}, {"run_id", "r1"}, {"upload_id", upload_id},
                                    {"step", 1200},                   {"chunks", 2},     {"digest", store::manifest(upload_id)}};
   ctx.Assert(value == expected, "the payload is %s, expected %s: a consumer needs the step, the chunk count and the digest without reading the weights",
              values[0], expected.dump());
-  ctx.Equal(eventsOutbox(ctx).size(), 0,
+  ctx.Equal(hEventsOutbox(ctx).size(), 0,
             "the broker took the event: write an outbox row only when the delivery fails or no report comes, or the relay publishes the checkpoint twice; the outbox rows");
 }
 
 void CheckCommitBeforeEvent(harness::Ctx& ctx) {
-  const std::string partial = eventsUpload("r1", 1200, 1);
+  const std::string partial = hEventsUpload("r1", 1200, 1);
   ctx.Assert(!finishUpload(partial).has_value(), "an upload with a chunk missing must not commit");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0,
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 0,
             "an upload with a chunk missing must produce no checkpoint.committed record (a consumer would resume from a checkpoint that does not exist; commit first, then produce); the records");
-  const std::string full = eventsUpload("r1", 1300);
+  const std::string full = hEventsUpload("r1", 1300);
   size_t atCommit = 999;
   bool fired = false;
   ctx.Redis.After("checkpoint:" + full, [&] {
     fired = true;
-    atCommit = ctx.Kafka.Records(kEventsTopic).size();
+    atCommit = ctx.Kafka.Records(kHEventsTopic).size();
   });
   ctx.Assert(finishUpload(full).has_value(), "a complete upload must commit");
   ctx.Settle();
   ctx.Assert(fired, "finishUpload never wrote checkpoint:%s", full);
   ctx.Equal(atCommit, 0, "when the checkpoint record was written the topic must still be empty (produce after the commit); the records at commit time");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the committed checkpoint must still be announced; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "the committed checkpoint must still be announced; the records");
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  finishUpload(eventsUpload("r1", 1200));
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  finishUpload(hEventsUpload("r1", 1200));
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1,
             "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  finishUpload(eventsUpload("r1", 1300));
+  finishUpload(hEventsUpload("r1", 1300));
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  const std::string first = eventsUpload("r1", 1200);
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  const std::string first = hEventsUpload("r1", 1200);
   const auto record = finishUpload(first);
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row no consumer ever learns of the checkpoint; the rows");
-  const nlohmann::json firstRow = {{"topic", kEventsTopic},
+  const nlohmann::json firstRow = {{"topic", kHEventsTopic},
                                    {"key", "r1"},
                                    {"payload",
                                     {{"type", "checkpoint.committed"}, {"run_id", "r1"}, {"upload_id", first}, {"step", 1200}, {"chunks", 2}, {"digest", store::manifest(first)}}}};
   ctx.Assert(rows[0] == firstRow, "the outbox row is %s, expected the topic, the key r1 and the event's payload: %s", rows[0].dump(), firstRow.dump());
   ctx.Assert(record.has_value() && store::record(first).has_value(), "the checkpoint must stay committed when only the produce failed");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
-  const std::string second = eventsUpload("r1", 1300);
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
+  const std::string second = hEventsUpload("r1", 1300);
   const int64_t before = ctx.Clock.Now();
   finishUpload(second);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "finishUpload waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
+  rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 2, "no delivery report within the window: the outbox must hold a second row; the rows");
-  const nlohmann::json secondRow = {{"topic", kEventsTopic},
+  const nlohmann::json secondRow = {{"topic", kHEventsTopic},
                                     {"key", "r1"},
                                     {"payload",
                                      {{"type", "checkpoint.committed"}, {"run_id", "r1"}, {"upload_id", second}, {"step", 1300}, {"chunks", 2}, {"digest", store::manifest(second)}}}};

@@ -933,20 +933,20 @@ import (
 	"leetbuild/harness"
 )
 
-const crmReply = "We refunded the second charge."
+const kHCrmReply = "We refunded the second charge."
 
-var crmBg = context.Background()
+var hCrmBg = context.Background()
 
-// crmPeer is the CRM: one record per idempotency key (a request without one is always a new
+// HCrmPeer is the CRM: one record per idempotency key (a request without one is always a new
 // record); dropReplies of the next calls are recorded but answered UNAVAILABLE.
-type crmPeer struct {
+type HCrmPeer struct {
 	pb.UnimplementedCrmServer
 	records     []string
 	keys        map[string]string
 	dropReplies int
 }
 
-func (c *crmPeer) SyncNote(_ context.Context, req *pb.SyncNoteRequest) (*pb.SyncNoteReply, error) {
+func (c *HCrmPeer) SyncNote(_ context.Context, req *pb.SyncNoteRequest) (*pb.SyncNoteReply, error) {
 	key := req.GetIdempotencyKey()
 	var reply *pb.SyncNoteReply
 	if id, seen := c.keys[key]; key != "" && seen {
@@ -965,54 +965,54 @@ func (c *crmPeer) SyncNote(_ context.Context, req *pb.SyncNoteRequest) (*pb.Sync
 	return reply, nil
 }
 
-func crmStandIn(ctx *harness.Ctx) *crmPeer {
-	peer := &crmPeer{keys: map[string]string{}}
+func hCrmStandIn(ctx *harness.Ctx) *HCrmPeer {
+	peer := &HCrmPeer{keys: map[string]string{}}
 	pb.RegisterCrmServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func crmTicket() string { return store.CreateTicket(crmBg, "R-1", "Invoice 4471 charged twice").ID }
+func hCrmTicket() string { return store.CreateTicket(hCrmBg, "R-1", "Invoice 4471 charged twice").ID }
 
-func crmNote(ctx *harness.Ctx) store.Note {
-	note, err := store.CommitNote(crmBg, crmTicket(), "A-1", "public", crmReply)
+func hCrmNote(ctx *harness.Ctx) store.Note {
+	note, err := store.CommitNote(hCrmBg, hCrmTicket(), "A-1", "public", kHCrmReply)
 	ctx.NoError(err, "CommitNote failed")
 	return *note
 }
 
-func crmPending() []string {
+func hCrmPending() []string {
 	ids := []string{}
-	for _, n := range store.PendingSyncs(crmBg) {
+	for _, n := range store.PendingSyncs(hCrmBg) {
 		ids = append(ids, n.ID)
 	}
 	return ids
 }
 
 func CheckNonblockingSync(ctx *harness.Ctx) {
-	peer := crmStandIn(ctx)
-	ticketID := crmTicket()
+	peer := hCrmStandIn(ctx)
+	ticketID := hCrmTicket()
 	ctx.GRPC.SetLatency("SyncNote", 2.0, "")
-	note, err := postNote(crmBg, ticketID, "A-1", "public", crmReply)
+	note, err := postNote(hCrmBg, ticketID, "A-1", "public", kHCrmReply)
 	ctx.NoError(err, "postNote failed")
 	calls := len(ctx.GRPC.CallsTo("SyncNote", ""))
 	ctx.Assert(calls == 0, "postNote called the CRM %d time(s) before answering: the agent waits on the CRM and an outage fails their post. Commit the note with its outbox entry and answer", calls)
-	ctx.Equal(crmPending(), []string{note.ID}, "the posted note must wait in crm:outbox; it holds")
+	ctx.Equal(hCrmPending(), []string{note.ID}, "the posted note must wait in crm:outbox; it holds")
 	ctx.GRPC.SetLatency("SyncNote", 0, "")
-	ctx.Equal(drainOutbox(crmBg), 1, "the drain must sync the one pending note; it synced")
-	ctx.Equal(crmPending(), []string{}, "a synced note must leave crm:outbox; it holds")
+	ctx.Equal(drainOutbox(hCrmBg), 1, "the drain must sync the one pending note; it synced")
+	ctx.Equal(hCrmPending(), []string{}, "a synced note must leave crm:outbox; it holds")
 	ctx.Assert(ctx.Redis.SIsMember("crm:synced", note.ID), "the drain must mark the note synced")
 	ctx.Equal(peer.records, []string{note.ID}, "the CRM's records")
 }
 
 func CheckSyncDeadline(ctx *harness.Ctx) {
-	crmStandIn(ctx)
-	note := crmNote(ctx)
-	ctx.Equal(syncNote(crmBg, note), true, "with the CRM healthy the sync must succeed; it answered")
+	hCrmStandIn(ctx)
+	note := hCrmNote(ctx)
+	ctx.Equal(syncNote(hCrmBg, note), true, "with the CRM healthy the sync must succeed; it answered")
 	call := ctx.GRPC.CallsTo("SyncNote", "")[0]
 	ctx.Assert(call.HasDeadline(), "a SyncNote call carries no deadline: a CRM that accepts the connection and never answers holds the drain forever")
 	ctx.Assert(2500*time.Millisecond <= call.Timeout && call.Timeout <= 3500*time.Millisecond, "a SyncNote call carries a %v deadline, expected deadline = 3 s", call.Timeout)
 	ctx.GRPC.SetLatency("SyncNote", 30.0, "")
 	started := ctx.Clock.Now()
-	ctx.Equal(syncNote(crmBg, note), false, "a CRM that takes 30 s per call must not count as synced; the sync answered")
+	ctx.Equal(syncNote(hCrmBg, note), false, "a CRM that takes 30 s per call must not count as synced; the sync answered")
 	took := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(took <= 10, "syncNote spent %.0f s on a CRM that does not answer, expected at most maxAttempts × deadline", took)
 	slow := ctx.GRPC.CallsTo("SyncNote", "")[1:]
@@ -1022,14 +1022,14 @@ func CheckSyncDeadline(ctx *harness.Ctx) {
 	}
 	_, quarantined := ctx.Redis.HGet("crm:quarantine", note.ID)
 	ctx.Assert(!quarantined, "a note whose attempts ran out of time was quarantined: DEADLINE_EXCEEDED is transient, the note stays in crm:outbox")
-	ctx.Equal(crmPending(), []string{note.ID}, "a note whose attempts ran out of time must stay in crm:outbox; it holds")
+	ctx.Equal(hCrmPending(), []string{note.ID}, "a note whose attempts ran out of time must stay in crm:outbox; it holds")
 }
 
 func CheckIdempotentSync(ctx *harness.Ctx) {
-	peer := crmStandIn(ctx)
-	note := crmNote(ctx)
+	peer := hCrmStandIn(ctx)
+	note := hCrmNote(ctx)
 	peer.dropReplies = 1
-	ctx.Equal(syncNote(crmBg, note), true, "after one lost reply the retry must land; the sync answered")
+	ctx.Equal(syncNote(hCrmBg, note), true, "after one lost reply the retry must land; the sync answered")
 	ctx.Assert(len(peer.records) == 1, "the CRM recorded the note %d times after one lost reply: the retry made a second record. Send the note id as IdempotencyKey", len(peer.records))
 	for _, call := range ctx.GRPC.CallsTo("SyncNote", "") {
 		key := call.Request.(*pb.SyncNoteRequest).GetIdempotencyKey()
@@ -1038,38 +1038,38 @@ func CheckIdempotentSync(ctx *harness.Ctx) {
 }
 
 func CheckRetryPolicy(ctx *harness.Ctx) {
-	crmStandIn(ctx)
-	note := crmNote(ctx)
+	hCrmStandIn(ctx)
+	note := hCrmNote(ctx)
 	ctx.GRPC.Fail("SyncNote", codes.Unavailable, "crm restarting", 5, "")
-	ctx.Equal(syncNote(crmBg, note), false, "five UNAVAILABLE in a row: the sync must give up after maxAttempts = 3; it answered")
+	ctx.Equal(syncNote(hCrmBg, note), false, "five UNAVAILABLE in a row: the sync must give up after maxAttempts = 3; it answered")
 	ctx.Equal(len(ctx.GRPC.CallsTo("SyncNote", "")), 3, "the attempts (maxAttempts = 3)")
-	ctx.Equal(crmPending(), []string{note.ID}, "a note whose attempts ran out must stay in crm:outbox for the next drain; it holds")
-	ctx.Equal(drainOutbox(crmBg), 1, "the next drain (two more failures, then a healthy CRM) must sync the note; it synced")
-	ctx.Equal(crmPending(), []string{}, "crm:outbox once the note was synced")
-	late := crmNote(ctx)
+	ctx.Equal(hCrmPending(), []string{note.ID}, "a note whose attempts ran out must stay in crm:outbox for the next drain; it holds")
+	ctx.Equal(drainOutbox(hCrmBg), 1, "the next drain (two more failures, then a healthy CRM) must sync the note; it synced")
+	ctx.Equal(hCrmPending(), []string{}, "crm:outbox once the note was synced")
+	late := hCrmNote(ctx)
 	before := len(ctx.GRPC.CallsTo("SyncNote", ""))
 	ctx.GRPC.Fail("SyncNote", codes.DeadlineExceeded, "crm too slow", 2, "")
-	ctx.Equal(syncNote(crmBg, late), true, "two DEADLINE_EXCEEDED then a healthy CRM: DEADLINE_EXCEEDED is transient, so the third attempt must land; the sync answered")
+	ctx.Equal(syncNote(hCrmBg, late), true, "two DEADLINE_EXCEEDED then a healthy CRM: DEADLINE_EXCEEDED is transient, so the third attempt must land; the sync answered")
 	ctx.Equal(len(ctx.GRPC.CallsTo("SyncNote", ""))-before, 3, "the attempts after two DEADLINE_EXCEEDED")
 }
 
 func CheckQuarantineSchema(ctx *harness.Ctx) {
-	crmStandIn(ctx)
-	note := crmNote(ctx)
+	hCrmStandIn(ctx)
+	note := hCrmNote(ctx)
 	before := len(ctx.GRPC.CallsTo("SyncNote", ""))
 	ctx.GRPC.Fail("SyncNote", codes.InvalidArgument, "author A-1 is not a CRM user", 1, "")
-	ctx.Equal(syncNote(crmBg, note), false, "a note the CRM's schema refuses must not count as synced; the sync answered")
+	ctx.Equal(syncNote(hCrmBg, note), false, "a note the CRM's schema refuses must not count as synced; the sync answered")
 	calls := len(ctx.GRPC.CallsTo("SyncNote", "")) - before
 	ctx.Assert(calls == 1, "a note the CRM refused with INVALID_ARGUMENT was sent %d times: the refusal is permanent, another attempt gets the same answer", calls)
 	reason, _ := ctx.Redis.HGet("crm:quarantine", note.ID)
 	ctx.Assert(reason != "", "the refused note is not in crm:quarantine: store.Quarantine(note id, reason) parks it with the reason for a person to look at")
 	ctx.Assert(regexp.MustCompile(\`(?i)invalid[_ ]?argument|\\b3\\b\`).MatchString(reason), "the quarantine reason is %q: it must name the status the CRM answered (INVALID_ARGUMENT)", reason)
-	ctx.Equal(crmPending(), []string{}, "a quarantined note must leave crm:outbox, or every drain sends it again; it holds")
+	ctx.Equal(hCrmPending(), []string{}, "a quarantined note must leave crm:outbox, or every drain sends it again; it holds")
 	for _, code := range []codes.Code{codes.PermissionDenied, codes.FailedPrecondition, codes.Internal} {
-		refused := crmNote(ctx)
+		refused := hCrmNote(ctx)
 		sentBefore := len(ctx.GRPC.CallsTo("SyncNote", ""))
 		ctx.GRPC.Fail("SyncNote", code, "refused", 1, "")
-		ctx.Equal(syncNote(crmBg, refused), false, "a note the CRM refused with %v must not count as synced; the sync answered", code)
+		ctx.Equal(syncNote(hCrmBg, refused), false, "a note the CRM refused with %v must not count as synced; the sync answered", code)
 		sent := len(ctx.GRPC.CallsTo("SyncNote", "")) - sentBefore
 		ctx.Assert(sent == 1, "a note the CRM refused with %v was sent %d times: only UNAVAILABLE and DEADLINE_EXCEEDED are transient", code, sent)
 		_, quarantined := ctx.Redis.HGet("crm:quarantine", refused.ID)

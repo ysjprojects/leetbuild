@@ -1377,7 +1377,7 @@ const (
 	hPlainURL    = "http://www.example.com/checkout"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
 // hDriverPeer is one browser: Navigate answers redirects as a 302 (navigateFail: the next ones fail
 // Unavailable once they arrive), Act applies the action (drop: refused with dropCode before the page
@@ -1430,7 +1430,7 @@ func (d *hDriverPeer) Snapshot(_ context.Context, _ *pb.SnapshotRequest) (*pb.Pa
 func hWorld(ctx *harness.Ctx) (*hDriverPeer, string) {
 	driver := &hDriverPeer{url: hEntryURL, dropCode: codes.Unavailable, loseCode: codes.DeadlineExceeded, redirects: map[string]string{}}
 	pb.RegisterBrowserDriverServer(ctx.GRPC.Server(""), driver)
-	return driver, sessions.CreateSession(clientBg, "acme", "public-web", "buy a kettle", 20, hEntryURL).ID
+	return driver, sessions.CreateSession(hClientBg, "acme", "public-web", "buy a kettle", 20, hEntryURL).ID
 }
 
 func hDeadlines(ctx *harness.Ctx) {
@@ -1444,46 +1444,46 @@ func hDeadlines(ctx *harness.Ctx) {
 
 func CheckDeadline(ctx *harness.Ctx) {
 	driver, sid := hWorld(ctx)
-	step := runAction(clientBg, sid, "w-1", Action{Type: "navigate", Target: hKettlesURL})
+	step := runAction(hClientBg, sid, "w-1", Action{Type: "navigate", Target: hKettlesURL})
 	ctx.Equal(step.Outcome, "ok", "a navigation with a healthy driver (%+v)", step)
-	step = runAction(clientBg, sid, "w-1", Action{Type: "click", Target: "#add-to-cart"})
+	step = runAction(hClientBg, sid, "w-1", Action{Type: "click", Target: "#add-to-cart"})
 	ctx.Equal(step.Outcome, "ok", "a click with a healthy driver (%+v)", step)
 	driver.loseReply = 1
-	runAction(clientBg, sid, "w-1", Action{Type: "click", Target: "#buy"})
+	runAction(hClientBg, sid, "w-1", Action{Type: "click", Target: "#buy"})
 	hDeadlines(ctx)
 	// The first attempt fails late: the retry still gets its own 15 s.
 	ctx.GRPC.SetLatency("Navigate", 10, "")
 	driver.navigateFail = 1
-	step = runAction(clientBg, sid, "w-1", Action{Type: "navigate", Target: hEntryURL})
+	step = runAction(hClientBg, sid, "w-1", Action{Type: "navigate", Target: hEntryURL})
 	ctx.Assert(step.Outcome == "ok", "a navigation whose first attempt failed Unavailable after 10 s ended %q (%s): every attempt carries its own 15 s deadline, and the retry of a 10 s page fits in it", step.Outcome, step.Reason)
 	hDeadlines(ctx)
 	ctx.GRPC.SetLatency("Navigate", 60, "")
-	step = runAction(clientBg, sid, "w-1", Action{Type: "navigate", Target: hEntryURL})
+	step = runAction(hClientBg, sid, "w-1", Action{Type: "navigate", Target: hEntryURL})
 	ctx.Equal(step.Outcome, "failed", "with a page that hangs for 60 s, under a 15 s deadline the navigation must end failed; outcome")
 }
 
 func CheckVerifyBeforeRetry(ctx *harness.Ctx) {
 	driver, sid := hWorld(ctx)
-	runAction(clientBg, sid, "w-1", Action{Type: "navigate", Target: hKettlesURL})
+	runAction(hClientBg, sid, "w-1", Action{Type: "navigate", Target: hKettlesURL})
 	driver.loseReply = 1
-	step := runAction(clientBg, sid, "w-1", Action{Type: "click", Target: "#buy"})
+	step := runAction(hClientBg, sid, "w-1", Action{Type: "click", Target: "#buy"})
 	ctx.Equal(driver.applied, 1, "the click's reply was lost after the page handled it, and a retry clicks again. Read Snapshot and compare the digest before sending it again; times applied")
 	ctx.Assert(len(ctx.GRPC.CallsTo("Snapshot", "")) > 0, "a click whose reply was lost must be checked against the page (Snapshot)")
 	ctx.Assert(step.Outcome == "ok" && step.Digest == hKettlesURL+"#1", "the click landed, so the step must end ok on the page it left: %+v", step)
 	driver.drop = 1
-	step = runAction(clientBg, sid, "w-1", Action{Type: "click", Target: "#confirm"})
+	step = runAction(hClientBg, sid, "w-1", Action{Type: "click", Target: "#confirm"})
 	ctx.Assert(driver.applied == 2 && step.Outcome == "ok", "a click the driver refused before touching the page left %d applied actions and outcome %q: the digest is unchanged, so one more Act is safe", driver.applied, step.Outcome)
 	driver.loseReply, driver.loseCode = 1, codes.Unavailable
-	step = runAction(clientBg, sid, "w-1", Action{Type: "click", Target: "#pay"})
+	step = runAction(hClientBg, sid, "w-1", Action{Type: "click", Target: "#pay"})
 	ctx.Assert(driver.applied == 3 && step.Outcome == "ok", "a click applied before its reply was lost as Unavailable left %d applied actions (expected 3) and outcome %q: Unavailable is checked against Snapshot too", driver.applied, step.Outcome)
 	// The one further Act is sent once: its own lost reply is not replayed blindly.
 	driver.drop, driver.loseReply, driver.loseCode = 1, 1, codes.DeadlineExceeded
-	runAction(clientBg, sid, "w-1", Action{Type: "click", Target: "#submit"})
+	runAction(hClientBg, sid, "w-1", Action{Type: "click", Target: "#submit"})
 	ctx.Assert(driver.applied == 4, "after a refused click and a replay whose reply was lost the page applied %d clicks: the replay is sent once, never through a blind retry", driver.applied-3)
 	for _, code := range []codes.Code{codes.InvalidArgument, codes.FailedPrecondition, codes.NotFound} {
 		snapshots := len(ctx.GRPC.CallsTo("Snapshot", ""))
 		driver.drop, driver.dropCode = 1, code
-		step = runAction(clientBg, sid, "w-1", Action{Type: "click", Target: "#gone"})
+		step = runAction(hClientBg, sid, "w-1", Action{Type: "click", Target: "#gone"})
 		ctx.Assert(driver.applied == 4 && step.Outcome == "failed", "a click the driver refused with %v left %d extra applied actions and outcome %q: only Unavailable and DeadlineExceeded may have lost a reply; %v ends the action failed", code, driver.applied-4, step.Outcome, code)
 		ctx.Assert(len(ctx.GRPC.CallsTo("Snapshot", "")) == snapshots, "a click refused with %v was followed by Snapshot: only Unavailable and DeadlineExceeded are checked against the page", code)
 	}
@@ -1503,7 +1503,7 @@ func CheckRedirectHops(ctx *harness.Ctx) {
 		{"https://www.example.com/checkout", hPlainURL, "/checkout, which redirects to plain http on the same host"},
 	}
 	for _, tc := range cases {
-		step := runAction(clientBg, sid, "w-1", Action{Type: "navigate", Target: tc.target})
+		step := runAction(hClientBg, sid, "w-1", Action{Type: "navigate", Target: tc.target})
 		var sent []string
 		for _, c := range ctx.GRPC.CallsTo("Navigate", "") {
 			sent = append(sent, c.Request.(*pb.NavigateRequest).GetUrl())
@@ -1513,10 +1513,10 @@ func CheckRedirectHops(ctx *harness.Ctx) {
 		}
 		ctx.Assert(step.Outcome == "blocked" && step.Reason != "", "navigating to %s must end the action blocked with a reason, got %+v", tc.label, step)
 	}
-	ctx.Equal(sessions.LoadSession(clientBg, sid).CurrentURL, hEntryURL, "a blocked navigation must leave the session on its page; current_url")
-	step := runAction(clientBg, sid, "w-1", Action{Type: "navigate", Target: "https://www.example.com/old-kettles"})
+	ctx.Equal(sessions.LoadSession(hClientBg, sid).CurrentURL, hEntryURL, "a blocked navigation must leave the session on its page; current_url")
+	step := runAction(hClientBg, sid, "w-1", Action{Type: "navigate", Target: "https://www.example.com/old-kettles"})
 	ctx.Assert(step.Outcome == "ok" && step.URL == hWikiURL, "a redirect to a host the profile allows must be followed, got %+v", step)
-	ctx.Equal(sessions.LoadSession(clientBg, sid).CurrentURL, hWikiURL, "the session must record the page the redirect ended on; current_url")
+	ctx.Equal(sessions.LoadSession(hClientBg, sid).CurrentURL, hWikiURL, "the session must record the page the redirect ended on; current_url")
 }
 `,
     cpp: `#include <leetbuild/harness.h>

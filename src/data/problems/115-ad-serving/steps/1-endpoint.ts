@@ -744,16 +744,16 @@ import (
 	"leetbuild/harness"
 )
 
-var apiRequest = map[string]any{"placement": "home-top", "user_hash": "u-1", "format": "banner"}
+var hApiRequest = map[string]any{"placement": "home-top", "user_hash": "u-1", "format": "banner"}
 
-func apiCampaign(id string, bid int64) store.Campaign {
+func hApiCampaign(id string, bid int64) store.Campaign {
 	return store.Campaign{
 		CampaignID: id, AdvertiserID: "adv-1", Version: 1, State: "active", Placement: "home-top", CreativeID: "cr-" + id,
 		BidMicros: bid, FreqCap: 3, FreqWindowS: 3600, PacedBudgetMicros: 1000000, GoalImpressions: 1000, StartTs: 0, EndTs: 86400,
 	}
 }
 
-func apiClient(ctx *harness.Ctx, campaigns ...store.Campaign) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx, campaigns ...store.Campaign) *harness.HTTP {
 	for _, c := range campaigns {
 		store.PutCampaign(context.Background(), c)
 	}
@@ -762,9 +762,9 @@ func apiClient(ctx *harness.Ctx, campaigns ...store.Campaign) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func apiWith(fields map[string]any) map[string]any {
+func hApiWith(fields map[string]any) map[string]any {
 	out := map[string]any{}
-	for k, v := range apiRequest {
+	for k, v := range hApiRequest {
 		out[k] = v
 	}
 	for k, v := range fields {
@@ -774,7 +774,7 @@ func apiWith(fields map[string]any) map[string]any {
 }
 
 // apiServed is the campaign the serve answered with ("" for none).
-func apiServed(ctx *harness.Ctx, r *harness.Response) string {
+func hApiServed(ctx *harness.Ctx, r *harness.Response) string {
 	ctx.Equal(r.Status, 200, "POST /v1/ads/serve (%s)", r.Text())
 	body, _ := r.JSON().(map[string]any)
 	ad, _ := body["ad"].(map[string]any)
@@ -783,79 +783,79 @@ func apiServed(ctx *harness.Ctx, r *harness.Response) string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx, apiCampaign("c-1", 900))
-	r := c.Post("/v1/ads/serve", apiRequest)
+	c := hApiClient(ctx, hApiCampaign("c-1", 900))
+	r := c.Post("/v1/ads/serve", hApiRequest)
 	ctx.Equal(r.Status, 200, "POST /v1/ads/serve (%s)", r.Text())
 	body, _ := r.JSON().(map[string]any)
 	ctx.Equal(body["ad"], map[string]any{"campaign_id": "c-1", "creative_id": "cr-c-1", "price_micros": 900}, "the only active campaign must win; the ad")
 }
 
 func CheckRequestGuard(ctx *harness.Ctx) {
-	c := apiClient(ctx, apiCampaign("c-1", 900))
+	c := hApiClient(ctx, hApiCampaign("c-1", 900))
 	bad := []struct {
 		body map[string]any
 		what string
 	}{
-		{apiWith(map[string]any{"placement": ""}), "an empty placement"},
-		{apiWith(map[string]any{"placement": strings.Repeat("p", 65)}), "a 65-character placement"},
+		{hApiWith(map[string]any{"placement": ""}), "an empty placement"},
+		{hApiWith(map[string]any{"placement": strings.Repeat("p", 65)}), "a 65-character placement"},
 		{map[string]any{"placement": "home-top", "format": "banner"}, "a request without user_hash"},
-		{apiWith(map[string]any{"user_hash": ""}), "an empty user_hash"},
-		{apiWith(map[string]any{"format": "popup"}), "format popup"},
+		{hApiWith(map[string]any{"user_hash": ""}), "an empty user_hash"},
+		{hApiWith(map[string]any{"format": "popup"}), "format popup"},
 		{map[string]any{"placement": "home-top", "user_hash": "u-1"}, "a request without format"},
 	}
 	for _, b := range bad {
 		r := c.Post("/v1/ads/serve", b.body)
 		ctx.Equal(r.Status, 400, "%s answered %s, expected 400 before any campaign is read; the status", b.what, r.Text())
 	}
-	r := c.Post("/v1/ads/serve", apiWith(map[string]any{"placement": strings.Repeat("p", 64)}))
+	r := c.Post("/v1/ads/serve", hApiWith(map[string]any{"placement": strings.Repeat("p", 64)}))
 	ctx.Equal(r.Status, 200, "a 64-character placement is valid (%s)", r.Text())
 }
 
 func CheckEligibility(ctx *harness.Ctx) {
-	paused := apiCampaign("c-1", 900)
+	paused := hApiCampaign("c-1", 900)
 	paused.State = "paused"
-	spent := apiCampaign("c-2", 800)
+	spent := hApiCampaign("c-2", 800)
 	spent.PacedBudgetMicros = 10000
-	exhausted := apiCampaign("c-3", 700)
+	exhausted := hApiCampaign("c-3", 700)
 	exhausted.State = "exhausted"
-	exact := apiCampaign("c-5", 600)
+	exact := hApiCampaign("c-5", 600)
 	exact.PacedBudgetMicros = 10000
-	c := apiClient(ctx, paused, spent, exhausted, apiCampaign("c-4", 400), exact)
+	c := hApiClient(ctx, paused, spent, exhausted, hApiCampaign("c-4", 400), exact)
 	ctx.Redis.Set("pace:c-2", "9500")
 	ctx.Redis.Set("pace:c-5", "9400")
-	won := apiServed(ctx, c.Post("/v1/ads/serve", apiRequest))
+	won := hApiServed(ctx, c.Post("/v1/ads/serve", hApiRequest))
 	ctx.Equal(won, "c-5", "c-1 is paused, c-3 exhausted, c-2 has 500 micros of budget left for an 800-micro bid, and c-5's 600-micro bid fits its remaining 600 exactly (spent + bid <= budget): c-5 must win; the serve went to")
 	ctx.Redis.Set("pace:c-5", "9401")
-	won = apiServed(ctx, c.Post("/v1/ads/serve", apiRequest))
+	won = hApiServed(ctx, c.Post("/v1/ads/serve", hApiRequest))
 	ctx.Equal(won, "c-4", "with c-5 one micro short of its 600-micro bid only c-4 may compete; the serve went to")
 	ctx.Redis.Set("pace:c-4", "1000000")
-	r := c.Post("/v1/ads/serve", apiRequest)
+	r := c.Post("/v1/ads/serve", hApiRequest)
 	body, _ := r.JSON().(map[string]any)
 	ctx.Assert(r.Status == 200 && body["ad"] == nil && body["reason"] == "no_eligible_campaign", "with every campaign paused or spent the serve answered %d %s, expected no_eligible_campaign", r.Status, r.Text())
 }
 
 func CheckFrequencyCap(ctx *harness.Ctx) {
-	capped := apiCampaign("c-1", 900)
+	capped := hApiCampaign("c-1", 900)
 	capped.FreqCap = 3
-	c := apiClient(ctx, capped, apiCampaign("c-2", 500))
+	c := hApiClient(ctx, capped, hApiCampaign("c-2", 500))
 	ctx.Redis.Set("freq:c-1:u-1", "3")
 	ctx.Redis.Set("freq:c-1:u-2", "2")
-	first := apiServed(ctx, c.Post("/v1/ads/serve", apiRequest))
-	second := apiServed(ctx, c.Post("/v1/ads/serve", apiWith(map[string]any{"user_hash": "u-2"})))
+	first := hApiServed(ctx, c.Post("/v1/ads/serve", hApiRequest))
+	second := hApiServed(ctx, c.Post("/v1/ads/serve", hApiWith(map[string]any{"user_hash": "u-2"})))
 	ctx.Equal(first, "c-2", "u-1 has seen c-1 three times (freq_cap 3); u-1 was served")
 	ctx.Equal(second, "c-1", "u-2 has seen c-1 twice, under its cap of 3; u-2 was served")
 }
 
 func CheckServedVersion(ctx *harness.Ctx) {
-	cheap := apiCampaign("c-0", 300)
+	cheap := hApiCampaign("c-0", 300)
 	cheap.Version = 11
-	versioned := apiCampaign("c-1", 900)
+	versioned := hApiCampaign("c-1", 900)
 	versioned.Version = 7
-	middle := apiCampaign("c-3", 500)
+	middle := hApiCampaign("c-3", 500)
 	middle.Version = 9
-	c := apiClient(ctx, cheap, versioned, middle)
-	r := c.Post("/v1/ads/serve", apiRequest)
-	ctx.Equal(apiServed(ctx, r), "c-1", "c-1 (900) outbids c-3 (500) and c-0 (300); the serve went to")
+	c := hApiClient(ctx, cheap, versioned, middle)
+	r := c.Post("/v1/ads/serve", hApiRequest)
+	ctx.Equal(hApiServed(ctx, r), "c-1", "c-1 (900) outbids c-3 (500) and c-0 (300); the serve went to")
 	body, _ := r.JSON().(map[string]any)
 	ctx.Equal(body["campaign_version"], 7, "the serve of c-1 (version 7, next to c-0 at version 11 and c-3 at version 9) answered %s: campaign_version must name the row of the campaign that won; campaign_version", r.Text())
 }
@@ -872,9 +872,9 @@ func CheckServedVersion(ctx *harness.Ctx) {
 
 namespace {
 
-const nlohmann::json kApiRequest = {{"placement", "home-top"}, {"user_hash", "u-1"}, {"format", "banner"}};
+const nlohmann::json kHApiRequest = {{"placement", "home-top"}, {"user_hash", "u-1"}, {"format", "banner"}};
 
-store::Campaign apiCampaign(const std::string& id, long long bid) {
+store::Campaign hApiCampaign(const std::string& id, long long bid) {
   store::Campaign c;
   c.campaign_id = id;
   c.advertiser_id = "adv-1";
@@ -892,7 +892,7 @@ store::Campaign apiCampaign(const std::string& id, long long bid) {
   return c;
 }
 
-harness::HTTP apiClient(harness::Ctx& ctx, const std::vector<store::Campaign>& campaigns) {
+harness::HTTP hApiClient(harness::Ctx& ctx, const std::vector<store::Campaign>& campaigns) {
   for (const auto& c : campaigns) store::putCampaign(c);
   static httplib::Server* svr = nullptr;
   delete svr;
@@ -901,22 +901,22 @@ harness::HTTP apiClient(harness::Ctx& ctx, const std::vector<store::Campaign>& c
   return ctx.HTTP(*svr);
 }
 
-harness::Response apiPost(harness::HTTP& c, const nlohmann::json& body) {
+harness::Response hApiPost(harness::HTTP& c, const nlohmann::json& body) {
   return c.Post("/v1/ads/serve", body.dump(), "Content-Type", "application/json");
 }
 
-nlohmann::json apiWith(const nlohmann::json& fields) {
-  nlohmann::json out = kApiRequest;
+nlohmann::json hApiWith(const nlohmann::json& fields) {
+  nlohmann::json out = kHApiRequest;
   for (const auto& [k, v] : fields.items()) out[k] = v;
   return out;
 }
 
-nlohmann::json apiBody(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hApiBody(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
 // The campaign the serve answered with ("" for none).
-std::string apiServed(harness::Ctx& ctx, const harness::Response& r) {
+std::string hApiServed(harness::Ctx& ctx, const harness::Response& r) {
   ctx.Equal(r.Status, 200, "POST /v1/ads/serve (%s)", r.Text());
-  const auto body = apiBody(r);
+  const auto body = hApiBody(r);
   if (!body.is_object() || !body.contains("ad") || !body["ad"].is_object()) return "";
   return body["ad"].value("campaign_id", std::string());
 }
@@ -924,80 +924,80 @@ std::string apiServed(harness::Ctx& ctx, const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = apiClient(ctx, {apiCampaign("c-1", 900)});
-  const auto r = apiPost(c, kApiRequest);
+  auto c = hApiClient(ctx, {hApiCampaign("c-1", 900)});
+  const auto r = hApiPost(c, kHApiRequest);
   ctx.Equal(r.Status, 200, "POST /v1/ads/serve (%s)", r.Text());
-  const auto body = apiBody(r);
+  const auto body = hApiBody(r);
   const nlohmann::json want = {{"campaign_id", "c-1"}, {"creative_id", "cr-c-1"}, {"price_micros", 900}};
   ctx.Assert(body.is_object() && body.contains("ad") && body["ad"] == want, "the only active campaign must win, got %s", r.Text());
 }
 
 void CheckRequestGuard(harness::Ctx& ctx) {
-  auto c = apiClient(ctx, {apiCampaign("c-1", 900)});
+  auto c = hApiClient(ctx, {hApiCampaign("c-1", 900)});
   const std::vector<std::pair<nlohmann::json, std::string>> bad = {
-      {apiWith({{"placement", ""}}), "an empty placement"},
-      {apiWith({{"placement", std::string(65, 'p')}}), "a 65-character placement"},
+      {hApiWith({{"placement", ""}}), "an empty placement"},
+      {hApiWith({{"placement", std::string(65, 'p')}}), "a 65-character placement"},
       {nlohmann::json{{"placement", "home-top"}, {"format", "banner"}}, "a request without user_hash"},
-      {apiWith({{"user_hash", ""}}), "an empty user_hash"},
-      {apiWith({{"format", "popup"}}), "format popup"},
+      {hApiWith({{"user_hash", ""}}), "an empty user_hash"},
+      {hApiWith({{"format", "popup"}}), "format popup"},
       {nlohmann::json{{"placement", "home-top"}, {"user_hash", "u-1"}}, "a request without format"},
   };
   for (const auto& [body, what] : bad) {
-    const auto r = apiPost(c, body);
+    const auto r = hApiPost(c, body);
     ctx.Equal(r.Status, 400, "%s answered %s, expected 400 before any campaign is read; the status", what, r.Text());
   }
-  const auto r = apiPost(c, apiWith({{"placement", std::string(64, 'p')}}));
+  const auto r = hApiPost(c, hApiWith({{"placement", std::string(64, 'p')}}));
   ctx.Equal(r.Status, 200, "a 64-character placement is valid (%s)", r.Text());
 }
 
 void CheckEligibility(harness::Ctx& ctx) {
-  auto paused = apiCampaign("c-1", 900);
+  auto paused = hApiCampaign("c-1", 900);
   paused.state = "paused";
-  auto spent = apiCampaign("c-2", 800);
+  auto spent = hApiCampaign("c-2", 800);
   spent.paced_budget_micros = 10000;
-  auto exhausted = apiCampaign("c-3", 700);
+  auto exhausted = hApiCampaign("c-3", 700);
   exhausted.state = "exhausted";
-  auto exact = apiCampaign("c-5", 600);
+  auto exact = hApiCampaign("c-5", 600);
   exact.paced_budget_micros = 10000;
-  auto c = apiClient(ctx, {paused, spent, exhausted, apiCampaign("c-4", 400), exact});
+  auto c = hApiClient(ctx, {paused, spent, exhausted, hApiCampaign("c-4", 400), exact});
   ctx.Redis.Set("pace:c-2", "9500");
   ctx.Redis.Set("pace:c-5", "9400");
-  std::string won = apiServed(ctx, apiPost(c, kApiRequest));
+  std::string won = hApiServed(ctx, hApiPost(c, kHApiRequest));
   ctx.Equal(won, std::string("c-5"),
             "c-1 is paused, c-3 exhausted, c-2 has 500 micros of budget left for an 800-micro bid, and c-5's 600-micro bid fits its remaining 600 exactly (spent + bid <= budget): c-5 must win; the serve went to");
   ctx.Redis.Set("pace:c-5", "9401");
-  won = apiServed(ctx, apiPost(c, kApiRequest));
+  won = hApiServed(ctx, hApiPost(c, kHApiRequest));
   ctx.Equal(won, std::string("c-4"), "with c-5 one micro short of its 600-micro bid only c-4 may compete; the serve went to");
   ctx.Redis.Set("pace:c-4", "1000000");
-  const auto r = apiPost(c, kApiRequest);
-  const auto body = apiBody(r);
+  const auto r = hApiPost(c, kHApiRequest);
+  const auto body = hApiBody(r);
   ctx.Assert(r.Status == 200 && body.is_object() && body.contains("ad") && body["ad"].is_null() && body.value("reason", std::string()) == "no_eligible_campaign",
              "with every campaign paused or spent the serve answered %d %s, expected no_eligible_campaign", r.Status, r.Text());
 }
 
 void CheckFrequencyCap(harness::Ctx& ctx) {
-  auto capped = apiCampaign("c-1", 900);
+  auto capped = hApiCampaign("c-1", 900);
   capped.freq_cap = 3;
-  auto c = apiClient(ctx, {capped, apiCampaign("c-2", 500)});
+  auto c = hApiClient(ctx, {capped, hApiCampaign("c-2", 500)});
   ctx.Redis.Set("freq:c-1:u-1", "3");
   ctx.Redis.Set("freq:c-1:u-2", "2");
-  const std::string first = apiServed(ctx, apiPost(c, kApiRequest));
-  const std::string second = apiServed(ctx, apiPost(c, apiWith({{"user_hash", "u-2"}})));
+  const std::string first = hApiServed(ctx, hApiPost(c, kHApiRequest));
+  const std::string second = hApiServed(ctx, hApiPost(c, hApiWith({{"user_hash", "u-2"}})));
   ctx.Equal(first, std::string("c-2"), "u-1 has seen c-1 three times (freq_cap 3); u-1 was served");
   ctx.Equal(second, std::string("c-1"), "u-2 has seen c-1 twice, under its cap of 3; u-2 was served");
 }
 
 void CheckServedVersion(harness::Ctx& ctx) {
-  auto cheap = apiCampaign("c-0", 300);
+  auto cheap = hApiCampaign("c-0", 300);
   cheap.version = 11;
-  auto versioned = apiCampaign("c-1", 900);
+  auto versioned = hApiCampaign("c-1", 900);
   versioned.version = 7;
-  auto middle = apiCampaign("c-3", 500);
+  auto middle = hApiCampaign("c-3", 500);
   middle.version = 9;
-  auto c = apiClient(ctx, {cheap, versioned, middle});
-  const auto r = apiPost(c, kApiRequest);
-  ctx.Equal(apiServed(ctx, r), std::string("c-1"), "c-1 (900) outbids c-3 (500) and c-0 (300); the serve went to");
-  const auto body = apiBody(r);
+  auto c = hApiClient(ctx, {cheap, versioned, middle});
+  const auto r = hApiPost(c, kHApiRequest);
+  ctx.Equal(hApiServed(ctx, r), std::string("c-1"), "c-1 (900) outbids c-3 (500) and c-0 (300); the serve went to");
+  const auto body = hApiBody(r);
   ctx.Assert(body.is_object() && body.contains("campaign_version") && body["campaign_version"] == 7,
              "the serve of c-1 (version 7, next to c-0 at version 11 and c-3 at version 9) answered %s: campaign_version must name the row of the campaign that won", r.Text());
 }

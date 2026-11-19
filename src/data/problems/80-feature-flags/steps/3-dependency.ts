@@ -778,52 +778,52 @@ import (
 	"leetbuild/harness"
 )
 
-var killBg = context.Background()
+var hKillBg = context.Background()
 
-type killSeen struct {
+type HKillSeen struct {
 	flagKey  string
 	version  int64
 	snapshot *engine.Snapshot
 }
 
-// killPeer records each push with the snapshot Redis held when it arrived (what a refetch would read).
-type killPeer struct {
+// HKillPeer records each push with the snapshot Redis held when it arrived (what a refetch would read).
+type HKillPeer struct {
 	pb.UnimplementedRelayServer
-	seen []killSeen
+	seen []HKillSeen
 }
 
-func (p *killPeer) PushKill(ctx context.Context, req *pb.KillRequest) (*pb.KillAck, error) {
+func (p *HKillPeer) PushKill(ctx context.Context, req *pb.KillRequest) (*pb.KillAck, error) {
 	s, _ := engine.ReadSnapshot(ctx)
-	p.seen = append(p.seen, killSeen{req.GetFlagKey(), req.GetVersion(), s})
+	p.seen = append(p.seen, HKillSeen{req.GetFlagKey(), req.GetVersion(), s})
 	return &pb.KillAck{AppliedVersion: req.GetVersion()}, nil
 }
 
-func killSetup(ctx *harness.Ctx) *killPeer {
-	peer := &killPeer{}
+func hKillSetup(ctx *harness.Ctx) *HKillPeer {
+	peer := &HKillPeer{}
 	pb.RegisterRelayServer(ctx.GRPC.Server(""), peer)
 	base := engine.Snapshot{Version: 4, Flags: map[string]engine.Flag{
 		"checkout":  {Rollout: 100, Salt: "2026"},
 		"search-v2": {Rollout: 100, Salt: "2026"},
 	}}
-	moved, err := engine.PublishSnapshot(killBg, base)
+	moved, err := engine.PublishSnapshot(hKillBg, base)
 	ctx.Assert(err == nil && moved, "seeding version 4 failed: %v", err)
 	return peer
 }
 
-func killRun(ctx *harness.Ctx, flagKey string) killResult {
-	result, err := killFlag(killBg, flagKey, "oncall")
+func hKillRun(ctx *harness.Ctx, flagKey string) killResult {
+	result, err := killFlag(hKillBg, flagKey, "oncall")
 	ctx.NoError(err, "killFlag(%s) failed", flagKey)
 	return result
 }
 
-func killIsKilled(flagKey string) bool {
-	d, _ := engine.Evaluate(killBg, flagKey, map[string]string{"user_id": "u-7"})
+func hKillIsKilled(flagKey string) bool {
+	d, _ := engine.Evaluate(hKillBg, flagKey, map[string]string{"user_id": "u-7"})
 	return d != nil && d.Reason == "killed"
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	killSetup(ctx)
-	result := killRun(ctx, "checkout")
+	hKillSetup(ctx)
+	result := hKillRun(ctx, "checkout")
 	ctx.Equal(result.Status, "pushed", "with the relay healthy, the status killFlag answers")
 	calls := ctx.GRPC.CallsTo("PushKill", "")
 	ctx.Equal(len(calls), 1, "one kill, the PushKill calls")
@@ -831,11 +831,11 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Assert(800*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 1200*time.Millisecond, "the PushKill call carries a %v deadline, expected 1 s", calls[0].Timeout)
 	ctx.GRPC.SetLatency("PushKill", 30.0, "")
 	started := ctx.Clock.Now()
-	result = killRun(ctx, "search-v2")
+	result = hKillRun(ctx, "search-v2")
 	elapsed := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(elapsed <= 1.5, "with the relay hung, killFlag held the operator for %.1f s: the push needs one attempt under a 1-second deadline", elapsed)
 	ctx.Equal(len(ctx.GRPC.CallsTo("PushKill", "")), 2, "a push that timed out is the retrier's, not retried in place; the PushKill calls of two kills")
-	ctx.Assert(killIsKilled("search-v2"), "after a kill whose push timed out, search-v2 must evaluate as killed: the kill must be in the snapshot")
+	ctx.Assert(hKillIsKilled("search-v2"), "after a kill whose push timed out, search-v2 must evaluate as killed: the kill must be in the snapshot")
 	ctx.Equal(result.Status, "pending", "the push timed out (DEADLINE_EXCEEDED); the status killFlag answers")
 	rows := ctx.Redis.LRange("flags:push:pending", 0, -1)
 	var row map[string]any
@@ -843,8 +843,8 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckCommitFirst(ctx *harness.Ctx) {
-	peer := killSetup(ctx)
-	result := killRun(ctx, "checkout")
+	peer := hKillSetup(ctx)
+	result := hKillRun(ctx, "checkout")
 	ctx.Equal(result.Version, int64(5), "the version the kill publishes")
 	ctx.Assert(len(peer.seen) > 0, "no PushKill reached the relay")
 	seen := peer.seen[0]
@@ -854,13 +854,13 @@ func CheckCommitFirst(ctx *harness.Ctx) {
 		held = seen.snapshot.Version
 	}
 	ctx.Assert(held == 5 && seen.snapshot.Flags["checkout"].Killed, "when the push for version 5 arrived, Redis held version %d: a relay that refetches on the push reads the old snapshot and keeps serving checkout. Publish the killed snapshot, then push", held)
-	ctx.Assert(killIsKilled("checkout"), "after the kill checkout must evaluate as killed")
+	ctx.Assert(hKillIsKilled("checkout"), "after the kill checkout must evaluate as killed")
 }
 
 func CheckPending(ctx *harness.Ctx) {
-	killSetup(ctx)
+	hKillSetup(ctx)
 	ctx.GRPC.Fail("PushKill", codes.Unavailable, "relay restarting", 1, "")
-	result := killRun(ctx, "checkout")
+	result := hKillRun(ctx, "checkout")
 	ctx.Equal(result.Status, "pending", "the PushKill failed UNAVAILABLE: a failed push is queued in flags:push:pending and answered pending; the status")
 	ctx.Equal(len(ctx.GRPC.CallsTo("PushKill", "")), 1, "a failed push is queued for the retrier, not retried in place; the PushKill calls")
 	rows := ctx.Redis.LRange("flags:push:pending", 0, -1)
@@ -868,8 +868,8 @@ func CheckPending(ctx *harness.Ctx) {
 	var row map[string]any
 	ctx.NoError(json.Unmarshal([]byte(rows[0]), &row), "the pending row must be JSON (%s)", rows[0])
 	ctx.Assert(row["flag_key"] == "checkout" && row["version"] == float64(5) && row["actor"] == "oncall", "the pending row is %s, expected flag_key checkout, version 5, actor oncall", rows[0])
-	ctx.Assert(killIsKilled("checkout"), "the kill must be in the snapshot even when the push failed")
-	ctx.Equal(killRun(ctx, "search-v2").Status, "pushed", "with the relay back, the status")
+	ctx.Assert(hKillIsKilled("checkout"), "the kill must be in the snapshot even when the push failed")
+	ctx.Equal(hKillRun(ctx, "search-v2").Status, "pushed", "with the relay back, the status")
 	ctx.Equal(len(ctx.Redis.LRange("flags:push:pending", 0, -1)), 1, "a push that landed must not add a pending row; rows")
 	// Any status is a failed push, not only the transient ones; rows queue in order for the retrier.
 	for _, failure := range []struct {
@@ -877,7 +877,7 @@ func CheckPending(ctx *harness.Ctx) {
 		version int64
 	}{{codes.PermissionDenied, 7}, {codes.Internal, 8}} {
 		ctx.GRPC.Fail("PushKill", failure.code, "relay refused", 1, "")
-		result = killRun(ctx, "checkout")
+		result = hKillRun(ctx, "checkout")
 		ctx.Assert(result.Status == "pending" && result.Version == failure.version, "the PushKill failed %v and killFlag answered %+v: every failed push is queued and answered pending, expected version %d", failure.code, result, failure.version)
 	}
 	var versions []float64
@@ -904,16 +904,16 @@ func CheckPending(ctx *harness.Ctx) {
 
 namespace {
 
-struct KillSeen {
+struct HKillSeen {
   std::string flag_key;
   long long version = 0;
   std::optional<nlohmann::json> snapshot;
 };
 
 // Records each push with the snapshot Redis held when it arrived (what a refetch would read).
-class KillPeer final : public flagrelay::Relay::Service {
+class HKillPeer final : public flagrelay::Relay::Service {
  public:
-  std::vector<KillSeen> seen;
+  std::vector<HKillSeen> seen;
   grpc::Status PushKill(grpc::ServerContext*, const flagrelay::KillRequest* req, flagrelay::KillAck* out) override {
     seen.push_back({req->flag_key(), req->version(), engine::readSnapshot()});
     out->set_applied_version(req->version());
@@ -921,17 +921,17 @@ class KillPeer final : public flagrelay::Relay::Service {
   }
 };
 
-KillPeer& killSetup(harness::Ctx& ctx) {
-  static KillPeer* peer = nullptr;
+HKillPeer& hKillSetup(harness::Ctx& ctx) {
+  static HKillPeer* peer = nullptr;
   delete peer;
-  peer = new KillPeer;
+  peer = new HKillPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   const nlohmann::json flag = {{"default", false}, {"rules", nlohmann::json::array()}, {"rollout", 100}, {"salt", "2026"}, {"killed", false}};
   ctx.Assert(engine::publishSnapshot({{"version", 4}, {"flags", {{"checkout", flag}, {"search-v2", flag}}}}), "seeding version 4 failed");
   return *peer;
 }
 
-nlohmann::json killRun(harness::Ctx& ctx, const std::string& flag_key) {
+nlohmann::json hKillRun(harness::Ctx& ctx, const std::string& flag_key) {
   try {
     return killFlag(flag_key, "oncall");
   } catch (const std::exception& e) {
@@ -939,7 +939,7 @@ nlohmann::json killRun(harness::Ctx& ctx, const std::string& flag_key) {
   }
 }
 
-bool killIsKilled(const std::string& flag_key) {
+bool hKillIsKilled(const std::string& flag_key) {
   const auto d = engine::evaluate(flag_key, {{"user_id", "u-7"}});
   return d && d->value("reason", "") == "killed";
 }
@@ -947,8 +947,8 @@ bool killIsKilled(const std::string& flag_key) {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  killSetup(ctx);
-  const auto result = killRun(ctx, "checkout");
+  hKillSetup(ctx);
+  const auto result = hKillRun(ctx, "checkout");
   ctx.Equal(result.value("status", ""), "pushed", "with the relay healthy, the status killFlag answers");
   const auto calls = ctx.GRPC.CallsTo("PushKill");
   ctx.Equal(calls.size(), 1, "one kill, the PushKill calls");
@@ -956,46 +956,46 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.Assert(0.8 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 1.2, "the PushKill call carries a %v s deadline, expected 1 s", calls[0].TimeoutSeconds());
   ctx.GRPC.SetLatency("PushKill", 30.0);
   const int64_t started = ctx.Clock.Now();
-  const auto hung = killRun(ctx, "search-v2");
+  const auto hung = hKillRun(ctx, "search-v2");
   const double elapsed = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(elapsed <= 1.5, "with the relay hung, killFlag held the operator for %v s: the push needs one attempt under a 1-second deadline", elapsed);
   ctx.Equal(ctx.GRPC.CallsTo("PushKill").size(), 2, "a push that timed out is the retrier's, not retried in place; the PushKill calls of two kills");
-  ctx.Assert(killIsKilled("search-v2"), "after a kill whose push timed out, search-v2 must evaluate as killed: the kill must be in the snapshot");
+  ctx.Assert(hKillIsKilled("search-v2"), "after a kill whose push timed out, search-v2 must evaluate as killed: the kill must be in the snapshot");
   ctx.Equal(hung.value("status", ""), "pending", "the push timed out (DEADLINE_EXCEEDED); the status killFlag answers");
   const auto rows = ctx.Redis.LRange("flags:push:pending", 0, -1);
   ctx.Assert(rows.size() == 1 && nlohmann::json::parse(rows[0], nullptr, false) == nlohmann::json{{"flag_key", "search-v2"}, {"version", 6}, {"actor", "oncall"}}, "after the timed-out push flags:push:pending holds %v, expected the search-v2 version 6 row: a deadline is a failed push too", rows);
 }
 
 void CheckCommitFirst(harness::Ctx& ctx) {
-  KillPeer& peer = killSetup(ctx);
-  const auto result = killRun(ctx, "checkout");
+  HKillPeer& peer = hKillSetup(ctx);
+  const auto result = hKillRun(ctx, "checkout");
   ctx.Equal(result.value("version", 0LL), 5LL, "the version the kill publishes");
   ctx.Assert(!peer.seen.empty(), "no PushKill reached the relay");
-  const KillSeen& seen = peer.seen[0];
+  const HKillSeen& seen = peer.seen[0];
   ctx.Assert(seen.flag_key == "checkout" && seen.version == 5, "the relay got a push for %s version %d, expected checkout version 5", seen.flag_key, seen.version);
   const long long held = seen.snapshot ? seen.snapshot->value("version", 0LL) : 0LL;
   ctx.Assert(held == 5 && seen.snapshot->at("flags").at("checkout").value("killed", false), "when the push for version 5 arrived, Redis held version %d: a relay that refetches on the push reads the old snapshot and keeps serving checkout. Publish the killed snapshot, then push", held);
-  ctx.Assert(killIsKilled("checkout"), "after the kill checkout must evaluate as killed");
+  ctx.Assert(hKillIsKilled("checkout"), "after the kill checkout must evaluate as killed");
 }
 
 void CheckPending(harness::Ctx& ctx) {
-  killSetup(ctx);
+  hKillSetup(ctx);
   ctx.GRPC.Fail("PushKill", grpc::StatusCode::UNAVAILABLE, "relay restarting", 1);
-  const auto result = killRun(ctx, "checkout");
+  const auto result = hKillRun(ctx, "checkout");
   ctx.Equal(result.value("status", ""), "pending", "the PushKill failed UNAVAILABLE: a failed push is queued in flags:push:pending and answered pending; the status");
   ctx.Equal(ctx.GRPC.CallsTo("PushKill").size(), 1, "a failed push is queued for the retrier, not retried in place; the PushKill calls");
   const auto rows = ctx.Redis.LRange("flags:push:pending", 0, -1);
   ctx.Equal(rows.size(), 1, "flags:push:pending must hold one row for the failed push (%v); rows", rows);
   const auto row = nlohmann::json::parse(rows[0], nullptr, false);
   ctx.Assert(row == nlohmann::json{{"flag_key", "checkout"}, {"version", 5}, {"actor", "oncall"}}, "the pending row is %s, expected flag_key checkout, version 5, actor oncall", rows[0]);
-  ctx.Assert(killIsKilled("checkout"), "the kill must be in the snapshot even when the push failed");
-  ctx.Equal(killRun(ctx, "search-v2").value("status", ""), "pushed", "with the relay back, the status");
+  ctx.Assert(hKillIsKilled("checkout"), "the kill must be in the snapshot even when the push failed");
+  ctx.Equal(hKillRun(ctx, "search-v2").value("status", ""), "pushed", "with the relay back, the status");
   ctx.Equal(ctx.Redis.LRange("flags:push:pending", 0, -1).size(), 1, "a push that landed must not add a pending row; rows");
   // Any status is a failed push, not only the transient ones; rows queue in order for the retrier.
   const std::vector<std::pair<grpc::StatusCode, long long>> failures = {{grpc::StatusCode::PERMISSION_DENIED, 7}, {grpc::StatusCode::INTERNAL, 8}};
   for (const auto& [code, version] : failures) {
     ctx.GRPC.Fail("PushKill", code, "relay refused", 1);
-    const auto refused = killRun(ctx, "checkout");
+    const auto refused = hKillRun(ctx, "checkout");
     ctx.Assert(refused.value("status", "") == "pending" && refused.value("version", 0LL) == version, "the PushKill failed with status %d and killFlag answered %s: every failed push is queued and answered pending, expected version %d", static_cast<int>(code), refused.dump(), version);
   }
   std::vector<long long> versions;

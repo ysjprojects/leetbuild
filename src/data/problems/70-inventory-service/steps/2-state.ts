@@ -856,48 +856,48 @@ import (
 	"inventory/stock"
 )
 
-const stateSKU = "sku-1"
+const kHStateSKU = "sku-1"
 
-func stateUnits(ctx *harness.Ctx) int {
-	value, _ := ctx.Redis.Get(stock.Key(stateSKU))
+func hStateUnits(ctx *harness.Ctx) int {
+	value, _ := ctx.Redis.Get(stock.Key(kHStateSKU))
 	n, _ := strconv.Atoi(value)
 	return n
 }
 
 // stateHeld is a reservation already holding units, as the reserve script leaves it.
-func stateHeld(ctx *harness.Ctx, reservationID string, quantity int) {
-	ctx.Redis.Do("HSET", stock.HoldsKey(stateSKU), reservationID, quantity)
+func hStateHeld(ctx *harness.Ctx, reservationID string, quantity int) {
+	ctx.Redis.Do("HSET", stock.HoldsKey(kHStateSKU), reservationID, quantity)
 	ctx.Redis.Set(stock.HoldKey(reservationID), quantity, "EX", 900)
 }
 
 // stateTake removes a reservation from the hold map, as a settled transition does, and returns its units.
-func stateTake(ctx *harness.Ctx, reservationID string) int {
-	value, ok := ctx.Redis.HGet(stock.HoldsKey(stateSKU), reservationID)
+func hStateTake(ctx *harness.Ctx, reservationID string) int {
+	value, ok := ctx.Redis.HGet(stock.HoldsKey(kHStateSKU), reservationID)
 	if !ok {
 		return 0
 	}
-	ctx.Redis.Do("HDEL", stock.HoldsKey(stateSKU), reservationID)
+	ctx.Redis.Do("HDEL", stock.HoldsKey(kHStateSKU), reservationID)
 	ctx.Redis.Del(stock.HoldKey(reservationID))
 	n, _ := strconv.Atoi(value)
 	return n
 }
 
 func CheckAtomicReserve(ctx *harness.Ctx) {
-	ctx.Redis.Set(stock.Key(stateSKU), 1)
+	ctx.Redis.Set(stock.Key(kHStateSKU), 1)
 	// Another buyer's reserve lands right after the learner's first command on the counter.
 	other := 0
-	probe := ctx.Redis.After(stock.Key(stateSKU), func() any {
-		if stateUnits(ctx) >= 1 {
-			ctx.Redis.Do("DECRBY", stock.Key(stateSKU), 1)
-			stateHeld(ctx, "r-other", 1)
+	probe := ctx.Redis.After(stock.Key(kHStateSKU), func() any {
+		if hStateUnits(ctx) >= 1 {
+			ctx.Redis.Do("DECRBY", stock.Key(kHStateSKU), 1)
+			hStateHeld(ctx, "r-other", 1)
 			other = 1
 		}
 		return other
 	})
-	won, err := reserve(context.Background(), stateSKU, 1, "r-1")
+	won, err := reserve(context.Background(), kHStateSKU, 1, "r-1")
 	ctx.NoError(err, "reserve")
 	ctx.Assert(probe.Fired, "reserve never touched stock:sku-1")
-	ctx.Assert(stateUnits(ctx) >= 0, "two buyers raced for the last unit and stock:sku-1 is %d: the other buyer took it between your read and your DECRBY, so the check and the decrement must be one Lua script", stateUnits(ctx))
+	ctx.Assert(hStateUnits(ctx) >= 0, "two buyers raced for the last unit and stock:sku-1 is %d: the other buyer took it between your read and your DECRBY, so the check and the decrement must be one Lua script", hStateUnits(ctx))
 	winners := other
 	if won {
 		winners++
@@ -906,70 +906,70 @@ func CheckAtomicReserve(ctx *harness.Ctx) {
 }
 
 func CheckHoldTtl(ctx *harness.Ctx) {
-	ctx.Redis.Set(stock.Key(stateSKU), 5)
+	ctx.Redis.Set(stock.Key(kHStateSKU), 5)
 	// The TTL is read right after the first command that writes hold:r-1: a hold key without one, even for a moment, outlives a crash.
 	var firstTTL int64
 	probe := ctx.Redis.After(stock.HoldKey("r-1"), func() any {
 		firstTTL = ctx.Redis.TTL(stock.HoldKey("r-1"))
 		return firstTTL
 	})
-	ok, err := reserve(context.Background(), stateSKU, 2, "r-1")
+	ok, err := reserve(context.Background(), kHStateSKU, 2, "r-1")
 	ctx.NoError(err, "reserve")
 	ctx.Assert(ok, "reserve refused 2 of 5 units")
 	ctx.Assert(probe.Fired, "reserve never wrote hold:r-1")
 	ctx.Assert(850 <= firstTTL && firstTTL <= 900, "right after the command that wrote hold:r-1 its TTL was %d: SET it with EX RESERVATION_TTL_S in the same command, inside the script", firstTTL)
 	ttl := ctx.Redis.TTL(stock.HoldKey("r-1"))
 	ctx.Assert(850 <= ttl && ttl <= 900, "hold:r-1 has TTL %d, expected the reservation's RESERVATION_TTL_S (900 s): a hold that outlives its reservation blocks units nobody can buy", ttl)
-	quantity, _ := ctx.Redis.HGet(stock.HoldsKey(stateSKU), "r-1")
+	quantity, _ := ctx.Redis.HGet(stock.HoldsKey(kHStateSKU), "r-1")
 	ctx.Equal(quantity, "2", "holds:sku-1's entry for r-1")
-	ctx.Equal(stateUnits(ctx), 3, "stock:sku-1 after reserving 2 of 5")
+	ctx.Equal(hStateUnits(ctx), 3, "stock:sku-1 after reserving 2 of 5")
 }
 
 func CheckReclaimExpired(ctx *harness.Ctx) {
-	ctx.Redis.Set(stock.Key(stateSKU), 4)
-	ok, err := reserve(context.Background(), stateSKU, 3, "r-1")
+	ctx.Redis.Set(stock.Key(kHStateSKU), 4)
+	ok, err := reserve(context.Background(), kHStateSKU, 3, "r-1")
 	ctx.NoError(err, "reserve")
 	ctx.Assert(ok, "reserve refused 3 of 4 units")
-	ok, err = reserve(context.Background(), stateSKU, 1, "r-0")
+	ok, err = reserve(context.Background(), kHStateSKU, 1, "r-0")
 	ctx.NoError(err, "reserve")
 	ctx.Assert(ok, "reserve refused the last unit")
 	ctx.Clock.Advance(3601) // both carts were abandoned an hour ago: their hold keys are gone
 	ctx.Equal(ctx.Redis.Exists(stock.HoldKey("r-1")), 0, "hold:r-1 an hour later")
-	stateHeld(ctx, "r-live", 2) // a cart filled a minute ago still holds 2 units
-	again, err := reserve(context.Background(), stateSKU, 3, "r-2")
+	hStateHeld(ctx, "r-live", 2) // a cart filled a minute ago still holds 2 units
+	again, err := reserve(context.Background(), kHStateSKU, 3, "r-2")
 	ctx.NoError(err, "reserve")
 	ctx.Assert(again, "carts abandoned an hour ago still block their 4 units: give back the units of every reservation whose hold key is gone, inside the script, before checking the counter")
-	ctx.Equal(ctx.Redis.HGetAll(stock.HoldsKey(stateSKU)), map[string]string{"r-live": "2", "r-2": "3"}, "holds:sku-1 (the live reservations r-live and r-2: only a hold whose own hold:{id} key is gone is given back)")
-	ctx.Equal(stateUnits(ctx), 1, "stock:sku-1 after the expired 3 and 1 came back and 3 were reserved again (each expired hold gives back its own quantity)")
+	ctx.Equal(ctx.Redis.HGetAll(stock.HoldsKey(kHStateSKU)), map[string]string{"r-live": "2", "r-2": "3"}, "holds:sku-1 (the live reservations r-live and r-2: only a hold whose own hold:{id} key is gone is given back)")
+	ctx.Equal(hStateUnits(ctx), 1, "stock:sku-1 after the expired 3 and 1 came back and 3 were reserved again (each expired hold gives back its own quantity)")
 }
 
 func CheckSettleOnce(ctx *harness.Ctx) {
-	ctx.Redis.Set(stock.Key(stateSKU), 5)
-	stateHeld(ctx, "r-1", 3)
-	stateHeld(ctx, "r-2", 2)
+	ctx.Redis.Set(stock.Key(kHStateSKU), 5)
+	hStateHeld(ctx, "r-1", 3)
+	hStateHeld(ctx, "r-2", 2)
 	// The warehouse's confirmation of r-1 lands right after the release's first command on the holds.
 	sold := 0
-	probe := ctx.Redis.After(stock.HoldsKey(stateSKU), func() any {
-		sold = stateTake(ctx, "r-1")
+	probe := ctx.Redis.After(stock.HoldsKey(kHStateSKU), func() any {
+		sold = hStateTake(ctx, "r-1")
 		return sold
 	})
-	released, err := release(context.Background(), stateSKU, "r-1")
+	released, err := release(context.Background(), kHStateSKU, "r-1")
 	ctx.NoError(err, "release")
 	ctx.Assert(probe.Fired, "release never touched holds:sku-1")
 	ctx.Assert(released+sold == 3, "r-1's 3 units were sold to the warehouse (%d) and put back on the counter (%d) at once: release must act only while the hold is still in holds:sku-1, in one script", sold, released)
-	ctx.Equal(stateUnits(ctx), 5+released, "stock:sku-1 after the release")
+	ctx.Equal(hStateUnits(ctx), 5+released, "stock:sku-1 after the release")
 	// A cancellation of r-2 lands right after the confirm's first command on the holds.
 	cancelled := 0
-	probe = ctx.Redis.After(stock.HoldsKey(stateSKU), func() any {
-		cancelled = stateTake(ctx, "r-2")
-		ctx.Redis.Do("INCRBY", stock.Key(stateSKU), cancelled)
+	probe = ctx.Redis.After(stock.HoldsKey(kHStateSKU), func() any {
+		cancelled = hStateTake(ctx, "r-2")
+		ctx.Redis.Do("INCRBY", stock.Key(kHStateSKU), cancelled)
 		return cancelled
 	})
-	confirmed, err := confirm(context.Background(), stateSKU, "r-2")
+	confirmed, err := confirm(context.Background(), kHStateSKU, "r-2")
 	ctx.NoError(err, "confirm")
 	ctx.Assert(probe.Fired, "confirm never touched holds:sku-1")
 	ctx.Assert(confirmed+cancelled == 2, "r-2's 2 units were put back (%d) and confirmed as sold (%d) at once: confirm must act only while the hold is still in holds:sku-1, in one script", cancelled, confirmed)
-	ctx.Equal(stateUnits(ctx), 5+released+cancelled, "stock:sku-1 after r-2 was confirmed (a confirmation sells the held units, it gives nothing back to the counter)")
+	ctx.Equal(hStateUnits(ctx), 5+released+cancelled, "stock:sku-1 after r-2 was confirmed (a confirmation sells the held units, it gives nothing back to the counter)")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -981,24 +981,24 @@ func CheckSettleOnce(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kStateSku = "sku-1";
+const std::string kHStateSku = "sku-1";
 
-long long stateUnits(harness::Ctx& ctx) {
-  const auto value = ctx.Redis.Get(inventory::stock::Key(kStateSku));
+long long hStateUnits(harness::Ctx& ctx) {
+  const auto value = ctx.Redis.Get(inventory::stock::Key(kHStateSku));
   return value ? std::stoll(*value) : 0;
 }
 
 // A reservation already holding units, as the reserve script leaves it.
-void stateHeld(harness::Ctx& ctx, const std::string& reservation_id, int quantity) {
-  ctx.Redis.Do("HSET", inventory::stock::HoldsKey(kStateSku), reservation_id, quantity);
+void hStateHeld(harness::Ctx& ctx, const std::string& reservation_id, int quantity) {
+  ctx.Redis.Do("HSET", inventory::stock::HoldsKey(kHStateSku), reservation_id, quantity);
   ctx.Redis.Do("SET", inventory::stock::HoldKey(reservation_id), quantity, "EX", 900);
 }
 
 // Remove a reservation from the hold map, as a settled transition does; its units.
-long long stateTake(harness::Ctx& ctx, const std::string& reservation_id) {
-  const auto value = ctx.Redis.HGet(inventory::stock::HoldsKey(kStateSku), reservation_id);
+long long hStateTake(harness::Ctx& ctx, const std::string& reservation_id) {
+  const auto value = ctx.Redis.HGet(inventory::stock::HoldsKey(kHStateSku), reservation_id);
   if (!value) return 0;
-  ctx.Redis.Do("HDEL", inventory::stock::HoldsKey(kStateSku), reservation_id);
+  ctx.Redis.Do("HDEL", inventory::stock::HoldsKey(kHStateSku), reservation_id);
   ctx.Redis.Do("DEL", inventory::stock::HoldKey(reservation_id));
   return std::stoll(*value);
 }
@@ -1006,29 +1006,29 @@ long long stateTake(harness::Ctx& ctx, const std::string& reservation_id) {
 }  // namespace
 
 void CheckAtomicReserve(harness::Ctx& ctx) {
-  ctx.Redis.Do("SET", inventory::stock::Key(kStateSku), 1);
+  ctx.Redis.Do("SET", inventory::stock::Key(kHStateSku), 1);
   // Another buyer's reserve lands right after the learner's first command on the counter.
   bool fired = false;
   int other = 0;
-  ctx.Redis.After(inventory::stock::Key(kStateSku), [&] {
+  ctx.Redis.After(inventory::stock::Key(kHStateSku), [&] {
     fired = true;
-    if (stateUnits(ctx) >= 1) {
-      ctx.Redis.Do("DECRBY", inventory::stock::Key(kStateSku), 1);
-      stateHeld(ctx, "r-other", 1);
+    if (hStateUnits(ctx) >= 1) {
+      ctx.Redis.Do("DECRBY", inventory::stock::Key(kHStateSku), 1);
+      hStateHeld(ctx, "r-other", 1);
       other = 1;
     }
   });
-  const bool won = reserve(kStateSku, 1, "r-1");
+  const bool won = reserve(kHStateSku, 1, "r-1");
   ctx.Assert(fired, "reserve never touched stock:sku-1");
-  ctx.Assert(stateUnits(ctx) >= 0,
+  ctx.Assert(hStateUnits(ctx) >= 0,
              "two buyers raced for the last unit and stock:sku-1 is %d: the other buyer took it between your read and your "
              "DECRBY, so the check and the decrement must be one Lua script",
-             stateUnits(ctx));
+             hStateUnits(ctx));
   ctx.Equal(other + (won ? 1 : 0), 1, "two buyers raced for the last unit; the buyers who got it");
 }
 
 void CheckHoldTtl(harness::Ctx& ctx) {
-  ctx.Redis.Do("SET", inventory::stock::Key(kStateSku), 5);
+  ctx.Redis.Do("SET", inventory::stock::Key(kHStateSku), 5);
   // The TTL is read right after the first command that writes hold:r-1: a hold key without one, even for a moment, outlives a crash.
   bool fired = false;
   long long first_ttl = 0;
@@ -1036,7 +1036,7 @@ void CheckHoldTtl(harness::Ctx& ctx) {
     fired = true;
     first_ttl = ctx.Redis.TTL(inventory::stock::HoldKey("r-1"));
   });
-  ctx.Assert(reserve(kStateSku, 2, "r-1"), "reserve refused 2 of 5 units");
+  ctx.Assert(reserve(kHStateSku, 2, "r-1"), "reserve refused 2 of 5 units");
   ctx.Assert(fired, "reserve never wrote hold:r-1");
   ctx.Assert(850 <= first_ttl && first_ttl <= 900,
              "right after the command that wrote hold:r-1 its TTL was %d: SET it with EX RESERVATION_TTL_S in the same command, "
@@ -1047,60 +1047,60 @@ void CheckHoldTtl(harness::Ctx& ctx) {
              "hold:r-1 has TTL %d, expected the reservation's RESERVATION_TTL_S (900 s): a hold that outlives its reservation "
              "blocks units nobody can buy",
              ttl);
-  ctx.Equal(ctx.Redis.HGet(inventory::stock::HoldsKey(kStateSku), "r-1").value_or(""), "2", "holds:sku-1's entry for r-1");
-  ctx.Equal(stateUnits(ctx), 3, "stock:sku-1 after reserving 2 of 5");
+  ctx.Equal(ctx.Redis.HGet(inventory::stock::HoldsKey(kHStateSku), "r-1").value_or(""), "2", "holds:sku-1's entry for r-1");
+  ctx.Equal(hStateUnits(ctx), 3, "stock:sku-1 after reserving 2 of 5");
 }
 
 void CheckReclaimExpired(harness::Ctx& ctx) {
-  ctx.Redis.Do("SET", inventory::stock::Key(kStateSku), 4);
-  ctx.Assert(reserve(kStateSku, 3, "r-1"), "reserve refused 3 of 4 units");
-  ctx.Assert(reserve(kStateSku, 1, "r-0"), "reserve refused the last unit");
+  ctx.Redis.Do("SET", inventory::stock::Key(kHStateSku), 4);
+  ctx.Assert(reserve(kHStateSku, 3, "r-1"), "reserve refused 3 of 4 units");
+  ctx.Assert(reserve(kHStateSku, 1, "r-0"), "reserve refused the last unit");
   ctx.Clock.Advance(3601);  // both carts were abandoned an hour ago: their hold keys are gone
   ctx.Equal(ctx.Redis.Exists(inventory::stock::HoldKey("r-1")), 0, "hold:r-1 an hour later");
-  stateHeld(ctx, "r-live", 2);  // a cart filled a minute ago still holds 2 units
-  ctx.Assert(reserve(kStateSku, 3, "r-2"),
+  hStateHeld(ctx, "r-live", 2);  // a cart filled a minute ago still holds 2 units
+  ctx.Assert(reserve(kHStateSku, 3, "r-2"),
              "carts abandoned an hour ago still block their 4 units: give back the units of every reservation whose hold key "
              "is gone, inside the script, before checking the counter");
-  ctx.Equal(ctx.Redis.HGetAll(inventory::stock::HoldsKey(kStateSku)),
+  ctx.Equal(ctx.Redis.HGetAll(inventory::stock::HoldsKey(kHStateSku)),
             std::map<std::string, std::string>{{"r-live", "2"}, {"r-2", "3"}},
             "holds:sku-1 (the live reservations r-live and r-2: only a hold whose own hold:{id} key is gone is given back)");
-  ctx.Equal(stateUnits(ctx), 1,
+  ctx.Equal(hStateUnits(ctx), 1,
             "stock:sku-1 after the expired 3 and 1 came back and 3 were reserved again (each expired hold gives back its own quantity)");
 }
 
 void CheckSettleOnce(harness::Ctx& ctx) {
-  ctx.Redis.Do("SET", inventory::stock::Key(kStateSku), 5);
-  stateHeld(ctx, "r-1", 3);
-  stateHeld(ctx, "r-2", 2);
+  ctx.Redis.Do("SET", inventory::stock::Key(kHStateSku), 5);
+  hStateHeld(ctx, "r-1", 3);
+  hStateHeld(ctx, "r-2", 2);
   // The warehouse's confirmation of r-1 lands right after the release's first command on the holds.
   bool fired = false;
   long long sold = 0;
-  ctx.Redis.After(inventory::stock::HoldsKey(kStateSku), [&] {
+  ctx.Redis.After(inventory::stock::HoldsKey(kHStateSku), [&] {
     fired = true;
-    sold = stateTake(ctx, "r-1");
+    sold = hStateTake(ctx, "r-1");
   });
-  const long long released = release(kStateSku, "r-1");
+  const long long released = release(kHStateSku, "r-1");
   ctx.Assert(fired, "release never touched holds:sku-1");
   ctx.Assert(released + sold == 3,
              "r-1's 3 units were sold to the warehouse (%d) and put back on the counter (%d) at once: release must act only "
              "while the hold is still in holds:sku-1, in one script",
              sold, released);
-  ctx.Equal(stateUnits(ctx), 5 + released, "stock:sku-1 after the release");
+  ctx.Equal(hStateUnits(ctx), 5 + released, "stock:sku-1 after the release");
   // A cancellation of r-2 lands right after the confirm's first command on the holds.
   fired = false;
   long long cancelled = 0;
-  ctx.Redis.After(inventory::stock::HoldsKey(kStateSku), [&] {
+  ctx.Redis.After(inventory::stock::HoldsKey(kHStateSku), [&] {
     fired = true;
-    cancelled = stateTake(ctx, "r-2");
-    ctx.Redis.Do("INCRBY", inventory::stock::Key(kStateSku), cancelled);
+    cancelled = hStateTake(ctx, "r-2");
+    ctx.Redis.Do("INCRBY", inventory::stock::Key(kHStateSku), cancelled);
   });
-  const long long confirmed = confirm(kStateSku, "r-2");
+  const long long confirmed = confirm(kHStateSku, "r-2");
   ctx.Assert(fired, "confirm never touched holds:sku-1");
   ctx.Assert(confirmed + cancelled == 2,
              "r-2's 2 units were put back (%d) and confirmed as sold (%d) at once: confirm must act only while the hold is "
              "still in holds:sku-1, in one script",
              cancelled, confirmed);
-  ctx.Equal(stateUnits(ctx), 5 + released + cancelled,
+  ctx.Equal(hStateUnits(ctx), 5 + released + cancelled,
             "stock:sku-1 after r-2 was confirmed (a confirmation sells the held units, it gives nothing back to the counter)");
 }
 `,

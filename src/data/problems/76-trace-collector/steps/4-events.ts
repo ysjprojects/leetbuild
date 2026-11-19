@@ -966,12 +966,12 @@ import (
 )
 
 const (
-	evTopic  = "trace.completed"
-	evTraceA = "4bf92f3577b34da6a3ce929d0e0e4736"
-	evTraceB = "5c0a3f4688c45eb7b4df03af1f1f5847"
+	kHEvTopic  = "trace.completed"
+	kHEvTraceA = "4bf92f3577b34da6a3ce929d0e0e4736"
+	kHEvTraceB = "5c0a3f4688c45eb7b4df03af1f1f5847"
 )
 
-func evTrace(traceID string, spans ...assembly.Span) *assembly.Trace {
+func hEvTrace(traceID string, spans ...assembly.Span) *assembly.Trace {
 	for i := range spans {
 		spans[i].TraceID = traceID
 		spans[i].StartMs = 1712345678901
@@ -979,29 +979,29 @@ func evTrace(traceID string, spans ...assembly.Span) *assembly.Trace {
 	return &assembly.Trace{TraceID: traceID, Owner: "acme", Root: spans[0].SpanID, Count: int64(len(spans)), Spans: spans}
 }
 
-func traceA() *assembly.Trace {
-	return evTrace(evTraceA,
+func hTraceA() *assembly.Trace {
+	return hEvTrace(kHEvTraceA,
 		assembly.Span{SpanID: "00f067aa0ba902b7", Service: "checkout", DurationMs: 412},
 		assembly.Span{SpanID: "00f067aa0ba902b8", ParentSpanID: "00f067aa0ba902b7", Service: "payments", DurationMs: 95},
 		assembly.Span{SpanID: "00f067aa0ba902b9", ParentSpanID: "00f067aa0ba902b7", Service: "payments", DurationMs: 120},
 		assembly.Span{SpanID: "00f067aa0ba902ba", ParentSpanID: "00f067aa0ba902b7", Service: "payments", DurationMs: 80})
 }
 
-func traceB() *assembly.Trace {
-	return evTrace(evTraceB,
+func hTraceB() *assembly.Trace {
+	return hEvTrace(kHEvTraceB,
 		assembly.Span{SpanID: "10f067aa0ba902b7", Service: "checkout", DurationMs: 300},
 		assembly.Span{SpanID: "10f067aa0ba902b8", ParentSpanID: "10f067aa0ba902b7", Service: "payments", DurationMs: 80})
 }
 
-func mustPublish(ctx *harness.Ctx, trace *assembly.Trace) {
+func hMustPublish(ctx *harness.Ctx, trace *assembly.Trace) {
 	_, err := publishCompleted(context.Background(), trace)
 	ctx.NoError(err, "publishCompleted(%s)", trace.TraceID)
 	ctx.Settle()
 }
 
-func evEvents(ctx *harness.Ctx) []map[string]any {
+func hEvEvents(ctx *harness.Ctx) []map[string]any {
 	out := []map[string]any{}
-	for _, r := range ctx.Kafka.Records(evTopic) {
+	for _, r := range ctx.Kafka.Records(kHEvTopic) {
 		var e map[string]any
 		json.Unmarshal(r.Value, &e)
 		out = append(out, e)
@@ -1010,22 +1010,22 @@ func evEvents(ctx *harness.Ctx) []map[string]any {
 }
 
 func CheckPerService(ctx *harness.Ctx) {
-	mustPublish(ctx, traceA())
-	events := evEvents(ctx)
-	ctx.Equal(len(events), 2, "a trace with spans in checkout and payments must produce one record per service on %s; the records", evTopic)
+	hMustPublish(ctx, hTraceA())
+	events := hEvEvents(ctx)
+	ctx.Equal(len(events), 2, "a trace with spans in checkout and payments must produce one record per service on %s; the records", kHEvTopic)
 	sort.Slice(events, func(i, j int) bool { return events[i]["service"].(string) < events[j]["service"].(string) })
 	want := []map[string]any{
-		{"trace_id": evTraceA, "service": "checkout", "span_count": 1, "max_ms": 412},
-		{"trace_id": evTraceA, "service": "payments", "span_count": 3, "max_ms": 120},
+		{"trace_id": kHEvTraceA, "service": "checkout", "span_count": 1, "max_ms": 412},
+		{"trace_id": kHEvTraceA, "service": "payments", "span_count": 3, "max_ms": 120},
 	}
 	ctx.Equal(events, want, "the events, with no span in them")
 }
 
 func CheckServiceKey(ctx *harness.Ctx) {
-	mustPublish(ctx, traceA())
-	mustPublish(ctx, traceB())
-	records := ctx.Kafka.Records(evTopic)
-	ctx.Assert(len(records) > 0, "nothing was produced on %s", evTopic)
+	hMustPublish(ctx, hTraceA())
+	hMustPublish(ctx, hTraceB())
+	records := ctx.Kafka.Records(kHEvTopic)
+	ctx.Assert(len(records) > 0, "nothing was produced on %s", kHEvTopic)
 	partitions := map[string]map[int]bool{}
 	for _, r := range records {
 		var e struct {
@@ -1044,25 +1044,25 @@ func CheckServiceKey(ctx *harness.Ctx) {
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
-	mustPublish(ctx, traceB())
-	ctx.Kafka.Failover(evTopic)
+	hMustPublish(ctx, hTraceB())
+	ctx.Kafka.Failover(kHEvTopic)
 	found := false
-	for _, e := range evEvents(ctx) {
-		found = found || e["trace_id"] == evTraceB
+	for _, e := range hEvEvents(ctx) {
+		found = found || e["trace_id"] == kHEvTraceB
 	}
-	ctx.Assert(found, "a leader failover right after the acknowledgement lost trace %s's events: wait for all in-sync replicas (RequireAll)", evTraceB)
+	ctx.Assert(found, "a leader failover right after the acknowledgement lost trace %s's events: wait for all in-sync replicas (RequireAll)", kHEvTraceB)
 }
 
 func CheckCountersBeforeCommit(ctx *harness.Ctx) {
 	// One partition, in this order; the last record's increment fails: rollup:search is not a hash.
 	for _, e := range []map[string]any{
-		{"trace_id": evTraceA, "service": "checkout", "span_count": 1, "max_ms": 412},
-		{"trace_id": evTraceA, "service": "payments", "span_count": 2, "max_ms": 120},
-		{"trace_id": evTraceB, "service": "checkout", "span_count": 1, "max_ms": 300},
-		{"trace_id": evTraceB, "service": "search", "span_count": 1, "max_ms": 40},
+		{"trace_id": kHEvTraceA, "service": "checkout", "span_count": 1, "max_ms": 412},
+		{"trace_id": kHEvTraceA, "service": "payments", "span_count": 2, "max_ms": 120},
+		{"trace_id": kHEvTraceB, "service": "checkout", "span_count": 1, "max_ms": 300},
+		{"trace_id": kHEvTraceB, "service": "search", "span_count": 1, "max_ms": 40},
 	} {
 		value, _ := json.Marshal(e)
-		ctx.Kafka.SeedPartition(evTopic, 0, e["service"], string(value))
+		ctx.Kafka.SeedPartition(kHEvTopic, 0, e["service"], string(value))
 	}
 	ctx.Redis.Set("rollup:search", "not-a-hash")
 	evCounted := func(field string) int {
@@ -1084,7 +1084,7 @@ func CheckCountersBeforeCommit(ctx *harness.Ctx) {
 	ctx.Assert(atCommit[0][0] >= 1 && atCommit[0][1] >= 1, "at the first commit the rollup had counted traces %d and spans %d: both increments must come before the commit, or a crash in between loses the event", atCommit[0][0], atCommit[0][1])
 	ctx.Equal(ctx.Redis.HGetAll("rollup:checkout"), map[string]string{"traces": "2", "spans": "2"}, "rollup:checkout")
 	ctx.Equal(ctx.Redis.HGetAll("rollup:payments"), map[string]string{"traces": "1", "spans": "2"}, "rollup:payments")
-	lag := ctx.Kafka.Lag("latency-rollup", evTopic)
+	lag := ctx.Kafka.Lag("latency-rollup", kHEvTopic)
 	ctx.Assert(lag <= 1, "the lag of group latency-rollup is %d: every event whose increments succeeded must be committed", lag)
 	ctx.Assert(lag == 1, "the increment of the search event failed (WRONGTYPE) and its offset was committed anyway: the event is lost from the rollup for good. Commit only after both increments succeeded")
 }
@@ -1103,11 +1103,11 @@ func CheckCountersBeforeCommit(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTopic2 = "trace.completed";
-const std::string kTraceA = "4bf92f3577b34da6a3ce929d0e0e4736";
-const std::string kTraceB = "5c0a3f4688c45eb7b4df03af1f1f5847";
+const std::string kHTopic2 = "trace.completed";
+const std::string kHTraceA = "4bf92f3577b34da6a3ce929d0e0e4736";
+const std::string kHTraceB = "5c0a3f4688c45eb7b4df03af1f1f5847";
 
-assembly::Trace evTrace(const std::string& trace_id, std::vector<assembly::Span> spans) {
+assembly::Trace hEvTrace(const std::string& trace_id, std::vector<assembly::Span> spans) {
   for (auto& s : spans) {
     s.trace_id = trace_id;
     s.start_ms = 1712345678901LL;
@@ -1115,24 +1115,24 @@ assembly::Trace evTrace(const std::string& trace_id, std::vector<assembly::Span>
   return assembly::Trace{trace_id, "acme", spans.at(0).span_id, static_cast<long long>(spans.size()), 0, 0, spans};
 }
 
-assembly::Trace traceA() {
-  return evTrace(kTraceA, {{"", "00f067aa0ba902b7", "", "checkout", 0, 412},
+assembly::Trace hTraceA() {
+  return hEvTrace(kHTraceA, {{"", "00f067aa0ba902b7", "", "checkout", 0, 412},
                            {"", "00f067aa0ba902b8", "00f067aa0ba902b7", "payments", 0, 95},
                            {"", "00f067aa0ba902b9", "00f067aa0ba902b7", "payments", 0, 120},
                            {"", "00f067aa0ba902ba", "00f067aa0ba902b7", "payments", 0, 80}});
 }
 
-assembly::Trace traceB() {
-  return evTrace(kTraceB, {{"", "10f067aa0ba902b7", "", "checkout", 0, 300}, {"", "10f067aa0ba902b8", "10f067aa0ba902b7", "payments", 0, 80}});
+assembly::Trace hTraceB() {
+  return hEvTrace(kHTraceB, {{"", "10f067aa0ba902b7", "", "checkout", 0, 300}, {"", "10f067aa0ba902b8", "10f067aa0ba902b7", "payments", 0, 80}});
 }
 
-std::vector<nlohmann::json> evEvents(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEvEvents(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
-  for (const auto& r : ctx.Kafka.Records(kTopic2)) out.push_back(nlohmann::json::parse(r.Value.value_or(""), nullptr, false));
+  for (const auto& r : ctx.Kafka.Records(kHTopic2)) out.push_back(nlohmann::json::parse(r.Value.value_or(""), nullptr, false));
   return out;
 }
 
-void evPublish(harness::Ctx& ctx, const assembly::Trace& trace) {
+void hEvPublish(harness::Ctx& ctx, const assembly::Trace& trace) {
   publish_completed(trace);
   ctx.Settle();
 }
@@ -1140,22 +1140,22 @@ void evPublish(harness::Ctx& ctx, const assembly::Trace& trace) {
 }  // namespace
 
 void CheckPerService(harness::Ctx& ctx) {
-  evPublish(ctx, traceA());
-  auto events = evEvents(ctx);
-  ctx.Equal(events.size(), 2, "a trace with spans in checkout and payments must produce one record per service on %s; the records", kTopic2);
+  hEvPublish(ctx, hTraceA());
+  auto events = hEvEvents(ctx);
+  ctx.Equal(events.size(), 2, "a trace with spans in checkout and payments must produce one record per service on %s; the records", kHTopic2);
   std::sort(events.begin(), events.end(), [](const nlohmann::json& a, const nlohmann::json& b) { return a.value("service", "") < b.value("service", ""); });
   const std::vector<nlohmann::json> want = {
-      {{"trace_id", kTraceA}, {"service", "checkout"}, {"span_count", 1}, {"max_ms", 412}},
-      {{"trace_id", kTraceA}, {"service", "payments"}, {"span_count", 3}, {"max_ms", 120}},
+      {{"trace_id", kHTraceA}, {"service", "checkout"}, {"span_count", 1}, {"max_ms", 412}},
+      {{"trace_id", kHTraceA}, {"service", "payments"}, {"span_count", 3}, {"max_ms", 120}},
   };
   ctx.Assert(events == want, "the events must be %s, with no span in them; got %s", nlohmann::json(want).dump(), nlohmann::json(events).dump());
 }
 
 void CheckServiceKey(harness::Ctx& ctx) {
-  evPublish(ctx, traceA());
-  evPublish(ctx, traceB());
-  const auto records = ctx.Kafka.Records(kTopic2);
-  ctx.Assert(!records.empty(), "nothing was produced on %s", kTopic2);
+  hEvPublish(ctx, hTraceA());
+  hEvPublish(ctx, hTraceB());
+  const auto records = ctx.Kafka.Records(kHTopic2);
+  ctx.Assert(!records.empty(), "nothing was produced on %s", kHTopic2);
   std::map<std::string, std::set<int>> partitions;
   for (const auto& r : records) {
     const auto event = nlohmann::json::parse(r.Value.value_or(""), nullptr, false);
@@ -1167,29 +1167,29 @@ void CheckServiceKey(harness::Ctx& ctx) {
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kTopic2, 1);
-  evPublish(ctx, traceA());
-  auto values = ctx.Kafka.Values(kTopic2);
+  ctx.Kafka.LoseAcks(kHTopic2, 1);
+  hEvPublish(ctx, hTraceA());
+  auto values = ctx.Kafka.Values(kHTopic2);
   const size_t before = values.size();
   std::sort(values.begin(), values.end());
   ctx.Assert(std::adjacent_find(values.begin(), values.end()) == values.end(),
-             "after one produce whose acknowledgement was lost %s holds the same event twice: the producer's retry wrote it again. Enable idempotence so the broker recognises the retry", kTopic2);
-  evPublish(ctx, traceB());
-  ctx.Kafka.Failover(kTopic2);
+             "after one produce whose acknowledgement was lost %s holds the same event twice: the producer's retry wrote it again. Enable idempotence so the broker recognises the retry", kHTopic2);
+  hEvPublish(ctx, hTraceB());
+  ctx.Kafka.Failover(kHTopic2);
   bool found = false;
-  for (const auto& e : evEvents(ctx)) found = found || (e.is_object() && e.value("trace_id", "") == kTraceB);
-  ctx.Assert(found && ctx.Kafka.Records(kTopic2).size() > before, "a leader failover right after the acknowledgement lost trace %s's events: wait for all in-sync replicas (acks=all)", kTraceB);
+  for (const auto& e : hEvEvents(ctx)) found = found || (e.is_object() && e.value("trace_id", "") == kHTraceB);
+  ctx.Assert(found && ctx.Kafka.Records(kHTopic2).size() > before, "a leader failover right after the acknowledgement lost trace %s's events: wait for all in-sync replicas (acks=all)", kHTraceB);
 }
 
 void CheckCountersBeforeCommit(harness::Ctx& ctx) {
   // One partition, in this order; the last record's increment fails: rollup:search is not a hash.
   for (const nlohmann::json& e : std::vector<nlohmann::json>{
-           {{"trace_id", kTraceA}, {"service", "checkout"}, {"span_count", 1}, {"max_ms", 412}},
-           {{"trace_id", kTraceA}, {"service", "payments"}, {"span_count", 2}, {"max_ms", 120}},
-           {{"trace_id", kTraceB}, {"service", "checkout"}, {"span_count", 1}, {"max_ms", 300}},
-           {{"trace_id", kTraceB}, {"service", "search"}, {"span_count", 1}, {"max_ms", 40}},
+           {{"trace_id", kHTraceA}, {"service", "checkout"}, {"span_count", 1}, {"max_ms", 412}},
+           {{"trace_id", kHTraceA}, {"service", "payments"}, {"span_count", 2}, {"max_ms", 120}},
+           {{"trace_id", kHTraceB}, {"service", "checkout"}, {"span_count", 1}, {"max_ms", 300}},
+           {{"trace_id", kHTraceB}, {"service", "search"}, {"span_count", 1}, {"max_ms", 40}},
        }) {
-    ctx.Kafka.SeedPartition(kTopic2, 0, e["service"].get<std::string>(), e.dump());
+    ctx.Kafka.SeedPartition(kHTopic2, 0, e["service"].get<std::string>(), e.dump());
   }
   ctx.Redis.Set("rollup:search", "not-a-hash");
   const auto counted = [&ctx](const std::string& field) {
@@ -1210,7 +1210,7 @@ void CheckCountersBeforeCommit(harness::Ctx& ctx) {
              atCommit[0].second);
   ctx.Equal(ctx.Redis.HGetAll("rollup:checkout"), std::map<std::string, std::string>{{"traces", "2"}, {"spans", "2"}}, "rollup:checkout");
   ctx.Equal(ctx.Redis.HGetAll("rollup:payments"), std::map<std::string, std::string>{{"traces", "1"}, {"spans", "2"}}, "rollup:payments");
-  const auto lag = ctx.Kafka.Lag("latency-rollup", kTopic2);
+  const auto lag = ctx.Kafka.Lag("latency-rollup", kHTopic2);
   ctx.Assert(lag <= 1, "the lag of group latency-rollup is %v: every event whose increments succeeded must be committed", lag);
   ctx.Assert(lag == 1, "the increment of the search event failed (WRONGTYPE) and its offset was committed anyway: the event is lost from the rollup for good. Commit only after both increments succeeded");
 }

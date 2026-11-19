@@ -1281,16 +1281,16 @@ import (
 	"leetbuild/harness"
 )
 
-const runGoodSQL = "SELECT trip_uuid FROM trips WHERE datestr = '2026-11-01'"
+const kHRunGoodSQL = "SELECT trip_uuid FROM trips WHERE datestr = '2026-11-01'"
 
-var runLimit1000 = regexp.MustCompile(\`(?i)\\blimit\\s+1000\\s*$\`)
+var hRunLimit1000 = regexp.MustCompile(\`(?i)\\blimit\\s+1000\\s*$\`)
 
 // warehousePeer is the stand-in warehouse: answers from querygen/warehouse.
-type warehousePeer struct {
+type HWarehousePeer struct {
 	pb.UnimplementedWarehouseServer
 }
 
-func (warehousePeer) Execute(_ context.Context, req *pb.ExecuteRequest) (*pb.ExecuteReply, error) {
+func (HWarehousePeer) Execute(_ context.Context, req *pb.ExecuteRequest) (*pb.ExecuteReply, error) {
 	reply := &pb.ExecuteReply{Columns: warehousedata.Columns}
 	for _, row := range warehousedata.Execute(req.GetSql()) {
 		reply.Rows = append(reply.Rows, &pb.Row{Values: row})
@@ -1298,32 +1298,32 @@ func (warehousePeer) Execute(_ context.Context, req *pb.ExecuteRequest) (*pb.Exe
 	return reply, nil
 }
 
-func runSeed(ctx *harness.Ctx, id, sql string, acked []string) {
+func hRunSeed(ctx *harness.Ctx, id, sql string, acked []string) {
 	queries.Save(context.Background(), queries.Record{QueryID: id, User: "ana", Workspace: "mobility", Question: "How many trips yesterday?", Status: "generated", TablesProposed: acked, TablesAcked: acked, SQL: sql})
 }
 
-func runStored(ctx *harness.Ctx, id string) map[string]any {
+func hRunStored(ctx *harness.Ctx, id string) map[string]any {
 	raw, _ := ctx.Redis.Get("query:" + id)
 	var rec map[string]any
 	json.Unmarshal([]byte(raw), &rec)
 	return rec
 }
 
-func runClient(ctx *harness.Ctx) *harness.HTTP {
-	pb.RegisterWarehouseServer(ctx.GRPC.Server(config.Warehouse), &warehousePeer{})
+func hRunClient(ctx *harness.Ctx) *harness.HTTP {
+	pb.RegisterWarehouseServer(ctx.GRPC.Server(config.Warehouse), &HWarehousePeer{})
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func runPost(c *harness.HTTP, id, user string) *harness.Response {
+func hRunPost(c *harness.HTTP, id, user string) *harness.Response {
 	if user == "" {
 		return c.Post("/v1/queries/"+id+"/run", nil)
 	}
 	return c.Post("/v1/queries/"+id+"/run", nil, "X-User-Id", user)
 }
 
-func runExecuted(ctx *harness.Ctx) []string {
+func hRunExecuted(ctx *harness.Ctx) []string {
 	var sqls []string
 	for _, call := range ctx.GRPC.CallsTo("Execute", "") {
 		if req, ok := call.Request.(*pb.ExecuteRequest); ok {
@@ -1333,132 +1333,132 @@ func runExecuted(ctx *harness.Ctx) []string {
 	return sqls
 }
 
-func runBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hRunBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	return body
 }
 
-func runRefused(ctx *harness.Ctx, c *harness.HTTP, id, sql, why string) {
-	before := len(runExecuted(ctx))
-	r := runPost(c, id, "ana")
+func hRunRefused(ctx *harness.Ctx, c *harness.HTTP, id, sql, why string) {
+	before := len(hRunExecuted(ctx))
+	r := hRunPost(c, id, "ana")
 	ctx.Equal(r.Status, 422, "%s: %q", why, sql)
-	ctx.Equal(len(runExecuted(ctx)), before, "%s: %q reached the warehouse; warehouse calls", why, sql)
+	ctx.Equal(len(hRunExecuted(ctx)), before, "%s: %q reached the warehouse; warehouse calls", why, sql)
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	runSeed(ctx, "q1", runGoodSQL, []string{"trips"})
-	c := runClient(ctx)
-	r := runPost(c, "q1", "ana")
+	hRunSeed(ctx, "q1", kHRunGoodSQL, []string{"trips"})
+	c := hRunClient(ctx)
+	r := hRunPost(c, "q1", "ana")
 	ctx.Equal(r.Status, 200, "the owner's run (%s)", r.Text())
-	body := runBody(ctx, r)
+	body := hRunBody(ctx, r)
 	ctx.Equal(body["columns"], []any{"datestr", "trip_uuid"}, "the answer carries the warehouse's columns")
 	rows, _ := body["rows"].([]any)
 	ctx.Assert(len(rows) > 0 && body["row_count"] == float64(len(rows)), "row_count must count the rows returned: %v vs %d", body["row_count"], len(rows))
-	ctx.Equal(runPost(c, "q1", "").Status, 401, "without X-User-Id the run")
-	ctx.Equal(runPost(c, "nope", "ana").Status, 404, "an unknown query id")
-	ctx.Equal(runPost(c, "q1", "ben").Status, 403, "another user's query")
+	ctx.Equal(hRunPost(c, "q1", "").Status, 401, "without X-User-Id the run")
+	ctx.Equal(hRunPost(c, "nope", "ana").Status, 404, "an unknown query id")
+	ctx.Equal(hRunPost(c, "q1", "ben").Status, 403, "another user's query")
 }
 
 func CheckSingleSelect(ctx *harness.Ctx) {
 	bad := []string{
-		runGoodSQL + "; DROP TABLE trips",
+		kHRunGoodSQL + "; DROP TABLE trips",
 		"DELETE FROM trips WHERE datestr = '2026-11-01'",
 		"UPDATE trips SET status = 'void' WHERE datestr = '2026-11-01'",
 		"CREATE TABLE trips_copy AS SELECT trip_uuid FROM trips WHERE datestr = '2026-11-01'",
 	}
 	good := []string{
-		runGoodSQL + ";",
+		kHRunGoodSQL + ";",
 		"select trip_uuid from trips where datestr = '2026-11-01'",
 		"WITH day AS (SELECT '2026-11-01' AS d) SELECT trip_uuid FROM trips WHERE datestr = '2026-11-01'",
 	}
 	for i, sql := range bad {
-		runSeed(ctx, "q"+string(rune('0'+i)), sql, []string{"trips"})
+		hRunSeed(ctx, "q"+string(rune('0'+i)), sql, []string{"trips"})
 	}
 	for i, sql := range good {
-		runSeed(ctx, "ok"+string(rune('0'+i)), sql, []string{"trips"})
+		hRunSeed(ctx, "ok"+string(rune('0'+i)), sql, []string{"trips"})
 	}
-	c := runClient(ctx)
+	c := hRunClient(ctx)
 	for i, sql := range bad {
-		runRefused(ctx, c, "q"+string(rune('0'+i)), sql, "only one SELECT (or WITH) may run, whatever other statement the model wrote")
+		hRunRefused(ctx, c, "q"+string(rune('0'+i)), sql, "only one SELECT (or WITH) may run, whatever other statement the model wrote")
 	}
 	for i, sql := range good {
-		r := runPost(c, "ok"+string(rune('0'+i)), "ana")
+		r := hRunPost(c, "ok"+string(rune('0'+i)), "ana")
 		ctx.Equal(r.Status, 200, "a single read must run: %q (%s)", sql, r.Text())
 	}
 }
 
 func CheckTablesAcked(ctx *harness.Ctx) {
 	join := "SELECT t.trip_uuid, d.rating FROM trips t JOIN drivers d ON t.driver_uuid = d.driver_uuid WHERE t.datestr = '2026-11-01'"
-	runSeed(ctx, "q1", join, []string{"trips"})
-	runSeed(ctx, "q2", join, []string{"trips", "drivers"})
-	runSeed(ctx, "q3", "SELECT trip_uuid FROM TRIPS WHERE datestr = '2026-11-01'", []string{"trips"})
+	hRunSeed(ctx, "q1", join, []string{"trips"})
+	hRunSeed(ctx, "q2", join, []string{"trips", "drivers"})
+	hRunSeed(ctx, "q3", "SELECT trip_uuid FROM TRIPS WHERE datestr = '2026-11-01'", []string{"trips"})
 	queries.Save(context.Background(), queries.Record{QueryID: "q4", User: "ana", Workspace: "mobility", Question: "How many trips yesterday?", Status: "generated", TablesProposed: []string{"trips", "drivers"}, TablesAcked: []string{"trips"}, SQL: join})
-	c := runClient(ctx)
-	runRefused(ctx, c, "q1", join, "drivers was never ACKed")
-	runRefused(ctx, c, "q4", join, "drivers was proposed but the user ACKed only trips")
-	r := runPost(c, "q2", "ana")
+	c := hRunClient(ctx)
+	hRunRefused(ctx, c, "q1", join, "drivers was never ACKed")
+	hRunRefused(ctx, c, "q4", join, "drivers was proposed but the user ACKed only trips")
+	r := hRunPost(c, "q2", "ana")
 	ctx.Equal(r.Status, 200, "with trips and drivers ACKed the join must run (%s)", r.Text())
-	r = runPost(c, "q3", "ana")
+	r = hRunPost(c, "q3", "ana")
 	ctx.Equal(r.Status, 200, "FROM TRIPS names the ACKed table trips (compare case-insensitively) (%s)", r.Text())
 }
 
 func CheckPartitionFilter(ctx *harness.Ctx) {
-	runSeed(ctx, "q1", "SELECT trip_uuid FROM trips WHERE status = 'completed'", []string{"trips"})
-	runSeed(ctx, "q2", "SELECT trip_uuid FROM trips", []string{"trips"})
-	runSeed(ctx, "q3", "SELECT trip_uuid FROM trips WHERE DATESTR >= '2026-10-01'", []string{"trips"})
-	runSeed(ctx, "q4", "SELECT datestr, trip_uuid FROM trips WHERE status = 'completed'", []string{"trips"})
-	c := runClient(ctx)
-	runRefused(ctx, c, "q1", "SELECT trip_uuid FROM trips WHERE status = 'completed'", "a WHERE without datestr scans every partition")
-	runRefused(ctx, c, "q2", "SELECT trip_uuid FROM trips", "no WHERE at all scans every partition")
-	runRefused(ctx, c, "q4", "SELECT datestr, trip_uuid FROM trips WHERE status = 'completed'", "datestr in the select list filters nothing: the WHERE clause must name it")
-	r := runPost(c, "q3", "ana")
+	hRunSeed(ctx, "q1", "SELECT trip_uuid FROM trips WHERE status = 'completed'", []string{"trips"})
+	hRunSeed(ctx, "q2", "SELECT trip_uuid FROM trips", []string{"trips"})
+	hRunSeed(ctx, "q3", "SELECT trip_uuid FROM trips WHERE DATESTR >= '2026-10-01'", []string{"trips"})
+	hRunSeed(ctx, "q4", "SELECT datestr, trip_uuid FROM trips WHERE status = 'completed'", []string{"trips"})
+	c := hRunClient(ctx)
+	hRunRefused(ctx, c, "q1", "SELECT trip_uuid FROM trips WHERE status = 'completed'", "a WHERE without datestr scans every partition")
+	hRunRefused(ctx, c, "q2", "SELECT trip_uuid FROM trips", "no WHERE at all scans every partition")
+	hRunRefused(ctx, c, "q4", "SELECT datestr, trip_uuid FROM trips WHERE status = 'completed'", "datestr in the select list filters nothing: the WHERE clause must name it")
+	r := hRunPost(c, "q3", "ana")
 	ctx.Equal(r.Status, 200, "a datestr range (any case) is a partition filter (%s)", r.Text())
 }
 
 func CheckLimitTimeout(ctx *harness.Ctx) {
-	runSeed(ctx, "q1", runGoodSQL, []string{"trips"})
-	runSeed(ctx, "q2", runGoodSQL+" LIMIT 5000", []string{"trips"})
-	runSeed(ctx, "q3", runGoodSQL+" LIMIT 10", []string{"trips"})
-	runSeed(ctx, "q4", runGoodSQL+" limit 5000;", []string{"trips"})
-	c := runClient(ctx)
-	r := runPost(c, "q1", "ana")
-	sent := runExecuted(ctx)
-	ctx.Assert(len(sent) > 0 && runLimit1000.MatchString(sent[len(sent)-1]), "the warehouse received %v: it must end in LIMIT 1000", sent)
-	ctx.Equal(runBody(ctx, r)["row_count"], float64(1000), "a capped query returns at most 1000 rows; row_count")
+	hRunSeed(ctx, "q1", kHRunGoodSQL, []string{"trips"})
+	hRunSeed(ctx, "q2", kHRunGoodSQL+" LIMIT 5000", []string{"trips"})
+	hRunSeed(ctx, "q3", kHRunGoodSQL+" LIMIT 10", []string{"trips"})
+	hRunSeed(ctx, "q4", kHRunGoodSQL+" limit 5000;", []string{"trips"})
+	c := hRunClient(ctx)
+	r := hRunPost(c, "q1", "ana")
+	sent := hRunExecuted(ctx)
+	ctx.Assert(len(sent) > 0 && hRunLimit1000.MatchString(sent[len(sent)-1]), "the warehouse received %v: it must end in LIMIT 1000", sent)
+	ctx.Equal(hRunBody(ctx, r)["row_count"], float64(1000), "a capped query returns at most 1000 rows; row_count")
 	calls := ctx.GRPC.CallsTo("Execute", "")
 	last := calls[len(calls)-1]
 	ctx.Assert(last.HasDeadline() && 59*time.Second <= last.Timeout && last.Timeout <= 61*time.Second, "the Execute call must carry a 60 s statement timeout, got %v", last.Timeout)
-	runPost(c, "q2", "ana")
-	sent = runExecuted(ctx)
-	ctx.Assert(runLimit1000.MatchString(sent[len(sent)-1]) && !strings.Contains(sent[len(sent)-1], "5000"), "a LIMIT 5000 must be lowered to 1000, the warehouse received %q", sent[len(sent)-1])
-	r = runPost(c, "q3", "ana")
-	ctx.Equal(runBody(ctx, r)["row_count"], float64(10), "a LIMIT 10 under the cap stays; row_count")
-	r = runPost(c, "q4", "ana")
-	sent = runExecuted(ctx)
-	ctx.Assert(runLimit1000.MatchString(sent[len(sent)-1]) && !strings.Contains(sent[len(sent)-1], "5000"), "a lower-case limit 5000 before a trailing semicolon must be lowered to 1000 too, the warehouse received %q", sent[len(sent)-1])
-	ctx.Equal(runBody(ctx, r)["row_count"], float64(1000), "a limit 5000 capped at 1000 returns 1000 rows; row_count")
+	hRunPost(c, "q2", "ana")
+	sent = hRunExecuted(ctx)
+	ctx.Assert(hRunLimit1000.MatchString(sent[len(sent)-1]) && !strings.Contains(sent[len(sent)-1], "5000"), "a LIMIT 5000 must be lowered to 1000, the warehouse received %q", sent[len(sent)-1])
+	r = hRunPost(c, "q3", "ana")
+	ctx.Equal(hRunBody(ctx, r)["row_count"], float64(10), "a LIMIT 10 under the cap stays; row_count")
+	r = hRunPost(c, "q4", "ana")
+	sent = hRunExecuted(ctx)
+	ctx.Assert(hRunLimit1000.MatchString(sent[len(sent)-1]) && !strings.Contains(sent[len(sent)-1], "5000"), "a lower-case limit 5000 before a trailing semicolon must be lowered to 1000 too, the warehouse received %q", sent[len(sent)-1])
+	ctx.Equal(hRunBody(ctx, r)["row_count"], float64(1000), "a limit 5000 capped at 1000 returns 1000 rows; row_count")
 	ctx.GRPC.SetLatency("Execute", 90, config.Warehouse)
 	started := ctx.Clock.Now()
-	r = runPost(c, "q1", "ana")
+	r = hRunPost(c, "q1", "ana")
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Equal(r.Status, 504, "a statement past the timeout")
 	ctx.Assert(waited <= 61, "the run waited %.0f s on a 90 s statement: the timeout must end it at 60 s", waited)
 }
 
 func CheckRunSignals(ctx *harness.Ctx) {
-	runSeed(ctx, "q1", runGoodSQL+" AND status = 'Finished'", []string{"trips"})
-	runSeed(ctx, "q2", runGoodSQL, []string{"trips"})
-	c := runClient(ctx)
-	r := runPost(c, "q1", "ana")
+	hRunSeed(ctx, "q1", kHRunGoodSQL+" AND status = 'Finished'", []string{"trips"})
+	hRunSeed(ctx, "q2", kHRunGoodSQL, []string{"trips"})
+	c := hRunClient(ctx)
+	r := hRunPost(c, "q1", "ana")
 	ctx.Equal(r.Status, 200, "a query whose filter matches nothing still runs (%s)", r.Text())
-	body := runBody(ctx, r)
+	body := hRunBody(ctx, r)
 	ctx.Assert(body["row_count"] == float64(0) && body["has_output"] == false, "no rows: has_output must be false, got %v with row_count %v", body["has_output"], body["row_count"])
-	stored := runStored(ctx, "q1")
+	stored := hRunStored(ctx, "q1")
 	ctx.Assert(stored["status"] == "ran" && stored["run_ok"] == true && stored["has_output"] == false, "the record must say ran, run_ok true, has_output false: %v", stored)
-	r = runPost(c, "q2", "ana")
-	ctx.Equal(runBody(ctx, r)["has_output"], true, "rows came back; has_output")
-	ctx.Equal(runStored(ctx, "q2")["has_output"], true, "the record must keep has_output true")
+	r = hRunPost(c, "q2", "ana")
+	ctx.Equal(hRunBody(ctx, r)["has_output"], true, "rows came back; has_output")
+	ctx.Equal(hRunStored(ctx, "q2")["has_output"], true, "the record must keep has_output true")
 }
 `,
     cpp: `#include <leetbuild/harness.h>

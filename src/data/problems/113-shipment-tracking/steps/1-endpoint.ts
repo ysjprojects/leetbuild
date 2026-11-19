@@ -983,7 +983,7 @@ using json = nlohmann::json;
 
 namespace {
 
-const json kBody = {{"order_id", "ord_8123"}, {"carrier", "ups"}, {"service_level", "ground"}};
+const json kHBody = {{"order_id", "ord_8123"}, {"carrier", "ups"}, {"service_level", "ground"}};
 
 harness::HTTP h_api(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
@@ -994,7 +994,7 @@ harness::HTTP h_api(harness::Ctx& ctx) {
 }
 
 json h_with(const std::string& field, const std::string& value) {
-  json out = kBody;
+  json out = kHBody;
   out[field] = value;
   return out;
 }
@@ -1022,7 +1022,7 @@ std::string h_replacement_of(const harness::Response& r) {
 
 void CheckRoute(harness::Ctx& ctx) {
   auto c = h_api(ctx);
-  const auto r = h_create(c, "k-1", kBody, "t-acme");
+  const auto r = h_create(c, "k-1", kHBody, "t-acme");
   const std::string shipment_id = h_created(ctx, r, "POST /v1/shipments");
   const json got = json::parse(r.Text());
   ctx.Assert(got.value("status", "") == "label" && got.value("order_id", "") == "ord_8123", "a new shipment must answer status label for ord_8123, got %s", r.Text());
@@ -1033,7 +1033,7 @@ void CheckRoute(harness::Ctx& ctx) {
 
 void CheckValidate(harness::Ctx& ctx) {
   auto c = h_api(ctx);
-  auto r = c.Post("/v1/shipments", kBody.dump(), "Content-Type", "application/json", "Idempotency-Key", "k-1");
+  auto r = c.Post("/v1/shipments", kHBody.dump(), "Content-Type", "application/json", "Idempotency-Key", "k-1");
   ctx.Equal(r.Status, 401, "a create without X-Tenant-Id; the status");
   r = h_create(c, "k-2", h_with("carrier", "upss"), "t-acme");
   ctx.Equal(r.Status, 422, "a create for carrier 'upss' (no partner has it) must be refused; ask registry::lookup; the status");
@@ -1054,8 +1054,8 @@ void CheckValidate(harness::Ctx& ctx) {
 
 void CheckSingleActive(harness::Ctx& ctx) {
   auto c = h_api(ctx);
-  const std::string first_id = h_created(ctx, h_create(c, "k-1", kBody, "t-acme"), "the first create");
-  const auto second = h_create(c, "k-2", kBody, "t-acme");
+  const std::string first_id = h_created(ctx, h_create(c, "k-1", kHBody, "t-acme"), "the first create");
+  const auto second = h_create(c, "k-2", kHBody, "t-acme");
   ctx.Equal(second.Status, 409, "a second shipment for ord_8123 while %s is live (%s); the status", first_id, second.Text());
   const json conflict = json::parse(second.Text(), nullptr, false);
   ctx.Assert(conflict.is_object() && conflict.value("error", "") == "active_shipment_exists" && conflict.value("shipment_id", "") == first_id,
@@ -1063,45 +1063,45 @@ void CheckSingleActive(harness::Ctx& ctx) {
   ctx.Equal(ctx.Redis.LRange("order:t-acme:ord_8123", 0, -1), {first_id}, "the refused create must save nothing; the order's shipments");
   for (const std::string live : {"in_transit", "out_for_delivery"}) {
     store::setStatus(first_id, live, 100);
-    const auto again = h_create(c, "k-" + live, kBody, "t-acme");
+    const auto again = h_create(c, "k-" + live, kHBody, "t-acme");
     const json named = json::parse(again.Text(), nullptr, false);
     ctx.Assert(again.Status == 409 && named.is_object() && named.value("shipment_id", "") == first_id,
                "a create while %s is %s (still live) answered %d %s, expected 409 naming it", first_id, live, again.Status, again.Text());
   }
   store::setStatus(first_id, "delivered", 100);
-  const auto third = h_create(c, "k-3", kBody, "t-acme");
+  const auto third = h_create(c, "k-3", kHBody, "t-acme");
   const std::string third_id = h_created(ctx, third, "a create after the order's shipment was delivered (no longer live)");
   ctx.Equal(h_replacement_of(third), "", "a create after a delivered shipment replaces nothing (replacement_of is only for a cancelled one); replacement_of");
   store::setStatus(third_id, "returned", 200);
-  const auto fourth = h_create(c, "k-4", kBody, "t-acme");
+  const auto fourth = h_create(c, "k-4", kHBody, "t-acme");
   h_created(ctx, fourth, "a create after the order's shipment was returned (no longer live)");
   ctx.Equal(h_replacement_of(fourth), "", "a create after a returned shipment replaces nothing; replacement_of");
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
   auto c = h_api(ctx);
-  const auto first = h_create(c, "k-1", kBody, "t-acme");
+  const auto first = h_create(c, "k-1", kHBody, "t-acme");
   const std::string first_id = h_created(ctx, first, "the first create");
-  const auto replay = h_create(c, "k-1", kBody, "t-acme");
+  const auto replay = h_create(c, "k-1", kHBody, "t-acme");
   ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1 must answer the recorded shipment (%s); the status", replay.Text());
   ctx.Equal(json::parse(replay.Text()), json::parse(first.Text()), "the replay must answer the recorded shipment");
-  const auto missing = c.Post("/v1/shipments", kBody.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t-acme");
+  const auto missing = c.Post("/v1/shipments", kHBody.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t-acme");
   ctx.Equal(missing.Status, 400, "a create without Idempotency-Key; the status");
   ctx.Equal(ctx.Redis.LRange("order:t-acme:ord_8123", 0, -1), {first_id}, "one create and its replay; the order's shipments");
   store::setStatus(first_id, "delivered", 100);
-  const auto late = h_create(c, "k-1", kBody, "t-acme");
+  const auto late = h_create(c, "k-1", kHBody, "t-acme");
   ctx.Equal(late.Status, 200, "a replay of k-1 after %s was delivered must answer the recorded shipment: the key is looked up before anything else (%s); the status", first_id, late.Text());
   ctx.Equal(json::parse(late.Text(), nullptr, false), json::parse(first.Text()), "a replay of k-1 after delivery must answer the recorded shipment");
   ctx.Equal(ctx.Redis.LRange("order:t-acme:ord_8123", 0, -1), {first_id}, "a replay after delivery must save nothing; the order's shipments");
-  const std::string other_id = h_created(ctx, h_create(c, "k-1", kBody, "t-globex"), "another tenant's create with the same key");
+  const std::string other_id = h_created(ctx, h_create(c, "k-1", kHBody, "t-globex"), "another tenant's create with the same key");
   ctx.Assert(other_id != first_id, "another tenant's key k-1 answered t-acme's shipment: keys are scoped by tenant");
 }
 
 void CheckReplacement(harness::Ctx& ctx) {
   auto c = h_api(ctx);
-  const std::string first_id = h_created(ctx, h_create(c, "k-1", kBody, "t-acme"), "the first create");
+  const std::string first_id = h_created(ctx, h_create(c, "k-1", kHBody, "t-acme"), "the first create");
   store::setStatus(first_id, "cancelled", 100);
-  const auto second = h_create(c, "k-2", kBody, "t-acme");
+  const auto second = h_create(c, "k-2", kHBody, "t-acme");
   const std::string second_id = h_created(ctx, second, "a create after the order's shipment was cancelled");
   ctx.Assert(second_id != first_id, "the replacement reused the cancelled id %s: the carrier's scans for the voided label would land on it", first_id);
   ctx.Equal(h_replacement_of(second), first_id, "the replacement must name the cancelled shipment; replacement_of");

@@ -1053,22 +1053,22 @@ import (
 	"leetbuild/harness"
 )
 
-const clientName = "payments-db"
+const kHClientName = "payments-db"
 
 var (
-	clientBg    = context.Background()
-	clientFleet = []string{"billing", "checkout", "ledger"}
+	hClientBg    = context.Background()
+	hClientFleet = []string{"billing", "checkout", "ledger"}
 )
 
 // consumerPeer can read every version but those after the one it is on (holds); a non-nil answer fixes its reply.
-type consumerPeer struct {
+type HConsumerPeer struct {
 	pb.UnimplementedSecretConsumerServer
 	id     string
 	holds  string
 	answer *pb.CanReadReply
 }
 
-func (p *consumerPeer) CanReadVersion(_ context.Context, req *pb.CanReadRequest) (*pb.CanReadReply, error) {
+func (p *HConsumerPeer) CanReadVersion(_ context.Context, req *pb.CanReadRequest) (*pb.CanReadReply, error) {
 	if p.answer != nil {
 		return p.answer, nil
 	}
@@ -1080,32 +1080,32 @@ func (p *consumerPeer) CanReadVersion(_ context.Context, req *pb.CanReadRequest)
 	return &pb.CanReadReply{ConsumerId: p.id, VersionId: version, CanRead: can}, nil
 }
 
-func clientServe(ctx *harness.Ctx, id, holds string) {
-	pb.RegisterSecretConsumerServer(ctx.GRPC.Server(id+":9000"), &consumerPeer{id: id, holds: holds})
+func hClientServe(ctx *harness.Ctx, id, holds string) {
+	pb.RegisterSecretConsumerServer(ctx.GRPC.Server(id+":9000"), &HConsumerPeer{id: id, holds: holds})
 }
 
-func clientSetup(ctx *harness.Ctx, name string, up []string, lagging string) {
-	vault.CreateVersion(clientBg, name, "material-one", 3600, "op-ana")
-	vault.CreateVersion(clientBg, name, "material-two", 3600, "op-ana")
-	rotation.Activate(clientBg, name, "v1")
-	rotation.Activate(clientBg, name, "v2")
+func hClientSetup(ctx *harness.Ctx, name string, up []string, lagging string) {
+	vault.CreateVersion(hClientBg, name, "material-one", 3600, "op-ana")
+	vault.CreateVersion(hClientBg, name, "material-two", 3600, "op-ana")
+	rotation.Activate(hClientBg, name, "v1")
+	rotation.Activate(hClientBg, name, "v2")
 	if up == nil {
 		return
 	}
-	for _, id := range clientFleet {
-		vault.RegisterConsumer(clientBg, name, id)
+	for _, id := range hClientFleet {
+		vault.RegisterConsumer(hClientBg, name, id)
 	}
 	for _, id := range up {
 		holds := "v2"
 		if id == lagging {
 			holds = "v1"
 		}
-		clientServe(ctx, id, holds)
+		hClientServe(ctx, id, holds)
 	}
 }
 
-func clientReports(ctx *harness.Ctx) map[string]Report {
-	reports, err := verifyConsumers(clientBg, clientName, "v2")
+func hClientReports(ctx *harness.Ctx) map[string]Report {
+	reports, err := verifyConsumers(hClientBg, kHClientName, "v2")
 	ctx.NoError(err, "verifyConsumers failed")
 	out := map[string]Report{}
 	for _, r := range reports {
@@ -1114,21 +1114,21 @@ func clientReports(ctx *harness.Ctx) map[string]Report {
 	return out
 }
 
-func clientValid(ctx *harness.Ctx, name string) []string {
-	valid, err := rotation.ValidVersions(clientBg, name)
+func hClientValid(ctx *harness.Ctx, name string) []string {
+	valid, err := rotation.ValidVersions(hClientBg, name)
 	ctx.NoError(err, "ValidVersions failed")
 	return valid
 }
 
 func CheckVerifyDeadline(ctx *harness.Ctx) {
-	clientSetup(ctx, clientName, clientFleet, "")
-	reports := clientReports(ctx)
+	hClientSetup(ctx, kHClientName, hClientFleet, "")
+	reports := hClientReports(ctx)
 	ids := []string{}
 	for id := range reports {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	ctx.Equal(ids, clientFleet, "verifyConsumers must answer one report per registered consumer")
+	ctx.Equal(ids, hClientFleet, "verifyConsumers must answer one report per registered consumer")
 	calls := ctx.GRPC.CallsTo("CanReadVersion", "")
 	ctx.Assert(len(calls) > 0, "no CanReadVersion call was made")
 	for _, call := range calls {
@@ -1139,7 +1139,7 @@ func CheckVerifyDeadline(ctx *harness.Ctx) {
 	ctx.GRPC.SetLatency("CanReadVersion", 1.5, "billing:9000")
 	ctx.GRPC.SetLatency("CanReadVersion", 30.0, "ledger:9000")
 	before := len(calls)
-	reports = clientReports(ctx)
+	reports = hClientReports(ctx)
 	ctx.Equal(reports["ledger"].Verified, false, "a consumer that takes 30 s to answer must be reported unverified after the deadline (%+v); verified", reports["ledger"])
 	ctx.Assert(reports["billing"].Verified && reports["checkout"].Verified, "the healthy consumers must still verify (billing answers in 1.5 s, inside its deadline), got %+v", reports)
 	later := ctx.GRPC.CallsTo("CanReadVersion", "")[before:]
@@ -1150,58 +1150,58 @@ func CheckVerifyDeadline(ctx *harness.Ctx) {
 }
 
 func CheckReplyMustMatch(ctx *harness.Ctx) {
-	clientSetup(ctx, clientName, clientFleet, "ledger")
+	hClientSetup(ctx, kHClientName, hClientFleet, "ledger")
 	// audit says yes, but for the version it holds; search names v2 but says it cannot read it.
-	for _, peer := range []*consumerPeer{
+	for _, peer := range []*HConsumerPeer{
 		{id: "audit", answer: &pb.CanReadReply{ConsumerId: "audit", VersionId: "v1", CanRead: true}},
 		{id: "search", answer: &pb.CanReadReply{ConsumerId: "search", VersionId: "v2", CanRead: false}},
 	} {
-		vault.RegisterConsumer(clientBg, clientName, peer.id)
+		vault.RegisterConsumer(hClientBg, kHClientName, peer.id)
 		pb.RegisterSecretConsumerServer(ctx.GRPC.Server(peer.id+":9000"), peer)
 	}
-	reports := clientReports(ctx)
+	reports := hClientReports(ctx)
 	ctx.Equal(reports["ledger"].Verified, false, "ledger answered can_read=false (it still runs on v1) and was reported %+v: only a yes for exactly v2 is a verification; verified", reports["ledger"])
 	audit, ok := reports["audit"]
 	ctx.Assert(ok && !audit.Verified, "audit answered can_read=true for version_id v1 and was reported %+v: only a yes for exactly v2 is a verification", audit)
 	search, ok := reports["search"]
 	ctx.Assert(ok && !search.Verified, "search answered version_id v2 with can_read=false and was reported %+v: only a yes for exactly v2 is a verification", search)
 	ctx.Assert(reports["billing"].Verified && reports["checkout"].Verified, "billing and checkout can read v2 and must verify, got %+v", reports)
-	ctx.Equal(vault.Accepted(clientBg, clientName, "v2"), []string{"billing", "checkout"}, "the consumers the vault records as having accepted v2")
+	ctx.Equal(vault.Accepted(hClientBg, kHClientName, "v2"), []string{"billing", "checkout"}, "the consumers the vault records as having accepted v2")
 }
 
 func CheckOneCallPerConsumer(ctx *harness.Ctx) {
-	clientSetup(ctx, clientName, []string{"billing", "checkout"}, "")
-	reports := clientReports(ctx)
+	hClientSetup(ctx, kHClientName, []string{"billing", "checkout"}, "")
+	reports := hClientReports(ctx)
 	ledger, ok := reports["ledger"]
 	ctx.Assert(ok && !ledger.Verified, "ledger is down (UNAVAILABLE) and must be reported unverified, got %+v", ledger)
 	ctx.Assert(strings.Contains(strings.ToLower(ledger.Detail), "unavailable"), "ledger's report must carry the call's status (Unavailable) as its detail, got %+v", ledger)
-	for _, id := range clientFleet {
+	for _, id := range hClientFleet {
 		made := len(ctx.GRPC.CallsTo("CanReadVersion", id+":9000"))
 		ctx.Equal(made, 1, "%s was called more than once for one verification: one down consumer made the gate ask the whole fleet again. Make one call per consumer and report the failure; its calls", id)
 	}
 }
 
 func CheckRetireGate(ctx *harness.Ctx) {
-	clientSetup(ctx, clientName, []string{"billing", "checkout"}, "")
-	blocked, err := retire(clientBg, clientName, "v1", "v2")
+	hClientSetup(ctx, kHClientName, []string{"billing", "checkout"}, "")
+	blocked, err := retire(hClientBg, kHClientName, "v1", "v2")
 	ctx.NoError(err, "retire failed")
 	ctx.Equal(blocked.Retired, false, "with ledger down an unverified consumer blocks retirement; retired")
 	ctx.Equal(blocked.BlockedBy, []string{"ledger"}, "blocked_by must name ledger")
-	ctx.Equal(clientValid(ctx, clientName), []string{"v2", "v1"}, "a blocked retirement must leave v1 valid; ValidVersions")
-	alerts := vault.Alerts(clientBg, clientName)
+	ctx.Equal(hClientValid(ctx, kHClientName), []string{"v2", "v1"}, "a blocked retirement must leave v1 valid; ValidVersions")
+	alerts := vault.Alerts(hClientBg, kHClientName)
 	ctx.Assert(len(alerts) == 1 && alerts[0].VersionID == "v2" && len(alerts[0].Pending) == 1 && alerts[0].Pending[0] == "ledger", "a blocked retirement must page with the pending consumers (vault.RaiseAlert), the alerts are %+v", alerts)
-	clientServe(ctx, "ledger", "v2")
-	done, err := retire(clientBg, clientName, "v1", "v2")
+	hClientServe(ctx, "ledger", "v2")
+	done, err := retire(hClientBg, kHClientName, "v1", "v2")
 	ctx.NoError(err, "retire failed")
 	ctx.Equal(done.Retired, true, "with every consumer verified; retired")
-	ctx.Equal(clientValid(ctx, clientName), []string{"v2"}, "after the retirement; ValidVersions")
-	ctx.Assert(vault.GetVersion(clientBg, clientName, "v1").RetiredAt != 0, "the retirement must be recorded on v1 (vault.RecordRetirement)")
-	ctx.Equal(len(vault.Alerts(clientBg, clientName)), 1, "a retirement every consumer verified must not page; the alerts")
-	clientSetup(ctx, "orphan", nil, "")
-	empty, err := retire(clientBg, "orphan", "v1", "v2")
+	ctx.Equal(hClientValid(ctx, kHClientName), []string{"v2"}, "after the retirement; ValidVersions")
+	ctx.Assert(vault.GetVersion(hClientBg, kHClientName, "v1").RetiredAt != 0, "the retirement must be recorded on v1 (vault.RecordRetirement)")
+	ctx.Equal(len(vault.Alerts(hClientBg, kHClientName)), 1, "a retirement every consumer verified must not page; the alerts")
+	hClientSetup(ctx, "orphan", nil, "")
+	empty, err := retire(hClientBg, "orphan", "v1", "v2")
 	ctx.NoError(err, "retire failed")
 	ctx.Equal(empty.Retired, false, "a secret with no registered consumers retired its old version: nobody verified is not everybody verified; retired")
-	ctx.Equal(len(vault.Alerts(clientBg, "orphan")), 1, "a retirement blocked by an empty registry must page; the alerts")
+	ctx.Equal(len(vault.Alerts(hClientBg, "orphan")), 1, "a retirement blocked by an empty registry must page; the alerts")
 }
 `,
     cpp: `#include <leetbuild/harness.h>

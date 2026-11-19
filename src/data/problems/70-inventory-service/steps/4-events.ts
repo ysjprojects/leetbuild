@@ -771,31 +771,31 @@ import (
 	"inventory/store"
 )
 
-const eventsTopic = "inventory.event"
+const kHEventsTopic = "inventory.event"
 
-func eventsReservation(n int, sku string) *store.Reservation {
+func hEventsReservation(n int, sku string) *store.Reservation {
 	return &store.Reservation{
 		ReservationID: fmt.Sprintf("r-%d", n), Tenant: "t1", IdempotencyKey: fmt.Sprintf("k-%d", n),
 		SKU: sku, Quantity: 3, Status: "reserved",
 	}
 }
 
-func eventsPublish(ctx *harness.Ctx, r *store.Reservation, reason string) bool {
+func hEventsPublish(ctx *harness.Ctx, r *store.Reservation, reason string) bool {
 	ok, err := publishMovement(context.Background(), r, reason)
 	ctx.NoError(err, "publishMovement")
 	return ok
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	var rows []HEventsRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -803,22 +803,22 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckSkuKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsReservation(1, "sku-1"), "reserved")
-	eventsPublish(ctx, eventsReservation(2, "sku-2"), "reserved")
-	eventsPublish(ctx, eventsReservation(3, "sku-1"), "reserved")
+	hEventsPublish(ctx, hEventsReservation(1, "sku-1"), "reserved")
+	hEventsPublish(ctx, hEventsReservation(2, "sku-2"), "reserved")
+	hEventsPublish(ctx, hEventsReservation(3, "sku-1"), "reserved")
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three publishMovement calls must produce three records on inventory.event; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"sku-1", "sku-2", "sku-1"}, "the records must be keyed by the skus")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"sku-1", "sku-2", "sku-1"}, "the records must be keyed by the skus")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both sku-1 movements must land on one partition, or the ledger folds one sku's deltas out of order; the partitions")
 }
 
 func CheckSignedDelta(ctx *harness.Ctx) {
 	for _, reason := range []string{"reserved", "released", "confirmed"} {
-		eventsPublish(ctx, eventsReservation(1, "sku-1"), reason)
+		hEventsPublish(ctx, hEventsReservation(1, "sku-1"), reason)
 	}
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 3, "three publishMovement calls must produce three records; the records")
 	var deltas []float64
 	for i, text := range values {
@@ -834,34 +834,34 @@ func CheckSignedDelta(ctx *harness.Ctx) {
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, eventsReservation(1, "sku-1"), "reserved")
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish(ctx, hEventsReservation(1, "sku-1"), "reserved")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the movement twice (enable.idempotence); the records")
-	eventsPublish(ctx, eventsReservation(2, "sku-1"), "reserved")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the movement twice (enable.idempotence); the records")
+	hEventsPublish(ctx, hEventsReservation(2, "sku-1"), "reserved")
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ok := eventsPublish(ctx, eventsReservation(0, "sku-1"), "reserved")
+	ok := hEventsPublish(ctx, hEventsReservation(0, "sku-1"), "reserved")
 	ctx.Settle()
 	ctx.Equal(ok, true, "publishMovement's result for a movement the broker acknowledged")
-	ctx.Equal(len(eventsOutbox(ctx)), 0, "outbox rows left by a movement the broker acknowledged (the relay would publish it twice)")
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok = eventsPublish(ctx, eventsReservation(1, "sku-1"), "reserved")
+	ctx.Equal(len(hEventsOutbox(ctx)), 0, "outbox rows left by a movement the broker acknowledged (the relay would publish it twice)")
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok = hEventsPublish(ctx, hEventsReservation(1, "sku-1"), "reserved")
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the ledger never learns these units moved; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "sku-1" && rows[0].Payload["reservation_id"] == "r-1" && rows[0].Payload["reason"] == "reserved" && rows[0].Payload["delta"] == float64(-3), "the outbox row is %v, expected the topic, the key sku-1 and the movement's payload", rows[0])
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == "sku-1" && rows[0].Payload["reservation_id"] == "r-1" && rows[0].Payload["reason"] == "reserved" && rows[0].Payload["delta"] == float64(-3), "the outbox row is %v, expected the topic, the key sku-1 and the movement's payload", rows[0])
 	ctx.Equal(ok, false, "publishMovement's result after a failed delivery")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsPublish(ctx, eventsReservation(2, "sku-1"), "reserved")
+	ok = hEventsPublish(ctx, hEventsReservation(2, "sku-1"), "reserved")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishMovement waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["reservation_id"] == "r-2", "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishMovement's result without a delivery report")
 }
@@ -877,13 +877,13 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "inventory.event";
+const std::string kHEventsTopic = "inventory.event";
 
-inventory::Reservation eventsReservation(int n, const std::string& sku = "sku-1") {
+inventory::Reservation hEventsReservation(int n, const std::string& sku = "sku-1") {
   return inventory::Reservation{"r-" + std::to_string(n), "t1", "k-" + std::to_string(n), sku, 3, "reserved", 0};
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -893,35 +893,35 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
+std::string hEventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckSkuKey(harness::Ctx& ctx) {
-  publishMovement(eventsReservation(1, "sku-1"), "reserved");
-  publishMovement(eventsReservation(2, "sku-2"), "reserved");
-  publishMovement(eventsReservation(3, "sku-1"), "reserved");
+  publishMovement(hEventsReservation(1, "sku-1"), "reserved");
+  publishMovement(hEventsReservation(2, "sku-2"), "reserved");
+  publishMovement(hEventsReservation(3, "sku-1"), "reserved");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three publishMovement calls must produce three records on inventory.event; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"sku-1", "sku-2", "sku-1"}, "the records must be keyed by the skus");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"sku-1", "sku-2", "sku-1"}, "the records must be keyed by the skus");
   ctx.Equal(records[0].Partition, records[2].Partition,
             "both sku-1 movements must land on one partition, or the ledger folds one sku's deltas out of order; the partitions");
 }
 
 void CheckSignedDelta(harness::Ctx& ctx) {
-  for (const std::string reason : {"reserved", "released", "confirmed"}) publishMovement(eventsReservation(1), reason);
+  for (const std::string reason : {"reserved", "released", "confirmed"}) publishMovement(hEventsReservation(1), reason);
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 3, "three publishMovement calls must produce three records; the records");
   std::vector<long long> deltas;
   for (size_t i = 0; i < values.size(); i++) {
     const auto value = nlohmann::json::parse(values[i], nullptr, false);
     if (i == 0) {
-      ctx.Assert(eventsField(value, "sku") == "sku-1" && eventsField(value, "reservation_id") == "r-1" &&
-                     eventsField(value, "reason") == "reserved" && value.value("quantity", 0) == 3,
+      ctx.Assert(hEventsField(value, "sku") == "sku-1" && hEventsField(value, "reservation_id") == "r-1" &&
+                     hEventsField(value, "reason") == "reserved" && value.value("quantity", 0) == 3,
                  "the payload is %s, expected sku, reservation_id, reason and quantity", values[i]);
     }
     deltas.push_back(value.is_object() ? value.value("delta", 99LL) : 99LL);
@@ -930,41 +930,41 @@ void CheckSignedDelta(harness::Ctx& ctx) {
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishMovement(eventsReservation(1), "reserved");
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishMovement(hEventsReservation(1), "reserved");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1,
             "after one lost acknowledgement the producer's retry must not write the movement twice (enable.idempotence); the records");
-  publishMovement(eventsReservation(2), "reserved");
+  publishMovement(hEventsReservation(2), "reserved");
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2,
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2,
             "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  bool ok = publishMovement(eventsReservation(0), "reserved");
+  bool ok = publishMovement(hEventsReservation(0), "reserved");
   ctx.Settle();
   ctx.Equal(ok, true, "publishMovement's result for a movement the broker acknowledged");
-  ctx.Equal(eventsOutbox(ctx).size(), 0, "outbox rows left by a movement the broker acknowledged (the relay would publish it twice)");
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  ok = publishMovement(eventsReservation(1), "reserved");
+  ctx.Equal(hEventsOutbox(ctx).size(), 0, "outbox rows left by a movement the broker acknowledged (the relay would publish it twice)");
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  ok = publishMovement(hEventsReservation(1), "reserved");
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the ledger never learns these units moved; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "sku-1" &&
-                 rows[0].contains("payload") && eventsField(rows[0]["payload"], "reservation_id") == "r-1" &&
-                 eventsField(rows[0]["payload"], "reason") == "reserved" && rows[0]["payload"].is_object() &&
+  ctx.Assert(hEventsField(rows[0], "topic") == kHEventsTopic && hEventsField(rows[0], "key") == "sku-1" &&
+                 rows[0].contains("payload") && hEventsField(rows[0]["payload"], "reservation_id") == "r-1" &&
+                 hEventsField(rows[0]["payload"], "reason") == "reserved" && rows[0]["payload"].is_object() &&
                  rows[0]["payload"].value("delta", 99LL) == -3,
              "the outbox row is %s, expected the topic, the key sku-1 and the movement's payload", rows[0].dump());
   ctx.Equal(ok, false, "publishMovement's result after a failed delivery");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publishMovement(eventsReservation(2), "reserved");
+  ok = publishMovement(hEventsReservation(2), "reserved");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publishMovement waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "reservation_id") == "r-2",
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hEventsField(rows[1]["payload"], "reservation_id") == "r-2",
              "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishMovement's result without a delivery report");
 }

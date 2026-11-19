@@ -923,13 +923,13 @@ import (
 	"fleet/position"
 )
 
-// apiState stands in for step 4's recordPosition: the latest (ts, seq) per vehicle, applied when newer.
-type apiState struct {
+// HApiState stands in for step 4's recordPosition: the latest (ts, seq) per vehicle, applied when newer.
+type HApiState struct {
 	latest map[string][2]int64
 }
 
-func newAPI(ctx *harness.Ctx) (*harness.HTTP, *apiState) {
-	s := &apiState{latest: map[string][2]int64{}}
+func hNewAPI(ctx *harness.Ctx) (*harness.HTTP, *HApiState) {
+	s := &HApiState{latest: map[string][2]int64{}}
 	recordPosition = func(_ context.Context, vehicleID string, p position.Position) (bool, error) {
 		cur, ok := s.latest[vehicleID]
 		if ok && (p.DeviceTimestampMs < cur[0] || (p.DeviceTimestampMs == cur[0] && p.Sequence <= cur[1])) {
@@ -944,7 +944,7 @@ func newAPI(ctx *harness.Ctx) (*harness.HTTP, *apiState) {
 }
 
 // written is the vehicles with a latest record, sorted.
-func (s *apiState) written() []string {
+func (s *HApiState) written() []string {
 	out := make([]string, 0, len(s.latest))
 	for id := range s.latest {
 		out = append(out, id)
@@ -953,7 +953,7 @@ func (s *apiState) written() []string {
 	return out
 }
 
-func apiUpdate(vehicleID string, ts, seq int64, latLon ...float64) map[string]any {
+func hApiUpdate(vehicleID string, ts, seq int64, latLon ...float64) map[string]any {
 	lat, lon := 47.6, -122.3
 	if len(latLon) > 0 {
 		lat = latLon[0]
@@ -964,13 +964,13 @@ func apiUpdate(vehicleID string, ts, seq int64, latLon ...float64) map[string]an
 	return map[string]any{"vehicle_id": vehicleID, "device_timestamp_ms": ts, "sequence": seq, "lat": lat, "lon": lon}
 }
 
-func apiBatch(updates ...map[string]any) map[string]any {
+func hApiBatch(updates ...map[string]any) map[string]any {
 	return map[string]any{"batch_id": "b-1", "updates": updates}
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c, s := newAPI(ctx)
-	r := c.Post("/v1/vehicles/positions", apiBatch(apiUpdate("v-1", ctx.Clock.Now(), 42)), "X-Tenant-Id", "t-1")
+	c, s := hNewAPI(ctx)
+	r := c.Post("/v1/vehicles/positions", hApiBatch(hApiUpdate("v-1", ctx.Clock.Now(), 42)), "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 200, "POST /v1/vehicles/positions with a valid batch (%s)", r.Text())
 	ctype := r.Header.Get("Content-Type")
 	ctx.Assert(strings.HasPrefix(ctype, "application/json"), "the answer must be JSON, got Content-Type %q", ctype)
@@ -979,24 +979,24 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckTenant(ctx *harness.Ctx) {
-	c, s := newAPI(ctx)
-	r := c.Post("/v1/vehicles/positions", apiBatch(apiUpdate("v-1", ctx.Clock.Now(), 1)))
+	c, s := hNewAPI(ctx)
+	r := c.Post("/v1/vehicles/positions", hApiBatch(hApiUpdate("v-1", ctx.Clock.Now(), 1)))
 	ctx.Equal(r.Status, 401, "a batch without X-Tenant-Id")
 	ctx.Equal(s.written(), []string{}, "a batch without a tenant recorded vehicles: nothing may be recorded for nobody; the vehicles written")
-	r = c.Post("/v1/vehicles/positions", apiBatch(apiUpdate("v-1", ctx.Clock.Now(), 1)), "X-Tenant-Id", "")
+	r = c.Post("/v1/vehicles/positions", hApiBatch(hApiUpdate("v-1", ctx.Clock.Now(), 1)), "X-Tenant-Id", "")
 	ctx.Equal(r.Status, 401, "a batch with an empty X-Tenant-Id")
-	r = c.Post("/v1/vehicles/positions", apiBatch(apiUpdate("v-1", ctx.Clock.Now(), 1)), "X-Tenant-Id", "t-1")
+	r = c.Post("/v1/vehicles/positions", hApiBatch(hApiUpdate("v-1", ctx.Clock.Now(), 1)), "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 200, "with a tenant the same batch (%s)", r.Text())
 }
 
 func CheckValidateFirst(ctx *harness.Ctx) {
-	c, s := newAPI(ctx)
+	c, s := hNewAPI(ctx)
 	now := ctx.Clock.Now()
-	r := c.Post("/v1/vehicles/positions", apiBatch(apiUpdate("v-1", now, 1), apiUpdate("v-2", now, 1), apiUpdate("v-3", now, 1, 200.0)), "X-Tenant-Id", "t-1")
+	r := c.Post("/v1/vehicles/positions", hApiBatch(hApiUpdate("v-1", now, 1), hApiUpdate("v-2", now, 1), hApiUpdate("v-3", now, 1, 200.0)), "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 400, "a batch whose third update has lat 200")
 	ctx.Equal(s.written(), []string{}, "the batch was rejected with 400 but vehicles were recorded: every update is validated before any is recorded, so the device can fix the batch and resend it; the vehicles written")
-	for _, bad := range []map[string]any{apiUpdate("", now, 1), apiUpdate("v-1", -5, 1), apiUpdate("v-1", now, -1), apiUpdate("v-1", now, 1, 47.6, 181.0), {"vehicle_id": "v-1"}} {
-		r = c.Post("/v1/vehicles/positions", apiBatch(apiUpdate("v-9", now, 1), bad), "X-Tenant-Id", "t-1")
+	for _, bad := range []map[string]any{hApiUpdate("", now, 1), hApiUpdate("v-1", -5, 1), hApiUpdate("v-1", now, -1), hApiUpdate("v-1", now, 1, 47.6, 181.0), {"vehicle_id": "v-1"}} {
+		r = c.Post("/v1/vehicles/positions", hApiBatch(hApiUpdate("v-9", now, 1), bad), "X-Tenant-Id", "t-1")
 		ctx.Equal(r.Status, 400, "a batch with the invalid update %v", bad)
 	}
 	ctx.Equal(s.written(), []string{}, "rejected batches recorded vehicles; the vehicles written")
@@ -1005,36 +1005,36 @@ func CheckValidateFirst(ctx *harness.Ctx) {
 }
 
 func CheckSkew(ctx *harness.Ctx) {
-	c, s := newAPI(ctx)
+	c, s := hNewAPI(ctx)
 	now := ctx.Clock.Now()
-	r := c.Post("/v1/vehicles/positions", apiBatch(apiUpdate("v-1", now, 1), apiUpdate("v-2", now-10*60_000, 1)), "X-Tenant-Id", "t-1")
+	r := c.Post("/v1/vehicles/positions", hApiBatch(hApiUpdate("v-1", now, 1), hApiUpdate("v-2", now-10*60_000, 1)), "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 400, "a batch with a position dated ten minutes ago (a device clock that far off is not trusted)")
 	ctx.Equal(s.written(), []string{}, "the skewed batch recorded vehicles: a skewed update rejects the batch before anything is written; the vehicles written")
-	r = c.Post("/v1/vehicles/positions", apiBatch(apiUpdate("v-1", now+10*60_000, 1)), "X-Tenant-Id", "t-1")
+	r = c.Post("/v1/vehicles/positions", hApiBatch(hApiUpdate("v-1", now+10*60_000, 1)), "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 400, "a position dated ten minutes in the future (the skew bound is abs(now - ts))")
-	r = c.Post("/v1/vehicles/positions", apiBatch(apiUpdate("v-1", now-4*60_000, 1), apiUpdate("v-2", now+4*60_000, 1)), "X-Tenant-Id", "t-1")
+	r = c.Post("/v1/vehicles/positions", hApiBatch(hApiUpdate("v-1", now-4*60_000, 1), hApiUpdate("v-2", now+4*60_000, 1)), "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 200, "positions four minutes either side of the server clock (within maxSkewMs = 300 000): %s", r.Text())
 	ctx.Equal(s.written(), []string{"v-1", "v-2"}, "the accepted batch's vehicles")
-	r = c.Post("/v1/vehicles/positions", apiBatch(apiUpdate("v-3", now-300_000, 1), apiUpdate("v-4", now+300_000, 1)), "X-Tenant-Id", "t-1")
+	r = c.Post("/v1/vehicles/positions", hApiBatch(hApiUpdate("v-3", now-300_000, 1), hApiUpdate("v-4", now+300_000, 1)), "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 200, "positions exactly 300 000 ms either side of the server clock (only a skew greater than maxSkewMs is rejected): %s", r.Text())
 	for _, ts := range []int64{now - 300_001, now + 300_001} {
-		r = c.Post("/v1/vehicles/positions", apiBatch(apiUpdate("v-5", ts, 1)), "X-Tenant-Id", "t-1")
+		r = c.Post("/v1/vehicles/positions", hApiBatch(hApiUpdate("v-5", ts, 1)), "X-Tenant-Id", "t-1")
 		ctx.Equal(r.Status, 400, "a position %+d ms from the server clock (one millisecond past maxSkewMs is rejected)", ts-now)
 	}
 	ctx.Equal(s.written(), []string{"v-1", "v-2", "v-3", "v-4"}, "after the boundary batches the vehicles recorded (v-5 was outside the skew)")
 }
 
 func CheckCounts(ctx *harness.Ctx) {
-	c, _ := newAPI(ctx)
+	c, _ := hNewAPI(ctx)
 	now := ctx.Clock.Now()
-	first := apiBatch(apiUpdate("v-1", now, 5), apiUpdate("v-2", now, 7))
+	first := hApiBatch(hApiUpdate("v-1", now, 5), hApiUpdate("v-2", now, 7))
 	r := c.Post("/v1/vehicles/positions", first, "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 200, "two new updates (%s)", r.Text())
 	ctx.Equal(r.JSON(), map[string]any{"accepted": 2, "duplicate": 0}, "two new updates")
 	r = c.Post("/v1/vehicles/positions", first, "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 200, "the same batch again (%s)", r.Text())
 	ctx.Equal(r.JSON(), map[string]any{"accepted": 0, "duplicate": 2}, "the same batch again (a device replaying its buffer): the state ignored both, the response must say so")
-	r = c.Post("/v1/vehicles/positions", apiBatch(apiUpdate("v-1", now+1000, 6), apiUpdate("v-2", now, 7)), "X-Tenant-Id", "t-1")
+	r = c.Post("/v1/vehicles/positions", hApiBatch(hApiUpdate("v-1", now+1000, 6), hApiUpdate("v-2", now, 7)), "X-Tenant-Id", "t-1")
 	ctx.Equal(r.JSON(), map[string]any{"accepted": 1, "duplicate": 1}, "one new and one replayed update")
 }
 `,
@@ -1051,120 +1051,120 @@ func CheckCounts(ctx *harness.Ctx) {
 namespace {
 
 // Stands in for step 4's record_position: the latest (ts, seq) per vehicle, applied when newer.
-std::map<std::string, std::pair<long long, long long>> apiLatest;
+std::map<std::string, std::pair<long long, long long>> hApiLatest;
 
 // The vehicles with a latest record, sorted.
-std::vector<std::string> apiWritten() {
+std::vector<std::string> hApiWritten() {
   std::vector<std::string> out;
-  for (const auto& [id, _] : apiLatest) out.push_back(id);
+  for (const auto& [id, _] : hApiLatest) out.push_back(id);
   return out;
 }
 
-struct Api {
+struct HApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
-    apiLatest.clear();
+  explicit HApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
+    hApiLatest.clear();
     register_routes(svr);
   }
 };
 
-nlohmann::json apiUpdate(const std::string& vehicle_id, long long ts, long long seq = 1, double lat = 47.6, double lon = -122.3) {
+nlohmann::json hApiUpdate(const std::string& vehicle_id, long long ts, long long seq = 1, double lat = 47.6, double lon = -122.3) {
   return {{"vehicle_id", vehicle_id}, {"device_timestamp_ms", ts}, {"sequence", seq}, {"lat", lat}, {"lon", lon}};
 }
 
-nlohmann::json apiBatch(std::vector<nlohmann::json> updates) {
+nlohmann::json hApiBatch(std::vector<nlohmann::json> updates) {
   return {{"batch_id", "b-1"}, {"updates", updates}};
 }
 
-harness::Response apiPost(Api& api, const nlohmann::json& body, const std::vector<std::string>& headers = {"X-Tenant-Id", "t-1"}) {
+harness::Response hApiPost(HApi& api, const nlohmann::json& body, const std::vector<std::string>& headers = {"X-Tenant-Id", "t-1"}) {
   return api.http.Send("POST", "/v1/vehicles/positions", body.dump(), headers);
 }
 
 }  // namespace
 
 bool record_position(const std::string& vehicle_id, const Position& p) {
-  const auto it = apiLatest.find(vehicle_id);
-  if (it != apiLatest.end() && (p.device_timestamp_ms < it->second.first ||
+  const auto it = hApiLatest.find(vehicle_id);
+  if (it != hApiLatest.end() && (p.device_timestamp_ms < it->second.first ||
                                 (p.device_timestamp_ms == it->second.first && p.sequence <= it->second.second)))
     return false;
-  apiLatest[vehicle_id] = {p.device_timestamp_ms, p.sequence};
+  hApiLatest[vehicle_id] = {p.device_timestamp_ms, p.sequence};
   return true;
 }
 
 void CheckRoute(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto r = apiPost(api, apiBatch({apiUpdate("v-1", ctx.Clock.Now(), 42)}));
+  HApi api(ctx);
+  const auto r = hApiPost(api, hApiBatch({hApiUpdate("v-1", ctx.Clock.Now(), 42)}));
   ctx.Equal(r.Status, 200, "POST /v1/vehicles/positions with a valid batch (%s)", r.Text());
   const std::string ctype = r.HeaderValue("Content-Type");
   ctx.Assert(ctype.rfind("application/json", 0) == 0, "the answer must be JSON, got Content-Type %q", ctype);
   ctx.Equal(r.JSON(), harness::ParseJSON(R"({"accepted":1,"duplicate":0})"), "one new update must answer accepted 1, duplicate 0");
-  ctx.Equal(apiWritten(), {"v-1"}, "after the batch the vehicles record_position received (it writes vehicle:v-1:latest)");
+  ctx.Equal(hApiWritten(), {"v-1"}, "after the batch the vehicles record_position received (it writes vehicle:v-1:latest)");
 }
 
 void CheckTenant(harness::Ctx& ctx) {
-  Api api(ctx);
-  auto r = apiPost(api, apiBatch({apiUpdate("v-1", ctx.Clock.Now())}), {});
+  HApi api(ctx);
+  auto r = hApiPost(api, hApiBatch({hApiUpdate("v-1", ctx.Clock.Now())}), {});
   ctx.Equal(r.Status, 401, "a batch without X-Tenant-Id");
-  ctx.Equal(apiWritten(), std::vector<std::string>{}, "a batch without a tenant recorded vehicles: nothing may be recorded for nobody; the vehicles written");
-  r = apiPost(api, apiBatch({apiUpdate("v-1", ctx.Clock.Now())}), {"X-Tenant-Id", ""});
+  ctx.Equal(hApiWritten(), std::vector<std::string>{}, "a batch without a tenant recorded vehicles: nothing may be recorded for nobody; the vehicles written");
+  r = hApiPost(api, hApiBatch({hApiUpdate("v-1", ctx.Clock.Now())}), {"X-Tenant-Id", ""});
   ctx.Equal(r.Status, 401, "a batch with an empty X-Tenant-Id");
-  r = apiPost(api, apiBatch({apiUpdate("v-1", ctx.Clock.Now())}));
+  r = hApiPost(api, hApiBatch({hApiUpdate("v-1", ctx.Clock.Now())}));
   ctx.Equal(r.Status, 200, "with a tenant the same batch (%s)", r.Text());
 }
 
 void CheckValidateFirst(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   const long long now = ctx.Clock.Now();
-  auto r = apiPost(api, apiBatch({apiUpdate("v-1", now), apiUpdate("v-2", now), apiUpdate("v-3", now, 1, 200.0)}));
+  auto r = hApiPost(api, hApiBatch({hApiUpdate("v-1", now), hApiUpdate("v-2", now), hApiUpdate("v-3", now, 1, 200.0)}));
   ctx.Equal(r.Status, 400, "a batch whose third update has lat 200");
-  ctx.Equal(apiWritten(), std::vector<std::string>{},
+  ctx.Equal(hApiWritten(), std::vector<std::string>{},
             "the batch was rejected with 400 but vehicles were recorded: every update is validated before any is "
             "recorded, so the device can fix the batch and resend it; the vehicles written");
-  const std::vector<nlohmann::json> bads = {apiUpdate("", now), apiUpdate("v-1", -5), apiUpdate("v-1", now, -1),
-                                           apiUpdate("v-1", now, 1, 47.6, 181.0), {{"vehicle_id", "v-1"}}};
+  const std::vector<nlohmann::json> bads = {hApiUpdate("", now), hApiUpdate("v-1", -5), hApiUpdate("v-1", now, -1),
+                                           hApiUpdate("v-1", now, 1, 47.6, 181.0), {{"vehicle_id", "v-1"}}};
   for (const auto& bad : bads) {
-    r = apiPost(api, apiBatch({apiUpdate("v-9", now), bad}));
+    r = hApiPost(api, hApiBatch({hApiUpdate("v-9", now), bad}));
     ctx.Equal(r.Status, 400, "a batch with the invalid update %s", bad.dump());
   }
-  ctx.Equal(apiWritten(), std::vector<std::string>{}, "rejected batches recorded vehicles; the vehicles written");
-  r = apiPost(api, nlohmann::json{{"batch_id", "b-2"}, {"updates", nlohmann::json::array()}});
+  ctx.Equal(hApiWritten(), std::vector<std::string>{}, "rejected batches recorded vehicles; the vehicles written");
+  r = hApiPost(api, nlohmann::json{{"batch_id", "b-2"}, {"updates", nlohmann::json::array()}});
   ctx.Equal(r.Status, 400, "an empty batch");
 }
 
 void CheckSkew(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   const long long now = ctx.Clock.Now();
-  auto r = apiPost(api, apiBatch({apiUpdate("v-1", now), apiUpdate("v-2", now - 10 * 60000)}));
+  auto r = hApiPost(api, hApiBatch({hApiUpdate("v-1", now), hApiUpdate("v-2", now - 10 * 60000)}));
   ctx.Equal(r.Status, 400, "a batch with a position dated ten minutes ago (a device clock that far off is not trusted)");
-  ctx.Equal(apiWritten(), std::vector<std::string>{},
+  ctx.Equal(hApiWritten(), std::vector<std::string>{},
             "the skewed batch recorded vehicles: a skewed update rejects the batch before anything is written; the vehicles written");
-  r = apiPost(api, apiBatch({apiUpdate("v-1", now + 10 * 60000)}));
+  r = hApiPost(api, hApiBatch({hApiUpdate("v-1", now + 10 * 60000)}));
   ctx.Equal(r.Status, 400, "a position dated ten minutes in the future (the skew bound is abs(now - ts))");
-  r = apiPost(api, apiBatch({apiUpdate("v-1", now - 4 * 60000), apiUpdate("v-2", now + 4 * 60000)}));
+  r = hApiPost(api, hApiBatch({hApiUpdate("v-1", now - 4 * 60000), hApiUpdate("v-2", now + 4 * 60000)}));
   ctx.Equal(r.Status, 200, "positions four minutes either side of the server clock (within kMaxSkewMs = 300 000): %s", r.Text());
-  ctx.Equal(apiWritten(), {"v-1", "v-2"}, "the accepted batch's vehicles");
-  r = apiPost(api, apiBatch({apiUpdate("v-3", now - 300000), apiUpdate("v-4", now + 300000)}));
+  ctx.Equal(hApiWritten(), {"v-1", "v-2"}, "the accepted batch's vehicles");
+  r = hApiPost(api, hApiBatch({hApiUpdate("v-3", now - 300000), hApiUpdate("v-4", now + 300000)}));
   ctx.Equal(r.Status, 200, "positions exactly 300 000 ms either side of the server clock (only a skew greater than kMaxSkewMs is rejected): %s", r.Text());
   for (const long long ts : {now - 300001, now + 300001}) {
-    r = apiPost(api, apiBatch({apiUpdate("v-5", ts)}));
+    r = hApiPost(api, hApiBatch({hApiUpdate("v-5", ts)}));
     ctx.Equal(r.Status, 400, "a position %d ms from the server clock (one millisecond past kMaxSkewMs is rejected)", ts - now);
   }
-  ctx.Equal(apiWritten(), {"v-1", "v-2", "v-3", "v-4"}, "after the boundary batches the vehicles recorded (v-5 was outside the skew)");
+  ctx.Equal(hApiWritten(), {"v-1", "v-2", "v-3", "v-4"}, "after the boundary batches the vehicles recorded (v-5 was outside the skew)");
 }
 
 void CheckCounts(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   const long long now = ctx.Clock.Now();
-  const auto first = apiBatch({apiUpdate("v-1", now, 5), apiUpdate("v-2", now, 7)});
-  auto r = apiPost(api, first);
+  const auto first = hApiBatch({hApiUpdate("v-1", now, 5), hApiUpdate("v-2", now, 7)});
+  auto r = hApiPost(api, first);
   ctx.Equal(r.Status, 200, "two new updates (%s)", r.Text());
   ctx.Equal(r.JSON(), harness::ParseJSON(R"({"accepted":2,"duplicate":0})"), "two new updates");
-  r = apiPost(api, first);
+  r = hApiPost(api, first);
   ctx.Equal(r.Status, 200, "the same batch again (%s)", r.Text());
   ctx.Equal(r.JSON(), harness::ParseJSON(R"({"accepted":0,"duplicate":2})"),
             "the same batch again (a device replaying its buffer): the state ignored both, the response must say so");
-  r = apiPost(api, apiBatch({apiUpdate("v-1", now + 1000, 6), apiUpdate("v-2", now, 7)}));
+  r = hApiPost(api, hApiBatch({hApiUpdate("v-1", now + 1000, 6), hApiUpdate("v-2", now, 7)}));
   ctx.Equal(r.JSON(), harness::ParseJSON(R"({"accepted":1,"duplicate":1})"), "one new and one replayed update");
 }
 `,

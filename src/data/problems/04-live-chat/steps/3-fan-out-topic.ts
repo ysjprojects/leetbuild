@@ -815,29 +815,29 @@ import (
 	"chat/subscriptions"
 )
 
-const fanTopic = "chat-messages"
+const kHFanTopic = "chat-messages"
 
-var fanBg = context.Background()
+var hFanBg = context.Background()
 
-func fanMsg(room, user, text string, ts int64) *pb.ServerMsg {
+func hFanMsg(room, user, text string, ts int64) *pb.ServerMsg {
 	return &pb.ServerMsg{Room: room, User: user, Text: text, Ts: ts}
 }
 
 // fanDelivery is one message localDeliver handed to a room.
-type fanDelivery struct {
+type HFanDelivery struct {
 	room string
 	msg  *pb.ServerMsg
 }
 
 // fanRecording is everything localDeliver hands to its rooms on this instance: real subscriptions
 // on the shared table.
-type fanRecording struct {
+type HFanRecording struct {
 	subs map[string]<-chan *pb.ServerMsg
-	got  []fanDelivery
+	got  []HFanDelivery
 }
 
-func recordRooms(rooms ...string) *fanRecording {
-	r := &fanRecording{subs: map[string]<-chan *pb.ServerMsg{}}
+func hRecordRooms(rooms ...string) *HFanRecording {
+	r := &HFanRecording{subs: map[string]<-chan *pb.ServerMsg{}}
 	for _, room := range rooms {
 		r.subs[room] = subscriptions.Subscribe(room)
 	}
@@ -845,12 +845,12 @@ func recordRooms(rooms ...string) *fanRecording {
 }
 
 // take collects what arrived since the last take.
-func (r *fanRecording) take() []fanDelivery {
+func (r *HFanRecording) take() []HFanDelivery {
 	for room, sub := range r.subs {
 		for more := true; more; {
 			select {
 			case msg := <-sub:
-				r.got = append(r.got, fanDelivery{room: room, msg: msg})
+				r.got = append(r.got, HFanDelivery{room: room, msg: msg})
 			default:
 				more = false
 			}
@@ -859,7 +859,7 @@ func (r *fanRecording) take() []fanDelivery {
 	return r.got
 }
 
-func fanTexts(delivered []fanDelivery, room string) []string {
+func hFanTexts(delivered []HFanDelivery, room string) []string {
 	var texts []string
 	for _, d := range delivered {
 		if d.room == room {
@@ -871,17 +871,17 @@ func fanTexts(delivered []fanDelivery, room string) []string {
 
 // fanSeed puts a record on the topic the way the learner's own publish produces it: the serialized
 // ServerMsg keyed by the room.
-func fanSeed(ctx *harness.Ctx, room string, msg *pb.ServerMsg) {
+func hFanSeed(ctx *harness.Ctx, room string, msg *pb.ServerMsg) {
 	value, err := proto.Marshal(msg)
 	ctx.NoError(err, "proto.Marshal")
-	ctx.Kafka.Seed(fanTopic, room, value)
+	ctx.Kafka.Seed(kHFanTopic, room, value)
 }
 
 // onFanSubscribe runs fn(group) the moment a consumer subscribes to the topic, before it reads,
 // the way another instance's message lands between a subscription and its first poll.
-func onFanSubscribe(ctx *harness.Ctx, fn func(group string)) {
+func hOnFanSubscribe(ctx *harness.Ctx, fn func(group string)) {
 	ctx.Kafka.OnSubscribe(func(group string, topics []string) {
-		if slices.Contains(topics, fanTopic) {
+		if slices.Contains(topics, kHFanTopic) {
 			fn(group)
 		}
 	})
@@ -889,19 +889,19 @@ func onFanSubscribe(ctx *harness.Ctx, fn func(group string)) {
 
 // fanPublish is one publish, delivered: the Async writer sends in the background, so the harness
 // lets it finish before the next one, as awaiting each publish does in TypeScript.
-func fanPublish(ctx *harness.Ctx, room string, msg *pb.ServerMsg) {
-	ctx.NoError(publish(fanBg, room, msg), "publish(ctx, %q, %v) returned an error", room, msg)
+func hFanPublish(ctx *harness.Ctx, room string, msg *pb.ServerMsg) {
+	ctx.NoError(publish(hFanBg, room, msg), "publish(ctx, %q, %v) returned an error", room, msg)
 	ctx.Settle()
 }
 
 func CheckTopicKeyed(ctx *harness.Ctx) {
-	hi := fanMsg("room-7", "ana", "hi", 1700000000000)
-	fanPublish(ctx, "room-7", hi)
-	fanPublish(ctx, "room-8", fanMsg("room-8", "bo", "yo", 1700000000000))
-	fanPublish(ctx, "room-7", fanMsg("room-7", "cy", "hey", 1700000000000))
-	records := ctx.Kafka.Records(fanTopic)
-	ctx.Equal(len(records), 3, "the records three publish calls produced to %q (topics seen: %v)", fanTopic, ctx.Kafka.Topics())
-	keys := ctx.Kafka.Keys(fanTopic)
+	hi := hFanMsg("room-7", "ana", "hi", 1700000000000)
+	hFanPublish(ctx, "room-7", hi)
+	hFanPublish(ctx, "room-8", hFanMsg("room-8", "bo", "yo", 1700000000000))
+	hFanPublish(ctx, "room-7", hFanMsg("room-7", "cy", "hey", 1700000000000))
+	records := ctx.Kafka.Records(kHFanTopic)
+	ctx.Equal(len(records), 3, "the records three publish calls produced to %q (topics seen: %v)", kHFanTopic, ctx.Kafka.Topics())
+	keys := ctx.Kafka.Keys(kHFanTopic)
 	ctx.Equal(keys, []string{"room-7", "room-8", "room-7"}, "the record keys must be the room ids")
 	parsed := &pb.ServerMsg{}
 	ctx.NoError(proto.Unmarshal(records[0].Value, parsed), "the record value must be the serialized ServerMsg")
@@ -916,20 +916,20 @@ func CheckTopicKeyed(ctx *harness.Ctx) {
 	ctx.Equal(len(parts), 1, "room-7's messages landed on partitions %v: keyed by room they stay on one partition; partitions used", parts)
 }
 
-// fanRoom7Texts is what recordFanRoom7 saw, in the instance whose localDeliver it replaced: a second
+// hFanRoom7Texts is what hRecordFanRoom7 saw, in the instance whose localDeliver it replaced: a second
 // instance compiles its own copy of this file, so its recorder fills its own copy of the slice.
-var fanRoom7Texts []string
+var hFanRoom7Texts []string
 
-func recordFanRoom7(room string, msg *pb.ServerMsg) {
+func hRecordFanRoom7(room string, msg *pb.ServerMsg) {
 	if room == "room-7" {
-		fanRoom7Texts = append(fanRoom7Texts, msg.GetText())
+		hFanRoom7Texts = append(hFanRoom7Texts, msg.GetText())
 	}
 }
 
 func CheckUniqueGroup(ctx *harness.Ctx) {
-	da := recordRooms("room-7")
+	da := hRecordRooms("room-7")
 	b := ctx.Instance() // a second process: fresh package variables, its own subscription table
-	b.Set("localDeliver", b.Get("recordFanRoom7"))
+	b.Set("localDeliver", b.Get("hRecordFanRoom7"))
 	ga, gb := groupID, b.Get("groupID").(string)
 	host, _ := os.Hostname()
 	ctx.Assert(strings.HasPrefix(ga, "chat-server-"), "groupID is %q, expected chat-server-{hostname}-{pid}", ga)
@@ -937,7 +937,7 @@ func CheckUniqueGroup(ctx *harness.Ctx) {
 	ctx.Assert(len(ga) > len("chat-server-")+len(host)+1, "groupID %q needs a per-process part (pid) after the hostname", ga)
 	ctx.Assert(ga != gb, "two instances on this host computed the same group id %q: with a shared group the topic is split between them instead of broadcast", ga)
 	seeded := map[string]bool{}
-	onFanSubscribe(ctx, func(group string) {
+	hOnFanSubscribe(ctx, func(group string) {
 		// each instance's first subscription is answered by one new message
 		if seeded[group] {
 			return
@@ -947,12 +947,12 @@ func CheckUniqueGroup(ctx *harness.Ctx) {
 		if group == ga {
 			from = "A"
 		}
-		fanSeed(ctx, "room-7", fanMsg("room-7", "ana", "hello from "+from, 1700000000000))
+		hFanSeed(ctx, "room-7", hFanMsg("room-7", "ana", "hello from "+from, 1700000000000))
 	})
 	runB := b.Get("runConsumer").(func(context.Context))
-	ctx.Drain(func() { runConsumer(fanBg) }) // A joins and sees 'hello from A'
-	ctx.Drain(func() { runB(fanBg) })        // B joins; 'hello from B' is produced while both groups exist
-	ctx.Drain(func() { runConsumer(fanBg) }) // A resumes from its committed offset
+	ctx.Drain(func() { runConsumer(hFanBg) }) // A joins and sees 'hello from A'
+	ctx.Drain(func() { runB(hFanBg) })        // B joins; 'hello from B' is produced while both groups exist
+	ctx.Drain(func() { runConsumer(hFanBg) }) // A resumes from its committed offset
 	var groups []string
 	for _, c := range ctx.Kafka.Consumers() {
 		if !slices.Contains(groups, c.Group) {
@@ -961,40 +961,40 @@ func CheckUniqueGroup(ctx *harness.Ctx) {
 	}
 	sort.Strings(groups)
 	ctx.Assert(slices.Contains(groups, ga) && slices.Contains(groups, gb), "the broker saw consumer groups %v, expected the readers to use GroupID: groupID (%q, %q)", groups, ga, gb)
-	textsA := fanTexts(da.take(), "room-7")
-	textsB := b.Get("fanRoom7Texts").([]string)
+	textsA := hFanTexts(da.take(), "room-7")
+	textsB := b.Get("hFanRoom7Texts").([]string)
 	ctx.Equal(textsB, []string{"hello from B"}, "what instance B delivered")
 	ctx.Equal(textsA, []string{"hello from A", "hello from B"}, "what instance A delivered: with one group per instance every instance receives every message")
 }
 
 func CheckLatest(ctx *harness.Ctx) {
-	delivered := recordRooms("room-7")
-	fanSeed(ctx, "room-7", fanMsg("room-7", "ana", "yesterday", 1700000000000))
-	onFanSubscribe(ctx, func(string) { fanSeed(ctx, "room-7", fanMsg("room-7", "bo", "now", 1700000000000)) })
-	ctx.Drain(func() { runConsumer(fanBg) })
-	ctx.Assert(len(ctx.Kafka.EventsOf("subscribe")) > 0, "the consumer never subscribed to %q", fanTopic)
-	texts := fanTexts(delivered.take(), "room-7")
+	delivered := hRecordRooms("room-7")
+	hFanSeed(ctx, "room-7", hFanMsg("room-7", "ana", "yesterday", 1700000000000))
+	hOnFanSubscribe(ctx, func(string) { hFanSeed(ctx, "room-7", hFanMsg("room-7", "bo", "now", 1700000000000)) })
+	ctx.Drain(func() { runConsumer(hFanBg) })
+	ctx.Assert(len(ctx.Kafka.EventsOf("subscribe")) > 0, "the consumer never subscribed to %q", kHFanTopic)
+	texts := hFanTexts(delivered.take(), "room-7")
 	ctx.Equal(texts, []string{"now"}, "what a freshly started instance delivered: a new group must start at the latest offset (StartOffset: kafka.LastOffset), not replay 'yesterday'")
 }
 
 func CheckDeliver(ctx *harness.Ctx) {
-	recording := recordRooms("room-7", "room-8")
-	expected := []fanDelivery{
-		{room: "room-7", msg: fanMsg("room-7", "ana", "hi", 1)},
-		{room: "room-8", msg: fanMsg("room-8", "bo", "yo", 2)},
-		{room: "room-7", msg: fanMsg("room-7", "cy", "hey", 3)},
+	recording := hRecordRooms("room-7", "room-8")
+	expected := []HFanDelivery{
+		{room: "room-7", msg: hFanMsg("room-7", "ana", "hi", 1)},
+		{room: "room-8", msg: hFanMsg("room-8", "bo", "yo", 2)},
+		{room: "room-7", msg: hFanMsg("room-7", "cy", "hey", 3)},
 	}
-	onFanSubscribe(ctx, func(string) {
+	hOnFanSubscribe(ctx, func(string) {
 		for _, e := range expected {
-			fanSeed(ctx, e.room, e.msg)
+			hFanSeed(ctx, e.room, e.msg)
 		}
 	})
-	ctx.Drain(func() { runConsumer(fanBg) })
+	ctx.Drain(func() { runConsumer(hFanBg) })
 	subscribes := ctx.Kafka.EventsOf("subscribe")
-	ctx.Assert(slices.ContainsFunc(subscribes, func(e harness.KafkaEvent) bool { return slices.Contains(e.Topics, fanTopic) }), "the consumer never subscribed to %q (subscribe events: %v)", fanTopic, subscribes)
+	ctx.Assert(slices.ContainsFunc(subscribes, func(e harness.KafkaEvent) bool { return slices.Contains(e.Topics, kHFanTopic) }), "the consumer never subscribed to %q (subscribe events: %v)", kHFanTopic, subscribes)
 	delivered := recording.take()
 	ctx.Equal(len(delivered), 3, "three records were produced: the calls to localDeliver")
-	shape := func(ds []fanDelivery) []string {
+	shape := func(ds []HFanDelivery) []string {
 		var out []string
 		for _, d := range ds {
 			out = append(out, strings.Join([]string{d.room, d.msg.GetUser(), d.msg.GetText(), strconv.FormatInt(d.msg.GetTs(), 10)}, " "))
@@ -1003,7 +1003,7 @@ func CheckDeliver(ctx *harness.Ctx) {
 		return out
 	}
 	ctx.Equal(shape(delivered), shape(expected), "what localDeliver received (room = the record key, msg = the decoded value)")
-	ctx.Equal(fanTexts(delivered, "room-7"), []string{"hi", "hey"}, "room-7's messages, in production order")
+	ctx.Equal(hFanTexts(delivered, "room-7"), []string{"hi", "hey"}, "room-7's messages, in production order")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1022,9 +1022,9 @@ func CheckDeliver(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string fanTopic = "chat-messages";
+const std::string kHFanTopic = "chat-messages";
 
-chat::ServerMsg fanMsg(const std::string& room, const std::string& user, const std::string& text, int64_t ts) {
+chat::ServerMsg hFanMsg(const std::string& room, const std::string& user, const std::string& text, int64_t ts) {
   chat::ServerMsg msg;
   msg.set_room(room);
   msg.set_user(user);
@@ -1034,17 +1034,17 @@ chat::ServerMsg fanMsg(const std::string& room, const std::string& user, const s
 }
 
 // One message local_deliver handed to a room.
-struct FanDelivery {
+struct HFanDelivery {
   std::string room;
   chat::ServerMsg msg;
 };
 
 // Everything local_deliver hands to its rooms on this instance: real subscriptions on the shared table.
-struct FanRecording {
+struct HFanRecording {
   std::shared_ptr<std::mutex> mu = std::make_shared<std::mutex>();
-  std::shared_ptr<std::vector<FanDelivery>> got = std::make_shared<std::vector<FanDelivery>>();
+  std::shared_ptr<std::vector<HFanDelivery>> got = std::make_shared<std::vector<HFanDelivery>>();
 
-  explicit FanRecording(const std::vector<std::string>& rooms) {
+  explicit HFanRecording(const std::vector<std::string>& rooms) {
     for (const auto& room : rooms) {
       subscribe(room, [room, mu = mu, got = got](const chat::ServerMsg& msg) {
         std::lock_guard<std::mutex> lock(*mu);
@@ -1053,13 +1053,13 @@ struct FanRecording {
     }
   }
 
-  std::vector<FanDelivery> take() const {
+  std::vector<HFanDelivery> take() const {
     std::lock_guard<std::mutex> lock(*mu);
     return *got;
   }
 };
 
-std::vector<std::string> fanTexts(const std::vector<FanDelivery>& delivered, const std::string& room) {
+std::vector<std::string> hFanTexts(const std::vector<HFanDelivery>& delivered, const std::string& room) {
   std::vector<std::string> texts;
   for (const auto& d : delivered)
     if (d.room == room) texts.push_back(d.msg.text());
@@ -1068,26 +1068,26 @@ std::vector<std::string> fanTexts(const std::vector<FanDelivery>& delivered, con
 
 // A record on the topic the way the learner's own publish produces it: the serialized ServerMsg
 // keyed by the room.
-void fanSeed(harness::Ctx& ctx, const std::string& room, const chat::ServerMsg& msg) {
-  ctx.Kafka.Seed(fanTopic, room, msg.SerializeAsString());
+void hFanSeed(harness::Ctx& ctx, const std::string& room, const chat::ServerMsg& msg) {
+  ctx.Kafka.Seed(kHFanTopic, room, msg.SerializeAsString());
 }
 
 // Runs fn(group) the moment a consumer subscribes to the topic, before it reads, the way another
 // instance's message lands between a subscription and its first poll.
-void onFanSubscribe(harness::Ctx& ctx, std::function<void(const std::string& group)> fn) {
+void hOnFanSubscribe(harness::Ctx& ctx, std::function<void(const std::string& group)> fn) {
   ctx.Kafka.OnSubscribe([fn](const std::string& group, const std::vector<std::string>& topics) {
-    if (std::find(topics.begin(), topics.end(), fanTopic) != topics.end()) fn(group);
+    if (std::find(topics.begin(), topics.end(), kHFanTopic) != topics.end()) fn(group);
   });
 }
 
 // One publish, delivered: the producer sends in the background (linger.ms), so the harness lets it
 // finish before the next one, as awaiting each publish does in TypeScript.
-void fanPublish(harness::Ctx& ctx, const std::string& room, const chat::ServerMsg& msg) {
+void hFanPublish(harness::Ctx& ctx, const std::string& room, const chat::ServerMsg& msg) {
   publish(room, msg);
   ctx.Settle();
 }
 
-bool hasHexRun(const std::string& s, size_t n) {
+bool hHasHexRun(const std::string& s, size_t n) {
   size_t run = 0;
   for (char c : s) {
     run = std::isxdigit(static_cast<unsigned char>(c)) ? run + 1 : 0;
@@ -1099,14 +1099,14 @@ bool hasHexRun(const std::string& s, size_t n) {
 }  // namespace
 
 void CheckTopicKeyed(harness::Ctx& ctx) {
-  const auto hi = fanMsg("room-7", "ana", "hi", 1700000000000);
-  fanPublish(ctx, "room-7", hi);
-  fanPublish(ctx, "room-8", fanMsg("room-8", "bo", "yo", 1700000000000));
-  fanPublish(ctx, "room-7", fanMsg("room-7", "cy", "hey", 1700000000000));
-  const auto records = ctx.Kafka.Records(fanTopic);
-  ctx.Equal(records.size(), 3, "the records three publish calls produced to %q (topics seen: %v)", fanTopic,
+  const auto hi = hFanMsg("room-7", "ana", "hi", 1700000000000);
+  hFanPublish(ctx, "room-7", hi);
+  hFanPublish(ctx, "room-8", hFanMsg("room-8", "bo", "yo", 1700000000000));
+  hFanPublish(ctx, "room-7", hFanMsg("room-7", "cy", "hey", 1700000000000));
+  const auto records = ctx.Kafka.Records(kHFanTopic);
+  ctx.Equal(records.size(), 3, "the records three publish calls produced to %q (topics seen: %v)", kHFanTopic,
             ctx.Kafka.Topics());
-  ctx.Equal(ctx.Kafka.Keys(fanTopic), {"room-7", "room-8", "room-7"}, "the record keys must be the room ids");
+  ctx.Equal(ctx.Kafka.Keys(kHFanTopic), {"room-7", "room-8", "room-7"}, "the record keys must be the room ids");
   chat::ServerMsg parsed;
   ctx.Assert(records[0].Value.has_value() && parsed.ParseFromString(*records[0].Value),
              "the record value must be the serialized ServerMsg");
@@ -1123,7 +1123,7 @@ void CheckTopicKeyed(harness::Ctx& ctx) {
 // instance B is a consumer the harness runs the way a second chat-server would: its own group,
 // chat-server-{hostname}-{its pid}, configured as kGroupId's consumer is.
 void CheckUniqueGroup(harness::Ctx& ctx) {
-  const FanRecording da({"room-7"});
+  const HFanRecording da({"room-7"});
   const std::string ga = kGroupId;
   const std::string host = hostname();
   ctx.Assert(ga.rfind("chat-server-", 0) == 0, "kGroupId is %q, expected chat-server-{hostname}-{pid}", ga);
@@ -1133,16 +1133,16 @@ void CheckUniqueGroup(harness::Ctx& ctx) {
              "kGroupId %q needs a per-process part (pid) after the hostname", ga);
   const std::string tail = ga.substr(at + host.size());
   const std::string pid = std::to_string(getpid());
-  ctx.Assert(tail.find(pid) != std::string::npos || hasHexRun(tail, 8),
+  ctx.Assert(tail.find(pid) != std::string::npos || hHasHexRun(tail, 8),
              "two instances on this host computed the same group id %q: with a shared group the topic is split between "
              "them instead of broadcast (put the pid, %s, or a uuid after the hostname)",
              ga, pid);
   const std::string gb = "chat-server-" + host + "-" + std::to_string(getpid() + 1);
   std::set<std::string> seeded;
-  onFanSubscribe(ctx, [&](const std::string& group) {
+  hOnFanSubscribe(ctx, [&](const std::string& group) {
     // each instance's first subscription is answered by one new message
     if (!seeded.insert(group).second) return;
-    fanSeed(ctx, "room-7", fanMsg("room-7", "ana", std::string("hello from ") + (group == ga ? "A" : "B"), 1700000000000));
+    hFanSeed(ctx, "room-7", hFanMsg("room-7", "ana", std::string("hello from ") + (group == ga ? "A" : "B"), 1700000000000));
   });
   auto textsB = std::make_shared<std::vector<std::string>>();
   const auto runB = [gb, textsB] {
@@ -1153,7 +1153,7 @@ void CheckUniqueGroup(harness::Ctx& ctx) {
     conf->set("auto.offset.reset", "latest", err);
     conf->set("enable.auto.commit", "true", err);
     std::unique_ptr<RdKafka::KafkaConsumer> b(RdKafka::KafkaConsumer::create(conf.get(), err));
-    b->subscribe({fanTopic});
+    b->subscribe({kHFanTopic});
     while (true) {
       std::unique_ptr<RdKafka::Message> record(b->consume(200));
       if (record->err() != RdKafka::ERR_NO_ERROR) continue;
@@ -1172,41 +1172,41 @@ void CheckUniqueGroup(harness::Ctx& ctx) {
   ctx.Assert(std::find(groups.begin(), groups.end(), ga) != groups.end(),
              "the broker saw consumer groups %v, expected the consumer to use group.id = kGroupId (%q)", groups, ga);
   ctx.Equal(*textsB, {"hello from B"}, "what instance B delivered");
-  ctx.Equal(fanTexts(da.take(), "room-7"), {"hello from A", "hello from B"},
+  ctx.Equal(hFanTexts(da.take(), "room-7"), {"hello from A", "hello from B"},
             "what instance A delivered: with one group per instance every instance receives every message");
 }
 
 void CheckLatest(harness::Ctx& ctx) {
-  const FanRecording delivered({"room-7"});
-  fanSeed(ctx, "room-7", fanMsg("room-7", "ana", "yesterday", 1700000000000));
-  onFanSubscribe(ctx, [&](const std::string&) { fanSeed(ctx, "room-7", fanMsg("room-7", "bo", "now", 1700000000000)); });
+  const HFanRecording delivered({"room-7"});
+  hFanSeed(ctx, "room-7", hFanMsg("room-7", "ana", "yesterday", 1700000000000));
+  hOnFanSubscribe(ctx, [&](const std::string&) { hFanSeed(ctx, "room-7", hFanMsg("room-7", "bo", "now", 1700000000000)); });
   ctx.Drain([] { run_consumer(); });
-  ctx.Assert(!ctx.Kafka.EventsOf("subscribe").empty(), "the consumer never subscribed to %q", fanTopic);
-  ctx.Equal(fanTexts(delivered.take(), "room-7"), {"now"},
+  ctx.Assert(!ctx.Kafka.EventsOf("subscribe").empty(), "the consumer never subscribed to %q", kHFanTopic);
+  ctx.Equal(hFanTexts(delivered.take(), "room-7"), {"now"},
             "what a freshly started instance delivered: a new group must start at the latest offset "
             "(auto.offset.reset=latest), not replay 'yesterday'");
 }
 
 void CheckDeliver(harness::Ctx& ctx) {
-  const FanRecording recording({"room-7", "room-8"});
-  const std::vector<FanDelivery> expected = {
-      {"room-7", fanMsg("room-7", "ana", "hi", 1)},
-      {"room-8", fanMsg("room-8", "bo", "yo", 2)},
-      {"room-7", fanMsg("room-7", "cy", "hey", 3)},
+  const HFanRecording recording({"room-7", "room-8"});
+  const std::vector<HFanDelivery> expected = {
+      {"room-7", hFanMsg("room-7", "ana", "hi", 1)},
+      {"room-8", hFanMsg("room-8", "bo", "yo", 2)},
+      {"room-7", hFanMsg("room-7", "cy", "hey", 3)},
   };
-  onFanSubscribe(ctx, [&](const std::string&) {
-    for (const auto& e : expected) fanSeed(ctx, e.room, e.msg);
+  hOnFanSubscribe(ctx, [&](const std::string&) {
+    for (const auto& e : expected) hFanSeed(ctx, e.room, e.msg);
   });
   ctx.Drain([] { run_consumer(); });
   const auto subscribes = ctx.Kafka.EventsOf("subscribe");
   ctx.Assert(std::any_of(subscribes.begin(), subscribes.end(),
                          [](const harness::KafkaEvent& e) {
-                           return std::find(e.Topics.begin(), e.Topics.end(), fanTopic) != e.Topics.end();
+                           return std::find(e.Topics.begin(), e.Topics.end(), kHFanTopic) != e.Topics.end();
                          }),
-             "the consumer never subscribed to %q (subscribe events: %v)", fanTopic, subscribes);
+             "the consumer never subscribed to %q (subscribe events: %v)", kHFanTopic, subscribes);
   const auto delivered = recording.take();
   ctx.Equal(delivered.size(), 3, "three records were produced: the calls to local_deliver");
-  const auto shape = [](const std::vector<FanDelivery>& ds) {
+  const auto shape = [](const std::vector<HFanDelivery>& ds) {
     std::vector<std::string> out;
     for (const auto& d : ds)
       out.push_back(d.room + " " + d.msg.user() + " " + d.msg.text() + " " + std::to_string(d.msg.ts()));
@@ -1214,7 +1214,7 @@ void CheckDeliver(harness::Ctx& ctx) {
     return out;
   };
   ctx.Equal(shape(delivered), shape(expected), "what local_deliver received (room = the record key, msg = the decoded value)");
-  ctx.Equal(fanTexts(delivered, "room-7"), {"hi", "hey"}, "room-7's messages, in production order");
+  ctx.Equal(hFanTexts(delivered, "room-7"), {"hi", "hey"}, "room-7's messages, in production order");
 }
 `,
   },

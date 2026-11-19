@@ -559,9 +559,9 @@ import (
 	"fleet/position"
 )
 
-const stateV1 = "vehicle:v-1:latest"
+const kHStateV1 = "vehicle:v-1:latest"
 
-func statePos(ts, seq int64, latLon ...float64) position.Position {
+func hStatePos(ts, seq int64, latLon ...float64) position.Position {
 	p := position.Position{VehicleID: "v-1", DeviceTimestampMs: ts, Sequence: seq, Lat: 47.6, Lon: -122.3}
 	if len(latLon) > 0 {
 		p.Lat = latLon[0]
@@ -572,9 +572,9 @@ func statePos(ts, seq int64, latLon ...float64) position.Position {
 	return p
 }
 
-// stateRecord is the record as numbers [ts, seq, lat, lon], or nil.
-func stateRecord(ctx *harness.Ctx) []float64 {
-	h := ctx.Redis.HGetAll(stateV1)
+// hStateRecord is the record as numbers [ts, seq, lat, lon], or nil.
+func hStateRecord(ctx *harness.Ctx) []float64 {
+	h := ctx.Redis.HGetAll(kHStateV1)
 	if len(h) == 0 {
 		return nil
 	}
@@ -589,56 +589,56 @@ func stateRecord(ctx *harness.Ctx) []float64 {
 	return out
 }
 
-func stateUpdate(ctx *harness.Ctx, p position.Position) bool {
+func hStateUpdate(ctx *harness.Ctx, p position.Position) bool {
 	applied, err := updateLatest(context.Background(), "v-1", p)
 	ctx.NoError(err, "updateLatest(%v)", p)
 	return applied
 }
 
 func CheckCompareTs(ctx *harness.Ctx) {
-	ctx.Equal(stateUpdate(ctx, statePos(1000, 1)), true, "the first position for a vehicle must be applied")
-	ctx.Equal(stateRecord(ctx), []float64{1000, 1, 47.6, -122.3}, "after the first position vehicle:v-1:latest (ts, seq, lat, lon)")
-	ctx.Equal(stateUpdate(ctx, statePos(900, 2, 1.0)), false, "an older timestamp (900 after 1000) must be ignored even with a higher sequence: the device's clock orders positions, its counter only breaks ties; applied")
-	rec := stateRecord(ctx)
+	ctx.Equal(hStateUpdate(ctx, hStatePos(1000, 1)), true, "the first position for a vehicle must be applied")
+	ctx.Equal(hStateRecord(ctx), []float64{1000, 1, 47.6, -122.3}, "after the first position vehicle:v-1:latest (ts, seq, lat, lon)")
+	ctx.Equal(hStateUpdate(ctx, hStatePos(900, 2, 1.0)), false, "an older timestamp (900 after 1000) must be ignored even with a higher sequence: the device's clock orders positions, its counter only breaks ties; applied")
+	rec := hStateRecord(ctx)
 	ctx.Assert(rec[0] == 1000 && rec[2] == 47.6, "the older position overwrote the record (%v): the map shows where the vehicle was", rec)
-	ctx.Equal(stateUpdate(ctx, statePos(2000, 0, 2.0)), true, "a newer timestamp with a lower sequence (the device rebooted and its counter restarted) must be applied")
-	ctx.Equal(stateUpdate(ctx, statePos(2000, 9, 3.0)), true, "equal timestamps: the higher sequence (9 after 0) must be applied")
-	ctx.Equal(stateUpdate(ctx, statePos(2000, 10, 4.0)), true, "equal timestamps: sequence 10 is higher than 9; comparing them as strings ('10' < '9') ignores it; applied")
-	ctx.Equal(stateUpdate(ctx, statePos(2000, 9, 5.0)), false, "equal timestamps: a lower sequence (9 after 10) must be ignored; applied")
-	ctx.Equal(stateRecord(ctx), []float64{2000, 10, 4.0, -122.3}, "vehicle:v-1:latest must hold the winner (ts, seq, lat, lon)")
+	ctx.Equal(hStateUpdate(ctx, hStatePos(2000, 0, 2.0)), true, "a newer timestamp with a lower sequence (the device rebooted and its counter restarted) must be applied")
+	ctx.Equal(hStateUpdate(ctx, hStatePos(2000, 9, 3.0)), true, "equal timestamps: the higher sequence (9 after 0) must be applied")
+	ctx.Equal(hStateUpdate(ctx, hStatePos(2000, 10, 4.0)), true, "equal timestamps: sequence 10 is higher than 9; comparing them as strings ('10' < '9') ignores it; applied")
+	ctx.Equal(hStateUpdate(ctx, hStatePos(2000, 9, 5.0)), false, "equal timestamps: a lower sequence (9 after 10) must be ignored; applied")
+	ctx.Equal(hStateRecord(ctx), []float64{2000, 10, 4.0, -122.3}, "vehicle:v-1:latest must hold the winner (ts, seq, lat, lon)")
 }
 
 func CheckEval(ctx *harness.Ctx) {
-	ctx.Equal(stateUpdate(ctx, statePos(1000, 1)), true, "the first position for a vehicle must be applied")
+	ctx.Equal(hStateUpdate(ctx, hStatePos(1000, 1)), true, "the first position for a vehicle must be applied")
 	// Another fleetd replica lands right after the first command that touches the record, between a
 	// client-side read and its write, with a fresher position.
-	probe := ctx.Redis.After(stateV1, func() any {
-		return ctx.Redis.Do("HSET", stateV1, "ts", 3000, "seq", 5, "lat", 9.0, "lon", 9.0)
+	probe := ctx.Redis.After(kHStateV1, func() any {
+		return ctx.Redis.Do("HSET", kHStateV1, "ts", 3000, "seq", 5, "lat", 9.0, "lon", 9.0)
 	})
-	stateUpdate(ctx, statePos(2000, 2, 2.0))
+	hStateUpdate(ctx, hStatePos(2000, 2, 2.0))
 	ctx.Assert(probe.Fired, "updateLatest sent no command touching vehicle:v-1:latest")
-	rec := stateRecord(ctx)
+	rec := hStateRecord(ctx)
 	ctx.Assert(rec != nil && rec[0] == 3000, "vehicle:v-1:latest holds %v after another replica wrote ts 3000 between your read and your write: the fresher position was lost. Read, compare and write inside one Lua script (EVAL/EVALSHA), which Redis runs without interleaving", rec)
-	ctx.Equal(stateUpdate(ctx, statePos(2500, 3)), false, "with ts 3000 stored, a position at 2500 must be ignored; applied")
+	ctx.Equal(hStateUpdate(ctx, hStatePos(2500, 3)), false, "with ts 3000 stored, a position at 2500 must be ignored; applied")
 }
 
 func CheckReplay(ctx *harness.Ctx) {
-	ctx.Equal(stateUpdate(ctx, statePos(1000, 7)), true, "the first position for a vehicle must be applied")
-	before := ctx.Redis.HGetAll(stateV1)
-	applied := stateUpdate(ctx, statePos(1000, 7))
+	ctx.Equal(hStateUpdate(ctx, hStatePos(1000, 7)), true, "the first position for a vehicle must be applied")
+	before := ctx.Redis.HGetAll(kHStateV1)
+	applied := hStateUpdate(ctx, hStatePos(1000, 7))
 	ctx.Assert(!applied, "the same position again (a device replaying its buffer after a reconnect) was reported as applied: the endpoint counts it as accepted instead of duplicate. Equal timestamp and equal sequence is not newer")
-	ctx.Equal(ctx.Redis.HGetAll(stateV1), before, "a replay must not change the record")
-	ctx.Equal(stateUpdate(ctx, statePos(1000, 8)), true, "the next sequence at the same timestamp is new and must be applied")
+	ctx.Equal(ctx.Redis.HGetAll(kHStateV1), before, "a replay must not change the record")
+	ctx.Equal(hStateUpdate(ctx, hStatePos(1000, 8)), true, "the next sequence at the same timestamp is new and must be applied")
 }
 
 func CheckOneRoundTrip(ctx *harness.Ctx) {
-	stateUpdate(ctx, statePos(1000, 1)) // the first call may load the script
+	hStateUpdate(ctx, hStatePos(1000, 1)) // the first call may load the script
 	before := len(ctx.Redis.RoundTrips())
-	stateUpdate(ctx, statePos(2000, 2))
-	stateUpdate(ctx, statePos(1500, 3))
+	hStateUpdate(ctx, hStatePos(2000, 2))
+	hStateUpdate(ctx, hStatePos(1500, 3))
 	trips := len(ctx.Redis.RoundTrips()) - before
 	ctx.Assert(trips <= 2, "two updates cost %d Redis round trips, expected one each (EVALSHA): 5 000 vehicles reporting every second must not pay a read and a write per position", trips)
-	ctx.Equal(stateRecord(ctx)[0], 2000, "vehicle:v-1:latest ts")
+	ctx.Equal(hStateRecord(ctx)[0], 2000, "vehicle:v-1:latest ts")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -650,15 +650,15 @@ func CheckOneRoundTrip(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kStateV1 = "vehicle:v-1:latest";
+const std::string kHStateV1 = "vehicle:v-1:latest";
 
-Position statePos(long long ts, long long seq, double lat = 47.6, double lon = -122.3) {
+Position hStatePos(long long ts, long long seq, double lat = 47.6, double lon = -122.3) {
   return Position{"v-1", ts, seq, lat, lon};
 }
 
 // The record as numbers {ts, seq, lat, lon}, or empty.
-std::vector<double> stateRecord(harness::Ctx& ctx) {
-  const auto h = ctx.Redis.HGetAll(kStateV1);
+std::vector<double> hStateRecord(harness::Ctx& ctx) {
+  const auto h = ctx.Redis.HGetAll(kHStateV1);
   if (h.empty()) return {};
   std::vector<double> out;
   for (const std::string f : {"ts", "seq", "lat", "lon"}) {
@@ -675,65 +675,65 @@ std::vector<double> stateRecord(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckCompareTs(harness::Ctx& ctx) {
-  ctx.Equal(update_latest("v-1", statePos(1000, 1)), true, "the first position for a vehicle must be applied");
-  ctx.Equal(stateRecord(ctx), {1000.0, 1.0, 47.6, -122.3}, "after the first position vehicle:v-1:latest (ts, seq, lat, lon)");
-  ctx.Equal(update_latest("v-1", statePos(900, 2, 1.0)), false,
+  ctx.Equal(update_latest("v-1", hStatePos(1000, 1)), true, "the first position for a vehicle must be applied");
+  ctx.Equal(hStateRecord(ctx), {1000.0, 1.0, 47.6, -122.3}, "after the first position vehicle:v-1:latest (ts, seq, lat, lon)");
+  ctx.Equal(update_latest("v-1", hStatePos(900, 2, 1.0)), false,
             "an older timestamp (900 after 1000) must be ignored even with a higher sequence: the device's clock orders "
             "positions, its counter only breaks ties; applied");
-  const auto rec = stateRecord(ctx);
+  const auto rec = hStateRecord(ctx);
   ctx.Assert(rec.size() == 4 && rec[0] == 1000 && rec[2] == 47.6,
              "the older position overwrote the record (%v): the map shows where the vehicle was", rec);
-  ctx.Equal(update_latest("v-1", statePos(2000, 0, 2.0)), true,
+  ctx.Equal(update_latest("v-1", hStatePos(2000, 0, 2.0)), true,
             "a newer timestamp with a lower sequence (the device rebooted and its counter restarted) must be applied");
-  ctx.Equal(update_latest("v-1", statePos(2000, 9, 3.0)), true, "equal timestamps: the higher sequence (9 after 0) must be applied");
-  ctx.Equal(update_latest("v-1", statePos(2000, 10, 4.0)), true,
+  ctx.Equal(update_latest("v-1", hStatePos(2000, 9, 3.0)), true, "equal timestamps: the higher sequence (9 after 0) must be applied");
+  ctx.Equal(update_latest("v-1", hStatePos(2000, 10, 4.0)), true,
             "equal timestamps: sequence 10 is higher than 9; comparing them as strings ('10' < '9') ignores it; applied");
-  ctx.Equal(update_latest("v-1", statePos(2000, 9, 5.0)), false, "equal timestamps: a lower sequence (9 after 10) must be ignored; applied");
-  ctx.Equal(stateRecord(ctx), {2000.0, 10.0, 4.0, -122.3}, "vehicle:v-1:latest must hold the winner (ts, seq, lat, lon)");
+  ctx.Equal(update_latest("v-1", hStatePos(2000, 9, 5.0)), false, "equal timestamps: a lower sequence (9 after 10) must be ignored; applied");
+  ctx.Equal(hStateRecord(ctx), {2000.0, 10.0, 4.0, -122.3}, "vehicle:v-1:latest must hold the winner (ts, seq, lat, lon)");
 }
 
 void CheckEval(harness::Ctx& ctx) {
-  ctx.Equal(update_latest("v-1", statePos(1000, 1)), true, "the first position for a vehicle must be applied");
+  ctx.Equal(update_latest("v-1", hStatePos(1000, 1)), true, "the first position for a vehicle must be applied");
   // Another fleetd replica lands right after the first command that touches the record, between a
   // client-side read and its write, with a fresher position.
   bool fired = false;
-  ctx.Redis.After(kStateV1, [&] {
+  ctx.Redis.After(kHStateV1, [&] {
     fired = true;
-    ctx.Redis.Do("HSET", kStateV1, "ts", 3000, "seq", 5, "lat", 9.0, "lon", 9.0);
+    ctx.Redis.Do("HSET", kHStateV1, "ts", 3000, "seq", 5, "lat", 9.0, "lon", 9.0);
   });
-  update_latest("v-1", statePos(2000, 2, 2.0));
+  update_latest("v-1", hStatePos(2000, 2, 2.0));
   ctx.Assert(fired, "update_latest sent no command touching vehicle:v-1:latest");
-  const auto rec = stateRecord(ctx);
+  const auto rec = hStateRecord(ctx);
   ctx.Assert(rec.size() == 4 && rec[0] == 3000,
              "vehicle:v-1:latest holds %v after another replica wrote ts 3000 between your read and your write: the "
              "fresher position was lost. Read, compare and write inside one Lua script (EVAL/EVALSHA), which Redis runs "
              "without interleaving",
              rec);
-  ctx.Equal(update_latest("v-1", statePos(2500, 3)), false, "with ts 3000 stored, a position at 2500 must be ignored; applied");
+  ctx.Equal(update_latest("v-1", hStatePos(2500, 3)), false, "with ts 3000 stored, a position at 2500 must be ignored; applied");
 }
 
 void CheckReplay(harness::Ctx& ctx) {
-  ctx.Equal(update_latest("v-1", statePos(1000, 7)), true, "the first position for a vehicle must be applied");
-  const auto before = ctx.Redis.HGetAll(kStateV1);
-  const bool applied = update_latest("v-1", statePos(1000, 7));
+  ctx.Equal(update_latest("v-1", hStatePos(1000, 7)), true, "the first position for a vehicle must be applied");
+  const auto before = ctx.Redis.HGetAll(kHStateV1);
+  const bool applied = update_latest("v-1", hStatePos(1000, 7));
   ctx.Assert(!applied,
              "the same position again (a device replaying its buffer after a reconnect) was reported as applied: the "
              "endpoint counts it as accepted instead of duplicate. Equal timestamp and equal sequence is not newer");
-  ctx.Equal(ctx.Redis.HGetAll(kStateV1), before, "a replay must not change the record");
-  ctx.Equal(update_latest("v-1", statePos(1000, 8)), true, "the next sequence at the same timestamp is new and must be applied");
+  ctx.Equal(ctx.Redis.HGetAll(kHStateV1), before, "a replay must not change the record");
+  ctx.Equal(update_latest("v-1", hStatePos(1000, 8)), true, "the next sequence at the same timestamp is new and must be applied");
 }
 
 void CheckOneRoundTrip(harness::Ctx& ctx) {
-  update_latest("v-1", statePos(1000, 1));  // the first call may load the script
+  update_latest("v-1", hStatePos(1000, 1));  // the first call may load the script
   const size_t before = ctx.Redis.RoundTrips().size();
-  update_latest("v-1", statePos(2000, 2));
-  update_latest("v-1", statePos(1500, 3));
+  update_latest("v-1", hStatePos(2000, 2));
+  update_latest("v-1", hStatePos(1500, 3));
   const size_t trips = ctx.Redis.RoundTrips().size() - before;
   ctx.Assert(trips <= 2,
              "two updates cost %d Redis round trips, expected one each (EVALSHA): 5 000 vehicles reporting every second "
              "must not pay a read and a write per position",
              static_cast<int>(trips));
-  ctx.Equal(stateRecord(ctx)[0], 2000, "vehicle:v-1:latest ts");
+  ctx.Equal(hStateRecord(ctx)[0], 2000, "vehicle:v-1:latest ts");
 }
 `,
   },

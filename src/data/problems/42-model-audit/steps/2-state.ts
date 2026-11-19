@@ -870,51 +870,51 @@ import (
 	"leetbuild/harness"
 )
 
-const stateKey = "audit:chain:t1"
+const kHStateKey = "audit:chain:t1"
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func recDigest(n int) string { return digest.Sha256Hex(fmt.Sprintf("record-%d", n)) }
+func hRecDigest(n int) string { return digest.Sha256Hex(fmt.Sprintf("record-%d", n)) }
 
-func mustAppend(ctx *harness.Ctx, recordID string, n int) Entry {
-	entry, err := appendEntry(stateBg, "t1", recordID, recDigest(n))
+func hMustAppend(ctx *harness.Ctx, recordID string, n int) Entry {
+	entry, err := appendEntry(hStateBg, "t1", recordID, hRecDigest(n))
 	ctx.NoError(err, "appendEntry(t1, %s) failed", recordID)
 	return entry
 }
 
-func mustVerify(ctx *harness.Ctx, from int64) Verdict {
-	verdict, err := verifyChain(stateBg, "t1", from)
+func hMustVerify(ctx *harness.Ctx, from int64) Verdict {
+	verdict, err := verifyChain(hStateBg, "t1", from)
 	ctx.NoError(err, "verifyChain(t1, %d) failed", from)
 	return verdict
 }
 
-func show(v Verdict) string {
+func hShow(v Verdict) string {
 	if v.FirstDivergence == nil {
 		return fmt.Sprintf("{valid %t, chain_length %d, first_divergence none}", v.Valid, v.ChainLength)
 	}
 	return fmt.Sprintf("{valid %t, chain_length %d, first_divergence %d}", v.Valid, v.ChainLength, *v.FirstDivergence)
 }
 
-func expect(ctx *harness.Ctx, got Verdict, valid bool, length int64, divergence int64, what string) {
+func hExpect(ctx *harness.Ctx, got Verdict, valid bool, length int64, divergence int64, what string) {
 	ok := got.Valid == valid && got.ChainLength == length
 	if divergence == 0 {
 		ok = ok && got.FirstDivergence == nil
 	} else {
 		ok = ok && got.FirstDivergence != nil && *got.FirstDivergence == divergence
 	}
-	ctx.Assert(ok, "%s verifyChain answered %s", what, show(got))
+	ctx.Assert(ok, "%s verifyChain answered %s", what, hShow(got))
 }
 
 func CheckChainLink(ctx *harness.Ctx) {
 	var answers []Entry
 	for n := 1; n <= 3; n++ {
-		answers = append(answers, mustAppend(ctx, fmt.Sprintf("d-%d", n), n))
+		answers = append(answers, hMustAppend(ctx, fmt.Sprintf("d-%d", n), n))
 	}
-	chain := ctx.Redis.HGetAll(stateKey)
+	chain := ctx.Redis.HGetAll(kHStateKey)
 	prev := ""
 	for n := 1; n <= 3; n++ {
-		ctx.Assert(chain[fmt.Sprintf("rec:%d", n)] == recDigest(n) && chain[fmt.Sprintf("id:%d", n)] == fmt.Sprintf("d-%d", n), "position %d holds rec %q and id %q, expected the digest and id of d-%d", n, chain[fmt.Sprintf("rec:%d", n)], chain[fmt.Sprintf("id:%d", n)], n)
-		want := digest.LinkDigest(prev, recDigest(n), int64(n))
+		ctx.Assert(chain[fmt.Sprintf("rec:%d", n)] == hRecDigest(n) && chain[fmt.Sprintf("id:%d", n)] == fmt.Sprintf("d-%d", n), "position %d holds rec %q and id %q, expected the digest and id of d-%d", n, chain[fmt.Sprintf("rec:%d", n)], chain[fmt.Sprintf("id:%d", n)], n)
+		want := digest.LinkDigest(prev, hRecDigest(n), int64(n))
 		ctx.Equal(chain[fmt.Sprintf("link:%d", n)], want, "link:%d must be LinkDigest(link:%d, rec:%d, %d): a link that ignores the one before it lets an edited record keep a valid link", n, n-1, n, n)
 		ctx.Assert(answers[n-1].Position == int64(n) && answers[n-1].Digest == want, "append %d answered %+v, expected position %d and its link", n, answers[n-1], n)
 		prev = want
@@ -924,23 +924,23 @@ func CheckChainLink(ctx *harness.Ctx) {
 
 func CheckCasAppend(ctx *harness.Ctx) {
 	// A second auditd replica appends right after this one read the chain.
-	rival := ctx.Redis.After(stateKey, func() any {
-		entry, err := appendEntry(stateBg, "t1", "d-rival", recDigest(9))
+	rival := ctx.Redis.After(kHStateKey, func() any {
+		entry, err := appendEntry(hStateBg, "t1", "d-rival", hRecDigest(9))
 		ctx.NoError(err, "the rival append failed")
 		return entry
 	})
-	mine := mustAppend(ctx, "d-mine", 1)
-	ctx.Assert(rival.Fired, "nothing touched %s", stateKey)
+	mine := hMustAppend(ctx, "d-mine", 1)
+	ctx.Assert(rival.Fired, "nothing touched %s", kHStateKey)
 	theirs, _ := rival.Result.(Entry)
 	positions := []int{int(mine.Position), int(theirs.Position)}
 	sort.Ints(positions)
 	ctx.Equal(positions, []int{1, 2}, "two appends that landed together must get positions 1 and 2 (one record overwrote the other: the write must check that the chain still ends where the append read it); positions")
-	chain := ctx.Redis.HGetAll(stateKey)
+	chain := ctx.Redis.HGetAll(kHStateKey)
 	ids := []string{chain["id:1"], chain["id:2"]}
 	sort.Strings(ids)
 	ctx.Equal(ids, []string{"d-mine", "d-rival"}, "the ids at positions 1 and 2")
 	ctx.Equal(chain["length"], "2", "length")
-	expect(ctx, mustVerify(ctx, 1), true, 2, 0, "after the race (the second link must be computed from the first)")
+	hExpect(ctx, hMustVerify(ctx, 1), true, 2, 0, "after the race (the second link must be computed from the first)")
 	// Under contention: eight writes from other replicas, each landing right after one of this append's
 	// commands, so up to four of its compare-and-sets lose; the fifth attempt (MAX_APPEND_ATTEMPTS) still lands.
 	const busy = "audit:chain:t2"
@@ -951,45 +951,45 @@ func CheckCasAppend(ctx *harness.Ctx) {
 		chain := ctx.Redis.HGetAll(busy)
 		length, _ := strconv.Atoi(chain["length"])
 		position := length + 1
-		link := digest.LinkDigest(chain["head"], recDigest(100+landed), int64(position))
+		link := digest.LinkDigest(chain["head"], hRecDigest(100+landed), int64(position))
 		p := strconv.Itoa(position)
-		ctx.Redis.Do("HSET", busy, "rec:"+p, recDigest(100+landed), "link:"+p, link, "id:"+p, fmt.Sprintf("d-r%d", landed), "head", link, "length", p)
+		ctx.Redis.Do("HSET", busy, "rec:"+p, hRecDigest(100+landed), "link:"+p, link, "id:"+p, fmt.Sprintf("d-r%d", landed), "head", link, "length", p)
 		if landed < 8 {
 			ctx.Redis.After(busy, replica)
 		}
 		return nil
 	}
 	ctx.Redis.After(busy, replica)
-	late, err := appendEntry(stateBg, "t2", "d-late", recDigest(50))
+	late, err := appendEntry(hStateBg, "t2", "d-late", hRecDigest(50))
 	ctx.NoError(err, "an append whose compare-and-set lost to other replicas four times failed: it reads again and retries, up to MAX_APPEND_ATTEMPTS = 5 attempts")
 	next := int64(landed + 1)
 	id, _ := ctx.Redis.HGet(busy, "id:"+strconv.FormatInt(next, 10))
 	ctx.Assert(late.Position == next && id == "d-late", "after other replicas took positions 1 to %d the append answered %+v, expected position %d: it reads again and retries, up to MAX_APPEND_ATTEMPTS = 5 attempts", landed, late, next)
-	contended, err := verifyChain(stateBg, "t2", 1)
+	contended, err := verifyChain(hStateBg, "t2", 1)
 	ctx.NoError(err, "verifyChain(t2, 1) failed")
-	expect(ctx, contended, true, next, 0, "after the contended append")
+	hExpect(ctx, contended, true, next, 0, "after the contended append")
 }
 
 func CheckNoTtl(ctx *harness.Ctx) {
-	mustAppend(ctx, "d-1", 1)
-	ctx.Equal(ctx.Redis.TTL(stateKey), int64(-1), "%s must have no TTL: the audit trail is retained, not cached; its TTL", stateKey)
+	hMustAppend(ctx, "d-1", 1)
+	ctx.Equal(ctx.Redis.TTL(kHStateKey), int64(-1), "%s must have no TTL: the audit trail is retained, not cached; its TTL", kHStateKey)
 	ctx.Clock.Advance(3 * 86400)
-	ctx.Equal(ctx.Redis.Exists(stateKey), int64(1), "three days later the chain must still exist")
-	ctx.Equal(mustAppend(ctx, "d-2", 2).Position, int64(2), "an append three days later must continue the chain; its position")
+	ctx.Equal(ctx.Redis.Exists(kHStateKey), int64(1), "three days later the chain must still exist")
+	ctx.Equal(hMustAppend(ctx, "d-2", 2).Position, int64(2), "an append three days later must continue the chain; its position")
 }
 
 func CheckFirstDivergence(ctx *harness.Ctx) {
 	for n := 1; n <= 4; n++ {
-		mustAppend(ctx, fmt.Sprintf("d-%d", n), n)
+		hMustAppend(ctx, fmt.Sprintf("d-%d", n), n)
 	}
-	expect(ctx, mustVerify(ctx, 1), true, 4, 0, "on an intact chain of 4,")
-	expect(ctx, mustVerify(ctx, 3), true, 2, 0, "from position 3 of 4 (expected 2 links covered),")
-	original, _ := ctx.Redis.HGet(stateKey, "rec:3")
-	ctx.Redis.Do("HSET", stateKey, "rec:3", recDigest(33)) // someone rewrote record 3's digest
-	expect(ctx, mustVerify(ctx, 1), false, 2, 3, "with rec:3 rewritten (expected invalid, 2 links covered, first divergence at 3),")
-	ctx.Redis.Do("HSET", stateKey, "rec:3", original)
-	ctx.Redis.Do("HDEL", stateKey, "link:4")
-	expect(ctx, mustVerify(ctx, 2), false, 2, 4, "with link:4 missing, from 2 (expected invalid, 2 links covered, first divergence at 4),")
+	hExpect(ctx, hMustVerify(ctx, 1), true, 4, 0, "on an intact chain of 4,")
+	hExpect(ctx, hMustVerify(ctx, 3), true, 2, 0, "from position 3 of 4 (expected 2 links covered),")
+	original, _ := ctx.Redis.HGet(kHStateKey, "rec:3")
+	ctx.Redis.Do("HSET", kHStateKey, "rec:3", hRecDigest(33)) // someone rewrote record 3's digest
+	hExpect(ctx, hMustVerify(ctx, 1), false, 2, 3, "with rec:3 rewritten (expected invalid, 2 links covered, first divergence at 3),")
+	ctx.Redis.Do("HSET", kHStateKey, "rec:3", original)
+	ctx.Redis.Do("HDEL", kHStateKey, "link:4")
+	hExpect(ctx, hMustVerify(ctx, 2), false, 2, 4, "with link:4 missing, from 2 (expected invalid, 2 links covered, first divergence at 4),")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1003,20 +1003,20 @@ func CheckFirstDivergence(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kKey = "audit:chain:t1";
+const std::string kHKey = "audit:chain:t1";
 
-std::string recDigest(int n) { return sha256_hex("record-" + std::to_string(n)); }
+std::string hRecDigest(int n) { return sha256_hex("record-" + std::to_string(n)); }
 
-std::string show(const Verdict& v) {
+std::string hShow(const Verdict& v) {
   return "{valid " + std::string(v.valid ? "true" : "false") + ", chain_length " + std::to_string(v.chain_length) + ", first_divergence " +
          (v.first_divergence ? std::to_string(*v.first_divergence) : "none") + "}";
 }
 
-void expect(harness::Ctx& ctx, const Verdict& got, bool valid, long length, std::optional<long> divergence, const std::string& what) {
-  ctx.Assert(got.valid == valid && got.chain_length == length && got.first_divergence == divergence, "%s verifyChain answered %s", what, show(got));
+void hExpect(harness::Ctx& ctx, const Verdict& got, bool valid, long length, std::optional<long> divergence, const std::string& what) {
+  ctx.Assert(got.valid == valid && got.chain_length == length && got.first_divergence == divergence, "%s verifyChain answered %s", what, hShow(got));
 }
 
-std::string field(const std::map<std::string, std::string>& chain, const std::string& name) {
+std::string hField(const std::map<std::string, std::string>& chain, const std::string& name) {
   const auto it = chain.find(name);
   return it == chain.end() ? "" : it->second;
 }
@@ -1025,43 +1025,43 @@ std::string field(const std::map<std::string, std::string>& chain, const std::st
 
 void CheckChainLink(harness::Ctx& ctx) {
   std::vector<Entry> answers;
-  for (int n = 1; n <= 3; n++) answers.push_back(appendEntry("t1", "d-" + std::to_string(n), recDigest(n)));
-  const auto chain = ctx.Redis.HGetAll(kKey);
+  for (int n = 1; n <= 3; n++) answers.push_back(appendEntry("t1", "d-" + std::to_string(n), hRecDigest(n)));
+  const auto chain = ctx.Redis.HGetAll(kHKey);
   std::string prev;
   for (int n = 1; n <= 3; n++) {
     const std::string i = std::to_string(n);
-    ctx.Assert(field(chain, "rec:" + i) == recDigest(n) && field(chain, "id:" + i) == "d-" + i, "position %d holds rec %q and id %q, expected the digest and id of d-%d", n, field(chain, "rec:" + i), field(chain, "id:" + i), n);
-    const std::string want = digest::linkDigest(prev, recDigest(n), n);
-    ctx.Equal(field(chain, "link:" + i), want, "link:%d must be linkDigest(link:%d, rec:%d, %d): a link that ignores the one before it lets an edited record keep a valid link", n, n - 1, n, n);
+    ctx.Assert(hField(chain, "rec:" + i) == hRecDigest(n) && hField(chain, "id:" + i) == "d-" + i, "position %d holds rec %q and id %q, expected the digest and id of d-%d", n, hField(chain, "rec:" + i), hField(chain, "id:" + i), n);
+    const std::string want = digest::linkDigest(prev, hRecDigest(n), n);
+    ctx.Equal(hField(chain, "link:" + i), want, "link:%d must be linkDigest(link:%d, rec:%d, %d): a link that ignores the one before it lets an edited record keep a valid link", n, n - 1, n, n);
     ctx.Assert(answers[n - 1].position == n && answers[n - 1].digest == want, "append %d answered position %d digest %s, expected position %d and its link", n, answers[n - 1].position, answers[n - 1].digest, n);
     prev = want;
   }
-  ctx.Assert(field(chain, "head") == prev && field(chain, "length") == "3", "head is %q and length %q, expected the link at position 3 and 3", field(chain, "head"), field(chain, "length"));
+  ctx.Assert(hField(chain, "head") == prev && hField(chain, "length") == "3", "head is %q and length %q, expected the link at position 3 and 3", hField(chain, "head"), hField(chain, "length"));
 }
 
 void CheckCasAppend(harness::Ctx& ctx) {
   // A second auditd replica appends right after this one read the chain.
   auto theirs = std::make_shared<std::optional<Entry>>();
   auto failed = std::make_shared<std::string>();
-  ctx.Redis.After(kKey, [theirs, failed] {
+  ctx.Redis.After(kHKey, [theirs, failed] {
     try {
-      *theirs = appendEntry("t1", "d-rival", recDigest(9));
+      *theirs = appendEntry("t1", "d-rival", hRecDigest(9));
     } catch (const std::exception& e) {
       *failed = e.what();
     }
   });
-  const Entry mine = appendEntry("t1", "d-mine", recDigest(1));
+  const Entry mine = appendEntry("t1", "d-mine", hRecDigest(1));
   ctx.Assert(failed->empty(), "the rival append failed: %s", *failed);
-  ctx.Assert(theirs->has_value(), "nothing touched %s", kKey);
+  ctx.Assert(theirs->has_value(), "nothing touched %s", kHKey);
   std::vector<long> positions = {mine.position, (*theirs)->position};
   std::sort(positions.begin(), positions.end());
   ctx.Equal(positions, {1L, 2L}, "two appends that landed together must get positions 1 and 2 (one record overwrote the other: the write must check that the chain still ends where the append read it); positions");
-  const auto chain = ctx.Redis.HGetAll(kKey);
-  std::vector<std::string> ids = {field(chain, "id:1"), field(chain, "id:2")};
+  const auto chain = ctx.Redis.HGetAll(kHKey);
+  std::vector<std::string> ids = {hField(chain, "id:1"), hField(chain, "id:2")};
   std::sort(ids.begin(), ids.end());
   ctx.Equal(ids, {std::string("d-mine"), std::string("d-rival")}, "the ids at positions 1 and 2");
-  ctx.Equal(field(chain, "length"), "2", "length");
-  expect(ctx, verifyChain("t1", 1), true, 2, std::nullopt, "after the race (the second link must be computed from the first)");
+  ctx.Equal(hField(chain, "length"), "2", "length");
+  hExpect(ctx, verifyChain("t1", 1), true, 2, std::nullopt, "after the race (the second link must be computed from the first)");
   // Under contention: eight writes from other replicas, each landing right after one of this append's
   // commands, so up to four of its compare-and-sets lose; the fifth attempt (MAX_APPEND_ATTEMPTS) still lands.
   const std::string busy = "audit:chain:t2";
@@ -1070,45 +1070,45 @@ void CheckCasAppend(harness::Ctx& ctx) {
   *replica = [&ctx, busy, landed, replica] {
     const int n = ++*landed;
     const auto chain = ctx.Redis.HGetAll(busy);
-    const std::string length = field(chain, "length");
+    const std::string length = hField(chain, "length");
     const long position = (length.empty() ? 0 : std::stol(length)) + 1;
-    const std::string link = digest::linkDigest(field(chain, "head"), recDigest(100 + n), position);
+    const std::string link = digest::linkDigest(hField(chain, "head"), hRecDigest(100 + n), position);
     const std::string p = std::to_string(position);
-    ctx.Redis.Do("HSET", busy, "rec:" + p, recDigest(100 + n), "link:" + p, link, "id:" + p, "d-r" + std::to_string(n), "head", link, "length", p);
+    ctx.Redis.Do("HSET", busy, "rec:" + p, hRecDigest(100 + n), "link:" + p, link, "id:" + p, "d-r" + std::to_string(n), "head", link, "length", p);
     if (n < 8) ctx.Redis.After(busy, *replica);
   };
   ctx.Redis.After(busy, *replica);
   std::optional<Entry> late;
   std::string error;
   try {
-    late = appendEntry("t2", "d-late", recDigest(50));
+    late = appendEntry("t2", "d-late", hRecDigest(50));
   } catch (const std::exception& e) {
     error = e.what();
   }
   ctx.Assert(error.empty(), "an append whose compare-and-set lost to other replicas four times failed (%s): it reads again and retries, up to MAX_APPEND_ATTEMPTS = 5 attempts", error);
   const long next = *landed + 1;
   ctx.Assert(late && late->position == next && ctx.Redis.HGet(busy, "id:" + std::to_string(next)).value_or("") == "d-late", "after other replicas took positions 1 to %d the append answered position %d, expected %d: it reads again and retries, up to MAX_APPEND_ATTEMPTS = 5 attempts", *landed, late ? late->position : 0L, next);
-  expect(ctx, verifyChain("t2", 1), true, next, std::nullopt, "after the contended append");
+  hExpect(ctx, verifyChain("t2", 1), true, next, std::nullopt, "after the contended append");
 }
 
 void CheckNoTtl(harness::Ctx& ctx) {
-  appendEntry("t1", "d-1", recDigest(1));
-  ctx.Equal(ctx.Redis.TTL(kKey), -1, "%s must have no TTL: the audit trail is retained, not cached; its TTL", kKey);
+  appendEntry("t1", "d-1", hRecDigest(1));
+  ctx.Equal(ctx.Redis.TTL(kHKey), -1, "%s must have no TTL: the audit trail is retained, not cached; its TTL", kHKey);
   ctx.Clock.Advance(3 * 86400);
-  ctx.Equal(ctx.Redis.Exists(kKey), 1, "three days later the chain must still exist");
-  ctx.Equal(appendEntry("t1", "d-2", recDigest(2)).position, 2, "an append three days later must continue the chain; its position");
+  ctx.Equal(ctx.Redis.Exists(kHKey), 1, "three days later the chain must still exist");
+  ctx.Equal(appendEntry("t1", "d-2", hRecDigest(2)).position, 2, "an append three days later must continue the chain; its position");
 }
 
 void CheckFirstDivergence(harness::Ctx& ctx) {
-  for (int n = 1; n <= 4; n++) appendEntry("t1", "d-" + std::to_string(n), recDigest(n));
-  expect(ctx, verifyChain("t1", 1), true, 4, std::nullopt, "on an intact chain of 4,");
-  expect(ctx, verifyChain("t1", 3), true, 2, std::nullopt, "from position 3 of 4 (expected 2 links covered),");
-  const std::string original = ctx.Redis.HGet(kKey, "rec:3").value_or("");
-  ctx.Redis.Do("HSET", kKey, "rec:3", recDigest(33));  // someone rewrote record 3's digest
-  expect(ctx, verifyChain("t1", 1), false, 2, 3L, "with rec:3 rewritten (expected invalid, 2 links covered, first divergence at 3),");
-  ctx.Redis.Do("HSET", kKey, "rec:3", original);
-  ctx.Redis.Do("HDEL", kKey, "link:4");
-  expect(ctx, verifyChain("t1", 2), false, 2, 4L, "with link:4 missing, from 2 (expected invalid, 2 links covered, first divergence at 4),");
+  for (int n = 1; n <= 4; n++) appendEntry("t1", "d-" + std::to_string(n), hRecDigest(n));
+  hExpect(ctx, verifyChain("t1", 1), true, 4, std::nullopt, "on an intact chain of 4,");
+  hExpect(ctx, verifyChain("t1", 3), true, 2, std::nullopt, "from position 3 of 4 (expected 2 links covered),");
+  const std::string original = ctx.Redis.HGet(kHKey, "rec:3").value_or("");
+  ctx.Redis.Do("HSET", kHKey, "rec:3", hRecDigest(33));  // someone rewrote record 3's digest
+  hExpect(ctx, verifyChain("t1", 1), false, 2, 3L, "with rec:3 rewritten (expected invalid, 2 links covered, first divergence at 3),");
+  ctx.Redis.Do("HSET", kHKey, "rec:3", original);
+  ctx.Redis.Do("HDEL", kHKey, "link:4");
+  hExpect(ctx, verifyChain("t1", 2), false, 2, 4L, "with link:4 missing, from 2 (expected invalid, 2 links covered, first divergence at 4),");
 }
 `,
   },

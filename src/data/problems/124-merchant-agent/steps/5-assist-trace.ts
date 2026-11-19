@@ -977,25 +977,25 @@ import (
 )
 
 const (
-	traceTopic    = "assist.trace"
-	traceCustomer = "Jane Okafor, jane.okafor@example.com"
+	kHTraceTopic    = "assist.trace"
+	kHTraceCustomer = "Jane Okafor, jane.okafor@example.com"
 )
 
-func traceTurn(turnID, shop string) trace.TurnRecord {
-	result, _ := json.Marshal(map[string]any{"customers": []string{traceCustomer}})
+func hTraceTurn(turnID, shop string) trace.TurnRecord {
+	result, _ := json.Marshal(map[string]any{"customers": []string{kHTraceCustomer}})
 	return trace.TurnRecord{
-		TurnID: turnID, Shop: shop, Page: "customers", Message: "which customers spend like " + traceCustomer + "?",
+		TurnID: turnID, Shop: shop, Page: "customers", Message: "which customers spend like " + kHTraceCustomer + "?",
 		ToolsUsed: []string{"segment_customers"}, ToolResults: []string{string(result)}, LatencyMs: 840, Tokens: 2400, JudgeScore: 0.92,
 	}
 }
 
-func tracePublish(ctx *harness.Ctx, turn trace.TurnRecord) {
+func hTracePublish(ctx *harness.Ctx, turn trace.TurnRecord) {
 	ctx.NoError(publish(context.Background(), turn), "publish(%s)", turn.TurnID)
 }
 
-func traceIDs(ctx *harness.Ctx) []string {
+func hTraceIDs(ctx *harness.Ctx) []string {
 	ids := []string{}
-	for _, r := range ctx.Kafka.Records(traceTopic) {
+	for _, r := range ctx.Kafka.Records(kHTraceTopic) {
 		var v map[string]any
 		json.Unmarshal(r.Value, &v)
 		id, _ := v["turn_id"].(string)
@@ -1004,7 +1004,7 @@ func traceIDs(ctx *harness.Ctx) []string {
 	return ids
 }
 
-func traceOutbox(ctx *harness.Ctx) []map[string]any {
+func hTraceOutbox(ctx *harness.Ctx) []map[string]any {
 	rows := []map[string]any{}
 	for _, row := range ctx.Redis.LRange("outbox:assist.trace", 0, -1) {
 		var v map[string]any
@@ -1015,13 +1015,13 @@ func traceOutbox(ctx *harness.Ctx) []map[string]any {
 }
 
 func CheckShopKey(ctx *harness.Ctx) {
-	tracePublish(ctx, traceTurn("t-1", "s1"))
-	tracePublish(ctx, traceTurn("t-2", "s2"))
-	tracePublish(ctx, traceTurn("t-3", "s1"))
+	hTracePublish(ctx, hTraceTurn("t-1", "s1"))
+	hTracePublish(ctx, hTraceTurn("t-2", "s2"))
+	hTracePublish(ctx, hTraceTurn("t-3", "s1"))
 	ctx.Settle()
-	records := ctx.Kafka.Records(traceTopic)
-	ctx.Equal(len(records), 3, "three turns must produce three records on %s; records", traceTopic)
-	keys := ctx.Kafka.Keys(traceTopic)
+	records := ctx.Kafka.Records(kHTraceTopic)
+	ctx.Equal(len(records), 3, "three turns must produce three records on %s; records", kHTraceTopic)
+	keys := ctx.Kafka.Keys(kHTraceTopic)
 	sort.Strings(keys)
 	ctx.Equal(keys, []string{"s1", "s1", "s2"}, "records must be keyed by the shop (keyed by turn id, one shop's traces scatter across partitions)")
 	var s1 []int
@@ -1046,23 +1046,23 @@ func CheckShopKey(ctx *harness.Ctx) {
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(traceTopic, 1)
-	tracePublish(ctx, traceTurn("t-1", "s1"))
+	ctx.Kafka.LoseAcks(kHTraceTopic, 1)
+	hTracePublish(ctx, hTraceTurn("t-1", "s1"))
 	ctx.Settle()
-	ctx.Equal(traceIDs(ctx), []string{"t-1"}, "after one produce whose acknowledgement was lost the topic must hold the trace once (enable.idempotence); the records")
-	tracePublish(ctx, traceTurn("t-2", "s1"))
+	ctx.Equal(hTraceIDs(ctx), []string{"t-1"}, "after one produce whose acknowledgement was lost the topic must hold the trace once (enable.idempotence); the records")
+	hTracePublish(ctx, hTraceTurn("t-2", "s1"))
 	ctx.Settle()
-	ctx.Kafka.Failover(traceTopic)
-	ctx.Equal(traceIDs(ctx), []string{"t-1", "t-2"}, "a leader failover right after the acknowledgement must keep the trace (acks=all); the records")
+	ctx.Kafka.Failover(kHTraceTopic)
+	ctx.Equal(hTraceIDs(ctx), []string{"t-1", "t-2"}, "a leader failover right after the acknowledgement must keep the trace (acks=all); the records")
 }
 
 func CheckNoMerchantData(ctx *harness.Ctx) {
 	var logged bytes.Buffer
 	log.SetOutput(&logged)
-	tracePublish(ctx, traceTurn("t-1", "s1"))
+	hTracePublish(ctx, hTraceTurn("t-1", "s1"))
 	ctx.Settle()
 	log.SetOutput(os.Stderr)
-	records := ctx.Kafka.Records(traceTopic)
+	records := ctx.Kafka.Records(kHTraceTopic)
 	ctx.Equal(len(records), 1, "one turn; records")
 	value := string(records[0].Value)
 	ctx.Assert(!strings.Contains(value, "Okafor") && !strings.Contains(value, "spend like"), "the trace carries the merchant's words or a tool's customer list: %s", value)
@@ -1072,19 +1072,19 @@ func CheckNoMerchantData(ctx *harness.Ctx) {
 		_, has := event[k]
 		ctx.Assert(!has, "the trace has the field %s: a topic is retained and readable by every consumer group", k)
 	}
-	ctx.Equal(traceFieldNames(event), traceFields(), "the event holds exactly the eight trace fields, an allow-list; its fields")
+	ctx.Equal(hTraceFieldNames(event), hTraceFields(), "the event holds exactly the eight trace fields, an allow-list; its fields")
 	ctx.Assert(!strings.Contains(logged.String(), "Okafor") && !strings.Contains(logged.String(), "spend like"), "a log line carries the merchant's message: %q", strings.TrimSpace(logged.String()))
 }
 
 // traceFields is the eight trace fields, sorted.
-func traceFields() []string {
+func hTraceFields() []string {
 	fields := []string{"turn_id", "shop", "page", "tools_used", "latency_ms", "tokens", "judge_score", "prompt_version"}
 	sort.Strings(fields)
 	return fields
 }
 
 // traceFieldNames is the event's field names, sorted.
-func traceFieldNames(event map[string]any) []string {
+func hTraceFieldNames(event map[string]any) []string {
 	names := []string{}
 	for k := range event {
 		names = append(names, k)
@@ -1094,36 +1094,36 @@ func traceFieldNames(event map[string]any) []string {
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(traceTopic, 1)
+	ctx.Kafka.FailNext(kHTraceTopic, 1)
 	func() {
 		defer func() {
 			if e := recover(); e != nil {
 				ctx.Fatalf("publish panicked when the broker refused the record: %v. Write the event to the outbox instead", e)
 			}
 		}()
-		tracePublish(ctx, traceTurn("t-9", "s1"))
+		hTracePublish(ctx, hTraceTurn("t-9", "s1"))
 	}()
 	ctx.Settle()
-	rows := traceOutbox(ctx)
+	rows := hTraceOutbox(ctx)
 	ctx.Assert(len(rows) > 0, "the broker refused the record and nothing reached outbox:assist.trace: read the delivery report (TopicPartition.Error) and call outbox.Insert")
 	event, _ := rows[0]["event"].(map[string]any)
 	ctx.Assert(event["turn_id"] == "t-9" && rows[0]["reason"] != "", "the outbox row carries the event and the reason: %v", rows[0])
-	ctx.Equal(traceFieldNames(event), traceFields(), "the outbox row holds the same event as the topic would, the eight trace fields and no merchant data; its fields")
-	tracePublish(ctx, traceTurn("t-10", "s1"))
+	ctx.Equal(hTraceFieldNames(event), hTraceFields(), "the outbox row holds the same event as the topic would, the eight trace fields and no merchant data; its fields")
+	hTracePublish(ctx, hTraceTurn("t-10", "s1"))
 	ctx.Settle()
-	ctx.Equal(traceIDs(ctx), []string{"t-10"}, "a healthy produce reaches the topic; the records")
-	ctx.Equal(len(traceOutbox(ctx)), 1, "a delivered record must not be written to the outbox; the rows")
+	ctx.Equal(hTraceIDs(ctx), []string{"t-10"}, "a healthy produce reaches the topic; the records")
+	ctx.Equal(len(hTraceOutbox(ctx)), 1, "a delivered record must not be written to the outbox; the rows")
 }
 
 func CheckInsertBeforeCommit(ctx *harness.Ctx) {
 	for i, shop := range []string{"s1", "s1", "s2"} {
 		value, _ := json.Marshal(map[string]any{"turn_id": "t-" + string(rune('0'+i)), "shop": shop, "page": "home", "tools_used": []string{}, "latency_ms": 500, "tokens": 900, "judge_score": 0.9, "prompt_version": "sk-prompt-14"})
-		ctx.Kafka.Seed(traceTopic, shop, string(value))
+		ctx.Kafka.Seed(kHTraceTopic, shop, string(value))
 	}
 	// The ground-truth set refuses the insert (gtx:candidates is not a list): nothing may be committed past it.
 	ctx.Redis.Set("gtx:candidates", "not a list")
 	ctx.Drain(func() { runGtxBuilder(context.Background()) })
-	lag := ctx.Kafka.Lag("gtx-builder", traceTopic)
+	lag := ctx.Kafka.Lag("gtx-builder", kHTraceTopic)
 	ctx.Assert(lag == 3, "every insert failed and the gtx-builder committed past them (lag %d, not 3): a failed insert must not be committed, or a restart never retries it", lag)
 	ctx.Redis.Del("gtx:candidates")
 	var atCommit []int64
@@ -1132,7 +1132,7 @@ func CheckInsertBeforeCommit(ctx *harness.Ctx) {
 	ctx.Assert(len(atCommit) > 0, "the gtx-builder never committed an offset")
 	ctx.Assert(atCommit[0] >= 1, "at the first commit the ground-truth candidates held %d rows: insert before you commit, or a crash in between skips the trace", atCommit[0])
 	ctx.Equal(ctx.Redis.LLen("gtx:candidates"), int64(3), "three traces must become three candidates; candidates")
-	ctx.Equal(ctx.Kafka.Lag("gtx-builder", traceTopic), 0, "every inserted trace must be committed; the lag")
+	ctx.Equal(ctx.Kafka.Lag("gtx-builder", kHTraceTopic), 0, "every inserted trace must be committed; the lag")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1149,30 +1149,30 @@ func CheckInsertBeforeCommit(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTraceTopic = "assist.trace";
-const std::string kCustomer = "Jane Okafor, jane.okafor@example.com";
+const std::string kHTraceTopic = "assist.trace";
+const std::string kHCustomer = "Jane Okafor, jane.okafor@example.com";
 
-trace::TurnRecord traceTurn(const std::string& turn_id, const std::string& shop) {
+trace::TurnRecord hTraceTurn(const std::string& turn_id, const std::string& shop) {
   trace::TurnRecord t;
   t.turn_id = turn_id;
   t.shop = shop;
   t.page = "customers";
-  t.message = "which customers spend like " + kCustomer + "?";
+  t.message = "which customers spend like " + kHCustomer + "?";
   t.tools_used = {"segment_customers"};
-  t.tool_results = {nlohmann::json({{"customers", {kCustomer}}}).dump()};
+  t.tool_results = {nlohmann::json({{"customers", {kHCustomer}}}).dump()};
   t.latency_ms = 840;
   t.tokens = 2400;
   t.judge_score = 0.92;
   return t;
 }
 
-void traceSettle(harness::Ctx& ctx) {
+void hTraceSettle(harness::Ctx& ctx) {
   ctx.Settle();
   producer->poll(0);  // the service loop serves delivery reports between turns
 }
 
 // The event's field names, sorted (nlohmann::json keeps an object's keys sorted).
-std::vector<std::string> traceFieldNames(const nlohmann::json& event) {
+std::vector<std::string> hTraceFieldNames(const nlohmann::json& event) {
   std::vector<std::string> names;
   if (event.is_object()) {
     for (const auto& [k, v] : event.items()) names.push_back(k);
@@ -1180,18 +1180,18 @@ std::vector<std::string> traceFieldNames(const nlohmann::json& event) {
   return names;
 }
 
-const std::vector<std::string> kTraceFields = {"judge_score", "latency_ms", "page", "prompt_version", "shop", "tokens", "tools_used", "turn_id"};
+const std::vector<std::string> kHTraceFields = {"judge_score", "latency_ms", "page", "prompt_version", "shop", "tokens", "tools_used", "turn_id"};
 
-std::vector<std::string> traceIDs(harness::Ctx& ctx) {
+std::vector<std::string> hTraceIDs(harness::Ctx& ctx) {
   std::vector<std::string> ids;
-  for (const auto& r : ctx.Kafka.Records(kTraceTopic)) {
+  for (const auto& r : ctx.Kafka.Records(kHTraceTopic)) {
     const auto v = nlohmann::json::parse(r.Value.value_or(""), nullptr, false);
     ids.push_back(v.is_object() ? v.value("turn_id", "") : "");
   }
   return ids;
 }
 
-std::vector<nlohmann::json> traceOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hTraceOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& row : ctx.Redis.LRange("outbox:assist.trace", 0, -1)) rows.push_back(nlohmann::json::parse(row, nullptr, false));
   return rows;
@@ -1200,13 +1200,13 @@ std::vector<nlohmann::json> traceOutbox(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckShopKey(harness::Ctx& ctx) {
-  publish(traceTurn("t-1", "s1"));
-  publish(traceTurn("t-2", "s2"));
-  publish(traceTurn("t-3", "s1"));
-  traceSettle(ctx);
-  const auto records = ctx.Kafka.Records(kTraceTopic);
-  ctx.Equal(records.size(), 3, "three turns must produce three records on %s; records", kTraceTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTraceTopic), {"s1", "s2", "s1"}, "records must be keyed by the shop (keyed by turn id, one shop's traces scatter across partitions)");
+  publish(hTraceTurn("t-1", "s1"));
+  publish(hTraceTurn("t-2", "s2"));
+  publish(hTraceTurn("t-3", "s1"));
+  hTraceSettle(ctx);
+  const auto records = ctx.Kafka.Records(kHTraceTopic);
+  ctx.Equal(records.size(), 3, "three turns must produce three records on %s; records", kHTraceTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHTraceTopic), {"s1", "s2", "s1"}, "records must be keyed by the shop (keyed by turn id, one shop's traces scatter across partitions)");
   ctx.Equal(records[0].Partition, records[2].Partition, "one shop's traces must land on one partition; s1's partitions");
   const auto event = nlohmann::json::parse(records[0].Value.value_or(""), nullptr, false);
   for (const std::string field : {"turn_id", "shop", "page", "tools_used", "latency_ms", "tokens", "judge_score", "prompt_version"}) {
@@ -1217,25 +1217,25 @@ void CheckShopKey(harness::Ctx& ctx) {
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kTraceTopic, 1);
-  publish(traceTurn("t-1", "s1"));
-  traceSettle(ctx);
-  ctx.Equal(traceIDs(ctx), {"t-1"}, "after one produce whose acknowledgement was lost the topic must hold the trace once (enable.idempotence); the records");
-  publish(traceTurn("t-2", "s1"));
-  traceSettle(ctx);
-  ctx.Kafka.Failover(kTraceTopic);
-  ctx.Equal(traceIDs(ctx), {"t-1", "t-2"}, "a leader failover right after the acknowledgement must keep the trace (acks=all); the records");
+  ctx.Kafka.LoseAcks(kHTraceTopic, 1);
+  publish(hTraceTurn("t-1", "s1"));
+  hTraceSettle(ctx);
+  ctx.Equal(hTraceIDs(ctx), {"t-1"}, "after one produce whose acknowledgement was lost the topic must hold the trace once (enable.idempotence); the records");
+  publish(hTraceTurn("t-2", "s1"));
+  hTraceSettle(ctx);
+  ctx.Kafka.Failover(kHTraceTopic);
+  ctx.Equal(hTraceIDs(ctx), {"t-1", "t-2"}, "a leader failover right after the acknowledgement must keep the trace (acks=all); the records");
 }
 
 void CheckNoMerchantData(harness::Ctx& ctx) {
   std::ostringstream logged;
   auto* out = std::cout.rdbuf(logged.rdbuf());
   auto* err = std::cerr.rdbuf(logged.rdbuf());
-  publish(traceTurn("t-1", "s1"));
-  traceSettle(ctx);
+  publish(hTraceTurn("t-1", "s1"));
+  hTraceSettle(ctx);
   std::cout.rdbuf(out);
   std::cerr.rdbuf(err);
-  const auto records = ctx.Kafka.Records(kTraceTopic);
+  const auto records = ctx.Kafka.Records(kHTraceTopic);
   ctx.Equal(records.size(), 1, "one turn; records");
   const std::string value = records[0].Value.value_or("");
   ctx.Assert(value.find("Okafor") == std::string::npos && value.find("spend like") == std::string::npos, "the trace carries the merchant's words or a tool's customer list: %s", value);
@@ -1243,27 +1243,27 @@ void CheckNoMerchantData(harness::Ctx& ctx) {
   for (const std::string k : {"merchant_message", "tool_results", "message"}) {
     ctx.Assert(!event.is_object() || !event.contains(k), "the trace has the field %s: a topic is retained and readable by every consumer group", k);
   }
-  ctx.Equal(traceFieldNames(event), kTraceFields, "the event holds exactly the eight trace fields, an allow-list; its fields");
+  ctx.Equal(hTraceFieldNames(event), kHTraceFields, "the event holds exactly the eight trace fields, an allow-list; its fields");
   ctx.Assert(logged.str().find("Okafor") == std::string::npos && logged.str().find("spend like") == std::string::npos, "a log line carries the merchant's message: %q", logged.str());
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kTraceTopic, 1);
+  ctx.Kafka.FailNext(kHTraceTopic, 1);
   try {
-    publish(traceTurn("t-9", "s1"));
+    publish(hTraceTurn("t-9", "s1"));
   } catch (const std::exception& e) {
     ctx.Fatalf("publish threw when the broker refused the record: %s. Write the event to the outbox instead", e.what());
   }
-  traceSettle(ctx);
-  const auto rows = traceOutbox(ctx);
+  hTraceSettle(ctx);
+  const auto rows = hTraceOutbox(ctx);
   ctx.Assert(!rows.empty(), "the broker refused the record and nothing reached outbox:assist.trace: handle the delivery report (dr_cb) with outbox::insert");
   ctx.Assert(rows[0].is_object() && rows[0].contains("event") && rows[0]["event"].value("turn_id", "") == "t-9" && !rows[0].value("reason", "").empty(),
              "the outbox row carries the event and the reason: %s", rows[0].dump());
-  ctx.Equal(traceFieldNames(rows[0]["event"]), kTraceFields, "the outbox row holds the same event as the topic would, the eight trace fields and no merchant data; its fields");
-  publish(traceTurn("t-10", "s1"));
-  traceSettle(ctx);
-  ctx.Equal(traceIDs(ctx), {"t-10"}, "a healthy produce reaches the topic; the records");
-  ctx.Equal(traceOutbox(ctx).size(), 1, "a delivered record must not be written to the outbox; the rows");
+  ctx.Equal(hTraceFieldNames(rows[0]["event"]), kHTraceFields, "the outbox row holds the same event as the topic would, the eight trace fields and no merchant data; its fields");
+  publish(hTraceTurn("t-10", "s1"));
+  hTraceSettle(ctx);
+  ctx.Equal(hTraceIDs(ctx), {"t-10"}, "a healthy produce reaches the topic; the records");
+  ctx.Equal(hTraceOutbox(ctx).size(), 1, "a delivered record must not be written to the outbox; the rows");
 }
 
 void CheckInsertBeforeCommit(harness::Ctx& ctx) {
@@ -1271,7 +1271,7 @@ void CheckInsertBeforeCommit(harness::Ctx& ctx) {
   for (const std::string shop : {"s1", "s1", "s2"}) {
     const nlohmann::json v = {{"turn_id", "t-" + std::to_string(i++)}, {"shop", shop}, {"page", "home"}, {"tools_used", nlohmann::json::array()},
                               {"latency_ms", 500}, {"tokens", 900}, {"judge_score", 0.9}, {"prompt_version", "sk-prompt-14"}};
-    ctx.Kafka.Seed(kTraceTopic, shop, v.dump());
+    ctx.Kafka.Seed(kHTraceTopic, shop, v.dump());
   }
   // The ground-truth set refuses the insert (gtx:candidates is not a list): nothing may be committed past it.
   ctx.Redis.Set("gtx:candidates", "not a list");
@@ -1282,7 +1282,7 @@ void CheckInsertBeforeCommit(harness::Ctx& ctx) {
   } catch (...) {
     // the builder may stop on the failed insert
   }
-  const long long lag = ctx.Kafka.Lag("gtx-builder", kTraceTopic);
+  const long long lag = ctx.Kafka.Lag("gtx-builder", kHTraceTopic);
   ctx.Assert(lag == 3, "every insert failed and the gtx-builder committed past them (lag %d, not 3): a failed insert must not be committed, or a restart never retries it", lag);
   ctx.Redis.Del("gtx:candidates");
   std::vector<long long> atCommit;
@@ -1291,7 +1291,7 @@ void CheckInsertBeforeCommit(harness::Ctx& ctx) {
   ctx.Assert(!atCommit.empty(), "the gtx-builder never committed an offset");
   ctx.Assert(atCommit[0] >= 1, "at the first commit the ground-truth candidates held %d rows: insert before you commit, or a crash in between skips the trace", atCommit[0]);
   ctx.Equal(ctx.Redis.LLen("gtx:candidates"), 3, "three traces must become three candidates; candidates");
-  ctx.Equal(ctx.Kafka.Lag("gtx-builder", kTraceTopic), 0, "every inserted trace must be committed; the lag");
+  ctx.Equal(ctx.Kafka.Lag("gtx-builder", kHTraceTopic), 0, "every inserted trace must be committed; the lag");
 }
 `,
   },

@@ -715,32 +715,32 @@ import (
 	"cronsched/store"
 )
 
-const eventsTopic = "schedule.fired"
+const kHEventsTopic = "schedule.fired"
 
 // eventsWindow is 2026-03-10T09:00:00Z.
-const eventsWindow int64 = 1773133200
+const kHEventsWindow int64 = 1773133200
 
 // eventsSchedule is schedule s{n}; every schedule here runs the same job.
-func eventsSchedule(n int) *store.Schedule {
+func hEventsSchedule(n int) *store.Schedule {
 	return &store.Schedule{ID: fmt.Sprintf("s%d", n), Tenant: "t1", Cron: "*/5 * * * *", Timezone: "UTC", JobRef: "billing.invoice", MisfirePolicy: "skip"}
 }
 
-func eventsPublish(ctx *harness.Ctx, s *store.Schedule, window int64, outcome, reason string) bool {
+func hEventsPublish(ctx *harness.Ctx, s *store.Schedule, window int64, outcome, reason string) bool {
 	ok, err := publishRun(context.Background(), s, window, outcome, reason)
 	ctx.NoError(err, "publishRun")
 	return ok
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	var rows []HEventsRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -748,23 +748,23 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckScheduleKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsSchedule(1), eventsWindow, "fired", "")
-	eventsPublish(ctx, eventsSchedule(2), eventsWindow, "fired", "")
-	eventsPublish(ctx, eventsSchedule(1), eventsWindow+300, "fired", "")
+	hEventsPublish(ctx, hEventsSchedule(1), kHEventsWindow, "fired", "")
+	hEventsPublish(ctx, hEventsSchedule(2), kHEventsWindow, "fired", "")
+	hEventsPublish(ctx, hEventsSchedule(1), kHEventsWindow+300, "fired", "")
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three fired windows must produce three records on schedule.fired; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"s1", "s2", "s1"}, "the records must be keyed by the schedule ids (two schedules of one job must not share an order)")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"s1", "s2", "s1"}, "the records must be keyed by the schedule ids (two schedules of one job must not share an order)")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both s1 records must land on one partition, or the ledger reads s1's windows out of order; the partitions")
 }
 
 func CheckAllOutcomes(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsSchedule(1), eventsWindow, "skipped", "policy_skip")
-	eventsPublish(ctx, eventsSchedule(1), eventsWindow+300, "error", "trigger_failed")
-	eventsPublish(ctx, eventsSchedule(1), eventsWindow+600, "fired", "")
+	hEventsPublish(ctx, hEventsSchedule(1), kHEventsWindow, "skipped", "policy_skip")
+	hEventsPublish(ctx, hEventsSchedule(1), kHEventsWindow+300, "error", "trigger_failed")
+	hEventsPublish(ctx, hEventsSchedule(1), kHEventsWindow+600, "fired", "")
 	ctx.Settle()
 	var got, windows []string
-	for _, text := range ctx.Kafka.Values(eventsTopic) {
+	for _, text := range ctx.Kafka.Values(kHEventsTopic) {
 		var v map[string]any
 		ctx.NoError(json.Unmarshal([]byte(text), &v), "the payload must be JSON")
 		got = append(got, fmt.Sprintf("%v:%v", v["outcome"], v["reason"]))
@@ -776,36 +776,36 @@ func CheckAllOutcomes(ctx *harness.Ctx) {
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	ok := eventsPublish(ctx, eventsSchedule(1), eventsWindow, "fired", "")
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	ok := hEventsPublish(ctx, hEventsSchedule(1), kHEventsWindow, "fired", "")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the run twice (enable.idempotence); the records")
-	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0, "after a lost acknowledgement the idempotent retry delivered the event, yet publishRun returned %v and the outbox holds %v: the relay would publish it a second time", ok, eventsOutbox(ctx))
-	eventsPublish(ctx, eventsSchedule(1), eventsWindow+300, "fired", "")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the run twice (enable.idempotence); the records")
+	ctx.Assert(ok && len(hEventsOutbox(ctx)) == 0, "after a lost acknowledgement the idempotent retry delivered the event, yet publishRun returned %v and the outbox holds %v: the relay would publish it a second time", ok, hEventsOutbox(ctx))
+	hEventsPublish(ctx, hEventsSchedule(1), kHEventsWindow+300, "fired", "")
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ok := eventsPublish(ctx, eventsSchedule(1), eventsWindow-300, "fired", "")
+	ok := hEventsPublish(ctx, hEventsSchedule(1), kHEventsWindow-300, "fired", "")
 	ctx.Settle()
 	ctx.Equal(ok, true, "publishRun's result for a delivered event")
-	ctx.Assert(len(eventsOutbox(ctx)) == 0, "a delivered event left outbox rows %v: the relay would publish it a second time", eventsOutbox(ctx))
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok = eventsPublish(ctx, eventsSchedule(1), eventsWindow, "error", "trigger_failed")
+	ctx.Assert(len(hEventsOutbox(ctx)) == 0, "a delivered event left outbox rows %v: the relay would publish it a second time", hEventsOutbox(ctx))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok = hEventsPublish(ctx, hEventsSchedule(1), kHEventsWindow, "error", "trigger_failed")
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the ledger never learns the window ran; the rows")
 	payload := map[string]any{"schedule_id": "s1", "job_ref": "billing.invoice", "window": "2026-03-10T09:00:00Z", "outcome": "error", "reason": "trigger_failed"}
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "s1" && fmt.Sprint(rows[0].Payload) == fmt.Sprint(payload), "the outbox row is %v, expected the topic, the key s1 and the payload %v", rows[0], payload)
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == "s1" && fmt.Sprint(rows[0].Payload) == fmt.Sprint(payload), "the outbox row is %v, expected the topic, the key s1 and the payload %v", rows[0], payload)
 	ctx.Equal(ok, false, "publishRun's result after a failed delivery")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsPublish(ctx, eventsSchedule(1), eventsWindow+300, "fired", "")
+	ok = hEventsPublish(ctx, hEventsSchedule(1), kHEventsWindow+300, "fired", "")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishRun waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["window"] == "2026-03-10T09:05:00Z", "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishRun's result without a delivery report")
 }
@@ -822,15 +822,15 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "schedule.fired";
-constexpr int64_t kEventsWindow = 1773133200;  // 2026-03-10T09:00:00Z
+const std::string kHEventsTopic = "schedule.fired";
+constexpr int64_t kHEventsWindow = 1773133200;  // 2026-03-10T09:00:00Z
 
 // Schedule s{n}; every schedule here runs the same job.
-cronsched::Schedule eventsSchedule(int n) {
+cronsched::Schedule hEventsSchedule(int n) {
   return cronsched::Schedule{"s" + std::to_string(n), "t1", "*/5 * * * *", "UTC", "billing.invoice", "skip", ""};
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -840,37 +840,37 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
+std::string hEventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckScheduleKey(harness::Ctx& ctx) {
-  publishRun(eventsSchedule(1), kEventsWindow, "fired", "");
-  publishRun(eventsSchedule(2), kEventsWindow, "fired", "");
-  publishRun(eventsSchedule(1), kEventsWindow + 300, "fired", "");
+  publishRun(hEventsSchedule(1), kHEventsWindow, "fired", "");
+  publishRun(hEventsSchedule(2), kHEventsWindow, "fired", "");
+  publishRun(hEventsSchedule(1), kHEventsWindow + 300, "fired", "");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three fired windows must produce three records on schedule.fired; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"s1", "s2", "s1"},
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"s1", "s2", "s1"},
             "the records must be keyed by the schedule ids (two schedules of one job must not share an order)");
   ctx.Equal(records[0].Partition, records[2].Partition,
             "both s1 records must land on one partition, or the ledger reads s1's windows out of order; the partitions");
 }
 
 void CheckAllOutcomes(harness::Ctx& ctx) {
-  publishRun(eventsSchedule(1), kEventsWindow, "skipped", "policy_skip");
-  publishRun(eventsSchedule(1), kEventsWindow + 300, "error", "trigger_failed");
-  publishRun(eventsSchedule(1), kEventsWindow + 600, "fired", "");
+  publishRun(hEventsSchedule(1), kHEventsWindow, "skipped", "policy_skip");
+  publishRun(hEventsSchedule(1), kHEventsWindow + 300, "error", "trigger_failed");
+  publishRun(hEventsSchedule(1), kHEventsWindow + 600, "fired", "");
   ctx.Settle();
   std::vector<std::string> got;
   std::vector<std::string> windows;
-  for (const auto& text : ctx.Kafka.Values(kEventsTopic)) {
+  for (const auto& text : ctx.Kafka.Values(kHEventsTopic)) {
     const auto v = nlohmann::json::parse(text, nullptr, false);
-    got.push_back(eventsField(v, "outcome") + ":" + eventsField(v, "reason"));
-    windows.push_back(eventsField(v, "window"));
-    ctx.Assert(eventsField(v, "schedule_id") == "s1" && eventsField(v, "job_ref") == "billing.invoice",
+    got.push_back(hEventsField(v, "outcome") + ":" + hEventsField(v, "reason"));
+    windows.push_back(hEventsField(v, "window"));
+    ctx.Assert(hEventsField(v, "schedule_id") == "s1" && hEventsField(v, "job_ref") == "billing.invoice",
                "every record must name schedule_id s1 and job_ref billing.invoice: %s", text);
   }
   ctx.Equal(got, {"skipped:policy_skip", "error:trigger_failed", "fired:"},
@@ -880,49 +880,49 @@ void CheckAllOutcomes(harness::Ctx& ctx) {
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  const bool ok = publishRun(eventsSchedule(1), kEventsWindow, "fired", "");
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  const bool ok = publishRun(hEventsSchedule(1), kHEventsWindow, "fired", "");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1,
             "after one lost acknowledgement the producer's retry must not write the run twice (enable.idempotence); the records");
-  ctx.Assert(ok && eventsOutbox(ctx).empty(),
+  ctx.Assert(ok && hEventsOutbox(ctx).empty(),
              "after a lost acknowledgement the idempotent retry delivered the event, yet publishRun returned %v and the outbox holds %d "
              "rows: the relay would publish it a second time",
-             ok, eventsOutbox(ctx).size());
-  publishRun(eventsSchedule(1), kEventsWindow + 300, "fired", "");
+             ok, hEventsOutbox(ctx).size());
+  publishRun(hEventsSchedule(1), kHEventsWindow + 300, "fired", "");
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2,
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2,
             "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  bool ok = publishRun(eventsSchedule(1), kEventsWindow - 300, "fired", "");
+  bool ok = publishRun(hEventsSchedule(1), kHEventsWindow - 300, "fired", "");
   ctx.Settle();
   ctx.Equal(ok, true, "publishRun's result for a delivered event");
-  ctx.Assert(eventsOutbox(ctx).empty(), "a delivered event left %d outbox rows: the relay would publish it a second time", eventsOutbox(ctx).size());
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  ok = publishRun(eventsSchedule(1), kEventsWindow, "error", "trigger_failed");
+  ctx.Assert(hEventsOutbox(ctx).empty(), "a delivered event left %d outbox rows: the relay would publish it a second time", hEventsOutbox(ctx).size());
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  ok = publishRun(hEventsSchedule(1), kHEventsWindow, "error", "trigger_failed");
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the ledger never learns the window ran; the rows");
   const nlohmann::json payload = {{"schedule_id", "s1"},
                                   {"job_ref", "billing.invoice"},
                                   {"window", "2026-03-10T09:00:00Z"},
                                   {"outcome", "error"},
                                   {"reason", "trigger_failed"}};
-  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "s1" && rows[0].contains("payload") &&
+  ctx.Assert(hEventsField(rows[0], "topic") == kHEventsTopic && hEventsField(rows[0], "key") == "s1" && rows[0].contains("payload") &&
                  rows[0]["payload"] == payload,
              "the outbox row is %s, expected the topic, the key s1 and the payload %s", rows[0].dump(), payload.dump());
   ctx.Equal(ok, false, "publishRun's result after a failed delivery");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publishRun(eventsSchedule(1), kEventsWindow + 300, "fired", "");
+  ok = publishRun(hEventsSchedule(1), kHEventsWindow + 300, "fired", "");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publishRun waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row",
              waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "window") == "2026-03-10T09:05:00Z",
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hEventsField(rows[1]["payload"], "window") == "2026-03-10T09:05:00Z",
              "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishRun's result without a delivery report");
 }

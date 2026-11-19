@@ -605,75 +605,75 @@ import (
 	"leetbuild/harness"
 )
 
-const stateKey = "lease:j-1"
+const kHStateKey = "lease:j-1"
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func mustAcquire(ctx *harness.Ctx, jobID string) bool {
-	ok, err := acquire(stateBg, jobID)
+func hMustAcquire(ctx *harness.Ctx, jobID string) bool {
+	ok, err := acquire(hStateBg, jobID)
 	ctx.NoError(err, "acquire(%s)", jobID)
 	return ok
 }
 
-func mustRemaining(ctx *harness.Ctx, jobID string) int {
-	left, err := remaining(stateBg, jobID)
+func hMustRemaining(ctx *harness.Ctx, jobID string) int {
+	left, err := remaining(hStateBg, jobID)
 	ctx.NoError(err, "remaining(%s)", jobID)
 	return left
 }
 
-func mustFinish(ctx *harness.Ctx, jobID, output string) bool {
-	ok, err := finish(stateBg, jobID, 0, output, 120, 64)
+func hMustFinish(ctx *harness.Ctx, jobID, output string) bool {
+	ok, err := finish(hStateBg, jobID, 0, output, 120, 64)
 	ctx.NoError(err, "finish(%s)", jobID)
 	return ok
 }
 
 func CheckAtomicLease(ctx *harness.Ctx) {
-	atWrite := ctx.Redis.After(stateKey, func() any { return ctx.Redis.TTL(stateKey) })
-	ctx.Assert(mustAcquire(ctx, "j-1"), "the first acquire of j-1 must take the lease")
+	atWrite := ctx.Redis.After(kHStateKey, func() any { return ctx.Redis.TTL(kHStateKey) })
+	ctx.Assert(hMustAcquire(ctx, "j-1"), "the first acquire of j-1 must take the lease")
 	ctx.Assert(atWrite.Fired, "acquire never wrote lease:j-1")
 	ttl, _ := atWrite.Result.(int64)
 	ctx.Assert(ttl > 0, "right after acquire's first command lease:j-1 had TTL %v: a runner that dies there leaves a lease that never expires. Set the key and its expiry in one command", atWrite.Result)
-	ctx.Assert(ctx.Redis.TTL(stateKey) >= 299 && ctx.Redis.TTL(stateKey) <= 300, "the lease's TTL is %d, expected maxRuntime = 300 s", ctx.Redis.TTL(stateKey))
+	ctx.Assert(ctx.Redis.TTL(kHStateKey) >= 299 && ctx.Redis.TTL(kHStateKey) <= 300, "the lease's TTL is %d, expected maxRuntime = 300 s", ctx.Redis.TTL(kHStateKey))
 	ctx.Clock.Advance(100)
-	ctx.Assert(!mustAcquire(ctx, "j-1"), "a second acquire of a held lease answered true: two runners would both run j-1")
-	ctx.Assert(ctx.Redis.TTL(stateKey) <= 200, "a second acquire restarted j-1's clock (TTL %d s, 100 s into the lease): only the first acquire sets the deadline", ctx.Redis.TTL(stateKey))
+	ctx.Assert(!hMustAcquire(ctx, "j-1"), "a second acquire of a held lease answered true: two runners would both run j-1")
+	ctx.Assert(ctx.Redis.TTL(kHStateKey) <= 200, "a second acquire restarted j-1's clock (TTL %d s, 100 s into the lease): only the first acquire sets the deadline", ctx.Redis.TTL(kHStateKey))
 }
 
 func CheckLeaseAuthority(ctx *harness.Ctx) {
-	ctx.Assert(mustAcquire(ctx, "j-1"), "the first acquire of j-1 must take the lease")
+	ctx.Assert(hMustAcquire(ctx, "j-1"), "the first acquire of j-1 must take the lease")
 	ctx.Clock.Advance(100)
-	left := mustRemaining(ctx, "j-1")
+	left := hMustRemaining(ctx, "j-1")
 	ctx.Assert(left >= 199 && left <= 200, "100 s into a 300 s lease remaining() answered %d", left)
-	ctx.Redis.Do("EXPIRE", stateKey, 30) // an operator cuts the job's budget
-	left = mustRemaining(ctx, "j-1")
+	ctx.Redis.Do("EXPIRE", kHStateKey, 30) // an operator cuts the job's budget
+	left = hMustRemaining(ctx, "j-1")
 	ctx.Assert(left > 0 && left <= 30, "the lease's TTL is now 30 s and remaining() answered %d: the deadline lives in Redis, not in the runner's memory", left)
-	ctx.Redis.Del(stateKey) // an operator kills the job
-	ctx.Equal(mustRemaining(ctx, "j-1"), 0, "the lease is gone, the job must stop; remaining()")
+	ctx.Redis.Del(kHStateKey) // an operator kills the job
+	ctx.Equal(hMustRemaining(ctx, "j-1"), 0, "the lease is gone, the job must stop; remaining()")
 }
 
 func CheckLateResult(ctx *harness.Ctx) {
-	late := jobs.Create(stateBg, "t1", "gvisor", nil, "print(1)").JobID
-	onTime := jobs.Create(stateBg, "t1", "gvisor", nil, "print(2)").JobID
-	ctx.Assert(mustAcquire(ctx, late), "the first acquire of %s must take the lease", late)
+	late := jobs.Create(hStateBg, "t1", "gvisor", nil, "print(1)").JobID
+	onTime := jobs.Create(hStateBg, "t1", "gvisor", nil, "print(2)").JobID
+	ctx.Assert(hMustAcquire(ctx, late), "the first acquire of %s must take the lease", late)
 	ctx.Clock.Advance(301)
-	ctx.Assert(!mustFinish(ctx, late, "late output"), "finish 301 s into a 300 s lease answered true, expected false")
-	_, stored := jobs.ReadOutput(stateBg, late)
-	ctx.Assert(jobs.Get(stateBg, late).Status != "finished" && !stored, "a result that arrived after the lease was stored: %+v. Discard it", jobs.Get(stateBg, late))
-	ctx.Assert(mustAcquire(ctx, onTime), "the first acquire of %s must take the lease", onTime)
+	ctx.Assert(!hMustFinish(ctx, late, "late output"), "finish 301 s into a 300 s lease answered true, expected false")
+	_, stored := jobs.ReadOutput(hStateBg, late)
+	ctx.Assert(jobs.Get(hStateBg, late).Status != "finished" && !stored, "a result that arrived after the lease was stored: %+v. Discard it", jobs.Get(hStateBg, late))
+	ctx.Assert(hMustAcquire(ctx, onTime), "the first acquire of %s must take the lease", onTime)
 	ctx.Clock.Advance(10)
-	ctx.Assert(mustFinish(ctx, onTime, "on time"), "finish 10 s into the lease answered false, expected true")
-	output, _ := jobs.ReadOutput(stateBg, onTime)
-	ctx.Assert(jobs.Get(stateBg, onTime).Status == "finished" && output == "on time", "a result inside the lease must be stored, the store holds %+v", jobs.Get(stateBg, onTime))
+	ctx.Assert(hMustFinish(ctx, onTime, "on time"), "finish 10 s into the lease answered false, expected true")
+	output, _ := jobs.ReadOutput(hStateBg, onTime)
+	ctx.Assert(jobs.Get(hStateBg, onTime).Status == "finished" && output == "on time", "a result inside the lease must be stored, the store holds %+v", jobs.Get(hStateBg, onTime))
 	ctx.Equal(ctx.Redis.Exists("lease:"+onTime), int64(0), "a finished job must release its lease")
-	raced := jobs.Create(stateBg, "t1", "gvisor", nil, "print(3)").JobID
-	ctx.Assert(mustAcquire(ctx, raced), "the first acquire of %s must take the lease", raced)
+	raced := jobs.Create(hStateBg, "t1", "gvisor", nil, "print(3)").JobID
+	ctx.Assert(hMustAcquire(ctx, raced), "the first acquire of %s must take the lease", raced)
 	ctx.Clock.Advance(10)
 	// A sweeper reclaims the lease right after finish's first command on it: one of the two must lose.
 	sweeper := ctx.Redis.After("lease:"+raced, func() any { return ctx.Redis.Del("lease:" + raced) })
-	mustFinish(ctx, raced, "raced")
+	hMustFinish(ctx, raced, "raced")
 	ctx.Assert(sweeper.Fired, "finish never touched lease:%s", raced)
 	swept, _ := sweeper.Result.(int64)
-	_, stored = jobs.ReadOutput(stateBg, raced)
+	_, stored = jobs.ReadOutput(hStateBg, raced)
 	ctx.Assert(!(swept == 1 && stored), "a sweeper deleted lease:%s right after finish first touched it, and finish still stored the result: the check and the claim must be one command", raced)
 	ctx.Assert(swept == 1 || stored, "finish inside the lease stored nothing although no one else claimed lease:%s", raced)
 }
@@ -686,25 +686,25 @@ func CheckLateResult(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kStateKey = "lease:j-1";
+const std::string kHStateKey = "lease:j-1";
 
 }  // namespace
 
 void CheckAtomicLease(harness::Ctx& ctx) {
   bool fired = false;
   long long at_write = 0;
-  ctx.Redis.After(kStateKey, [&] {
+  ctx.Redis.After(kHStateKey, [&] {
     fired = true;
-    at_write = ctx.Redis.TTL(kStateKey);
+    at_write = ctx.Redis.TTL(kHStateKey);
   });
   ctx.Assert(acquire("j-1"), "the first acquire of j-1 must take the lease");
   ctx.Assert(fired, "acquire never wrote lease:j-1");
   ctx.Assert(at_write > 0, "right after acquire's first command lease:j-1 had TTL %d: a runner that dies there leaves a lease that never expires. Set the key and its expiry in one command", at_write);
-  const long long ttl0 = ctx.Redis.TTL(kStateKey);
+  const long long ttl0 = ctx.Redis.TTL(kHStateKey);
   ctx.Assert(ttl0 >= 299 && ttl0 <= 300, "the lease's TTL is %d, expected kMaxRuntimeS = 300", ttl0);
   ctx.Clock.Advance(100);
   ctx.Assert(!acquire("j-1"), "a second acquire of a held lease answered true: two runners would both run j-1");
-  const long long ttl = ctx.Redis.TTL(kStateKey);
+  const long long ttl = ctx.Redis.TTL(kHStateKey);
   ctx.Assert(ttl <= 200, "a second acquire restarted j-1's clock (TTL %d s, 100 s into the lease): only the first acquire sets the deadline", ttl);
 }
 
@@ -713,10 +713,10 @@ void CheckLeaseAuthority(harness::Ctx& ctx) {
   ctx.Clock.Advance(100);
   long left = remaining("j-1");
   ctx.Assert(left >= 199 && left <= 200, "100 s into a 300 s lease remaining() answered %d", left);
-  ctx.Redis.Do("EXPIRE", kStateKey, 30);  // an operator cuts the job's budget
+  ctx.Redis.Do("EXPIRE", kHStateKey, 30);  // an operator cuts the job's budget
   left = remaining("j-1");
   ctx.Assert(left > 0 && left <= 30, "the lease's TTL is now 30 s and remaining() answered %d: the deadline lives in Redis, not in the runner's memory", left);
-  ctx.Redis.Del(kStateKey);  // an operator kills the job
+  ctx.Redis.Del(kHStateKey);  // an operator kills the job
   ctx.Equal(remaining("j-1"), 0L, "the lease is gone, the job must stop; remaining()");
 }
 

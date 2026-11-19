@@ -1203,96 +1203,96 @@ import (
 )
 
 const (
-	eventsTopic  = "prompt.security"
-	eventsGroup  = "signatures"
-	eventsT      = int64(1_791_201_600) // 2026-10-05 12:00:00 UTC
-	eventsSigA   = "5f1c0a9e2b7d4c13"
-	eventsSigB   = "a07e3d91c4b2f865"
-	eventsAnswer = "The notice period is thirty days."
+	kHEventsTopic  = "prompt.security"
+	kHEventsGroup  = "signatures"
+	kHEventsT      = int64(1_791_201_600) // 2026-10-05 12:00:00 UTC
+	kHEventsSigA   = "5f1c0a9e2b7d4c13"
+	kHEventsSigB   = "a07e3d91c4b2f865"
+	kHEventsAnswer = "The notice period is thirty days."
 )
 
-var eventsHour = eventsT / 3600
+var hEventsHour = kHEventsT / 3600
 
-func eventsDocHash() string {
+func hEventsDocHash() string {
 	sum := sha256.Sum256([]byte("The notice period is thirty days. Either party may end the contract in writing."))
 	return hex.EncodeToString(sum[:])
 }
 
-func eventsServed(rid string) types.Decision {
-	return types.Decision{RequestID: rid, DocumentHash: eventsDocHash(), Answer: eventsAnswer, Spans: []string{eventsAnswer}, Signals: []string{}}
+func hEventsServed(rid string) types.Decision {
+	return types.Decision{RequestID: rid, DocumentHash: hEventsDocHash(), Answer: kHEventsAnswer, Spans: []string{kHEventsAnswer}, Signals: []string{}}
 }
 
-func eventsRefused(rid, signature string) types.Decision {
-	return types.Decision{RequestID: rid, DocumentHash: eventsDocHash(), Answer: "I cannot answer that from this document.", Spans: []string{}, Refused: true, Signals: []string{"secret"}, Signature: signature}
+func hEventsRefused(rid, signature string) types.Decision {
+	return types.Decision{RequestID: rid, DocumentHash: hEventsDocHash(), Answer: "I cannot answer that from this document.", Spans: []string{}, Refused: true, Signals: []string{"secret"}, Signature: signature}
 }
 
-func eventsPublish(ctx *harness.Ctx, user string, d types.Decision) {
+func hEventsPublish(ctx *harness.Ctx, user string, d types.Decision) {
 	publish(context.Background(), user, d)
 	ctx.Settle()
 }
 
-func eventsSeed(ctx *harness.Ctx, user, decision, signature string, ts int64) {
+func hEventsSeed(ctx *harness.Ctx, user, decision, signature string, ts int64) {
 	signals := []string{}
 	if decision == "refused" {
 		signals = []string{"secret"}
 	}
-	ctx.Kafka.Seed(eventsTopic, user, map[string]any{"event_id": fmt.Sprintf("e-%d-%s", ts, user), "user": user, "document_hash": eventsDocHash(), "decision": decision, "signals": signals, "signature": signature, "ts": ts})
+	ctx.Kafka.Seed(kHEventsTopic, user, map[string]any{"event_id": fmt.Sprintf("e-%d-%s", ts, user), "user": user, "document_hash": hEventsDocHash(), "decision": decision, "signals": signals, "signature": signature, "ts": ts})
 }
 
-func eventsValue(ctx *harness.Ctx, r harness.KafkaRecord) map[string]any {
+func hEventsValue(ctx *harness.Ctx, r harness.KafkaRecord) map[string]any {
 	var event map[string]any
 	ctx.Assert(json.Unmarshal(r.Value, &event) == nil, "the record's value is not JSON: %s", r.Value)
 	return event
 }
 
-func eventsDrain(ctx *harness.Ctx) {
+func hEventsDrain(ctx *harness.Ctx) {
 	ctx.Drain(func() { run(context.Background()) })
 }
 
 func CheckUserKey(ctx *harness.Ctx) {
 	started := float64(ctx.Clock.Now() / 1000)
-	eventsPublish(ctx, "u-ana", eventsServed("r-1"))
-	eventsPublish(ctx, "u-ana", eventsRefused("r-2", eventsSigA))
-	eventsPublish(ctx, "u-ben", eventsServed("r-3"))
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 3, "three decisions must leave three events on %s; the records", eventsTopic)
+	hEventsPublish(ctx, "u-ana", hEventsServed("r-1"))
+	hEventsPublish(ctx, "u-ana", hEventsRefused("r-2", kHEventsSigA))
+	hEventsPublish(ctx, "u-ben", hEventsServed("r-3"))
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 3, "three decisions must leave three events on %s; the records", kHEventsTopic)
 	var keys []string
 	for _, r := range records {
 		keys = append(keys, string(r.Key))
 	}
 	ctx.Equal(keys, []string{"u-ana", "u-ana", "u-ben"}, "key each event by the user, so one user's events share a partition and keep their order; the keys")
 	ctx.Equal(records[0].Partition, records[1].Partition, "two events of one user must share a partition")
-	event := eventsValue(ctx, records[1])
+	event := hEventsValue(ctx, records[1])
 	for _, f := range []string{"event_id", "user", "document_hash", "decision", "signals", "signature", "ts"} {
 		_, ok := event[f]
 		ctx.Assert(ok, "the event lacks %s: %s", f, records[1].Value)
 	}
-	ctx.Assert(event["user"] == "u-ana" && event["document_hash"] == eventsDocHash(), "the event names the user and the document hash: %s", records[1].Value)
+	ctx.Assert(event["user"] == "u-ana" && event["document_hash"] == hEventsDocHash(), "the event names the user and the document hash: %s", records[1].Value)
 	signals, _ := event["signals"].([]any)
-	ctx.Assert(event["decision"] == "refused" && len(signals) == 1 && signals[0] == "secret" && event["signature"] == eventsSigA, "a refusal's event carries decision refused, its signals and its signature: %s", records[1].Value)
+	ctx.Assert(event["decision"] == "refused" && len(signals) == 1 && signals[0] == "secret" && event["signature"] == kHEventsSigA, "a refusal's event carries decision refused, its signals and its signature: %s", records[1].Value)
 	now := float64(ctx.Clock.Now() / 1000)
 	ts, _ := event["ts"].(float64)
 	ctx.Assert(ts == float64(int64(ts)) && ts >= started-1 && ts <= now+1, "ts is the decision's time in unix seconds (between %.0f and %.0f), the event says %v: the consumer buckets it by ts / 3600", started, now, event["ts"])
-	ctx.Equal(eventsValue(ctx, records[0])["decision"], "served", "a served decision's event says served")
+	ctx.Equal(hEventsValue(ctx, records[0])["decision"], "served", "a served decision's event says served")
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, "u-ana", eventsRefused("r-2", eventsSigA))
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "a leader failover must not lose the event (acks=all waits for every in-sync replica); the records")
-	eventsPublish(ctx, "u-ana", eventsServed("r-1"))
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "after the failover the producer must keep producing; the records")
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish(ctx, "u-ana", hEventsRefused("r-2", kHEventsSigA))
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "a leader failover must not lose the event (acks=all waits for every in-sync replica); the records")
+	hEventsPublish(ctx, "u-ana", hEventsServed("r-1"))
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "after the failover the producer must keep producing; the records")
 }
 
 func CheckNoText(ctx *harness.Ctx) {
 	var logged bytes.Buffer
 	log.SetOutput(&logged)
-	eventsPublish(ctx, "u-ana", eventsServed("r-1"))
-	eventsPublish(ctx, "u-ben", eventsRefused("r-2", eventsSigA))
-	for _, r := range ctx.Kafka.Records(eventsTopic) {
-		_, has := eventsValue(ctx, r)["answer"]
+	hEventsPublish(ctx, "u-ana", hEventsServed("r-1"))
+	hEventsPublish(ctx, "u-ben", hEventsRefused("r-2", kHEventsSigA))
+	for _, r := range ctx.Kafka.Records(kHEventsTopic) {
+		_, has := hEventsValue(ctx, r)["answer"]
 		ctx.Assert(!has, "the event carries an answer field: %s. The topic is retained and replicated; hashes and signal names are enough", r.Value)
 		ctx.Assert(!strings.Contains(string(r.Value), "thirty days"), "the answer text is in the event: %s", r.Value)
 	}
@@ -1300,17 +1300,17 @@ func CheckNoText(ctx *harness.Ctx) {
 }
 
 func CheckHourBucket(ctx *harness.Ctx) {
-	eventsSeed(ctx, "u-ana", "refused", eventsSigA, eventsT+10)
-	eventsSeed(ctx, "u-ben", "refused", eventsSigA, eventsT+20)
-	eventsSeed(ctx, "u-ana", "served", "", eventsT+30)
-	eventsSeed(ctx, "u-cy", "refused", eventsSigA, eventsT+3_599)
-	eventsSeed(ctx, "u-cy", "refused", eventsSigB, eventsT+3_600)
-	eventsDrain(ctx)
-	thisHour := "signatures:" + strconv.FormatInt(eventsHour, 10)
-	nextHour := "signatures:" + strconv.FormatInt(eventsHour+1, 10)
+	hEventsSeed(ctx, "u-ana", "refused", kHEventsSigA, kHEventsT+10)
+	hEventsSeed(ctx, "u-ben", "refused", kHEventsSigA, kHEventsT+20)
+	hEventsSeed(ctx, "u-ana", "served", "", kHEventsT+30)
+	hEventsSeed(ctx, "u-cy", "refused", kHEventsSigA, kHEventsT+3_599)
+	hEventsSeed(ctx, "u-cy", "refused", kHEventsSigB, kHEventsT+3_600)
+	hEventsDrain(ctx)
+	thisHour := "signatures:" + strconv.FormatInt(hEventsHour, 10)
+	nextHour := "signatures:" + strconv.FormatInt(hEventsHour+1, 10)
 	ctx.Equal(ctx.Redis.Exists("signatures"), 0, "one global signatures hash (%v) cannot show when an attack began: bucket by hour, signatures:{ts / 3600}; EXISTS signatures", ctx.Redis.HGetAll("signatures"))
-	ctx.Equal(ctx.Redis.HGetAll(thisHour), map[string]string{eventsSigA: "3"}, "%s must count %s three times (ts %d + 10, + 20 and + 3599) and nothing for the served decision", thisHour, eventsSigA, eventsT)
-	ctx.Equal(ctx.Redis.HGetAll(nextHour), map[string]string{eventsSigB: "1"}, "%s must count %s once (ts %d + 3600 opens the next hour)", nextHour, eventsSigB, eventsT)
+	ctx.Equal(ctx.Redis.HGetAll(thisHour), map[string]string{kHEventsSigA: "3"}, "%s must count %s three times (ts %d + 10, + 20 and + 3599) and nothing for the served decision", thisHour, kHEventsSigA, kHEventsT)
+	ctx.Equal(ctx.Redis.HGetAll(nextHour), map[string]string{kHEventsSigB: "1"}, "%s must count %s once (ts %d + 3600 opens the next hour)", nextHour, kHEventsSigB, kHEventsT)
 	for _, key := range []string{thisHour, nextHour} {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(ttl >= 7*86_400-60 && ttl <= 7*86_400, "%s has TTL %d: an hourly bucket is kept for 7 days", key, ttl)
@@ -1318,14 +1318,14 @@ func CheckHourBucket(ctx *harness.Ctx) {
 }
 
 func CheckWriteBeforeCommit(ctx *harness.Ctx) {
-	eventsSeed(ctx, "u-ana", "refused", eventsSigA, eventsT+10)
+	hEventsSeed(ctx, "u-ana", "refused", kHEventsSigA, kHEventsT+10)
 	// the next event's bucket is not a hash: its HINCRBY fails WRONGTYPE; a third event follows it
-	eventsSeed(ctx, "u-ana", "refused", eventsSigB, eventsT+7_210)
-	eventsSeed(ctx, "u-ana", "refused", eventsSigA, eventsT+20)
-	ctx.Redis.Set("signatures:"+strconv.FormatInt(eventsHour+2, 10), "not a hash")
-	records := ctx.Kafka.Records(eventsTopic)
+	hEventsSeed(ctx, "u-ana", "refused", kHEventsSigB, kHEventsT+7_210)
+	hEventsSeed(ctx, "u-ana", "refused", kHEventsSigA, kHEventsT+20)
+	ctx.Redis.Set("signatures:"+strconv.FormatInt(hEventsHour+2, 10), "not a hash")
+	records := ctx.Kafka.Records(kHEventsTopic)
 	event, failing := records[0], records[1]
-	thisHour := "signatures:" + strconv.FormatInt(eventsHour, 10)
+	thisHour := "signatures:" + strconv.FormatInt(hEventsHour, 10)
 	type snapshot struct {
 		offsets harness.KafkaOffsets
 		count   string
@@ -1336,25 +1336,25 @@ func CheckWriteBeforeCommit(ctx *harness.Ctx) {
 		for tp, offset := range offsets {
 			snap.offsets[tp] = offset
 		}
-		snap.count, _ = ctx.Redis.HGet(thisHour, eventsSigA)
+		snap.count, _ = ctx.Redis.HGet(thisHour, kHEventsSigA)
 		atCommit = append(atCommit, snap)
 	})
-	eventsDrain(ctx)
+	hEventsDrain(ctx)
 	consumers := ctx.Kafka.Consumers()
 	ctx.Assert(len(consumers) > 0 && !consumers[len(consumers)-1].AutoCommit, "enable.auto.commit is on: offsets would be committed on a timer, before the count")
 	var covering []string
 	for _, snap := range atCommit {
-		if snap.offsets[harness.KafkaTopicPartition{Topic: eventsTopic, Partition: event.Partition}] > event.Offset {
+		if snap.offsets[harness.KafkaTopicPartition{Topic: kHEventsTopic, Partition: event.Partition}] > event.Offset {
 			covering = append(covering, snap.count)
 		}
 	}
 	ctx.Assert(len(covering) > 0, "the event's offset was never committed")
 	ctx.Equal(covering[0], "1", "write the count first, then commit, so a crash replays the event instead of losing it; the count when the offset was committed")
 	for _, snap := range atCommit {
-		offset := snap.offsets[harness.KafkaTopicPartition{Topic: eventsTopic, Partition: failing.Partition}]
+		offset := snap.offsets[harness.KafkaTopicPartition{Topic: kHEventsTopic, Partition: failing.Partition}]
 		ctx.Assert(offset <= failing.Offset, "the second event's count failed (WRONGTYPE) and its offset was committed anyway (to %d): a failed write must leave the event uncommitted, to be read again", offset)
 	}
-	ctx.Equal(ctx.Kafka.CommittedOffset(eventsGroup, eventsTopic, event.Partition), failing.Offset, "the first event, counted, must be committed; the group's offset")
+	ctx.Equal(ctx.Kafka.CommittedOffset(kHEventsGroup, kHEventsTopic, event.Partition), failing.Offset, "the first event, counted, must be committed; the group's offset")
 }
 `,
     cpp: `#include <leetbuild/harness.h>

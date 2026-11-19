@@ -835,22 +835,22 @@ import (
 )
 
 const (
-	clTrace = "4bf92f3577b34da6a3ce929d0e0e4736"
-	clKey   = "trace:" + clTrace
-	clRoot  = "00f067aa0ba902b7"
-	clChild = "00f067aa0ba902b8"
+	kHClTrace = "4bf92f3577b34da6a3ce929d0e0e4736"
+	kHClKey   = "trace:" + kHClTrace
+	kHClRoot  = "00f067aa0ba902b7"
+	kHClChild = "00f067aa0ba902b8"
 )
 
-// storagePeer stores every trace whose spans all name a service and records whether the assembly
+// HStoragePeer stores every trace whose spans all name a service and records whether the assembly
 // state still existed when each write reached it.
-type storagePeer struct {
+type HStoragePeer struct {
 	pb.UnimplementedTraceWriterServer
 	ctx          *harness.Ctx
 	statePresent []bool
 	stored       []*pb.WriteRequest
 }
 
-func (s *storagePeer) Write(_ context.Context, req *pb.WriteRequest) (*pb.WriteReply, error) {
+func (s *HStoragePeer) Write(_ context.Context, req *pb.WriteRequest) (*pb.WriteReply, error) {
 	s.statePresent = append(s.statePresent, s.ctx.Redis.Exists("trace:"+req.GetTraceId()) == 1)
 	for _, span := range req.GetSpans() {
 		if span.GetService() == "" {
@@ -861,37 +861,37 @@ func (s *storagePeer) Write(_ context.Context, req *pb.WriteRequest) (*pb.WriteR
 	return &pb.WriteReply{Stored: int64(len(req.GetSpans()))}, nil
 }
 
-func clientPeer(ctx *harness.Ctx, childService string) *storagePeer {
-	peer := &storagePeer{ctx: ctx}
+func hClientPeer(ctx *harness.Ctx, childService string) *HStoragePeer {
+	peer := &HStoragePeer{ctx: ctx}
 	pb.RegisterTraceWriterServer(ctx.GRPC.Server(""), peer)
 	bg := context.Background()
-	_, err := assembly.InsertSpan(bg, "acme", assembly.Span{TraceID: clTrace, SpanID: clRoot, Service: "checkout", StartMs: 1712345678901, DurationMs: 412})
+	_, err := assembly.InsertSpan(bg, "acme", assembly.Span{TraceID: kHClTrace, SpanID: kHClRoot, Service: "checkout", StartMs: 1712345678901, DurationMs: 412})
 	ctx.NoError(err, "seeding the root span")
-	_, err = assembly.InsertSpan(bg, "acme", assembly.Span{TraceID: clTrace, SpanID: clChild, ParentSpanID: clRoot, Service: childService, StartMs: 1712345678950, DurationMs: 120})
+	_, err = assembly.InsertSpan(bg, "acme", assembly.Span{TraceID: kHClTrace, SpanID: kHClChild, ParentSpanID: kHClRoot, Service: childService, StartMs: 1712345678950, DurationMs: 120})
 	ctx.NoError(err, "seeding the child span")
 	return peer
 }
 
-func flushOnce(ctx *harness.Ctx) (flushResult, bool) {
+func hFlushOnce(ctx *harness.Ctx) (flushResult, bool) {
 	var result flushResult
 	var err error
-	returned := ctx.Drain(func() { result, err = flushTrace(context.Background(), clTrace) })
+	returned := ctx.Drain(func() { result, err = flushTrace(context.Background(), kHClTrace) })
 	if returned {
 		ctx.NoError(err, "flushTrace")
 	}
 	return result, returned
 }
 
-func mustFlush(ctx *harness.Ctx, why string) flushResult {
-	result, returned := flushOnce(ctx)
+func hMustFlush(ctx *harness.Ctx, why string) flushResult {
+	result, returned := hFlushOnce(ctx)
 	ctx.Assert(returned, "%s: flushTrace never returned, it kept retrying until the runtime stopped it", why)
 	return result
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientPeer(ctx, "payments")
+	hClientPeer(ctx, "payments")
 	ctx.GRPC.SetLatency("Write", 10.0, "")
-	result, returned := flushOnce(ctx)
+	result, returned := hFlushOnce(ctx)
 	calls := ctx.GRPC.CallsTo("Write", "")
 	ctx.Assert(len(calls) > 0, "flushTrace never called Write")
 	for _, call := range calls {
@@ -901,15 +901,15 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Assert(returned, "with storage stalled flushTrace never returned")
 	ctx.Assert(len(calls) == 3, "with storage stalled flushTrace called Write %d times, expected MAX_ATTEMPTS = 3: DEADLINE_EXCEEDED is retried, and every attempt gets its own 2 s", len(calls))
 	ctx.Assert(result.Kept && !result.Flushed, "every write timed out, so the trace must be kept for the next cycle; flushTrace answered %+v", result)
-	ctx.Equal(ctx.Redis.Exists(clKey), 1, "the writes timed out; the trace must still be in Redis")
+	ctx.Equal(ctx.Redis.Exists(kHClKey), 1, "the writes timed out; the trace must still be in Redis")
 	ctx.GRPC.SetLatency("Write", 0, "")
-	again := mustFlush(ctx, "with storage answering again")
+	again := hMustFlush(ctx, "with storage answering again")
 	ctx.Assert(again.Flushed, "once storage answers, the kept trace must be written; flushTrace answered %+v", again)
 }
 
 func CheckDeleteAfterConfirm(ctx *harness.Ctx) {
-	peer := clientPeer(ctx, "payments")
-	result := mustFlush(ctx, "with storage healthy")
+	peer := hClientPeer(ctx, "payments")
+	result := hMustFlush(ctx, "with storage healthy")
 	ctx.Assert(len(peer.statePresent) > 0, "flushTrace never reached storage")
 	ctx.Assert(peer.statePresent[0], "the trace's Redis state was already deleted when the Write reached storage: had that write timed out, the only copy of the trace would be gone. Delete it after Write answered OK")
 	ctx.Assert(result.Flushed && result.Attempts == 1, "a healthy storage takes the write at once; flushTrace answered %+v", result)
@@ -918,47 +918,47 @@ func CheckDeleteAfterConfirm(ctx *harness.Ctx) {
 	for _, s := range request.GetSpans() {
 		ids = append(ids, s.GetSpanId())
 	}
-	ctx.Assert(request.GetTenant() == "acme" && len(ids) == 2 && ids[0] == clRoot && ids[1] == clChild, "the write must carry the tenant and both spans, storage got tenant %q and spans %q", request.GetTenant(), ids)
-	ctx.Equal(ctx.Redis.Exists(clKey), 0, "storage confirmed the write; the assembly state must be gone from Redis")
+	ctx.Assert(request.GetTenant() == "acme" && len(ids) == 2 && ids[0] == kHClRoot && ids[1] == kHClChild, "the write must carry the tenant and both spans, storage got tenant %q and spans %q", request.GetTenant(), ids)
+	ctx.Equal(ctx.Redis.Exists(kHClKey), 0, "storage confirmed the write; the assembly state must be gone from Redis")
 }
 
 func CheckBoundedRetries(ctx *harness.Ctx) {
-	clientPeer(ctx, "payments")
+	hClientPeer(ctx, "payments")
 	ctx.GRPC.Fail("Write", codes.Unavailable, "", 3, "")
-	result := mustFlush(ctx, "with storage down")
+	result := hMustFlush(ctx, "with storage down")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Write", "")), 3, "with storage down, the Write calls (MAX_ATTEMPTS = 3)")
 	ctx.Equal(result, flushResult{Kept: true, Attempts: 3}, "three UNAVAILABLE answers must end in kept, attempts 3; flushTrace answered")
-	ctx.Equal(ctx.Redis.Exists(clKey), 1, "storage never took the trace; it must stay in Redis for the next cycle")
+	ctx.Equal(ctx.Redis.Exists(kHClKey), 1, "storage never took the trace; it must stay in Redis for the next cycle")
 	for _, terminal := range []struct {
 		name string
 		code codes.Code
 	}{{"PERMISSION_DENIED", codes.PermissionDenied}, {"INTERNAL", codes.Internal}, {"FAILED_PRECONDITION", codes.FailedPrecondition}} {
 		before := len(ctx.GRPC.CallsTo("Write", ""))
 		ctx.GRPC.Fail("Write", terminal.code, "", 1, "")
-		result = mustFlush(ctx, "with storage answering "+terminal.name)
+		result = hMustFlush(ctx, "with storage answering "+terminal.name)
 		calls := len(ctx.GRPC.CallsTo("Write", "")) - before
 		ctx.Assert(calls == 1, "storage answered %s and flushTrace called Write %d times: only UNAVAILABLE and DEADLINE_EXCEEDED are retried", terminal.name, calls)
 		ctx.Assert(result == flushResult{Kept: true, Attempts: 1}, "%s is neither retried nor a schema rejection: the trace is kept for the next cycle, attempts 1; flushTrace answered %+v", terminal.name, result)
-		ctx.Assert(ctx.Redis.Exists(clKey) == 1 && ctx.Redis.Exists("quarantine:"+clTrace) == 0, "after %s the trace must stay in the assembly, not be dropped or quarantined", terminal.name)
+		ctx.Assert(ctx.Redis.Exists(kHClKey) == 1 && ctx.Redis.Exists("quarantine:"+kHClTrace) == 0, "after %s the trace must stay in the assembly, not be dropped or quarantined", terminal.name)
 	}
 	before := len(ctx.GRPC.CallsTo("Write", ""))
 	ctx.GRPC.Fail("Write", codes.Unavailable, "", 2, "")
-	result = mustFlush(ctx, "with storage back after two UNAVAILABLE answers")
+	result = hMustFlush(ctx, "with storage back after two UNAVAILABLE answers")
 	calls := len(ctx.GRPC.CallsTo("Write", "")) - before
 	ctx.Assert(calls == 3 && result == flushResult{Flushed: true, Attempts: 3}, "two UNAVAILABLE answers then OK: the third attempt must write the trace; flushTrace called Write %d times and answered %+v", calls, result)
-	ctx.Equal(ctx.Redis.Exists(clKey), 0, "storage confirmed the third attempt; the assembly state must be gone from Redis")
+	ctx.Equal(ctx.Redis.Exists(kHClKey), 0, "storage confirmed the third attempt; the assembly state must be gone from Redis")
 }
 
 func CheckQuarantine(ctx *harness.Ctx) {
-	clientPeer(ctx, "")
-	result := mustFlush(ctx, "with a trace storage refuses")
+	hClientPeer(ctx, "")
+	result := hMustFlush(ctx, "with a trace storage refuses")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Write", "")), 1, "storage answered INVALID_ARGUMENT: a schema rejection is not retried; the Write calls")
 	ctx.Assert(result.Quarantined && !result.Flushed, "a rejected trace must be answered as quarantined, flushTrace answered %+v", result)
-	ttl := ctx.Redis.TTL("quarantine:" + clTrace)
-	ctx.Assert(ttl >= 7*86400-60 && ttl <= 7*86400, "quarantine:%s has TTL %d: the trace must be parked with assembly.Quarantine", clTrace, ttl)
-	parked, _ := ctx.Redis.Get("quarantine:" + clTrace)
-	ctx.Assert(strings.Contains(parked, "span without a service"), "quarantine:%s must record storage's details as the reason (span without a service: ...), it holds %.200q", clTrace, parked)
-	ctx.Equal(ctx.Redis.Exists(clKey), 0, "a quarantined trace must leave the assembly")
+	ttl := ctx.Redis.TTL("quarantine:" + kHClTrace)
+	ctx.Assert(ttl >= 7*86400-60 && ttl <= 7*86400, "quarantine:%s has TTL %d: the trace must be parked with assembly.Quarantine", kHClTrace, ttl)
+	parked, _ := ctx.Redis.Get("quarantine:" + kHClTrace)
+	ctx.Assert(strings.Contains(parked, "span without a service"), "quarantine:%s must record storage's details as the reason (span without a service: ...), it holds %.200q", kHClTrace, parked)
+	ctx.Equal(ctx.Redis.Exists(kHClKey), 0, "a quarantined trace must leave the assembly")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -972,16 +972,16 @@ func CheckQuarantine(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTrace = "4bf92f3577b34da6a3ce929d0e0e4736";
-const std::string kKey = "trace:" + kTrace;
-const std::string kRoot = "00f067aa0ba902b7";
-const std::string kChild = "00f067aa0ba902b8";
+const std::string kHTrace = "4bf92f3577b34da6a3ce929d0e0e4736";
+const std::string kHKey = "trace:" + kHTrace;
+const std::string kHRoot = "00f067aa0ba902b7";
+const std::string kHChild = "00f067aa0ba902b8";
 
 // Span storage: stores every trace whose spans all name a service; records whether the assembly
 // state still existed when each write reached it.
-class StoragePeer final : public tracestore::TraceWriter::Service {
+class HStoragePeer final : public tracestore::TraceWriter::Service {
  public:
-  explicit StoragePeer(harness::Ctx& ctx) : ctx_(ctx) {}
+  explicit HStoragePeer(harness::Ctx& ctx) : ctx_(ctx) {}
   std::vector<bool> state_present;
   std::vector<tracestore::WriteRequest> stored;
   grpc::Status Write(grpc::ServerContext*, const tracestore::WriteRequest* req, tracestore::WriteReply* out) override {
@@ -998,19 +998,19 @@ class StoragePeer final : public tracestore::TraceWriter::Service {
   harness::Ctx& ctx_;
 };
 
-StoragePeer& clientPeer(harness::Ctx& ctx, const std::string& child_service) {
-  static StoragePeer* peer = nullptr;
+HStoragePeer& hClientPeer(harness::Ctx& ctx, const std::string& child_service) {
+  static HStoragePeer* peer = nullptr;
   delete peer;
-  peer = new StoragePeer(ctx);
+  peer = new HStoragePeer(ctx);
   ctx.GRPC.Server("")->RegisterService(peer);
-  assembly::insertSpan("acme", assembly::Span{kTrace, kRoot, "", "checkout", 1712345678901LL, 412});
-  assembly::insertSpan("acme", assembly::Span{kTrace, kChild, kRoot, child_service, 1712345678950LL, 120});
+  assembly::insertSpan("acme", assembly::Span{kHTrace, kHRoot, "", "checkout", 1712345678901LL, 412});
+  assembly::insertSpan("acme", assembly::Span{kHTrace, kHChild, kHRoot, child_service, 1712345678950LL, 120});
   return *peer;
 }
 
-FlushResult mustFlush(harness::Ctx& ctx, const std::string& why) {
+FlushResult hMustFlush(harness::Ctx& ctx, const std::string& why) {
   FlushResult result;
-  const bool returned = ctx.Drain([&] { result = flushTrace(kTrace); });
+  const bool returned = ctx.Drain([&] { result = flushTrace(kHTrace); });
   ctx.Assert(returned, "%s: flushTrace never returned, it kept retrying until the runtime stopped it", why);
   return result;
 }
@@ -1018,10 +1018,10 @@ FlushResult mustFlush(harness::Ctx& ctx, const std::string& why) {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  clientPeer(ctx, "payments");
+  hClientPeer(ctx, "payments");
   ctx.GRPC.SetLatency("Write", 10.0);
   FlushResult result;
-  const bool returned = ctx.Drain([&] { result = flushTrace(kTrace); });
+  const bool returned = ctx.Drain([&] { result = flushTrace(kHTrace); });
   const auto calls = ctx.GRPC.CallsTo("Write");
   ctx.Assert(!calls.empty(), "flushTrace never called Write");
   for (const auto& call : calls) {
@@ -1031,64 +1031,64 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.Assert(returned, "with storage stalled flushTrace never returned");
   ctx.Assert(calls.size() == 3, "with storage stalled flushTrace called Write %v times, expected kMaxAttempts = 3: DEADLINE_EXCEEDED is retried, and every attempt gets its own 2 s", calls.size());
   ctx.Assert(result.kept && !result.flushed, "every write timed out, so the trace must be kept for the next cycle; flushTrace answered kept %t flushed %t", result.kept, result.flushed);
-  ctx.Equal(ctx.Redis.Exists(kKey), 1, "the writes timed out; the trace must still be in Redis");
+  ctx.Equal(ctx.Redis.Exists(kHKey), 1, "the writes timed out; the trace must still be in Redis");
   ctx.GRPC.SetLatency("Write", 0);
-  const FlushResult again = mustFlush(ctx, "with storage answering again");
+  const FlushResult again = hMustFlush(ctx, "with storage answering again");
   ctx.Assert(again.flushed, "once storage answers, the kept trace must be written");
 }
 
 void CheckDeleteAfterConfirm(harness::Ctx& ctx) {
-  StoragePeer& peer = clientPeer(ctx, "payments");
-  const FlushResult result = mustFlush(ctx, "with storage healthy");
+  HStoragePeer& peer = hClientPeer(ctx, "payments");
+  const FlushResult result = hMustFlush(ctx, "with storage healthy");
   ctx.Assert(!peer.state_present.empty(), "flushTrace never reached storage");
   ctx.Assert(peer.state_present[0], "the trace's Redis state was already deleted when the Write reached storage: had that write timed out, the only copy of the trace would be gone. Delete it after Write answered OK");
   ctx.Assert(result.flushed && result.attempts == 1, "a healthy storage takes the write at once; flushTrace answered flushed %t after %v attempts", result.flushed, result.attempts);
   const auto& request = peer.stored.at(0);
   std::vector<std::string> ids;
   for (const auto& s : request.spans()) ids.push_back(s.span_id());
-  ctx.Assert(request.tenant() == "acme" && ids == std::vector<std::string>{kRoot, kChild}, "the write must carry the tenant and both spans, storage got tenant %q and spans %q", request.tenant(), ids);
-  ctx.Equal(ctx.Redis.Exists(kKey), 0, "storage confirmed the write; the assembly state must be gone from Redis");
+  ctx.Assert(request.tenant() == "acme" && ids == std::vector<std::string>{kHRoot, kHChild}, "the write must carry the tenant and both spans, storage got tenant %q and spans %q", request.tenant(), ids);
+  ctx.Equal(ctx.Redis.Exists(kHKey), 0, "storage confirmed the write; the assembly state must be gone from Redis");
 }
 
 void CheckBoundedRetries(harness::Ctx& ctx) {
-  clientPeer(ctx, "payments");
+  hClientPeer(ctx, "payments");
   ctx.GRPC.Fail("Write", grpc::StatusCode::UNAVAILABLE, "", 3);
-  FlushResult result = mustFlush(ctx, "with storage down");
+  FlushResult result = hMustFlush(ctx, "with storage down");
   ctx.Equal(ctx.GRPC.CallsTo("Write").size(), 3, "with storage down, the Write calls (kMaxAttempts = 3)");
   ctx.Assert(!result.flushed && result.kept && !result.quarantined && result.attempts == 3, "three UNAVAILABLE answers must end in kept, attempts 3; flushTrace answered kept %t after %v attempts", result.kept, result.attempts);
-  ctx.Equal(ctx.Redis.Exists(kKey), 1, "storage never took the trace; it must stay in Redis for the next cycle");
+  ctx.Equal(ctx.Redis.Exists(kHKey), 1, "storage never took the trace; it must stay in Redis for the next cycle");
   const std::vector<std::pair<std::string, grpc::StatusCode>> terminals = {
       {"PERMISSION_DENIED", grpc::StatusCode::PERMISSION_DENIED}, {"INTERNAL", grpc::StatusCode::INTERNAL}, {"FAILED_PRECONDITION", grpc::StatusCode::FAILED_PRECONDITION}};
   for (const auto& [name, code] : terminals) {
     const std::size_t before = ctx.GRPC.CallsTo("Write").size();
     ctx.GRPC.Fail("Write", code, "", 1);
-    result = mustFlush(ctx, "with storage answering " + name);
+    result = hMustFlush(ctx, "with storage answering " + name);
     const std::size_t calls = ctx.GRPC.CallsTo("Write").size() - before;
     ctx.Assert(calls == 1, "storage answered %s and flushTrace called Write %v times: only UNAVAILABLE and DEADLINE_EXCEEDED are retried", name, calls);
     ctx.Assert(!result.flushed && result.kept && !result.quarantined && result.attempts == 1,
                "%s is neither retried nor a schema rejection: the trace is kept for the next cycle, attempts 1; flushTrace answered flushed %t kept %t quarantined %t after %v attempts", name,
                result.flushed, result.kept, result.quarantined, result.attempts);
-    ctx.Assert(ctx.Redis.Exists(kKey) == 1 && ctx.Redis.Exists("quarantine:" + kTrace) == 0, "after %s the trace must stay in the assembly, not be dropped or quarantined", name);
+    ctx.Assert(ctx.Redis.Exists(kHKey) == 1 && ctx.Redis.Exists("quarantine:" + kHTrace) == 0, "after %s the trace must stay in the assembly, not be dropped or quarantined", name);
   }
   const std::size_t before = ctx.GRPC.CallsTo("Write").size();
   ctx.GRPC.Fail("Write", grpc::StatusCode::UNAVAILABLE, "", 2);
-  result = mustFlush(ctx, "with storage back after two UNAVAILABLE answers");
+  result = hMustFlush(ctx, "with storage back after two UNAVAILABLE answers");
   const std::size_t calls = ctx.GRPC.CallsTo("Write").size() - before;
   ctx.Assert(calls == 3 && result.flushed && !result.kept && !result.quarantined && result.attempts == 3,
              "two UNAVAILABLE answers then OK: the third attempt must write the trace; flushTrace called Write %v times and answered flushed %t after %v attempts", calls, result.flushed, result.attempts);
-  ctx.Equal(ctx.Redis.Exists(kKey), 0, "storage confirmed the third attempt; the assembly state must be gone from Redis");
+  ctx.Equal(ctx.Redis.Exists(kHKey), 0, "storage confirmed the third attempt; the assembly state must be gone from Redis");
 }
 
 void CheckQuarantine(harness::Ctx& ctx) {
-  clientPeer(ctx, "");
-  const FlushResult result = mustFlush(ctx, "with a trace storage refuses");
+  hClientPeer(ctx, "");
+  const FlushResult result = hMustFlush(ctx, "with a trace storage refuses");
   ctx.Equal(ctx.GRPC.CallsTo("Write").size(), 1, "storage answered INVALID_ARGUMENT: a schema rejection is not retried; the Write calls");
   ctx.Assert(result.quarantined && !result.flushed, "a rejected trace must be answered as quarantined");
-  const long long ttl = ctx.Redis.TTL("quarantine:" + kTrace);
-  ctx.Assert(ttl >= 7 * 86400 - 60 && ttl <= 7 * 86400, "quarantine:%s has TTL %v: the trace must be parked with assembly::quarantine", kTrace, ttl);
-  const std::string parked = ctx.Redis.Get("quarantine:" + kTrace).value_or("");
-  ctx.Assert(parked.find("span without a service") != std::string::npos, "quarantine:%s must record storage's details as the reason (span without a service: ...), it holds %q", kTrace, parked.substr(0, 200));
-  ctx.Equal(ctx.Redis.Exists(kKey), 0, "a quarantined trace must leave the assembly");
+  const long long ttl = ctx.Redis.TTL("quarantine:" + kHTrace);
+  ctx.Assert(ttl >= 7 * 86400 - 60 && ttl <= 7 * 86400, "quarantine:%s has TTL %v: the trace must be parked with assembly::quarantine", kHTrace, ttl);
+  const std::string parked = ctx.Redis.Get("quarantine:" + kHTrace).value_or("");
+  ctx.Assert(parked.find("span without a service") != std::string::npos, "quarantine:%s must record storage's details as the reason (span without a service: ...), it holds %q", kHTrace, parked.substr(0, 200));
+  ctx.Equal(ctx.Redis.Exists(kHKey), 0, "a quarantined trace must leave the assembly");
 }
 `,
   },

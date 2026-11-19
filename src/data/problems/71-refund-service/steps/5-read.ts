@@ -723,15 +723,15 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-// readPsp has paid the refunds in applied, failed rf-5 and never saw any other.
-type readPsp struct {
+// HReadPsp has paid the refunds in applied, failed rf-5 and never saw any other.
+type HReadPsp struct {
 	pb.UnimplementedPspServer
 	applied map[string]string
 }
 
-func (p *readPsp) GetRefund(_ context.Context, req *pb.GetRefundRequest) (*pb.RefundStatus, error) {
+func (p *HReadPsp) GetRefund(_ context.Context, req *pb.GetRefundRequest) (*pb.RefundStatus, error) {
 	if req.GetRefundId() == "rf-5" {
 		return &pb.RefundStatus{RefundId: "rf-5", Status: "FAILED"}, nil
 	}
@@ -742,7 +742,7 @@ func (p *readPsp) GetRefund(_ context.Context, req *pb.GetRefundRequest) (*pb.Re
 	return &pb.RefundStatus{RefundId: req.GetRefundId(), Status: "SUCCEEDED", PspRef: ref}, nil
 }
 
-type readRow struct {
+type HReadRow struct {
 	RefundID    string \`json:"refund_id"\`
 	AmountMinor int64  \`json:"amount_minor"\`
 	ReasonCode  string \`json:"reason_code"\`
@@ -750,18 +750,18 @@ type readRow struct {
 	PspRef      string \`json:"psp_ref"\`
 }
 
-type readBody struct {
+type HReadBody struct {
 	RefundedMinor  *int64    \`json:"refunded_minor"\`
 	PendingMinor   *int64    \`json:"pending_minor"\`
 	RemainingMinor *int64    \`json:"remaining_minor"\`
 	DriftMinor     *int64    \`json:"drift_minor"\`
-	Refunds        []readRow \`json:"refunds"\`
+	Refunds        []HReadRow \`json:"refunds"\`
 }
 
-func readServe(ctx *harness.Ctx, pendingPaid bool) *harness.HTTP {
-	pb.RegisterPspServer(ctx.GRPC.Server(""), &readPsp{applied: map[string]string{"rf-4": "re_4"}})
-	records.AddPayment(readBg, "pay_1", "t1", 10000)
-	records.AddPayment(readBg, "pay_2", "t2", 8000)
+func hReadServe(ctx *harness.Ctx, pendingPaid bool) *harness.HTTP {
+	pb.RegisterPspServer(ctx.GRPC.Server(""), &HReadPsp{applied: map[string]string{"rf-4": "re_4"}})
+	records.AddPayment(hReadBg, "pay_1", "t1", 10000)
+	records.AddPayment(hReadBg, "pay_2", "t2", 8000)
 	type seed struct {
 		id     string
 		amount int64
@@ -772,14 +772,14 @@ func readServe(ctx *harness.Ctx, pendingPaid bool) *harness.HTTP {
 		seeds = append(seeds, seed{"rf-4", 2000, "PENDING"}, seed{"rf-5", 2000, "PENDING"})
 	}
 	for _, s := range seeds {
-		ledger.Claim(readBg, "pay_1", s.id, s.amount, 10000)
-		records.InsertRefund(readBg, s.id, "t1", "pay_1", s.amount, "damaged", "")
+		ledger.Claim(hReadBg, "pay_1", s.id, s.amount, 10000)
+		records.InsertRefund(hReadBg, s.id, "t1", "pay_1", s.amount, "damaged", "")
 		if s.status == "CONFIRMED" {
-			records.MarkConfirmed(readBg, s.id, "re_"+s.id[3:])
+			records.MarkConfirmed(hReadBg, s.id, "re_"+s.id[3:])
 		}
 		if s.status == "REJECTED" {
-			records.MarkRejected(readBg, s.id)
-			ledger.Release(readBg, "pay_1", s.id)
+			records.MarkRejected(hReadBg, s.id)
+			ledger.Release(hReadBg, "pay_1", s.id)
 		}
 	}
 	mux := http.NewServeMux()
@@ -787,28 +787,28 @@ func readServe(ctx *harness.Ctx, pendingPaid bool) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func readGet(c *harness.HTTP, payment, tenant string) *harness.Response {
+func hReadGet(c *harness.HTTP, payment, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Get("/v1/payments/" + payment + "/refunds")
 	}
 	return c.Get("/v1/payments/"+payment+"/refunds", "X-Tenant-Id", tenant)
 }
 
-func readDecode(r *harness.Response) readBody {
-	var body readBody
+func hReadDecode(r *harness.Response) HReadBody {
+	var body HReadBody
 	json.Unmarshal([]byte(r.Text()), &body)
 	return body
 }
 
-func readNum(v *int64) any {
+func hReadNum(v *int64) any {
 	if v == nil {
 		return "absent"
 	}
 	return *v
 }
 
-func readRows(body readBody) map[string]readRow {
-	rows := map[string]readRow{}
+func hReadRows(body HReadBody) map[string]HReadRow {
+	rows := map[string]HReadRow{}
 	for _, row := range body.Refunds {
 		rows[row.RefundID] = row
 	}
@@ -816,22 +816,22 @@ func readRows(body readBody) map[string]readRow {
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := readServe(ctx, false)
-	ctx.Equal(readGet(c, "pay_1", "").Status, 401, "a read without X-Tenant-Id")
-	ctx.Equal(readGet(c, "pay_1", "t2").Status, 404, "tenant t2 reading t1's payment (a foreign payment looks missing)")
-	ctx.Equal(readGet(c, "pay_404", "t1").Status, 404, "a missing payment")
-	own := readGet(c, "pay_1", "t1")
+	c := hReadServe(ctx, false)
+	ctx.Equal(hReadGet(c, "pay_1", "").Status, 401, "a read without X-Tenant-Id")
+	ctx.Equal(hReadGet(c, "pay_1", "t2").Status, 404, "tenant t2 reading t1's payment (a foreign payment looks missing)")
+	ctx.Equal(hReadGet(c, "pay_404", "t1").Status, 404, "a missing payment")
+	own := hReadGet(c, "pay_1", "t1")
 	ctx.Equal(own.Status, 200, "t1 reading its own payment (%s)", own.Text())
 }
 
 func CheckDurableTotal(ctx *harness.Ctx) {
-	c := readServe(ctx, false)
-	r := readGet(c, "pay_1", "t1")
+	c := hReadServe(ctx, false)
+	r := hReadGet(c, "pay_1", "t1")
 	ctx.Equal(r.Status, 200, "the read (%s)", r.Text())
-	body := readDecode(r)
-	got := []any{readNum(body.RefundedMinor), readNum(body.PendingMinor), readNum(body.RemainingMinor)}
+	body := hReadDecode(r)
+	got := []any{hReadNum(body.RefundedMinor), hReadNum(body.PendingMinor), hReadNum(body.RemainingMinor)}
 	ctx.Equal(got, []any{int64(3000), int64(1000), int64(6000)}, "refunded, pending, remaining for a CONFIRMED 3000, a REJECTED 2000 and a PENDING 1000 of 10000 (total the records by status)")
-	rows := readRows(body)
+	rows := hReadRows(body)
 	ctx.Equal(len(rows), 3, "the rows (rf-1, rf-2, rf-3)")
 	first := rows["rf-1"]
 	ctx.Assert(first.Status == "CONFIRMED" && first.ReasonCode == "damaged" && first.PspRef == "re_1", "the row of rf-1 is %+v, expected status CONFIRMED, reason_code damaged and psp_ref re_1", first)
@@ -839,29 +839,29 @@ func CheckDurableTotal(ctx *harness.Ctx) {
 }
 
 func CheckDrift(ctx *harness.Ctx) {
-	c := readServe(ctx, false)
-	ctx.Equal(readNum(readDecode(readGet(c, "pay_1", "t1")).DriftMinor), int64(0), "with the ledger in step with the records, drift_minor")
+	c := hReadServe(ctx, false)
+	ctx.Equal(hReadNum(hReadDecode(hReadGet(c, "pay_1", "t1")).DriftMinor), int64(0), "with the ledger in step with the records, drift_minor")
 	ctx.Redis.Del("refunded:pay_1")
 	ctx.Redis.Do("HSET", "refunded:pay_1", "total", 1000, "rf-3", 1000) // the ledger lost rf-1's claim
-	drifted := readDecode(readGet(c, "pay_1", "t1"))
-	ctx.Equal(readNum(drifted.DriftMinor), int64(3000), "the ledger holds 1000 against 4000 in the records; drift_minor")
-	ctx.Equal(readNum(drifted.RefundedMinor), int64(3000), "refunded_minor comes from the records, not the ledger")
+	drifted := hReadDecode(hReadGet(c, "pay_1", "t1"))
+	ctx.Equal(hReadNum(drifted.DriftMinor), int64(3000), "the ledger holds 1000 against 4000 in the records; drift_minor")
+	ctx.Equal(hReadNum(drifted.RefundedMinor), int64(3000), "refunded_minor comes from the records, not the ledger")
 	left := ctx.Redis.HGetAll("refunded:pay_1")
 	ctx.Equal(left, map[string]string{"total": "1000", "rf-3": "1000"}, "drift is reported and left for a repair to act on; the ledger after the read")
 	ctx.Redis.Do("HSET", "refunded:pay_1", "total", 6000, "rf-1", 3000, "rf-9", 2000) // a claim no record backs
-	over := readDecode(readGet(c, "pay_1", "t1"))
-	ctx.Equal(readNum(over.DriftMinor), int64(-2000), "the ledger holds 6000 against 4000 in the records; drift_minor (records minus ledger, with its sign)")
+	over := hReadDecode(hReadGet(c, "pay_1", "t1"))
+	ctx.Equal(hReadNum(over.DriftMinor), int64(-2000), "the ledger holds 6000 against 4000 in the records; drift_minor (records minus ledger, with its sign)")
 }
 
 func CheckPendingReconciled(ctx *harness.Ctx) {
-	c := readServe(ctx, true)
-	body := readDecode(readGet(c, "pay_1", "t1"))
-	paid := readRows(body)["rf-4"]
+	c := hReadServe(ctx, true)
+	body := hReadDecode(hReadGet(c, "pay_1", "t1"))
+	paid := hReadRows(body)["rf-4"]
 	ctx.Assert(paid.Status == "CONFIRMED" && paid.PspRef == "re_4", "the PSP paid rf-4 as re_4 and the read reports it as %+v: reconcile PENDING rows before reporting them", paid)
-	ctx.Equal(records.FindRefund(readBg, "rf-4").Status, "CONFIRMED", "the reconciled refund's status in the records")
-	failed := readRows(body)["rf-5"]
-	ctx.Assert(failed.Status == "REJECTED" && records.FindRefund(readBg, "rf-5").Status == "REJECTED", "the PSP reports rf-5 FAILED and the read reports it as %+v, expected REJECTED as its record then stands", failed)
-	got := []any{readNum(body.RefundedMinor), readNum(body.PendingMinor), readNum(body.RemainingMinor), readNum(body.DriftMinor)}
+	ctx.Equal(records.FindRefund(hReadBg, "rf-4").Status, "CONFIRMED", "the reconciled refund's status in the records")
+	failed := hReadRows(body)["rf-5"]
+	ctx.Assert(failed.Status == "REJECTED" && records.FindRefund(hReadBg, "rf-5").Status == "REJECTED", "the PSP reports rf-5 FAILED and the read reports it as %+v, expected REJECTED as its record then stands", failed)
+	got := []any{hReadNum(body.RefundedMinor), hReadNum(body.PendingMinor), hReadNum(body.RemainingMinor), hReadNum(body.DriftMinor)}
 	ctx.Equal(got, []any{int64(5000), int64(1000), int64(4000), int64(0)}, "refunded, pending, remaining and drift (rf-1 and rf-4 refunded, rf-3, which the PSP never saw, pending, rf-5 released, and the ledger read after the reconciliation)")
 	for _, call := range ctx.GRPC.CallsTo("GetRefund", "") {
 		ctx.Assert(call.HasDeadline() && call.Timeout <= 5500*time.Millisecond, "a GetRefund call carries a %v deadline, expected 5 s", call.Timeout)
@@ -884,7 +884,7 @@ func CheckPendingReconciled(ctx *harness.Ctx) {
 namespace {
 
 // Has paid the refunds in applied, failed rf-5 and never saw any other.
-class ReadPsp final : public refundd::Psp::Service {
+class HReadPsp final : public refundd::Psp::Service {
  public:
   std::map<std::string, std::string> applied{{"rf-4", "re_4"}};
 
@@ -902,10 +902,10 @@ class ReadPsp final : public refundd::Psp::Service {
   }
 };
 
-harness::HTTP readServe(harness::Ctx& ctx, bool pending_paid) {
-  static ReadPsp* peer = nullptr;
+harness::HTTP hReadServe(harness::Ctx& ctx, bool pending_paid) {
+  static HReadPsp* peer = nullptr;
   delete peer;
-  peer = new ReadPsp;
+  peer = new HReadPsp;
   ctx.GRPC.Server("")->RegisterService(peer);
   records::addPayment("pay_1", "t1", 10000);
   records::addPayment("pay_2", "t2", 8000);
@@ -931,17 +931,17 @@ harness::HTTP readServe(harness::Ctx& ctx, bool pending_paid) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response readGet(harness::HTTP& c, const std::string& payment, const std::string& tenant) {
+harness::Response hReadGet(harness::HTTP& c, const std::string& payment, const std::string& tenant) {
   if (tenant.empty()) return c.Get("/v1/payments/" + payment + "/refunds");
   return c.Get("/v1/payments/" + payment + "/refunds", "X-Tenant-Id", tenant);
 }
 
-nlohmann::json readBody(const harness::Response& r) {
+nlohmann::json hReadBody(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : nlohmann::json::object();
 }
 
-std::map<std::string, nlohmann::json> readRows(const nlohmann::json& body) {
+std::map<std::string, nlohmann::json> hReadRows(const nlohmann::json& body) {
   std::map<std::string, nlohmann::json> rows;
   if (body.contains("refunds") && body["refunds"].is_array()) {
     for (const auto& row : body["refunds"]) rows[row.value("refund_id", "")] = row;
@@ -952,26 +952,26 @@ std::map<std::string, nlohmann::json> readRows(const nlohmann::json& body) {
 }  // namespace
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = readServe(ctx, false);
-  ctx.Equal(readGet(c, "pay_1", "").Status, 401, "a read without X-Tenant-Id");
-  ctx.Equal(readGet(c, "pay_1", "t2").Status, 404, "tenant t2 reading t1's payment (a foreign payment looks missing)");
-  ctx.Equal(readGet(c, "pay_404", "t1").Status, 404, "a missing payment");
-  const auto own = readGet(c, "pay_1", "t1");
+  auto c = hReadServe(ctx, false);
+  ctx.Equal(hReadGet(c, "pay_1", "").Status, 401, "a read without X-Tenant-Id");
+  ctx.Equal(hReadGet(c, "pay_1", "t2").Status, 404, "tenant t2 reading t1's payment (a foreign payment looks missing)");
+  ctx.Equal(hReadGet(c, "pay_404", "t1").Status, 404, "a missing payment");
+  const auto own = hReadGet(c, "pay_1", "t1");
   ctx.Equal(own.Status, 200, "t1 reading its own payment (%s)", own.Text());
 }
 
 void CheckDurableTotal(harness::Ctx& ctx) {
-  auto c = readServe(ctx, false);
-  const auto r = readGet(c, "pay_1", "t1");
+  auto c = hReadServe(ctx, false);
+  const auto r = hReadGet(c, "pay_1", "t1");
   ctx.Equal(r.Status, 200, "the read (%s)", r.Text());
-  const auto body = readBody(r);
+  const auto body = hReadBody(r);
   const long long refunded = body.value("refunded_minor", -1LL);
   const long long pending = body.value("pending_minor", -1LL);
   const long long remaining = body.value("remaining_minor", -1LL);
   ctx.Assert(refunded == 3000 && pending == 1000 && remaining == 6000,
              "refunded, pending, remaining are %d, %d, %d for a CONFIRMED 3000, a REJECTED 2000 and a PENDING 1000 of 10000, expected 3000, 1000, 6000: total the records by status",
              refunded, pending, remaining);
-  auto rows = readRows(body);
+  auto rows = hReadRows(body);
   ctx.Equal(rows.size(), 3, "the rows (rf-1, rf-2, rf-3)");
   const auto first = rows["rf-1"];
   ctx.Assert(first.value("status", "") == "CONFIRMED" && first.value("reason_code", "") == "damaged" && first.value("psp_ref", "") == "re_1",
@@ -980,25 +980,25 @@ void CheckDurableTotal(harness::Ctx& ctx) {
 }
 
 void CheckDrift(harness::Ctx& ctx) {
-  auto c = readServe(ctx, false);
-  ctx.Equal(readBody(readGet(c, "pay_1", "t1")).value("drift_minor", -1LL), 0, "with the ledger in step with the records, drift_minor");
+  auto c = hReadServe(ctx, false);
+  ctx.Equal(hReadBody(hReadGet(c, "pay_1", "t1")).value("drift_minor", -1LL), 0, "with the ledger in step with the records, drift_minor");
   ctx.Redis.Do("DEL", "refunded:pay_1");
   ctx.Redis.Do("HSET", "refunded:pay_1", "total", 1000, "rf-3", 1000);  // the ledger lost rf-1's claim
-  const auto drifted = readBody(readGet(c, "pay_1", "t1"));
+  const auto drifted = hReadBody(hReadGet(c, "pay_1", "t1"));
   ctx.Equal(drifted.value("drift_minor", -1LL), 3000, "the ledger holds 1000 against 4000 in the records; drift_minor");
   ctx.Equal(drifted.value("refunded_minor", -1LL), 3000, "refunded_minor comes from the records, not the ledger");
   const auto left = ctx.Redis.HGetAll("refunded:pay_1");
   ctx.Assert(left.size() == 2 && left.count("total") && left.at("total") == "1000" && left.count("rf-3"),
              "the read rewrote the ledger to %d fields (total %s): drift is reported and left for a repair to act on", left.size(), left.count("total") ? left.at("total") : "absent");
   ctx.Redis.Do("HSET", "refunded:pay_1", "total", 6000, "rf-1", 3000, "rf-9", 2000);  // a claim no record backs
-  const auto over = readBody(readGet(c, "pay_1", "t1"));
+  const auto over = hReadBody(hReadGet(c, "pay_1", "t1"));
   ctx.Equal(over.value("drift_minor", -1LL), -2000, "the ledger holds 6000 against 4000 in the records; drift_minor (records minus ledger, with its sign)");
 }
 
 void CheckPendingReconciled(harness::Ctx& ctx) {
-  auto c = readServe(ctx, true);
-  const auto body = readBody(readGet(c, "pay_1", "t1"));
-  auto rows = readRows(body);
+  auto c = hReadServe(ctx, true);
+  const auto body = hReadBody(hReadGet(c, "pay_1", "t1"));
+  auto rows = hReadRows(body);
   const auto paid = rows["rf-4"];
   ctx.Assert(paid.is_object() && paid.value("status", "") == "CONFIRMED" && paid.value("psp_ref", "") == "re_4",
              "the PSP paid rf-4 as re_4 and the read reports it as %s: reconcile PENDING rows before reporting them", paid.dump());

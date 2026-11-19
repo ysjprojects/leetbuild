@@ -842,13 +842,13 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "citation.event"
+const kHEventsTopic = "citation.event"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
 // eventsResult is a stored citation, and what the verifier found for it: re-anchored into version 2.
-func eventsResult(documentID, answerID, status, reason string) store.Citation {
-	row := store.Create(eventsBg, "t1", store.Citation{AnswerID: answerID, DocumentID: documentID, Version: 1, Start: 4, End: 12, Quote: "Lovelace"})
+func hEventsResult(documentID, answerID, status, reason string) store.Citation {
+	row := store.Create(hEventsBg, "t1", store.Citation{AnswerID: answerID, DocumentID: documentID, Version: 1, Start: 4, End: 12, Quote: "Lovelace"})
 	row.Version = 2
 	row.Start = 12
 	row.End = 20
@@ -857,22 +857,22 @@ func eventsResult(documentID, answerID, status, reason string) store.Citation {
 	return row
 }
 
-func eventsPublish(ctx *harness.Ctx, result store.Citation) bool {
-	ok, err := publishVerification(eventsBg, result)
+func hEventsPublish(ctx *harness.Ctx, result store.Citation) bool {
+	ok, err := publishVerification(hEventsBg, result)
 	ctx.NoError(err, "publishVerification")
 	return ok
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	var rows []HEventsRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -880,83 +880,83 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 // eventsPayloadC1 is the event payload of the first result eventsResult makes, decoded: c-1 re-anchored into version 2, verified.
-var eventsPayloadC1 = map[string]any{"citation_id": "c-1", "tenant": "t1", "document_id": "doc-7", "version": float64(2), "start": float64(12), "end": float64(20), "status": "verified", "reason": ""}
+var hEventsPayloadC1 = map[string]any{"citation_id": "c-1", "tenant": "t1", "document_id": "doc-7", "version": float64(2), "start": float64(12), "end": float64(20), "status": "verified", "reason": ""}
 
 func CheckDocumentKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsResult("doc-7", "a-1", "verified", ""))
-	eventsPublish(ctx, eventsResult("doc-9", "a-1", "verified", ""))
-	eventsPublish(ctx, eventsResult("doc-7", "a-2", "verified", ""))
+	hEventsPublish(ctx, hEventsResult("doc-7", "a-1", "verified", ""))
+	hEventsPublish(ctx, hEventsResult("doc-9", "a-1", "verified", ""))
+	hEventsPublish(ctx, hEventsResult("doc-7", "a-2", "verified", ""))
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three publishVerification calls must produce three records on citation.event; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"doc-7", "doc-9", "doc-7"}, "the records must be keyed by the document ids")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"doc-7", "doc-9", "doc-7"}, "the records must be keyed by the document ids")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both doc-7 events must land on one partition, or the lineage consumer applies one document's history out of order; the partitions")
 }
 
 func CheckStatusPublished(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsResult("doc-7", "a-1", "broken", "span_moved"))
-	eventsPublish(ctx, eventsResult("doc-9", "a-1", "pending", "docstore_unavailable"))
+	hEventsPublish(ctx, hEventsResult("doc-7", "a-1", "broken", "span_moved"))
+	hEventsPublish(ctx, hEventsResult("doc-9", "a-1", "pending", "docstore_unavailable"))
 	ctx.Settle()
 	seen := [][]any{}
-	for _, text := range ctx.Kafka.Values(eventsTopic) {
+	for _, text := range ctx.Kafka.Values(kHEventsTopic) {
 		var value map[string]any
 		ctx.NoError(json.Unmarshal([]byte(text), &value), "the payload must be JSON")
 		seen = append(seen, []any{value["citation_id"], value["status"], value["reason"]})
 	}
 	ctx.Equal(seen, [][]any{{"c-1", "broken", "span_moved"}, {"c-2", "pending", "docstore_unavailable"}}, "a broken and a pending result must each produce an event with its status and reason (a lineage that records only verified citations hides every regression)")
-	ctx.Equal(store.Get(eventsBg, "c-1").Status, "broken", "the broken result must be committed; the stored status")
+	ctx.Equal(store.Get(hEventsBg, "c-1").Status, "broken", "the broken result must be committed; the stored status")
 }
 
 func CheckCommitFirst(ctx *harness.Ctx) {
-	result := eventsResult("doc-7", "a-1", "verified", "")
-	probe := ctx.Redis.After("citation:c-1", func() any { return len(ctx.Kafka.Records(eventsTopic)) })
-	eventsPublish(ctx, result)
+	result := hEventsResult("doc-7", "a-1", "verified", "")
+	probe := ctx.Redis.After("citation:c-1", func() any { return len(ctx.Kafka.Records(kHEventsTopic)) })
+	hEventsPublish(ctx, result)
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "publishVerification never committed the result (no write to citation:c-1)")
 	ctx.Equal(probe.Result, 0, "when the result was committed the topic already held records: a consumer reading the store on that event finds a status it does not announce. Commit first, then produce; the records at commit time")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the commit; the records")
-	row := store.Get(eventsBg, "c-1")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "the event must still be produced after the commit; the records")
+	row := store.Get(hEventsBg, "c-1")
 	ctx.Assert(row.Status == "verified" && row.Version == 2 && row.Start == 12, "the store holds %+v after the commit, expected the verified result at version 2 [12, 20)", row)
 	var event map[string]any
-	ctx.NoError(json.Unmarshal([]byte(ctx.Kafka.Values(eventsTopic)[0]), &event), "the payload must be JSON")
-	ctx.Equal(event, eventsPayloadC1, "the event must carry the committed result; the payload")
-	failing := eventsResult("doc-7", "a-1", "verified", "")
+	ctx.NoError(json.Unmarshal([]byte(ctx.Kafka.Values(kHEventsTopic)[0]), &event), "the payload must be JSON")
+	ctx.Equal(event, hEventsPayloadC1, "the event must carry the committed result; the payload")
+	failing := hEventsResult("doc-7", "a-1", "verified", "")
 	ctx.Redis.Del("citation:c-2")
 	ctx.Redis.Set("citation:c-2", "not a hash") // the commit answers WRONGTYPE
-	ok, err := publishVerification(eventsBg, failing)
+	ok, err := publishVerification(hEventsBg, failing)
 	ctx.Settle()
 	ctx.Assert(err != nil || !ok, "publishVerification reported success although its commit failed (WRONGTYPE on citation:c-2): the failure must reach the caller")
-	ctx.Assert(len(ctx.Kafka.Records(eventsTopic)) == 1 && len(eventsOutbox(ctx)) == 0, "a result whose commit failed was announced anyway (records: %d, outbox: %v): an event must never describe a status the store does not hold", len(ctx.Kafka.Records(eventsTopic)), eventsOutbox(ctx))
+	ctx.Assert(len(ctx.Kafka.Records(kHEventsTopic)) == 1 && len(hEventsOutbox(ctx)) == 0, "a result whose commit failed was announced anyway (records: %d, outbox: %v): an event must never describe a status the store does not hold", len(ctx.Kafka.Records(kHEventsTopic)), hEventsOutbox(ctx))
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, eventsResult("doc-7", "a-1", "verified", ""))
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish(ctx, hEventsResult("doc-7", "a-1", "verified", ""))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	eventsPublish(ctx, eventsResult("doc-7", "a-1", "verified", ""))
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hEventsPublish(ctx, hEventsResult("doc-7", "a-1", "verified", ""))
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsPublish(ctx, eventsResult("doc-7", "a-1", "verified", ""))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok := hEventsPublish(ctx, hEventsResult("doc-7", "a-1", "verified", ""))
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the event is lost; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "doc-7", "the outbox row is %v, expected the topic and the key doc-7", rows[0])
-	ctx.Equal(rows[0].Payload, eventsPayloadC1, "the outbox row must carry the event payload; the payload")
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == "doc-7", "the outbox row is %v, expected the topic and the key doc-7", rows[0])
+	ctx.Equal(rows[0].Payload, hEventsPayloadC1, "the outbox row must carry the event payload; the payload")
 	ctx.Equal(ok, false, "publishVerification's result after a failed delivery")
-	ctx.Equal(store.Get(eventsBg, "c-1").Status, "verified", "the result must stay committed when only the produce failed; the stored status")
-	next := eventsResult("doc-7", "a-1", "verified", "")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Equal(store.Get(hEventsBg, "c-1").Status, "verified", "the result must stay committed when only the produce failed; the stored status")
+	next := hEventsResult("doc-7", "a-1", "verified", "")
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsPublish(ctx, next)
+	ok = hEventsPublish(ctx, next)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishVerification waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout = 2 s, then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["citation_id"] == "c-2", "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishVerification's result without a delivery report")
 }
@@ -972,10 +972,10 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "citation.event";
+const std::string kHEventsTopic = "citation.event";
 
 // A stored citation, and what the verifier found for it: re-anchored into version 2.
-store::Citation eventsResult(const std::string& document_id, const std::string& answer_id = "a-1", const std::string& status = "verified", const std::string& reason = "") {
+store::Citation hEventsResult(const std::string& document_id, const std::string& answer_id = "a-1", const std::string& status = "verified", const std::string& reason = "") {
   store::Citation row = store::create("t1", store::Citation{"", "", answer_id, document_id, 1, 4, 12, "Lovelace", "", ""});
   row.version = 2;
   row.start = 12;
@@ -985,7 +985,7 @@ store::Citation eventsResult(const std::string& document_id, const std::string& 
   return row;
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -995,57 +995,57 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
+std::string hEventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 // The event payload of the first result eventsResult makes: c-1 re-anchored into version 2, verified.
-const nlohmann::json kEventsPayloadC1 = {{"citation_id", "c-1"}, {"tenant", "t1"}, {"document_id", "doc-7"}, {"version", 2}, {"start", 12}, {"end", 20}, {"status", "verified"}, {"reason", ""}};
+const nlohmann::json kHEventsPayloadC1 = {{"citation_id", "c-1"}, {"tenant", "t1"}, {"document_id", "doc-7"}, {"version", 2}, {"start", 12}, {"end", 20}, {"status", "verified"}, {"reason", ""}};
 
 }  // namespace
 
 void CheckDocumentKey(harness::Ctx& ctx) {
-  publishVerification(eventsResult("doc-7", "a-1"));
-  publishVerification(eventsResult("doc-9", "a-1"));
-  publishVerification(eventsResult("doc-7", "a-2"));
+  publishVerification(hEventsResult("doc-7", "a-1"));
+  publishVerification(hEventsResult("doc-9", "a-1"));
+  publishVerification(hEventsResult("doc-7", "a-2"));
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three publishVerification calls must produce three records on citation.event; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"doc-7", "doc-9", "doc-7"}, "the records must be keyed by the document ids");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"doc-7", "doc-9", "doc-7"}, "the records must be keyed by the document ids");
   ctx.Equal(records[0].Partition, records[2].Partition, "both doc-7 events must land on one partition, or the lineage consumer applies one document's history out of order; the partitions");
 }
 
 void CheckStatusPublished(harness::Ctx& ctx) {
-  publishVerification(eventsResult("doc-7", "a-1", "broken", "span_moved"));
-  publishVerification(eventsResult("doc-9", "a-1", "pending", "docstore_unavailable"));
+  publishVerification(hEventsResult("doc-7", "a-1", "broken", "span_moved"));
+  publishVerification(hEventsResult("doc-9", "a-1", "pending", "docstore_unavailable"));
   ctx.Settle();
   std::vector<std::string> seen;
-  for (const auto& text : ctx.Kafka.Values(kEventsTopic)) {
+  for (const auto& text : ctx.Kafka.Values(kHEventsTopic)) {
     const auto value = nlohmann::json::parse(text, nullptr, false);
-    seen.push_back(eventsField(value, "citation_id") + " " + eventsField(value, "status") + " " + eventsField(value, "reason"));
+    seen.push_back(hEventsField(value, "citation_id") + " " + hEventsField(value, "status") + " " + hEventsField(value, "reason"));
   }
   ctx.Equal(seen, {"c-1 broken span_moved", "c-2 pending docstore_unavailable"}, "a broken and a pending result must each produce an event with its status and reason (a lineage that records only verified citations hides every regression)");
   ctx.Equal(store::get("c-1")->status, "broken", "the broken result must be committed; the stored status");
 }
 
 void CheckCommitFirst(harness::Ctx& ctx) {
-  const store::Citation result = eventsResult("doc-7");
+  const store::Citation result = hEventsResult("doc-7");
   size_t atCommit = 999;
   bool fired = false;
   ctx.Redis.After("citation:c-1", [&] {
     fired = true;
-    atCommit = ctx.Kafka.Records(kEventsTopic).size();
+    atCommit = ctx.Kafka.Records(kHEventsTopic).size();
   });
   publishVerification(result);
   ctx.Settle();
   ctx.Assert(fired, "publishVerification never committed the result (no write to citation:c-1)");
   ctx.Equal(atCommit, 0, "when the result was committed the topic already held records: a consumer reading the store on that event finds a status it does not announce. Commit first, then produce; the records at commit time");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the event must still be produced after the commit; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "the event must still be produced after the commit; the records");
   const auto row = store::get("c-1");
   ctx.Assert(row && row->status == "verified" && row->version == 2 && row->start == 12, "the store holds %s after the commit, expected the verified result at version 2 [12, 20)", row ? store::toJson(*row).dump() : "nothing");
-  const auto event = nlohmann::json::parse(ctx.Kafka.Values(kEventsTopic)[0], nullptr, false);
-  ctx.Assert(event == kEventsPayloadC1, "the event is %s, expected the committed result %s", event.dump(), kEventsPayloadC1.dump());
-  const store::Citation failing = eventsResult("doc-7");
+  const auto event = nlohmann::json::parse(ctx.Kafka.Values(kHEventsTopic)[0], nullptr, false);
+  ctx.Assert(event == kHEventsPayloadC1, "the event is %s, expected the committed result %s", event.dump(), kHEventsPayloadC1.dump());
+  const store::Citation failing = hEventsResult("doc-7");
   ctx.Redis.Del("citation:c-2");
   ctx.Redis.Set("citation:c-2", "not a hash");  // the commit answers WRONGTYPE
   bool ok = false;
@@ -1056,40 +1056,40 @@ void CheckCommitFirst(harness::Ctx& ctx) {
   }
   ctx.Settle();
   ctx.Assert(!ok, "publishVerification returned true although its commit failed (WRONGTYPE on citation:c-2): the failure must reach the caller");
-  ctx.Assert(ctx.Kafka.Records(kEventsTopic).size() == 1 && eventsOutbox(ctx).empty(),
-             "a result whose commit failed was announced anyway (records: %d, outbox rows: %d): an event must never describe a status the store does not hold", ctx.Kafka.Records(kEventsTopic).size(),
-             eventsOutbox(ctx).size());
+  ctx.Assert(ctx.Kafka.Records(kHEventsTopic).size() == 1 && hEventsOutbox(ctx).empty(),
+             "a result whose commit failed was announced anyway (records: %d, outbox rows: %d): an event must never describe a status the store does not hold", ctx.Kafka.Records(kHEventsTopic).size(),
+             hEventsOutbox(ctx).size());
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishVerification(eventsResult("doc-7"));
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishVerification(hEventsResult("doc-7"));
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  publishVerification(eventsResult("doc-7"));
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  publishVerification(hEventsResult("doc-7"));
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = publishVerification(eventsResult("doc-7"));
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  bool ok = publishVerification(hEventsResult("doc-7"));
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the event is lost; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "doc-7" && rows[0].contains("payload") && rows[0]["payload"] == kEventsPayloadC1,
-             "the outbox row is %s, expected the topic, the key doc-7 and the event payload %s", rows[0].dump(), kEventsPayloadC1.dump());
+  ctx.Assert(hEventsField(rows[0], "topic") == kHEventsTopic && hEventsField(rows[0], "key") == "doc-7" && rows[0].contains("payload") && rows[0]["payload"] == kHEventsPayloadC1,
+             "the outbox row is %s, expected the topic, the key doc-7 and the event payload %s", rows[0].dump(), kHEventsPayloadC1.dump());
   ctx.Equal(ok, false, "publishVerification's result after a failed delivery");
   ctx.Equal(store::get("c-1")->status, "verified", "the result must stay committed when only the produce failed; the stored status");
-  const store::Citation next = eventsResult("doc-7");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  const store::Citation next = hEventsResult("doc-7");
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = publishVerification(next);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publishVerification waited %.1f s for a broker that does not answer: wait for the report at most kAckTimeoutMs = 2000, then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "citation_id") == "c-2",
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hEventsField(rows[1]["payload"], "citation_id") == "c-2",
              "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishVerification's result without a delivery report");
 }

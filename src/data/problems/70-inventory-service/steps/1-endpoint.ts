@@ -724,7 +724,7 @@ import (
 	"inventory/store"
 )
 
-func apiWorld(ctx *harness.Ctx, units int) *harness.HTTP {
+func hApiWorld(ctx *harness.Ctx, units int) *harness.HTTP {
 	ctx.Redis.Do("HSET", "sku:sku-1", "tenant", "t1")
 	ctx.Redis.Do("HSET", "sku:sku-9", "tenant", "t2")
 	ctx.Redis.Set("stock:sku-1", units)
@@ -734,7 +734,7 @@ func apiWorld(ctx *harness.Ctx, units int) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func apiReserve(c *harness.HTTP, sku string, quantity any, key string) *harness.Response {
+func hApiReserve(c *harness.HTTP, sku string, quantity any, key string) *harness.Response {
 	body := map[string]any{"sku": sku, "quantity": quantity}
 	if key == "" {
 		return c.Post("/v1/reservations", body, "X-Tenant-Id", "t1")
@@ -742,73 +742,73 @@ func apiReserve(c *harness.HTTP, sku string, quantity any, key string) *harness.
 	return c.Post("/v1/reservations", body, "X-Tenant-Id", "t1", "Idempotency-Key", key)
 }
 
-func apiUnits(ctx *harness.Ctx, sku string) int {
+func hApiUnits(ctx *harness.Ctx, sku string) int {
 	value, _ := ctx.Redis.Get("stock:" + sku)
 	n, _ := strconv.Atoi(value)
 	return n
 }
 
-type apiReservation struct {
+type HApiReservation struct {
 	ReservationID string \`json:"reservation_id"\`
 	SKU           string \`json:"sku"\`
 	Quantity      int    \`json:"quantity"\`
 	Status        string \`json:"status"\`
 }
 
-func apiBody(r *harness.Response) apiReservation {
-	var body apiReservation
+func hApiBody(r *harness.Response) HApiReservation {
+	var body HApiReservation
 	r.Decode(&body)
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiWorld(ctx, 10)
-	r := apiReserve(c, "sku-1", 3, "k-1")
+	c := hApiWorld(ctx, 10)
+	r := hApiReserve(c, "sku-1", 3, "k-1")
 	ctx.Equal(r.Status, 201, "POST /v1/reservations (%s)", r.Text())
-	body := apiBody(r)
+	body := hApiBody(r)
 	ctx.Assert(body.Status == "reserved" && body.Quantity == 3 && body.SKU == "sku-1", "the reservation must answer sku-1, 3 units, reserved; got %s", r.Text())
-	ctx.Equal(apiUnits(ctx, "sku-1"), 7, "stock:sku-1 after reserving 3 of 10")
+	ctx.Equal(hApiUnits(ctx, "sku-1"), 7, "stock:sku-1 after reserving 3 of 10")
 	stored, err := store.Get(context.Background(), body.ReservationID)
 	ctx.NoError(err, "reading the reservation store")
 	ctx.Assert(stored != nil && stored.Status == "reserved", "the reservation store holds %+v for %q", stored, body.ReservationID)
 }
 
 func CheckQuantityRange(ctx *harness.Ctx) {
-	c := apiWorld(ctx, 5000)
+	c := hApiWorld(ctx, 5000)
 	for n, quantity := range []int64{-3, 0, 1001, 4294967297} {
-		r := apiReserve(c, "sku-1", quantity, fmt.Sprintf("k-%d", n))
-		ctx.Assert(r.Status == 400, "a quantity of %d answered %d and stock:sku-1 is now %d: a quantity outside 1..1000 is 400, before any stock moves", quantity, r.Status, apiUnits(ctx, "sku-1"))
-		ctx.Equal(apiUnits(ctx, "sku-1"), 5000, "stock:sku-1 after a rejected quantity of %d", quantity)
+		r := hApiReserve(c, "sku-1", quantity, fmt.Sprintf("k-%d", n))
+		ctx.Assert(r.Status == 400, "a quantity of %d answered %d and stock:sku-1 is now %d: a quantity outside 1..1000 is 400, before any stock moves", quantity, r.Status, hApiUnits(ctx, "sku-1"))
+		ctx.Equal(hApiUnits(ctx, "sku-1"), 5000, "stock:sku-1 after a rejected quantity of %d", quantity)
 	}
-	fraction := apiReserve(c, "sku-1", 2.5, "k-5")
-	ctx.Assert(fraction.Status == 400 || fraction.Status == 422, "a quantity of 2.5 answered %d and stock:sku-1 is now %d: a quantity that is not a whole number is rejected before any stock moves", fraction.Status, apiUnits(ctx, "sku-1"))
-	ctx.Equal(apiUnits(ctx, "sku-1"), 5000, "stock:sku-1 after a rejected quantity of 2.5")
-	one := apiReserve(c, "sku-1", 1, "k-8")
-	r := apiReserve(c, "sku-1", 1000, "k-9")
+	fraction := hApiReserve(c, "sku-1", 2.5, "k-5")
+	ctx.Assert(fraction.Status == 400 || fraction.Status == 422, "a quantity of 2.5 answered %d and stock:sku-1 is now %d: a quantity that is not a whole number is rejected before any stock moves", fraction.Status, hApiUnits(ctx, "sku-1"))
+	ctx.Equal(hApiUnits(ctx, "sku-1"), 5000, "stock:sku-1 after a rejected quantity of 2.5")
+	one := hApiReserve(c, "sku-1", 1, "k-8")
+	r := hApiReserve(c, "sku-1", 1000, "k-9")
 	ctx.Equal(one.Status, 201, "a quantity of 1, the floor (%s)", one.Text())
 	ctx.Equal(r.Status, 201, "a quantity of 1000, the cap (%s)", r.Text())
-	ctx.Equal(apiUnits(ctx, "sku-1"), 3999, "stock:sku-1 after reserving 1 and 1000 of 5000")
+	ctx.Equal(hApiUnits(ctx, "sku-1"), 3999, "stock:sku-1 after reserving 1 and 1000 of 5000")
 }
 
 func CheckSkuTenant(ctx *harness.Ctx) {
-	c := apiWorld(ctx, 10)
-	other := apiReserve(c, "sku-9", 3, "k-1")
-	unknown := apiReserve(c, "sku-404", 3, "k-2")
+	c := hApiWorld(ctx, 10)
+	other := hApiReserve(c, "sku-9", 3, "k-1")
+	unknown := hApiReserve(c, "sku-404", 3, "k-2")
 	ctx.Equal(other.Status, 404, "tenant t1 reserving t2's sku-9")
-	ctx.Equal(apiUnits(ctx, "sku-9"), 10, "t2's stock:sku-9 after t1's request")
+	ctx.Equal(hApiUnits(ctx, "sku-9"), 10, "t2's stock:sku-9 after t1's request")
 	ctx.Equal(unknown.Status, 404, "a sku the catalogue does not know")
 	ctx.Equal(len(ctx.Redis.Keys("reservation:*")), 0, "reservations stored by rejected requests")
 }
 
 func CheckIdempotency(ctx *harness.Ctx) {
-	c := apiWorld(ctx, 10)
-	first := apiReserve(c, "sku-1", 3, "k-1")
-	replay := apiReserve(c, "sku-1", 3, "k-1")
-	missing := apiReserve(c, "sku-1", 3, "")
+	c := hApiWorld(ctx, 10)
+	first := hApiReserve(c, "sku-1", 3, "k-1")
+	replay := hApiReserve(c, "sku-1", 3, "k-1")
+	missing := hApiReserve(c, "sku-1", 3, "")
 	ctx.Equal(first.Status, 201, "the first reservation (%s)", first.Text())
 	ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1 must answer the first reservation; the status")
-	ctx.Equal(apiBody(replay).ReservationID, apiBody(first).ReservationID, "the replay must answer the first reservation's id")
-	ctx.Equal(apiUnits(ctx, "sku-1"), 7, "stock:sku-1 after one reservation of 3 and its replay (the retry must not hold the units again)")
+	ctx.Equal(hApiBody(replay).ReservationID, hApiBody(first).ReservationID, "the replay must answer the first reservation's id")
+	ctx.Equal(hApiUnits(ctx, "sku-1"), 7, "stock:sku-1 after one reservation of 3 and its replay (the retry must not hold the units again)")
 	ctx.Equal(missing.Status, 400, "a reservation without Idempotency-Key")
 }
 `,
@@ -822,7 +822,7 @@ func CheckIdempotency(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP apiWorld(harness::Ctx& ctx, int units) {
+harness::HTTP hApiWorld(harness::Ctx& ctx, int units) {
   ctx.Redis.Do("HSET", "sku:sku-1", "tenant", "t1");
   ctx.Redis.Do("HSET", "sku:sku-9", "tenant", "t2");
   ctx.Redis.Do("SET", "stock:sku-1", units);
@@ -834,18 +834,18 @@ harness::HTTP apiWorld(harness::Ctx& ctx, int units) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response apiReserve(harness::HTTP& c, const std::string& sku, const nlohmann::json& quantity, const std::string& key) {
+harness::Response hApiReserve(harness::HTTP& c, const std::string& sku, const nlohmann::json& quantity, const std::string& key) {
   const std::string body = nlohmann::json{{"sku", sku}, {"quantity", quantity}}.dump();
   if (key.empty()) return c.Post("/v1/reservations", body, "Content-Type", "application/json", "X-Tenant-Id", "t1");
   return c.Post("/v1/reservations", body, "Content-Type", "application/json", "X-Tenant-Id", "t1", "Idempotency-Key", key);
 }
 
-long long apiUnits(harness::Ctx& ctx, const std::string& sku) {
+long long hApiUnits(harness::Ctx& ctx, const std::string& sku) {
   const auto value = ctx.Redis.Get("stock:" + sku);
   return value ? std::stoll(*value) : 0;
 }
 
-nlohmann::json apiBody(const harness::Response& r) {
+nlohmann::json hApiBody(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : nlohmann::json::object();
 }
@@ -853,57 +853,57 @@ nlohmann::json apiBody(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = apiWorld(ctx, 10);
-  const auto r = apiReserve(c, "sku-1", 3, "k-1");
+  auto c = hApiWorld(ctx, 10);
+  const auto r = hApiReserve(c, "sku-1", 3, "k-1");
   ctx.Equal(r.Status, 201, "POST /v1/reservations (%s)", r.Text());
-  const auto body = apiBody(r);
+  const auto body = hApiBody(r);
   ctx.Assert(body.value("status", "") == "reserved" && body.value("quantity", 0) == 3 && body.value("sku", "") == "sku-1",
              "the reservation must answer sku-1, 3 units, reserved; got %s", r.Text());
-  ctx.Equal(apiUnits(ctx, "sku-1"), 7, "stock:sku-1 after reserving 3 of 10");
+  ctx.Equal(hApiUnits(ctx, "sku-1"), 7, "stock:sku-1 after reserving 3 of 10");
   const auto stored = inventory::store::Get(body.value("reservation_id", ""));
   ctx.Assert(stored && stored->status == "reserved", "the reservation store holds no reserved record for %q", body.value("reservation_id", ""));
 }
 
 void CheckQuantityRange(harness::Ctx& ctx) {
-  auto c = apiWorld(ctx, 5000);
+  auto c = hApiWorld(ctx, 5000);
   int n = 0;
   for (const long long quantity : {-3LL, 0LL, 1001LL, 4294967297LL}) {
-    const auto r = apiReserve(c, "sku-1", quantity, "k-" + std::to_string(n++));
+    const auto r = hApiReserve(c, "sku-1", quantity, "k-" + std::to_string(n++));
     ctx.Assert(r.Status == 400, "a quantity of %d answered %d and stock:sku-1 is now %d: a quantity outside 1..1000 is 400, before any stock moves",
-               quantity, r.Status, apiUnits(ctx, "sku-1"));
-    ctx.Equal(apiUnits(ctx, "sku-1"), 5000, "stock:sku-1 after a rejected quantity of %d", quantity);
+               quantity, r.Status, hApiUnits(ctx, "sku-1"));
+    ctx.Equal(hApiUnits(ctx, "sku-1"), 5000, "stock:sku-1 after a rejected quantity of %d", quantity);
   }
-  const auto fraction = apiReserve(c, "sku-1", 2.5, "k-5");
+  const auto fraction = hApiReserve(c, "sku-1", 2.5, "k-5");
   ctx.Assert(fraction.Status == 400 || fraction.Status == 422,
              "a quantity of 2.5 answered %d and stock:sku-1 is now %d: a quantity that is not a whole number is rejected before any stock moves",
-             fraction.Status, apiUnits(ctx, "sku-1"));
-  ctx.Equal(apiUnits(ctx, "sku-1"), 5000, "stock:sku-1 after a rejected quantity of 2.5");
-  const auto one = apiReserve(c, "sku-1", 1, "k-8");
-  const auto r = apiReserve(c, "sku-1", 1000, "k-9");
+             fraction.Status, hApiUnits(ctx, "sku-1"));
+  ctx.Equal(hApiUnits(ctx, "sku-1"), 5000, "stock:sku-1 after a rejected quantity of 2.5");
+  const auto one = hApiReserve(c, "sku-1", 1, "k-8");
+  const auto r = hApiReserve(c, "sku-1", 1000, "k-9");
   ctx.Equal(one.Status, 201, "a quantity of 1, the floor (%s)", one.Text());
   ctx.Equal(r.Status, 201, "a quantity of 1000, the cap (%s)", r.Text());
-  ctx.Equal(apiUnits(ctx, "sku-1"), 3999, "stock:sku-1 after reserving 1 and 1000 of 5000");
+  ctx.Equal(hApiUnits(ctx, "sku-1"), 3999, "stock:sku-1 after reserving 1 and 1000 of 5000");
 }
 
 void CheckSkuTenant(harness::Ctx& ctx) {
-  auto c = apiWorld(ctx, 10);
-  const auto other = apiReserve(c, "sku-9", 3, "k-1");
-  const auto unknown = apiReserve(c, "sku-404", 3, "k-2");
+  auto c = hApiWorld(ctx, 10);
+  const auto other = hApiReserve(c, "sku-9", 3, "k-1");
+  const auto unknown = hApiReserve(c, "sku-404", 3, "k-2");
   ctx.Equal(other.Status, 404, "tenant t1 reserving t2's sku-9");
-  ctx.Equal(apiUnits(ctx, "sku-9"), 10, "t2's stock:sku-9 after t1's request");
+  ctx.Equal(hApiUnits(ctx, "sku-9"), 10, "t2's stock:sku-9 after t1's request");
   ctx.Equal(unknown.Status, 404, "a sku the catalogue does not know");
   ctx.Equal(ctx.Redis.Keys("reservation:*").size(), 0, "reservations stored by rejected requests");
 }
 
 void CheckIdempotency(harness::Ctx& ctx) {
-  auto c = apiWorld(ctx, 10);
-  const auto first = apiReserve(c, "sku-1", 3, "k-1");
-  const auto replay = apiReserve(c, "sku-1", 3, "k-1");
-  const auto missing = apiReserve(c, "sku-1", 3, "");
+  auto c = hApiWorld(ctx, 10);
+  const auto first = hApiReserve(c, "sku-1", 3, "k-1");
+  const auto replay = hApiReserve(c, "sku-1", 3, "k-1");
+  const auto missing = hApiReserve(c, "sku-1", 3, "");
   ctx.Equal(first.Status, 201, "the first reservation (%s)", first.Text());
   ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1 must answer the first reservation; the status");
-  ctx.Equal(apiBody(replay).value("reservation_id", ""), apiBody(first).value("reservation_id", ""), "the replay must answer the first reservation's id");
-  ctx.Equal(apiUnits(ctx, "sku-1"), 7, "stock:sku-1 after one reservation of 3 and its replay (the retry must not hold the units again)");
+  ctx.Equal(hApiBody(replay).value("reservation_id", ""), hApiBody(first).value("reservation_id", ""), "the replay must answer the first reservation's id");
+  ctx.Equal(hApiUnits(ctx, "sku-1"), 7, "stock:sku-1 after one reservation of 3 and its replay (the retry must not hold the units again)");
   ctx.Equal(missing.Status, 400, "a reservation without Idempotency-Key");
 }
 `,

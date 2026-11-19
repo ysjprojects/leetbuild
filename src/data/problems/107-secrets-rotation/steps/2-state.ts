@@ -693,60 +693,60 @@ import (
 )
 
 const (
-	stateName    = "payments-db"
-	stateActive  = "secret:payments-db:active"
-	stateOverlap = "secret:payments-db:overlap"
-	stateRevoked = "secret:payments-db:revoked"
+	kHStateName    = "payments-db"
+	kHStateActive  = "secret:payments-db:active"
+	kHStateOverlap = "secret:payments-db:overlap"
+	kHStateRevoked = "secret:payments-db:revoked"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func stateActivate(ctx *harness.Ctx, versionID string) string {
-	previous, err := activate(stateBg, stateName, versionID)
-	ctx.NoError(err, "activate(%s, %s) failed", stateName, versionID)
+func hStateActivate(ctx *harness.Ctx, versionID string) string {
+	previous, err := activate(hStateBg, kHStateName, versionID)
+	ctx.NoError(err, "activate(%s, %s) failed", kHStateName, versionID)
 	return previous
 }
 
-func stateValid(ctx *harness.Ctx) []string {
-	valid, err := validVersions(stateBg, stateName)
-	ctx.NoError(err, "validVersions(%s) failed", stateName)
+func hStateValid(ctx *harness.Ctx) []string {
+	valid, err := validVersions(hStateBg, kHStateName)
+	ctx.NoError(err, "validVersions(%s) failed", kHStateName)
 	return valid
 }
 
 func CheckOverlapWindow(ctx *harness.Ctx) {
-	ctx.Equal(stateActivate(ctx, "v1"), "", "the first activation has no previous version: activate must answer \\"\\"")
+	ctx.Equal(hStateActivate(ctx, "v1"), "", "the first activation has no previous version: activate must answer \\"\\"")
 	// The overlap carries its expiry from the command that writes it: a crash between a write and a later EXPIRE keeps the old version valid for ever.
-	born := ctx.Redis.After(stateOverlap, func() any { return ctx.Redis.TTL(stateOverlap) })
-	ctx.Equal(stateActivate(ctx, "v2"), "v1", "activating v2 over v1 must answer the previous version")
-	ctx.Equal(stateValid(ctx), []string{"v2", "v1"}, "right after the swap a consumer mid-deploy still holds v1, so v1 stays valid for the overlap; validVersions")
-	ctx.Assert(born.Fired, "activating v2 over v1 never wrote %s: the previous version stays valid under the overlap key", stateOverlap)
+	born := ctx.Redis.After(kHStateOverlap, func() any { return ctx.Redis.TTL(kHStateOverlap) })
+	ctx.Equal(hStateActivate(ctx, "v2"), "v1", "activating v2 over v1 must answer the previous version")
+	ctx.Equal(hStateValid(ctx), []string{"v2", "v1"}, "right after the swap a consumer mid-deploy still holds v1, so v1 stays valid for the overlap; validVersions")
+	ctx.Assert(born.Fired, "activating v2 over v1 never wrote %s: the previous version stays valid under the overlap key", kHStateOverlap)
 	ctx.Assert(born.Err == nil, "reading the overlap TTL failed: %v", born.Err)
 	bornTTL, _ := born.Result.(int64)
-	ctx.Assert(bornTTL > 0 && bornTTL <= 900, "right after the command that wrote %s its TTL was %d: the swap script sets the overlap with EX overlapSeconds itself, not in a later command", stateOverlap, bornTTL)
-	ttl := ctx.Redis.TTL(stateOverlap)
-	ctx.Assert(ttl > 0 && ttl <= 900, "%s has TTL %d, expected the 900-second overlap", stateOverlap, ttl)
+	ctx.Assert(bornTTL > 0 && bornTTL <= 900, "right after the command that wrote %s its TTL was %d: the swap script sets the overlap with EX overlapSeconds itself, not in a later command", kHStateOverlap, bornTTL)
+	ttl := ctx.Redis.TTL(kHStateOverlap)
+	ctx.Assert(ttl > 0 && ttl <= 900, "%s has TTL %d, expected the 900-second overlap", kHStateOverlap, ttl)
 	ctx.Clock.Advance(890)
-	ctx.Equal(stateValid(ctx), []string{"v2", "v1"}, "890 s after the swap (the overlap lasts overlapSeconds = 900); validVersions")
+	ctx.Equal(hStateValid(ctx), []string{"v2", "v1"}, "890 s after the swap (the overlap lasts overlapSeconds = 900); validVersions")
 	ctx.Clock.Advance(20)
-	ctx.Equal(stateValid(ctx), []string{"v2"}, "past the overlap; validVersions")
+	ctx.Equal(hStateValid(ctx), []string{"v2"}, "past the overlap; validVersions")
 }
 
 func CheckAtomicSwap(ctx *harness.Ctx) {
-	stateActivate(ctx, "v1")
+	hStateActivate(ctx, "v1")
 	// A second rotation (to v3) lands while this one (to v2) is swapping the pointer.
-	rival := ctx.Redis.After(stateActive, func() any {
-		previous, err := activate(stateBg, stateName, "v3")
+	rival := ctx.Redis.After(kHStateActive, func() any {
+		previous, err := activate(hStateBg, kHStateName, "v3")
 		ctx.NoError(err, "the rival activation failed")
 		return previous
 	})
-	ours := stateActivate(ctx, "v2")
-	ctx.Assert(rival.Fired, "nothing touched %s", stateActive)
+	ours := hStateActivate(ctx, "v2")
+	ctx.Assert(rival.Fired, "nothing touched %s", kHStateActive)
 	ctx.Assert(rival.Err == nil, "the rival activation failed: %v", rival.Err)
 	theirs, _ := rival.Result.(string)
 	ctx.Assert((ours == "v1" && theirs == "v2") || (ours == "v3" && theirs == "v1"),
 		"two activations racing over v1 answered previous versions %q (to v2) and %q (to v3): one of them read the pointer, the other moved it, and the first overwrote it, so a version vanished from every window. Read and move the pointer in one Lua script", ours, theirs)
-	active, _ := ctx.Redis.Get(stateActive)
-	overlap, _ := ctx.Redis.Get(stateOverlap)
+	active, _ := ctx.Redis.Get(kHStateActive)
+	overlap, _ := ctx.Redis.Get(kHStateOverlap)
 	expected := []string{"v2", "v3"}
 	if ours == "v1" {
 		expected = []string{"v3", "v2"}
@@ -755,29 +755,29 @@ func CheckAtomicSwap(ctx *harness.Ctx) {
 }
 
 func CheckPointerPermanent(ctx *harness.Ctx) {
-	stateActivate(ctx, "v1")
-	ttl := ctx.Redis.TTL(stateActive)
-	ctx.Equal(ttl, -1, "%s has a TTL: a quiet week would drop the pointer and every consumer with it. The pointer has no TTL; its TTL", stateActive)
+	hStateActivate(ctx, "v1")
+	ttl := ctx.Redis.TTL(kHStateActive)
+	ctx.Equal(ttl, -1, "%s has a TTL: a quiet week would drop the pointer and every consumer with it. The pointer has no TTL; its TTL", kHStateActive)
 	ctx.Clock.Advance(7 * 86400)
-	ctx.Equal(stateValid(ctx), []string{"v1"}, "a week without rotations later; validVersions")
-	stateActivate(ctx, "v2")
-	ctx.Equal(ctx.Redis.TTL(stateActive), -1, "after the second activation the pointer must still have no TTL; its TTL")
+	ctx.Equal(hStateValid(ctx), []string{"v1"}, "a week without rotations later; validVersions")
+	hStateActivate(ctx, "v2")
+	ctx.Equal(ctx.Redis.TTL(kHStateActive), -1, "after the second activation the pointer must still have no TTL; its TTL")
 }
 
 func CheckRevokeExplicit(ctx *harness.Ctx) {
-	stateActivate(ctx, "v1")
-	stateActivate(ctx, "v2")
-	refused, err := revoke(stateBg, stateName, "v2")
+	hStateActivate(ctx, "v1")
+	hStateActivate(ctx, "v2")
+	refused, err := revoke(hStateBg, kHStateName, "v2")
 	ctx.NoError(err, "revoke(v2) failed")
 	ctx.Equal(refused, false, "revoking the active version v2 must be refused: every consumer would lose the secret. Activate another version first; revoke answered")
-	active, _ := ctx.Redis.Get(stateActive)
+	active, _ := ctx.Redis.Get(kHStateActive)
 	ctx.Equal(active, "v2", "a refused revoke must leave the pointer; active")
-	ctx.Assert(!ctx.Redis.SIsMember(stateRevoked, "v2"), "a refused revoke still recorded v2 as revoked")
-	done, err := revoke(stateBg, stateName, "v1")
+	ctx.Assert(!ctx.Redis.SIsMember(kHStateRevoked, "v2"), "a refused revoke still recorded v2 as revoked")
+	done, err := revoke(hStateBg, kHStateName, "v1")
 	ctx.NoError(err, "revoke(v1) failed")
 	ctx.Equal(done, true, "revoking the previous version v1 must succeed; revoke answered")
-	ctx.Assert(ctx.Redis.SIsMember(stateRevoked, "v1"), "%s must hold v1 after the revoke", stateRevoked)
-	ctx.Equal(stateValid(ctx), []string{"v2"}, "after revoking v1 (a revoked version stops working at once, overlap or not); validVersions")
+	ctx.Assert(ctx.Redis.SIsMember(kHStateRevoked, "v1"), "%s must hold v1 after the revoke", kHStateRevoked)
+	ctx.Equal(hStateValid(ctx), []string{"v2"}, "after revoking v1 (a revoked version stops working at once, overlap or not); validVersions")
 }
 `,
     cpp: `#include <leetbuild/harness.h>

@@ -729,8 +729,8 @@ import (
 )
 
 var (
-	tenantHeader = []string{"X-Tenant-Id", "t-1"}
-	emailJob     = map[string]any{"type": "email.send", "payload": map[string]any{"to": "ada@example.com", "template": "welcome"}}
+	hTenantHeader = []string{"X-Tenant-Id", "t-1"}
+	hEmailJob     = map[string]any{"type": "email.send", "payload": map[string]any{"to": "ada@example.com", "template": "welcome"}}
 )
 
 func harnessAPI(ctx *harness.Ctx) *harness.HTTP {
@@ -739,7 +739,7 @@ func harnessAPI(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func jobIDOf(r *harness.Response) string {
+func hJobIDOf(r *harness.Response) string {
 	var body struct {
 		JobID string \`json:"job_id"\`
 	}
@@ -749,9 +749,9 @@ func jobIDOf(r *harness.Response) string {
 
 func CheckRoute(ctx *harness.Ctx) {
 	c := harnessAPI(ctx)
-	r := c.Post("/v1/jobs", emailJob, tenantHeader...)
+	r := c.Post("/v1/jobs", hEmailJob, hTenantHeader...)
 	ctx.Equal(r.Status, 202, "POST /v1/jobs (%s)", r.Text())
-	jobID := jobIDOf(r)
+	jobID := hJobIDOf(r)
 	ctx.Assert(jobID != "", "the 202 must carry the job id, got %s", r.Text())
 	job := store.GetJob(context.Background(), jobID)
 	ctx.Assert(job != nil && job.State == "queued" && job.Tenant == "t-1", "the job record of %s is %+v", jobID, job)
@@ -760,16 +760,16 @@ func CheckRoute(ctx *harness.Ctx) {
 
 func CheckJobType(ctx *harness.Ctx) {
 	c := harnessAPI(ctx)
-	headers := append(append([]string{}, tenantHeader...), "Dedupe-Key", "welcome-typo")
-	r := c.Post("/v1/jobs", map[string]any{"type": "emial.send", "payload": emailJob["payload"]}, headers...)
+	headers := append(append([]string{}, hTenantHeader...), "Dedupe-Key", "welcome-typo")
+	r := c.Post("/v1/jobs", map[string]any{"type": "emial.send", "payload": hEmailJob["payload"]}, headers...)
 	ctx.Equal(r.Status, 400, "the unregistered type emial.send must be 400 (no worker runs a type the registry does not know); the status")
 	ctx.Equal(ctx.Redis.LLen("jobs:queue"), 0, "an unregistered job type was queued; jobs:queue length")
 	ctx.Equal(len(ctx.Redis.Keys("job:*")), 0, "an unregistered job type left a job record %v; job records", ctx.Redis.Keys("job:*"))
 	ctx.Assert(len(ctx.Redis.Keys("jobs:dedupe:*")) == 0, "a request answered 400 reserved its Dedupe-Key %v: the corrected retry would be answered with a job that was never queued", ctx.Redis.Keys("jobs:dedupe:*"))
 	// The caller fixes the type and retries with the same key.
-	r = c.Post("/v1/jobs", emailJob, headers...)
+	r = c.Post("/v1/jobs", hEmailJob, headers...)
 	ctx.Equal(r.Status, 202, "the corrected retry with the same Dedupe-Key (%s)", r.Text())
-	ctx.Equal(ctx.Redis.LRange("jobs:queue", 0, -1), []string{jobIDOf(r)}, "the corrected retry must queue its job; jobs:queue")
+	ctx.Equal(ctx.Redis.LRange("jobs:queue", 0, -1), []string{hJobIDOf(r)}, "the corrected retry must queue its job; jobs:queue")
 }
 
 func CheckPayloadSchema(ctx *harness.Ctx) {
@@ -783,7 +783,7 @@ func CheckPayloadSchema(ctx *harness.Ctx) {
 		{map[string]any{"invoice_id": "inv-7", "amount_cents": "1200"}, "payload.amount_cents", "an amount sent as a string"},
 		{map[string]any{"invoice_id": "inv-7", "amount_cents": 1200, "card_number": "4242"}, "payload.card_number", "a field the schema does not list"},
 	}
-	headers := append(append([]string{}, tenantHeader...), "Dedupe-Key", "charge-inv-7")
+	headers := append(append([]string{}, hTenantHeader...), "Dedupe-Key", "charge-inv-7")
 	for _, tc := range cases {
 		r := c.Post("/v1/jobs", map[string]any{"type": "invoice.charge", "payload": tc.payload}, headers...)
 		ctx.Equal(r.Status, 422, "%s must be 422 (the job would fail in a worker five times instead); the status", tc.what)
@@ -793,7 +793,7 @@ func CheckPayloadSchema(ctx *harness.Ctx) {
 	ctx.Assert(len(ctx.Redis.Keys("jobs:dedupe:*")) == 0, "a request answered 422 reserved its Dedupe-Key %v: the corrected retry would be answered with a job that was never queued", ctx.Redis.Keys("jobs:dedupe:*"))
 	r := c.Post("/v1/jobs", map[string]any{"type": "invoice.charge", "payload": map[string]any{"invoice_id": "inv-7", "amount_cents": 1200}}, headers...)
 	ctx.Equal(r.Status, 202, "a payload that fits the schema, retried with the same Dedupe-Key (%s)", r.Text())
-	ctx.Equal(ctx.Redis.LRange("jobs:queue", 0, -1), []string{jobIDOf(r)}, "the corrected retry must queue its job; jobs:queue")
+	ctx.Equal(ctx.Redis.LRange("jobs:queue", 0, -1), []string{hJobIDOf(r)}, "the corrected retry must queue its job; jobs:queue")
 }
 
 func harnessContains(s, sub string) bool {
@@ -807,7 +807,7 @@ func harnessContains(s, sub string) bool {
 
 func CheckDedupeWindow(ctx *harness.Ctx) {
 	c := harnessAPI(ctx)
-	headers := append(append([]string{}, tenantHeader...), "Dedupe-Key", "welcome-ada")
+	headers := append(append([]string{}, hTenantHeader...), "Dedupe-Key", "welcome-ada")
 	key := store.DedupeKey("t-1", "welcome-ada")
 	var ttls []int64
 	var watchTTL func() any
@@ -821,29 +821,29 @@ func CheckDedupeWindow(ctx *harness.Ctx) {
 		return nil
 	}
 	ctx.Redis.After(key, watchTTL)
-	first := c.Post("/v1/jobs", emailJob, headers...)
+	first := c.Post("/v1/jobs", hEmailJob, headers...)
 	ctx.Equal(first.Status, 202, "the first POST (%s)", first.Text())
 	ctx.Assert(len(ttls) > 0 && ttls[len(ttls)-1] != -1, "%s existed without a TTL right after the command that created it (TTLs seen %v): reserve and expire in one SET NX EX, or a crash between two commands keeps the key forever", key, ttls)
-	original := jobIDOf(first)
-	replay := c.Post("/v1/jobs", emailJob, headers...)
-	ctx.Assert(replay.Status == 200 && jobIDOf(replay) == original, "a replayed Dedupe-Key must answer 200 with the original job id %s, got %d %s", original, replay.Status, replay.Text())
+	original := hJobIDOf(first)
+	replay := c.Post("/v1/jobs", hEmailJob, headers...)
+	ctx.Assert(replay.Status == 200 && hJobIDOf(replay) == original, "a replayed Dedupe-Key must answer 200 with the original job id %s, got %d %s", original, replay.Status, replay.Text())
 	ctx.Equal(ctx.Redis.LLen("jobs:queue"), 1, "a replay queued a second job; jobs:queue length")
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(ttl >= 86400-60 && ttl <= 86400, "%s has TTL %d: the reservation must expire after the dedupe window (86400 s), a day: not sooner, and not never", key, ttl)
 	ctx.Clock.Advance(86401)
-	later := c.Post("/v1/jobs", emailJob, headers...)
-	ctx.Assert(later.Status == 202 && jobIDOf(later) != original, "a day later the same key must queue a new job, got %d %s", later.Status, later.Text())
+	later := c.Post("/v1/jobs", hEmailJob, headers...)
+	ctx.Assert(later.Status == 202 && hJobIDOf(later) != original, "a day later the same key must queue a new job, got %d %s", later.Status, later.Text())
 	race := store.DedupeKey("t-1", "invoice-7")
 	// Another replica, handling the same retried request, reserves the key right after this request's first command on it.
 	probe := ctx.Redis.After(race, func() any { return ctx.Redis.Set(race, "job-other", "NX", "EX", 86400) })
 	before := ctx.Redis.LLen("jobs:queue")
-	r := c.Post("/v1/jobs", emailJob, append(append([]string{}, tenantHeader...), "Dedupe-Key", "invoice-7")...)
+	r := c.Post("/v1/jobs", hEmailJob, append(append([]string{}, hTenantHeader...), "Dedupe-Key", "invoice-7")...)
 	ctx.Assert(probe.Fired, "the request never touched the Dedupe-Key's reservation")
 	held, _ := ctx.Redis.Get(race)
 	if won, _ := probe.Result.(bool); won {
-		ctx.Assert(jobIDOf(r) == "job-other" && ctx.Redis.LLen("jobs:queue") == before, "another replica reserved the key between your read and your write; you queued %s anyway and the key now holds %s: reserve with one SET NX EX before the job exists", jobIDOf(r), held)
+		ctx.Assert(hJobIDOf(r) == "job-other" && ctx.Redis.LLen("jobs:queue") == before, "another replica reserved the key between your read and your write; you queued %s anyway and the key now holds %s: reserve with one SET NX EX before the job exists", hJobIDOf(r), held)
 	} else {
-		ctx.Assert(held == jobIDOf(r) && ctx.Redis.LLen("jobs:queue") == before+1, "your request reserved the key, so it must queue its job: the key holds %s, the answer was %s", held, r.Text())
+		ctx.Assert(held == hJobIDOf(r) && ctx.Redis.LLen("jobs:queue") == before+1, "your request reserved the key, so it must queue its job: the key holds %s, the answer was %s", held, r.Text())
 	}
 }
 `,
@@ -859,7 +859,7 @@ func CheckDedupeWindow(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEmail = R"({"type": "email.send", "payload": {"to": "ada@example.com", "template": "welcome"}})";
+const std::string kHEmail = R"({"type": "email.send", "payload": {"to": "ada@example.com", "template": "welcome"}})";
 
 harness::HTTP harnessApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
@@ -883,7 +883,7 @@ std::string harnessJobIdOf(const harness::Response& r) {
 
 void CheckRoute(harness::Ctx& ctx) {
   auto c = harnessApi(ctx);
-  const auto r = harnessPost(c, kEmail);
+  const auto r = harnessPost(c, kHEmail);
   ctx.Equal(r.Status, 202, "POST /v1/jobs (%s)", r.Text());
   const std::string job_id = harnessJobIdOf(r);
   ctx.Assert(!job_id.empty(), "the 202 must carry the job id, got %s", r.Text());
@@ -900,7 +900,7 @@ void CheckJobType(harness::Ctx& ctx) {
   ctx.Equal(ctx.Redis.Keys("job:*").size(), 0, "an unregistered job type left a job record; job records");
   ctx.Assert(ctx.Redis.Keys("jobs:dedupe:*").empty(), "a request answered 400 reserved its Dedupe-Key: the corrected retry would be answered with a job that was never queued");
   // The caller fixes the type and retries with the same key.
-  r = harnessPost(c, kEmail, "welcome-typo");
+  r = harnessPost(c, kHEmail, "welcome-typo");
   ctx.Equal(r.Status, 202, "the corrected retry with the same Dedupe-Key (%s)", r.Text());
   ctx.Equal(ctx.Redis.LRange("jobs:queue", 0, -1), std::vector<std::string>{harnessJobIdOf(r)}, "the corrected retry must queue its job; jobs:queue");
 }
@@ -935,19 +935,19 @@ void CheckDedupeWindow(harness::Ctx& ctx) {
     if (t == -2) ctx.Redis.After(key, watch_ttl);
   };
   ctx.Redis.After(key, watch_ttl);
-  const auto first = harnessPost(c, kEmail, "welcome-ada");
+  const auto first = harnessPost(c, kHEmail, "welcome-ada");
   ctx.Equal(first.Status, 202, "the first POST (%s)", first.Text());
   std::string seen;
   for (const long long t : ttls) seen += (seen.empty() ? "" : " ") + std::to_string(t);
   ctx.Assert(!ttls.empty() && ttls.back() != -1, "%s existed without a TTL right after the command that created it (TTLs seen [%s]): reserve and expire in one SET NX EX, or a crash between two commands keeps the key forever", key, seen);
   const std::string original = harnessJobIdOf(first);
-  const auto replay = harnessPost(c, kEmail, "welcome-ada");
+  const auto replay = harnessPost(c, kHEmail, "welcome-ada");
   ctx.Assert(replay.Status == 200 && harnessJobIdOf(replay) == original, "a replayed Dedupe-Key must answer 200 with the original job id %s, got %d %s", original, replay.Status, replay.Text());
   ctx.Equal(ctx.Redis.LLen("jobs:queue"), 1, "a replay queued a second job; jobs:queue length");
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(ttl >= 86400 - 60 && ttl <= 86400, "%s has TTL %d: the reservation must expire after the dedupe window (86400 s), a day: not sooner, and not never", key, ttl);
   ctx.Clock.Advance(86401);
-  const auto later = harnessPost(c, kEmail, "welcome-ada");
+  const auto later = harnessPost(c, kHEmail, "welcome-ada");
   ctx.Assert(later.Status == 202 && harnessJobIdOf(later) != original, "a day later the same key must queue a new job, got %d %s", later.Status, later.Text());
   const std::string race = store::dedupeKey("t-1", "invoice-7");
   bool fired = false;
@@ -958,7 +958,7 @@ void CheckDedupeWindow(harness::Ctx& ctx) {
     other_won = ctx.Redis.Set(race, "job-other", "NX", "EX", 86400);
   });
   const long long before = ctx.Redis.LLen("jobs:queue");
-  const auto r = harnessPost(c, kEmail, "invoice-7");
+  const auto r = harnessPost(c, kHEmail, "invoice-7");
   ctx.Assert(fired, "the request never touched the Dedupe-Key's reservation");
   const std::string held = ctx.Redis.Get(race).value_or("");
   if (other_won) {

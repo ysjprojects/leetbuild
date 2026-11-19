@@ -923,17 +923,17 @@ import (
 	"leetbuild/harness"
 )
 
-var apiGood = map[string]any{"seed_dataset": "wiki-qa", "seed_version": "2026-04-01", "recipe": "qa-pairs", "max_records": 1000}
+var hApiGood = map[string]any{"seed_dataset": "wiki-qa", "seed_version": "2026-04-01", "recipe": "qa-pairs", "max_records": 1000}
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiWith(overrides map[string]any) map[string]any {
+func hApiWith(overrides map[string]any) map[string]any {
 	out := map[string]any{}
-	for k, v := range apiGood {
+	for k, v := range hApiGood {
 		out[k] = v
 	}
 	for k, v := range overrides {
@@ -942,26 +942,26 @@ func apiWith(overrides map[string]any) map[string]any {
 	return out
 }
 
-func apiPost(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
+func hApiPost(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
 	return c.Post("/v1/synthetic/jobs", body, "X-Tenant-Id", tenant, "Idempotency-Key", key)
 }
 
-func apiJob(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hApiJob(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	job, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	return job
 }
 
-func apiNothingLeft(ctx *harness.Ctx, what string) {
+func hApiNothingLeft(ctx *harness.Ctx, what string) {
 	ctx.Equal(len(ctx.Redis.LRange("synth:queue", 0, -1)), 0, "%s, yet the generation queue holds %v (the workers will expand it); queued jobs", what, ctx.Redis.LRange("synth:queue", 0, -1))
 	ctx.Equal(len(ctx.Redis.Keys("synth:job:*")), 0, "%s, yet the job store holds %v; stored jobs", what, ctx.Redis.Keys("synth:job:*"))
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiGood, "k-1", "t1")
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiGood, "k-1", "t1")
 	ctx.Equal(r.Status, 201, "a valid submit (%s)", r.Text())
-	job := apiJob(ctx, r)
+	job := hApiJob(ctx, r)
 	for _, key := range []string{"job_id", "status", "seed_dataset", "seed_version", "recipe", "max_records"} {
 		_, ok := job[key]
 		ctx.Assert(ok, "the 201 body lacks %s: %s", key, r.Text())
@@ -971,32 +971,32 @@ func CheckRoute(ctx *harness.Ctx) {
 	_, stored := ctx.Redis.Get("synth:job:" + id)
 	ctx.Assert(stored, "the job %s must be in the job store (synth:job:{id}): keys %v", id, ctx.Redis.Keys("synth:*"))
 	ctx.Equal(ctx.Redis.LRange("synth:queue", 0, -1), []string{id}, "the accepted job must be handed to the workers once; the queue")
-	noTenant := c.Post("/v1/synthetic/jobs", apiGood, "Idempotency-Key", "k-2")
+	noTenant := c.Post("/v1/synthetic/jobs", hApiGood, "Idempotency-Key", "k-2")
 	ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the submit")
 }
 
 func CheckDerivativeLicense(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiWith(map[string]any{"seed_dataset": "news-crawl", "seed_version": "2026-02-15"}), "k-nd", "t1")
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiWith(map[string]any{"seed_dataset": "news-crawl", "seed_version": "2026-02-15"}), "k-nd", "t1")
 	ctx.Equal(r.Status, 422, "news-crawl@2026-02-15 is registered with a no-derivatives license (synthetic records are derivatives of their seed)")
-	apiNothingLeft(ctx, "a seed whose license forbids derivatives was refused")
-	r = apiPost(c, apiGood, "k-ok", "t1")
+	hApiNothingLeft(ctx, "a seed whose license forbids derivatives was refused")
+	r = hApiPost(c, hApiGood, "k-ok", "t1")
 	ctx.Equal(r.Status, 201, "wiki-qa@2026-04-01 allows derivatives (%s)", r.Text())
 }
 
 func CheckRecordCap(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	for _, cap := range []int{0, -5, 100_001, 10_000_000} {
-		r := apiPost(c, apiWith(map[string]any{"max_records": cap}), "k-"+harness.Show(cap), "t1")
+		r := hApiPost(c, hApiWith(map[string]any{"max_records": cap}), "k-"+harness.Show(cap), "t1")
 		ctx.Equal(r.Status, 400, "max_records=%d (the service bounds a job to 1..100000 records)", cap)
 	}
-	r := apiPost(c, apiWith(map[string]any{"recipe": ""}), "k-recipe", "t1")
+	r := hApiPost(c, hApiWith(map[string]any{"recipe": ""}), "k-recipe", "t1")
 	ctx.Equal(r.Status, 400, "an empty recipe")
-	apiNothingLeft(ctx, "every one of those submits was refused")
+	hApiNothingLeft(ctx, "every one of those submits was refused")
 	for _, cap := range []int{1, 100_000} {
-		r := apiPost(c, apiWith(map[string]any{"max_records": cap}), "k-ok-"+harness.Show(cap), "t1")
+		r := hApiPost(c, hApiWith(map[string]any{"max_records": cap}), "k-ok-"+harness.Show(cap), "t1")
 		ctx.Equal(r.Status, 201, "max_records=%d is within 1..100000 inclusive (%s)", cap, r.Text())
-		id, _ := apiJob(ctx, r)["job_id"].(string)
+		id, _ := hApiJob(ctx, r)["job_id"].(string)
 		raw, _ := ctx.Redis.Get("synth:job:" + id)
 		var stored map[string]any
 		json.Unmarshal([]byte(raw), &stored)
@@ -1005,33 +1005,33 @@ func CheckRecordCap(ctx *harness.Ctx) {
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	noKey := c.Post("/v1/synthetic/jobs", apiGood, "X-Tenant-Id", "t1")
+	c := hApiClient(ctx)
+	noKey := c.Post("/v1/synthetic/jobs", hApiGood, "X-Tenant-Id", "t1")
 	ctx.Equal(noKey.Status, 400, "a submit without Idempotency-Key")
-	emptyKey := apiPost(c, apiGood, "", "t1")
+	emptyKey := hApiPost(c, hApiGood, "", "t1")
 	ctx.Equal(emptyKey.Status, 400, "a submit with an empty Idempotency-Key (an empty key is no key)")
-	apiNothingLeft(ctx, "the submits without a usable Idempotency-Key were refused")
-	first := apiPost(c, apiGood, "k-7", "t1")
+	hApiNothingLeft(ctx, "the submits without a usable Idempotency-Key were refused")
+	first := hApiPost(c, hApiGood, "k-7", "t1")
 	ctx.Equal(first.Status, 201, "the first submit (%s)", first.Text())
-	replay := apiPost(c, apiGood, "k-7", "t1")
+	replay := hApiPost(c, hApiGood, "k-7", "t1")
 	ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored job (the client retried; it must not start a second expansion)")
-	ctx.Equal(apiJob(ctx, replay)["job_id"], apiJob(ctx, first)["job_id"], "the replay must resume the same job")
+	ctx.Equal(hApiJob(ctx, replay)["job_id"], hApiJob(ctx, first)["job_id"], "the replay must resume the same job")
 	for _, k := range []string{"job_id", "status", "seed_dataset", "seed_version", "recipe", "max_records"} {
-		ctx.Equal(apiJob(ctx, replay)[k], apiJob(ctx, first)[k], "the replay answers the stored job (%s); its %s", replay.Text(), k)
+		ctx.Equal(hApiJob(ctx, replay)[k], hApiJob(ctx, first)[k], "the replay answers the stored job (%s); its %s", replay.Text(), k)
 	}
 	ctx.Assert(len(ctx.Redis.Keys("synth:job:*")) == 1 && len(ctx.Redis.LRange("synth:queue", 0, -1)) == 1, "one key, one job: after a submit and its replay the store holds %d jobs and the queue %d", len(ctx.Redis.Keys("synth:job:*")), len(ctx.Redis.LRange("synth:queue", 0, -1)))
-	other := apiPost(c, apiGood, "k-7", "t2")
-	ctx.Assert(other.Status == 201 && apiJob(ctx, other)["job_id"] != apiJob(ctx, first)["job_id"], "another tenant reusing the key gets its own job (keys are per tenant)")
+	other := hApiPost(c, hApiGood, "k-7", "t2")
+	ctx.Assert(other.Status == 201 && hApiJob(ctx, other)["job_id"] != hApiJob(ctx, first)["job_id"], "another tenant reusing the key gets its own job (keys are per tenant)")
 }
 
 func CheckGateBeforeEnqueue(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiWith(map[string]any{"seed_version": "2027-01-01"}), "k-unknown", "t1")
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiWith(map[string]any{"seed_version": "2027-01-01"}), "k-unknown", "t1")
 	ctx.Equal(r.Status, 422, "an unregistered seed version")
-	apiNothingLeft(ctx, "an unregistered seed was refused with 422")
-	r = apiPost(c, apiWith(map[string]any{"seed_dataset": "forum-scrape"}), "k-unknown-2", "t1")
+	hApiNothingLeft(ctx, "an unregistered seed was refused with 422")
+	r = hApiPost(c, hApiWith(map[string]any{"seed_dataset": "forum-scrape"}), "k-unknown-2", "t1")
 	ctx.Equal(r.Status, 422, "an unregistered dataset")
-	apiNothingLeft(ctx, "an unregistered dataset was refused with 422")
+	hApiNothingLeft(ctx, "an unregistered dataset was refused with 422")
 }
 `,
     cpp: `#include <leetbuild/harness.h>

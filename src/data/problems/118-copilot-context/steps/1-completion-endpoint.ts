@@ -966,32 +966,32 @@ import (
 	"leetbuild/harness"
 )
 
-var apiAnswer = []string{"conn.cursor()", "conn.close()"}
+var hApiAnswer = []string{"conn.cursor()", "conn.close()"}
 
 // apiModel is the stand-in model service: records every request, answers two candidates.
-type apiModel struct {
+type HApiModel struct {
 	pb.UnimplementedModelServer
 	requests []*pb.CompleteRequest
 }
 
-func (m *apiModel) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
+func (m *HApiModel) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
 	m.requests = append(m.requests, req)
 	reply := &pb.CompleteReply{}
-	for _, text := range apiAnswer {
+	for _, text := range hApiAnswer {
 		reply.Candidates = append(reply.Candidates, &pb.Candidate{Text: text})
 	}
 	return reply, nil
 }
 
-func apiWorld(ctx *harness.Ctx) (*harness.HTTP, *apiModel) {
-	peer := &apiModel{}
+func hApiWorld(ctx *harness.Ctx) (*harness.HTTP, *HApiModel) {
+	peer := &HApiModel{}
 	pb.RegisterModelServer(ctx.GRPC.Server("model:9000"), peer)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux), peer
 }
 
-func apiLines(n int, line func(i int) string) string {
+func hApiLines(n int, line func(i int) string) string {
 	var b strings.Builder
 	for i := 0; i < n; i++ {
 		b.WriteString(line(i))
@@ -999,30 +999,30 @@ func apiLines(n int, line func(i int) string) string {
 	return b.String()
 }
 
-var apiPrefix = apiLines(2000, func(i int) string { return fmt.Sprintf("line_%d = %d\\n", i, i) }) + "value = "
-var apiSuffix = apiLines(500, func(i int) string { return fmt.Sprintf("after_%d()\\n", i) })
+var hApiPrefix = hApiLines(2000, func(i int) string { return fmt.Sprintf("line_%d = %d\\n", i, i) }) + "value = "
+var hApiSuffix = hApiLines(500, func(i int) string { return fmt.Sprintf("after_%d()\\n", i) })
 
-func apiTabs() []map[string]string {
+func hApiTabs() []map[string]string {
 	out := []map[string]string{}
 	for k := 0; k < 6; k++ {
-		text := apiLines(40, func(j int) string { return fmt.Sprintf("line_%d = compute(%d)\\n", 1960+j, k) })
+		text := hApiLines(40, func(j int) string { return fmt.Sprintf("line_%d = compute(%d)\\n", 1960+j, k) })
 		out = append(out, map[string]string{"path": fmt.Sprintf("lib/t%d.py", k), "text": text})
 	}
 	return out
 }
 
-func apiBody(prefix, suffix string, openTabs []map[string]string, token int) map[string]any {
+func hApiBody(prefix, suffix string, openTabs []map[string]string, token int) map[string]any {
 	if openTabs == nil {
 		openTabs = []map[string]string{}
 	}
 	return map[string]any{"prefix": prefix, "suffix": suffix, "language": "python", "path": "db/conn.py", "token": token, "open_tabs": openTabs}
 }
 
-const apiShortPrefix = "def load(conn):\\n    return "
+const kHApiShortPrefix = "def load(conn):\\n    return "
 
 func CheckRoute(ctx *harness.Ctx) {
-	c, peer := apiWorld(ctx)
-	r := c.Post("/v1/completions", apiBody(apiShortPrefix, "\\n", nil, 17), "X-Session-Id", "s-ada")
+	c, peer := hApiWorld(ctx)
+	r := c.Post("/v1/completions", hApiBody(kHApiShortPrefix, "\\n", nil, 17), "X-Session-Id", "s-ada")
 	ctx.Equal(r.Status, 200, "POST /v1/completions (%s)", r.Text())
 	out, _ := r.JSON().(map[string]any)
 	ctx.Equal(out["candidates"], []any{"conn.cursor()", "conn.close()"}, "the reply must carry the model's candidates")
@@ -1030,14 +1030,14 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckSession(ctx *harness.Ctx) {
-	c, peer := apiWorld(ctx)
-	r := c.Post("/v1/completions", apiBody(apiShortPrefix, "\\n", apiTabs()[:1], 17))
+	c, peer := hApiWorld(ctx)
+	r := c.Post("/v1/completions", hApiBody(kHApiShortPrefix, "\\n", hApiTabs()[:1], 17))
 	ctx.Equal(r.Status, 401, "a request without X-Session-Id")
 	ctx.Equal(len(peer.requests), 0, "a request without a session reached the model; Complete calls")
 	ctx.Equal(len(ctx.Redis.Keys("tabs:*")), 0, "a request without a session stored tabs (%v); keys", ctx.Redis.Keys("tabs:*"))
-	first := c.Post("/v1/completions", apiBody(apiShortPrefix, "\\n", nil, 17), "X-Session-Id", "s-ada")
-	second := c.Post("/v1/completions", apiBody(apiShortPrefix, "\\n", nil, 18), "X-Session-Id", "s-ada")
-	third := c.Post("/v1/completions", apiBody(apiShortPrefix, "\\n", nil, 17), "X-Session-Id", "s-ada")
+	first := c.Post("/v1/completions", hApiBody(kHApiShortPrefix, "\\n", nil, 17), "X-Session-Id", "s-ada")
+	second := c.Post("/v1/completions", hApiBody(kHApiShortPrefix, "\\n", nil, 18), "X-Session-Id", "s-ada")
+	third := c.Post("/v1/completions", hApiBody(kHApiShortPrefix, "\\n", nil, 17), "X-Session-Id", "s-ada")
 	ctx.Assert(first.Status == 200 && second.Status == 200 && third.Status == 200, "three completions answered %d, %d and %d", first.Status, second.Status, third.Status)
 	a, _ := first.JSON().(map[string]any)
 	b, _ := second.JSON().(map[string]any)
@@ -1050,39 +1050,39 @@ func CheckSession(ctx *harness.Ctx) {
 }
 
 func CheckWindow(ctx *harness.Ctx) {
-	c, peer := apiWorld(ctx)
-	r := c.Post("/v1/completions", apiBody(apiPrefix, apiSuffix, apiTabs(), 17), "X-Session-Id", "s-ada")
+	c, peer := hApiWorld(ctx)
+	r := c.Post("/v1/completions", hApiBody(hApiPrefix, hApiSuffix, hApiTabs(), 17), "X-Session-Id", "s-ada")
 	ctx.Equal(r.Status, 200, "a 25,000-character file must be trimmed, not rejected (%s)", r.Text())
 	sent := peer.requests[len(peer.requests)-1]
-	ctx.Assert(sent.GetPrefix() == apiPrefix[len(apiPrefix)-3500:], "the model received a prefix of %d characters: keep the last 3,500, the lines nearest the cursor", len(sent.GetPrefix()))
-	ctx.Assert(sent.GetSuffix() == apiSuffix[:1000], "the model received a suffix of %d characters: keep the first 1,000", len(sent.GetSuffix()))
+	ctx.Assert(sent.GetPrefix() == hApiPrefix[len(hApiPrefix)-3500:], "the model received a prefix of %d characters: keep the last 3,500, the lines nearest the cursor", len(sent.GetPrefix()))
+	ctx.Assert(sent.GetSuffix() == hApiSuffix[:1000], "the model received a suffix of %d characters: keep the first 1,000", len(sent.GetSuffix()))
 	snippetChars := 0
 	for _, s := range sent.GetSnippets() {
 		snippetChars += len(s)
 	}
 	ctx.Assert(snippetChars > 0 && snippetChars <= 1500, "the snippets took %d characters: they get what is left of the 6,000-character window (1,500)", snippetChars)
 	calls := len(peer.requests)
-	near := c.Post("/v1/completions", apiBody(strings.Repeat("a", 1040000), "\\n", nil, 17), "X-Session-Id", "s-ada")
+	near := c.Post("/v1/completions", hApiBody(strings.Repeat("a", 1040000), "\\n", nil, 17), "X-Session-Id", "s-ada")
 	ctx.Equal(near.Status, 200, "a body of 1,040,000 bytes (under 1 MiB = 1,048,576) must be trimmed, only a body over the limit is 413; the status")
 	ctx.Assert(len(peer.requests) == calls+1 && peer.requests[len(peer.requests)-1].GetPrefix() == strings.Repeat("a", 3500), "a body under 1 MiB must reach the model with its prefix trimmed to 3,500 characters")
 	calls = len(peer.requests)
-	big := c.Post("/v1/completions", apiBody(strings.Repeat("a", 1100000), "\\n", nil, 17), "X-Session-Id", "s-ada")
+	big := c.Post("/v1/completions", hApiBody(strings.Repeat("a", 1100000), "\\n", nil, 17), "X-Session-Id", "s-ada")
 	ctx.Equal(big.Status, 413, "a body over 1 MiB")
 	heavy := []map[string]string{{"path": "lib/big_a.py", "text": strings.Repeat("x", 600000)}, {"path": "lib/big_b.py", "text": strings.Repeat("y", 600000)}}
-	tabsBig := c.Post("/v1/completions", apiBody(apiShortPrefix, "\\n", heavy, 17), "X-Session-Id", "s-big")
+	tabsBig := c.Post("/v1/completions", hApiBody(kHApiShortPrefix, "\\n", heavy, 17), "X-Session-Id", "s-big")
 	ctx.Equal(tabsBig.Status, 413, "a body of 1.2 MB in its open tabs (short prefix): the limit is on the whole body; the status")
 	ctx.Assert(len(ctx.Redis.Keys("tabs:s-big*")) == 0, "a body over 1 MiB stored its tabs %v: reject it before any work", ctx.Redis.Keys("tabs:s-big*"))
 	ctx.Equal(len(peer.requests), calls, "a body over 1 MiB reached the model; Complete calls")
 }
 
 func CheckNoCodeLog(ctx *harness.Ctx) {
-	c, _ := apiWorld(ctx)
+	c, _ := hApiWorld(ctx)
 	const canary = "CANARY_7731"
 	var logged bytes.Buffer
 	log.SetOutput(&logged)
 	defer log.SetOutput(os.Stderr)
 	tab := []map[string]string{{"path": "lib/keys.py", "text": "secret = '" + canary + "'"}}
-	r := c.Post("/v1/completions", apiBody("secret = '"+canary+"'\\nvalue = ", "\\n# "+canary+"\\n", tab, 17), "X-Session-Id", "s-ada")
+	r := c.Post("/v1/completions", hApiBody("secret = '"+canary+"'\\nvalue = ", "\\n# "+canary+"\\n", tab, 17), "X-Session-Id", "s-ada")
 	log.SetOutput(os.Stderr)
 	ctx.Equal(r.Status, 200, "POST /v1/completions (%s)", r.Text())
 	ctx.Assert(!strings.Contains(logged.String(), canary), "the code reached a log line: %q", strings.TrimSpace(logged.String()))
@@ -1104,47 +1104,47 @@ func CheckNoCodeLog(ctx *harness.Ctx) {
 
 namespace {
 
-const std::vector<std::string> kApiAnswer = {"conn.cursor()", "conn.close()"};
-const std::string kApiShortPrefix = "def load(conn):\\n    return ";
+const std::vector<std::string> kHApiAnswer = {"conn.cursor()", "conn.close()"};
+const std::string kHApiShortPrefix = "def load(conn):\\n    return ";
 
 // The stand-in model service: records every request, answers two candidates.
-class ApiModel final : public copilotctx::Model::Service {
+class HApiModel final : public copilotctx::Model::Service {
  public:
   std::vector<copilotctx::CompleteRequest> requests;
   grpc::Status Complete(grpc::ServerContext*, const copilotctx::CompleteRequest* req, copilotctx::CompleteReply* reply) override {
     requests.push_back(*req);
-    for (const std::string& text : kApiAnswer) reply->add_candidates()->set_text(text);
+    for (const std::string& text : kHApiAnswer) reply->add_candidates()->set_text(text);
     return grpc::Status::OK;
   }
 };
 
-struct ApiWorld {
-  ApiModel peer;
+struct HApiWorld {
+  HApiModel peer;
   httplib::Server svr;
 };
 
-ApiWorld& apiWorld(harness::Ctx& ctx) {
-  static ApiWorld* world = nullptr;
+HApiWorld& hApiWorld(harness::Ctx& ctx) {
+  static HApiWorld* world = nullptr;
   delete world;
-  world = new ApiWorld();
+  world = new HApiWorld();
   ctx.GRPC.Server("model:9000")->RegisterService(&world->peer);
   register_routes(world->svr);
   return *world;
 }
 
-std::string apiPrefix() {
+std::string hApiPrefix() {
   std::string out;
   for (int i = 0; i < 2000; i++) out += "line_" + std::to_string(i) + " = " + std::to_string(i) + "\\n";
   return out + "value = ";
 }
 
-std::string apiSuffix() {
+std::string hApiSuffix() {
   std::string out;
   for (int i = 0; i < 500; i++) out += "after_" + std::to_string(i) + "()\\n";
   return out;
 }
 
-nlohmann::json apiTabs() {
+nlohmann::json hApiTabs() {
   nlohmann::json out = nlohmann::json::array();
   for (int k = 0; k < 6; k++) {
     std::string text;
@@ -1154,37 +1154,37 @@ nlohmann::json apiTabs() {
   return out;
 }
 
-std::string apiBody(const std::string& prefix, const std::string& suffix, const nlohmann::json& open_tabs, int token) {
+std::string hApiBody(const std::string& prefix, const std::string& suffix, const nlohmann::json& open_tabs, int token) {
   return nlohmann::json{{"prefix", prefix}, {"suffix", suffix}, {"language", "python"}, {"path", "db/conn.py"}, {"token", token}, {"open_tabs", open_tabs}}.dump();
 }
 
-harness::Response apiPost(harness::HTTP& c, const std::string& body) {
+harness::Response hApiPost(harness::HTTP& c, const std::string& body) {
   return c.Post("/v1/completions", body, "Content-Type", "application/json", "X-Session-Id", "s-ada");
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto& w = apiWorld(ctx);
+  auto& w = hApiWorld(ctx);
   auto c = ctx.HTTP(w.svr);
-  const auto r = apiPost(c, apiBody(kApiShortPrefix, "\\n", nlohmann::json::array(), 17));
+  const auto r = hApiPost(c, hApiBody(kHApiShortPrefix, "\\n", nlohmann::json::array(), 17));
   ctx.Equal(r.Status, 200, "POST /v1/completions (%s)", r.Text());
   const auto out = nlohmann::json::parse(r.Text(), nullptr, false);
-  ctx.Assert(out.is_object() && out.value("candidates", nlohmann::json()) == nlohmann::json(kApiAnswer), "the reply must carry the model's candidates, got %s", r.Text());
+  ctx.Assert(out.is_object() && out.value("candidates", nlohmann::json()) == nlohmann::json(kHApiAnswer), "the reply must carry the model's candidates, got %s", r.Text());
   ctx.Assert(w.peer.requests.size() == 1 && w.peer.requests[0].language() == "python", "one Complete call with the request's language expected, saw %d", w.peer.requests.size());
 }
 
 void CheckSession(harness::Ctx& ctx) {
-  auto& w = apiWorld(ctx);
+  auto& w = hApiWorld(ctx);
   auto c = ctx.HTTP(w.svr);
-  nlohmann::json one = nlohmann::json::array({apiTabs()[0]});
-  const auto r = c.Post("/v1/completions", apiBody(kApiShortPrefix, "\\n", one, 17), "Content-Type", "application/json");
+  nlohmann::json one = nlohmann::json::array({hApiTabs()[0]});
+  const auto r = c.Post("/v1/completions", hApiBody(kHApiShortPrefix, "\\n", one, 17), "Content-Type", "application/json");
   ctx.Equal(r.Status, 401, "a request without X-Session-Id");
   ctx.Equal(w.peer.requests.size(), 0, "a request without a session reached the model; Complete calls");
   ctx.Equal(ctx.Redis.Keys("tabs:*").size(), 0, "a request without a session stored tabs; keys");
-  const auto first = apiPost(c, apiBody(kApiShortPrefix, "\\n", nlohmann::json::array(), 17));
-  const auto second = apiPost(c, apiBody(kApiShortPrefix, "\\n", nlohmann::json::array(), 18));
-  const auto third = apiPost(c, apiBody(kApiShortPrefix, "\\n", nlohmann::json::array(), 17));
+  const auto first = hApiPost(c, hApiBody(kHApiShortPrefix, "\\n", nlohmann::json::array(), 17));
+  const auto second = hApiPost(c, hApiBody(kHApiShortPrefix, "\\n", nlohmann::json::array(), 18));
+  const auto third = hApiPost(c, hApiBody(kHApiShortPrefix, "\\n", nlohmann::json::array(), 17));
   ctx.Assert(first.Status == 200 && second.Status == 200 && third.Status == 200, "three completions answered %d, %d and %d", first.Status, second.Status, third.Status);
   const auto a = nlohmann::json::parse(first.Text(), nullptr, false);
   const auto b = nlohmann::json::parse(second.Text(), nullptr, false);
@@ -1199,11 +1199,11 @@ void CheckSession(harness::Ctx& ctx) {
 }
 
 void CheckWindow(harness::Ctx& ctx) {
-  auto& w = apiWorld(ctx);
+  auto& w = hApiWorld(ctx);
   auto c = ctx.HTTP(w.svr);
-  const std::string prefix = apiPrefix();
-  const std::string suffix = apiSuffix();
-  const auto r = apiPost(c, apiBody(prefix, suffix, apiTabs(), 17));
+  const std::string prefix = hApiPrefix();
+  const std::string suffix = hApiSuffix();
+  const auto r = hApiPost(c, hApiBody(prefix, suffix, hApiTabs(), 17));
   ctx.Equal(r.Status, 200, "a 25,000-character file must be trimmed, not rejected (%s)", r.Text());
   const auto& sent = w.peer.requests.back();
   ctx.Assert(sent.prefix() == prefix.substr(prefix.size() - 3500), "the model received a prefix of %d characters: keep the last 3,500, the lines nearest the cursor", sent.prefix().size());
@@ -1212,28 +1212,28 @@ void CheckWindow(harness::Ctx& ctx) {
   for (const auto& s : sent.snippets()) snippet_chars += s.size();
   ctx.Assert(snippet_chars > 0 && snippet_chars <= 1500, "the snippets took %d characters: they get what is left of the 6,000-character window (1,500)", snippet_chars);
   std::size_t calls = w.peer.requests.size();
-  const auto near = apiPost(c, apiBody(std::string(1040000, 'a'), "\\n", nlohmann::json::array(), 17));
+  const auto near = hApiPost(c, hApiBody(std::string(1040000, 'a'), "\\n", nlohmann::json::array(), 17));
   ctx.Equal(near.Status, 200, "a body of 1,040,000 bytes (under 1 MiB = 1,048,576) must be trimmed, only a body over the limit is 413; the status");
   ctx.Assert(w.peer.requests.size() == calls + 1 && w.peer.requests.back().prefix() == std::string(3500, 'a'), "a body under 1 MiB must reach the model with its prefix trimmed to 3,500 characters");
   calls = w.peer.requests.size();
-  const auto big = apiPost(c, apiBody(std::string(1100000, 'a'), "\\n", nlohmann::json::array(), 17));
+  const auto big = hApiPost(c, hApiBody(std::string(1100000, 'a'), "\\n", nlohmann::json::array(), 17));
   ctx.Equal(big.Status, 413, "a body over 1 MiB");
   nlohmann::json heavy = nlohmann::json::array({{{"path", "lib/big_a.py"}, {"text", std::string(600000, 'x')}}, {{"path", "lib/big_b.py"}, {"text", std::string(600000, 'y')}}});
-  const auto tabs_big = c.Post("/v1/completions", apiBody(kApiShortPrefix, "\\n", heavy, 17), "Content-Type", "application/json", "X-Session-Id", "s-big");
+  const auto tabs_big = c.Post("/v1/completions", hApiBody(kHApiShortPrefix, "\\n", heavy, 17), "Content-Type", "application/json", "X-Session-Id", "s-big");
   ctx.Equal(tabs_big.Status, 413, "a body of 1.2 MB in its open tabs (short prefix): the limit is on the whole body; the status");
   ctx.Equal(ctx.Redis.Keys("tabs:s-big*").size(), 0, "a body over 1 MiB stored its tabs: reject it before any work; keys");
   ctx.Equal(w.peer.requests.size(), calls, "a body over 1 MiB reached the model; Complete calls");
 }
 
 void CheckNoCodeLog(harness::Ctx& ctx) {
-  auto& w = apiWorld(ctx);
+  auto& w = hApiWorld(ctx);
   auto c = ctx.HTTP(w.svr);
   const std::string canary = "CANARY_7731";
   nlohmann::json tab = nlohmann::json::array({{{"path", "lib/keys.py"}, {"text", "secret = '" + canary + "'"}}});
   std::ostringstream logged;
   auto* out = std::cout.rdbuf(logged.rdbuf());
   auto* err = std::cerr.rdbuf(logged.rdbuf());
-  const auto r = apiPost(c, apiBody("secret = '" + canary + "'\\nvalue = ", "\\n# " + canary + "\\n", tab, 17));
+  const auto r = hApiPost(c, hApiBody("secret = '" + canary + "'\\nvalue = ", "\\n# " + canary + "\\n", tab, 17));
   std::cout.rdbuf(out);
   std::cerr.rdbuf(err);
   ctx.Equal(r.Status, 200, "POST /v1/completions (%s)", r.Text());

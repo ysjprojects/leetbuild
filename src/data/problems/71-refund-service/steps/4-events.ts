@@ -780,73 +780,73 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "refund.event"
+const kHEventsTopic = "refund.event"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-// eventsPsp pays every refund (re_<n> for rf-<n>) except on a disputed charge, and notes how many
+// HEventsPsp pays every refund (re_<n> for rf-<n>) except on a disputed charge, and notes how many
 // records refund.event held when it was asked.
-type eventsPsp struct {
+type HEventsPsp struct {
 	pb.UnimplementedPspServer
 	ctx     *harness.Ctx
 	onTopic []int
 }
 
-func (p *eventsPsp) Refund(_ context.Context, req *pb.RefundRequest) (*pb.RefundReply, error) {
-	p.onTopic = append(p.onTopic, len(p.ctx.Kafka.Records(eventsTopic)))
+func (p *HEventsPsp) Refund(_ context.Context, req *pb.RefundRequest) (*pb.RefundReply, error) {
+	p.onTopic = append(p.onTopic, len(p.ctx.Kafka.Records(kHEventsTopic)))
 	if req.GetPaymentId() == "pay_disputed" {
 		return nil, status.Error(codes.FailedPrecondition, "charge_for_pending_refund_disputed")
 	}
 	return &pb.RefundReply{PspRef: "re_" + strings.TrimPrefix(req.GetRefundId(), "rf-"), Status: "SUCCEEDED"}, nil
 }
 
-func (p *eventsPsp) GetRefund(_ context.Context, req *pb.GetRefundRequest) (*pb.RefundStatus, error) {
+func (p *HEventsPsp) GetRefund(_ context.Context, req *pb.GetRefundRequest) (*pb.RefundStatus, error) {
 	return nil, status.Errorf(codes.NotFound, "no refund %s", req.GetRefundId())
 }
 
-type eventsSeed struct {
+type HEventsSeed struct {
 	id, payment string
 	amount      int64
 }
 
-func eventsServe(ctx *harness.Ctx, refunds ...eventsSeed) *eventsPsp {
-	peer := &eventsPsp{ctx: ctx}
+func hEventsServe(ctx *harness.Ctx, refunds ...HEventsSeed) *HEventsPsp {
+	peer := &HEventsPsp{ctx: ctx}
 	pb.RegisterPspServer(ctx.GRPC.Server(""), peer)
 	for _, r := range refunds {
-		if records.FindPayment(eventsBg, r.payment) == nil {
-			records.AddPayment(eventsBg, r.payment, "t1", 10000)
+		if records.FindPayment(hEventsBg, r.payment) == nil {
+			records.AddPayment(hEventsBg, r.payment, "t1", 10000)
 		}
-		ledger.Claim(eventsBg, r.payment, r.id, r.amount, 10000)
-		records.InsertRefund(eventsBg, r.id, "t1", r.payment, r.amount, "damaged", "")
+		ledger.Claim(hEventsBg, r.payment, r.id, r.amount, 10000)
+		records.InsertRefund(hEventsBg, r.id, "t1", r.payment, r.amount, "damaged", "")
 	}
 	return peer
 }
 
-func eventsSettle(ctx *harness.Ctx, refundID string) bool {
-	ok, err := settleRefund(eventsBg, refundID)
+func hEventsSettle(ctx *harness.Ctx, refundID string) bool {
+	ok, err := settleRefund(hEventsBg, refundID)
 	ctx.NoError(err, "settleRefund(%s)", refundID)
 	return ok
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	var rows []HEventsRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
 	return rows
 }
 
-func eventsIDs(ctx *harness.Ctx) []string {
+func hEventsIDs(ctx *harness.Ctx) []string {
 	var ids []string
-	for _, v := range ctx.Kafka.Values(eventsTopic) {
+	for _, v := range ctx.Kafka.Values(kHEventsTopic) {
 		var value map[string]any
 		json.Unmarshal([]byte(v), &value)
 		id, _ := value["refund_id"].(string)
@@ -856,40 +856,40 @@ func eventsIDs(ctx *harness.Ctx) []string {
 }
 
 func CheckPaymentKey(ctx *harness.Ctx) {
-	eventsServe(ctx, eventsSeed{"rf-1", "pay_1", 3000}, eventsSeed{"rf-2", "pay_2", 2000}, eventsSeed{"rf-3", "pay_1", 1000})
+	hEventsServe(ctx, HEventsSeed{"rf-1", "pay_1", 3000}, HEventsSeed{"rf-2", "pay_2", 2000}, HEventsSeed{"rf-3", "pay_1", 1000})
 	for _, id := range []string{"rf-1", "rf-2", "rf-3"} {
-		eventsSettle(ctx, id)
+		hEventsSettle(ctx, id)
 	}
 	ctx.Settle()
-	got := ctx.Kafka.Records(eventsTopic)
+	got := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(got), 3, "three settled refunds must produce three records on refund.event; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"pay_1", "pay_2", "pay_1"}, "the records must be keyed by the payment ids")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"pay_1", "pay_2", "pay_1"}, "the records must be keyed by the payment ids")
 	ctx.Equal(got[0].Partition, got[2].Partition, "both pay_1 refunds must land on one partition, or finance reads one payment's refunds out of order; the partitions")
 }
 
 func CheckAfterConfirmation(ctx *harness.Ctx) {
-	peer := eventsServe(ctx, eventsSeed{"rf-1", "pay_1", 3000}, eventsSeed{"rf-2", "pay_disputed", 2000}, eventsSeed{"rf-3", "pay_1", 1000})
-	ctx.Equal(eventsSettle(ctx, "rf-1"), true, "a refund the PSP confirmed and the broker took; settleRefund's result")
+	peer := hEventsServe(ctx, HEventsSeed{"rf-1", "pay_1", 3000}, HEventsSeed{"rf-2", "pay_disputed", 2000}, HEventsSeed{"rf-3", "pay_1", 1000})
+	ctx.Equal(hEventsSettle(ctx, "rf-1"), true, "a refund the PSP confirmed and the broker took; settleRefund's result")
 	ctx.Settle()
 	ctx.Assert(len(peer.onTopic) > 0 && peer.onTopic[0] == 0, "when the PSP was asked to pay rf-1, refund.event already held %v record(s): the event went out before the money moved", peer.onTopic)
-	ok := eventsSettle(ctx, "rf-2")
+	ok := hEventsSettle(ctx, "rf-2")
 	ctx.Settle()
-	ctx.Equal(eventsIDs(ctx), []string{"rf-1"}, "the PSP refused rf-2, so only rf-1 may be on refund.event; the events")
+	ctx.Equal(hEventsIDs(ctx), []string{"rf-1"}, "the PSP refused rf-2, so only rf-1 may be on refund.event; the events")
 	ctx.Equal(ok, false, "settleRefund's result for a refund the PSP refused")
 	ctx.GRPC.Fail("Refund", codes.Unavailable, "", 3, "") // the outcome stays unknown: PENDING
-	ok = eventsSettle(ctx, "rf-3")
+	ok = hEventsSettle(ctx, "rf-3")
 	ctx.Settle()
-	ids := eventsIDs(ctx)
+	ids := hEventsIDs(ctx)
 	ctx.Assert(!ok && len(ids) == 1 && ids[0] == "rf-1", "rf-3 stayed PENDING (the PSP never answered) and settleRefund returned %t with refund.event holding events for %v: only a CONFIRMED refund is an event", ok, ids)
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 0, "the outbox holds %v after one delivered event and two refunds that were not confirmed: the relay would publish them", rows)
 }
 
 func CheckEventFields(ctx *harness.Ctx) {
-	eventsServe(ctx, eventsSeed{"rf-1", "pay_1", 3000})
-	eventsSettle(ctx, "rf-1")
+	hEventsServe(ctx, HEventsSeed{"rf-1", "pay_1", 3000})
+	hEventsSettle(ctx, "rf-1")
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one settled refund must produce one record; the records")
 	var value map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the event must be JSON")
@@ -898,33 +898,33 @@ func CheckEventFields(ctx *harness.Ctx) {
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
-	eventsServe(ctx, eventsSeed{"rf-1", "pay_1", 3000}, eventsSeed{"rf-2", "pay_1", 2000})
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsSettle(ctx, "rf-1")
+	hEventsServe(ctx, HEventsSeed{"rf-1", "pay_1", 3000}, HEventsSeed{"rf-2", "pay_1", 2000})
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsSettle(ctx, "rf-1")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the refund twice (enable.idempotence); the records")
-	eventsSettle(ctx, "rf-2")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the refund twice (enable.idempotence); the records")
+	hEventsSettle(ctx, "rf-2")
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxFallback(ctx *harness.Ctx) {
-	eventsServe(ctx, eventsSeed{"rf-1", "pay_1", 3000}, eventsSeed{"rf-2", "pay_1", 2000})
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsSettle(ctx, "rf-1")
+	hEventsServe(ctx, HEventsSeed{"rf-1", "pay_1", 3000}, HEventsSeed{"rf-2", "pay_1", 2000})
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok := hEventsSettle(ctx, "rf-1")
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row finance never hears of a refund the customer has; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "pay_1" && rows[0].Payload["refund_id"] == "rf-1", "the outbox row is %v, expected the topic, the key pay_1 and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == "pay_1" && rows[0].Payload["refund_id"] == "rf-1", "the outbox row is %v, expected the topic, the key pay_1 and the payload", rows[0])
 	ctx.Equal(ok, false, "settleRefund's result after a failed delivery")
-	ctx.Equal(records.FindRefund(eventsBg, "rf-1").Status, "CONFIRMED", "the refund stays CONFIRMED when only the produce failed; its status")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Equal(records.FindRefund(hEventsBg, "rf-1").Status, "CONFIRMED", "the refund stays CONFIRMED when only the produce failed; its status")
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsSettle(ctx, "rf-2")
+	ok = hEventsSettle(ctx, "rf-2")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "settleRefund waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Key == "pay_1", "no report within the window and the outbox holds %v, expected a second row keyed pay_1", rows)
 	expected := map[string]any{"refund_id": "rf-2", "payment_id": "pay_1", "amount_minor": 2000.0, "reason_code": "damaged", "psp_ref": "re_2", "status": "CONFIRMED"}
 	ctx.Equal(rows[len(rows)-1].Payload, expected, "the outbox row of rf-2's payload")
@@ -945,17 +945,17 @@ func CheckOutboxFallback(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "refund.event";
+const std::string kHEventsTopic = "refund.event";
 
 // Pays every refund (re_<n> for rf-<n>) except on a disputed charge, and notes how many records
 // refund.event held when it was asked.
-class EventsPsp final : public refundd::Psp::Service {
+class HEventsPsp final : public refundd::Psp::Service {
  public:
   harness::Ctx* ctx = nullptr;
   std::vector<size_t> on_topic;
 
   grpc::Status Refund(grpc::ServerContext*, const refundd::RefundRequest* req, refundd::RefundReply* out) override {
-    on_topic.push_back(ctx->Kafka.Records(kEventsTopic).size());
+    on_topic.push_back(ctx->Kafka.Records(kHEventsTopic).size());
     if (req->payment_id() == "pay_disputed") return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "charge_for_pending_refund_disputed");
     out->set_psp_ref("re_" + req->refund_id().substr(3));
     out->set_status("SUCCEEDED");
@@ -967,10 +967,10 @@ class EventsPsp final : public refundd::Psp::Service {
   }
 };
 
-EventsPsp& eventsServe(harness::Ctx& ctx, const std::vector<std::tuple<std::string, std::string, long long>>& refunds) {
-  static EventsPsp* peer = nullptr;
+HEventsPsp& hEventsServe(harness::Ctx& ctx, const std::vector<std::tuple<std::string, std::string, long long>>& refunds) {
+  static HEventsPsp* peer = nullptr;
   delete peer;
-  peer = new EventsPsp;
+  peer = new HEventsPsp;
   peer->ctx = &ctx;
   ctx.GRPC.Server("")->RegisterService(peer);
   for (const auto& [refund_id, payment, amount] : refunds) {
@@ -981,7 +981,7 @@ EventsPsp& eventsServe(harness::Ctx& ctx, const std::vector<std::tuple<std::stri
   return *peer;
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -991,53 +991,53 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
+std::string hEventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
-std::vector<std::string> eventsIDs(harness::Ctx& ctx) {
+std::vector<std::string> hEventsIDs(harness::Ctx& ctx) {
   std::vector<std::string> ids;
-  for (const auto& v : ctx.Kafka.Values(kEventsTopic)) ids.push_back(eventsField(nlohmann::json::parse(v, nullptr, false), "refund_id"));
+  for (const auto& v : ctx.Kafka.Values(kHEventsTopic)) ids.push_back(hEventsField(nlohmann::json::parse(v, nullptr, false), "refund_id"));
   return ids;
 }
 
 }  // namespace
 
 void CheckPaymentKey(harness::Ctx& ctx) {
-  eventsServe(ctx, {{"rf-1", "pay_1", 3000}, {"rf-2", "pay_2", 2000}, {"rf-3", "pay_1", 1000}});
+  hEventsServe(ctx, {{"rf-1", "pay_1", 3000}, {"rf-2", "pay_2", 2000}, {"rf-3", "pay_1", 1000}});
   for (const std::string id : {"rf-1", "rf-2", "rf-3"}) settleRefund(id);
   ctx.Settle();
-  const auto got = ctx.Kafka.Records(kEventsTopic);
+  const auto got = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(got.size(), 3, "three settled refunds must produce three records on refund.event; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"pay_1", "pay_2", "pay_1"}, "the records must be keyed by the payment ids");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"pay_1", "pay_2", "pay_1"}, "the records must be keyed by the payment ids");
   ctx.Equal(got[0].Partition, got[2].Partition, "both pay_1 refunds must land on one partition, or finance reads one payment's refunds out of order; the partitions");
 }
 
 void CheckAfterConfirmation(harness::Ctx& ctx) {
-  EventsPsp& peer = eventsServe(ctx, {{"rf-1", "pay_1", 3000}, {"rf-2", "pay_disputed", 2000}, {"rf-3", "pay_1", 1000}});
+  HEventsPsp& peer = hEventsServe(ctx, {{"rf-1", "pay_1", 3000}, {"rf-2", "pay_disputed", 2000}, {"rf-3", "pay_1", 1000}});
   ctx.Equal(settleRefund("rf-1"), true, "a refund the PSP confirmed and the broker took; settleRefund's result");
   ctx.Settle();
   ctx.Assert(!peer.on_topic.empty() && peer.on_topic[0] == 0, "when the PSP was asked to pay rf-1, refund.event already held %d record(s): the event went out before the money moved",
              peer.on_topic.empty() ? 0 : peer.on_topic[0]);
   bool ok = settleRefund("rf-2");
   ctx.Settle();
-  ctx.Equal(eventsIDs(ctx), std::vector<std::string>{"rf-1"}, "the PSP refused rf-2, so only rf-1 may be on refund.event; the events");
+  ctx.Equal(hEventsIDs(ctx), std::vector<std::string>{"rf-1"}, "the PSP refused rf-2, so only rf-1 may be on refund.event; the events");
   ctx.Equal(ok, false, "settleRefund's result for a refund the PSP refused");
   ctx.GRPC.Fail("Refund", grpc::StatusCode::UNAVAILABLE, "", 3);  // the outcome stays unknown: PENDING
   ok = settleRefund("rf-3");
   ctx.Settle();
-  const auto ids = eventsIDs(ctx);
+  const auto ids = hEventsIDs(ctx);
   ctx.Assert(!ok && ids == std::vector<std::string>{"rf-1"},
              "rf-3 stayed PENDING (the PSP never answered) and settleRefund returned %t with refund.event holding %d events: only a CONFIRMED refund is an event", ok, ids.size());
-  const auto rows = eventsOutbox(ctx);
+  const auto rows = hEventsOutbox(ctx);
   ctx.Assert(rows.empty(), "the outbox holds %d rows after one delivered event and two refunds that were not confirmed: the relay would publish them", rows.size());
 }
 
 void CheckEventFields(harness::Ctx& ctx) {
-  eventsServe(ctx, {{"rf-1", "pay_1", 3000}});
+  hEventsServe(ctx, {{"rf-1", "pay_1", 3000}});
   settleRefund("rf-1");
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one settled refund must produce one record; the records");
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
   const nlohmann::json expected{{"refund_id", "rf-1"}, {"payment_id", "pay_1"}, {"amount_minor", 3000},
@@ -1046,36 +1046,36 @@ void CheckEventFields(harness::Ctx& ctx) {
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
-  eventsServe(ctx, {{"rf-1", "pay_1", 3000}, {"rf-2", "pay_1", 2000}});
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  hEventsServe(ctx, {{"rf-1", "pay_1", 3000}, {"rf-2", "pay_1", 2000}});
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
   settleRefund("rf-1");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the refund twice (enable.idempotence); the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the refund twice (enable.idempotence); the records");
   settleRefund("rf-2");
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxFallback(harness::Ctx& ctx) {
-  eventsServe(ctx, {{"rf-1", "pay_1", 3000}, {"rf-2", "pay_1", 2000}});
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  hEventsServe(ctx, {{"rf-1", "pay_1", 3000}, {"rf-2", "pay_1", 2000}});
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   bool ok = settleRefund("rf-1");
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row finance never hears of a refund the customer has; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "pay_1" && rows[0].contains("payload") &&
-                 eventsField(rows[0]["payload"], "refund_id") == "rf-1",
+  ctx.Assert(hEventsField(rows[0], "topic") == kHEventsTopic && hEventsField(rows[0], "key") == "pay_1" && rows[0].contains("payload") &&
+                 hEventsField(rows[0]["payload"], "refund_id") == "rf-1",
              "the outbox row is %s, expected the topic, the key pay_1 and the payload", rows[0].dump());
   ctx.Equal(ok, false, "settleRefund's result after a failed delivery");
   ctx.Equal(records::findRefund("rf-1")->status, "CONFIRMED", "the refund stays CONFIRMED when only the produce failed; its status");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = settleRefund("rf-2");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "settleRefund waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && eventsField(rows[1], "key") == "pay_1", "no report within the window and the outbox holds %d rows, expected a second row keyed pay_1", rows.size());
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && hEventsField(rows[1], "key") == "pay_1", "no report within the window and the outbox holds %d rows, expected a second row keyed pay_1", rows.size());
   const nlohmann::json expected{{"refund_id", "rf-2"}, {"payment_id", "pay_1"}, {"amount_minor", 2000},
                                 {"reason_code", "damaged"}, {"psp_ref", "re_2"}, {"status", "CONFIRMED"}};
   ctx.Assert(rows[1].contains("payload") && rows[1]["payload"] == expected, "the outbox row of rf-2 is %s, expected the payload %s", rows[1].dump(), expected.dump());

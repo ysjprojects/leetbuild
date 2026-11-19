@@ -891,51 +891,51 @@ import (
 )
 
 var (
-	clientBg      = context.Background()
-	clientInvoice = map[string]any{"invoice_id": "inv-7", "amount_cents": 1200}
+	hClientBg      = context.Background()
+	hClientInvoice = map[string]any{"invoice_id": "inv-7", "amount_cents": 1200}
 )
 
 // runnerPeer runs every job; counted notes the attempts the job record held when each call arrived.
-type runnerPeer struct {
+type HRunnerPeer struct {
 	pb.UnimplementedJobRunnerServer
 	counted []int
 }
 
-func (p *runnerPeer) Execute(_ context.Context, req *pb.ExecuteRequest) (*pb.ExecuteReply, error) {
-	p.counted = append(p.counted, store.GetJob(clientBg, req.GetJobId()).Attempts)
+func (p *HRunnerPeer) Execute(_ context.Context, req *pb.ExecuteRequest) (*pb.ExecuteReply, error) {
+	p.counted = append(p.counted, store.GetJob(hClientBg, req.GetJobId()).Attempts)
 	return &pb.ExecuteReply{Result: "ok"}, nil
 }
 
-func clientClaimed(ctx *harness.Ctx, jobID string) {
-	ctx.NoError(store.CreateJob(clientBg, jobID, "t-1", "invoice.charge", clientInvoice), "CreateJob")
-	got, err := queue.Claim(clientBg, "w-1")
+func hClientClaimed(ctx *harness.Ctx, jobID string) {
+	ctx.NoError(store.CreateJob(hClientBg, jobID, "t-1", "invoice.charge", hClientInvoice), "CreateJob")
+	got, err := queue.Claim(hClientBg, "w-1")
 	ctx.NoError(err, "Claim")
 	ctx.Equal(got, jobID, "the harness's claim")
 }
 
-func clientSetup(ctx *harness.Ctx) *runnerPeer {
-	peer := &runnerPeer{}
+func hClientSetup(ctx *harness.Ctx) *HRunnerPeer {
+	peer := &HRunnerPeer{}
 	pb.RegisterJobRunnerServer(ctx.GRPC.Server(""), peer)
-	clientClaimed(ctx, "job-1")
+	hClientClaimed(ctx, "job-1")
 	return peer
 }
 
-func clientRun(ctx *harness.Ctx, jobID string) string {
-	outcome, err := runAttempt(clientBg, jobID, "w-1")
+func hClientRun(ctx *harness.Ctx, jobID string) string {
+	outcome, err := runAttempt(hClientBg, jobID, "w-1")
 	ctx.NoError(err, "runAttempt(%s)", jobID)
 	return outcome
 }
 
-func clientReclaim(ctx *harness.Ctx, seconds float64) {
+func hClientReclaim(ctx *harness.Ctx, seconds float64) {
 	ctx.Clock.Advance(seconds)
-	queue.ReturnExpired(clientBg)
-	got, _ := queue.Claim(clientBg, "w-1")
+	queue.ReturnExpired(hClientBg)
+	got, _ := queue.Claim(hClientBg, "w-1")
 	ctx.Equal(got, "job-1", "the retried job must be claimable once its retry is due; the claim")
 }
 
 func CheckExecuteCall(ctx *harness.Ctx) {
-	clientSetup(ctx)
-	ctx.Equal(clientRun(ctx, "job-1"), "completed", "with a healthy executor the attempt")
+	hClientSetup(ctx)
+	ctx.Equal(hClientRun(ctx, "job-1"), "completed", "with a healthy executor the attempt")
 	calls := ctx.GRPC.CallsTo("Execute", "")
 	ctx.Equal(len(calls), 1, "one attempt's Execute calls")
 	req := calls[0].Request.(*pb.ExecuteRequest)
@@ -943,19 +943,19 @@ func CheckExecuteCall(ctx *harness.Ctx) {
 	var payload map[string]any
 	json.Unmarshal([]byte(req.GetPayload()), &payload)
 	ctx.Assert(payload["invoice_id"] == "inv-7" && payload["amount_cents"] == float64(1200), "the request carries payload %s", req.GetPayload())
-	ctx.Equal(store.GetJob(clientBg, "job-1").State, "completed", "the job's state after a successful attempt")
+	ctx.Equal(store.GetJob(hClientBg, "job-1").State, "completed", "the job's state after a successful attempt")
 	_, inflight := ctx.Redis.ZScore("jobs:inflight", "job-1")
 	ctx.Assert(!inflight, "a completed job must leave jobs:inflight")
-	history := store.AttemptHistory(clientBg, "job-1")
+	history := store.AttemptHistory(hClientBg, "job-1")
 	ctx.Assert(len(history) == 1 && history[0].Error == "", "the history must hold one successful attempt, got %+v", history)
 }
 
 func CheckRetryClasses(ctx *harness.Ctx) {
-	clientSetup(ctx)
+	hClientSetup(ctx)
 	ctx.GRPC.Fail("Execute", codes.InvalidArgument, "template welcome-v9 does not exist", 1, "")
-	outcome := clientRun(ctx, "job-1")
+	outcome := hClientRun(ctx, "job-1")
 	ctx.Assert(outcome == "dead", "INVALID_ARGUMENT returned %q: a job the executor rejects as written fails the same way on every retry, so bury it on the first attempt", outcome)
-	job := store.GetJob(clientBg, "job-1")
+	job := store.GetJob(hClientBg, "job-1")
 	ctx.Assert(job.State == "dead" && job.DeadReason == "permanent_error", "the buried job is %+v, expected dead with dead_reason permanent_error", job)
 	ctx.Equal(ctx.Redis.LRange("jobs:dead", 0, -1), []string{"job-1"}, "jobs:dead")
 	n := 1
@@ -963,33 +963,33 @@ func CheckRetryClasses(ctx *harness.Ctx) {
 	for _, code := range []codes.Code{codes.FailedPrecondition, codes.NotFound, codes.PermissionDenied} {
 		n++
 		jobID := fmt.Sprintf("job-%d", n)
-		clientClaimed(ctx, jobID)
+		hClientClaimed(ctx, jobID)
 		ctx.GRPC.Fail("Execute", code, "rejected", 1, "")
-		outcome = clientRun(ctx, jobID)
-		record := store.GetJob(clientBg, jobID)
+		outcome = hClientRun(ctx, jobID)
+		record := store.GetJob(hClientBg, jobID)
 		ctx.Assert(outcome == "dead" && record.DeadReason == "permanent_error", "%v returned %q with the job %+v: only UNAVAILABLE, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED and ABORTED are retryable, any other status buries with permanent_error", code, outcome, record)
 	}
 	for _, code := range []codes.Code{codes.Unavailable, codes.ResourceExhausted, codes.Aborted} {
 		n++
 		jobID := fmt.Sprintf("job-%d", n)
-		clientClaimed(ctx, jobID)
+		hClientClaimed(ctx, jobID)
 		ctx.GRPC.Fail("Execute", code, "try again later", 1, "")
-		outcome = clientRun(ctx, jobID)
-		record := store.GetJob(clientBg, jobID)
+		outcome = hClientRun(ctx, jobID)
+		record := store.GetJob(hClientBg, jobID)
 		ctx.Assert(outcome == "retry" && record.State == "retrying", "%v returned %q with the job %+v: the executor may answer later, so schedule a retry", code, outcome, record)
 	}
 }
 
 func CheckAttemptsDurable(ctx *harness.Ctx) {
-	peer := clientSetup(ctx)
+	peer := hClientSetup(ctx)
 	ctx.GRPC.Fail("Execute", codes.Unavailable, "executor restarting", 5, "")
 	outcomes := []string{}
 	for {
-		outcomes = append(outcomes, clientRun(ctx, "job-1"))
+		outcomes = append(outcomes, hClientRun(ctx, "job-1"))
 		if outcomes[len(outcomes)-1] != "retry" || len(outcomes) == 6 {
 			break
 		}
-		clientReclaim(ctx, 60)
+		hClientReclaim(ctx, 60)
 	}
 	ctx.Equal(outcomes, []string{"retry", "retry", "retry", "retry", "dead"}, "five UNAVAILABLE attempts: the fifth must bury the job (maxAttempts = 5), which needs a count that grows on every attempt; the outcomes")
 	sent := []int32{}
@@ -997,31 +997,31 @@ func CheckAttemptsDurable(ctx *harness.Ctx) {
 		sent = append(sent, c.Request.(*pb.ExecuteRequest).GetAttempt())
 	}
 	ctx.Equal(sent, []int32{1, 2, 3, 4, 5}, "the attempts the Execute calls carried")
-	job := store.GetJob(clientBg, "job-1")
+	job := store.GetJob(hClientBg, "job-1")
 	ctx.Assert(job.Attempts == 5 && job.DeadReason == "max_attempts_exceeded", "the job is %+v, expected 5 attempts and dead_reason max_attempts_exceeded", job)
-	ctx.Equal(len(store.AttemptHistory(clientBg, "job-1")), 5, "the attempts in the history")
-	clientClaimed(ctx, "job-2")
-	ctx.Equal(clientRun(ctx, "job-2"), "completed", "a healthy attempt")
+	ctx.Equal(len(store.AttemptHistory(hClientBg, "job-1")), 5, "the attempts in the history")
+	hClientClaimed(ctx, "job-2")
+	ctx.Equal(hClientRun(ctx, "job-2"), "completed", "a healthy attempt")
 	ctx.Equal(peer.counted, []int{1}, "when Execute arrived the job record must already count the attempt (counted after the call, a worker that dies mid-call gives the job a free attempt); the counts seen")
 }
 
 func CheckBackoff(ctx *harness.Ctx) {
-	clientSetup(ctx)
+	hClientSetup(ctx)
 	ctx.GRPC.Fail("Execute", codes.Unavailable, "executor restarting", 4, "")
 	for i, delay := range []int64{1000, 2000, 4000, 8000} {
 		now := ctx.Clock.Now()
-		ctx.Equal(clientRun(ctx, "job-1"), "retry", "attempt %d", i+1)
+		ctx.Equal(hClientRun(ctx, "job-1"), "retry", "attempt %d", i+1)
 		due, _ := ctx.Redis.ZScore("jobs:inflight", "job-1")
 		ctx.Assert(int64(due) == now+delay, "after attempt %d the retry is due %d ms from now, expected %d ms (backoffBaseMs doubled per attempt): a retry at once hits an executor that is still down", i+1, int64(due)-now, delay)
-		ctx.Equal(store.GetJob(clientBg, "job-1").NextRetryAtMs, now+delay, "next_retry_at_ms")
-		clientReclaim(ctx, float64(delay)/1000)
+		ctx.Equal(store.GetJob(hClientBg, "job-1").NextRetryAtMs, now+delay, "next_retry_at_ms")
+		hClientReclaim(ctx, float64(delay)/1000)
 	}
 }
 
 func CheckCallDeadline(ctx *harness.Ctx) {
-	clientSetup(ctx)
+	hClientSetup(ctx)
 	ctx.GRPC.SetLatency("Execute", 120.0, "")
-	outcome := clientRun(ctx, "job-1")
+	outcome := hClientRun(ctx, "job-1")
 	calls := ctx.GRPC.CallsTo("Execute", "")
 	ctx.Assert(len(calls) > 0, "no Execute call was made")
 	ctx.Assert(calls[0].HasDeadline(), "the Execute call carries no deadline: an executor that hangs holds the worker past the 60 s visibility timeout, and the reaper hands the job to a second worker")
@@ -1044,7 +1044,7 @@ func CheckCallDeadline(ctx *harness.Ctx) {
 namespace {
 
 // Runs every job; counted notes the attempts the job record held when each call arrived.
-class RunnerPeer final : public jobqueue::JobRunner::Service {
+class HRunnerPeer final : public jobqueue::JobRunner::Service {
  public:
   std::vector<long> counted;
   grpc::Status Execute(grpc::ServerContext*, const jobqueue::ExecuteRequest* req, jobqueue::ExecuteReply* out) override {
@@ -1054,21 +1054,21 @@ class RunnerPeer final : public jobqueue::JobRunner::Service {
   }
 };
 
-void clientClaimed(harness::Ctx& ctx, const std::string& job_id) {
+void hClientClaimed(harness::Ctx& ctx, const std::string& job_id) {
   store::createJob(job_id, "t-1", "invoice.charge", nlohmann::json{{"invoice_id", "inv-7"}, {"amount_cents", 1200}});
   ctx.Equal(queue::claim("w-1").value_or(""), job_id, "the harness's claim");
 }
 
-RunnerPeer& clientSetup(harness::Ctx& ctx) {
-  static RunnerPeer* peer = nullptr;
+HRunnerPeer& hClientSetup(harness::Ctx& ctx) {
+  static HRunnerPeer* peer = nullptr;
   delete peer;
-  peer = new RunnerPeer;
+  peer = new HRunnerPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
-  clientClaimed(ctx, "job-1");
+  hClientClaimed(ctx, "job-1");
   return *peer;
 }
 
-void clientReclaim(harness::Ctx& ctx, double seconds) {
+void hClientReclaim(harness::Ctx& ctx, double seconds) {
   ctx.Clock.Advance(seconds);
   queue::returnExpired();
   ctx.Equal(queue::claim("w-1").value_or(""), "job-1", "the retried job must be claimable once its retry is due; the claim");
@@ -1077,7 +1077,7 @@ void clientReclaim(harness::Ctx& ctx, double seconds) {
 }  // namespace
 
 void CheckExecuteCall(harness::Ctx& ctx) {
-  clientSetup(ctx);
+  hClientSetup(ctx);
   ctx.Equal(runAttempt("job-1", "w-1"), "completed", "with a healthy executor the attempt");
   const auto calls = ctx.GRPC.CallsTo("Execute");
   ctx.Equal(calls.size(), 1, "one attempt's Execute calls");
@@ -1092,7 +1092,7 @@ void CheckExecuteCall(harness::Ctx& ctx) {
 }
 
 void CheckRetryClasses(harness::Ctx& ctx) {
-  clientSetup(ctx);
+  hClientSetup(ctx);
   ctx.GRPC.Fail("Execute", grpc::StatusCode::INVALID_ARGUMENT, "template welcome-v9 does not exist", 1);
   std::string outcome = runAttempt("job-1", "w-1");
   ctx.Assert(outcome == "dead", "INVALID_ARGUMENT returned %q: a job the executor rejects as written fails the same way on every retry, so bury it on the first attempt", outcome);
@@ -1108,7 +1108,7 @@ void CheckRetryClasses(harness::Ctx& ctx) {
   };
   for (const auto& [code, name] : permanent) {
     const std::string job_id = "job-" + std::to_string(++n);
-    clientClaimed(ctx, job_id);
+    hClientClaimed(ctx, job_id);
     ctx.GRPC.Fail("Execute", code, "rejected", 1);
     outcome = runAttempt(job_id, "w-1");
     const auto record = store::getJob(job_id);
@@ -1121,7 +1121,7 @@ void CheckRetryClasses(harness::Ctx& ctx) {
   };
   for (const auto& [code, name] : retryable) {
     const std::string job_id = "job-" + std::to_string(++n);
-    clientClaimed(ctx, job_id);
+    hClientClaimed(ctx, job_id);
     ctx.GRPC.Fail("Execute", code, "try again later", 1);
     outcome = runAttempt(job_id, "w-1");
     const auto record = store::getJob(job_id);
@@ -1130,13 +1130,13 @@ void CheckRetryClasses(harness::Ctx& ctx) {
 }
 
 void CheckAttemptsDurable(harness::Ctx& ctx) {
-  RunnerPeer& peer = clientSetup(ctx);
+  HRunnerPeer& peer = hClientSetup(ctx);
   ctx.GRPC.Fail("Execute", grpc::StatusCode::UNAVAILABLE, "executor restarting", 5);
   std::vector<std::string> outcomes;
   for (;;) {
     outcomes.push_back(runAttempt("job-1", "w-1"));
     if (outcomes.back() != "retry" || outcomes.size() == 6) break;
-    clientReclaim(ctx, 60);
+    hClientReclaim(ctx, 60);
   }
   ctx.Equal(outcomes, std::vector<std::string>{"retry", "retry", "retry", "retry", "dead"},
             "five UNAVAILABLE attempts: the fifth must bury the job (kMaxAttempts = 5), which needs a count that grows on every attempt; the outcomes");
@@ -1146,13 +1146,13 @@ void CheckAttemptsDurable(harness::Ctx& ctx) {
   const auto job = store::getJob("job-1");
   ctx.Assert(job->attempts == 5 && job->dead_reason == "max_attempts_exceeded", "the job has %d attempts and dead_reason %q, expected 5 and max_attempts_exceeded", job->attempts, job->dead_reason);
   ctx.Equal(store::attemptHistory("job-1").size(), 5, "the attempts in the history");
-  clientClaimed(ctx, "job-2");
+  hClientClaimed(ctx, "job-2");
   ctx.Equal(runAttempt("job-2", "w-1"), "completed", "a healthy attempt");
   ctx.Equal(peer.counted, std::vector<long>{1}, "when Execute arrived the job record must already count the attempt (counted after the call, a worker that dies mid-call gives the job a free attempt); the counts seen");
 }
 
 void CheckBackoff(harness::Ctx& ctx) {
-  clientSetup(ctx);
+  hClientSetup(ctx);
   ctx.GRPC.Fail("Execute", grpc::StatusCode::UNAVAILABLE, "executor restarting", 4);
   int attempt = 0;
   for (const long long delay : {1000LL, 2000LL, 4000LL, 8000LL}) {
@@ -1162,12 +1162,12 @@ void CheckBackoff(harness::Ctx& ctx) {
     const long long due = static_cast<long long>(ctx.Redis.ZScore("jobs:inflight", "job-1").value_or(0));
     ctx.Assert(due == now + delay, "after attempt %d the retry is due %d ms from now, expected %d ms (kBackoffBaseMs doubled per attempt): a retry at once hits an executor that is still down", attempt, due - now, delay);
     ctx.Equal(store::getJob("job-1")->next_retry_at_ms, now + delay, "next_retry_at_ms");
-    clientReclaim(ctx, static_cast<double>(delay) / 1000);
+    hClientReclaim(ctx, static_cast<double>(delay) / 1000);
   }
 }
 
 void CheckCallDeadline(harness::Ctx& ctx) {
-  clientSetup(ctx);
+  hClientSetup(ctx);
   ctx.GRPC.SetLatency("Execute", 120.0);
   const std::string outcome = runAttempt("job-1", "w-1");
   const auto calls = ctx.GRPC.CallsTo("Execute");

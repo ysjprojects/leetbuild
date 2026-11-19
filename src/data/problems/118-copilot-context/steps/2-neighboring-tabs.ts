@@ -917,7 +917,7 @@ import (
 	"leetbuild/harness"
 )
 
-func tabsLines(n int, line func(i int) string) []string {
+func hTabsLines(n int, line func(i int) string) []string {
 	out := make([]string, n)
 	for i := range out {
 		out[i] = line(i)
@@ -926,50 +926,50 @@ func tabsLines(n int, line func(i int) string) []string {
 }
 
 var (
-	tabsOld    = strings.Join(tabsLines(40, func(i int) string { return fmt.Sprintf("legacy_total_%d = legacy_sum(report_rows, legacy_col_%d)", i, i) }), "\\n")
-	tabsBlock  = "def load_user(conn, user_id):\\n    cursor = conn.cursor()\\n    cursor.execute(USER_QUERY, (user_id,))\\n    row = cursor.fetchone()\\n    return User.from_row(row)\\n"
-	tabsPrefix = tabsOld + "\\n" + strings.Join(strings.Split(strings.Repeat(tabsBlock, 12), "\\n")[:59], "\\n") + "\\n    user = User.from_"
-	tabsPool   = "import psycopg\\n\\ndef open_conn(dsn):\\n    conn = psycopg.connect(dsn, autocommit=True)\\n    cursor = conn.cursor()\\n    cursor.execute(\\"SET statement_timeout = 500\\")\\n    return conn\\n"
-	tabsUser   = strings.Join(tabsLines(20, func(i int) string { return fmt.Sprintf("# models filler line %d lorem ipsum dolor", i) }), "\\n") +
+	hTabsOld    = strings.Join(hTabsLines(40, func(i int) string { return fmt.Sprintf("legacy_total_%d = legacy_sum(report_rows, legacy_col_%d)", i, i) }), "\\n")
+	hTabsBlock  = "def load_user(conn, user_id):\\n    cursor = conn.cursor()\\n    cursor.execute(USER_QUERY, (user_id,))\\n    row = cursor.fetchone()\\n    return User.from_row(row)\\n"
+	hTabsPrefix = hTabsOld + "\\n" + strings.Join(strings.Split(strings.Repeat(hTabsBlock, 12), "\\n")[:59], "\\n") + "\\n    user = User.from_"
+	hTabsPool   = "import psycopg\\n\\ndef open_conn(dsn):\\n    conn = psycopg.connect(dsn, autocommit=True)\\n    cursor = conn.cursor()\\n    cursor.execute(\\"SET statement_timeout = 500\\")\\n    return conn\\n"
+	hTabsUser   = strings.Join(hTabsLines(20, func(i int) string { return fmt.Sprintf("# models filler line %d lorem ipsum dolor", i) }), "\\n") +
 		"\\nfrom dataclasses import dataclass\\n\\n@dataclass\\nclass User:\\n    user_id: int\\n    email: str\\n\\n    @classmethod\\n    def from_row(cls, row):\\n        return cls(user_id=row[0], email=row[1])\\n" +
-		strings.Join(tabsLines(20, func(i int) string { return fmt.Sprintf("# models2 filler line %d lorem ipsum dolor", i) }), "\\n")
-	tabsNotes  = "Release notes: the cursor blinks faster now. Contributors thanked: alice bob carol dave erin frank grace heidi ivan judy mallory niaj olivia peggy rupert sybil trent victor walter"
-	tabsLegacy = strings.Join(tabsLines(12, func(i int) string { return fmt.Sprintf("legacy_total_%d = legacy_sum(report_rows, legacy_col_%d)", i+28, i+28) }), "\\n")
-	tabsExact  = "conn = alpha + beta + gamma + delta + epsilon + zeta\\n"
-	tabsLorem  = "Lorem ipsum dolor sit amet, consectetur adipiscing elit.\\n"
-	tabsWide   = strings.Repeat("-", 270) + "\\nload_user(conn, user_id)\\n" + strings.Repeat("-", 380) + "\\nrow = fetchone(USER_QUERY)\\n" + strings.Repeat("-", 600) + "\\n"
+		strings.Join(hTabsLines(20, func(i int) string { return fmt.Sprintf("# models2 filler line %d lorem ipsum dolor", i) }), "\\n")
+	hTabsNotes  = "Release notes: the cursor blinks faster now. Contributors thanked: alice bob carol dave erin frank grace heidi ivan judy mallory niaj olivia peggy rupert sybil trent victor walter"
+	hTabsLegacy = strings.Join(hTabsLines(12, func(i int) string { return fmt.Sprintf("legacy_total_%d = legacy_sum(report_rows, legacy_col_%d)", i+28, i+28) }), "\\n")
+	hTabsExact  = "conn = alpha + beta + gamma + delta + epsilon + zeta\\n"
+	hTabsLorem  = "Lorem ipsum dolor sit amet, consectetur adipiscing elit.\\n"
+	hTabsWide   = strings.Repeat("-", 270) + "\\nload_user(conn, user_id)\\n" + strings.Repeat("-", 380) + "\\nrow = fetchone(USER_QUERY)\\n" + strings.Repeat("-", 600) + "\\n"
 )
 
 // tabsVariant is the pool module with k unrelated names added: each one lowers its score a little.
-func tabsVariant(k int) string {
-	return tabsPool + strings.Join(tabsLines(k, func(j int) string { return fmt.Sprintf("extra_name_%d_%d = None\\n", k, j) }), "")
+func hTabsVariant(k int) string {
+	return hTabsPool + strings.Join(hTabsLines(k, func(j int) string { return fmt.Sprintf("extra_name_%d_%d = None\\n", k, j) }), "")
 }
 
-func tabsRemember(ctx *harness.Ctx, session string, open []Tab) {
+func hTabsRemember(ctx *harness.Ctx, session string, open []Tab) {
 	ctx.NoError(rememberTabs(context.Background(), session, open), "rememberTabs(%s)", session)
 }
 
-func tabsPick(ctx *harness.Ctx, session string, paths []string) []string {
-	picked, err := pickSnippets(context.Background(), session, paths, tabsPrefix)
+func hTabsPick(ctx *harness.Ctx, session string, paths []string) []string {
+	picked, err := pickSnippets(context.Background(), session, paths, hTabsPrefix)
 	ctx.NoError(err, "pickSnippets(%s)", session)
 	return picked
 }
 
 func CheckSessionKey(ctx *harness.Ctx) {
-	tabsRemember(ctx, "s-ada", []Tab{{"db/conn.py", tabsPool}})
-	tabsRemember(ctx, "s-bob", []Tab{{"db/conn.py", tabsPool + "BOB_ONLY = 'session b'\\n"}})
+	hTabsRemember(ctx, "s-ada", []Tab{{"db/conn.py", hTabsPool}})
+	hTabsRemember(ctx, "s-bob", []Tab{{"db/conn.py", hTabsPool + "BOB_ONLY = 'session b'\\n"}})
 	keys := ctx.Redis.Keys("tabs:*")
 	ctx.Equal(keys, []string{"tabs:s-ada:db/conn.py", "tabs:s-bob:db/conn.py"}, "two sessions with db/conn.py open: the key is tabs:{session}:{path}; the keys")
-	picked := tabsPick(ctx, "s-ada", []string{"db/conn.py"})
+	picked := hTabsPick(ctx, "s-ada", []string{"db/conn.py"})
 	for _, s := range picked {
 		ctx.Assert(!strings.Contains(s, "BOB_ONLY"), "session s-ada was handed s-bob's file: %q", s)
 	}
-	ctx.Equal(picked, []string{tabsPool}, "session s-ada's own db/conn.py must come back as its snippet")
+	ctx.Equal(picked, []string{hTabsPool}, "session s-ada's own db/conn.py must come back as its snippet")
 }
 
 func CheckTtl(ctx *harness.Ctx) {
 	created := ctx.Redis.After("tabs:s-ada:db/conn.py", func() any { return ctx.Redis.TTL("tabs:s-ada:db/conn.py") })
-	tabsRemember(ctx, "s-ada", []Tab{{"db/conn.py", tabsPool}, {"models/user.py", tabsUser}})
+	hTabsRemember(ctx, "s-ada", []Tab{{"db/conn.py", hTabsPool}, {"models/user.py", hTabsUser}})
 	keys := ctx.Redis.Keys("tabs:*")
 	ctx.Equal(len(keys), 2, "two open tabs left the keys %v; keys", keys)
 	for _, key := range keys {
@@ -979,7 +979,7 @@ func CheckTtl(ctx *harness.Ctx) {
 	createdTTL, _ := created.Result.(int64)
 	ctx.Assert(created.Fired && createdTTL >= 590 && createdTTL <= 600, "right after the command that wrote tabs:s-ada:db/conn.py its TTL was %v: the expiry is set by the write itself, not by a second command", created.Result)
 	ctx.Clock.Advance(300)
-	tabsRemember(ctx, "s-ada", []Tab{{"db/conn.py", tabsPool}})
+	hTabsRemember(ctx, "s-ada", []Tab{{"db/conn.py", hTabsPool}})
 	conn := []string{}
 	for _, key := range ctx.Redis.Keys("tabs:*") {
 		if strings.HasSuffix(key, "db/conn.py") {
@@ -992,44 +992,44 @@ func CheckTtl(ctx *harness.Ctx) {
 }
 
 func CheckSimilarity(ctx *harness.Ctx) {
-	open := []Tab{{"docs/notes.py", tabsNotes}, {"models/user.py", tabsUser}, {"db/pool.py", tabsPool}, {"legacy/report.py", tabsLegacy}}
-	open = append(open, Tab{"docs/exact.py", tabsExact}, Tab{"docs/lorem.py", tabsLorem}, Tab{"docs/wide.py", tabsWide})
+	open := []Tab{{"docs/notes.py", hTabsNotes}, {"models/user.py", hTabsUser}, {"db/pool.py", hTabsPool}, {"legacy/report.py", hTabsLegacy}}
+	open = append(open, Tab{"docs/exact.py", hTabsExact}, Tab{"docs/lorem.py", hTabsLorem}, Tab{"docs/wide.py", hTabsWide})
 	for k := 0; k < 6; k++ {
-		open = append(open, Tab{fmt.Sprintf("lib/pool_%d.py", k), tabsVariant(k)})
+		open = append(open, Tab{fmt.Sprintf("lib/pool_%d.py", k), hTabsVariant(k)})
 	}
-	tabsRemember(ctx, "s-ada", open)
-	alone := tabsPick(ctx, "s-ada", []string{"docs/notes.py"})
-	ctx.Equal(alone, []string{tabsNotes}, "docs/notes.py shares one identifier with the cursor (score 0.02): with nothing above 0.05 the best match is still included")
-	nothing := tabsPick(ctx, "s-ada", []string{"docs/lorem.py"})
+	hTabsRemember(ctx, "s-ada", open)
+	alone := hTabsPick(ctx, "s-ada", []string{"docs/notes.py"})
+	ctx.Equal(alone, []string{hTabsNotes}, "docs/notes.py shares one identifier with the cursor (score 0.02): with nothing above 0.05 the best match is still included")
+	nothing := hTabsPick(ctx, "s-ada", []string{"docs/lorem.py"})
 	ctx.Assert(len(nothing) == 0, "docs/lorem.py shares no identifier with the cursor (score 0): the fallback keeps the best match only when it shares one, got %q", nothing)
-	mixed := tabsPick(ctx, "s-ada", []string{"legacy/report.py", "docs/notes.py", "models/user.py", "db/pool.py"})
+	mixed := hTabsPick(ctx, "s-ada", []string{"legacy/report.py", "docs/notes.py", "models/user.py", "db/pool.py"})
 	for _, s := range mixed {
 		ctx.Assert(!strings.Contains(s, "legacy_sum"), "legacy/report.py matches only lines more than 60 lines from the cursor: score the last 60 lines of the prefix (cursorWindowLines), the cursor line included")
-		ctx.Assert(s != tabsNotes, "docs/notes.py scores below 0.05 and two tabs score above it: the best-match fallback is only for when nothing reaches the bar")
+		ctx.Assert(s != hTabsNotes, "docs/notes.py scores below 0.05 and two tabs score above it: the best-match fallback is only for when nothing reaches the bar")
 	}
-	ctx.Assert(len(mixed) == 2 && mixed[0] == tabsPool, "db/pool.py (0.22) then models/user.py (0.19) expected, best first; got %d snippets %q", len(mixed), mixed)
+	ctx.Assert(len(mixed) == 2 && mixed[0] == hTabsPool, "db/pool.py (0.22) then models/user.py (0.19) expected, best first; got %d snippets %q", len(mixed), mixed)
 	ctx.Assert(strings.Contains(mixed[1], "def from_row") && len(mixed[1]) <= 500, "models/user.py must offer its best 500-character window (the one with from_row), got %q", mixed[1])
-	edge := tabsPick(ctx, "s-ada", []string{"docs/exact.py", "db/pool.py"})
-	ctx.Equal(edge, []string{tabsPool, tabsExact}, "docs/exact.py scores exactly 0.05 (1 shared identifier of 20): at least minSnippetScore is kept; the snippets")
-	wide := tabsPick(ctx, "s-ada", []string{"docs/wide.py"})
-	ctx.Equal(wide, []string{tabsWide[250:750]}, "docs/wide.py's best window starts at character 250: score every 500-character window with a stride of 250; the snippets")
+	edge := hTabsPick(ctx, "s-ada", []string{"docs/exact.py", "db/pool.py"})
+	ctx.Equal(edge, []string{hTabsPool, hTabsExact}, "docs/exact.py scores exactly 0.05 (1 shared identifier of 20): at least minSnippetScore is kept; the snippets")
+	wide := hTabsPick(ctx, "s-ada", []string{"docs/wide.py"})
+	ctx.Equal(wide, []string{hTabsWide[250:750]}, "docs/wide.py's best window starts at character 250: score every 500-character window with a stride of 250; the snippets")
 	paths := []string{}
 	for _, k := range []int{5, 2, 0, 4, 1, 3} {
 		paths = append(paths, fmt.Sprintf("lib/pool_%d.py", k))
 	}
-	many := tabsPick(ctx, "s-ada", paths)
-	ctx.Equal(many, []string{tabsVariant(0), tabsVariant(1), tabsVariant(2), tabsVariant(3)}, "six matching tabs must give the 4 best, best first (lib/pool_0 … lib/pool_3)")
+	many := hTabsPick(ctx, "s-ada", paths)
+	ctx.Equal(many, []string{hTabsVariant(0), hTabsVariant(1), hTabsVariant(2), hTabsVariant(3)}, "six matching tabs must give the 4 best, best first (lib/pool_0 … lib/pool_3)")
 }
 
 func CheckBatchedRead(ctx *harness.Ctx) {
-	paths := tabsLines(8, func(k int) string { return fmt.Sprintf("src/f%d.py", k) })
+	paths := hTabsLines(8, func(k int) string { return fmt.Sprintf("src/f%d.py", k) })
 	open := []Tab{}
 	for _, path := range paths {
-		open = append(open, Tab{path, tabsPool})
+		open = append(open, Tab{path, hTabsPool})
 	}
-	tabsRemember(ctx, "s-ada", open)
+	hTabsRemember(ctx, "s-ada", open)
 	before := len(ctx.Redis.RoundTrips())
-	picked := tabsPick(ctx, "s-ada", append(append(append([]string{}, paths[:4]...), "src/closed.py"), paths[4:]...))
+	picked := hTabsPick(ctx, "s-ada", append(append(append([]string{}, paths[:4]...), "src/closed.py"), paths[4:]...))
 	trips := ctx.Redis.RoundTrips()[before:]
 	ctx.Assert(len(trips) == 1 && len(trips[0]) == 1 && trips[0][0] == "MGET", "pickSnippets made %d round trips for 9 open tabs (%v): read them with one MGET", len(trips), trips)
 	ctx.Equal(len(picked), 4, "eight stored tabs and one never written (src/closed.py, expired or never sent) must give 4 snippets; snippets")
@@ -1044,26 +1044,26 @@ func CheckBatchedRead(ctx *harness.Ctx) {
 
 namespace {
 
-std::string tabsJoin(const std::vector<std::string>& lines, const std::string& sep) {
+std::string hTabsJoin(const std::vector<std::string>& lines, const std::string& sep) {
   std::string out;
   for (std::size_t i = 0; i < lines.size(); i++) out += (i == 0 ? "" : sep) + lines[i];
   return out;
 }
 
-std::string tabsLegacyLines(int from, int to) {
+std::string hTabsLegacyLines(int from, int to) {
   std::vector<std::string> lines;
   for (int i = from; i < to; i++)
     lines.push_back("legacy_total_" + std::to_string(i) + " = legacy_sum(report_rows, legacy_col_" + std::to_string(i) + ")");
-  return tabsJoin(lines, "\\n");
+  return hTabsJoin(lines, "\\n");
 }
 
-std::string tabsFiller(const std::string& tag) {
+std::string hTabsFiller(const std::string& tag) {
   std::vector<std::string> lines;
   for (int i = 0; i < 20; i++) lines.push_back("# " + tag + " filler line " + std::to_string(i) + " lorem ipsum dolor");
-  return tabsJoin(lines, "\\n");
+  return hTabsJoin(lines, "\\n");
 }
 
-std::string tabsPrefix() {
+std::string hTabsPrefix() {
   const std::string block =
       "def load_user(conn, user_id):\\n    cursor = conn.cursor()\\n    cursor.execute(USER_QUERY, (user_id,))\\n    row = cursor.fetchone()\\n    return User.from_row(row)\\n";
   std::string repeated;
@@ -1075,27 +1075,27 @@ std::string tabsPrefix() {
     lines.push_back(repeated.substr(start, nl - start));
     start = nl + 1;
   }
-  return tabsLegacyLines(0, 40) + "\\n" + tabsJoin(lines, "\\n") + "\\n    user = User.from_";
+  return hTabsLegacyLines(0, 40) + "\\n" + hTabsJoin(lines, "\\n") + "\\n    user = User.from_";
 }
 
-const std::string kTabsPool =
+const std::string kHTabsPool =
     "import psycopg\\n\\ndef open_conn(dsn):\\n    conn = psycopg.connect(dsn, autocommit=True)\\n    cursor = conn.cursor()\\n    cursor.execute(\\"SET statement_timeout = 500\\")\\n    return conn\\n";
-const std::string kTabsNotes =
+const std::string kHTabsNotes =
     "Release notes: the cursor blinks faster now. Contributors thanked: alice bob carol dave erin frank grace heidi ivan judy mallory niaj olivia peggy rupert sybil trent victor walter";
-const std::string kTabsExact = "conn = alpha + beta + gamma + delta + epsilon + zeta\\n";
-const std::string kTabsLorem = "Lorem ipsum dolor sit amet, consectetur adipiscing elit.\\n";
-const std::string kTabsWide =
+const std::string kHTabsExact = "conn = alpha + beta + gamma + delta + epsilon + zeta\\n";
+const std::string kHTabsLorem = "Lorem ipsum dolor sit amet, consectetur adipiscing elit.\\n";
+const std::string kHTabsWide =
     std::string(270, '-') + "\\nload_user(conn, user_id)\\n" + std::string(380, '-') + "\\nrow = fetchone(USER_QUERY)\\n" + std::string(600, '-') + "\\n";
 
-std::string tabsUser() {
-  return tabsFiller("models") +
+std::string hTabsUser() {
+  return hTabsFiller("models") +
          "\\nfrom dataclasses import dataclass\\n\\n@dataclass\\nclass User:\\n    user_id: int\\n    email: str\\n\\n    @classmethod\\n    def from_row(cls, row):\\n        return cls(user_id=row[0], email=row[1])\\n" +
-         tabsFiller("models2");
+         hTabsFiller("models2");
 }
 
 // The pool module with k unrelated names added: each one lowers its score a little.
-std::string tabsVariant(int k) {
-  std::string out = kTabsPool;
+std::string hTabsVariant(int k) {
+  std::string out = kHTabsPool;
   for (int j = 0; j < k; j++) out += "extra_name_" + std::to_string(k) + "_" + std::to_string(j) + " = None\\n";
   return out;
 }
@@ -1103,19 +1103,19 @@ std::string tabsVariant(int k) {
 }  // namespace
 
 void CheckSessionKey(harness::Ctx& ctx) {
-  rememberTabs("s-ada", {{"db/conn.py", kTabsPool}});
-  rememberTabs("s-bob", {{"db/conn.py", kTabsPool + "BOB_ONLY = 'session b'\\n"}});
+  rememberTabs("s-ada", {{"db/conn.py", kHTabsPool}});
+  rememberTabs("s-bob", {{"db/conn.py", kHTabsPool + "BOB_ONLY = 'session b'\\n"}});
   ctx.Equal(ctx.Redis.Keys("tabs:*"), {"tabs:s-ada:db/conn.py", "tabs:s-bob:db/conn.py"},
             "two sessions with db/conn.py open: the key is tabs:{session}:{path}; the keys");
-  const auto picked = pickSnippets("s-ada", {"db/conn.py"}, tabsPrefix());
+  const auto picked = pickSnippets("s-ada", {"db/conn.py"}, hTabsPrefix());
   for (const auto& s : picked) ctx.Assert(s.find("BOB_ONLY") == std::string::npos, "session s-ada was handed s-bob's file: %q", s);
-  ctx.Equal(picked, {kTabsPool}, "session s-ada's own db/conn.py must come back as its snippet");
+  ctx.Equal(picked, {kHTabsPool}, "session s-ada's own db/conn.py must come back as its snippet");
 }
 
 void CheckTtl(harness::Ctx& ctx) {
   auto created = std::make_shared<std::optional<long long>>();
   ctx.Redis.After("tabs:s-ada:db/conn.py", [created, &ctx] { *created = ctx.Redis.TTL("tabs:s-ada:db/conn.py"); });
-  rememberTabs("s-ada", {{"db/conn.py", kTabsPool}, {"models/user.py", tabsUser()}});
+  rememberTabs("s-ada", {{"db/conn.py", kHTabsPool}, {"models/user.py", hTabsUser()}});
   const auto keys = ctx.Redis.Keys("tabs:*");
   ctx.Equal(keys.size(), 2, "two open tabs left the keys %v; keys", keys);
   for (const auto& key : keys) {
@@ -1125,7 +1125,7 @@ void CheckTtl(harness::Ctx& ctx) {
   const long long created_ttl = created->value_or(-3);
   ctx.Assert(created->has_value() && created_ttl >= 590 && created_ttl <= 600, "right after the command that wrote tabs:s-ada:db/conn.py its TTL was %d: the expiry is set by the write itself, not by a second command", created_ttl);
   ctx.Clock.Advance(300);
-  rememberTabs("s-ada", {{"db/conn.py", kTabsPool}});
+  rememberTabs("s-ada", {{"db/conn.py", kHTabsPool}});
   std::vector<std::string> conn;
   for (const auto& key : ctx.Redis.Keys("tabs:*"))
     if (key.size() >= 10 && key.compare(key.size() - 10, 10, "db/conn.py") == 0) conn.push_back(key);
@@ -1135,29 +1135,29 @@ void CheckTtl(harness::Ctx& ctx) {
 }
 
 void CheckSimilarity(harness::Ctx& ctx) {
-  std::vector<Tab> open = {{"docs/notes.py", kTabsNotes}, {"models/user.py", tabsUser()}, {"db/pool.py", kTabsPool}, {"legacy/report.py", tabsLegacyLines(28, 40)},
-                           {"docs/exact.py", kTabsExact}, {"docs/lorem.py", kTabsLorem}, {"docs/wide.py", kTabsWide}};
-  for (int k = 0; k < 6; k++) open.push_back({"lib/pool_" + std::to_string(k) + ".py", tabsVariant(k)});
+  std::vector<Tab> open = {{"docs/notes.py", kHTabsNotes}, {"models/user.py", hTabsUser()}, {"db/pool.py", kHTabsPool}, {"legacy/report.py", hTabsLegacyLines(28, 40)},
+                           {"docs/exact.py", kHTabsExact}, {"docs/lorem.py", kHTabsLorem}, {"docs/wide.py", kHTabsWide}};
+  for (int k = 0; k < 6; k++) open.push_back({"lib/pool_" + std::to_string(k) + ".py", hTabsVariant(k)});
   rememberTabs("s-ada", open);
-  const std::string prefix = tabsPrefix();
-  ctx.Equal(pickSnippets("s-ada", {"docs/notes.py"}, prefix), {kTabsNotes},
+  const std::string prefix = hTabsPrefix();
+  ctx.Equal(pickSnippets("s-ada", {"docs/notes.py"}, prefix), {kHTabsNotes},
             "docs/notes.py shares one identifier with the cursor (score 0.02): with nothing above 0.05 the best match is still included");
   const auto nothing = pickSnippets("s-ada", {"docs/lorem.py"}, prefix);
   ctx.Assert(nothing.empty(), "docs/lorem.py shares no identifier with the cursor (score 0): the fallback keeps the best match only when it shares one, got %d snippets", nothing.size());
   const auto mixed = pickSnippets("s-ada", {"legacy/report.py", "docs/notes.py", "models/user.py", "db/pool.py"}, prefix);
   for (const auto& s : mixed) {
     ctx.Assert(s.find("legacy_sum") == std::string::npos, "legacy/report.py matches only lines more than 60 lines from the cursor: score the last 60 lines of the prefix (kCursorWindowLines), the cursor line included");
-    ctx.Assert(s != kTabsNotes, "docs/notes.py scores below 0.05 and two tabs score above it: the best-match fallback is only for when nothing reaches the bar");
+    ctx.Assert(s != kHTabsNotes, "docs/notes.py scores below 0.05 and two tabs score above it: the best-match fallback is only for when nothing reaches the bar");
   }
-  ctx.Assert(mixed.size() == 2 && mixed[0] == kTabsPool, "db/pool.py (0.22) then models/user.py (0.19) expected, best first; got %d snippets", mixed.size());
+  ctx.Assert(mixed.size() == 2 && mixed[0] == kHTabsPool, "db/pool.py (0.22) then models/user.py (0.19) expected, best first; got %d snippets", mixed.size());
   ctx.Assert(mixed.size() == 2 && mixed[1].find("def from_row") != std::string::npos && mixed[1].size() <= 500, "models/user.py must offer its best 500-character window (the one with from_row)");
-  ctx.Equal(pickSnippets("s-ada", {"docs/exact.py", "db/pool.py"}, prefix), {kTabsPool, kTabsExact},
+  ctx.Equal(pickSnippets("s-ada", {"docs/exact.py", "db/pool.py"}, prefix), {kHTabsPool, kHTabsExact},
             "docs/exact.py scores exactly 0.05 (1 shared identifier of 20): at least kMinSnippetScore is kept; the snippets");
-  ctx.Equal(pickSnippets("s-ada", {"docs/wide.py"}, prefix), {kTabsWide.substr(250, 500)},
+  ctx.Equal(pickSnippets("s-ada", {"docs/wide.py"}, prefix), {kHTabsWide.substr(250, 500)},
             "docs/wide.py's best window starts at character 250: score every 500-character window with a stride of 250; the snippets");
   std::vector<std::string> paths;
   for (int k : {5, 2, 0, 4, 1, 3}) paths.push_back("lib/pool_" + std::to_string(k) + ".py");
-  ctx.Equal(pickSnippets("s-ada", paths, prefix), {tabsVariant(0), tabsVariant(1), tabsVariant(2), tabsVariant(3)},
+  ctx.Equal(pickSnippets("s-ada", paths, prefix), {hTabsVariant(0), hTabsVariant(1), hTabsVariant(2), hTabsVariant(3)},
             "six matching tabs must give the 4 best, best first (lib/pool_0 … lib/pool_3)");
 }
 
@@ -1166,14 +1166,14 @@ void CheckBatchedRead(harness::Ctx& ctx) {
   std::vector<Tab> open;
   for (int k = 0; k < 8; k++) {
     paths.push_back("src/f" + std::to_string(k) + ".py");
-    open.push_back({paths.back(), kTabsPool});
+    open.push_back({paths.back(), kHTabsPool});
   }
   rememberTabs("s-ada", open);
   std::vector<std::string> asked(paths.begin(), paths.begin() + 4);
   asked.push_back("src/closed.py");
   asked.insert(asked.end(), paths.begin() + 4, paths.end());
   const std::size_t before = ctx.Redis.RoundTrips().size();
-  const auto picked = pickSnippets("s-ada", asked, tabsPrefix());
+  const auto picked = pickSnippets("s-ada", asked, hTabsPrefix());
   const auto all = ctx.Redis.RoundTrips();
   const std::vector<std::vector<std::string>> trips(all.begin() + static_cast<long>(before), all.end());
   ctx.Assert(trips.size() == 1 && trips[0].size() == 1 && trips[0][0] == "MGET", "pickSnippets made %d round trips for 9 open tabs (%v): read them with one MGET", trips.size(), trips);

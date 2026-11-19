@@ -953,14 +953,14 @@ import (
 )
 
 // notifierPeer mails every attendee of a request once per token; dropReplies loses the reply after the mail went out.
-type notifierPeer struct {
+type HNotifierPeer struct {
 	pb.UnimplementedNotifierServer
 	mails       []string
 	tokens      map[string]bool
 	dropReplies int
 }
 
-func (n *notifierPeer) NotifyAttendees(_ context.Context, req *pb.NotifyRequest) (*pb.NotifyReply, error) {
+func (n *HNotifierPeer) NotifyAttendees(_ context.Context, req *pb.NotifyRequest) (*pb.NotifyReply, error) {
 	mailed := int32(0)
 	if req.GetIdempotencyToken() == "" || !n.tokens[req.GetIdempotencyToken()] {
 		n.tokens[req.GetIdempotencyToken()] = true
@@ -976,32 +976,32 @@ func (n *notifierPeer) NotifyAttendees(_ context.Context, req *pb.NotifyRequest)
 	return &pb.NotifyReply{Mailed: mailed}, nil
 }
 
-func ntWorld(ctx *harness.Ctx) *notifierPeer {
-	notifier := &notifierPeer{tokens: map[string]bool{}}
+func hNtWorld(ctx *harness.Ctx) *HNotifierPeer {
+	notifier := &HNotifierPeer{tokens: map[string]bool{}}
 	pb.RegisterNotifierServer(ctx.GRPC.Server(""), notifier)
 	return notifier
 }
 
-func ntEvent(revision int, title string, attendees ...string) store.Event {
+func hNtEvent(revision int, title string, attendees ...string) store.Event {
 	return store.Event{
 		EventID: "e-1", CalendarID: "c1", Tenant: "t1", Title: title, Rrule: "FREQ=WEEKLY;COUNT=4",
 		Dtstart: "2026-03-02T09:00:00Z", Dtend: "2026-03-02T09:30:00Z", Revision: revision, Attendees: attendees,
 	}
 }
 
-func ntNotify(ctx *harness.Ctx, before *store.Event, after store.Event) int {
+func hNtNotify(ctx *harness.Ctx, before *store.Event, after store.Event) int {
 	sent, err := notifyChange(context.Background(), before, after)
 	ctx.NoError(err, "notifyChange")
 	return sent
 }
 
-func ntMails(n *notifierPeer) []string {
+func hNtMails(n *HNotifierPeer) []string {
 	mails := append([]string{}, n.mails...)
 	sort.Strings(mails)
 	return mails
 }
 
-func ntCallsFor(ctx *harness.Ctx, eventID string) []harness.Call {
+func hNtCallsFor(ctx *harness.Ctx, eventID string) []harness.Call {
 	var calls []harness.Call
 	for _, c := range ctx.GRPC.CallsTo("NotifyAttendees", "") {
 		if req, _ := c.Request.(*pb.NotifyRequest); req.GetEventId() == eventID {
@@ -1011,26 +1011,26 @@ func ntCallsFor(ctx *harness.Ctx, eventID string) []harness.Call {
 	return calls
 }
 
-func ntEventWithID(eventID string) store.Event {
-	e := ntEvent(1, "Standup", "ana@example.com", "bo@example.com")
+func hNtEventWithID(eventID string) store.Event {
+	e := hNtEvent(1, "Standup", "ana@example.com", "bo@example.com")
 	e.EventID = eventID
 	return e
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	notifier := ntWorld(ctx)
+	notifier := hNtWorld(ctx)
 	ctx.GRPC.SetLatency("NotifyAttendees", 2.0, "")
-	ntNotify(ctx, nil, ntEvent(1, "Standup", "ana@example.com", "bo@example.com"))
-	ctx.Equal(ntMails(notifier), []string{"ana@example.com create", "bo@example.com create"}, "a notifier that answers in 2 s must send one invitation each; the mails")
+	hNtNotify(ctx, nil, hNtEvent(1, "Standup", "ana@example.com", "bo@example.com"))
+	ctx.Equal(hNtMails(notifier), []string{"ana@example.com create", "bo@example.com create"}, "a notifier that answers in 2 s must send one invitation each; the mails")
 	call := ctx.GRPC.CallsTo("NotifyAttendees", "")[0]
 	ctx.Assert(call.HasDeadline(), "the NotifyAttendees call carries no deadline: a notifier that hangs holds the request worker with it")
 	ctx.Assert(2500*time.Millisecond <= call.Timeout && call.Timeout <= 3500*time.Millisecond, "the NotifyAttendees deadline is %v, expected about 3 s", call.Timeout)
 	// The first attempt takes 2 s and its reply is lost: the retry gets 3 s of its own.
 	notifier.dropReplies = 1
-	_, err := notifyChange(context.Background(), nil, ntEventWithID("e-2"))
+	_, err := notifyChange(context.Background(), nil, hNtEventWithID("e-2"))
 	var timeouts []time.Duration
 	ok := err == nil
-	for _, c := range ntCallsFor(ctx, "e-2") {
+	for _, c := range hNtCallsFor(ctx, "e-2") {
 		timeouts = append(timeouts, c.Timeout)
 		ok = ok && c.HasDeadline() && 2500*time.Millisecond <= c.Timeout && c.Timeout <= 3500*time.Millisecond
 	}
@@ -1038,9 +1038,9 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckOneToken(ctx *harness.Ctx) {
-	notifier := ntWorld(ctx)
+	notifier := hNtWorld(ctx)
 	notifier.dropReplies = 1 // the attendees were mailed, the reply never came back
-	ntNotify(ctx, nil, ntEvent(1, "Standup", "ana@example.com", "bo@example.com"))
+	hNtNotify(ctx, nil, hNtEvent(1, "Standup", "ana@example.com", "bo@example.com"))
 	calls := ctx.GRPC.CallsTo("NotifyAttendees", "")
 	ctx.Equal(len(calls), 2, "a lost reply is retried once; the calls")
 	var tokens []string
@@ -1049,7 +1049,7 @@ func CheckOneToken(ctx *harness.Ctx) {
 		tokens = append(tokens, req.GetIdempotencyToken())
 	}
 	ctx.Equal(tokens, []string{"e-1:1:create", "e-1:1:create"}, "the attempts' tokens (the retry is the same notification)")
-	ctx.Equal(ntMails(notifier), []string{"ana@example.com create", "bo@example.com create"}, "the mails after a lost reply (a retry must not mail the attendees again)")
+	ctx.Equal(hNtMails(notifier), []string{"ana@example.com create", "bo@example.com create"}, "the mails after a lost reply (a retry must not mail the attendees again)")
 	// Only UNAVAILABLE and DEADLINE_EXCEEDED are retried, at most 3 attempts in all.
 	cases := []struct {
 		code     codes.Code
@@ -1058,29 +1058,29 @@ func CheckOneToken(ctx *harness.Ctx) {
 	for n, tc := range cases {
 		eventID := "e-" + strconv.Itoa(n+2)
 		ctx.GRPC.Fail("NotifyAttendees", tc.code, "", tc.expected, "")
-		_, _ = notifyChange(context.Background(), nil, ntEventWithID(eventID)) // whether the failure reaches the caller is not this check's question
-		made := len(ntCallsFor(ctx, eventID))
+		_, _ = notifyChange(context.Background(), nil, hNtEventWithID(eventID)) // whether the failure reaches the caller is not this check's question
+		made := len(hNtCallsFor(ctx, eventID))
 		ctx.Assert(made == tc.expected, "a notifier failing %v got %d calls, expected %d: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, up to 3 attempts", tc.code, made, tc.expected)
 	}
 }
 
 func CheckChangeKind(ctx *harness.Ctx) {
-	notifier := ntWorld(ctx)
-	before := ntEvent(1, "Standup", "ana@example.com", "bo@example.com")
-	ntNotify(ctx, nil, before) // revision 1 invited ana and bo
+	notifier := hNtWorld(ctx)
+	before := hNtEvent(1, "Standup", "ana@example.com", "bo@example.com")
+	hNtNotify(ctx, nil, before) // revision 1 invited ana and bo
 	notifier.mails = nil
-	sent := ntNotify(ctx, &before, ntEvent(2, "Standup (moved to room 4)", "ana@example.com", "bo@example.com", "cy@example.com"))
+	sent := hNtNotify(ctx, &before, hNtEvent(2, "Standup (moved to room 4)", "ana@example.com", "bo@example.com", "cy@example.com"))
 	for _, mail := range notifier.mails {
 		ctx.Assert(mail != "ana@example.com create", "ana, who already has the invitation, got a new one for a title fix: %v", notifier.mails)
 	}
-	ctx.Equal(ntMails(notifier), []string{"ana@example.com update", "bo@example.com update", "cy@example.com create"}, "after the invitations of revision 1, an update to ana and bo and an invitation to cy (each notification's token names revision 2); the mails")
+	ctx.Equal(hNtMails(notifier), []string{"ana@example.com update", "bo@example.com update", "cy@example.com create"}, "after the invitations of revision 1, an update to ana and bo and an invitation to cy (each notification's token names revision 2); the mails")
 	ctx.Equal(sent, 2, "notifyChange's count of notifications (update, create)")
 }
 
 func CheckRemovedCancel(ctx *harness.Ctx) {
-	notifier := ntWorld(ctx)
-	before := ntEvent(1, "Standup", "ana@example.com", "bo@example.com", "cy@example.com")
-	sent := ntNotify(ctx, &before, ntEvent(2, "Standup", "ana@example.com", "bo@example.com"))
+	notifier := hNtWorld(ctx)
+	before := hNtEvent(1, "Standup", "ana@example.com", "bo@example.com", "cy@example.com")
+	sent := hNtNotify(ctx, &before, hNtEvent(2, "Standup", "ana@example.com", "bo@example.com"))
 	var cy []string
 	for _, mail := range notifier.mails {
 		if strings.HasPrefix(mail, "cy@") {
@@ -1088,7 +1088,7 @@ func CheckRemovedCancel(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Equal(cy, []string{"cy@example.com cancel"}, "cy was taken off the event: without a cancel the meeting stays in cy's calendar; cy's mails")
-	ctx.Equal(ntMails(notifier), []string{"ana@example.com update", "bo@example.com update", "cy@example.com cancel"}, "updates to ana and bo and a cancel to cy; the mails")
+	ctx.Equal(hNtMails(notifier), []string{"ana@example.com update", "bo@example.com update", "cy@example.com cancel"}, "updates to ana and bo and a cancel to cy; the mails")
 	var kinds []string
 	for _, c := range ctx.GRPC.CallsTo("NotifyAttendees", "") {
 		req, _ := c.Request.(*pb.NotifyRequest)
@@ -1110,7 +1110,7 @@ func CheckRemovedCancel(ctx *harness.Ctx) {
 namespace {
 
 // Mails every attendee of a request once per token; drop_replies loses the reply after the mail went out.
-class NotifierPeer final : public calnotify::Notifier::Service {
+class HNotifierPeer final : public calnotify::Notifier::Service {
  public:
   std::vector<std::string> mails;
   std::set<std::string> tokens;
@@ -1134,31 +1134,31 @@ class NotifierPeer final : public calnotify::Notifier::Service {
   }
 };
 
-NotifierPeer* ntWorld(harness::Ctx& ctx) {
-  static NotifierPeer* notifier = nullptr;
+HNotifierPeer* hNtWorld(harness::Ctx& ctx) {
+  static HNotifierPeer* notifier = nullptr;
   delete notifier;
-  notifier = new NotifierPeer;
+  notifier = new HNotifierPeer;
   ctx.GRPC.Server("")->RegisterService(notifier);
   return notifier;
 }
 
-calendard::Event ntEvent(int64_t revision, const std::string& title, const std::vector<std::string>& attendees) {
+calendard::Event hNtEvent(int64_t revision, const std::string& title, const std::vector<std::string>& attendees) {
   return calendard::Event{"e-1", "c1", "t1", title, "FREQ=WEEKLY;COUNT=4", "2026-03-02T09:00:00Z", "2026-03-02T09:30:00Z", revision, attendees};
 }
 
-std::vector<std::string> ntMails(const NotifierPeer* n) {
+std::vector<std::string> hNtMails(const HNotifierPeer* n) {
   std::vector<std::string> mails = n->mails;
   std::sort(mails.begin(), mails.end());
   return mails;
 }
 
-calendard::Event ntEventWithId(const std::string& event_id) {
-  auto e = ntEvent(1, "Standup", {"ana@example.com", "bo@example.com"});
+calendard::Event hNtEventWithId(const std::string& event_id) {
+  auto e = hNtEvent(1, "Standup", {"ana@example.com", "bo@example.com"});
   e.event_id = event_id;
   return e;
 }
 
-std::vector<harness::Call> ntCallsFor(harness::Ctx& ctx, const std::string& event_id) {
+std::vector<harness::Call> hNtCallsFor(harness::Ctx& ctx, const std::string& event_id) {
   std::vector<harness::Call> calls;
   for (const auto& c : ctx.GRPC.CallsTo("NotifyAttendees")) {
     if (c.Request<calnotify::NotifyRequest>().event_id() == event_id) calls.push_back(c);
@@ -1169,10 +1169,10 @@ std::vector<harness::Call> ntCallsFor(harness::Ctx& ctx, const std::string& even
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  auto* notifier = ntWorld(ctx);
+  auto* notifier = hNtWorld(ctx);
   ctx.GRPC.SetLatency("NotifyAttendees", 2.0);
-  notifyChange(std::nullopt, ntEvent(1, "Standup", {"ana@example.com", "bo@example.com"}));
-  ctx.Equal(ntMails(notifier), {"ana@example.com create", "bo@example.com create"}, "a notifier that answers in 2 s must send one invitation each; the mails");
+  notifyChange(std::nullopt, hNtEvent(1, "Standup", {"ana@example.com", "bo@example.com"}));
+  ctx.Equal(hNtMails(notifier), {"ana@example.com create", "bo@example.com create"}, "a notifier that answers in 2 s must send one invitation each; the mails");
   const auto call = ctx.GRPC.CallsTo("NotifyAttendees")[0];
   ctx.Assert(call.HasDeadline(), "the NotifyAttendees call carries no deadline: a notifier that hangs holds the request worker with it");
   ctx.Assert(2.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 3.5, "the NotifyAttendees deadline is %vs, expected about 3 s", call.TimeoutSeconds());
@@ -1180,13 +1180,13 @@ void CheckDeadline(harness::Ctx& ctx) {
   notifier->drop_replies = 1;
   std::string error;
   try {
-    notifyChange(std::nullopt, ntEventWithId("e-2"));
+    notifyChange(std::nullopt, hNtEventWithId("e-2"));
   } catch (const std::exception& e) {
     error = e.what();
   }
   std::vector<double> timeouts;
   bool ok = error.empty();
-  for (const auto& c : ntCallsFor(ctx, "e-2")) {
+  for (const auto& c : hNtCallsFor(ctx, "e-2")) {
     timeouts.push_back(c.TimeoutSeconds());
     ok = ok && c.HasDeadline() && 2.5 <= c.TimeoutSeconds() && c.TimeoutSeconds() <= 3.5;
   }
@@ -1197,15 +1197,15 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckOneToken(harness::Ctx& ctx) {
-  auto* notifier = ntWorld(ctx);
+  auto* notifier = hNtWorld(ctx);
   notifier->drop_replies = 1;  // the attendees were mailed, the reply never came back
-  notifyChange(std::nullopt, ntEvent(1, "Standup", {"ana@example.com", "bo@example.com"}));
+  notifyChange(std::nullopt, hNtEvent(1, "Standup", {"ana@example.com", "bo@example.com"}));
   const auto calls = ctx.GRPC.CallsTo("NotifyAttendees");
   ctx.Equal(calls.size(), 2, "a lost reply is retried once; the calls");
   std::vector<std::string> tokens;
   for (const auto& c : calls) tokens.push_back(c.Request<calnotify::NotifyRequest>().idempotency_token());
   ctx.Equal(tokens, {"e-1:1:create", "e-1:1:create"}, "the attempts' tokens (the retry is the same notification)");
-  ctx.Equal(ntMails(notifier), {"ana@example.com create", "bo@example.com create"}, "the mails after a lost reply (a retry must not mail the attendees again)");
+  ctx.Equal(hNtMails(notifier), {"ana@example.com create", "bo@example.com create"}, "the mails after a lost reply (a retry must not mail the attendees again)");
   // Only UNAVAILABLE and DEADLINE_EXCEEDED are retried, at most 3 attempts in all.
   const std::vector<std::tuple<grpc::StatusCode, std::string, int>> cases = {
       {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT", 1}, {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED", 1}, {grpc::StatusCode::UNAVAILABLE, "UNAVAILABLE", 3}};
@@ -1214,39 +1214,39 @@ void CheckOneToken(harness::Ctx& ctx) {
     const std::string event_id = "e-" + std::to_string(n + 2);
     ctx.GRPC.Fail("NotifyAttendees", code, "", expected);
     try {
-      notifyChange(std::nullopt, ntEventWithId(event_id));
+      notifyChange(std::nullopt, hNtEventWithId(event_id));
     } catch (...) {
       // whether the failure reaches the caller is not this check's question
     }
-    const int made = static_cast<int>(ntCallsFor(ctx, event_id).size());
+    const int made = static_cast<int>(hNtCallsFor(ctx, event_id).size());
     ctx.Assert(made == expected, "a notifier failing %s got %d calls, expected %d: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, up to 3 attempts", name, made, expected);
   }
 }
 
 void CheckChangeKind(harness::Ctx& ctx) {
-  auto* notifier = ntWorld(ctx);
-  const auto before = ntEvent(1, "Standup", {"ana@example.com", "bo@example.com"});
+  auto* notifier = hNtWorld(ctx);
+  const auto before = hNtEvent(1, "Standup", {"ana@example.com", "bo@example.com"});
   notifyChange(std::nullopt, before);  // revision 1 invited ana and bo
   notifier->mails.clear();
-  const int sent = notifyChange(before, ntEvent(2, "Standup (moved to room 4)", {"ana@example.com", "bo@example.com", "cy@example.com"}));
+  const int sent = notifyChange(before, hNtEvent(2, "Standup (moved to room 4)", {"ana@example.com", "bo@example.com", "cy@example.com"}));
   for (const auto& mail : notifier->mails) {
     ctx.Assert(mail != "ana@example.com create", "ana, who already has the invitation, got a new one for a title fix: %v", notifier->mails);
   }
-  ctx.Equal(ntMails(notifier), {"ana@example.com update", "bo@example.com update", "cy@example.com create"},
+  ctx.Equal(hNtMails(notifier), {"ana@example.com update", "bo@example.com update", "cy@example.com create"},
             "after the invitations of revision 1, an update to ana and bo and an invitation to cy (each notification's token names revision 2); the mails");
   ctx.Equal(sent, 2, "notifyChange's count of notifications (update, create)");
 }
 
 void CheckRemovedCancel(harness::Ctx& ctx) {
-  auto* notifier = ntWorld(ctx);
-  const int sent = notifyChange(ntEvent(1, "Standup", {"ana@example.com", "bo@example.com", "cy@example.com"}),
-                                ntEvent(2, "Standup", {"ana@example.com", "bo@example.com"}));
+  auto* notifier = hNtWorld(ctx);
+  const int sent = notifyChange(hNtEvent(1, "Standup", {"ana@example.com", "bo@example.com", "cy@example.com"}),
+                                hNtEvent(2, "Standup", {"ana@example.com", "bo@example.com"}));
   std::vector<std::string> cy;
   for (const auto& mail : notifier->mails) {
     if (mail.rfind("cy@", 0) == 0) cy.push_back(mail);
   }
   ctx.Equal(cy, {"cy@example.com cancel"}, "cy was taken off the event: without a cancel the meeting stays in cy's calendar; cy's mails");
-  ctx.Equal(ntMails(notifier), {"ana@example.com update", "bo@example.com update", "cy@example.com cancel"}, "updates to ana and bo and a cancel to cy; the mails");
+  ctx.Equal(hNtMails(notifier), {"ana@example.com update", "bo@example.com update", "cy@example.com cancel"}, "updates to ana and bo and a cancel to cy; the mails");
   std::vector<std::string> kinds;
   for (const auto& c : ctx.GRPC.CallsTo("NotifyAttendees")) kinds.push_back(c.Request<calnotify::NotifyRequest>().kind());
   std::sort(kinds.begin(), kinds.end());

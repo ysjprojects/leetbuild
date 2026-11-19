@@ -895,30 +895,30 @@ import (
 	"cronsched/store"
 )
 
-const readDay int64 = 86400
+const kHReadDay int64 = 86400
 
-func readPut(ctx *harness.Ctx, id, expr, timezone, tenant string) {
+func hReadPut(ctx *harness.Ctx, id, expr, timezone, tenant string) {
 	s := &store.Schedule{ID: id, Tenant: tenant, Cron: expr, Timezone: timezone, JobRef: "billing.invoice", MisfirePolicy: "skip"}
 	ctx.NoError(store.Put(context.Background(), s), "storing the schedule")
 }
 
-func readRecord(ctx *harness.Ctx, id string, window int64, outcome, reason string) {
+func hReadRecord(ctx *harness.Ctx, id string, window int64, outcome, reason string) {
 	ctx.NoError(store.RecordRun(context.Background(), id, window, outcome, reason), "writing the ledger")
 }
 
-func readExpected(expr, timezone string) []int64 {
+func hReadExpected(expr, timezone string) []int64 {
 	now := time.Now().Unix()
 	spec, _ := cron.Parse(expr)
-	return cron.FiresBetween(spec, timezone, now-7*readDay, now)
+	return cron.FiresBetween(spec, timezone, now-7*kHReadDay, now)
 }
 
-func readClient(ctx *harness.Ctx) *harness.HTTP {
+func hReadClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-type readHistoryBody struct {
+type HReadHistoryBody struct {
 	ScheduleID string \`json:"schedule_id"\`
 	Rows       []struct {
 		Window  string \`json:"window"\`
@@ -928,16 +928,16 @@ type readHistoryBody struct {
 	Stalled *bool \`json:"stalled"\`
 }
 
-func readGet(ctx *harness.Ctx, c *harness.HTTP, id string) readHistoryBody {
+func hReadGet(ctx *harness.Ctx, c *harness.HTTP, id string) HReadHistoryBody {
 	r := c.Get("/v1/schedules/"+id+"/history", "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 200, "GET /v1/schedules/%s/history", id)
-	var body readHistoryBody
+	var body HReadHistoryBody
 	ctx.NoError(json.Unmarshal(r.Body, &body), "the answer must be JSON with schedule_id, rows and stalled")
 	ctx.Assert(body.Rows != nil && body.Stalled != nil, "the answer must carry a rows list and a stalled flag")
 	return body
 }
 
-func readRows(body readHistoryBody) []string {
+func hReadRows(body HReadHistoryBody) []string {
 	out := []string{}
 	for _, row := range body.Rows {
 		out = append(out, row.Window+" "+row.Outcome+"/"+row.Reason)
@@ -946,17 +946,17 @@ func readRows(body readHistoryBody) []string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	readPut(ctx, "s1", "0 * * * *", "UTC", "t1")
-	c := readClient(ctx)
-	body := readGet(ctx, c, "s1")
+	hReadPut(ctx, "s1", "0 * * * *", "UTC", "t1")
+	c := hReadClient(ctx)
+	body := hReadGet(ctx, c, "s1")
 	ctx.Equal(body.ScheduleID, "s1", "the answer's schedule_id")
 	r := c.Get("/v1/schedules/s1/history")
 	ctx.Equal(r.Status, 401, "a request without X-Tenant-Id")
 }
 
 func CheckTenant404(ctx *harness.Ctx) {
-	readPut(ctx, "s2", "0 * * * *", "UTC", "t2")
-	c := readClient(ctx)
+	hReadPut(ctx, "s2", "0 * * * *", "UTC", "t2")
+	c := hReadClient(ctx)
 	missing := c.Get("/v1/schedules/nope/history", "X-Tenant-Id", "t1")
 	ctx.Equal(missing.Status, 404, "an unknown schedule")
 	r := c.Get("/v1/schedules/s2/history", "X-Tenant-Id", "t1")
@@ -966,21 +966,21 @@ func CheckTenant404(ctx *harness.Ctx) {
 }
 
 func CheckMisfires(ctx *harness.Ctx) {
-	readPut(ctx, "s1", "0 * * * *", "UTC", "t1")
-	expected := readExpected("0 * * * *", "UTC")
+	hReadPut(ctx, "s1", "0 * * * *", "UTC", "t1")
+	expected := hReadExpected("0 * * * *", "UTC")
 	for _, w := range expected {
-		readRecord(ctx, "s1", w, "fired", "")
+		hReadRecord(ctx, "s1", w, "fired", "")
 	}
 	skipped := expected[len(expected)-20]
-	readRecord(ctx, "s1", skipped, "skipped", "policy_skip")
+	hReadRecord(ctx, "s1", skipped, "skipped", "policy_skip")
 	missing := []int64{expected[len(expected)-10], expected[len(expected)-5]}
 	for _, w := range missing {
 		ctx.Redis.Do("HDEL", "runs:s1", strconv.FormatInt(w, 10))
 	}
 	manual := expected[len(expected)-30] + 1800 // a recorded window off the hourly cron, at :30
-	readRecord(ctx, "s1", manual, "fired", "")
-	c := readClient(ctx)
-	rows := readRows(readGet(ctx, c, "s1"))
+	hReadRecord(ctx, "s1", manual, "fired", "")
+	c := hReadClient(ctx)
+	rows := hReadRows(hReadGet(ctx, c, "s1"))
 	ctx.Assert(len(rows) == len(expected)+1, "an hourly schedule's last 7 days list %d rows, expected one per expected window plus the recorded :30 window, %d: two windows have no ledger row and must still appear", len(rows), len(expected)+1)
 	want := []string{}
 	for _, w := range expected {
@@ -997,30 +997,30 @@ func CheckMisfires(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Equal(rows, want, "the rows (every expected window and the recorded :30 window, off the cron but in range, oldest first; the two without a ledger row as misfire/no_record)")
-	readPut(ctx, "s3", "0 9 * * *", "Asia/Tokyo", "t1")
+	hReadPut(ctx, "s3", "0 9 * * *", "Asia/Tokyo", "t1")
 	tokyo := []string{}
-	for _, w := range readExpected("0 9 * * *", "Asia/Tokyo") {
+	for _, w := range hReadExpected("0 9 * * *", "Asia/Tokyo") {
 		tokyo = append(tokyo, cron.FormatInstant(w)+" misfire/no_record")
 	}
-	ctx.Equal(readRows(readGet(ctx, c, "s3")), tokyo, "a daily 09:00 Asia/Tokyo schedule with no ledger rows must list a misfire at each 09:00 Tokyo (00:00Z); the rows")
+	ctx.Equal(hReadRows(hReadGet(ctx, c, "s3")), tokyo, "a daily 09:00 Asia/Tokyo schedule with no ledger rows must list a misfire at each 09:00 Tokyo (00:00Z); the rows")
 }
 
 func CheckHistoryWindow(ctx *harness.Ctx) {
 	// Now is the top of an hour: the hourly fire now - 7 days is in the history, the one at now is not yet.
 	ctx.Clock.Advance(float64(3600 - time.Now().Unix()%3600))
 	now := time.Now().Unix()
-	readPut(ctx, "s1", "0 * * * *", "UTC", "t1")
-	expected := readExpected("0 * * * *", "UTC")
-	ctx.Equal(expected[0], now-7*readDay, "harness: the first expected window (now - 7 days)")
+	hReadPut(ctx, "s1", "0 * * * *", "UTC", "t1")
+	expected := hReadExpected("0 * * * *", "UTC")
+	ctx.Equal(expected[0], now-7*kHReadDay, "harness: the first expected window (now - 7 days)")
 	for _, w := range append(append([]int64(nil), expected...), now) {
-		readRecord(ctx, "s1", w, "fired", "")
+		hReadRecord(ctx, "s1", w, "fired", "")
 	}
-	old := []int64{expected[0] - 3*readDay, expected[0] - readDay} // 10 and 8 days ago
+	old := []int64{expected[0] - 3*kHReadDay, expected[0] - kHReadDay} // 10 and 8 days ago
 	for _, w := range old {
-		readRecord(ctx, "s1", w, "fired", "")
+		hReadRecord(ctx, "s1", w, "fired", "")
 	}
 	listed := []string{}
-	for _, row := range readGet(ctx, readClient(ctx), "s1").Rows {
+	for _, row := range hReadGet(ctx, hReadClient(ctx), "s1").Rows {
 		listed = append(listed, row.Window)
 	}
 	has := func(w int64) bool {
@@ -1035,7 +1035,7 @@ func CheckHistoryWindow(ctx *harness.Ctx) {
 		ctx.Assert(!has(w), "the row for %s, older than 7 days, is listed: the history covers the last 7 days", cron.FormatInstant(w))
 	}
 	ctx.Assert(!has(now), "the window %s, which starts now, is listed: the history covers now - 7 days <= window < now", cron.FormatInstant(now))
-	ctx.Assert(has(now-7*readDay), "the window %s, exactly 7 days ago, is missing: the history covers now - 7 days <= window < now", cron.FormatInstant(now-7*readDay))
+	ctx.Assert(has(now-7*kHReadDay), "the window %s, exactly 7 days ago, is missing: the history covers now - 7 days <= window < now", cron.FormatInstant(now-7*kHReadDay))
 	want := []string{}
 	for _, w := range expected {
 		want = append(want, cron.FormatInstant(w))
@@ -1044,40 +1044,40 @@ func CheckHistoryWindow(ctx *harness.Ctx) {
 }
 
 func CheckStallFlag(ctx *harness.Ctx) {
-	c := readClient(ctx)
+	c := hReadClient(ctx)
 	hour := (time.Now().UTC().Hour() + 22) % 24
 	daily := fmt.Sprintf("0 %d * * *", hour) // fired about two hours ago
-	readPut(ctx, "d1", daily, "UTC", "t1")
-	for _, w := range readExpected(daily, "UTC") {
-		readRecord(ctx, "d1", w, "fired", "")
+	hReadPut(ctx, "d1", daily, "UTC", "t1")
+	for _, w := range hReadExpected(daily, "UTC") {
+		hReadRecord(ctx, "d1", w, "fired", "")
 	}
-	stalled := *readGet(ctx, c, "d1").Stalled
+	stalled := *hReadGet(ctx, c, "d1").Stalled
 	ctx.Assert(!stalled, "a daily schedule that fired at %02d:00 today answered stalled=true: two quiet hours are not a stall for a job that runs once a day", hour)
-	expected := readExpected("*/15 * * * *", "UTC")
+	expected := hReadExpected("*/15 * * * *", "UTC")
 	n := len(expected)
 	for _, id := range []string{"q1", "q2", "q3"} {
-		readPut(ctx, id, "*/15 * * * *", "UTC", "t1")
+		hReadPut(ctx, id, "*/15 * * * *", "UTC", "t1")
 	}
 	for _, w := range expected[:n-3] {
-		readRecord(ctx, "q1", w, "fired", "")
+		hReadRecord(ctx, "q1", w, "fired", "")
 	}
 	// q2 missed three windows a day ago and has run since, but not its last two.
 	for i, w := range expected[:n-2] {
 		if i < n-100 || i >= n-97 {
-			readRecord(ctx, "q2", w, "fired", "")
+			hReadRecord(ctx, "q2", w, "fired", "")
 		}
 	}
 	// q3 ran its last three windows, and they failed: an error is a row, not silence.
 	for i, w := range expected {
 		if i < n-3 {
-			readRecord(ctx, "q3", w, "fired", "")
+			hReadRecord(ctx, "q3", w, "fired", "")
 		} else {
-			readRecord(ctx, "q3", w, "error", "trigger_failed")
+			hReadRecord(ctx, "q3", w, "error", "trigger_failed")
 		}
 	}
-	ctx.Assert(*readGet(ctx, c, "q1").Stalled, "a quarter-hourly schedule whose last 3 windows have no row answered stalled=false, expected true")
-	ctx.Assert(!*readGet(ctx, c, "q2").Stalled, "a quarter-hourly schedule missing only its last 2 windows (and 3 windows a day ago) answered stalled=true, expected false: the stall is the newest 3 windows")
-	ctx.Assert(!*readGet(ctx, c, "q3").Stalled, "a quarter-hourly schedule whose last 3 windows each have an error row answered stalled=true, expected false: a stall is windows with no row at all")
+	ctx.Assert(*hReadGet(ctx, c, "q1").Stalled, "a quarter-hourly schedule whose last 3 windows have no row answered stalled=false, expected true")
+	ctx.Assert(!*hReadGet(ctx, c, "q2").Stalled, "a quarter-hourly schedule missing only its last 2 windows (and 3 windows a day ago) answered stalled=true, expected false: the stall is the newest 3 windows")
+	ctx.Assert(!*hReadGet(ctx, c, "q3").Stalled, "a quarter-hourly schedule whose last 3 windows each have an error row answered stalled=true, expected false: a stall is windows with no row at all")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1096,22 +1096,22 @@ func CheckStallFlag(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr int64_t kReadDay = 86400;
+constexpr int64_t kHReadDay = 86400;
 
-int64_t readClockNow() {
+int64_t hReadClockNow() {
   return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-void readPut(const std::string& id, const std::string& expr, const std::string& timezone = "UTC", const std::string& tenant = "t1") {
+void hReadPut(const std::string& id, const std::string& expr, const std::string& timezone = "UTC", const std::string& tenant = "t1") {
   cronsched::store::Put(cronsched::Schedule{id, tenant, expr, timezone, "billing.invoice", "skip", ""});
 }
 
-std::vector<int64_t> readExpected(const std::string& expr, const std::string& timezone = "UTC") {
-  const int64_t now = readClockNow();
-  return cronsched::cron::FiresBetween(*cronsched::cron::Parse(expr), timezone, now - 7 * kReadDay, now);
+std::vector<int64_t> hReadExpected(const std::string& expr, const std::string& timezone = "UTC") {
+  const int64_t now = hReadClockNow();
+  return cronsched::cron::FiresBetween(*cronsched::cron::Parse(expr), timezone, now - 7 * kHReadDay, now);
 }
 
-harness::HTTP readClient(harness::Ctx& ctx) {
+harness::HTTP hReadClient(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1119,7 +1119,7 @@ harness::HTTP readClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json readGet(harness::Ctx& ctx, harness::HTTP& c, const std::string& id) {
+nlohmann::json hReadGet(harness::Ctx& ctx, harness::HTTP& c, const std::string& id) {
   const auto r = c.Get("/v1/schedules/" + id + "/history", "X-Tenant-Id", "t1");
   ctx.Equal(r.Status, 200, "GET /v1/schedules/%s/history", id);
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
@@ -1128,7 +1128,7 @@ nlohmann::json readGet(harness::Ctx& ctx, harness::HTTP& c, const std::string& i
   return body;
 }
 
-std::vector<std::string> readRows(const nlohmann::json& body) {
+std::vector<std::string> hReadRows(const nlohmann::json& body) {
   std::vector<std::string> out;
   for (const auto& row : body["rows"]) {
     out.push_back(row.value("window", "") + " " + row.value("outcome", "") + "/" + row.value("reason", ""));
@@ -1139,17 +1139,17 @@ std::vector<std::string> readRows(const nlohmann::json& body) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  readPut("s1", "0 * * * *");
-  auto c = readClient(ctx);
-  const auto body = readGet(ctx, c, "s1");
+  hReadPut("s1", "0 * * * *");
+  auto c = hReadClient(ctx);
+  const auto body = hReadGet(ctx, c, "s1");
   ctx.Equal(body.value("schedule_id", ""), "s1", "the answer's schedule_id");
   const auto r = c.Get("/v1/schedules/s1/history");
   ctx.Equal(r.Status, 401, "a request without X-Tenant-Id");
 }
 
 void CheckTenant404(harness::Ctx& ctx) {
-  readPut("s2", "0 * * * *", "UTC", "t2");
-  auto c = readClient(ctx);
+  hReadPut("s2", "0 * * * *", "UTC", "t2");
+  auto c = hReadClient(ctx);
   const auto missing = c.Get("/v1/schedules/nope/history", "X-Tenant-Id", "t1");
   ctx.Equal(missing.Status, 404, "an unknown schedule");
   const auto r = c.Get("/v1/schedules/s2/history", "X-Tenant-Id", "t1");
@@ -1163,8 +1163,8 @@ void CheckTenant404(harness::Ctx& ctx) {
 }
 
 void CheckMisfires(harness::Ctx& ctx) {
-  readPut("s1", "0 * * * *");
-  const auto expected = readExpected("0 * * * *");
+  hReadPut("s1", "0 * * * *");
+  const auto expected = hReadExpected("0 * * * *");
   for (const int64_t w : expected) cronsched::store::RecordRun("s1", w, "fired", "");
   const int64_t skipped = expected[expected.size() - 20];
   cronsched::store::RecordRun("s1", skipped, "skipped", "policy_skip");
@@ -1172,8 +1172,8 @@ void CheckMisfires(harness::Ctx& ctx) {
   for (const int64_t w : missing) ctx.Redis.Do("HDEL", "runs:s1", std::to_string(w));
   const int64_t manual = expected[expected.size() - 30] + 1800;  // a recorded window off the hourly cron, at :30
   cronsched::store::RecordRun("s1", manual, "fired", "");
-  auto c = readClient(ctx);
-  const auto rows = readRows(readGet(ctx, c, "s1"));
+  auto c = hReadClient(ctx);
+  const auto rows = hReadRows(hReadGet(ctx, c, "s1"));
   ctx.Assert(rows.size() == expected.size() + 1,
              "an hourly schedule's last 7 days list %d rows, expected one per expected window plus the recorded :30 window, %d: two windows "
              "have no ledger row and must still appear",
@@ -1189,26 +1189,26 @@ void CheckMisfires(harness::Ctx& ctx) {
   ctx.Equal(rows, want,
             "the rows (every expected window and the recorded :30 window, off the cron but in range, oldest first; the two without a "
             "ledger row as misfire/no_record)");
-  readPut("s3", "0 9 * * *", "Asia/Tokyo");
+  hReadPut("s3", "0 9 * * *", "Asia/Tokyo");
   std::vector<std::string> tokyo;
-  for (const int64_t w : readExpected("0 9 * * *", "Asia/Tokyo")) tokyo.push_back(cronsched::cron::FormatInstant(w) + " misfire/no_record");
-  ctx.Equal(readRows(readGet(ctx, c, "s3")), tokyo,
+  for (const int64_t w : hReadExpected("0 9 * * *", "Asia/Tokyo")) tokyo.push_back(cronsched::cron::FormatInstant(w) + " misfire/no_record");
+  ctx.Equal(hReadRows(hReadGet(ctx, c, "s3")), tokyo,
             "a daily 09:00 Asia/Tokyo schedule with no ledger rows must list a misfire at each 09:00 Tokyo (00:00Z); the rows");
 }
 
 void CheckHistoryWindow(harness::Ctx& ctx) {
   // Now is the top of an hour: the hourly fire now - 7 days is in the history, the one at now is not yet.
-  ctx.Clock.Advance(static_cast<double>(3600 - readClockNow() % 3600));
-  const int64_t now = readClockNow();
-  readPut("s1", "0 * * * *");
-  const auto expected = readExpected("0 * * * *");
-  ctx.Equal(expected[0], now - 7 * kReadDay, "harness: the first expected window (now - 7 days)");
+  ctx.Clock.Advance(static_cast<double>(3600 - hReadClockNow() % 3600));
+  const int64_t now = hReadClockNow();
+  hReadPut("s1", "0 * * * *");
+  const auto expected = hReadExpected("0 * * * *");
+  ctx.Equal(expected[0], now - 7 * kHReadDay, "harness: the first expected window (now - 7 days)");
   for (const int64_t w : expected) cronsched::store::RecordRun("s1", w, "fired", "");
   cronsched::store::RecordRun("s1", now, "fired", "");
-  const std::vector<int64_t> old = {expected[0] - 3 * kReadDay, expected[0] - kReadDay};  // 10 and 8 days ago
+  const std::vector<int64_t> old = {expected[0] - 3 * kHReadDay, expected[0] - kHReadDay};  // 10 and 8 days ago
   for (const int64_t w : old) cronsched::store::RecordRun("s1", w, "fired", "");
-  auto c = readClient(ctx);
-  const auto body = readGet(ctx, c, "s1");
+  auto c = hReadClient(ctx);
+  const auto body = hReadGet(ctx, c, "s1");
   std::vector<std::string> listed;
   for (const auto& row : body["rows"]) listed.push_back(row.value("window", ""));
   for (const int64_t w : old) {
@@ -1217,25 +1217,25 @@ void CheckHistoryWindow(harness::Ctx& ctx) {
   }
   ctx.Assert(std::find(listed.begin(), listed.end(), cronsched::cron::FormatInstant(now)) == listed.end(),
              "the window %s, which starts now, is listed: the history covers now - 7 days <= window < now", cronsched::cron::FormatInstant(now));
-  ctx.Assert(std::find(listed.begin(), listed.end(), cronsched::cron::FormatInstant(now - 7 * kReadDay)) != listed.end(),
+  ctx.Assert(std::find(listed.begin(), listed.end(), cronsched::cron::FormatInstant(now - 7 * kHReadDay)) != listed.end(),
              "the window %s, exactly 7 days ago, is missing: the history covers now - 7 days <= window < now",
-             cronsched::cron::FormatInstant(now - 7 * kReadDay));
+             cronsched::cron::FormatInstant(now - 7 * kHReadDay));
   std::vector<std::string> want;
   for (const int64_t w : expected) want.push_back(cronsched::cron::FormatInstant(w));
   ctx.Equal(listed, want, "the history's rows (the windows of the last 7 days, oldest first)");
 }
 
 void CheckStallFlag(harness::Ctx& ctx) {
-  auto c = readClient(ctx);
-  const int hour = static_cast<int>(((readClockNow() % kReadDay) / 3600 + 22) % 24);
+  auto c = hReadClient(ctx);
+  const int hour = static_cast<int>(((hReadClockNow() % kHReadDay) / 3600 + 22) % 24);
   const std::string daily = "0 " + std::to_string(hour) + " * * *";  // fired about two hours ago
-  readPut("d1", daily);
-  for (const int64_t w : readExpected(daily)) cronsched::store::RecordRun("d1", w, "fired", "");
-  ctx.Assert(!readGet(ctx, c, "d1")["stalled"].get<bool>(),
+  hReadPut("d1", daily);
+  for (const int64_t w : hReadExpected(daily)) cronsched::store::RecordRun("d1", w, "fired", "");
+  ctx.Assert(!hReadGet(ctx, c, "d1")["stalled"].get<bool>(),
              "a daily schedule that fired at %d:00 today answered stalled=true: two quiet hours are not a stall for a job that runs once a day", hour);
-  const auto expected = readExpected("*/15 * * * *");
+  const auto expected = hReadExpected("*/15 * * * *");
   const size_t n = expected.size();
-  for (const std::string id : {"q1", "q2", "q3"}) readPut(id, "*/15 * * * *");
+  for (const std::string id : {"q1", "q2", "q3"}) hReadPut(id, "*/15 * * * *");
   for (size_t i = 0; i + 3 < n; i++) cronsched::store::RecordRun("q1", expected[i], "fired", "");
   // q2 missed three windows a day ago and has run since, but not its last two.
   for (size_t i = 0; i + 2 < n; i++) {
@@ -1250,11 +1250,11 @@ void CheckStallFlag(harness::Ctx& ctx) {
       cronsched::store::RecordRun("q3", expected[i], "error", "trigger_failed");
     }
   }
-  ctx.Assert(readGet(ctx, c, "q1")["stalled"].get<bool>(), "a quarter-hourly schedule whose last 3 windows have no row answered stalled=false, expected true");
-  ctx.Assert(!readGet(ctx, c, "q2")["stalled"].get<bool>(),
+  ctx.Assert(hReadGet(ctx, c, "q1")["stalled"].get<bool>(), "a quarter-hourly schedule whose last 3 windows have no row answered stalled=false, expected true");
+  ctx.Assert(!hReadGet(ctx, c, "q2")["stalled"].get<bool>(),
              "a quarter-hourly schedule missing only its last 2 windows (and 3 windows a day ago) answered stalled=true, expected false: the "
              "stall is the newest 3 windows");
-  ctx.Assert(!readGet(ctx, c, "q3")["stalled"].get<bool>(),
+  ctx.Assert(!hReadGet(ctx, c, "q3")["stalled"].get<bool>(),
              "a quarter-hourly schedule whose last 3 windows each have an error row answered stalled=true, expected false: a stall is windows "
              "with no row at all");
 }

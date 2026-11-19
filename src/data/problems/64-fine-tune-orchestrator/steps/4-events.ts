@@ -964,7 +964,7 @@ func CheckOutboxOnRefusal(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "finetune.job";
+const std::string kHEventsTopic = "finetune.job";
 const std::string kHarnessConfigHash = "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e";
 
 void harnessSeedJob(harness::Ctx& ctx, const std::string& job_id, const std::string& status) {
@@ -981,7 +981,7 @@ void harnessSettle(harness::Ctx& ctx) {
 
 std::vector<nlohmann::json> harnessEvents(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
-  for (const auto& value : ctx.Kafka.Values(kEventsTopic)) out.push_back(nlohmann::json::parse(value, nullptr, false));
+  for (const auto& value : ctx.Kafka.Values(kHEventsTopic)) out.push_back(nlohmann::json::parse(value, nullptr, false));
   return out;
 }
 
@@ -996,9 +996,9 @@ void CheckJobKey(harness::Ctx& ctx) {
   ctx.Assert(record_transition("job-8", "queued", "running"), "job-8 queued -> running must be accepted");
   ctx.Assert(record_transition("job-7", "running", "succeeded"), "job-7 running -> succeeded must be accepted");
   harnessSettle(ctx);
-  const auto records = ctx.Kafka.Records(kEventsTopic);
-  ctx.Equal(records.size(), 3, "three moves; records on %s", kEventsTopic);
-  auto keys = ctx.Kafka.Keys(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
+  ctx.Equal(records.size(), 3, "three moves; records on %s", kHEventsTopic);
+  auto keys = ctx.Kafka.Keys(kHEventsTopic);
   std::sort(keys.begin(), keys.end());
   ctx.Equal(keys, {"job-7", "job-7", "job-8"}, "events must be keyed by job id (keyed by team, a compacted topic keeps one job per team and the other jobs' final statuses are gone)");
   std::set<int> partitions;
@@ -1012,7 +1012,7 @@ void CheckReferencePayload(harness::Ctx& ctx) {
   harnessSeedJob(ctx, "job-7", "running");
   ctx.Assert(record_transition("job-7", "running", "succeeded"), "running -> succeeded must be accepted");
   harnessSettle(ctx);
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one move; records");
   const auto all = harnessEvents(ctx);
   ctx.Equal(all[0],
@@ -1025,7 +1025,7 @@ void CheckCommitBeforeProduce(harness::Ctx& ctx) {
   harnessSeedJob(ctx, "job-7", "cancelled");  // the team cancelled the run a second before the trainer reported success
   const bool moved = record_transition("job-7", "running", "succeeded");
   harnessSettle(ctx);
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "the store refused running -> succeeded for a cancelled job, yet the topic says %v: produce only after the commit; records", harnessEvents(ctx));
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 0, "the store refused running -> succeeded for a cancelled job, yet the topic says %v: produce only after the commit; records", harnessEvents(ctx));
   ctx.Assert(!moved, "record_transition must answer false when the store refuses the move");
   ctx.Equal(harnessStatusOf(ctx, "job-7"), "cancelled", "the job must stay cancelled");
   harnessSeedJob(ctx, "job-8", "running");
@@ -1052,15 +1052,15 @@ void CheckCommitBeforeProduce(harness::Ctx& ctx) {
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
   harnessSeedJob(ctx, "job-7", "running");
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
   record_transition("job-7", "running", "succeeded");
   harnessSettle(ctx);
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "one move whose acknowledgement was lost: the producer's retry must not write the event again (enable.idempotence with acks=all); the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "one move whose acknowledgement was lost: the producer's retry must not write the event again (enable.idempotence with acks=all); the records");
 }
 
 void CheckOutboxOnRefusal(harness::Ctx& ctx) {
   harnessSeedJob(ctx, "job-7", "running");
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   try {
     record_transition("job-7", "running", "succeeded");
   } catch (const std::exception& e) {
@@ -1073,12 +1073,12 @@ void CheckOutboxOnRefusal(harness::Ctx& ctx) {
   ctx.Assert(row.is_object() && row.value("job_id", "") == "job-7" && row.value("status", "") == "succeeded", "the outbox row must be the event itself, got %v", row);
   ctx.Assert(row.is_object() && row.value("config_hash", "") == kHarnessConfigHash && !row.contains("hyperparameters") && rows[0].find("learning_rate") == std::string::npos,
              "the outbox row carries the event's payload (config_hash, not the hyperparameters): %v", row);
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "nothing reached the topic for the refused produce; records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 0, "nothing reached the topic for the refused produce; records");
   ctx.Equal(harnessStatusOf(ctx, "job-7"), "succeeded", "the committed move stands; the job's status");
   harnessSeedJob(ctx, "job-8", "running");
   record_transition("job-8", "running", "succeeded");
   harnessSettle(ctx);
-  ctx.Assert(ctx.Kafka.Records(kEventsTopic).size() == 1 && ctx.Redis.LRange("ft:outbox", 0, -1).size() == 1, "a healthy produce after the refusal reaches the topic and adds no outbox row");
+  ctx.Assert(ctx.Kafka.Records(kHEventsTopic).size() == 1 && ctx.Redis.LRange("ft:outbox", 0, -1).size() == 1, "a healthy produce after the refusal reaches the topic and adds no outbox row");
 }
 `,
   },

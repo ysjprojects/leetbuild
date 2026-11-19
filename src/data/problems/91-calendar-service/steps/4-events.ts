@@ -698,9 +698,9 @@ import (
 	"calendard/store"
 )
 
-const evTopic = "calendar.event"
+const kHEvTopic = "calendar.event"
 
-func evEvent(n int, calendar string) *store.Event {
+func hEvEvent(n int, calendar string) *store.Event {
 	return &store.Event{
 		EventID: fmt.Sprintf("e-%d", n), CalendarID: calendar, Tenant: "t1", Title: "1:1 with Ana (performance review)",
 		Rrule: "FREQ=WEEKLY;COUNT=4", Dtstart: "2026-03-02T09:00:00Z", Dtend: "2026-03-02T09:30:00Z", Revision: 2,
@@ -708,22 +708,22 @@ func evEvent(n int, calendar string) *store.Event {
 	}
 }
 
-func evPublish(ctx *harness.Ctx, e *store.Event) bool {
+func hEvPublish(ctx *harness.Ctx, e *store.Event) bool {
 	ok, err := publishChange(context.Background(), e, "update")
 	ctx.NoError(err, "publishChange")
 	return ok
 }
 
-type evRow struct {
+type HEvRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func evOutbox(ctx *harness.Ctx) []evRow {
-	var rows []evRow
+func hEvOutbox(ctx *harness.Ctx) []HEvRow {
+	var rows []HEvRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row evRow
+		var row HEvRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -731,13 +731,13 @@ func evOutbox(ctx *harness.Ctx) []evRow {
 }
 
 func CheckCalendarKey(ctx *harness.Ctx) {
-	evPublish(ctx, evEvent(1, "c1"))
-	evPublish(ctx, evEvent(2, "c2"))
-	evPublish(ctx, evEvent(3, "c1"))
+	hEvPublish(ctx, hEvEvent(1, "c1"))
+	hEvPublish(ctx, hEvEvent(2, "c2"))
+	hEvPublish(ctx, hEvEvent(3, "c1"))
 	ctx.Settle()
-	records := ctx.Kafka.Records(evTopic)
+	records := ctx.Kafka.Records(kHEvTopic)
 	ctx.Equal(len(records), 3, "three publishChange calls must produce three records on calendar.event; the records")
-	keys := ctx.Kafka.Keys(evTopic)
+	keys := ctx.Kafka.Keys(kHEvTopic)
 	sorted := append([]string{}, keys...)
 	sort.Strings(sorted)
 	ctx.Equal(sorted, []string{"c1", "c1", "c2"}, "the records must be keyed by the calendar ids")
@@ -751,9 +751,9 @@ func CheckCalendarKey(ctx *harness.Ctx) {
 }
 
 func CheckIdsOnly(ctx *harness.Ctx) {
-	evPublish(ctx, evEvent(1, "c1"))
+	hEvPublish(ctx, hEvEvent(1, "c1"))
 	ctx.Settle()
-	values := ctx.Kafka.Values(evTopic)
+	values := ctx.Kafka.Values(kHEvTopic)
 	ctx.Equal(len(values), 1, "one publishChange must produce one record; the records")
 	var value map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the payload must be JSON")
@@ -762,23 +762,23 @@ func CheckIdsOnly(ctx *harness.Ctx) {
 }
 
 func CheckCommitThenPublish(ctx *harness.Ctx) {
-	probe := ctx.Redis.After("event:e-1", func() any { return len(ctx.Kafka.Records(evTopic)) })
-	evPublish(ctx, evEvent(1, "c1"))
+	probe := ctx.Redis.After("event:e-1", func() any { return len(ctx.Kafka.Records(kHEvTopic)) })
+	hEvPublish(ctx, hEvEvent(1, "c1"))
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "publishChange never committed the event (no write to event:e-1)")
 	ctx.Equal(probe.Result, 0, "when the event was committed the topic already held records: a change for a revision nobody can read yet is a phantom. Commit first, then produce; the records at commit time")
-	ctx.Equal(len(ctx.Kafka.Records(evTopic)), 1, "the change must still be produced after the commit; the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEvTopic)), 1, "the change must still be produced after the commit; the records")
 	// A commit that fails (event:e-5 holds a string: WRONGTYPE) announces nothing.
 	ctx.Redis.Set("event:e-5", "not a hash")
-	_, _ = publishChange(context.Background(), evEvent(5, "c1"), "update") // the failed commit reaching the caller is fine
+	_, _ = publishChange(context.Background(), hEvEvent(5, "c1"), "update") // the failed commit reaching the caller is fine
 	ctx.Settle()
 	var announced, queued []any
-	for _, text := range ctx.Kafka.Values(evTopic) {
+	for _, text := range ctx.Kafka.Values(kHEvTopic) {
 		var value map[string]any
 		_ = json.Unmarshal([]byte(text), &value)
 		announced = append(announced, value["event_id"])
 	}
-	for _, row := range evOutbox(ctx) {
+	for _, row := range hEvOutbox(ctx) {
 		queued = append(queued, row.Payload["event_id"])
 	}
 	for _, id := range append(append([]any{}, announced...), queued...) {
@@ -787,26 +787,26 @@ func CheckCommitThenPublish(ctx *harness.Ctx) {
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(evTopic, 1)
-	ok := evPublish(ctx, evEvent(1, "c1"))
+	ctx.Kafka.FailNext(kHEvTopic, 1)
+	ok := hEvPublish(ctx, hEvEvent(1, "c1"))
 	ctx.Settle()
-	rows := evOutbox(ctx)
+	rows := hEvOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the change never reaches a sync client; the rows")
-	ctx.Assert(rows[0].Topic == evTopic && rows[0].Key == "c1", "the outbox row is %v, expected the topic and the key c1", rows[0])
+	ctx.Assert(rows[0].Topic == kHEvTopic && rows[0].Key == "c1", "the outbox row is %v, expected the topic and the key c1", rows[0])
 	ctx.Equal(rows[0].Payload, map[string]any{"event_id": "e-1", "calendar_id": "c1", "revision": 2, "kind": "update"}, "the outbox row's payload")
 	ctx.Equal(ok, false, "publishChange's result after a failed delivery")
 	ctx.Equal(ctx.Redis.Exists("event:e-1"), 1, "the event must stay committed when only the produce failed")
 	// The broker acknowledges after 1.5 s: inside the window, so the change is on its way.
-	ctx.Kafka.StallFor(evTopic, 1.5)
-	ok = evPublish(ctx, evEvent(3, "c1"))
-	rows = evOutbox(ctx)
+	ctx.Kafka.StallFor(kHEvTopic, 1.5)
+	ok = hEvPublish(ctx, hEvEvent(3, "c1"))
+	rows = hEvOutbox(ctx)
 	ctx.Assert(ok && len(rows) == 1, "a broker that acknowledged after 1.5 s got publishChange returning %v and the outbox %v: the ack is awaited for 2 s", ok, rows)
-	ctx.Kafka.Stall(evTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEvTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = evPublish(ctx, evEvent(2, "c1"))
+	ok = hEvPublish(ctx, hEvEvent(2, "c1"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishChange waited %.1f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited)
-	rows = evOutbox(ctx)
+	rows = hEvOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["event_id"] == "e-2", "no acknowledgement within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishChange's result without an acknowledgement")
 }
@@ -822,14 +822,14 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEvTopic = "calendar.event";
+const std::string kHEvTopic = "calendar.event";
 
-calendard::Event evEvent(int n, const std::string& calendar = "c1") {
+calendard::Event hEvEvent(int n, const std::string& calendar = "c1") {
   return calendard::Event{"e-" + std::to_string(n), calendar, "t1", "1:1 with Ana (performance review)", "FREQ=WEEKLY;COUNT=4",
                           "2026-03-02T09:00:00Z", "2026-03-02T09:30:00Z", 2, {"ana@example.com", "bo@example.com"}};
 }
 
-std::vector<nlohmann::json> evOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEvOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -839,20 +839,20 @@ std::vector<nlohmann::json> evOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string evField(const nlohmann::json& j, const std::string& field) {
+std::string hEvField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckCalendarKey(harness::Ctx& ctx) {
-  publishChange(evEvent(1, "c1"), "update");
-  publishChange(evEvent(2, "c2"), "update");
-  publishChange(evEvent(3, "c1"), "update");
+  publishChange(hEvEvent(1, "c1"), "update");
+  publishChange(hEvEvent(2, "c2"), "update");
+  publishChange(hEvEvent(3, "c1"), "update");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEvTopic);
+  const auto records = ctx.Kafka.Records(kHEvTopic);
   ctx.Equal(records.size(), 3, "three publishChange calls must produce three records on calendar.event; the records");
-  const auto keys = ctx.Kafka.Keys(kEvTopic);
+  const auto keys = ctx.Kafka.Keys(kHEvTopic);
   auto sorted = keys;
   std::sort(sorted.begin(), sorted.end());
   ctx.Equal(sorted, {"c1", "c1", "c2"}, "the records must be keyed by the calendar ids");
@@ -865,9 +865,9 @@ void CheckCalendarKey(harness::Ctx& ctx) {
 }
 
 void CheckIdsOnly(harness::Ctx& ctx) {
-  publishChange(evEvent(1), "update");
+  publishChange(hEvEvent(1), "update");
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEvTopic);
+  const auto values = ctx.Kafka.Values(kHEvTopic);
   ctx.Equal(values.size(), 1, "one publishChange must produce one record; the records");
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
   ctx.Equal(value, nlohmann::json{{"event_id", "e-1"}, {"calendar_id", "c1"}, {"revision", 2}, {"kind", "update"}},
@@ -879,55 +879,55 @@ void CheckCommitThenPublish(harness::Ctx& ctx) {
   bool fired = false;
   ctx.Redis.After("event:e-1", [&] {
     fired = true;
-    atCommit = ctx.Kafka.Records(kEvTopic).size();
+    atCommit = ctx.Kafka.Records(kHEvTopic).size();
   });
-  publishChange(evEvent(1), "update");
+  publishChange(hEvEvent(1), "update");
   ctx.Settle();
   ctx.Assert(fired, "publishChange never committed the event (no write to event:e-1)");
   ctx.Equal(atCommit, 0,
             "when the event was committed the topic already held records: a change for a revision nobody can read yet is a "
             "phantom. Commit first, then produce; the records at commit time");
-  ctx.Equal(ctx.Kafka.Records(kEvTopic).size(), 1, "the change must still be produced after the commit; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEvTopic).size(), 1, "the change must still be produced after the commit; the records");
   // A commit that fails (event:e-5 holds a string: WRONGTYPE) announces nothing.
   ctx.Redis.Do("SET", "event:e-5", "not a hash");
   try {
-    publishChange(evEvent(5), "update");
+    publishChange(hEvEvent(5), "update");
   } catch (...) {
     // the failed commit reaching the caller is fine
   }
   ctx.Settle();
   std::vector<std::string> announced, queued;
-  for (const auto& text : ctx.Kafka.Values(kEvTopic)) announced.push_back(evField(nlohmann::json::parse(text, nullptr, false), "event_id"));
-  for (const auto& row : evOutbox(ctx)) queued.push_back(row.contains("payload") ? evField(row["payload"], "event_id") : "");
+  for (const auto& text : ctx.Kafka.Values(kHEvTopic)) announced.push_back(hEvField(nlohmann::json::parse(text, nullptr, false), "event_id"));
+  for (const auto& row : hEvOutbox(ctx)) queued.push_back(row.contains("payload") ? hEvField(row["payload"], "event_id") : "");
   ctx.Assert(std::find(announced.begin(), announced.end(), "e-5") == announced.end() && std::find(queued.begin(), queued.end(), "e-5") == queued.end(),
              "the commit of e-5 failed and its change went out anyway (topic: %v, outbox: %v): a change for a revision nobody can read is a phantom",
              announced, queued);
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEvTopic, 1);
-  bool ok = publishChange(evEvent(1), "update");
+  ctx.Kafka.FailNext(kHEvTopic, 1);
+  bool ok = publishChange(hEvEvent(1), "update");
   ctx.Settle();
-  auto rows = evOutbox(ctx);
+  auto rows = hEvOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the change never reaches a sync client; the rows");
-  ctx.Assert(evField(rows[0], "topic") == kEvTopic && evField(rows[0], "key") == "c1", "the outbox row is %s, expected the topic and the key c1", rows[0].dump());
+  ctx.Assert(hEvField(rows[0], "topic") == kHEvTopic && hEvField(rows[0], "key") == "c1", "the outbox row is %s, expected the topic and the key c1", rows[0].dump());
   ctx.Equal(rows[0].value("payload", nlohmann::json()), nlohmann::json{{"event_id", "e-1"}, {"calendar_id", "c1"}, {"revision", 2}, {"kind", "update"}},
             "the outbox row's payload");
   ctx.Equal(ok, false, "publishChange's result after a failed delivery");
   ctx.Equal(ctx.Redis.Exists("event:e-1"), 1, "the event must stay committed when only the produce failed");
   // The broker acknowledges after 1.5 s: inside the window, so the change is on its way.
-  ctx.Kafka.StallFor(kEvTopic, 1.5);
-  ok = publishChange(evEvent(3), "update");
-  rows = evOutbox(ctx);
+  ctx.Kafka.StallFor(kHEvTopic, 1.5);
+  ok = publishChange(hEvEvent(3), "update");
+  rows = hEvOutbox(ctx);
   ctx.Assert(ok && rows.size() == 1, "a broker that acknowledged after 1.5 s got publishChange returning %v and %d outbox rows: the ack is awaited for 2 s", ok,
              rows.size());
-  ctx.Kafka.Stall(kEvTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEvTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publishChange(evEvent(2), "update");
+  ok = publishChange(hEvEvent(2), "update");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publishChange waited %.1f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited);
-  rows = evOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && evField(rows[1]["payload"], "event_id") == "e-2",
+  rows = hEvOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hEvField(rows[1]["payload"], "event_id") == "e-2",
              "no acknowledgement within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishChange's result without an acknowledgement");
 }

@@ -956,14 +956,14 @@ import (
 	"leetbuild/harness"
 )
 
-const stateKey = "refunded:pay_1"
+const kHStateKey = "refunded:pay_1"
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func stateHeld(ctx *harness.Ctx) (int64, map[string]int64) {
+func hStateHeld(ctx *harness.Ctx) (int64, map[string]int64) {
 	fields := map[string]int64{}
 	var total int64
-	for name, value := range ctx.Redis.HGetAll(stateKey) {
+	for name, value := range ctx.Redis.HGetAll(kHStateKey) {
 		n, _ := strconv.ParseInt(value, 10, 64)
 		if name == "total" {
 			total = n
@@ -974,7 +974,7 @@ func stateHeld(ctx *harness.Ctx) (int64, map[string]int64) {
 	return total, fields
 }
 
-func stateSum(fields map[string]int64) int64 {
+func hStateSum(fields map[string]int64) int64 {
 	var s int64
 	for _, v := range fields {
 		s += v
@@ -982,89 +982,89 @@ func stateSum(fields map[string]int64) int64 {
 	return s
 }
 
-// stateOtherClaim is another server's claim as the contract's script makes it: it cannot interleave with itself.
-func stateOtherClaim(ctx *harness.Ctx, refundID string, amount, limit int64) bool {
-	raw, _ := ctx.Redis.HGet(stateKey, "total")
+// hStateOtherClaim is another server's claim as the contract's script makes it: it cannot interleave with itself.
+func hStateOtherClaim(ctx *harness.Ctx, refundID string, amount, limit int64) bool {
+	raw, _ := ctx.Redis.HGet(kHStateKey, "total")
 	total, _ := strconv.ParseInt(raw, 10, 64)
-	if _, exists := ctx.Redis.HGet(stateKey, refundID); exists || total+amount > limit {
+	if _, exists := ctx.Redis.HGet(kHStateKey, refundID); exists || total+amount > limit {
 		return false
 	}
-	ctx.Redis.Do("HSET", stateKey, refundID, amount)
-	ctx.Redis.Do("HINCRBY", stateKey, "total", amount)
+	ctx.Redis.Do("HSET", kHStateKey, refundID, amount)
+	ctx.Redis.Do("HINCRBY", kHStateKey, "total", amount)
 	return true
 }
 
-func stateOtherRelease(ctx *harness.Ctx, refundID string) {
-	raw, exists := ctx.Redis.HGet(stateKey, refundID)
+func hStateOtherRelease(ctx *harness.Ctx, refundID string) {
+	raw, exists := ctx.Redis.HGet(kHStateKey, refundID)
 	if !exists {
 		return
 	}
 	amount, _ := strconv.ParseInt(raw, 10, 64)
-	ctx.Redis.Do("HDEL", stateKey, refundID)
-	ctx.Redis.Do("HINCRBY", stateKey, "total", -amount)
+	ctx.Redis.Do("HDEL", kHStateKey, refundID)
+	ctx.Redis.Do("HINCRBY", kHStateKey, "total", -amount)
 }
 
-func stateClaim(ctx *harness.Ctx, refundID string, amount int64) ClaimResult {
-	got, err := claim(stateBg, "pay_1", refundID, amount, 10000)
+func hStateClaim(ctx *harness.Ctx, refundID string, amount int64) ClaimResult {
+	got, err := claim(hStateBg, "pay_1", refundID, amount, 10000)
 	ctx.NoError(err, "claim(pay_1, %s, %d, 10000)", refundID, amount)
 	return got
 }
 
 func CheckAtomic(ctx *harness.Ctx) {
-	ctx.Equal(stateClaim(ctx, "rf-1", 6000), ClaimResult{Accepted: true, RefundedMinor: 6000, RemainingMinor: 4000}, "claiming 6000 of 10000")
-	ctx.Equal(stateClaim(ctx, "rf-2", 5000), ClaimResult{Accepted: false, RefundedMinor: 6000, RemainingMinor: 4000}, "claiming 5000 more")
-	total, fields := stateHeld(ctx)
+	ctx.Equal(hStateClaim(ctx, "rf-1", 6000), ClaimResult{Accepted: true, RefundedMinor: 6000, RemainingMinor: 4000}, "claiming 6000 of 10000")
+	ctx.Equal(hStateClaim(ctx, "rf-2", 5000), ClaimResult{Accepted: false, RefundedMinor: 6000, RemainingMinor: 4000}, "claiming 5000 more")
+	total, fields := hStateHeld(ctx)
 	ctx.Assert(total == 6000 && len(fields) == 1 && fields["rf-1"] == 6000, "a refused claim of rf-2 left total %d over %v, expected 6000 over rf-1: a refusal writes nothing", total, fields)
-	ctx.Redis.Del(stateKey)
-	probe := ctx.Redis.After(stateKey, func() any { return stateOtherClaim(ctx, "rf-9", 6000, 10000) })
-	stateClaim(ctx, "rf-1", 6000)
+	ctx.Redis.Del(kHStateKey)
+	probe := ctx.Redis.After(kHStateKey, func() any { return hStateOtherClaim(ctx, "rf-9", 6000, 10000) })
+	hStateClaim(ctx, "rf-1", 6000)
 	ctx.Assert(probe.Fired, "claim sent no command touching refunded:pay_1")
-	total, fields = stateHeld(ctx)
-	ctx.Assert(total <= 10000 && total == stateSum(fields), "another server claimed 6000 between claim's read and its write: refunded:pay_1 holds total %d over %v on a 10000 payment. Read, compare and add inside one script", total, fields)
-	ctx.Redis.Del(stateKey)
-	ctx.Redis.Do("HSET", stateKey, "total", 7000, "rf-1", 3000, "rf-2", 4000)
-	ctx.Redis.After(stateKey, func() any { stateOtherRelease(ctx, "rf-2"); return nil })
-	_, err := release(stateBg, "pay_1", "rf-2")
+	total, fields = hStateHeld(ctx)
+	ctx.Assert(total <= 10000 && total == hStateSum(fields), "another server claimed 6000 between claim's read and its write: refunded:pay_1 holds total %d over %v on a 10000 payment. Read, compare and add inside one script", total, fields)
+	ctx.Redis.Del(kHStateKey)
+	ctx.Redis.Do("HSET", kHStateKey, "total", 7000, "rf-1", 3000, "rf-2", 4000)
+	ctx.Redis.After(kHStateKey, func() any { hStateOtherRelease(ctx, "rf-2"); return nil })
+	_, err := release(hStateBg, "pay_1", "rf-2")
 	ctx.NoError(err, "release(pay_1, rf-2)")
-	total, fields = stateHeld(ctx)
+	total, fields = hStateHeld(ctx)
 	ctx.Assert(total == 3000 && len(fields) == 1 && fields["rf-1"] == 3000, "a release of rf-2 retried on another server landed inside release: refunded:pay_1 holds total %d over %v, expected 3000 over rf-1. Release inside one script", total, fields)
 }
 
 func CheckClaimOnce(ctx *harness.Ctx) {
-	stateClaim(ctx, "rf-1", 3000)
-	again := stateClaim(ctx, "rf-1", 3000)
-	total, fields := stateHeld(ctx)
+	hStateClaim(ctx, "rf-1", 3000)
+	again := hStateClaim(ctx, "rf-1", 3000)
+	total, fields := hStateHeld(ctx)
 	ctx.Assert(again.Accepted && again.RefundedMinor == 3000 && again.RemainingMinor == 7000 && total == 3000, "a claim retried for rf-1 answered %+v and left total %d over %v, expected accepted, 3000, 7000: the refund already holds its amount", again, total, fields)
-	ctx.Equal(stateClaim(ctx, "rf-2", 7000), ClaimResult{Accepted: true, RefundedMinor: 10000, RemainingMinor: 0}, "with rf-1 counted once, 7000 more fits exactly; the claim")
-	ctx.Equal(stateClaim(ctx, "rf-2", 7000), ClaimResult{Accepted: true, RefundedMinor: 10000, RemainingMinor: 0}, "a claim retried for rf-2 once the payment is fully claimed (the refund already holds its amount, whatever room is left)")
-	release(stateBg, "pay_1", "rf-2")
-	left, err := release(stateBg, "pay_1", "rf-2")
+	ctx.Equal(hStateClaim(ctx, "rf-2", 7000), ClaimResult{Accepted: true, RefundedMinor: 10000, RemainingMinor: 0}, "with rf-1 counted once, 7000 more fits exactly; the claim")
+	ctx.Equal(hStateClaim(ctx, "rf-2", 7000), ClaimResult{Accepted: true, RefundedMinor: 10000, RemainingMinor: 0}, "a claim retried for rf-2 once the payment is fully claimed (the refund already holds its amount, whatever room is left)")
+	release(hStateBg, "pay_1", "rf-2")
+	left, err := release(hStateBg, "pay_1", "rf-2")
 	ctx.NoError(err, "release(pay_1, rf-2)")
 	ctx.Equal(left, 3000, "releasing rf-2 twice must take it off once; the total left")
 }
 
 func CheckNoTtl(ctx *harness.Ctx) {
-	stateClaim(ctx, "rf-1", 10000)
-	ttl := ctx.Redis.TTL(stateKey)
+	hStateClaim(ctx, "rf-1", 10000)
+	ttl := ctx.Redis.TTL(kHStateKey)
 	ctx.Equal(ttl, -1, "refunded:pay_1 must have no TTL (a cap that expires lets a fully refunded payment refund again); the TTL")
 	ctx.Clock.Advance(31 * 86400)
-	ctx.Equal(stateClaim(ctx, "rf-2", 1000).Accepted, false, "31 days after a full refund the payment must refuse 1000 more; accepted")
+	ctx.Equal(hStateClaim(ctx, "rf-2", 1000).Accepted, false, "31 days after a full refund the payment must refuse 1000 more; accepted")
 }
 
 func CheckRebuild(ctx *harness.Ctx) {
-	records.AddPayment(stateBg, "pay_1", "t1", 10000)
-	records.InsertRefund(stateBg, "rf-1", "t1", "pay_1", 3000, "damaged", "")
-	records.InsertRefund(stateBg, "rf-2", "t1", "pay_1", 5000, "damaged", "")
-	records.InsertRefund(stateBg, "rf-3", "t1", "pay_1", 1000, "damaged", "")
-	records.MarkConfirmed(stateBg, "rf-1", "re_1")
-	records.MarkRejected(stateBg, "rf-2")
-	ctx.Redis.Do("HSET", stateKey, "total", 9999, "rf-stale", 9999)
-	written, err := rebuild(stateBg, "pay_1")
+	records.AddPayment(hStateBg, "pay_1", "t1", 10000)
+	records.InsertRefund(hStateBg, "rf-1", "t1", "pay_1", 3000, "damaged", "")
+	records.InsertRefund(hStateBg, "rf-2", "t1", "pay_1", 5000, "damaged", "")
+	records.InsertRefund(hStateBg, "rf-3", "t1", "pay_1", 1000, "damaged", "")
+	records.MarkConfirmed(hStateBg, "rf-1", "re_1")
+	records.MarkRejected(hStateBg, "rf-2")
+	ctx.Redis.Do("HSET", kHStateKey, "total", 9999, "rf-stale", 9999)
+	written, err := rebuild(hStateBg, "pay_1")
 	ctx.NoError(err, "rebuild(pay_1)")
-	total, fields := stateHeld(ctx)
+	total, fields := hStateHeld(ctx)
 	ctx.Assert(total == 4000 && len(fields) == 2 && fields["rf-1"] == 3000 && fields["rf-3"] == 1000, "rebuild wrote total %d over %v, expected 4000 over rf-1 and rf-3: a REJECTED refund holds nothing and a field no record backs goes", total, fields)
 	ctx.Equal(written, 4000, "rebuild's result (the total it wrote)")
-	got := stateClaim(ctx, "rf-4", 6000)
+	got := hStateClaim(ctx, "rf-4", 6000)
 	ctx.Assert(got.Accepted && got.RemainingMinor == 0, "after the rebuild 6000 more must fit a 10000 payment holding 4000; the claim answered %+v", got)
 }
 `,
@@ -1077,47 +1077,47 @@ func CheckRebuild(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kStateKey = "refunded:pay_1";
+const std::string kHStateKey = "refunded:pay_1";
 
-std::pair<long long, std::map<std::string, long long>> stateHeld(harness::Ctx& ctx) {
+std::pair<long long, std::map<std::string, long long>> hStateHeld(harness::Ctx& ctx) {
   long long total = 0;
   std::map<std::string, long long> fields;
-  for (const auto& [name, value] : ctx.Redis.HGetAll(kStateKey)) {
+  for (const auto& [name, value] : ctx.Redis.HGetAll(kHStateKey)) {
     if (name == "total") total = std::stoll(value);
     else fields[name] = std::stoll(value);
   }
   return {total, fields};
 }
 
-long long stateSum(const std::map<std::string, long long>& fields) {
+long long hStateSum(const std::map<std::string, long long>& fields) {
   long long s = 0;
   for (const auto& [name, value] : fields) s += value;
   return s;
 }
 
-std::string stateText(const std::map<std::string, long long>& fields) {
+std::string hStateText(const std::map<std::string, long long>& fields) {
   std::string out;
   for (const auto& [name, value] : fields) out += (out.empty() ? "" : ", ") + name + "=" + std::to_string(value);
   return "{" + out + "}";
 }
 
 // Another server's claim as the contract's script makes it: it cannot interleave with itself.
-void stateOtherClaim(harness::Ctx& ctx, const std::string& refund_id, long long amount, long long limit) {
-  const auto raw = ctx.Redis.HGet(kStateKey, "total");
+void hStateOtherClaim(harness::Ctx& ctx, const std::string& refund_id, long long amount, long long limit) {
+  const auto raw = ctx.Redis.HGet(kHStateKey, "total");
   const long long total = raw ? std::stoll(*raw) : 0;
-  if (ctx.Redis.HGet(kStateKey, refund_id) || total + amount > limit) return;
-  ctx.Redis.Do("HSET", kStateKey, refund_id, amount);
-  ctx.Redis.Do("HINCRBY", kStateKey, "total", amount);
+  if (ctx.Redis.HGet(kHStateKey, refund_id) || total + amount > limit) return;
+  ctx.Redis.Do("HSET", kHStateKey, refund_id, amount);
+  ctx.Redis.Do("HINCRBY", kHStateKey, "total", amount);
 }
 
-void stateOtherRelease(harness::Ctx& ctx, const std::string& refund_id) {
-  const auto amount = ctx.Redis.HGet(kStateKey, refund_id);
+void hStateOtherRelease(harness::Ctx& ctx, const std::string& refund_id) {
+  const auto amount = ctx.Redis.HGet(kHStateKey, refund_id);
   if (!amount) return;
-  ctx.Redis.Do("HDEL", kStateKey, refund_id);
-  ctx.Redis.Do("HINCRBY", kStateKey, "total", -std::stoll(*amount));
+  ctx.Redis.Do("HDEL", kHStateKey, refund_id);
+  ctx.Redis.Do("HINCRBY", kHStateKey, "total", -std::stoll(*amount));
 }
 
-bool sameClaim(const ClaimResult& got, bool accepted, long long refunded, long long remaining) {
+bool hSameClaim(const ClaimResult& got, bool accepted, long long refunded, long long remaining) {
   return got.accepted == accepted && got.refunded_minor == refunded && got.remaining_minor == remaining;
 }
 
@@ -1125,47 +1125,47 @@ bool sameClaim(const ClaimResult& got, bool accepted, long long refunded, long l
 
 void CheckAtomic(harness::Ctx& ctx) {
   ClaimResult got = claim("pay_1", "rf-1", 6000, 10000);
-  ctx.Assert(sameClaim(got, true, 6000, 4000), "claiming 6000 of 10000 answered (%t, %d, %d), expected (true, 6000, 4000)", got.accepted, got.refunded_minor, got.remaining_minor);
+  ctx.Assert(hSameClaim(got, true, 6000, 4000), "claiming 6000 of 10000 answered (%t, %d, %d), expected (true, 6000, 4000)", got.accepted, got.refunded_minor, got.remaining_minor);
   got = claim("pay_1", "rf-2", 5000, 10000);
-  ctx.Assert(sameClaim(got, false, 6000, 4000), "claiming 5000 more answered (%t, %d, %d), expected (false, 6000, 4000)", got.accepted, got.refunded_minor, got.remaining_minor);
+  ctx.Assert(hSameClaim(got, false, 6000, 4000), "claiming 5000 more answered (%t, %d, %d), expected (false, 6000, 4000)", got.accepted, got.refunded_minor, got.remaining_minor);
   {
-    const auto [refused_total, refused_fields] = stateHeld(ctx);
+    const auto [refused_total, refused_fields] = hStateHeld(ctx);
     ctx.Assert(refused_total == 6000 && refused_fields.size() == 1 && refused_fields.count("rf-1"),
-               "a refused claim of rf-2 left total %d over %s, expected 6000 over rf-1: a refusal writes nothing", refused_total, stateText(refused_fields));
+               "a refused claim of rf-2 left total %d over %s, expected 6000 over rf-1: a refusal writes nothing", refused_total, hStateText(refused_fields));
   }
-  ctx.Redis.Do("DEL", kStateKey);
+  ctx.Redis.Do("DEL", kHStateKey);
   bool fired = false;
-  ctx.Redis.After(kStateKey, [&] {
+  ctx.Redis.After(kHStateKey, [&] {
     fired = true;
-    stateOtherClaim(ctx, "rf-9", 6000, 10000);
+    hStateOtherClaim(ctx, "rf-9", 6000, 10000);
   });
   claim("pay_1", "rf-1", 6000, 10000);
   ctx.Assert(fired, "claim sent no command touching refunded:pay_1");
-  auto [total, fields] = stateHeld(ctx);
-  ctx.Assert(total <= 10000 && total == stateSum(fields),
+  auto [total, fields] = hStateHeld(ctx);
+  ctx.Assert(total <= 10000 && total == hStateSum(fields),
              "another server claimed 6000 between claim's read and its write: refunded:pay_1 holds total %d over %s on a 10000 payment. Read, compare and add inside one script",
-             total, stateText(fields));
-  ctx.Redis.Do("DEL", kStateKey);
-  ctx.Redis.Do("HSET", kStateKey, "total", 7000, "rf-1", 3000, "rf-2", 4000);
-  ctx.Redis.After(kStateKey, [&] { stateOtherRelease(ctx, "rf-2"); });
+             total, hStateText(fields));
+  ctx.Redis.Do("DEL", kHStateKey);
+  ctx.Redis.Do("HSET", kHStateKey, "total", 7000, "rf-1", 3000, "rf-2", 4000);
+  ctx.Redis.After(kHStateKey, [&] { hStateOtherRelease(ctx, "rf-2"); });
   release("pay_1", "rf-2");
-  const auto [after, left] = stateHeld(ctx);
+  const auto [after, left] = hStateHeld(ctx);
   ctx.Assert(after == 3000 && left.size() == 1 && left.count("rf-1"),
              "a release of rf-2 retried on another server landed inside release: refunded:pay_1 holds total %d over %s, expected 3000 over rf-1. Release inside one script",
-             after, stateText(left));
+             after, hStateText(left));
 }
 
 void CheckClaimOnce(harness::Ctx& ctx) {
   claim("pay_1", "rf-1", 3000, 10000);
   const ClaimResult again = claim("pay_1", "rf-1", 3000, 10000);
-  const auto [total, fields] = stateHeld(ctx);
-  ctx.Assert(sameClaim(again, true, 3000, 7000) && total == 3000,
+  const auto [total, fields] = hStateHeld(ctx);
+  ctx.Assert(hSameClaim(again, true, 3000, 7000) && total == 3000,
              "a claim retried for rf-1 answered (%t, %d, %d) and left total %d over %s, expected (true, 3000, 7000): the refund already holds its amount",
-             again.accepted, again.refunded_minor, again.remaining_minor, total, stateText(fields));
+             again.accepted, again.refunded_minor, again.remaining_minor, total, hStateText(fields));
   const ClaimResult got = claim("pay_1", "rf-2", 7000, 10000);
-  ctx.Assert(sameClaim(got, true, 10000, 0), "with rf-1 counted once, 7000 more fits exactly; the claim answered (%t, %d, %d)", got.accepted, got.refunded_minor, got.remaining_minor);
+  ctx.Assert(hSameClaim(got, true, 10000, 0), "with rf-1 counted once, 7000 more fits exactly; the claim answered (%t, %d, %d)", got.accepted, got.refunded_minor, got.remaining_minor);
   const ClaimResult retried = claim("pay_1", "rf-2", 7000, 10000);
-  ctx.Assert(sameClaim(retried, true, 10000, 0),
+  ctx.Assert(hSameClaim(retried, true, 10000, 0),
              "a claim retried for rf-2 once the payment is fully claimed answered (%t, %d, %d), expected (true, 10000, 0): the refund already holds its amount, whatever room is left",
              retried.accepted, retried.refunded_minor, retried.remaining_minor);
   release("pay_1", "rf-2");
@@ -1174,7 +1174,7 @@ void CheckClaimOnce(harness::Ctx& ctx) {
 
 void CheckNoTtl(harness::Ctx& ctx) {
   claim("pay_1", "rf-1", 10000, 10000);
-  ctx.Equal(ctx.Redis.TTL(kStateKey), -1, "refunded:pay_1 must have no TTL (a cap that expires lets a fully refunded payment refund again); the TTL");
+  ctx.Equal(ctx.Redis.TTL(kHStateKey), -1, "refunded:pay_1 must have no TTL (a cap that expires lets a fully refunded payment refund again); the TTL");
   ctx.Clock.Advance(31 * 86400);
   ctx.Equal(claim("pay_1", "rf-2", 1000, 10000).accepted, false, "31 days after a full refund the payment must refuse 1000 more; accepted");
 }
@@ -1186,12 +1186,12 @@ void CheckRebuild(harness::Ctx& ctx) {
   records::insertRefund("rf-3", "t1", "pay_1", 1000, "damaged", "");
   records::markConfirmed("rf-1", "re_1");
   records::markRejected("rf-2");
-  ctx.Redis.Do("HSET", kStateKey, "total", 9999, "rf-stale", 9999);
+  ctx.Redis.Do("HSET", kHStateKey, "total", 9999, "rf-stale", 9999);
   const long long written = rebuild("pay_1");
-  const auto [total, fields] = stateHeld(ctx);
+  const auto [total, fields] = hStateHeld(ctx);
   ctx.Assert(total == 4000 && fields.size() == 2 && fields.count("rf-1") && fields.at("rf-1") == 3000 && fields.count("rf-3"),
              "rebuild wrote total %d over %s, expected 4000 over rf-1 and rf-3: a REJECTED refund holds nothing and a field no record backs goes",
-             total, stateText(fields));
+             total, hStateText(fields));
   ctx.Equal(written, 4000, "rebuild's result (the total it wrote)");
   const ClaimResult got = claim("pay_1", "rf-4", 6000, 10000);
   ctx.Assert(got.accepted && got.remaining_minor == 0, "after the rebuild 6000 more must fit a 10000 payment holding 4000");

@@ -726,33 +726,33 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "workflow.step"
+const kHEventsTopic = "workflow.step"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-var eventsExpected = map[string]any{"run_id": "r1", "workflow": "signup", "step": "send_welcome", "effect_id": "r1:send_welcome", "outcome": "started"}
+var hEventsExpected = map[string]any{"run_id": "r1", "workflow": "signup", "step": "send_welcome", "effect_id": "r1:send_welcome", "outcome": "started"}
 
-func eventsRun(runID string) *runs.Run {
+func hEventsRun(runID string) *runs.Run {
 	return &runs.Run{
 		RunID: runID, Tenant: "t1", Workflow: "signup", DefinitionVersion: 3, PinnedSteps: []string{"create_account", "send_welcome"},
 		Input: map[string]any{"email": "ada@example.com"}, MaxSteps: 50, StartedAt: 1000,
 	}
 }
 
-func eventsPublish(runID, step, outcome string) (bool, error) {
-	return publishStep(eventsBg, eventsRun(runID), step, outcome)
+func hEventsPublish(runID, step, outcome string) (bool, error) {
+	return publishStep(hEventsBg, hEventsRun(runID), step, outcome)
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	rows := []eventsRow{}
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	rows := []HEventsRow{}
 	for _, text := range ctx.Redis.HGetAll("outbox") {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -760,57 +760,57 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckKeyRun(ctx *harness.Ctx) {
-	eventsPublish("r1", "create_account", "succeeded")
-	eventsPublish("r2", "create_account", "succeeded")
-	eventsPublish("r1", "send_welcome", "started")
+	hEventsPublish("r1", "create_account", "succeeded")
+	hEventsPublish("r2", "create_account", "succeeded")
+	hEventsPublish("r1", "send_welcome", "started")
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three publishStep calls must produce three records on workflow.step; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"r1", "r2", "r1"}, "the records must be keyed by the run ids")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"r1", "r2", "r1"}, "the records must be keyed by the run ids")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both r1 events must land on one partition, or the auditor reads r1's history out of order; the partitions")
 }
 
 func CheckOutcome(ctx *harness.Ctx) {
-	eventsPublish("r1", "send_welcome", "started")
-	eventsPublish("r1", "send_welcome", "succeeded")
+	hEventsPublish("r1", "send_welcome", "started")
+	hEventsPublish("r1", "send_welcome", "succeeded")
 	ctx.Settle()
 	var outcomes []any
-	for _, v := range ctx.Kafka.Values(eventsTopic) {
+	for _, v := range ctx.Kafka.Values(kHEventsTopic) {
 		var event map[string]any
 		json.Unmarshal([]byte(v), &event)
 		outcomes = append(outcomes, event["outcome"])
 	}
 	ctx.Equal(outcomes, []any{"started", "succeeded"}, "publishing started then succeeded (otherwise the auditor cannot tell a running step from a finished one); the outcomes")
-	_, err := eventsPublish("r1", "send_welcome", "done")
+	_, err := hEventsPublish("r1", "send_welcome", "done")
 	ctx.Assert(err != nil, "publishStep accepted the outcome \\"done\\", which is not in outcomes")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "an unknown outcome must be refused before anything is produced; the records")
-	ctx.Equal(len(eventsOutbox(ctx)), 0, "the refused outcome \\"done\\" must leave no outbox row (the relay would publish it); the rows")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "an unknown outcome must be refused before anything is produced; the records")
+	ctx.Equal(len(hEventsOutbox(ctx)), 0, "the refused outcome \\"done\\" must leave no outbox row (the relay would publish it); the rows")
 }
 
 func CheckNoInput(ctx *harness.Ctx) {
-	eventsPublish("r1", "send_welcome", "started")
+	hEventsPublish("r1", "send_welcome", "started")
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one publishStep must produce one record; the records")
 	ctx.Assert(!strings.Contains(values[0], "ada@example.com"), "the event carries the run's input: %s. The topic keeps it for days after the run store deletes it", values[0])
 	var event map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &event), "the event must be JSON")
-	ctx.Equal(event, eventsExpected, "the event")
+	ctx.Equal(event, hEventsExpected, "the event")
 }
 
 func CheckAcks(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish("r1", "create_account", "succeeded")
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish("r1", "create_account", "succeeded")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	eventsPublish("r1", "send_welcome", "started")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hEventsPublish("r1", "send_welcome", "started")
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records")
 }
 
-func eventsRowIDs(ctx *harness.Ctx) []string {
+func hEventsRowIDs(ctx *harness.Ctx) []string {
 	ids := []string{}
 	for id := range ctx.Redis.HGetAll("outbox") {
 		ids = append(ids, id)
@@ -819,7 +819,7 @@ func eventsRowIDs(ctx *harness.Ctx) []string {
 	return ids
 }
 
-type eventsSeen struct {
+type HEventsSeen struct {
 	produced int
 	ids      []string
 }
@@ -827,30 +827,30 @@ type eventsSeen struct {
 func CheckOutbox(ctx *harness.Ctx) {
 	// The moment the outbox is first written, the event must not be on the topic yet.
 	seen := ctx.Redis.After("outbox", func() any {
-		return eventsSeen{len(ctx.Kafka.Records(eventsTopic)), eventsRowIDs(ctx)}
+		return HEventsSeen{len(ctx.Kafka.Records(kHEventsTopic)), hEventsRowIDs(ctx)}
 	})
-	ok, err := eventsPublish("r1", "create_account", "succeeded")
+	ok, err := hEventsPublish("r1", "create_account", "succeeded")
 	ctx.NoError(err, "publishStep failed for a healthy broker")
 	ctx.Equal(ok, true, "publishStep's result for an acknowledged event")
-	ctx.Equal(len(eventsOutbox(ctx)), 0, "the broker acknowledged the event, so the outbox must be empty (the relay would publish it again); the rows")
+	ctx.Equal(len(hEventsOutbox(ctx)), 0, "the broker acknowledged the event, so the outbox must be empty (the relay would publish it again); the rows")
 	ctx.Assert(seen.Fired, "an acknowledged publish never wrote its outbox row: a crash between the produce and the acknowledgement loses the transition")
-	first, _ := seen.Result.(eventsSeen)
+	first, _ := seen.Result.(HEventsSeen)
 	ctx.Assert(first.produced == 0 && strings.Join(first.ids, ",") == "r1:create_account:succeeded", "when the outbox was first written the topic held %d records and the outbox the rows %q, expected no record yet and the one row r1:create_account:succeeded (the event id): the row goes in before the produce", first.produced, first.ids)
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok, _ = eventsPublish("r1", "send_welcome", "started")
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok, _ = hEventsPublish("r1", "send_welcome", "started")
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the transition is gone from the history; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "r1", "the outbox row is %+v, expected the topic and the key r1", rows[0])
-	ctx.Equal(rows[0].Payload, eventsExpected, "the event in the outbox row")
-	ctx.Equal(eventsRowIDs(ctx), []string{"r1:send_welcome:started"}, "the outbox row's event id")
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == "r1", "the outbox row is %+v, expected the topic and the key r1", rows[0])
+	ctx.Equal(rows[0].Payload, hEventsExpected, "the event in the outbox row")
+	ctx.Equal(hEventsRowIDs(ctx), []string{"r1:send_welcome:started"}, "the outbox row's event id")
 	ctx.Equal(ok, false, "publishStep's result after a failed delivery")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok, _ = eventsPublish("r1", "send_welcome", "succeeded")
+	ok, _ = hEventsPublish("r1", "send_welcome", "succeeded")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishStep waited %.1f s for a broker that does not answer: wait for the report at most 2 s", waited)
-	ctx.Equal(len(eventsOutbox(ctx)), 2, "no acknowledgement within the window must leave a second row; the rows")
+	ctx.Equal(len(hEventsOutbox(ctx)), 2, "no acknowledgement within the window must leave a second row; the rows")
 	ctx.Equal(ok, false, "publishStep's result without an acknowledgement")
 }
 `,
@@ -867,9 +867,9 @@ func CheckOutbox(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "workflow.step";
+const std::string kHEventsTopic = "workflow.step";
 
-runs::Run eventsRun(const std::string& run_id) {
+runs::Run hEventsRun(const std::string& run_id) {
   runs::Run run;
   run.run_id = run_id;
   run.tenant = "t1";
@@ -882,18 +882,18 @@ runs::Run eventsRun(const std::string& run_id) {
   return run;
 }
 
-const nlohmann::json kEventsExpected = {{"run_id", "r1"}, {"workflow", "signup"}, {"step", "send_welcome"}, {"effect_id", "r1:send_welcome"}, {"outcome", "started"}};
+const nlohmann::json kHEventsExpected = {{"run_id", "r1"}, {"workflow", "signup"}, {"step", "send_welcome"}, {"effect_id", "r1:send_welcome"}, {"outcome", "started"}};
 
 // What publishStep returned: "true", "false", or "threw".
 std::string hPublishEvent(const std::string& run_id, const std::string& step, const std::string& outcome) {
   try {
-    return publishStep(eventsRun(run_id), step, outcome) ? "true" : "false";
+    return publishStep(hEventsRun(run_id), step, outcome) ? "true" : "false";
   } catch (const std::exception&) {
     return "threw";
   }
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& [event_id, text] : ctx.Redis.HGetAll("outbox")) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -903,18 +903,18 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::vector<std::string> eventsRowIds(harness::Ctx& ctx) {
+std::vector<std::string> hEventsRowIds(harness::Ctx& ctx) {
   std::vector<std::string> ids;
   for (const auto& [event_id, text] : ctx.Redis.HGetAll("outbox")) ids.push_back(event_id);
   std::sort(ids.begin(), ids.end());
   return ids;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
+std::string hEventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
-struct EventsSeen {
+struct HEventsSeen {
   bool fired = false;
   size_t produced = 0;
   std::vector<std::string> ids;
@@ -927,9 +927,9 @@ void CheckKeyRun(harness::Ctx& ctx) {
   hPublishEvent("r2", "create_account", "succeeded");
   hPublishEvent("r1", "send_welcome", "started");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three publishStep calls must produce three records on workflow.step; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"r1", "r2", "r1"}, "the records must be keyed by the run ids");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"r1", "r2", "r1"}, "the records must be keyed by the run ids");
   ctx.Equal(records[0].Partition, records[2].Partition, "both r1 events must land on one partition, or the auditor reads r1's history out of order; the partitions");
 }
 
@@ -938,63 +938,63 @@ void CheckOutcome(harness::Ctx& ctx) {
   hPublishEvent("r1", "send_welcome", "succeeded");
   ctx.Settle();
   std::vector<std::string> outcomes;
-  for (const auto& v : ctx.Kafka.Values(kEventsTopic)) outcomes.push_back(eventsField(nlohmann::json::parse(v, nullptr, false), "outcome"));
+  for (const auto& v : ctx.Kafka.Values(kHEventsTopic)) outcomes.push_back(hEventsField(nlohmann::json::parse(v, nullptr, false), "outcome"));
   ctx.Equal(outcomes, {"started", "succeeded"}, "publishing started then succeeded (otherwise the auditor cannot tell a running step from a finished one); the outcomes");
   ctx.Equal(hPublishEvent("r1", "send_welcome", "done"), "threw", "the outcome \\"done\\" is not in kOutcomes and must be refused; publishStep");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "an unknown outcome must be refused before anything is produced; the records");
-  ctx.Equal(eventsOutbox(ctx).size(), 0, "the refused outcome \\"done\\" must leave no outbox row (the relay would publish it); the rows");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "an unknown outcome must be refused before anything is produced; the records");
+  ctx.Equal(hEventsOutbox(ctx).size(), 0, "the refused outcome \\"done\\" must leave no outbox row (the relay would publish it); the rows");
 }
 
 void CheckNoInput(harness::Ctx& ctx) {
   hPublishEvent("r1", "send_welcome", "started");
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one publishStep must produce one record; the records");
   ctx.Assert(values[0].find("ada@example.com") == std::string::npos, "the event carries the run's input: %s. The topic keeps it for days after the run store deletes it", values[0]);
-  ctx.Equal(nlohmann::json::parse(values[0], nullptr, false), kEventsExpected, "the event");
+  ctx.Equal(nlohmann::json::parse(values[0], nullptr, false), kHEventsExpected, "the event");
 }
 
 void CheckAcks(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
   hPublishEvent("r1", "create_account", "succeeded");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
   hPublishEvent("r1", "send_welcome", "started");
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
   // The moment the outbox is first written, the event must not be on the topic yet.
-  auto seen = std::make_shared<EventsSeen>();
+  auto seen = std::make_shared<HEventsSeen>();
   ctx.Redis.After("outbox", [seen, &ctx] {
     seen->fired = true;
-    seen->produced = ctx.Kafka.Records(kEventsTopic).size();
-    seen->ids = eventsRowIds(ctx);
+    seen->produced = ctx.Kafka.Records(kHEventsTopic).size();
+    seen->ids = hEventsRowIds(ctx);
   });
   ctx.Equal(hPublishEvent("r1", "create_account", "succeeded"), "true", "publishStep's result for an acknowledged event");
-  ctx.Equal(eventsOutbox(ctx).size(), 0, "the broker acknowledged the event, so the outbox must be empty (the relay would publish it again); the rows");
+  ctx.Equal(hEventsOutbox(ctx).size(), 0, "the broker acknowledged the event, so the outbox must be empty (the relay would publish it again); the rows");
   ctx.Assert(seen->fired, "an acknowledged publish never wrote its outbox row: a crash between the produce and the acknowledgement loses the transition");
   ctx.Assert(seen->produced == 0 && seen->ids == std::vector<std::string>{"r1:create_account:succeeded"},
              "when the outbox was first written the topic held %d records and the outbox the rows %q, expected no record yet and the one row r1:create_account:succeeded (the event id): the row goes in before the produce",
              seen->produced, seen->ids);
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   std::string ok = hPublishEvent("r1", "send_welcome", "started");
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the transition is gone from the history; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "r1", "the outbox row is %s, expected the topic and the key r1", rows[0].dump());
-  ctx.Equal(rows[0].value("payload", nlohmann::json()), kEventsExpected, "the event in the outbox row");
-  ctx.Equal(eventsRowIds(ctx), {"r1:send_welcome:started"}, "the outbox row's event id");
+  ctx.Assert(hEventsField(rows[0], "topic") == kHEventsTopic && hEventsField(rows[0], "key") == "r1", "the outbox row is %s, expected the topic and the key r1", rows[0].dump());
+  ctx.Equal(rows[0].value("payload", nlohmann::json()), kHEventsExpected, "the event in the outbox row");
+  ctx.Equal(hEventsRowIds(ctx), {"r1:send_welcome:started"}, "the outbox row's event id");
   ctx.Equal(ok, "false", "publishStep's result after a failed delivery");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = hPublishEvent("r1", "send_welcome", "succeeded");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publishStep waited %.1f s for a broker that does not answer: wait for the report at most 2 s", waited);
-  ctx.Equal(eventsOutbox(ctx).size(), 2, "no acknowledgement within the window must leave a second row; the rows");
+  ctx.Equal(hEventsOutbox(ctx).size(), 2, "no acknowledgement within the window must leave a second row; the rows");
   ctx.Equal(ok, "false", "publishStep's result without an acknowledgement");
 }
 `,

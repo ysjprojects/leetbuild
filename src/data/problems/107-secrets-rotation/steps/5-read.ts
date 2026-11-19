@@ -1062,30 +1062,30 @@ import (
 )
 
 const (
-	readName     = "payments-db"
-	readMaterial = "pg-password-CANARY-41d7"
-	readPath     = "/v1/secrets/payments-db/versions"
+	kHReadName     = "payments-db"
+	kHReadMaterial = "pg-password-CANARY-41d7"
+	kHReadPath     = "/v1/secrets/payments-db/versions"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
 // readClient seeds v1 (hourly) and v2 (30 days), three consumers, two of which verified v2.
-func readClient(ctx *harness.Ctx) *harness.HTTP {
-	vault.CreateVersion(readBg, readName, readMaterial, 3600, "op-ana")
-	vault.CreateVersion(readBg, readName, readMaterial+"-2", 2592000, "op-ana")
-	vault.RecordActivation(readBg, readName, "v1")
-	vault.RecordActivation(readBg, readName, "v2")
+func hReadClient(ctx *harness.Ctx) *harness.HTTP {
+	vault.CreateVersion(hReadBg, kHReadName, kHReadMaterial, 3600, "op-ana")
+	vault.CreateVersion(hReadBg, kHReadName, kHReadMaterial+"-2", 2592000, "op-ana")
+	vault.RecordActivation(hReadBg, kHReadName, "v1")
+	vault.RecordActivation(hReadBg, kHReadName, "v2")
 	for _, id := range []string{"billing", "checkout", "ledger"} {
-		vault.RegisterConsumer(readBg, readName, id)
+		vault.RegisterConsumer(hReadBg, kHReadName, id)
 	}
-	vault.RecordAcceptance(readBg, readName, "v2", "billing")
-	vault.RecordAcceptance(readBg, readName, "v2", "checkout")
+	vault.RecordAcceptance(hReadBg, kHReadName, "v2", "billing")
+	vault.RecordAcceptance(hReadBg, kHReadName, "v2", "checkout")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readOK(ctx *harness.Ctx, r *harness.Response, what string) []map[string]any {
+func hReadOK(ctx *harness.Ctx, r *harness.Response, what string) []map[string]any {
 	ctx.Equal(r.Status, 200, "%s (%s)", what, r.Text())
 	var body struct {
 		Versions []map[string]any \`json:"versions"\`
@@ -1094,7 +1094,7 @@ func readOK(ctx *harness.Ctx, r *harness.Response, what string) []map[string]any
 	return body.Versions
 }
 
-func readIDs(versions []map[string]any) []string {
+func hReadIDs(versions []map[string]any) []string {
 	ids := []string{}
 	for _, v := range versions {
 		id, _ := v["version_id"].(string)
@@ -1103,7 +1103,7 @@ func readIDs(versions []map[string]any) []string {
 	return ids
 }
 
-func readByID(versions []map[string]any) map[string]map[string]any {
+func hReadByID(versions []map[string]any) map[string]map[string]any {
 	out := map[string]map[string]any{}
 	for _, v := range versions {
 		id, _ := v["version_id"].(string)
@@ -1113,44 +1113,44 @@ func readByID(versions []map[string]any) map[string]map[string]any {
 }
 
 func CheckReadRoute(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	versions := readOK(ctx, c.Get(readPath, "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+readPath)
-	ctx.Equal(readIDs(versions), []string{"v2", "v1"}, "the versions must come newest first")
-	ctx.Equal(versions[0]["fingerprint"], vault.Fingerprint(readMaterial+"-2"), "each entry carries the version's fingerprint")
-	one := readOK(ctx, c.Get(readPath+"?limit=1", "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+readPath+"?limit=1")
-	ctx.Equal(readIDs(one), []string{"v2"}, "limit=1 must answer the newest version only")
-	ctx.Equal(c.Get(readPath).Status, 401, "a read without X-Operator-Id")
+	c := hReadClient(ctx)
+	versions := hReadOK(ctx, c.Get(kHReadPath, "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+kHReadPath)
+	ctx.Equal(hReadIDs(versions), []string{"v2", "v1"}, "the versions must come newest first")
+	ctx.Equal(versions[0]["fingerprint"], vault.Fingerprint(kHReadMaterial+"-2"), "each entry carries the version's fingerprint")
+	one := hReadOK(ctx, c.Get(kHReadPath+"?limit=1", "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+kHReadPath+"?limit=1")
+	ctx.Equal(hReadIDs(one), []string{"v2"}, "limit=1 must answer the newest version only")
+	ctx.Equal(c.Get(kHReadPath).Status, 401, "a read without X-Operator-Id")
 	ctx.Equal(c.Get("/v1/secrets/nope/versions", "X-Operator-Id", "op-ana", "X-Scopes", "secrets").Status, 404, "a read of an unknown secret")
 	for i := 0; i < 51; i++ {
-		vault.CreateVersion(readBg, "bulk", fmt.Sprintf("material-%d", i), 3600, "op-ana")
+		vault.CreateVersion(hReadBg, "bulk", fmt.Sprintf("material-%d", i), 3600, "op-ana")
 	}
-	ids := readIDs(readOK(ctx, c.Get("/v1/secrets/bulk/versions", "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET /v1/secrets/bulk/versions (51 versions, no limit)"))
+	ids := hReadIDs(hReadOK(ctx, c.Get("/v1/secrets/bulk/versions", "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET /v1/secrets/bulk/versions (51 versions, no limit)"))
 	ctx.Assert(len(ids) == 50 && ids[0] == "v51" && ids[49] == "v2", "without limit a read answers the 50 newest versions (defaultLimit), v51 down to v2, got %d: %v", len(ids), ids)
 }
 
 func CheckScopeRequired(ctx *harness.Ctx) {
-	c := readClient(ctx)
+	c := hReadClient(ctx)
 	for _, scopes := range []string{"", "deploy metrics", "secrets-readonly,deploy", "nosecrets"} {
-		r := c.Get(readPath, "X-Operator-Id", "op-eve", "X-Scopes", scopes)
+		r := c.Get(kHReadPath, "X-Operator-Id", "op-eve", "X-Scopes", scopes)
 		ctx.Equal(r.Status, 403, "a read with scopes %q (without the secrets scope itself it must be 403)", scopes)
 		ctx.Assert(!strings.Contains(r.Text(), "fingerprint"), "a refused read still listed the versions: %s", r.Text())
 	}
 	ctx.Equal(c.Get("/v1/secrets/nope/versions", "X-Operator-Id", "op-eve").Status, 403, "a read of an unknown secret without the secrets scope (the scope is checked first, so a caller without it cannot tell which secrets exist)")
-	readOK(ctx, c.Get(readPath, "X-Operator-Id", "op-ben", "X-Scopes", "secrets,deploy"), "a read with X-Scopes: secrets,deploy")
-	readOK(ctx, c.Get(readPath, "X-Operator-Id", "op-ben", "X-Scopes", "deploy secrets"), "a read with X-Scopes: deploy secrets")
+	hReadOK(ctx, c.Get(kHReadPath, "X-Operator-Id", "op-ben", "X-Scopes", "secrets,deploy"), "a read with X-Scopes: secrets,deploy")
+	hReadOK(ctx, c.Get(kHReadPath, "X-Operator-Id", "op-ben", "X-Scopes", "deploy secrets"), "a read with X-Scopes: deploy secrets")
 }
 
 func CheckClosedQuery(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	r := c.Get(readPath+"?include_material=true", "X-Operator-Id", "op-ana", "X-Scopes", "secrets")
-	ctx.Assert(!strings.Contains(r.Text(), readMaterial), "include_material=true returned the material to the owner: %s. No parameter may widen the read", r.Text())
+	c := hReadClient(ctx)
+	r := c.Get(kHReadPath+"?include_material=true", "X-Operator-Id", "op-ana", "X-Scopes", "secrets")
+	ctx.Assert(!strings.Contains(r.Text(), kHReadMaterial), "include_material=true returned the material to the owner: %s. No parameter may widen the read", r.Text())
 	ctx.Equal(r.Status, 400, "an unknown query parameter (include_material)")
-	ctx.Equal(c.Get(readPath+"?expand=material", "X-Operator-Id", "op-ana", "X-Scopes", "secrets").Status, 400, "an unknown query parameter (expand): the query is checked against allowedQuery, not against the parameters known to be dangerous")
+	ctx.Equal(c.Get(kHReadPath+"?expand=material", "X-Operator-Id", "op-ana", "X-Scopes", "secrets").Status, 400, "an unknown query parameter (expand): the query is checked against allowedQuery, not against the parameters known to be dangerous")
 	for _, limit := range []string{"0", "201", "ten"} {
-		ctx.Equal(c.Get(readPath+"?limit="+limit, "X-Operator-Id", "op-ana", "X-Scopes", "secrets").Status, 400, "limit=%s (limit is 1..200)", limit)
+		ctx.Equal(c.Get(kHReadPath+"?limit="+limit, "X-Operator-Id", "op-ana", "X-Scopes", "secrets").Status, 400, "limit=%s (limit is 1..200)", limit)
 	}
 	fields := map[string]bool{"version_id": true, "fingerprint": true, "rotation_seconds": true, "created_at": true, "rotate_at": true, "activated_at": true, "retired_at": true, "health": true, "acceptance": true}
-	for _, v := range readOK(ctx, c.Get(readPath+"?limit=200", "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+readPath+"?limit=200") {
+	for _, v := range hReadOK(ctx, c.Get(kHReadPath+"?limit=200", "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+kHReadPath+"?limit=200") {
 		_, has := v["material"]
 		ctx.Assert(!has, "an entry carries material: %v", v)
 		for field := range v {
@@ -1160,24 +1160,24 @@ func CheckClosedQuery(ctx *harness.Ctx) {
 }
 
 func CheckHealthInterval(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	fresh := readByID(readOK(ctx, c.Get(readPath, "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+readPath))
+	c := hReadClient(ctx)
+	fresh := hReadByID(hReadOK(ctx, c.Get(kHReadPath, "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+kHReadPath))
 	ctx.Assert(fresh["v1"]["health"] == "ok" && fresh["v2"]["health"] == "ok", "right after the creates both versions are ok, got %v", fresh)
 	ctx.Clock.Advance(3599)
-	early := readByID(readOK(ctx, c.Get(readPath, "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+readPath+" 3599 s later"))
+	early := hReadByID(hReadOK(ctx, c.Get(kHReadPath, "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+kHReadPath+" 3599 s later"))
 	ctx.Equal(early["v1"]["health"], "ok", "v1 rotates every 3600 s and is 3599 s old; its health")
 	ctx.Clock.Advance(1)
-	later := readByID(readOK(ctx, c.Get(readPath, "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+readPath+" an hour later"))
+	later := hReadByID(hReadOK(ctx, c.Get(kHReadPath, "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+kHReadPath+" an hour later"))
 	ctx.Equal(later["v1"]["health"], "overdue", "v1 rotates every 3600 s and reached its rotate_at: health follows the version's own rotate_at, overdue from that second on; its health")
 	ctx.Equal(later["v2"]["health"], "ok", "v2 rotates every 30 days and is an hour old; its health")
-	vault.RecordRetirement(readBg, readName, "v1")
-	retired := readByID(readOK(ctx, c.Get(readPath, "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+readPath+" after v1 retired"))
+	vault.RecordRetirement(hReadBg, kHReadName, "v1")
+	retired := hReadByID(hReadOK(ctx, c.Get(kHReadPath, "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+kHReadPath+" after v1 retired"))
 	ctx.Equal(retired["v1"]["health"], "retired", "v1 is retired (and past its rotate_at): a retired version is retired, whatever its interval says; its health")
 }
 
 func CheckAcceptanceVisible(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	body := readByID(readOK(ctx, c.Get(readPath, "X-Operator-Id", "op-ben", "X-Scopes", "secrets,deploy"), "GET "+readPath+" as op-ben (not the owner)"))
+	c := hReadClient(ctx)
+	body := hReadByID(hReadOK(ctx, c.Get(kHReadPath, "X-Operator-Id", "op-ben", "X-Scopes", "secrets,deploy"), "GET "+kHReadPath+" as op-ben (not the owner)"))
 	ctx.Equal(body["v2"]["acceptance"], map[string]any{"verified": []any{"billing", "checkout"}, "pending": []any{"ledger"}}, "the on-call engineer (op-ben, holding the secrets scope) must see v2's acceptance")
 	ctx.Equal(body["v1"]["acceptance"], map[string]any{"verified": []any{}, "pending": []any{"billing", "checkout", "ledger"}}, "nobody verified v1, so its acceptance")
 }

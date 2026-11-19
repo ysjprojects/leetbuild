@@ -505,7 +505,7 @@ import (
 
 const hPath = "/v1/accounts/acct_1/usage"
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
 func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
@@ -514,7 +514,7 @@ func hAPI(ctx *harness.Ctx) *harness.HTTP {
 }
 
 func hSeed() {
-	ledger.RecordUsage(readBg, ledger.Record{RequestID: "req_1", Account: "acct_1", Route: "/v1/generate", Units: 1200, Gateway: "gw-eu-1"})
+	ledger.RecordUsage(hReadBg, ledger.Record{RequestID: "req_1", Account: "acct_1", Route: "/v1/generate", Units: 1200, Gateway: "gw-eu-1"})
 }
 
 func hRead(ctx *harness.Ctx, c *harness.HTTP) map[string]any {
@@ -539,17 +539,17 @@ func CheckWindow(ctx *harness.Ctx) {
 
 func CheckOverage(ctx *harness.Ctx) {
 	c := hAPI(ctx)
-	ledger.SetPlanCap(readBg, "acct_1", 1000)
-	_, err := hUsage.ApplyUsage(readBg, "acct_1", "req_1", "/v1/generate", 600, "gw-eu-1")
+	ledger.SetPlanCap(hReadBg, "acct_1", 1000)
+	_, err := hUsage.ApplyUsage(hReadBg, "acct_1", "req_1", "/v1/generate", 600, "gw-eu-1")
 	ctx.NoError(err, "seeding the window failed")
 	under := hRead(ctx, c)
 	ctx.Assert(under["cap"] == float64(1000) && under["overage"] == false, "an account at 600 units of a 1000-unit plan must read cap 1000 and overage false, got %v", under)
-	_, err = hUsage.ApplyUsage(readBg, "acct_1", "req_2", "/v1/generate", 600, "gw-eu-1")
+	_, err = hUsage.ApplyUsage(hReadBg, "acct_1", "req_2", "/v1/generate", 600, "gw-eu-1")
 	ctx.NoError(err, "seeding the window failed")
 	body := hRead(ctx, c)
 	ctx.Assert(body["cap"] == float64(1000) && body["overage"] == true, "an account at 1200 units of a 1000-unit plan must read cap 1000 and overage true, got %v", body)
 	// The plan is raised mid-hour: the window was counted, and flagged, against the cap it carries.
-	ledger.SetPlanCap(readBg, "acct_1", 5000)
+	ledger.SetPlanCap(hReadBg, "acct_1", 5000)
 	raised := hRead(ctx, c)
 	ctx.Assert(raised["cap"] == float64(1000) && raised["overage"] == true, "after the plan was raised the window still carries cap 1000 and overage 1, and the read answered %v: answer the window's cap and flag, not the plan's", raised)
 }
@@ -561,10 +561,10 @@ func CheckCloseId(ctx *harness.Ctx) {
 	value, present := before["close_id"]
 	ctx.Assert(present && value == nil, "before any close the read must answer close_id null, got %v", before)
 	older := fmt.Sprintf("close:acct_1:%d", w-2)
-	ledger.MarkClosed(readBg, "acct_1", w-2, older, 700)
+	ledger.MarkClosed(hReadBg, "acct_1", w-2, older, 700)
 	ctx.Equal(hRead(ctx, c)["close_id"], older, "the last close that tied out closed window %d: answer the close LastClose holds, whatever window it closed; the read's close_id", w-2)
 	want := fmt.Sprintf("close:acct_1:%d", w-1)
-	ledger.MarkClosed(readBg, "acct_1", w-1, want, 900)
+	ledger.MarkClosed(hReadBg, "acct_1", w-1, want, 900)
 	ctx.Equal(hRead(ctx, c)["close_id"], want, "after the last hour closed, the read's close_id")
 }
 

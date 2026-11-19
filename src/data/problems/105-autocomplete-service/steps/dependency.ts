@@ -706,28 +706,28 @@ import (
 )
 
 var (
-	clientBg    = context.Background()
-	clientTerms = map[string][]string{"ke": {"kettle", "kettlebell", "keyboard"}, "in": {"inbox", "invoice templates"}}
+	hClientBg    = context.Background()
+	hClientTerms = map[string][]string{"ke": {"kettle", "kettlebell", "keyboard"}, "in": {"inbox", "invoice templates"}}
 )
 
 // suggesterPeer is the ranking suggester: a fixed answer per prefix.
-type suggesterPeer struct {
+type HSuggesterPeer struct {
 	pb.UnimplementedSuggesterServer
 }
 
-func (suggesterPeer) Suggest(_ context.Context, req *pb.SuggestRequest) (*pb.SuggestReply, error) {
-	return &pb.SuggestReply{Terms: clientTerms[req.GetPrefix()], ModelVersion: "rank-7"}, nil
+func (HSuggesterPeer) Suggest(_ context.Context, req *pb.SuggestRequest) (*pb.SuggestReply, error) {
+	return &pb.SuggestReply{Terms: hClientTerms[req.GetPrefix()], ModelVersion: "rank-7"}, nil
 }
 
-func clientPeer(ctx *harness.Ctx) {
-	pb.RegisterSuggesterServer(ctx.GRPC.Server(""), suggesterPeer{})
+func hClientPeer(ctx *harness.Ctx) {
+	pb.RegisterSuggesterServer(ctx.GRPC.Server(""), HSuggesterPeer{})
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientPeer(ctx)
-	got := suggest(clientBg, "acme", "ke")
+	hClientPeer(ctx)
+	got := suggest(hClientBg, "acme", "ke")
 	ctx.Assert(got.Source == "suggester", "with a healthy suggester suggest answered %+v", got)
-	ctx.Equal(got.Suggestions, clientTerms["ke"], "the suggester's terms")
+	ctx.Equal(got.Suggestions, hClientTerms["ke"], "the suggester's terms")
 	calls := ctx.GRPC.CallsTo("Suggest", "")
 	ctx.Assert(len(calls) > 0, "no Suggest call was made")
 	for _, call := range calls {
@@ -736,15 +736,15 @@ func CheckDeadline(ctx *harness.Ctx) {
 	}
 	ctx.GRPC.SetLatency("Suggest", 0.4, "")
 	before := ctx.Clock.Now()
-	suggest(clientBg, "acme", "in")
+	suggest(hClientBg, "acme", "in")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 0.2, "suggest waited %.2f s for a suggester that takes 0.4 s: the dropdown has 150 ms", waited)
 }
 
 func CheckNoInlineRetry(ctx *harness.Ctx) {
-	clientPeer(ctx)
+	hClientPeer(ctx)
 	ctx.GRPC.Fail("Suggest", codes.Unavailable, "deploy in progress", 3, "")
-	suggest(clientBg, "acme", "ke")
+	suggest(hClientBg, "acme", "ke")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Suggest", "")), 1, "one keystroke against a failing suggester: retrying in the request multiplies the load during an outage; the Suggest calls")
 	ctx.Equal(ctx.Clock.Sleeps(), 0, "a failure must not be slept on in the request; the sleeps")
 	// Whatever the error, one call: no status code earns a second attempt inside the request.
@@ -755,40 +755,40 @@ func CheckNoInlineRetry(ctx *harness.Ctx) {
 		ctx.GRPC.ClearFailures()
 		ctx.GRPC.Fail("Suggest", tc.code, "suggester error", 2, "")
 		before := len(ctx.GRPC.CallsTo("Suggest", ""))
-		got := suggest(clientBg, "acme", tc.prefix)
+		got := suggest(hClientBg, "acme", tc.prefix)
 		ctx.Equal(len(ctx.GRPC.CallsTo("Suggest", ""))-before, 1, "a keystroke whose Suggest call failed %v: no error is retried inside the request; the Suggest calls", tc.code)
 		ctx.Equal(got.Source, "fallback", "a keystroke whose Suggest call failed %v must answer the fallback; the source", tc.code)
 	}
 }
 
 func CheckFallback(ctx *harness.Ctx) {
-	clientPeer(ctx)
+	hClientPeer(ctx)
 	ctx.GRPC.SetLatency("Suggest", 1.0, "")
-	got := suggest(clientBg, "acme", "in")
+	got := suggest(hClientBg, "acme", "in")
 	ctx.Equal(got.Source, "fallback", "with the suggester taking 1 s the answer must be the fallback, marked; the source")
 	ctx.Equal(got.Suggestions, []string{"integrations", "inventory", "invoices"}, "the fallback for \\"in\\" (the curated terms that start with the prefix)")
 	ctx.Assert(got.FallbackVersion != "", "the fallback answer carries no fallback_version: a bad list cannot be traced or rolled back")
 	ctx.GRPC.SetLatency("Suggest", 0, "")
 	ctx.GRPC.Fail("Suggest", codes.Unavailable, "deploy in progress", 1, "")
-	got = suggest(clientBg, "acme", "ke")
+	got = suggest(hClientBg, "acme", "ke")
 	ctx.Assert(got.Source == "fallback", "with the suggester UNAVAILABLE suggest answered %+v, expected the fallback", got)
 	ctx.Equal(got.Suggestions, []string{"kettle", "keyboard"}, "the fallback for \\"ke\\"")
 	ctx.GRPC.Fail("Suggest", codes.Unavailable, "deploy in progress", 1, "")
-	got = suggest(clientBg, "acme", "ve")
+	got = suggest(hClientBg, "acme", "ve")
 	ctx.Assert(got.Source == "fallback" && len(got.Suggestions) == 0, "the fallback for \\"ve\\" answered %+v, expected no suggestions: a curated term qualifies when it starts with the prefix (inventory only contains it)", got)
 }
 
 func CheckDegradedNotCached(ctx *harness.Ctx) {
-	clientPeer(ctx)
+	hClientPeer(ctx)
 	ctx.GRPC.Fail("Suggest", codes.Unavailable, "deploy in progress", 3, "")
-	first := suggest(clientBg, "acme", "ke")
+	first := suggest(hClientBg, "acme", "ke")
 	cached := ctx.Redis.Keys("suggest:cache:*")
 	ctx.Assert(len(cached) == 0, "a failed call left %q in the cache (%+v): a degraded answer must not be cached", cached, first)
 	ctx.GRPC.ClearFailures()
-	second := suggest(clientBg, "acme", "ke")
+	second := suggest(hClientBg, "acme", "ke")
 	ctx.Assert(second.Source == "suggester", "once the suggester recovered the next keystroke answered %+v, expected the suggester's terms", second)
-	ctx.Equal(second.Suggestions, clientTerms["ke"], "the suggester's terms once it recovered")
-	third := suggest(clientBg, "acme", "ke")
+	ctx.Equal(second.Suggestions, hClientTerms["ke"], "the suggester's terms once it recovered")
+	third := suggest(hClientBg, "acme", "ke")
 	ctx.Assert(third.Source == "cache", "the suggester's answer must be cached, the third keystroke answered %+v", third)
 }
 `,
@@ -802,12 +802,12 @@ func CheckDegradedNotCached(ctx *harness.Ctx) {
 
 namespace {
 
-using Strings = std::vector<std::string>;
+using HStrings = std::vector<std::string>;
 
-const std::map<std::string, Strings> hTerms = {{"ke", {"kettle", "kettlebell", "keyboard"}}, {"in", {"inbox", "invoice templates"}}};
+const std::map<std::string, HStrings> hTerms = {{"ke", {"kettle", "kettlebell", "keyboard"}}, {"in", {"inbox", "invoice templates"}}};
 
 // The ranking suggester: a fixed answer per prefix.
-class SuggesterPeer final : public suggestd::Suggester::Service {
+class HSuggesterPeer final : public suggestd::Suggester::Service {
  public:
   grpc::Status Suggest(grpc::ServerContext*, const suggestd::SuggestRequest* req, suggestd::SuggestReply* out) override {
     const auto found = hTerms.find(req->prefix());
@@ -819,17 +819,17 @@ class SuggesterPeer final : public suggestd::Suggester::Service {
   }
 };
 
-void clientPeer(harness::Ctx& ctx) {
-  static SuggesterPeer* peer = nullptr;
+void hClientPeer(harness::Ctx& ctx) {
+  static HSuggesterPeer* peer = nullptr;
   delete peer;
-  peer = new SuggesterPeer;
+  peer = new HSuggesterPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
 }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  clientPeer(ctx);
+  hClientPeer(ctx);
   const Answer got = suggest("acme", "ke");
   ctx.Equal(got.source, "suggester", "with a healthy suggester, the source");
   ctx.Equal(got.suggestions, hTerms.at("ke"), "the suggester's terms");
@@ -847,7 +847,7 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckNoInlineRetry(harness::Ctx& ctx) {
-  clientPeer(ctx);
+  hClientPeer(ctx);
   ctx.GRPC.Fail("Suggest", grpc::StatusCode::UNAVAILABLE, "deploy in progress", 3);
   suggest("acme", "ke");
   ctx.Equal(ctx.GRPC.CallsTo("Suggest").size(), 1, "one keystroke against a failing suggester: retrying in the request multiplies the load during an outage; the Suggest calls");
@@ -866,25 +866,25 @@ void CheckNoInlineRetry(harness::Ctx& ctx) {
 }
 
 void CheckFallback(harness::Ctx& ctx) {
-  clientPeer(ctx);
+  hClientPeer(ctx);
   ctx.GRPC.SetLatency("Suggest", 1.0);
   Answer got = suggest("acme", "in");
   ctx.Equal(got.source, "fallback", "with the suggester taking 1 s the answer must be the fallback, marked; the source");
-  ctx.Equal(got.suggestions, Strings{"integrations", "inventory", "invoices"}, "the fallback for \\"in\\" (the curated terms that start with the prefix)");
+  ctx.Equal(got.suggestions, HStrings{"integrations", "inventory", "invoices"}, "the fallback for \\"in\\" (the curated terms that start with the prefix)");
   ctx.Assert(!got.fallback_version.empty(), "the fallback answer carries no fallback_version: a bad list cannot be traced or rolled back");
   ctx.GRPC.SetLatency("Suggest", 0);
   ctx.GRPC.Fail("Suggest", grpc::StatusCode::UNAVAILABLE, "deploy in progress", 1);
   got = suggest("acme", "ke");
   ctx.Equal(got.source, "fallback", "with the suggester UNAVAILABLE, the source");
-  ctx.Equal(got.suggestions, Strings{"kettle", "keyboard"}, "the fallback for \\"ke\\"");
+  ctx.Equal(got.suggestions, HStrings{"kettle", "keyboard"}, "the fallback for \\"ke\\"");
   ctx.GRPC.Fail("Suggest", grpc::StatusCode::UNAVAILABLE, "deploy in progress", 1);
   got = suggest("acme", "ve");
   ctx.Equal(got.source, "fallback", "with the suggester UNAVAILABLE, the source for \\"ve\\"");
-  ctx.Equal(got.suggestions, Strings{}, "the fallback for \\"ve\\": a curated term qualifies when it starts with the prefix (inventory only contains it)");
+  ctx.Equal(got.suggestions, HStrings{}, "the fallback for \\"ve\\": a curated term qualifies when it starts with the prefix (inventory only contains it)");
 }
 
 void CheckDegradedNotCached(harness::Ctx& ctx) {
-  clientPeer(ctx);
+  hClientPeer(ctx);
   ctx.GRPC.Fail("Suggest", grpc::StatusCode::UNAVAILABLE, "deploy in progress", 3);
   const Answer first = suggest("acme", "ke");
   const auto cached = ctx.Redis.Keys("suggest:cache:*");

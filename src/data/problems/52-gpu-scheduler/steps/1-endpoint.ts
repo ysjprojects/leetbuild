@@ -1151,17 +1151,17 @@ import (
 	"leetbuild/harness"
 )
 
-var apiBody = map[string]any{"gpu_type": "a100", "count": 4, "memory_gb": 80, "max_hourly_bid": 3.5}
+var hApiBody = map[string]any{"gpu_type": "a100", "count": 4, "memory_gb": 80, "max_hourly_bid": 3.5}
 
 // apiNode is a registered node with a live heartbeat, as the ledger (step 2) writes it.
-func apiNode(ctx *harness.Ctx, id, gpuType string, capacity, allocatedGPUs int) {
+func hApiNode(ctx *harness.Ctx, id, gpuType string, capacity, allocatedGPUs int) {
 	ctx.Redis.Do("HSET", "node:"+id, "gpu_type", gpuType, "capacity", capacity, "allocated", allocatedGPUs)
 	ctx.Redis.Do("SADD", "nodes", id)
 	ctx.Redis.Do("SET", "heartbeat:"+id, "1", "EX", 30)
 }
 
 // apiLedger stands in for allocate (state.go, step 2): the ledger's script.
-func apiLedger(ctx *harness.Ctx) {
+func hApiLedger(ctx *harness.Ctx) {
 	allocate = func(_ context.Context, nodeID, placementID string, count int) (string, error) {
 		if ctx.Redis.Exists("heartbeat:"+nodeID) == 0 {
 			return "NO_HEARTBEAT", nil
@@ -1187,9 +1187,9 @@ func apiLedger(ctx *harness.Ctx) {
 }
 
 // apiBoot is the scheduler with gpu-1 (a100, 8 GPUs) registered before it boots, and its log captured.
-func apiBoot(ctx *harness.Ctx) (*harness.HTTP, *bytes.Buffer) {
-	apiNode(ctx, "gpu-1", "a100", 8, 0)
-	apiLedger(ctx)
+func hApiBoot(ctx *harness.Ctx) (*harness.HTTP, *bytes.Buffer) {
+	hApiNode(ctx, "gpu-1", "a100", 8, 0)
+	hApiLedger(ctx)
 	var logged bytes.Buffer
 	log.SetOutput(&logged)
 	mux := http.NewServeMux()
@@ -1197,9 +1197,9 @@ func apiBoot(ctx *harness.Ctx) (*harness.HTTP, *bytes.Buffer) {
 	return ctx.HTTP(mux), &logged
 }
 
-func apiWith(field string, value any) map[string]any {
+func hApiWith(field string, value any) map[string]any {
 	body := map[string]any{}
-	for k, v := range apiBody {
+	for k, v := range hApiBody {
 		body[k] = v
 	}
 	body[field] = value
@@ -1207,9 +1207,9 @@ func apiWith(field string, value any) map[string]any {
 }
 
 func CheckRouteShape(ctx *harness.Ctx) {
-	c, _ := apiBoot(ctx)
+	c, _ := hApiBoot(ctx)
 	defer log.SetOutput(os.Stderr)
-	r := c.Post("/v1/placements", apiBody)
+	r := c.Post("/v1/placements", hApiBody)
 	ctx.Equal(r.Status, 201, "POST /v1/placements with a valid body (%s)", r.Text())
 	body, _ := r.JSON().(map[string]any)
 	pid, _ := body["placement_id"].(string)
@@ -1221,64 +1221,64 @@ func CheckRouteShape(ctx *harness.Ctx) {
 }
 
 func CheckUnknownType(ctx *harness.Ctx) {
-	c, _ := apiBoot(ctx)
+	c, _ := hApiBoot(ctx)
 	defer log.SetOutput(os.Stderr)
 	fleetRead := ctx.Redis.After("nodes", func() any { return "read" })
-	r := c.Post("/v1/placements", apiWith("gpu_type", "tpu"))
+	r := c.Post("/v1/placements", hApiWith("gpu_type", "tpu"))
 	ctx.Equal(r.Status, 400, "gpu_type tpu: an unknown type must be refused, not placed on whatever node is free")
 	allocatedGPUs, _ := ctx.Redis.HGet("node:gpu-1", "allocated")
 	ctx.Equal(allocatedGPUs, "0", "a refused request must not book a node; allocated")
 	ctx.Equal(len(ctx.Redis.Keys("placement:*")), 0, "a refused request must write no placement record; the records")
-	r = c.Post("/v1/placements", apiWith("gpu_type", 7))
+	r = c.Post("/v1/placements", hApiWith("gpu_type", 7))
 	ctx.Equal(r.Status, 400, "gpu_type 7")
 	ctx.Assert(!fleetRead.Fired, "a request refused for its gpu_type read the node set first: validate the body before any node is read")
-	r = c.Post("/v1/placements", apiWith("gpu_type", "h100"))
+	r = c.Post("/v1/placements", hApiWith("gpu_type", "h100"))
 	ctx.Equal(r.Status, 409, "gpu_type h100 with only an a100 node live: a known type is placed only on a node of that type, never on another type's")
 	allocatedGPUs, _ = ctx.Redis.HGet("node:gpu-1", "allocated")
 	ctx.Assert(allocatedGPUs == "0" && len(ctx.Redis.Keys("placement:*")) == 0, "an h100 request must not book the a100 node")
 }
 
 func CheckCapacityCeiling(ctx *harness.Ctx) {
-	c, _ := apiBoot(ctx)
+	c, _ := hApiBoot(ctx)
 	defer log.SetOutput(os.Stderr)
 	for _, count := range []any{9, 0, -1, 2.5, "four", true, 4294967297} {
-		r := c.Post("/v1/placements", apiWith("count", count))
+		r := c.Post("/v1/placements", hApiWith("count", count))
 		ctx.Equal(r.Status, 400, "count %v (an integer from 1 to MaxNodeGPUs = 8)", harness.Show(count))
 	}
 	allocatedGPUs, _ := ctx.Redis.HGet("node:gpu-1", "allocated")
 	ctx.Assert(allocatedGPUs == "0" && len(ctx.Redis.Keys("placement:*")) == 0, "no refused count may reach the ledger")
 	for _, field := range []string{"memory_gb", "max_hourly_bid"} {
-		r := c.Post("/v1/placements", apiWith(field, "lots"))
+		r := c.Post("/v1/placements", hApiWith(field, "lots"))
 		ctx.Equal(r.Status, 400, "%s 'lots'", field)
 	}
-	r := c.Post("/v1/placements", apiWith("count", 8))
+	r := c.Post("/v1/placements", hApiWith("count", 8))
 	ctx.Equal(r.Status, 201, "count 8 on an idle 8-GPU node (%s)", r.Text())
 }
 
 func CheckFreshCapacity(ctx *harness.Ctx) {
-	c, _ := apiBoot(ctx)
+	c, _ := hApiBoot(ctx)
 	defer log.SetOutput(os.Stderr)
 	// After boot: gpu-2 joins the fleet and gpu-1 fills up with placements from another replica.
-	apiNode(ctx, "gpu-2", "a100", 8, 0)
+	hApiNode(ctx, "gpu-2", "a100", 8, 0)
 	ctx.Redis.Do("HSET", "node:gpu-1", "allocated", 8)
-	r := c.Post("/v1/placements", apiBody)
+	r := c.Post("/v1/placements", hApiBody)
 	ctx.Equal(r.Status, 201, "with gpu-1 full and gpu-2 idle: the node set must be read on every request, not at boot")
 	body, _ := r.JSON().(map[string]any)
 	ctx.Equal(body["node_id"], "gpu-2", "the node the request landed on (gpu-1 has 0 free)")
 	ctx.Redis.Del("heartbeat:gpu-2")
-	r = c.Post("/v1/placements", apiBody)
+	r = c.Post("/v1/placements", hApiBody)
 	ctx.Equal(r.Status, 409, "with gpu-1 full and gpu-2's heartbeat lapsed")
 	// gpu-2 reports in again (4 free), gpu-1 frees up to 2, gpu-3 joins idle (8 free).
 	ctx.Redis.Do("SET", "heartbeat:gpu-2", "1", "EX", 30)
 	ctx.Redis.Do("HSET", "node:gpu-1", "allocated", 6)
-	apiNode(ctx, "gpu-3", "a100", 8, 0)
-	r = c.Post("/v1/placements", apiWith("count", 1))
+	hApiNode(ctx, "gpu-3", "a100", 8, 0)
+	r = c.Post("/v1/placements", hApiWith("count", 1))
 	ctx.Equal(r.Status, 201, "with 2, 4 and 8 GPUs free on gpu-1, gpu-2 and gpu-3 a request for 1 GPU (%s)", r.Text())
 	body, _ = r.JSON().(map[string]any)
 	ctx.Assert(body["node_id"] == "gpu-3", "with 2, 4 and 8 GPUs free on gpu-1, gpu-2 and gpu-3 the request landed on %v, expected gpu-3: candidates are tried by free GPUs, most first", body["node_id"])
 	// Another replica fills gpu-3 right after this request read it.
 	filled := ctx.Redis.After("node:gpu-3", func() any { return ctx.Redis.Do("HSET", "node:gpu-3", "allocated", 8) })
-	r = c.Post("/v1/placements", apiWith("count", 2))
+	r = c.Post("/v1/placements", hApiWith("count", 2))
 	ctx.Assert(filled.Fired, "the request never read node:gpu-3")
 	ctx.Equal(r.Status, 201, "gpu-3 filled up between the read and allocate, so the ledger answered NO_CAPACITY there (%s): the next candidate is tried, the first ALLOCATED wins", r.Text())
 	body, _ = r.JSON().(map[string]any)
@@ -1286,9 +1286,9 @@ func CheckFreshCapacity(ctx *harness.Ctx) {
 }
 
 func CheckLogNoPayload(ctx *harness.Ctx) {
-	c, logged := apiBoot(ctx)
+	c, logged := hApiBoot(ctx)
 	defer log.SetOutput(os.Stderr)
-	r := c.Post("/v1/placements", apiBody)
+	r := c.Post("/v1/placements", hApiBody)
 	ctx.Equal(r.Status, 201, "POST (%s)", r.Text())
 	body, _ := r.JSON().(map[string]any)
 	pid, _ := body["placement_id"].(string)
@@ -1321,54 +1321,54 @@ func CheckLogNoPayload(ctx *harness.Ctx) {
 
 namespace {
 
-harness::Ctx* apiCtx = nullptr;
+harness::Ctx* hApiCtx = nullptr;
 
-const nlohmann::json kApiBody = {{"gpu_type", "a100"}, {"count", 4}, {"memory_gb", 80}, {"max_hourly_bid", 3.5}};
+const nlohmann::json kHApiBody = {{"gpu_type", "a100"}, {"count", 4}, {"memory_gb", 80}, {"max_hourly_bid", 3.5}};
 
 // A registered node with a live heartbeat, as the ledger (step 2) writes it.
-void apiNode(harness::Ctx& ctx, const std::string& id, const std::string& gpu_type = "a100", int capacity = 8, int allocated = 0) {
+void hApiNode(harness::Ctx& ctx, const std::string& id, const std::string& gpu_type = "a100", int capacity = 8, int allocated = 0) {
   ctx.Redis.Do("HSET", "node:" + id, "gpu_type", gpu_type, "capacity", capacity, "allocated", allocated);
   ctx.Redis.Do("SADD", "nodes", id);
   ctx.Redis.Do("SET", "heartbeat:" + id, "1", "EX", 30);
 }
 
-nlohmann::json apiWith(const std::string& field, const nlohmann::json& value) {
-  nlohmann::json body = kApiBody;
+nlohmann::json hApiWith(const std::string& field, const nlohmann::json& value) {
+  nlohmann::json body = kHApiBody;
   body[field] = value;
   return body;
 }
 
-struct ApiWorld {
+struct HApiWorld {
   httplib::Server svr;
   std::ostringstream logged;
   std::streambuf* clog = nullptr;
-  ~ApiWorld() {
+  ~HApiWorld() {
     if (clog) std::clog.rdbuf(clog);
   }
 };
 
-ApiWorld* apiWorld = nullptr;
+HApiWorld* hApiWorld = nullptr;
 
 // The scheduler with gpu-1 (a100, 8 GPUs) registered before it serves, and its log captured.
-harness::HTTP apiBoot(harness::Ctx& ctx) {
-  delete apiWorld;
-  apiWorld = new ApiWorld;
-  apiCtx = &ctx;
-  apiNode(ctx, "gpu-1");
-  apiWorld->clog = std::clog.rdbuf(apiWorld->logged.rdbuf());
-  register_routes(apiWorld->svr);
-  return ctx.HTTP(apiWorld->svr);
+harness::HTTP hApiBoot(harness::Ctx& ctx) {
+  delete hApiWorld;
+  hApiWorld = new HApiWorld;
+  hApiCtx = &ctx;
+  hApiNode(ctx, "gpu-1");
+  hApiWorld->clog = std::clog.rdbuf(hApiWorld->logged.rdbuf());
+  register_routes(hApiWorld->svr);
+  return ctx.HTTP(hApiWorld->svr);
 }
 
 // What the handler wrote to std::clog so far, line by line.
-std::vector<std::string> apiLines() {
+std::vector<std::string> hApiLines() {
   std::vector<std::string> lines;
-  std::istringstream in(apiWorld->logged.str());
+  std::istringstream in(hApiWorld->logged.str());
   for (std::string line; std::getline(in, line);) lines.push_back(line);
   return lines;
 }
 
-harness::Response apiPost(harness::HTTP& c, const nlohmann::json& body) {
+harness::Response hApiPost(harness::HTTP& c, const nlohmann::json& body) {
   return c.Post("/v1/placements", body.dump(), "Content-Type", "application/json");
 }
 
@@ -1376,7 +1376,7 @@ harness::Response apiPost(harness::HTTP& c, const nlohmann::json& body) {
 
 // The ledger (state.cpp, step 2) as the harness stands in for it: its script.
 std::string allocate(const std::string& node_id, const std::string& placement_id, int count) {
-  harness::Ctx& ctx = *apiCtx;
+  harness::Ctx& ctx = *hApiCtx;
   if (ctx.Redis.Exists("heartbeat:" + node_id) == 0) return "NO_HEARTBEAT";
   const auto fields = ctx.Redis.HGetAll("node:" + node_id);
   const int capacity = fields.count("capacity") ? std::stoi(fields.at("capacity")) : 0;
@@ -1389,8 +1389,8 @@ std::string allocate(const std::string& node_id, const std::string& placement_id
 }
 
 void CheckRouteShape(harness::Ctx& ctx) {
-  auto c = apiBoot(ctx);
-  auto r = apiPost(c, kApiBody);
+  auto c = hApiBoot(ctx);
+  auto r = hApiPost(c, kHApiBody);
   ctx.Equal(r.Status, 201, "POST /v1/placements with a valid body (%s)", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   const std::string pid = body.is_object() ? body.value("placement_id", "") : "";
@@ -1403,54 +1403,54 @@ void CheckRouteShape(harness::Ctx& ctx) {
 }
 
 void CheckUnknownType(harness::Ctx& ctx) {
-  auto c = apiBoot(ctx);
+  auto c = hApiBoot(ctx);
   auto fleetRead = std::make_shared<std::atomic<bool>>(false);
   ctx.Redis.After("nodes", [fleetRead] { *fleetRead = true; });
-  auto r = apiPost(c, apiWith("gpu_type", "tpu"));
+  auto r = hApiPost(c, hApiWith("gpu_type", "tpu"));
   ctx.Equal(r.Status, 400, "gpu_type tpu: an unknown type must be refused, not placed on whatever node is free");
   ctx.Equal(ctx.Redis.HGet("node:gpu-1", "allocated"), "0", "a refused request must not book a node; allocated");
   ctx.Equal(ctx.Redis.Keys("placement:*").size(), 0, "a refused request must write no placement record; the records");
-  r = apiPost(c, apiWith("gpu_type", 7));
+  r = hApiPost(c, hApiWith("gpu_type", 7));
   ctx.Equal(r.Status, 400, "gpu_type 7");
   ctx.Assert(!*fleetRead, "a request refused for its gpu_type read the node set first: validate the body before any node is read");
-  r = apiPost(c, apiWith("gpu_type", "h100"));
+  r = hApiPost(c, hApiWith("gpu_type", "h100"));
   ctx.Equal(r.Status, 409, "gpu_type h100 with only an a100 node live: a known type is placed only on a node of that type, never on another type's");
   ctx.Assert(ctx.Redis.HGet("node:gpu-1", "allocated") == "0" && ctx.Redis.Keys("placement:*").empty(), "an h100 request must not book the a100 node");
 }
 
 void CheckCapacityCeiling(harness::Ctx& ctx) {
-  auto c = apiBoot(ctx);
+  auto c = hApiBoot(ctx);
   for (const nlohmann::json count : {nlohmann::json(9), nlohmann::json(0), nlohmann::json(-1), nlohmann::json(2.5), nlohmann::json("four"), nlohmann::json(true),
                                      nlohmann::json(4294967297LL)}) {
-    auto r = apiPost(c, apiWith("count", count));
+    auto r = hApiPost(c, hApiWith("count", count));
     ctx.Equal(r.Status, 400, "count %s (an integer from 1 to kMaxNodeGpus = 8)", count.dump());
   }
   ctx.Assert(ctx.Redis.HGet("node:gpu-1", "allocated") == "0" && ctx.Redis.Keys("placement:*").empty(), "no refused count may reach the ledger");
   for (const std::string field : {"memory_gb", "max_hourly_bid"}) {
-    auto r = apiPost(c, apiWith(field, "lots"));
+    auto r = hApiPost(c, hApiWith(field, "lots"));
     ctx.Equal(r.Status, 400, "%s 'lots'", field);
   }
-  auto r = apiPost(c, apiWith("count", 8));
+  auto r = hApiPost(c, hApiWith("count", 8));
   ctx.Equal(r.Status, 201, "count 8 on an idle 8-GPU node (%s)", r.Text());
 }
 
 void CheckFreshCapacity(harness::Ctx& ctx) {
-  auto c = apiBoot(ctx);
+  auto c = hApiBoot(ctx);
   // After boot: gpu-2 joins the fleet and gpu-1 fills up with placements from another replica.
-  apiNode(ctx, "gpu-2");
+  hApiNode(ctx, "gpu-2");
   ctx.Redis.Do("HSET", "node:gpu-1", "allocated", 8);
-  auto r = apiPost(c, kApiBody);
+  auto r = hApiPost(c, kHApiBody);
   ctx.Equal(r.Status, 201, "with gpu-1 full and gpu-2 idle: the node set must be read on every request, not at boot");
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Equal(body.is_object() ? body.value("node_id", "") : "", "gpu-2", "the node the request landed on (gpu-1 has 0 free)");
   ctx.Redis.Del("heartbeat:gpu-2");
-  r = apiPost(c, kApiBody);
+  r = hApiPost(c, kHApiBody);
   ctx.Equal(r.Status, 409, "with gpu-1 full and gpu-2's heartbeat lapsed");
   // gpu-2 reports in again (4 free), gpu-1 frees up to 2, gpu-3 joins idle (8 free).
   ctx.Redis.Do("SET", "heartbeat:gpu-2", "1", "EX", 30);
   ctx.Redis.Do("HSET", "node:gpu-1", "allocated", 6);
-  apiNode(ctx, "gpu-3");
-  r = apiPost(c, apiWith("count", 1));
+  hApiNode(ctx, "gpu-3");
+  r = hApiPost(c, hApiWith("count", 1));
   ctx.Equal(r.Status, 201, "with 2, 4 and 8 GPUs free on gpu-1, gpu-2 and gpu-3 a request for 1 GPU (%s)", r.Text());
   auto landed = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Equal(landed.is_object() ? landed.value("node_id", "") : "", "gpu-3",
@@ -1461,7 +1461,7 @@ void CheckFreshCapacity(harness::Ctx& ctx) {
     *filled = true;
     ctx.Redis.Do("HSET", "node:gpu-3", "allocated", 8);
   });
-  r = apiPost(c, apiWith("count", 2));
+  r = hApiPost(c, hApiWith("count", 2));
   ctx.Assert(*filled, "the request never read node:gpu-3");
   ctx.Equal(r.Status, 201, "gpu-3 filled up between the read and allocate, so the ledger answered NO_CAPACITY there (%s): the next candidate is tried, the first ALLOCATED wins", r.Text());
   landed = nlohmann::json::parse(r.Text(), nullptr, false);
@@ -1469,13 +1469,13 @@ void CheckFreshCapacity(harness::Ctx& ctx) {
 }
 
 void CheckLogNoPayload(harness::Ctx& ctx) {
-  auto c = apiBoot(ctx);
-  auto r = apiPost(c, kApiBody);
+  auto c = hApiBoot(ctx);
+  auto r = hApiPost(c, kHApiBody);
   ctx.Equal(r.Status, 201, "POST (%s)", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   const std::string pid = body.is_object() ? body.value("placement_id", "") : "";
   std::clog.flush();
-  const std::vector<std::string> lines = apiLines();
+  const std::vector<std::string> lines = hApiLines();
   ctx.Assert(!lines.empty(), "the placement must be logged (std::clog)");
   for (const auto& line : lines) {
     std::string bare = line;  // a random id can contain "80"

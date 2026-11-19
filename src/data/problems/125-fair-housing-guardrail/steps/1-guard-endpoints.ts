@@ -855,11 +855,11 @@ const (
 )
 
 // classifierPeer scores 0.92 for text that names a protected group, 0.04 for anything else.
-type classifierPeer struct {
+type HClassifierPeer struct {
 	pb.UnimplementedClassifierServer
 }
 
-func (classifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
+func (HClassifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
 	text := strings.ToLower(req.GetText())
 	for _, word := range []string{"latino", "christian", "families with kids"} {
 		if strings.Contains(text, word) {
@@ -869,17 +869,17 @@ func (classifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.
 	return &pb.ClassifyReply{Score: 0.04}, nil
 }
 
-type judgePeer struct {
+type HJudgePeer struct {
 	pb.UnimplementedJudgeServer
 }
 
-func (judgePeer) Assess(context.Context, *pb.AssessRequest) (*pb.Assessment, error) {
+func (HJudgePeer) Assess(context.Context, *pb.AssessRequest) (*pb.Assessment, error) {
 	return &pb.Assessment{Compliant: true}, nil
 }
 
 func hAPI(ctx *harness.Ctx) *harness.HTTP {
-	pb.RegisterClassifierServer(ctx.GRPC.Server(""), classifierPeer{})
-	pb.RegisterJudgeServer(ctx.GRPC.Server(""), judgePeer{})
+	pb.RegisterClassifierServer(ctx.GRPC.Server(""), HClassifierPeer{})
+	pb.RegisterJudgeServer(ctx.GRPC.Server(""), HJudgePeer{})
 	bg := context.Background()
 	store.AddAPIKey(bg, "k-assistant", "assistant")
 	store.SavePolicy(bg, store.Policy{Version: hV1, StopPhrases: []string{"no section 8"}})
@@ -1017,7 +1017,7 @@ const std::string kHNeutral = "Two-bedroom homes near light rail under $900k";
 const std::string kHSteering = "Beacon Hill is mostly Latino families, so you would fit right in.";
 
 // Scores 0.92 for text that names a protected group, 0.04 for anything else.
-class ClassifierPeer final : public fairhousing::Classifier::Service {
+class HClassifierPeer final : public fairhousing::Classifier::Service {
  public:
   grpc::Status Classify(grpc::ServerContext*, const fairhousing::ClassifyRequest* req, fairhousing::ClassifyReply* out) override {
     std::string text = req->text();
@@ -1034,7 +1034,7 @@ class ClassifierPeer final : public fairhousing::Classifier::Service {
   }
 };
 
-class JudgePeer final : public fairhousing::Judge::Service {
+class HJudgePeer final : public fairhousing::Judge::Service {
  public:
   grpc::Status Assess(grpc::ServerContext*, const fairhousing::AssessRequest*, fairhousing::Assessment* out) override {
     out->set_compliant(true);
@@ -1043,8 +1043,8 @@ class JudgePeer final : public fairhousing::Judge::Service {
 };
 
 struct HPeers {
-  ClassifierPeer classifier;
-  JudgePeer judge;
+  HClassifierPeer classifier;
+  HJudgePeer judge;
 };
 
 harness::HTTP hApi(harness::Ctx& ctx) {

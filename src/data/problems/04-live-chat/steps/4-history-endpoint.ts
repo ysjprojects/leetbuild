@@ -912,10 +912,10 @@ import (
 	"leetbuild/harness"
 )
 
-const historyHourMs = 3600 * 1000
+const kHHistoryHourMs = 3600 * 1000
 
 // historyCall is one call the store saw: op "exists" (room) or "list" (room, before, limit).
-type historyCall struct {
+type HHistoryCall struct {
 	op     string
 	room   string
 	before int64
@@ -924,19 +924,19 @@ type historyCall struct {
 
 // historyStore is the provided message store: newest first, Ts < before, at most limit; it
 // records every call.
-type historyStore struct {
+type HHistoryStore struct {
 	rooms map[string][]Message
-	calls []historyCall
+	calls []HHistoryCall
 }
 
-func (s *historyStore) Exists(room string) bool {
-	s.calls = append(s.calls, historyCall{op: "exists", room: room})
+func (s *HHistoryStore) Exists(room string) bool {
+	s.calls = append(s.calls, HHistoryCall{op: "exists", room: room})
 	_, ok := s.rooms[room]
 	return ok
 }
 
-func (s *historyStore) List(room string, before int64, limit int) []Message {
-	s.calls = append(s.calls, historyCall{op: "list", room: room, before: before, limit: limit})
+func (s *HHistoryStore) List(room string, before int64, limit int) []Message {
+	s.calls = append(s.calls, HHistoryCall{op: "list", room: room, before: before, limit: limit})
 	newestFirst := append([]Message(nil), s.rooms[room]...)
 	sort.Slice(newestFirst, func(i, j int) bool { return newestFirst[i].Ts > newestFirst[j].Ts })
 	var out []Message
@@ -948,26 +948,26 @@ func (s *historyStore) List(room string, before int64, limit int) []Message {
 	return out
 }
 
-func (s *historyStore) listed() bool {
-	return slices.ContainsFunc(s.calls, func(c historyCall) bool { return c.op == "list" })
+func (s *HHistoryStore) listed() bool {
+	return slices.ContainsFunc(s.calls, func(c HHistoryCall) bool { return c.op == "list" })
 }
 
 // historyApp is the learner's server; every request gets a fresh store holding 120 messages in
 // room-7 (ts = 1000 .. 120000) plus one dated an hour from now, and an empty room "quiet".
-type historyApp struct {
+type HHistoryApp struct {
 	ctx    *harness.Ctx
 	client *harness.HTTP
-	store  *historyStore
+	store  *HHistoryStore
 }
 
-func newHistoryApp(ctx *harness.Ctx) *historyApp {
-	a := &historyApp{ctx: ctx}
+func hNewHistoryApp(ctx *harness.Ctx) *HHistoryApp {
+	a := &HHistoryApp{ctx: ctx}
 	a.reset()
 	a.client = ctx.Main(main).HTTP()
 	return a
 }
 
-func (a *historyApp) reset() {
+func (a *HHistoryApp) reset() {
 	room7 := make([]Message, 0, 121)
 	for i := 1; i <= 120; i++ {
 		user := "bo"
@@ -976,19 +976,19 @@ func (a *historyApp) reset() {
 		}
 		room7 = append(room7, Message{User: user, Text: fmt.Sprintf("message %d", i), Ts: int64(i) * 1000})
 	}
-	room7 = append(room7, Message{User: "cy", Text: "from the future", Ts: a.ctx.Clock.Now() + historyHourMs})
-	a.store = &historyStore{rooms: map[string][]Message{"room-7": room7, "quiet": {}}}
+	room7 = append(room7, Message{User: "cy", Text: "from the future", Ts: a.ctx.Clock.Now() + kHHistoryHourMs})
+	a.store = &HHistoryStore{rooms: map[string][]Message{"room-7": room7, "quiet": {}}}
 	store = a.store
 }
 
 // get sends GET path to a fresh store.
-func (a *historyApp) get(path string) *harness.Response {
+func (a *HHistoryApp) get(path string) *harness.Response {
 	a.reset()
 	return a.client.Get(path)
 }
 
 // historyBody is the JSON page: the whole object and its messages.
-func historyBody(ctx *harness.Ctx, r *harness.Response) (map[string]any, []map[string]any) {
+func hHistoryBody(ctx *harness.Ctx, r *harness.Response) (map[string]any, []map[string]any) {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be the JSON object {messages: [...], next_before: ...}, got %s", r.Text())
 	raw, ok := body["messages"].([]any)
@@ -1002,7 +1002,7 @@ func historyBody(ctx *harness.Ctx, r *harness.Response) (map[string]any, []map[s
 	return body, messages
 }
 
-func historyTs(messages []map[string]any) []int64 {
+func hHistoryTs(messages []map[string]any) []int64 {
 	ts := make([]int64, len(messages))
 	for i, m := range messages {
 		n, _ := m["ts"].(float64)
@@ -1011,7 +1011,7 @@ func historyTs(messages []map[string]any) []int64 {
 	return ts
 }
 
-func historyTsDown(from int64) []int64 {
+func hHistoryTsDown(from int64) []int64 {
 	ts := make([]int64, 10)
 	for i := range ts {
 		ts[i] = (from - int64(i)) * 1000
@@ -1020,21 +1020,21 @@ func historyTsDown(from int64) []int64 {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	r := newHistoryApp(ctx).get("/rooms/room-7/messages")
+	r := hNewHistoryApp(ctx).get("/rooms/room-7/messages")
 	ctx.Equal(r.Status, 200, "GET /rooms/room-7/messages")
 	ctx.Assert(strings.HasPrefix(r.Header.Get("Content-Type"), "application/json"), "Content-Type is %q, expected JSON", r.Header.Get("Content-Type"))
 	body, ok := r.JSON().(map[string]any)
 	_, hasMessages := body["messages"]
 	_, hasNext := body["next_before"]
 	ctx.Assert(ok && hasMessages && hasNext, "the body must be {messages: [...], next_before: ...}, got %s", r.Text())
-	_, messages := historyBody(ctx, r)
+	_, messages := hHistoryBody(ctx, r)
 	ctx.Equal(len(messages), 50, "the messages on the default page (limit = 50)")
 	first := messages[0]
 	ctx.Equal(first, map[string]any{"user": "bo", "text": "message 120", "ts": float64(120000)}, "the first message of the page must be the newest one (ts 120000)")
 }
 
 func CheckLimitBounds(ctx *harness.Ctx) {
-	a := newHistoryApp(ctx)
+	a := hNewHistoryApp(ctx)
 	for _, limit := range []int{0, 101, -5} {
 		r := a.get(fmt.Sprintf("/rooms/room-7/messages?limit=%d", limit))
 		ctx.Equal(r.Status, 400, "limit=%d", limit)
@@ -1044,16 +1044,16 @@ func CheckLimitBounds(ctx *harness.Ctx) {
 		limit, n := c[0], c[1]
 		r := a.get(fmt.Sprintf("/rooms/room-7/messages?limit=%d", limit))
 		ctx.Equal(r.Status, 200, "limit=%d is within 1-100", limit)
-		_, messages := historyBody(ctx, r)
+		_, messages := hHistoryBody(ctx, r)
 		ctx.Equal(len(messages), n, "the messages limit=%d returned", limit)
 	}
 }
 
 func CheckUnknownRoom(ctx *harness.Ctx) {
-	a := newHistoryApp(ctx)
+	a := hNewHistoryApp(ctx)
 	r := a.get("/rooms/nowhere/messages")
 	ctx.Equal(r.Status, 404, "an unknown room")
-	ctx.Assert(slices.Contains(a.store.calls, historyCall{op: "exists", room: "nowhere"}), "the handler must ask store.Exists(%q); the store saw %v", "nowhere", a.store.calls)
+	ctx.Assert(slices.Contains(a.store.calls, HHistoryCall{op: "exists", room: "nowhere"}), "the handler must ask store.Exists(%q); the store saw %v", "nowhere", a.store.calls)
 	ctx.Assert(!a.store.listed(), "an unknown room must not be listed, but the store saw %v", a.store.calls)
 	r = a.get("/rooms/nowhere/messages?limit=0")
 	ctx.Equal(r.Status, 400, "a bad limit on an unknown room (validate before the store lookup)")
@@ -1064,10 +1064,10 @@ func CheckUnknownRoom(ctx *harness.Ctx) {
 }
 
 func CheckNextBefore(ctx *harness.Ctx) {
-	a := newHistoryApp(ctx)
+	a := hNewHistoryApp(ctx)
 	r := a.client.Get("/rooms/room-7/messages?limit=10")
 	ctx.Equal(r.Status, 200, "GET ...?limit=10")
-	var lists []historyCall
+	var lists []HHistoryCall
 	for _, c := range a.store.calls {
 		if c.op == "list" {
 			lists = append(lists, c)
@@ -1077,23 +1077,23 @@ func CheckNextBefore(ctx *harness.Ctx) {
 	before := lists[0].before
 	now := ctx.Clock.Now()
 	ctx.Assert(before-now < 60000 && now-before < 60000, "without ?before the store was asked for ts < %d, expected about now (%d ms)", before, now)
-	body, messages := historyBody(ctx, r)
-	ctx.Equal(historyTs(messages), historyTsDown(120), "the ts on the first page (newest first, 'from the future' excluded because before defaults to now)")
+	body, messages := hHistoryBody(ctx, r)
+	ctx.Equal(hHistoryTs(messages), hHistoryTsDown(120), "the ts on the first page (newest first, 'from the future' excluded because before defaults to now)")
 	ctx.Equal(body["next_before"], 111000, "next_before must be the ts of the last message on the page")
 	r = a.client.Get("/rooms/room-7/messages?before=111000&limit=10")
 	ctx.Equal(r.Status, 200, "GET ...?before=111000&limit=10")
-	ctx.Equal(a.store.calls[len(a.store.calls)-1], historyCall{op: "list", room: "room-7", before: 111000, limit: 10}, "the second page must list (room-7, 111000, 10)")
-	body, messages = historyBody(ctx, r)
-	ctx.Equal(historyTs(messages), historyTsDown(110), "the ts on the second page")
+	ctx.Equal(a.store.calls[len(a.store.calls)-1], HHistoryCall{op: "list", room: "room-7", before: 111000, limit: 10}, "the second page must list (room-7, 111000, 10)")
+	body, messages = hHistoryBody(ctx, r)
+	ctx.Equal(hHistoryTs(messages), hHistoryTsDown(110), "the ts on the second page")
 	ctx.Equal(body["next_before"], 101000, "next_before of the second page")
 	r = a.client.Get("/rooms/room-7/messages?before=5000&limit=10")
-	body, messages = historyBody(ctx, r)
+	body, messages = hHistoryBody(ctx, r)
 	ctx.Equal(len(messages), 4, "before=5000 leaves 4 messages")
 	ctx.Equal(body["next_before"], nil, "a page shorter than limit is the last one: next_before must be null")
 }
 
 func CheckCacheControl(ctx *harness.Ctx) {
-	r := newHistoryApp(ctx).get("/rooms/room-7/messages?limit=5")
+	r := hNewHistoryApp(ctx).get("/rooms/room-7/messages?limit=5")
 	ctx.Equal(r.Status, 200, "GET /rooms/room-7/messages?limit=5")
 	value := r.Header.Get("Cache-Control")
 	ctx.Assert(value != "", "the response carries no Cache-Control header")
@@ -1117,18 +1117,18 @@ func CheckCacheControl(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr long long historyHourMs = 3600 * 1000;
+constexpr long long kHHistoryHourMs = 3600 * 1000;
 
 // One call the store saw: op "exists" (room) or "list" (room, before, limit).
-struct HistoryCall {
+struct HHistoryCall {
   std::string op;
   std::string room;
   long long before = 0;
   int limit = 0;
-  bool operator==(const HistoryCall& o) const {
+  bool operator==(const HHistoryCall& o) const {
     return std::tie(op, room, before, limit) == std::tie(o.op, o.room, o.before, o.limit);
   }
-  friend std::ostream& operator<<(std::ostream& out, const HistoryCall& c) {
+  friend std::ostream& operator<<(std::ostream& out, const HHistoryCall& c) {
     return out << "{" << c.op << " " << c.room << " " << c.before << " " << c.limit << "}";
   }
 };
@@ -1136,27 +1136,27 @@ struct HistoryCall {
 // The provided message store's contents and the calls it saw: every request gets a fresh store
 // holding 120 messages in room-7 (ts = 1000 .. 120000) plus one dated an hour from now, and an
 // empty room "quiet".
-std::map<std::string, std::vector<Message>> historyRooms;
-std::vector<HistoryCall> historyCalls;
+std::map<std::string, std::vector<Message>> hHistoryRooms;
+std::vector<HHistoryCall> hHistoryCalls;
 
-bool listed() {
-  return std::any_of(historyCalls.begin(), historyCalls.end(), [](const HistoryCall& c) { return c.op == "list"; });
+bool hListed() {
+  return std::any_of(hHistoryCalls.begin(), hHistoryCalls.end(), [](const HHistoryCall& c) { return c.op == "list"; });
 }
 
-struct HistoryApp {
+struct HHistoryApp {
   harness::Ctx& ctx;
   harness::HTTP client;
 
-  explicit HistoryApp(harness::Ctx& c) : ctx(c), client((reset(c), c.Main().HTTP())) {}
+  explicit HHistoryApp(harness::Ctx& c) : ctx(c), client((reset(c), c.Main().HTTP())) {}
 
   static void reset(harness::Ctx& ctx) {
     std::vector<Message> room7;
     for (int i = 1; i <= 120; i++) {
       room7.push_back(Message{i % 2 == 1 ? "ana" : "bo", "message " + std::to_string(i), static_cast<long long>(i) * 1000});
     }
-    room7.push_back(Message{"cy", "from the future", ctx.Clock.Now() + historyHourMs});
-    historyRooms = {{"room-7", room7}, {"quiet", {}}};
-    historyCalls.clear();
+    room7.push_back(Message{"cy", "from the future", ctx.Clock.Now() + kHHistoryHourMs});
+    hHistoryRooms = {{"room-7", room7}, {"quiet", {}}};
+    hHistoryCalls.clear();
   }
 
   // GET path to a fresh store.
@@ -1167,7 +1167,7 @@ struct HistoryApp {
 };
 
 // The JSON page: the whole object and its messages.
-std::pair<harness::Any, std::vector<harness::Any>> historyBody(harness::Ctx& ctx, const harness::Response& r) {
+std::pair<harness::Any, std::vector<harness::Any>> hHistoryBody(harness::Ctx& ctx, const harness::Response& r) {
   const auto body = harness::ParseJSON(r.Text());
   ctx.Assert(body && body->IsObject(), "the body must be the JSON object {messages: [...], next_before: ...}, got %s",
              r.Text());
@@ -1177,13 +1177,13 @@ std::pair<harness::Any, std::vector<harness::Any>> historyBody(harness::Ctx& ctx
   return {*body, raw.Items()};
 }
 
-std::vector<long long> historyTs(const std::vector<harness::Any>& messages) {
+std::vector<long long> hHistoryTs(const std::vector<harness::Any>& messages) {
   std::vector<long long> ts;
   for (const auto& m : messages) ts.push_back(m["ts"].Int());
   return ts;
 }
 
-std::vector<long long> historyTsDown(long long from) {
+std::vector<long long> hHistoryTsDown(long long from) {
   std::vector<long long> ts;
   for (long long i = 0; i < 10; i++) ts.push_back((from - i) * 1000);
   return ts;
@@ -1194,13 +1194,13 @@ std::vector<long long> historyTsDown(long long from) {
 // The provided message store and JSON writer the step's file declares: newest first, ts < before,
 // at most limit; every call recorded.
 bool MessageStore::exists(const std::string& room) {
-  historyCalls.push_back({"exists", room, 0, 0});
-  return historyRooms.count(room) > 0;
+  hHistoryCalls.push_back({"exists", room, 0, 0});
+  return hHistoryRooms.count(room) > 0;
 }
 
 std::vector<Message> MessageStore::list(const std::string& room, long long before, int limit) {
-  historyCalls.push_back({"list", room, before, limit});
-  std::vector<Message> newestFirst = historyRooms[room];
+  hHistoryCalls.push_back({"list", room, before, limit});
+  std::vector<Message> newestFirst = hHistoryRooms[room];
   std::stable_sort(newestFirst.begin(), newestFirst.end(), [](const Message& a, const Message& b) { return a.ts > b.ts; });
   std::vector<Message> out;
   for (const auto& m : newestFirst)
@@ -1219,7 +1219,7 @@ std::string json_array(const std::vector<Message>& messages) {
 }
 
 void CheckRoute(harness::Ctx& ctx) {
-  HistoryApp a(ctx);
+  HHistoryApp a(ctx);
   const auto r = a.get("/rooms/room-7/messages");
   ctx.Equal(r.Status, 200, "GET /rooms/room-7/messages");
   const std::string type = r.HeaderValue("Content-Type");
@@ -1227,7 +1227,7 @@ void CheckRoute(harness::Ctx& ctx) {
   const auto body = harness::ParseJSON(r.Text());
   ctx.Assert(body && body->IsObject() && body->Fields().count("messages") && body->Fields().count("next_before"),
              "the body must be {messages: [...], next_before: ...}, got %s", r.Text());
-  const auto [_, messages] = historyBody(ctx, r);
+  const auto [_, messages] = hHistoryBody(ctx, r);
   ctx.Equal(messages.size(), 50, "the messages on the default page (limit = 50)");
   ctx.Equal(messages[0], std::map<std::string, harness::Any>{{"user", harness::Any(std::string("bo"))},
                                                               {"text", harness::Any(std::string("message 120"))},
@@ -1236,31 +1236,31 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckLimitBounds(harness::Ctx& ctx) {
-  HistoryApp a(ctx);
+  HHistoryApp a(ctx);
   for (int limit : {0, 101, -5}) {
     const auto r = a.get("/rooms/room-7/messages?limit=" + std::to_string(limit));
     ctx.Equal(r.Status, 400, "limit=%d", limit);
-    ctx.Assert(historyCalls.empty(), "limit=%d must be rejected before touching the store, but the store saw %v", limit,
-               historyCalls);
+    ctx.Assert(hHistoryCalls.empty(), "limit=%d must be rejected before touching the store, but the store saw %v", limit,
+               hHistoryCalls);
   }
   for (int limit : {1, 100}) {
     const auto r = a.get("/rooms/room-7/messages?limit=" + std::to_string(limit));
     ctx.Equal(r.Status, 200, "limit=%d is within 1-100", limit);
-    const auto [_, messages] = historyBody(ctx, r);
+    const auto [_, messages] = hHistoryBody(ctx, r);
     ctx.Equal(messages.size(), limit, "the messages limit=%d returned", limit);
   }
 }
 
 void CheckUnknownRoom(harness::Ctx& ctx) {
-  HistoryApp a(ctx);
+  HHistoryApp a(ctx);
   auto r = a.get("/rooms/nowhere/messages");
   ctx.Equal(r.Status, 404, "an unknown room");
-  ctx.Assert(std::find(historyCalls.begin(), historyCalls.end(), HistoryCall{"exists", "nowhere", 0, 0}) != historyCalls.end(),
-             "the handler must ask store.exists(%q); the store saw %v", "nowhere", historyCalls);
-  ctx.Assert(!listed(), "an unknown room must not be listed, but the store saw %v", historyCalls);
+  ctx.Assert(std::find(hHistoryCalls.begin(), hHistoryCalls.end(), HHistoryCall{"exists", "nowhere", 0, 0}) != hHistoryCalls.end(),
+             "the handler must ask store.exists(%q); the store saw %v", "nowhere", hHistoryCalls);
+  ctx.Assert(!hListed(), "an unknown room must not be listed, but the store saw %v", hHistoryCalls);
   r = a.get("/rooms/nowhere/messages?limit=0");
   ctx.Equal(r.Status, 400, "a bad limit on an unknown room (validate before the store lookup)");
-  ctx.Assert(historyCalls.empty(), "a bad limit must be rejected before store.exists, but the store saw %v", historyCalls);
+  ctx.Assert(hHistoryCalls.empty(), "a bad limit must be rejected before store.exists, but the store saw %v", hHistoryCalls);
   r = a.get("/rooms/quiet/messages");
   ctx.Equal(r.Status, 200, "an existing but empty room");
   ctx.Equal(harness::ParseJSON(r.Text()),
@@ -1270,36 +1270,36 @@ void CheckUnknownRoom(harness::Ctx& ctx) {
 }
 
 void CheckNextBefore(harness::Ctx& ctx) {
-  HistoryApp a(ctx);
+  HHistoryApp a(ctx);
   auto r = a.client.Get("/rooms/room-7/messages?limit=10");
   ctx.Equal(r.Status, 200, "GET ...?limit=10");
-  std::vector<HistoryCall> lists;
-  for (const auto& c : historyCalls)
+  std::vector<HHistoryCall> lists;
+  for (const auto& c : hHistoryCalls)
     if (c.op == "list") lists.push_back(c);
   ctx.Assert(lists.size() == 1 && lists[0].room == "room-7" && lists[0].limit == 10,
-             "expected one store.list(%q, <now>, 10), the store saw %v", "room-7", historyCalls);
+             "expected one store.list(%q, <now>, 10), the store saw %v", "room-7", hHistoryCalls);
   const long long before = lists[0].before;
   const long long now = ctx.Clock.Now();
   ctx.Assert(before - now < 60000 && now - before < 60000,
              "without ?before the store was asked for ts < %d, expected about now (%d ms)", before, now);
-  auto [body, messages] = historyBody(ctx, r);
-  ctx.Equal(historyTs(messages), historyTsDown(120),
+  auto [body, messages] = hHistoryBody(ctx, r);
+  ctx.Equal(hHistoryTs(messages), hHistoryTsDown(120),
             "the ts on the first page (newest first, 'from the future' excluded because before defaults to now)");
   ctx.Equal(body["next_before"], 111000, "next_before must be the ts of the last message on the page");
   r = a.client.Get("/rooms/room-7/messages?before=111000&limit=10");
   ctx.Equal(r.Status, 200, "GET ...?before=111000&limit=10");
-  ctx.Equal(historyCalls.back(), HistoryCall{"list", "room-7", 111000, 10}, "the second page must list (room-7, 111000, 10)");
-  std::tie(body, messages) = historyBody(ctx, r);
-  ctx.Equal(historyTs(messages), historyTsDown(110), "the ts on the second page");
+  ctx.Equal(hHistoryCalls.back(), HHistoryCall{"list", "room-7", 111000, 10}, "the second page must list (room-7, 111000, 10)");
+  std::tie(body, messages) = hHistoryBody(ctx, r);
+  ctx.Equal(hHistoryTs(messages), hHistoryTsDown(110), "the ts on the second page");
   ctx.Equal(body["next_before"], 101000, "next_before of the second page");
   r = a.client.Get("/rooms/room-7/messages?before=5000&limit=10");
-  std::tie(body, messages) = historyBody(ctx, r);
+  std::tie(body, messages) = hHistoryBody(ctx, r);
   ctx.Equal(messages.size(), 4, "before=5000 leaves 4 messages");
   ctx.Equal(body["next_before"], nullptr, "a page shorter than limit is the last one: next_before must be null");
 }
 
 void CheckCacheControl(harness::Ctx& ctx) {
-  HistoryApp a(ctx);
+  HHistoryApp a(ctx);
   const auto r = a.get("/rooms/room-7/messages?limit=5");
   ctx.Equal(r.Status, 200, "GET /rooms/room-7/messages?limit=5");
   const std::string value = r.HeaderValue("Cache-Control");

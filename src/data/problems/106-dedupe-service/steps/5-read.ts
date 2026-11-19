@@ -906,10 +906,10 @@ func CheckHistory(ctx *harness.Ctx) {
 
 namespace {
 
-const nlohmann::json kStrong = {{"a", "r-1"}, {"b", "r-2"}, {"score", 0.97}, {"key_type", "email_hash"}};
-const nlohmann::json kWeak = {{"a", "r-2"}, {"b", "r-3"}, {"score", 0.62}, {"key_type", "fuzzy"}};
-const nlohmann::json kBeyond = {{"a", "r-3"}, {"b", "r-4"}, {"score", 0.95}, {"key_type", "phone_hash"}};
-const std::vector<nlohmann::json> kHistory = {
+const nlohmann::json kHStrong = {{"a", "r-1"}, {"b", "r-2"}, {"score", 0.97}, {"key_type", "email_hash"}};
+const nlohmann::json kHWeak = {{"a", "r-2"}, {"b", "r-3"}, {"score", 0.62}, {"key_type", "fuzzy"}};
+const nlohmann::json kHBeyond = {{"a", "r-3"}, {"b", "r-4"}, {"score", 0.95}, {"key_type", "phone_hash"}};
+const std::vector<nlohmann::json> kHHistory = {
     {{"at", "2026-11-02T09:00:00Z"}, {"action", "merge"}, {"a", "r-1"}, {"b", "r-2"}, {"by", "matcher"}},
     {{"at", "2026-11-02T09:05:00Z"}, {"action", "hold"}, {"a", "r-2"}, {"b", "r-3"}, {"by", "matcher"}},
 };
@@ -944,7 +944,7 @@ std::string h_without_id(std::string text, const std::string& id) {
 
 void CheckRoute(harness::Ctx& ctx) {
   auto c = h_api(ctx);
-  const std::string id = clusters::create("acme", "r-1", {kStrong}, {kHistory[0]});
+  const std::string id = clusters::create("acme", "r-1", {kHStrong}, {kHHistory[0]});
   const auto r = h_read(c, id);
   ctx.Equal(r.Status, 200, "GET /v1/clusters/%s (%s)", id, r.Text());
   const auto b = h_body(r);
@@ -961,7 +961,7 @@ void CheckTenantScope(harness::Ctx& ctx) {
   ctx.Equal(missing.Status, 404, "a cluster that does not exist; the status");
   ctx.Assert(h_without_id(r.Text(), foreign) == h_without_id(missing.Text(), "c-404"),
              "another tenant's cluster answered %s and a missing one %s: the difference tells a caller the id exists. Answer both the same", r.Text(), missing.Text());
-  const std::string own = clusters::create("acme", "r-1", {kStrong}, {});
+  const std::string own = clusters::create("acme", "r-1", {kHStrong}, {});
   r = h_read(c, own, "");
   ctx.Equal(r.Status, 401, "a read without X-Tenant-Id (%s); the status", r.Text());
   r = h_read(c, own, "acme");
@@ -970,14 +970,14 @@ void CheckTenantScope(harness::Ctx& ctx) {
 
 void CheckWeakPair(harness::Ctx& ctx) {
   auto c = h_api(ctx);
-  const std::string id = clusters::create("acme", "r-1", {kStrong, kWeak, kBeyond}, kHistory);
+  const std::string id = clusters::create("acme", "r-1", {kHStrong, kHWeak, kHBeyond}, kHHistory);
   const auto r = h_read(c, id);
   ctx.Equal(r.Status, 200, "the read (%s)", r.Text());
   auto b = h_body(r);
   ctx.Assert(h_field(b, "members") == nlohmann::json{"r-1", "r-2"},
              "r-1–r-2 scores 0.97 and r-2–r-3 only 0.62, and the cluster's members are %s: a pair below kMinMergeConfidence = 0.85 bridged r-3 and r-4 in. Expected [r-1, r-2]",
              h_field(b, "members").dump());
-  ctx.Equal(h_field(b, "review"), nlohmann::json::array({kWeak}), "the weak pair must wait under review; review");
+  ctx.Equal(h_field(b, "review"), nlohmann::json::array({kHWeak}), "the weak pair must wait under review; review");
   const nlohmann::json at = {{"a", "r-5"}, {"b", "r-6"}, {"score", 0.85}, {"key_type", "email_hash"}};
   const nlohmann::json under = {{"a", "r-6"}, {"b", "r-7"}, {"score", 0.84}, {"key_type", "fuzzy"}};
   const nlohmann::json far = {{"a", "r-8"}, {"b", "r-9"}, {"score", 0.5}, {"key_type", "fuzzy"}};
@@ -990,14 +990,14 @@ void CheckWeakPair(harness::Ctx& ctx) {
 
 void CheckEvidence(harness::Ctx& ctx) {
   auto c = h_api(ctx);
-  const std::string id = clusters::create("acme", "r-1", {kStrong, kWeak, kBeyond}, kHistory);
+  const std::string id = clusters::create("acme", "r-1", {kHStrong, kHWeak, kHBeyond}, kHHistory);
   const auto r = h_read(c, id);
   const auto b = h_body(r);
   ctx.Assert(b.contains("evidence"), "the cluster answered %s: no evidence, so nobody can see why r-2 is a member", r.Text());
-  ctx.Equal(h_field(b, "evidence"), nlohmann::json::array({kStrong}), "the evidence must be the one strong pair between members as stored");
-  ctx.Equal(h_field(b, "review"), nlohmann::json::array({kWeak}), "review must hold the weak pair");
+  ctx.Equal(h_field(b, "evidence"), nlohmann::json::array({kHStrong}), "the evidence must be the one strong pair between members as stored");
+  ctx.Equal(h_field(b, "review"), nlohmann::json::array({kHWeak}), "review must hold the weak pair");
   const std::vector<nlohmann::json> triangle = {
-      kStrong, {{"a", "r-2"}, {"b", "r-5"}, {"score", 0.9}, {"key_type", "phone_hash"}}, {{"a", "r-1"}, {"b", "r-5"}, {"score", 0.88}, {"key_type", "content_hash"}}};
+      kHStrong, {{"a", "r-2"}, {"b", "r-5"}, {"score", 0.9}, {"key_type", "phone_hash"}}, {{"a", "r-1"}, {"b", "r-5"}, {"score", 0.88}, {"key_type", "content_hash"}}};
   const auto closed = h_body(h_read(c, clusters::create("acme", "r-1", triangle, {})));
   ctx.Equal(h_field(closed, "evidence"), nlohmann::json(triangle),
             "r-1, r-2 and r-5 are linked by three strong pairs: every strong pair between members is evidence, as stored, not only the ones that added a member; the evidence");
@@ -1005,9 +1005,9 @@ void CheckEvidence(harness::Ctx& ctx) {
 
 void CheckHistory(harness::Ctx& ctx) {
   auto c = h_api(ctx);
-  const std::string id = clusters::create("acme", "r-1", {kStrong, kWeak}, kHistory);
+  const std::string id = clusters::create("acme", "r-1", {kHStrong, kHWeak}, kHHistory);
   const auto b = h_body(h_read(c, id));
-  ctx.Equal(h_field(b, "history"), nlohmann::json(kHistory), "the cluster's history must be the stored merge actions, oldest first");
+  ctx.Equal(h_field(b, "history"), nlohmann::json(kHHistory), "the cluster's history must be the stored merge actions, oldest first");
 }
 `,
   },

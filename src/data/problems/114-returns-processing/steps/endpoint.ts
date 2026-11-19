@@ -907,24 +907,24 @@ import (
 	"leetbuild/harness"
 )
 
-const apiTenant = "t-1"
+const kHApiTenant = "t-1"
 
-var apiBg = context.Background()
+var hApiBg = context.Background()
 
-func apiLine(lineID string, daysAgo int, window string, ordered int64) {
-	store.PutLine(apiBg, store.OrderLine{
-		OrderLineID: lineID, Tenant: apiTenant, SKU: "KETTLE-2L", OrderedQuantity: ordered, UnitPriceCents: 4000,
+func hApiLine(lineID string, daysAgo int, window string, ordered int64) {
+	store.PutLine(hApiBg, store.OrderLine{
+		OrderLineID: lineID, Tenant: kHApiTenant, SKU: "KETTLE-2L", OrderedQuantity: ordered, UnitPriceCents: 4000,
 		DeliveredAt: store.AddDays(store.Today(), -daysAgo), PolicyWindow: window,
 	})
 }
 
-func apiServer(ctx *harness.Ctx) *harness.HTTP {
+func hApiServer(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiPost(c *harness.HTTP, lineID string, quantity int, reason, photo, tenant string, extra map[string]any) *harness.Response {
+func hApiPost(c *harness.HTTP, lineID string, quantity int, reason, photo, tenant string, extra map[string]any) *harness.Response {
 	body := map[string]any{"order_line_id": lineID, "quantity": quantity, "reason_code": reason}
 	if photo != "" {
 		body["photo_ref"] = photo
@@ -935,107 +935,107 @@ func apiPost(c *harness.HTTP, lineID string, quantity int, reason, photo, tenant
 	return c.Post("/v1/returns", body, "X-Tenant-Id", tenant)
 }
 
-func apiJSON(r *harness.Response) map[string]any {
+func hApiJSON(r *harness.Response) map[string]any {
 	var v map[string]any
 	json.Unmarshal([]byte(r.Text()), &v)
 	return v
 }
 
-func apiLeft(ctx *harness.Ctx, lineID string) int {
+func hApiLeft(ctx *harness.Ctx, lineID string) int {
 	v, _ := ctx.Redis.Get("line:" + lineID + ":returnable")
 	n, _ := strconv.Atoi(v)
 	return n
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	apiLine("L1", 3, "standard", 2)
-	c := apiServer(ctx)
-	r := apiPost(c, "L1", 1, "changed_mind", "", apiTenant, nil)
+	hApiLine("L1", 3, "standard", 2)
+	c := hApiServer(ctx)
+	r := hApiPost(c, "L1", 1, "changed_mind", "", kHApiTenant, nil)
 	ctx.Equal(r.Status, 201, "POST /v1/returns for a line delivered 3 days ago (%s)", r.Text())
-	body := apiJSON(r)
+	body := hApiJSON(r)
 	returnID, _ := body["return_id"].(string)
 	ctx.Assert(body["quantity"] == float64(1) && body["state"] == "registered" && returnID != "", "the 201 must carry return_id, quantity 1 and state registered, got %s", r.Text())
 	record := ctx.Redis.HGetAll("return:" + returnID)
-	ctx.Assert(record["order_line_id"] == "L1" && record["tenant"] == apiTenant && record["state"] == "registered", "return:%s holds %v", returnID, record)
-	ctx.Equal(apiLeft(ctx, "L1"), 1, "the line's returnable units after a return of 1 of 2")
-	other := apiPost(c, "L1", 1, "changed_mind", "", "t-2", nil)
+	ctx.Assert(record["order_line_id"] == "L1" && record["tenant"] == kHApiTenant && record["state"] == "registered", "return:%s holds %v", returnID, record)
+	ctx.Equal(hApiLeft(ctx, "L1"), 1, "the line's returnable units after a return of 1 of 2")
+	other := hApiPost(c, "L1", 1, "changed_mind", "", "t-2", nil)
 	ctx.Equal(other.Status, 404, "another tenant's order line")
-	unknown := apiPost(c, "L-404", 1, "changed_mind", "", apiTenant, nil)
+	unknown := hApiPost(c, "L-404", 1, "changed_mind", "", kHApiTenant, nil)
 	ctx.Equal(unknown.Status, 404, "an unknown order line")
 }
 
 func CheckWindow(ctx *harness.Ctx) {
-	apiLine("L-ext", 45, "extended", 2)
-	apiLine("L-30", 30, "standard", 2)
-	apiLine("L-31", 31, "standard", 2)
-	apiLine("L-60", 60, "extended", 2)
-	apiLine("L-61", 61, "extended", 2)
-	c := apiServer(ctx)
-	r := apiPost(c, "L-ext", 1, "changed_mind", "", apiTenant, nil)
+	hApiLine("L-ext", 45, "extended", 2)
+	hApiLine("L-30", 30, "standard", 2)
+	hApiLine("L-31", 31, "standard", 2)
+	hApiLine("L-60", 60, "extended", 2)
+	hApiLine("L-61", 61, "extended", 2)
+	c := hApiServer(ctx)
+	r := hApiPost(c, "L-ext", 1, "changed_mind", "", kHApiTenant, nil)
 	ctx.Equal(r.Status, 201, "an extended line delivered 45 days ago (a 60-day window) must be returnable: the window is the line's policy_window (%s)", r.Text())
-	r = apiPost(c, "L-60", 1, "changed_mind", "", apiTenant, nil)
+	r = hApiPost(c, "L-60", 1, "changed_mind", "", kHApiTenant, nil)
 	ctx.Equal(r.Status, 201, "an extended line delivered 60 days ago is on the last day of its window (%s)", r.Text())
-	lateExt := apiPost(c, "L-61", 1, "changed_mind", "", apiTenant, nil)
-	r = apiPost(c, "L-30", 1, "changed_mind", "", apiTenant, nil)
+	lateExt := hApiPost(c, "L-61", 1, "changed_mind", "", kHApiTenant, nil)
+	r = hApiPost(c, "L-30", 1, "changed_mind", "", kHApiTenant, nil)
 	ctx.Equal(r.Status, 201, "a standard line delivered 30 days ago is on the last day of its window (%s)", r.Text())
-	r = apiPost(c, "L-31", 1, "changed_mind", "", apiTenant, nil)
+	r = hApiPost(c, "L-31", 1, "changed_mind", "", kHApiTenant, nil)
 	ctx.Equal(r.Status, 422, "a standard line delivered 31 days ago")
-	delivered := store.LineOf(apiBg, "L-31").DeliveredAt
-	body := apiJSON(r)
+	delivered := store.LineOf(hApiBg, "L-31").DeliveredAt
+	body := hApiJSON(r)
 	ctx.Assert(body["delivered_at"] == delivered && body["window_ends"] == store.AddDays(delivered, 30), "the 422 must carry delivered_at %s and window_ends %s, got %s", delivered, store.AddDays(delivered, 30), r.Text())
-	ctx.Equal(apiLeft(ctx, "L-31"), 2, "a return outside the window must not take units; the line's returnable units")
+	ctx.Equal(hApiLeft(ctx, "L-31"), 2, "a return outside the window must not take units; the line's returnable units")
 	ctx.Equal(lateExt.Status, 422, "an extended line delivered 61 days ago (its 60-day window has closed)")
-	delivered = store.LineOf(apiBg, "L-61").DeliveredAt
-	body = apiJSON(lateExt)
+	delivered = store.LineOf(hApiBg, "L-61").DeliveredAt
+	body = hApiJSON(lateExt)
 	ctx.Assert(body["delivered_at"] == delivered && body["window_ends"] == store.AddDays(delivered, 60), "the 422 for an extended line must carry delivered_at %s and window_ends %s, got %s", delivered, store.AddDays(delivered, 60), lateExt.Text())
-	ctx.Equal(apiLeft(ctx, "L-61"), 2, "a return outside the extended window must not take units; the line's returnable units")
+	ctx.Equal(hApiLeft(ctx, "L-61"), 2, "a return outside the extended window must not take units; the line's returnable units")
 }
 
 func CheckNoClientFlag(ctx *harness.Ctx) {
-	apiLine("L1", 40, "standard", 2)
-	r := apiPost(apiServer(ctx), "L1", 1, "changed_mind", "", apiTenant, map[string]any{"eligible": true})
+	hApiLine("L1", 40, "standard", 2)
+	r := hApiPost(hApiServer(ctx), "L1", 1, "changed_mind", "", kHApiTenant, map[string]any{"eligible": true})
 	ctx.Equal(r.Status, 422, "a standard line delivered 40 days ago, asked with eligible: true in the body (the caller reopened a closed window; eligibility comes from the line, not the request)")
-	ctx.Assert(apiLeft(ctx, "L1") == 2 && len(ctx.Redis.Keys("return:ret-*")) == 0, "the refused return still took units (%d of 2 left) or left a record", apiLeft(ctx, "L1"))
+	ctx.Assert(hApiLeft(ctx, "L1") == 2 && len(ctx.Redis.Keys("return:ret-*")) == 0, "the refused return still took units (%d of 2 left) or left a record", hApiLeft(ctx, "L1"))
 }
 
 func CheckQuantity(ctx *harness.Ctx) {
-	apiLine("L1", 3, "standard", 2)
-	c := apiServer(ctx)
+	hApiLine("L1", 3, "standard", 2)
+	c := hApiServer(ctx)
 	for _, bad := range []int{0, -2} {
-		r := apiPost(c, "L1", bad, "changed_mind", "", apiTenant, nil)
+		r := hApiPost(c, "L1", bad, "changed_mind", "", kHApiTenant, nil)
 		ctx.Equal(r.Status, 400, "quantity %d", bad)
-		ctx.Equal(apiLeft(ctx, "L1"), 2, "quantity %d must leave the line alone (a negative return hands units back); the returnable units", bad)
+		ctx.Equal(hApiLeft(ctx, "L1"), 2, "quantity %d must leave the line alone (a negative return hands units back); the returnable units", bad)
 	}
-	r := apiPost(c, "L1", 3, "changed_mind", "", apiTenant, nil)
-	ctx.Assert(r.Status == 409 && apiJSON(r)["remaining"] == float64(2), "3 units of a line with 2 returnable answered %d %s, expected 409 with remaining 2", r.Status, r.Text())
-	r = apiPost(c, "L1", 2, "changed_mind", "", apiTenant, nil)
+	r := hApiPost(c, "L1", 3, "changed_mind", "", kHApiTenant, nil)
+	ctx.Assert(r.Status == 409 && hApiJSON(r)["remaining"] == float64(2), "3 units of a line with 2 returnable answered %d %s, expected 409 with remaining 2", r.Status, r.Text())
+	r = hApiPost(c, "L1", 2, "changed_mind", "", kHApiTenant, nil)
 	ctx.Equal(r.Status, 201, "2 units of a line with 2 returnable (%s)", r.Text())
-	r = apiPost(c, "L1", 1, "changed_mind", "", apiTenant, nil)
-	ctx.Assert(r.Status == 409 && apiJSON(r)["remaining"] == float64(0), "a line with nothing left answered %d %s, expected 409 with remaining 0", r.Status, r.Text())
+	r = hApiPost(c, "L1", 1, "changed_mind", "", kHApiTenant, nil)
+	ctx.Assert(r.Status == 409 && hApiJSON(r)["remaining"] == float64(0), "a line with nothing left answered %d %s, expected 409 with remaining 0", r.Status, r.Text())
 }
 
 func CheckReasonPhoto(ctx *harness.Ctx) {
-	apiLine("L1", 3, "standard", 5)
-	c := apiServer(ctx)
-	r := apiPost(c, "L1", 1, "it_was_late", "", apiTenant, nil)
+	hApiLine("L1", 3, "standard", 5)
+	c := hApiServer(ctx)
+	r := hApiPost(c, "L1", 1, "it_was_late", "", kHApiTenant, nil)
 	ctx.Equal(r.Status, 400, "reason_code it_was_late (the reason codes are a fixed set)")
 	for _, reason := range []string{"damaged", "wrong_item", "not_as_described"} {
-		r = apiPost(c, "L1", 1, reason, "", apiTenant, nil)
+		r = hApiPost(c, "L1", 1, reason, "", kHApiTenant, nil)
 		ctx.Equal(r.Status, 400, "a %s claim without a photo_ref", reason)
 	}
-	r = apiPost(c, "L1", 1, "damaged", "", apiTenant, map[string]any{"photo_ref": ""})
+	r = hApiPost(c, "L1", 1, "damaged", "", kHApiTenant, map[string]any{"photo_ref": ""})
 	ctx.Equal(r.Status, 400, "a damaged claim with an empty photo_ref (an empty reference is no evidence)")
-	ctx.Equal(apiLeft(ctx, "L1"), 5, "a refused claim must not take units; the returnable units")
-	r = apiPost(c, "L1", 1, "damaged", "photos/kettle-dent.jpg", apiTenant, nil)
+	ctx.Equal(hApiLeft(ctx, "L1"), 5, "a refused claim must not take units; the returnable units")
+	r = hApiPost(c, "L1", 1, "damaged", "photos/kettle-dent.jpg", kHApiTenant, nil)
 	ctx.Equal(r.Status, 201, "a damaged claim with a photo (%s)", r.Text())
-	returnID, _ := apiJSON(r)["return_id"].(string)
+	returnID, _ := hApiJSON(r)["return_id"].(string)
 	stored, _ := ctx.Redis.HGet("return:"+returnID, "photo_ref")
 	ctx.Equal(stored, "photos/kettle-dent.jpg", "the return's photo_ref")
 	for _, reason := range []string{"wrong_item", "not_as_described"} {
-		r = apiPost(c, "L1", 1, reason, "photos/kettle-box.jpg", apiTenant, nil)
+		r = hApiPost(c, "L1", 1, reason, "photos/kettle-box.jpg", kHApiTenant, nil)
 		ctx.Equal(r.Status, 201, "a %s claim with a photo (%s)", reason, r.Text())
 	}
-	r = apiPost(c, "L1", 1, "late_delivery", "", apiTenant, nil)
+	r = hApiPost(c, "L1", 1, "late_delivery", "", kHApiTenant, nil)
 	ctx.Equal(r.Status, 201, "late_delivery needs no photo (%s)", r.Text())
 }
 `,

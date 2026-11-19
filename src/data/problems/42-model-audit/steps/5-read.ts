@@ -669,9 +669,9 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func chainedRecord(ctx *harness.Ctx, n int, tenant string) string {
+func hChainedRecord(ctx *harness.Ctx, n int, tenant string) string {
 	fields := map[string]any{
 		"model_version":   "risk-v7",
 		"policy_id":       "refunds-2026-10",
@@ -679,21 +679,21 @@ func chainedRecord(ctx *harness.Ctx, n int, tenant string) string {
 		"decision_digest": digest.Sha256Hex(fmt.Sprintf("out-%d", n)),
 		"recorded_at":     fmt.Sprint(1700000000000 + n),
 	}
-	record, err := ledger.Insert(readBg, tenant, fields)
+	record, err := ledger.Insert(hReadBg, tenant, fields)
 	ctx.NoError(err, "the ledger insert failed")
-	entry, err := chain.AppendEntry(readBg, tenant, record.ID, ledger.RecordDigest(record))
+	entry, err := chain.AppendEntry(hReadBg, tenant, record.ID, ledger.RecordDigest(record))
 	ctx.NoError(err, "the chain append failed")
-	ledger.SetPosition(readBg, record.ID, entry.Position)
+	ledger.SetPosition(hReadBg, record.ID, entry.Position)
 	return record.ID
 }
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func verifyAs(c *harness.HTTP, recordID, tenant, query string) *harness.Response {
+func hVerifyAs(c *harness.HTTP, recordID, tenant, query string) *harness.Response {
 	path := "/v1/audit/decisions/" + recordID + "/verify" + query
 	if tenant == "" {
 		return c.Get(path)
@@ -701,54 +701,54 @@ func verifyAs(c *harness.HTTP, recordID, tenant, query string) *harness.Response
 	return c.Get(path, "X-Tenant-Id", tenant)
 }
 
-func bodyOf(r *harness.Response) map[string]any {
+func hBodyOf(r *harness.Response) map[string]any {
 	body, _ := r.JSON().(map[string]any)
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	ids := []string{chainedRecord(ctx, 1, "t1"), chainedRecord(ctx, 2, "t1"), chainedRecord(ctx, 3, "t1")}
-	r := verifyAs(readAPI(ctx), ids[0], "t1", "")
+	ids := []string{hChainedRecord(ctx, 1, "t1"), hChainedRecord(ctx, 2, "t1"), hChainedRecord(ctx, 3, "t1")}
+	r := hVerifyAs(hReadAPI(ctx), ids[0], "t1", "")
 	ctx.Equal(r.Status, 200, "GET /v1/audit/decisions/%s/verify (%s)", ids[0], r.Text())
-	body := bodyOf(r)
+	body := hBodyOf(r)
 	ctx.Assert(body["record_id"] == ids[0] && body["valid"] == true, "an intact chain must verify: %s", r.Text())
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	mine := chainedRecord(ctx, 1, "t1")
-	chainedRecord(ctx, 1, "t2")
-	ctx.Equal(verifyAs(c, mine, "", "?tenant=t1").Status, 401, "a verify without X-Tenant-Id (naming ?tenant=t1): the tenant is the header, never a parameter; the status")
-	foreign := verifyAs(c, mine, "t2", "")
+	c := hReadAPI(ctx)
+	mine := hChainedRecord(ctx, 1, "t1")
+	hChainedRecord(ctx, 1, "t2")
+	ctx.Equal(hVerifyAs(c, mine, "", "?tenant=t1").Status, 401, "a verify without X-Tenant-Id (naming ?tenant=t1): the tenant is the header, never a parameter; the status")
+	foreign := hVerifyAs(c, mine, "t2", "")
 	ctx.Equal(foreign.Status, 404, "tenant t2 verifying t1's record (%s): another tenant's record is 404, exactly like a missing one; the status", foreign.Text())
-	spoofed := verifyAs(c, mine, "t2", "?tenant=t1")
+	spoofed := hVerifyAs(c, mine, "t2", "?tenant=t1")
 	ctx.Equal(spoofed.Status, 404, "tenant t2 naming ?tenant=t1 (%s): the tenant is the header, not a parameter; the status", spoofed.Text())
-	missing := verifyAs(c, "d-404", "t2", "")
+	missing := hVerifyAs(c, "d-404", "t2", "")
 	ctx.Equal(missing.Status, 404, "a missing record; the status")
 	ctx.Equal(strings.ReplaceAll(foreign.Text(), mine, "{id}"), strings.ReplaceAll(missing.Text(), "d-404", "{id}"), "t2 asking for t1's record and for a missing one must get the same answer, or a caller learns which records exist; the answers")
-	own := verifyAs(c, mine, "t1", "")
-	ctx.Assert(own.Status == 200 && bodyOf(own)["valid"] == true, "t1 verifying its own record answered %d %s", own.Status, own.Text())
+	own := hVerifyAs(c, mine, "t1", "")
+	ctx.Assert(own.Status == 200 && hBodyOf(own)["valid"] == true, "t1 verifying its own record answered %d %s", own.Status, own.Text())
 }
 
 func CheckRecordDigest(ctx *harness.Ctx) {
-	ids := []string{chainedRecord(ctx, 1, "t1"), chainedRecord(ctx, 2, "t1"), chainedRecord(ctx, 3, "t1")}
+	ids := []string{hChainedRecord(ctx, 1, "t1"), hChainedRecord(ctx, 2, "t1"), hChainedRecord(ctx, 3, "t1")}
 	// The ledger row of record 2 is rewritten after it was chained.
 	ctx.Redis.Do("HSET", "audit:rec:"+ids[1], "decision_digest", digest.Sha256Hex("decision:deny"))
-	c := readAPI(ctx)
-	body := bodyOf(verifyAs(c, ids[1], "t1", ""))
+	c := hReadAPI(ctx)
+	body := hBodyOf(hVerifyAs(c, ids[1], "t1", ""))
 	ctx.Assert(body["valid"] == false && body["first_divergence"] == float64(2), "with record 2's ledger row rewritten the verify answered %v: the row must still hash to the record_digest the chain holds at its position", body)
-	clean := bodyOf(verifyAs(c, ids[0], "t1", ""))
+	clean := hBodyOf(hVerifyAs(c, ids[0], "t1", ""))
 	ctx.Equal(clean["valid"], true, "record 1 is untouched (%v); its valid", clean)
 }
 
 func CheckWalkChain(ctx *harness.Ctx) {
 	var ids []string
 	for n := 1; n <= 4; n++ {
-		ids = append(ids, chainedRecord(ctx, n, "t1"))
+		ids = append(ids, hChainedRecord(ctx, n, "t1"))
 	}
 	// Someone rewrites the chain entry at position 3.
 	ctx.Redis.Do("HSET", "audit:chain:t1", "rec:3", digest.Sha256Hex("forged"))
-	body := bodyOf(verifyAs(readAPI(ctx), ids[0], "t1", ""))
+	body := hBodyOf(hVerifyAs(hReadAPI(ctx), ids[0], "t1", ""))
 	ctx.Equal(body["valid"], false, "with position 3 of the chain rewritten, verifying record 1 (%v) must recompute every link from the record to the last; valid", body)
 	ctx.Equal(body["first_divergence"], 3, "the first divergence is position 3 (%v)", body)
 }
@@ -756,9 +756,9 @@ func CheckWalkChain(ctx *harness.Ctx) {
 func CheckCoverage(ctx *harness.Ctx) {
 	var ids []string
 	for n := 1; n <= 4; n++ {
-		ids = append(ids, chainedRecord(ctx, n, "t1"))
+		ids = append(ids, hChainedRecord(ctx, n, "t1"))
 	}
-	body := bodyOf(verifyAs(readAPI(ctx), ids[1], "t1", ""))
+	body := hBodyOf(hVerifyAs(hReadAPI(ctx), ids[1], "t1", ""))
 	want := map[string]any{"record_id": ids[1], "valid": true, "chain_length": float64(3), "first_divergence": nil, "head_position": float64(4)}
 	ctx.Equal(body, want, "verifying record 2 of 4: the answer says how many links it verified and where the first failure was")
 }
@@ -772,7 +772,7 @@ func CheckCoverage(ctx *harness.Ctx) {
 
 namespace {
 
-std::string chainedRecord(int n, const std::string& tenant) {
+std::string hChainedRecord(int n, const std::string& tenant) {
   const ledger::Decision record = ledger::insert(tenant, {{"model_version", "risk-v7"},
                                                           {"policy_id", "refunds-2026-10"},
                                                           {"input_digest", sha256_hex("in-" + std::to_string(n))},
@@ -783,7 +783,7 @@ std::string chainedRecord(int n, const std::string& tenant) {
   return record.id;
 }
 
-harness::HTTP readApi(harness::Ctx& ctx) {
+harness::HTTP hReadApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -791,16 +791,16 @@ harness::HTTP readApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response verifyAs(harness::HTTP& c, const std::string& record_id, const std::string& tenant, const std::string& query = "") {
+harness::Response hVerifyAs(harness::HTTP& c, const std::string& record_id, const std::string& tenant, const std::string& query = "") {
   const std::string path = "/v1/audit/decisions/" + record_id + "/verify" + query;
   if (tenant.empty()) return c.Get(path);
   return c.Get(path, "X-Tenant-Id", tenant);
 }
 
-json bodyOf(const harness::Response& r) { return json::parse(r.Text(), nullptr, false); }
+json hBodyOf(const harness::Response& r) { return json::parse(r.Text(), nullptr, false); }
 
 // The answer with the record id replaced, so that answers about two different ids compare.
-std::string withoutId(std::string text, const std::string& id) {
+std::string hWithoutId(std::string text, const std::string& id) {
   for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at + 4)) text.replace(at, id.size(), "{id}");
   return text;
 }
@@ -808,57 +808,57 @@ std::string withoutId(std::string text, const std::string& id) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  const std::vector<std::string> ids = {chainedRecord(1, "t1"), chainedRecord(2, "t1"), chainedRecord(3, "t1")};
-  auto c = readApi(ctx);
-  const auto r = verifyAs(c, ids[0], "t1");
+  const std::vector<std::string> ids = {hChainedRecord(1, "t1"), hChainedRecord(2, "t1"), hChainedRecord(3, "t1")};
+  auto c = hReadApi(ctx);
+  const auto r = hVerifyAs(c, ids[0], "t1");
   ctx.Equal(r.Status, 200, "GET /v1/audit/decisions/%s/verify (%s)", ids[0], r.Text());
-  const json body = bodyOf(r);
+  const json body = hBodyOf(r);
   ctx.Assert(body.is_object() && body.value("record_id", "") == ids[0] && body.value("valid", false), "an intact chain must verify: %s", r.Text());
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const std::string mine = chainedRecord(1, "t1");
-  chainedRecord(1, "t2");
-  ctx.Equal(verifyAs(c, mine, "", "?tenant=t1").Status, 401, "a verify without X-Tenant-Id (naming ?tenant=t1): the tenant is the header, never a parameter; the status");
-  const auto foreign = verifyAs(c, mine, "t2");
+  auto c = hReadApi(ctx);
+  const std::string mine = hChainedRecord(1, "t1");
+  hChainedRecord(1, "t2");
+  ctx.Equal(hVerifyAs(c, mine, "", "?tenant=t1").Status, 401, "a verify without X-Tenant-Id (naming ?tenant=t1): the tenant is the header, never a parameter; the status");
+  const auto foreign = hVerifyAs(c, mine, "t2");
   ctx.Equal(foreign.Status, 404, "tenant t2 verifying t1's record (%s): another tenant's record is 404, exactly like a missing one; the status", foreign.Text());
-  const auto spoofed = verifyAs(c, mine, "t2", "?tenant=t1");
+  const auto spoofed = hVerifyAs(c, mine, "t2", "?tenant=t1");
   ctx.Equal(spoofed.Status, 404, "tenant t2 naming ?tenant=t1 (%s): the tenant is the header, not a parameter; the status", spoofed.Text());
-  const auto missing = verifyAs(c, "d-404", "t2");
+  const auto missing = hVerifyAs(c, "d-404", "t2");
   ctx.Equal(missing.Status, 404, "a missing record; the status");
-  ctx.Equal(withoutId(foreign.Text(), mine), withoutId(missing.Text(), "d-404"), "t2 asking for t1's record and for a missing one must get the same answer, or a caller learns which records exist; the answers");
-  const auto own = verifyAs(c, mine, "t1");
-  ctx.Assert(own.Status == 200 && bodyOf(own).value("valid", false), "t1 verifying its own record answered %d %s", own.Status, own.Text());
+  ctx.Equal(hWithoutId(foreign.Text(), mine), hWithoutId(missing.Text(), "d-404"), "t2 asking for t1's record and for a missing one must get the same answer, or a caller learns which records exist; the answers");
+  const auto own = hVerifyAs(c, mine, "t1");
+  ctx.Assert(own.Status == 200 && hBodyOf(own).value("valid", false), "t1 verifying its own record answered %d %s", own.Status, own.Text());
 }
 
 void CheckRecordDigest(harness::Ctx& ctx) {
-  const std::vector<std::string> ids = {chainedRecord(1, "t1"), chainedRecord(2, "t1"), chainedRecord(3, "t1")};
+  const std::vector<std::string> ids = {hChainedRecord(1, "t1"), hChainedRecord(2, "t1"), hChainedRecord(3, "t1")};
   // The ledger row of record 2 is rewritten after it was chained.
   ctx.Redis.Do("HSET", "audit:rec:" + ids[1], "decision_digest", sha256_hex("decision:deny"));
-  auto c = readApi(ctx);
-  const json body = bodyOf(verifyAs(c, ids[1], "t1"));
+  auto c = hReadApi(ctx);
+  const json body = hBodyOf(hVerifyAs(c, ids[1], "t1"));
   ctx.Assert(body.is_object() && body.value("valid", true) == false && body.value("first_divergence", json()) == json(2), "with record 2's ledger row rewritten the verify answered %s: the row must still hash to the record_digest the chain holds at its position", body.dump());
-  const json clean = bodyOf(verifyAs(c, ids[0], "t1"));
+  const json clean = hBodyOf(hVerifyAs(c, ids[0], "t1"));
   ctx.Assert(clean.value("valid", false), "record 1 is untouched but its verify answered %s", clean.dump());
 }
 
 void CheckWalkChain(harness::Ctx& ctx) {
   std::vector<std::string> ids;
-  for (int n = 1; n <= 4; n++) ids.push_back(chainedRecord(n, "t1"));
+  for (int n = 1; n <= 4; n++) ids.push_back(hChainedRecord(n, "t1"));
   // Someone rewrites the chain entry at position 3.
   ctx.Redis.Do("HSET", "audit:chain:t1", "rec:3", sha256_hex("forged"));
-  auto c = readApi(ctx);
-  const json body = bodyOf(verifyAs(c, ids[0], "t1"));
+  auto c = hReadApi(ctx);
+  const json body = hBodyOf(hVerifyAs(c, ids[0], "t1"));
   ctx.Assert(body.is_object() && body.value("valid", true) == false, "with position 3 of the chain rewritten, verifying record 1 answered %s: the walk from the record to the last link must recompute every link", body.dump());
   ctx.Assert(body.value("first_divergence", json()) == json(3), "the first divergence is position 3, the verify answered %s", body.dump());
 }
 
 void CheckCoverage(harness::Ctx& ctx) {
   std::vector<std::string> ids;
-  for (int n = 1; n <= 4; n++) ids.push_back(chainedRecord(n, "t1"));
-  auto c = readApi(ctx);
-  const json body = bodyOf(verifyAs(c, ids[1], "t1"));
+  for (int n = 1; n <= 4; n++) ids.push_back(hChainedRecord(n, "t1"));
+  auto c = hReadApi(ctx);
+  const json body = hBodyOf(hVerifyAs(c, ids[1], "t1"));
   const json want = {{"record_id", ids[1]}, {"valid", true}, {"chain_length", 3}, {"first_divergence", nullptr}, {"head_position", 4}};
   ctx.Assert(body == want, "verifying record 2 of 4 answered %s, expected %s: the answer says how many links it verified and where the first failure was", body.dump(), want.dump());
 }

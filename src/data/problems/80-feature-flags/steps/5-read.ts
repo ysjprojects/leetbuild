@@ -639,23 +639,23 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func readSetup(ctx *harness.Ctx) *harness.HTTP {
+func hReadSetup(ctx *harness.Ctx) *harness.HTTP {
 	s := engine.Snapshot{Version: 3, Flags: map[string]engine.Flag{
 		"checkout":  {Rollout: 100, Salt: "2026", Rules: []registry.Rule{{Attribute: "country", Operator: "eq", Value: "US"}}},
 		"search-v2": {Rollout: 100, Salt: "2026", Killed: true},
 		"beta":      {Rollout: 0, Salt: "2026"},
 		"new-app":   {Rollout: 100, Salt: "2026", Rules: []registry.Rule{{Attribute: "app_version", Operator: "gt", Value: 5}}},
 	}}
-	moved, err := engine.PublishSnapshot(readBg, s)
+	moved, err := engine.PublishSnapshot(hReadBg, s)
 	ctx.Assert(err == nil && moved, "seeding version 3 failed: %v", err)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readExplain(c *harness.HTTP, flagKey, user string, query url.Values) *harness.Response {
+func hReadExplain(c *harness.HTTP, flagKey, user string, query url.Values) *harness.Response {
 	path := "/v1/flags/" + flagKey + "/evaluation"
 	if len(query) > 0 {
 		path += "?" + query.Encode()
@@ -666,37 +666,37 @@ func readExplain(c *harness.HTTP, flagKey, user string, query url.Values) *harne
 	return c.Get(path, "X-User-Id", user)
 }
 
-func readBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hReadBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	m, _ := r.JSON().(map[string]any)
 	ctx.Assert(m != nil, "the response body is not a JSON object: %s", r.Text())
 	return m
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readSetup(ctx)
-	r := readExplain(c, "beta", "u-7", nil)
+	c := hReadSetup(ctx)
+	r := hReadExplain(c, "beta", "u-7", nil)
 	ctx.Equal(r.Status, 200, "GET /v1/flags/beta/evaluation (%s)", r.Text())
-	b := readBody(ctx, r)
+	b := hReadBody(ctx, r)
 	_, hasReason := b["reason"]
 	ctx.Assert(b["flag_key"] == "beta" && b["user_id"] == "u-7" && b["value"] == false && b["bucket"] == float64(engine.Bucket("beta", "u-7", "2026")) && b["version"] == float64(3) && hasReason, "the explanation is %s, expected flag_key beta, user_id u-7, value false, bucket %d, version 3 and a reason", r.Text(), engine.Bucket("beta", "u-7", "2026"))
-	r = readExplain(c, "ghost", "u-7", nil)
+	r = hReadExplain(c, "ghost", "u-7", nil)
 	ctx.Equal(r.Status, 404, "an unknown flag (%s)", r.Text())
 }
 
 func CheckCallerOnly(ctx *harness.Ctx) {
-	c := readSetup(ctx)
-	r := readExplain(c, "beta", "u-7", url.Values{"user_id": {"u-42"}})
+	c := hReadSetup(ctx)
+	r := hReadExplain(c, "beta", "u-7", url.Values{"user_id": {"u-42"}})
 	ctx.Equal(r.Status, 403, "u-7 asked for u-42's explanation (%s): anyone can read anyone's decisions; the status", r.Text())
-	r = readExplain(c, "beta", "", nil)
+	r = hReadExplain(c, "beta", "", nil)
 	ctx.Equal(r.Status, 401, "a request without X-User-Id (%s)", r.Text())
-	r = readExplain(c, "beta", "u-42", nil)
-	ctx.Assert(r.Status == 200 && readBody(ctx, r)["user_id"] == "u-42", "u-42 asking for itself answered %d %s", r.Status, r.Text())
-	r = readExplain(c, "beta", "u-42", url.Values{"user_id": {"u-42"}})
+	r = hReadExplain(c, "beta", "u-42", nil)
+	ctx.Assert(r.Status == 200 && hReadBody(ctx, r)["user_id"] == "u-42", "u-42 asking for itself answered %d %s", r.Status, r.Text())
+	r = hReadExplain(c, "beta", "u-42", url.Values{"user_id": {"u-42"}})
 	ctx.Equal(r.Status, 200, "a user_id query naming the caller (%s)", r.Text())
 }
 
 func CheckSameDecision(ctx *harness.Ctx) {
-	c := readSetup(ctx)
+	c := hReadSetup(ctx)
 	cases := []struct {
 		flagKey string
 		attrs   map[string]string
@@ -714,25 +714,25 @@ func CheckSameDecision(ctx *harness.Ctx) {
 			query.Set(k, v)
 			attrs[k] = v
 		}
-		r := readExplain(c, tc.flagKey, "u-7", query)
+		r := hReadExplain(c, tc.flagKey, "u-7", query)
 		ctx.Equal(r.Status, 200, "explaining %s %v (%s)", tc.flagKey, tc.attrs, r.Text())
-		b := readBody(ctx, r)
-		served, err := engine.Evaluate(readBg, tc.flagKey, attrs)
+		b := hReadBody(ctx, r)
+		served, err := engine.Evaluate(hReadBg, tc.flagKey, attrs)
 		ctx.Assert(err == nil && served != nil, "engine.Evaluate(%s) failed: %v", tc.flagKey, err)
 		ctx.Assert(b["value"] == served.Value && b["reason"] == served.Reason && b["bucket"] == float64(served.Bucket) && b["version"] == float64(served.Version), "u-7 %v was served %+v for %s, but the explanation says %s: a second computation that skips kills and rules explains a decision nobody served", tc.attrs, *served, tc.flagKey, r.Text())
 	}
 }
 
 func CheckPrivate(ctx *harness.Ctx) {
-	c := readSetup(ctx)
+	c := hReadSetup(ctx)
 	answers := []struct {
 		what string
 		r    *harness.Response
 	}{
-		{"the explanation", readExplain(c, "beta", "u-7", nil)},
-		{"the 401 without X-User-Id", readExplain(c, "beta", "", nil)},
-		{"the 403 for another user", readExplain(c, "beta", "u-7", url.Values{"user_id": {"u-42"}})},
-		{"the 404 for an unknown flag", readExplain(c, "ghost", "u-7", nil)},
+		{"the explanation", hReadExplain(c, "beta", "u-7", nil)},
+		{"the 401 without X-User-Id", hReadExplain(c, "beta", "", nil)},
+		{"the 403 for another user", hReadExplain(c, "beta", "u-7", url.Values{"user_id": {"u-42"}})},
+		{"the 404 for an unknown flag", hReadExplain(c, "ghost", "u-7", nil)},
 	}
 	for _, a := range answers {
 		header := a.r.Header.Get("Cache-Control")
@@ -761,7 +761,7 @@ func CheckPrivate(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP readSetup(harness::Ctx& ctx) {
+harness::HTTP hReadSetup(harness::Ctx& ctx) {
   const auto flag = [](int rollout, const nlohmann::json& rules, bool killed) {
     return nlohmann::json{{"default", false}, {"rules", rules}, {"rollout", rollout}, {"salt", "2026"}, {"killed", killed}};
   };
@@ -780,12 +780,12 @@ harness::HTTP readSetup(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response readExplain(harness::HTTP& c, const std::string& flag_key, const std::string& user, const std::string& query = "") {
+harness::Response hReadExplain(harness::HTTP& c, const std::string& flag_key, const std::string& user, const std::string& query = "") {
   const std::string path = "/v1/flags/" + flag_key + "/evaluation" + (query.empty() ? "" : "?" + query);
   return user.empty() ? c.Get(path) : c.Get(path, "X-User-Id", user);
 }
 
-nlohmann::json readBody(const harness::Response& r) {
+nlohmann::json hReadBody(const harness::Response& r) {
   const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
   return j.is_discarded() ? nlohmann::json::object() : j;
 }
@@ -793,31 +793,31 @@ nlohmann::json readBody(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readSetup(ctx);
-  auto r = readExplain(c, "beta", "u-7");
+  auto c = hReadSetup(ctx);
+  auto r = hReadExplain(c, "beta", "u-7");
   ctx.Equal(r.Status, 200, "GET /v1/flags/beta/evaluation (%s)", r.Text());
-  const auto b = readBody(r);
+  const auto b = hReadBody(r);
   const int bucket = engine::bucket("beta", "u-7", "2026");
   ctx.Assert(b.value("flag_key", "") == "beta" && b.value("user_id", "") == "u-7" && b.value("value", true) == false && b.value("bucket", -1) == bucket && b.value("version", 0) == 3 && b.contains("reason"),
              "the explanation is %s, expected flag_key beta, user_id u-7, value false, bucket %d, version 3 and a reason", r.Text(), bucket);
-  r = readExplain(c, "ghost", "u-7");
+  r = hReadExplain(c, "ghost", "u-7");
   ctx.Equal(r.Status, 404, "an unknown flag (%s)", r.Text());
 }
 
 void CheckCallerOnly(harness::Ctx& ctx) {
-  auto c = readSetup(ctx);
-  auto r = readExplain(c, "beta", "u-7", "user_id=u-42");
+  auto c = hReadSetup(ctx);
+  auto r = hReadExplain(c, "beta", "u-7", "user_id=u-42");
   ctx.Equal(r.Status, 403, "u-7 asked for u-42's explanation (%s): anyone can read anyone's decisions; the status", r.Text());
-  r = readExplain(c, "beta", "");
+  r = hReadExplain(c, "beta", "");
   ctx.Equal(r.Status, 401, "a request without X-User-Id (%s)", r.Text());
-  r = readExplain(c, "beta", "u-42");
-  ctx.Assert(r.Status == 200 && readBody(r).value("user_id", "") == "u-42", "u-42 asking for itself answered %d %s", r.Status, r.Text());
-  r = readExplain(c, "beta", "u-42", "user_id=u-42");
+  r = hReadExplain(c, "beta", "u-42");
+  ctx.Assert(r.Status == 200 && hReadBody(r).value("user_id", "") == "u-42", "u-42 asking for itself answered %d %s", r.Status, r.Text());
+  r = hReadExplain(c, "beta", "u-42", "user_id=u-42");
   ctx.Equal(r.Status, 200, "a user_id query naming the caller (%s)", r.Text());
 }
 
 void CheckSameDecision(harness::Ctx& ctx) {
-  auto c = readSetup(ctx);
+  auto c = hReadSetup(ctx);
   const std::vector<std::pair<std::string, std::map<std::string, std::string>>> cases = {
       {"checkout", {{"country", "DE"}}}, {"checkout", {{"country", "US"}}}, {"search-v2", {}}, {"new-app", {{"app_version", "7"}}}, {"new-app", {{"app_version", "3"}}}};
   for (const auto& [flag_key, extra] : cases) {
@@ -827,9 +827,9 @@ void CheckSameDecision(harness::Ctx& ctx) {
       query += (query.empty() ? "" : "&") + k + "=" + v;
       attrs[k] = v;
     }
-    const auto r = readExplain(c, flag_key, "u-7", query);
+    const auto r = hReadExplain(c, flag_key, "u-7", query);
     ctx.Equal(r.Status, 200, "explaining %s %s (%s)", flag_key, query, r.Text());
-    const auto b = readBody(r);
+    const auto b = hReadBody(r);
     const auto served = engine::evaluate(flag_key, attrs);
     ctx.Assert(served.has_value(), "engine::evaluate(%s) found no flag", flag_key);
     for (const std::string name : {"value", "reason", "bucket", "version"}) {
@@ -839,12 +839,12 @@ void CheckSameDecision(harness::Ctx& ctx) {
 }
 
 void CheckPrivate(harness::Ctx& ctx) {
-  auto c = readSetup(ctx);
+  auto c = hReadSetup(ctx);
   const std::vector<std::pair<std::string, harness::Response>> answers = {
-      {"the explanation", readExplain(c, "beta", "u-7")},
-      {"the 401 without X-User-Id", readExplain(c, "beta", "")},
-      {"the 403 for another user", readExplain(c, "beta", "u-7", "user_id=u-42")},
-      {"the 404 for an unknown flag", readExplain(c, "ghost", "u-7")},
+      {"the explanation", hReadExplain(c, "beta", "u-7")},
+      {"the 401 without X-User-Id", hReadExplain(c, "beta", "")},
+      {"the 403 for another user", hReadExplain(c, "beta", "u-7", "user_id=u-42")},
+      {"the 404 for an unknown flag", hReadExplain(c, "ghost", "u-7")},
   };
   for (const auto& [what, r] : answers) {
     const std::string header = r.HeaderValue("Cache-Control");

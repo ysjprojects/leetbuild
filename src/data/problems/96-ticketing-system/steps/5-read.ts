@@ -779,49 +779,49 @@ import (
 	"leetbuild/harness"
 )
 
-const readInternal = "Customer is on the fraud watchlist, do not refund."
+const kHReadInternal = "Customer is on the fraud watchlist, do not refund."
 
 var (
-	readBg    = context.Background()
-	readR1    = []string{"X-Actor-Id", "R-1", "X-Actor-Role", "requester"}
-	readR2    = []string{"X-Actor-Id", "R-2", "X-Actor-Role", "requester"}
-	readAgent = []string{"X-Actor-Id", "A-7", "X-Actor-Role", "agent"}
+	hReadBg    = context.Background()
+	hReadR1    = []string{"X-Actor-Id", "R-1", "X-Actor-Role", "requester"}
+	hReadR2    = []string{"X-Actor-Id", "R-2", "X-Actor-Role", "requester"}
+	hReadAgent = []string{"X-Actor-Id", "A-7", "X-Actor-Role", "agent"}
 )
 
-type readPage struct {
+type HReadPage struct {
 	TicketID   string       \`json:"ticket_id"\`
 	State      string       \`json:"state"\`
 	Notes      []store.Note \`json:"notes"\`
 	NextCursor *string      \`json:"next_cursor"\`
 }
 
-func readClient(ctx *harness.Ctx) *harness.HTTP {
+func hReadClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readSeed(ctx *harness.Ctx, notes [][3]string) string {
-	ticketID := store.CreateTicket(readBg, "R-1", "Invoice 4471 charged twice").ID
+func hReadSeed(ctx *harness.Ctx, notes [][3]string) string {
+	ticketID := store.CreateTicket(hReadBg, "R-1", "Invoice 4471 charged twice").ID
 	for _, n := range notes {
-		_, err := store.AppendNote(readBg, ticketID, n[0], n[1], n[2])
+		_, err := store.AppendNote(hReadBg, ticketID, n[0], n[1], n[2])
 		ctx.NoError(err, "AppendNote failed")
 	}
 	return ticketID
 }
 
-func readGet(c *harness.HTTP, ticketID string, who []string, query url.Values) (*harness.Response, readPage) {
+func hReadGet(c *harness.HTTP, ticketID string, who []string, query url.Values) (*harness.Response, HReadPage) {
 	path := "/v1/tickets/" + ticketID
 	if len(query) > 0 {
 		path += "?" + query.Encode()
 	}
 	r := c.Get(path, who...)
-	var page readPage
+	var page HReadPage
 	r.Decode(&page)
 	return r, page
 }
 
-func readBodies(page readPage) []string {
+func hReadBodies(page HReadPage) []string {
 	out := []string{}
 	for _, n := range page.Notes {
 		out = append(out, n.Body)
@@ -830,70 +830,70 @@ func readBodies(page readPage) []string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	t := readSeed(ctx, [][3]string{{"R-1", "public", "My card was charged twice."}, {"A-7", "public", "We refunded the second charge."}})
-	r, page := readGet(c, t, readAgent, nil)
+	c := hReadClient(ctx)
+	t := hReadSeed(ctx, [][3]string{{"R-1", "public", "My card was charged twice."}, {"A-7", "public", "We refunded the second charge."}})
+	r, page := hReadGet(c, t, hReadAgent, nil)
 	ctx.Equal(r.Status, 200, "GET /v1/tickets/%s (%s)", t, r.Text())
 	ctx.Assert(page.TicketID == t && page.State == "open", "the page must name the ticket and its state, got %s", r.Text())
-	ctx.Equal(readBodies(page), []string{"We refunded the second charge.", "My card was charged twice."}, "the page must list the notes newest first")
+	ctx.Equal(hReadBodies(page), []string{"We refunded the second charge.", "My card was charged twice."}, "the page must list the notes newest first")
 }
 
 func CheckInternalHidden(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	t := readSeed(ctx, [][3]string{{"R-1", "public", "My card was charged twice."}, {"A-7", "internal", readInternal}, {"A-7", "public", "We refunded the second charge."}})
-	mine, minePage := readGet(c, t, readR1, nil)
+	c := hReadClient(ctx)
+	t := hReadSeed(ctx, [][3]string{{"R-1", "public", "My card was charged twice."}, {"A-7", "internal", kHReadInternal}, {"A-7", "public", "We refunded the second charge."}})
+	mine, minePage := hReadGet(c, t, hReadR1, nil)
 	ctx.Equal(mine.Status, 200, "the requester reading their ticket (%s)", mine.Text())
-	ctx.Assert(!strings.Contains(mine.Text(), readInternal), "the requester's page carries an internal note: %q. Leave out visibility internal for a requester", readBodies(minePage))
-	ctx.Equal(readBodies(minePage), []string{"We refunded the second charge.", "My card was charged twice."}, "the requester must see the public notes")
-	_, agentPage := readGet(c, t, readAgent, nil)
-	ctx.Assert(strings.Contains(strings.Join(readBodies(agentPage), "|"), readInternal), "an agent's page must keep the internal note, got %q", readBodies(agentPage))
+	ctx.Assert(!strings.Contains(mine.Text(), kHReadInternal), "the requester's page carries an internal note: %q. Leave out visibility internal for a requester", hReadBodies(minePage))
+	ctx.Equal(hReadBodies(minePage), []string{"We refunded the second charge.", "My card was charged twice."}, "the requester must see the public notes")
+	_, agentPage := hReadGet(c, t, hReadAgent, nil)
+	ctx.Assert(strings.Contains(strings.Join(hReadBodies(agentPage), "|"), kHReadInternal), "an agent's page must keep the internal note, got %q", hReadBodies(agentPage))
 }
 
 func CheckRequesterScope(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	t := readSeed(ctx, [][3]string{{"R-1", "public", "My card was charged twice."}})
-	r, _ := readGet(c, t, readR2, nil)
+	c := hReadClient(ctx)
+	t := hReadSeed(ctx, [][3]string{{"R-1", "public", "My card was charged twice."}})
+	r, _ := hReadGet(c, t, hReadR2, nil)
 	ctx.Equal(r.Status, 403, "requester R-2 reading R-1's ticket (a requester reads only their own tickets)")
-	r, _ = readGet(c, t, []string{"X-Actor-Role", "requester"}, nil)
+	r, _ = hReadGet(c, t, []string{"X-Actor-Role", "requester"}, nil)
 	ctx.Equal(r.Status, 401, "a read without X-Actor-Id")
-	r, _ = readGet(c, t, []string{"X-Actor-Id", "R-1", "X-Actor-Role", "admin"}, nil)
+	r, _ = hReadGet(c, t, []string{"X-Actor-Id", "R-1", "X-Actor-Role", "admin"}, nil)
 	ctx.Equal(r.Status, 403, "X-Actor-Role admin")
-	r, _ = readGet(c, t, []string{"X-Actor-Id", "R-1"}, nil)
+	r, _ = hReadGet(c, t, []string{"X-Actor-Id", "R-1"}, nil)
 	ctx.Equal(r.Status, 403, "the owner reading without X-Actor-Role (a missing role is not requester or agent)")
-	own, _ := readGet(c, t, readR1, nil)
-	agent, _ := readGet(c, t, readAgent, nil)
+	own, _ := hReadGet(c, t, hReadR1, nil)
+	agent, _ := hReadGet(c, t, hReadAgent, nil)
 	ctx.Assert(own.Status == 200 && agent.Status == 200, "the owner and an agent must read the ticket, got %d and %d", own.Status, agent.Status)
 }
 
 func CheckKeysetCursor(ctx *harness.Ctx) {
-	c := readClient(ctx)
+	c := hReadClient(ctx)
 	var five [][3]string
 	for i := 1; i <= 5; i++ {
 		five = append(five, [3]string{"A-7", "public", fmt.Sprintf("note %d", i)})
 	}
-	t := readSeed(ctx, five)
-	first, firstPage := readGet(c, t, readAgent, url.Values{"limit": {"2"}})
-	ctx.Equal(readBodies(firstPage), []string{"note 5", "note 4"}, "the first page of 2 must be the two newest notes")
+	t := hReadSeed(ctx, five)
+	first, firstPage := hReadGet(c, t, hReadAgent, url.Values{"limit": {"2"}})
+	ctx.Equal(hReadBodies(firstPage), []string{"note 5", "note 4"}, "the first page of 2 must be the two newest notes")
 	ctx.Assert(firstPage.NextCursor != nil && *firstPage.NextCursor != "", "a full page must carry next_cursor, got %s", first.Text())
-	store.AppendNote(readBg, t, "R-1", "public", "note 6") // posted while the agent scrolls
-	_, second := readGet(c, t, readAgent, url.Values{"limit": {"2"}, "cursor": {*firstPage.NextCursor}})
-	ctx.Equal(readBodies(second), []string{"note 3", "note 2"}, "after a note was posted, the page must continue below the last note fetched; the second page")
+	store.AppendNote(hReadBg, t, "R-1", "public", "note 6") // posted while the agent scrolls
+	_, second := hReadGet(c, t, hReadAgent, url.Values{"limit": {"2"}, "cursor": {*firstPage.NextCursor}})
+	ctx.Equal(hReadBodies(second), []string{"note 3", "note 2"}, "after a note was posted, the page must continue below the last note fetched; the second page")
 	ctx.Assert(second.NextCursor != nil, "the second page was full and must carry next_cursor")
-	third, thirdPage := readGet(c, t, readAgent, url.Values{"limit": {"2"}, "cursor": {*second.NextCursor}})
+	third, thirdPage := hReadGet(c, t, hReadAgent, url.Values{"limit": {"2"}, "cursor": {*second.NextCursor}})
 	ctx.Assert(len(thirdPage.Notes) == 1 && thirdPage.Notes[0].Body == "note 1" && thirdPage.NextCursor == nil, "the last page must be note 1 with next_cursor null, got %s", third.Text())
-	bad, _ := readGet(c, t, readAgent, url.Values{"cursor": {"abc"}})
+	bad, _ := hReadGet(c, t, hReadAgent, url.Values{"cursor": {"abc"}})
 	ctx.Equal(bad.Status, 400, "cursor=abc")
 	for _, value := range []string{"0", "-2"} {
-		r, _ := readGet(c, t, readAgent, url.Values{"cursor": {value}})
+		r, _ := hReadGet(c, t, hReadAgent, url.Values{"cursor": {value}})
 		ctx.Equal(r.Status, 400, "cursor=%s (a cursor that is not a positive integer is 400)", value)
 	}
 	// A requester walks a timeline whose newest notes are internal: every public note once, and the walk ends.
-	t2 := readSeed(ctx, [][3]string{{"R-1", "public", "p1"}, {"A-7", "internal", "i1"}, {"A-7", "internal", "i2"}, {"A-7", "public", "p2"}, {"A-7", "internal", "i3"}})
+	t2 := hReadSeed(ctx, [][3]string{{"R-1", "public", "p1"}, {"A-7", "internal", "i1"}, {"A-7", "internal", "i2"}, {"A-7", "public", "p2"}, {"A-7", "internal", "i3"}})
 	seen := []string{}
 	query := url.Values{"limit": {"2"}}
 	for i := 0; i < 10; i++ {
-		_, page := readGet(c, t2, readR1, query)
-		seen = append(seen, readBodies(page)...)
+		_, page := hReadGet(c, t2, hReadR1, query)
+		seen = append(seen, hReadBodies(page)...)
 		if page.NextCursor == nil {
 			break
 		}

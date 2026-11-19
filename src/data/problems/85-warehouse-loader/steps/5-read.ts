@@ -812,34 +812,34 @@ import (
 )
 
 // readPeer holds, per "target/load_id", the rows the table holds for that load.
-type readPeer struct {
+type HReadPeer struct {
 	pb.UnimplementedWarehouseServer
 	held map[string]int64
 }
 
-func (p *readPeer) CountRows(_ context.Context, req *pb.CountRequest) (*pb.CountReply, error) {
+func (p *HReadPeer) CountRows(_ context.Context, req *pb.CountRequest) (*pb.CountReply, error) {
 	return &pb.CountReply{Rows: p.held[req.GetTarget()+"/"+req.GetLoadId()]}, nil
 }
 
-func readAPI(ctx *harness.Ctx) (*readPeer, *harness.HTTP) {
-	peer := &readPeer{held: map[string]int64{}}
+func hReadAPI(ctx *harness.Ctx) (*HReadPeer, *harness.HTTP) {
+	peer := &HReadPeer{held: map[string]int64{}}
 	pb.RegisterWarehouseServer(ctx.GRPC.Server(""), peer)
 	mux := http.NewServeMux()
 	register(mux)
 	return peer, ctx.HTTP(mux)
 }
 
-func readSeed(ctx *harness.Ctx, loadID, planned, read string) {
+func hReadSeed(ctx *harness.Ctx, loadID, planned, read string) {
 	ctx.Redis.Do("HSET", "load:"+loadID, "load_id", loadID, "tenant", "acme", "dataset", "orders", "version", "2026-10-20", "target", "wh_acme.orders",
 		"mode", "merge", "transform", "dedupe", "sql", "SELECT DISTINCT * FROM source", "partitions", "4", "rows_planned", planned, "rows_read", read, "status", "complete")
 }
 
-func readReject(ctx *harness.Ctx, loadID, partitionID, reason string, rows int) {
+func hReadReject(ctx *harness.Ctx, loadID, partitionID, reason string, rows int) {
 	row, _ := json.Marshal(map[string]any{"partition_id": partitionID, "reason": reason, "rows": rows})
 	ctx.Redis.Do("RPUSH", "load:"+loadID+":rejects", string(row))
 }
 
-func readReport(ctx *harness.Ctx, c *harness.HTTP, loadID string) map[string]any {
+func hReadReport(ctx *harness.Ctx, c *harness.HTTP, loadID string) map[string]any {
 	r := c.Get("/v1/loads/"+loadID, "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/loads/%s (%s)", loadID, r.Text())
 	var body map[string]any
@@ -848,10 +848,10 @@ func readReport(ctx *harness.Ctx, c *harness.HTTP, loadID string) map[string]any
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	peer, c := readAPI(ctx)
-	readSeed(ctx, "ld-1", "1000", "1000")
+	peer, c := hReadAPI(ctx)
+	hReadSeed(ctx, "ld-1", "1000", "1000")
 	peer.held["wh_acme.orders/ld-1"] = 1000
-	body := readReport(ctx, c, "ld-1")
+	body := hReadReport(ctx, c, "ld-1")
 	ctx.Assert(body["load_id"] == "ld-1" && body["rows_read"] == float64(1000) && body["target"] == "wh_acme.orders", "the report must carry load_id, target and rows_read, got %v", body)
 	ctx.Equal(c.Get("/v1/loads/ld-1", "X-Tenant-Id", "globex").Status, 404, "tenant globex reading acme's load")
 	ctx.Equal(c.Get("/v1/loads/ld-404", "X-Tenant-Id", "acme").Status, 404, "a load that does not exist")
@@ -859,10 +859,10 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckWrittenFromWarehouse(ctx *harness.Ctx) {
-	peer, c := readAPI(ctx)
-	readSeed(ctx, "ld-1", "1000", "1000")
+	peer, c := hReadAPI(ctx)
+	hReadSeed(ctx, "ld-1", "1000", "1000")
 	peer.held["wh_acme.orders/ld-1"] = 940
-	body := readReport(ctx, c, "ld-1")
+	body := hReadReport(ctx, c, "ld-1")
 	ctx.Equal(body["rows_written"], 940, "the warehouse holds 940 rows of ld-1: written is what the warehouse holds, not the plan; rows_written")
 	calls := ctx.GRPC.CallsTo("CountRows", "")
 	ctx.Assert(len(calls) > 0, "the report must ask the warehouse CountRows(wh_acme.orders, ld-1)")
@@ -871,52 +871,52 @@ func CheckWrittenFromWarehouse(ctx *harness.Ctx) {
 }
 
 func CheckRejections(ctx *harness.Ctx) {
-	peer, c := readAPI(ctx)
-	readSeed(ctx, "ld-1", "1000", "1000")
+	peer, c := hReadAPI(ctx)
+	hReadSeed(ctx, "ld-1", "1000", "1000")
 	peer.held["wh_acme.orders/ld-1"] = 960
-	readReject(ctx, "ld-1", "p-1", "amount is not a decimal", 30)
-	readReject(ctx, "ld-1", "p-3", "id is null", 10)
-	readSeed(ctx, "ld-2", "500", "500")
+	hReadReject(ctx, "ld-1", "p-1", "amount is not a decimal", 30)
+	hReadReject(ctx, "ld-1", "p-3", "id is null", 10)
+	hReadSeed(ctx, "ld-2", "500", "500")
 	peer.held["wh_acme.orders/ld-2"] = 500
-	body := readReport(ctx, c, "ld-1")
+	body := hReadReport(ctx, c, "ld-1")
 	ctx.Equal(body["rows_rejected"], 40, "two rejected batches of 30 and 10 rows; rows_rejected")
 	want := []any{
 		map[string]any{"partition_id": "p-1", "reason": "amount is not a decimal", "rows": 30},
 		map[string]any{"partition_id": "p-3", "reason": "id is null", "rows": 10},
 	}
 	ctx.Equal(body["rejections"], want, "the report must list each rejection with partition_id, reason and rows")
-	clean := readReport(ctx, c, "ld-2")
+	clean := hReadReport(ctx, c, "ld-2")
 	ctx.Equal(clean["rows_rejected"], 0, "a load with no rejected rows; rows_rejected")
 	listed, _ := clean["rejections"].([]any)
 	ctx.Equal(len(listed), 0, "a load with no rejected rows lists no rejection; rejections")
 }
 
 func CheckFreshnessScoped(ctx *harness.Ctx) {
-	peer, c := readAPI(ctx)
-	readSeed(ctx, "ld-1", "1000", "1000")
+	peer, c := hReadAPI(ctx)
+	hReadSeed(ctx, "ld-1", "1000", "1000")
 	peer.held["wh_acme.orders/ld-1"] = 1000
 	ctx.Redis.Do("HSET", "freshness:wh_acme.orders", "committed_at", "100", "load_id", "ld-1")
 	// globex loaded the same source into its own table later.
 	ctx.Redis.Do("HSET", "freshness:orders", "committed_at", "200", "load_id", "ld-9")
 	ctx.Redis.Do("HSET", "freshness:wh_globex.orders", "committed_at", "200", "load_id", "ld-9")
-	body := readReport(ctx, c, "ld-1")
+	body := hReadReport(ctx, c, "ld-1")
 	ctx.Equal(body["freshness"], map[string]any{"committed_at": 100, "load_id": "ld-1"}, "wh_acme.orders last committed at 100 (ld-1): another tenant's load of the shared source is not this table's freshness")
 	ctx.Redis.Do("DEL", "freshness:wh_acme.orders")
-	none := readReport(ctx, c, "ld-1")
+	none := hReadReport(ctx, c, "ld-1")
 	ctx.Assert(none["freshness"] == nil, "wh_acme.orders has no commit on record and the report says freshness %v: the shared source's freshness never stands in for the table's", none["freshness"])
 }
 
 func CheckDeltaFlag(ctx *harness.Ctx) {
-	peer, c := readAPI(ctx)
-	readSeed(ctx, "ld-1", "1000", "1000")
+	peer, c := hReadAPI(ctx)
+	hReadSeed(ctx, "ld-1", "1000", "1000")
 	peer.held["wh_acme.orders/ld-1"] = 940
-	readReject(ctx, "ld-1", "p-1", "amount is not a decimal", 40)
-	readSeed(ctx, "ld-2", "500", "500")
+	hReadReject(ctx, "ld-1", "p-1", "amount is not a decimal", 40)
+	hReadSeed(ctx, "ld-2", "500", "500")
 	peer.held["wh_acme.orders/ld-2"] = 500
 	// ld-3: the warehouse holds one row more than was read (a duplicated row).
-	readSeed(ctx, "ld-3", "500", "500")
+	hReadSeed(ctx, "ld-3", "500", "500")
 	peer.held["wh_acme.orders/ld-3"] = 501
-	reports := []map[string]any{readReport(ctx, c, "ld-1"), readReport(ctx, c, "ld-2"), readReport(ctx, c, "ld-3")}
+	reports := []map[string]any{hReadReport(ctx, c, "ld-1"), hReadReport(ctx, c, "ld-2"), hReadReport(ctx, c, "ld-3")}
 	for _, body := range reports {
 		_, hasDelta := body["delta"]
 		_, hasFlag := body["flagged"]
@@ -945,7 +945,7 @@ func CheckDeltaFlag(ctx *harness.Ctx) {
 namespace {
 
 // held: "target/load_id" -> the rows the table holds for that load.
-class ReadPeer final : public whloader::Warehouse::Service {
+class HReadPeer final : public whloader::Warehouse::Service {
  public:
   std::map<std::string, long> held;
   grpc::Status CountRows(grpc::ServerContext*, const whloader::CountRequest* req, whloader::CountReply* out) override {
@@ -955,17 +955,17 @@ class ReadPeer final : public whloader::Warehouse::Service {
   }
 };
 
-struct HlWorld {
-  ReadPeer peer;
+struct HHlWorld {
+  HReadPeer peer;
   httplib::Server svr;
 };
 
-HlWorld& hlApi(harness::Ctx& ctx, harness::HTTP*& c) {
-  static HlWorld* world = nullptr;
+HHlWorld& hHlApi(harness::Ctx& ctx, harness::HTTP*& c) {
+  static HHlWorld* world = nullptr;
   static harness::HTTP* http = nullptr;
   delete world;
   delete http;
-  world = new HlWorld;
+  world = new HHlWorld;
   ctx.GRPC.Server("")->RegisterService(&world->peer);
   register_routes(world->svr);
   http = new harness::HTTP(ctx.HTTP(world->svr));
@@ -973,16 +973,16 @@ HlWorld& hlApi(harness::Ctx& ctx, harness::HTTP*& c) {
   return *world;
 }
 
-void hlSeed(harness::Ctx& ctx, const std::string& load_id, const std::string& planned, const std::string& read) {
+void hHlSeed(harness::Ctx& ctx, const std::string& load_id, const std::string& planned, const std::string& read) {
   ctx.Redis.Do("HSET", "load:" + load_id, "load_id", load_id, "tenant", "acme", "dataset", "orders", "version", "2026-10-20", "target", "wh_acme.orders",
                "mode", "merge", "transform", "dedupe", "sql", "SELECT DISTINCT * FROM source", "partitions", "4", "rows_planned", planned, "rows_read", read, "status", "complete");
 }
 
-void hlReject(harness::Ctx& ctx, const std::string& load_id, const std::string& partition_id, const std::string& reason, long rows) {
+void hHlReject(harness::Ctx& ctx, const std::string& load_id, const std::string& partition_id, const std::string& reason, long rows) {
   ctx.Redis.Do("RPUSH", "load:" + load_id + ":rejects", nlohmann::json{{"partition_id", partition_id}, {"reason", reason}, {"rows", rows}}.dump());
 }
 
-nlohmann::json hlReport(harness::Ctx& ctx, harness::HTTP& c, const std::string& load_id) {
+nlohmann::json hHlReport(harness::Ctx& ctx, harness::HTTP& c, const std::string& load_id) {
   const auto r = c.Get("/v1/loads/" + load_id, "X-Tenant-Id", "acme");
   ctx.Equal(r.Status, 200, "GET /v1/loads/%s (%s)", load_id, r.Text());
   return nlohmann::json::parse(r.Text(), nullptr, false);
@@ -992,10 +992,10 @@ nlohmann::json hlReport(harness::Ctx& ctx, harness::HTTP& c, const std::string& 
 
 void CheckRoute(harness::Ctx& ctx) {
   harness::HTTP* c = nullptr;
-  HlWorld& world = hlApi(ctx, c);
-  hlSeed(ctx, "ld-1", "1000", "1000");
+  HHlWorld& world = hHlApi(ctx, c);
+  hHlSeed(ctx, "ld-1", "1000", "1000");
   world.peer.held["wh_acme.orders/ld-1"] = 1000;
-  const auto body = hlReport(ctx, *c, "ld-1");
+  const auto body = hHlReport(ctx, *c, "ld-1");
   ctx.Assert(body.value("load_id", "") == "ld-1" && body.value("rows_read", 0L) == 1000 && body.value("target", "") == "wh_acme.orders",
              "the report must carry load_id, target and rows_read, got %s", body.dump());
   ctx.Equal(c->Get("/v1/loads/ld-1", "X-Tenant-Id", "globex").Status, 404, "tenant globex reading acme's load");
@@ -1005,10 +1005,10 @@ void CheckRoute(harness::Ctx& ctx) {
 
 void CheckWrittenFromWarehouse(harness::Ctx& ctx) {
   harness::HTTP* c = nullptr;
-  HlWorld& world = hlApi(ctx, c);
-  hlSeed(ctx, "ld-1", "1000", "1000");
+  HHlWorld& world = hHlApi(ctx, c);
+  hHlSeed(ctx, "ld-1", "1000", "1000");
   world.peer.held["wh_acme.orders/ld-1"] = 940;
-  const auto body = hlReport(ctx, *c, "ld-1");
+  const auto body = hHlReport(ctx, *c, "ld-1");
   ctx.Equal(body.value("rows_written", 0L), 940, "the warehouse holds 940 rows of ld-1: written is what the warehouse holds, not the plan; rows_written");
   const auto calls = ctx.GRPC.CallsTo("CountRows");
   ctx.Assert(!calls.empty(), "the report must ask the warehouse CountRows(wh_acme.orders, ld-1)");
@@ -1018,51 +1018,51 @@ void CheckWrittenFromWarehouse(harness::Ctx& ctx) {
 
 void CheckRejections(harness::Ctx& ctx) {
   harness::HTTP* c = nullptr;
-  HlWorld& world = hlApi(ctx, c);
-  hlSeed(ctx, "ld-1", "1000", "1000");
+  HHlWorld& world = hHlApi(ctx, c);
+  hHlSeed(ctx, "ld-1", "1000", "1000");
   world.peer.held["wh_acme.orders/ld-1"] = 960;
-  hlReject(ctx, "ld-1", "p-1", "amount is not a decimal", 30);
-  hlReject(ctx, "ld-1", "p-3", "id is null", 10);
-  hlSeed(ctx, "ld-2", "500", "500");
+  hHlReject(ctx, "ld-1", "p-1", "amount is not a decimal", 30);
+  hHlReject(ctx, "ld-1", "p-3", "id is null", 10);
+  hHlSeed(ctx, "ld-2", "500", "500");
   world.peer.held["wh_acme.orders/ld-2"] = 500;
-  const auto body = hlReport(ctx, *c, "ld-1");
+  const auto body = hHlReport(ctx, *c, "ld-1");
   ctx.Equal(body.value("rows_rejected", 0L), 40, "two rejected batches of 30 and 10 rows; rows_rejected");
   const nlohmann::json want = nlohmann::json::array({{{"partition_id", "p-1"}, {"reason", "amount is not a decimal"}, {"rows", 30}}, {{"partition_id", "p-3"}, {"reason", "id is null"}, {"rows", 10}}});
   ctx.Equal(body.contains("rejections") ? body["rejections"] : nlohmann::json(), want, "the report must list each rejection with partition_id, reason and rows");
-  const auto clean = hlReport(ctx, *c, "ld-2");
+  const auto clean = hHlReport(ctx, *c, "ld-2");
   ctx.Equal(clean.value("rows_rejected", -1L), 0, "a load with no rejected rows; rows_rejected");
   ctx.Equal(clean.contains("rejections") ? clean["rejections"].size() : 0, 0, "a load with no rejected rows lists no rejection; rejections");
 }
 
 void CheckFreshnessScoped(harness::Ctx& ctx) {
   harness::HTTP* c = nullptr;
-  HlWorld& world = hlApi(ctx, c);
-  hlSeed(ctx, "ld-1", "1000", "1000");
+  HHlWorld& world = hHlApi(ctx, c);
+  hHlSeed(ctx, "ld-1", "1000", "1000");
   world.peer.held["wh_acme.orders/ld-1"] = 1000;
   ctx.Redis.Do("HSET", "freshness:wh_acme.orders", "committed_at", "100", "load_id", "ld-1");
   // globex loaded the same source into its own table later.
   ctx.Redis.Do("HSET", "freshness:orders", "committed_at", "200", "load_id", "ld-9");
   ctx.Redis.Do("HSET", "freshness:wh_globex.orders", "committed_at", "200", "load_id", "ld-9");
-  const auto body = hlReport(ctx, *c, "ld-1");
+  const auto body = hHlReport(ctx, *c, "ld-1");
   ctx.Equal(body.contains("freshness") ? body["freshness"] : nlohmann::json(), nlohmann::json({{"committed_at", 100}, {"load_id", "ld-1"}}),
             "wh_acme.orders last committed at 100 (ld-1): another tenant's load of the shared source is not this table's freshness");
   ctx.Redis.Do("DEL", "freshness:wh_acme.orders");
-  const auto none = hlReport(ctx, *c, "ld-1");
+  const auto none = hHlReport(ctx, *c, "ld-1");
   ctx.Assert(!none.contains("freshness") || none["freshness"].is_null(), "wh_acme.orders has no commit on record and the report says freshness %s: the shared source's freshness never stands in for the table's", none.value("freshness", nlohmann::json()).dump());
 }
 
 void CheckDeltaFlag(harness::Ctx& ctx) {
   harness::HTTP* c = nullptr;
-  HlWorld& world = hlApi(ctx, c);
-  hlSeed(ctx, "ld-1", "1000", "1000");
+  HHlWorld& world = hHlApi(ctx, c);
+  hHlSeed(ctx, "ld-1", "1000", "1000");
   world.peer.held["wh_acme.orders/ld-1"] = 940;
-  hlReject(ctx, "ld-1", "p-1", "amount is not a decimal", 40);
-  hlSeed(ctx, "ld-2", "500", "500");
+  hHlReject(ctx, "ld-1", "p-1", "amount is not a decimal", 40);
+  hHlSeed(ctx, "ld-2", "500", "500");
   world.peer.held["wh_acme.orders/ld-2"] = 500;
   // ld-3: the warehouse holds one row more than was read (a duplicated row).
-  hlSeed(ctx, "ld-3", "500", "500");
+  hHlSeed(ctx, "ld-3", "500", "500");
   world.peer.held["wh_acme.orders/ld-3"] = 501;
-  const std::vector<nlohmann::json> reports = {hlReport(ctx, *c, "ld-1"), hlReport(ctx, *c, "ld-2"), hlReport(ctx, *c, "ld-3")};
+  const std::vector<nlohmann::json> reports = {hHlReport(ctx, *c, "ld-1"), hHlReport(ctx, *c, "ld-2"), hHlReport(ctx, *c, "ld-3")};
   for (const auto& body : reports) {
     ctx.Assert(body.contains("delta") && body.contains("flagged"), "the report must carry delta and flagged, got %s", body.dump());
     const long delta = body.value("rows_read", 0L) - body.value("rows_written", 0L) - body.value("rows_rejected", 0L);

@@ -907,22 +907,22 @@ import (
 )
 
 const (
-	intakeTopic = "schema.changed"
-	intakeDLQ   = "schema.changed.dlq"
-	intakeGroup = "metasense"
+	kHIntakeTopic = "schema.changed"
+	kHIntakeDLQ   = "schema.changed.dlq"
+	kHIntakeGroup = "metasense"
 )
 
 // intakeSeedRaw puts a record on partition 0: the records are handled in the order they are seeded.
-func intakeSeedRaw(ctx *harness.Ctx, key, value string) int64 {
-	return ctx.Kafka.SeedPartition(intakeTopic, 0, key, value).Offset
+func hIntakeSeedRaw(ctx *harness.Ctx, key, value string) int64 {
+	return ctx.Kafka.SeedPartition(kHIntakeTopic, 0, key, value).Offset
 }
 
-func intakeSeed(ctx *harness.Ctx, entity string, columns []string) int64 {
+func hIntakeSeed(ctx *harness.Ctx, entity string, columns []string) int64 {
 	value, _ := json.Marshal(map[string]any{"entity": entity, "owner": "team-logistics", "columns": columns})
-	return intakeSeedRaw(ctx, entity, string(value))
+	return hIntakeSeedRaw(ctx, entity, string(value))
 }
 
-func intakeQueued(ctx *harness.Ctx) []jobs.Job {
+func hIntakeQueued(ctx *harness.Ctx) []jobs.Job {
 	var queued []jobs.Job
 	for _, raw := range ctx.Redis.LRange("jobs:queue", 0, -1) {
 		var job jobs.Job
@@ -934,7 +934,7 @@ func intakeQueued(ctx *harness.Ctx) []jobs.Job {
 
 // intakeConsume runs the learner's loop until it waits for records that will not come, then stops it.
 // With mayFail, an error ending the loop is returned instead of failing the check.
-func intakeConsume(ctx *harness.Ctx, mayFail bool) error {
+func hIntakeConsume(ctx *harness.Ctx, mayFail bool) error {
 	c, cancel := context.WithCancel(context.Background())
 	var err error
 	ctx.Drain(func() { err = consume(c) })
@@ -949,12 +949,12 @@ func intakeConsume(ctx *harness.Ctx, mayFail bool) error {
 	return err
 }
 
-func intakeCommitted(ctx *harness.Ctx) int64 {
-	committed, _ := ctx.Kafka.Committed(intakeGroup, intakeTopic, 0)
+func hIntakeCommitted(ctx *harness.Ctx) int64 {
+	committed, _ := ctx.Kafka.Committed(kHIntakeGroup, kHIntakeTopic, 0)
 	return committed
 }
 
-func intakeStopped(err error) string {
+func hIntakeStopped(err error) string {
 	if err == nil {
 		return ""
 	}
@@ -963,9 +963,9 @@ func intakeStopped(err error) string {
 
 func CheckCommitAfterEnqueue(ctx *harness.Ctx) {
 	columns := []string{"merchant_id", "status", "delivery_time"}
-	intakeSeed(ctx, "deliveries", columns)
-	intakeSeed(ctx, "payments", []string{"card_no"})
-	intakeSeed(ctx, "orders", []string{"order_id"})
+	hIntakeSeed(ctx, "deliveries", columns)
+	hIntakeSeed(ctx, "payments", []string{"card_no"})
+	hIntakeSeed(ctx, "orders", []string{"order_id"})
 	var firstJobs []string
 	seenFirst := false
 	// Snapshot the deliveries job, then Redis refuses every later RPUSH jobs:queue (WRONGTYPE).
@@ -978,13 +978,13 @@ func CheckCommitAfterEnqueue(ctx *harness.Ctx) {
 	})
 	var atCommit []bool
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, probe.Fired) })
-	err := intakeConsume(ctx, true)
-	ctx.Assert(len(atCommit) > 0, "the offset of the deliveries event was never committed%s", intakeStopped(err))
+	err := hIntakeConsume(ctx, true)
+	ctx.Assert(len(atCommit) > 0, "the offset of the deliveries event was never committed%s", hIntakeStopped(err))
 	ctx.Assert(atCommit[0], "the offset was committed while jobs:queue was still empty: a crash between that commit and the enqueue loses the schema change. Queue the job, then commit")
 	ctx.Equal(len(firstJobs), 1, "jobs:queue must hold the deliveries job after the first enqueue; jobs")
 	ctx.Assert(!seenFirst, "deliveries was in jobs:seen before its job reached jobs:queue: a crash between the two skips the schema for good. jobs.MarkSeen after the enqueue")
 	ctx.Equal(len(ctx.Kafka.EventsOf("auto-commit")), 0, "offsets were auto-committed before the job existed; auto-commit events")
-	committed := intakeCommitted(ctx)
+	committed := hIntakeCommitted(ctx)
 	ctx.Assert(committed >= 1, "the deliveries event was handled but its offset never committed")
 	ctx.Equal(committed, int64(1), "Redis refused the payments job (RPUSH jobs:queue answered WRONGTYPE), yet the group committed past it: payments is lost. A job that was not queued must leave its offset where it was; committed offset")
 	ctx.Assert(!ctx.Redis.SIsMember("jobs:seen", "payments:"+jobs.SchemaHash([]string{"card_no"})), "payments is in jobs:seen though its job never reached jobs:queue: its redelivery would be skipped")
@@ -995,13 +995,13 @@ func CheckDedupeHash(ctx *harness.Ctx) {
 	changed := []string{"merchant_id", "status", "passport_no"}
 	// orders was queued by an earlier run of the service.
 	ctx.Redis.Do("SADD", "jobs:seen", "orders:"+jobs.SchemaHash([]string{"order_id"}))
-	intakeSeed(ctx, "deliveries", columns)
-	intakeSeed(ctx, "deliveries", columns) // the platform re-emits an unchanged schema
-	intakeSeed(ctx, "deliveries", changed)
-	intakeSeed(ctx, "payments", columns) // another entity with the same columns
-	intakeSeed(ctx, "orders", []string{"order_id"})
-	intakeConsume(ctx, false)
-	queued := intakeQueued(ctx)
+	hIntakeSeed(ctx, "deliveries", columns)
+	hIntakeSeed(ctx, "deliveries", columns) // the platform re-emits an unchanged schema
+	hIntakeSeed(ctx, "deliveries", changed)
+	hIntakeSeed(ctx, "payments", columns) // another entity with the same columns
+	hIntakeSeed(ctx, "orders", []string{"order_id"})
+	hIntakeConsume(ctx, false)
+	queued := hIntakeQueued(ctx)
 	ctx.Equal(len(queued), 3, "five events must queue 3 jobs: deliveries once per schema (one re-emitted unchanged), payments (same columns, another entity), and not orders (already in jobs:seen); jobs")
 	want := []string{"deliveries:" + jobs.SchemaHash(columns), "deliveries:" + jobs.SchemaHash(changed), "payments:" + jobs.SchemaHash(columns)}
 	var got []string
@@ -1015,7 +1015,7 @@ func CheckDedupeHash(ctx *harness.Ctx) {
 	for _, member := range want {
 		ctx.Assert(ctx.Redis.SIsMember("jobs:seen", member), "jobs:seen lacks %s: a queued schema must be marked seen, or its re-emission after a restart is scanned again", member)
 	}
-	ctx.Equal(ctx.Kafka.Lag(intakeGroup, intakeTopic), int64(0), "the skipped duplicates must be committed too, or they are redelivered forever; records left")
+	ctx.Equal(ctx.Kafka.Lag(kHIntakeGroup, kHIntakeTopic), int64(0), "the skipped duplicates must be committed too, or they are redelivered forever; records left")
 }
 
 func CheckDeadLetter(ctx *harness.Ctx) {
@@ -1034,22 +1034,22 @@ func CheckDeadLetter(ctx *harness.Ctx) {
 		{"numeric-column", \`{"entity":"orders","owner":"team-x","columns":["order_id",42]}\`},
 		{"listed", \`["orders"]\`},
 	} {
-		malformed = append(malformed, parked{kv[0], kv[1], intakeSeedRaw(ctx, kv[0], kv[1])})
+		malformed = append(malformed, parked{kv[0], kv[1], hIntakeSeedRaw(ctx, kv[0], kv[1])})
 	}
-	good := intakeSeed(ctx, "deliveries", []string{"merchant_id"})
+	good := hIntakeSeed(ctx, "deliveries", []string{"merchant_id"})
 	// Dead-lettered while the broker is slow to acknowledge, then once while it refuses the record.
 	late := parked{"late", \`{"entity":"late","owner":"","columns":["a"]}\`, 0}
-	late.offset = intakeSeedRaw(ctx, late.key, late.value)
+	late.offset = hIntakeSeedRaw(ctx, late.key, late.value)
 	lost := parked{"lost", \`{"entity":"lost","owner":"team-x","columns":"a"}\`, 0}
-	lost.offset = intakeSeedRaw(ctx, lost.key, lost.value)
-	intakeSeed(ctx, "after", []string{"merchant_id"})
+	lost.offset = hIntakeSeedRaw(ctx, lost.key, lost.value)
+	hIntakeSeed(ctx, "after", []string{"merchant_id"})
 	expected := append(append([]parked(nil), malformed...), late, lost)
 	var early []string
 	reported := map[string]bool{}
 	ctx.Kafka.OnCommit(func(_ string, offsets harness.KafkaOffsets) {
-		committed := offsets[harness.KafkaTopicPartition{Topic: intakeTopic, Partition: 0}]
+		committed := offsets[harness.KafkaTopicPartition{Topic: kHIntakeTopic, Partition: 0}]
 		on := map[string]bool{}
-		for _, v := range ctx.Kafka.Values(intakeDLQ) {
+		for _, v := range ctx.Kafka.Values(kHIntakeDLQ) {
 			on[v] = true
 		}
 		for _, p := range expected {
@@ -1060,16 +1060,16 @@ func CheckDeadLetter(ctx *harness.Ctx) {
 		}
 		switch committed {
 		case good + 1:
-			ctx.Kafka.StallFor(intakeDLQ, 3)
+			ctx.Kafka.StallFor(kHIntakeDLQ, 3)
 		case late.offset + 1:
-			ctx.Kafka.FailNext(intakeDLQ, 1)
+			ctx.Kafka.FailNext(kHIntakeDLQ, 1)
 		}
 	})
-	err := intakeConsume(ctx, true)
-	committed := intakeCommitted(ctx)
-	ctx.Assert(committed > late.offset, "the group committed offset %d%s: the dead-lettered records and deliveries must be committed, or they come back forever", committed, intakeStopped(err))
+	err := hIntakeConsume(ctx, true)
+	committed := hIntakeCommitted(ctx)
+	ctx.Assert(committed > late.offset, "the group committed offset %d%s: the dead-lettered records and deliveries must be committed, or they come back forever", committed, hIntakeStopped(err))
 	var entities []string
-	for _, job := range intakeQueued(ctx) {
+	for _, job := range hIntakeQueued(ctx) {
 		entities = append(entities, job.Entity)
 	}
 	ok := len(entities) > 0 && entities[0] == "deliveries"
@@ -1077,15 +1077,15 @@ func CheckDeadLetter(ctx *harness.Ctx) {
 		ok = ok && (e == "deliveries" || e == "after")
 	}
 	ctx.Assert(ok, "jobs:queue holds jobs for %v, expected deliveries and no malformed event", entities)
-	ctx.Equal(len(early), 0, "the offsets of %v were committed before %s acknowledged them (the broker was slow, then refused one): a crash there loses the payload. Commit once the broker took the dead letter; records committed early", early, intakeDLQ)
+	ctx.Equal(len(early), 0, "the offsets of %v were committed before %s acknowledged them (the broker was slow, then refused one): a crash there loses the payload. Commit once the broker took the dead letter; records committed early", early, kHIntakeDLQ)
 	var wantValues, wantKeys []string
 	for _, p := range append(append([]parked(nil), malformed...), late) {
 		wantValues = append(wantValues, p.value)
 		wantKeys = append(wantKeys, p.key)
 	}
-	values, keys := ctx.Kafka.Values(intakeDLQ), ctx.Kafka.Keys(intakeDLQ)
-	ctx.Assert(len(values) >= len(wantValues), "%s holds %v, expected the malformed payloads as they arrived: %v", intakeDLQ, values, wantValues)
-	ctx.Equal(values[:len(wantValues)], wantValues, "%s must hold the malformed payloads as they arrived, in order", intakeDLQ)
+	values, keys := ctx.Kafka.Values(kHIntakeDLQ), ctx.Kafka.Keys(kHIntakeDLQ)
+	ctx.Assert(len(values) >= len(wantValues), "%s holds %v, expected the malformed payloads as they arrived: %v", kHIntakeDLQ, values, wantValues)
+	ctx.Equal(values[:len(wantValues)], wantValues, "%s must hold the malformed payloads as they arrived, in order", kHIntakeDLQ)
 	ctx.Equal(keys[:len(wantKeys)], wantKeys, "the dead letters must carry the original keys")
 }
 `,

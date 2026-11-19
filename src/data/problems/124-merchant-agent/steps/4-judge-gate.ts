@@ -873,13 +873,13 @@ import (
 
 // gatePeer is the stand-in judges (sidekick/judge): rubberStamp makes the named criteria's judges
 // score everything 1.0; misses[criterion] lists conversation indices that judge scores 0.
-type gatePeer struct {
+type HGatePeer struct {
 	pb.UnimplementedJudgeServer
 	rubberStamp map[string]bool
 	misses      map[string]map[int]bool
 }
 
-func (p *gatePeer) Score(_ context.Context, req *pb.ScoreRequest) (*pb.ScoreReply, error) {
+func (p *HGatePeer) Score(_ context.Context, req *pb.ScoreRequest) (*pb.ScoreReply, error) {
 	if p.rubberStamp[req.GetCriterion()] {
 		return &pb.ScoreReply{Score: 1}, nil
 	}
@@ -891,7 +891,7 @@ func (p *gatePeer) Score(_ context.Context, req *pb.ScoreRequest) (*pb.ScoreRepl
 }
 
 // gateIndices is the set of conversation indices below 200 whose position in the cycle of 20 is listed.
-func gateIndices(positions ...int) map[int]bool {
+func hGateIndices(positions ...int) map[int]bool {
 	out := map[int]bool{}
 	for i := 0; i < 200; i++ {
 		for _, p := range positions {
@@ -903,20 +903,20 @@ func gateIndices(positions ...int) map[int]bool {
 	return out
 }
 
-func gateWorld(ctx *harness.Ctx) *gatePeer {
-	peer := &gatePeer{}
+func hGateWorld(ctx *harness.Ctx) *HGatePeer {
+	peer := &HGatePeer{}
 	pb.RegisterJudgeServer(ctx.GRPC.Server(config.JudgeAddr), peer)
 	ctx.Redis.Do("HSET", "gtx:baseline", "correctness", "0.95", "schema_compliance", "1.0", "helpfulness", "0.95")
 	return peer
 }
 
-func gateRun(ctx *harness.Ctx, version string) evals.Decision {
+func hGateRun(ctx *harness.Ctx, version string) evals.Decision {
 	d, err := gate(context.Background(), version)
 	ctx.NoError(err, "gate(%q)", version)
 	return d
 }
 
-func gateScored(ctx *harness.Ctx) []*pb.ScoreRequest {
+func hGateScored(ctx *harness.Ctx) []*pb.ScoreRequest {
 	out := []*pb.ScoreRequest{}
 	for _, c := range ctx.GRPC.CallsTo("Score", "") {
 		req, _ := c.Request.(*pb.ScoreRequest)
@@ -926,19 +926,19 @@ func gateScored(ctx *harness.Ctx) []*pb.ScoreRequest {
 }
 
 func CheckFullSample(ctx *harness.Ctx) {
-	gateWorld(ctx)
-	gateRun(ctx, "v-good")
+	hGateWorld(ctx)
+	hGateRun(ctx, "v-good")
 	ids := map[string]bool{}
-	for _, r := range gateScored(ctx) {
+	for _, r := range hGateScored(ctx) {
 		ids[r.GetConversationId()] = true
 	}
 	ctx.Equal(len(ids), 200, "five conversations cannot tell a two-point regression from noise; judge sampleSize = 200; conversations judged")
 }
 
 func CheckJudgePerCriterion(ctx *harness.Ctx) {
-	gateWorld(ctx)
-	gateRun(ctx, "v-good")
-	requests := gateScored(ctx)
+	hGateWorld(ctx)
+	hGateRun(ctx, "v-good")
+	requests := hGateScored(ctx)
 	ctx.Assert(len(requests) > 0, "the gate never called the judge")
 	seen := map[string]map[string]bool{}
 	for _, r := range requests {
@@ -960,25 +960,25 @@ func CheckJudgePerCriterion(ctx *harness.Ctx) {
 }
 
 func CheckCalibratedJudges(ctx *harness.Ctx) {
-	peer := gateWorld(ctx)
+	peer := hGateWorld(ctx)
 	peer.rubberStamp = map[string]bool{"correctness": true, "schema_compliance": true, "helpfulness": true}
-	d := gateRun(ctx, "v-good")
+	d := hGateRun(ctx, "v-good")
 	ctx.Assert(!d.Ship, "a judge that scores everything 1.0 disagrees with the labellers on correctness (kappa 0) and the gate shipped anyway: %+v", d)
 	ctx.Equal(ctx.Redis.Exists("gtx:release:v-good"), int64(0), "a refused release must record nothing; gtx:release:v-good exists")
 	peer.rubberStamp = map[string]bool{"helpfulness": true}
-	d = gateRun(ctx, "v-good")
+	d = hGateRun(ctx, "v-good")
 	ctx.Assert(!d.Ship, "the correctness judge is calibrated but the helpfulness judge scores everything 1.0 (kappa 0 against the labellers) and the gate shipped: every criterion's judge is calibrated before its mean counts, %+v", d)
 	ctx.Equal(ctx.Redis.Exists("gtx:release:v-good"), int64(0), "a refused release must record nothing; gtx:release:v-good exists")
 	peer.rubberStamp = nil
-	d = gateRun(ctx, "v-good")
+	d = hGateRun(ctx, "v-good")
 	ctx.Assert(d.Ship, "with judges that agree with the labellers v-good ships: %+v", d)
 }
 
 func CheckSchemaFirst(ctx *harness.Ctx) {
-	gateWorld(ctx)
-	d := gateRun(ctx, "v-tag")
+	hGateWorld(ctx)
+	d := hGateRun(ctx, "v-tag")
 	tagged := []string{}
-	for _, r := range gateScored(ctx) {
+	for _, r := range hGateScored(ctx) {
 		parts := strings.Split(r.GetConversationId(), "-")
 		i, _ := strconv.Atoi(parts[len(parts)-1])
 		if p := i % 20; p == 4 || p == 8 || p == 12 || p == 16 {
@@ -991,12 +991,12 @@ func CheckSchemaFirst(ctx *harness.Ctx) {
 }
 
 func CheckShipDecision(ctx *harness.Ctx) {
-	peer := gateWorld(ctx)
-	early := gateRun(ctx, "v-early")
+	peer := hGateWorld(ctx)
+	early := hGateRun(ctx, "v-early")
 	ctx.Assert(!early.Ship, "v-early's correctness is 0.65, under minScore = 0.8, and it shipped: %+v", early)
-	regress := gateRun(ctx, "v-regress")
+	regress := hGateRun(ctx, "v-regress")
 	ctx.Assert(!regress.Ship, "v-regress's helpfulness is 0.90 against a baseline of 0.95 (maxRegression = 0.02) and it shipped: %+v", regress)
-	good := gateRun(ctx, "v-good")
+	good := hGateRun(ctx, "v-good")
 	ctx.Assert(good.Ship, "v-good matches the baseline and must ship: %+v", good)
 	recorded := ctx.Redis.HGetAll("gtx:release:v-good")
 	correctness, _ := strconv.ParseFloat(recorded["correctness"], 64)
@@ -1004,17 +1004,17 @@ func CheckShipDecision(ctx *harness.Ctx) {
 	ctx.Assert(ctx.Redis.Exists("gtx:release:v-early", "gtx:release:v-regress") == 0, "a refused version must record nothing")
 	// Helpfulness 0.94 against a baseline of 0.95: one point down, within maxRegression = 0.02.
 	peer.misses = map[string]map[int]bool{"helpfulness": {2: true, 22: true}}
-	within := gateRun(ctx, "v-good")
+	within := hGateRun(ctx, "v-good")
 	ctx.Assert(within.Ship, "helpfulness %v is 0.01 below the baseline 0.95, within maxRegression = 0.02, and the gate refused: %+v", within.Means["helpfulness"], within)
 	// Correctness exactly at minScore = 0.8 (the baseline lowered to 0.8) ships; 0.795 does not.
 	ctx.Redis.Do("HSET", "gtx:baseline", "correctness", "0.8")
-	peer.misses = map[string]map[int]bool{"correctness": gateIndices(1, 2, 3)}
-	floor := gateRun(ctx, "v-good")
+	peer.misses = map[string]map[int]bool{"correctness": hGateIndices(1, 2, 3)}
+	floor := hGateRun(ctx, "v-good")
 	ctx.Assert(floor.Ship, "correctness %v is exactly minScore = 0.8, at least the floor, and the gate refused: %+v", floor.Means["correctness"], floor)
-	under := gateIndices(1, 2, 3)
+	under := hGateIndices(1, 2, 3)
 	under[4] = true
 	peer.misses = map[string]map[int]bool{"correctness": under}
-	below := gateRun(ctx, "v-good")
+	below := hGateRun(ctx, "v-good")
 	ctx.Assert(!below.Ship, "correctness %v is under minScore = 0.8 and the gate shipped: %+v", below.Means["correctness"], below)
 }
 `,
@@ -1037,7 +1037,7 @@ namespace {
 
 // The stand-in judges (sidekick/judge.h): rubber_stamp makes the named criteria's judges score
 // everything 1.0; misses[criterion] lists conversation indices that judge scores 0.
-class GatePeer final : public sidekickrpc::Judge::Service {
+class HGatePeer final : public sidekickrpc::Judge::Service {
  public:
   std::set<std::string> rubber_stamp;
   std::map<std::string, std::set<int>> misses;
@@ -1057,7 +1057,7 @@ class GatePeer final : public sidekickrpc::Judge::Service {
 };
 
 // The conversation indices below 200 whose position in the cycle of 20 is listed.
-std::set<int> gateIndices(std::initializer_list<int> positions) {
+std::set<int> hGateIndices(std::initializer_list<int> positions) {
   std::set<int> out;
   for (int i = 0; i < 200; ++i) {
     for (const int p : positions) {
@@ -1067,16 +1067,16 @@ std::set<int> gateIndices(std::initializer_list<int> positions) {
   return out;
 }
 
-GatePeer& gateWorld(harness::Ctx& ctx) {
-  static GatePeer* peer = nullptr;
+HGatePeer& hGateWorld(harness::Ctx& ctx) {
+  static HGatePeer* peer = nullptr;
   delete peer;
-  peer = new GatePeer;
+  peer = new HGatePeer;
   ctx.GRPC.Server(config::kJudgeAddr)->RegisterService(peer);
   ctx.Redis.Do("HSET", "gtx:baseline", "correctness", "0.95", "schema_compliance", "1.0", "helpfulness", "0.95");
   return *peer;
 }
 
-std::vector<sidekickrpc::ScoreRequest> gateScored(harness::Ctx& ctx) {
+std::vector<sidekickrpc::ScoreRequest> hGateScored(harness::Ctx& ctx) {
   std::vector<sidekickrpc::ScoreRequest> out;
   for (const auto& c : ctx.GRPC.CallsTo("Score")) out.push_back(c.Request<sidekickrpc::ScoreRequest>());
   return out;
@@ -1085,17 +1085,17 @@ std::vector<sidekickrpc::ScoreRequest> gateScored(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckFullSample(harness::Ctx& ctx) {
-  gateWorld(ctx);
+  hGateWorld(ctx);
   gate("v-good");
   std::set<std::string> ids;
-  for (const auto& r : gateScored(ctx)) ids.insert(r.conversation_id());
+  for (const auto& r : hGateScored(ctx)) ids.insert(r.conversation_id());
   ctx.Equal(ids.size(), 200, "five conversations cannot tell a two-point regression from noise; judge kSampleSize = 200; conversations judged");
 }
 
 void CheckJudgePerCriterion(harness::Ctx& ctx) {
-  gateWorld(ctx);
+  hGateWorld(ctx);
   gate("v-good");
-  const auto requests = gateScored(ctx);
+  const auto requests = hGateScored(ctx);
   ctx.Assert(!requests.empty(), "the gate never called the judge");
   std::map<std::string, std::set<std::string>> seen;
   for (const auto& r : requests) {
@@ -1113,7 +1113,7 @@ void CheckJudgePerCriterion(harness::Ctx& ctx) {
 }
 
 void CheckCalibratedJudges(harness::Ctx& ctx) {
-  auto& peer = gateWorld(ctx);
+  auto& peer = hGateWorld(ctx);
   peer.rubber_stamp = {"correctness", "schema_compliance", "helpfulness"};
   auto d = gate("v-good");
   ctx.Assert(!d.ship, "a judge that scores everything 1.0 disagrees with the labellers on correctness (kappa 0) and the gate shipped anyway (%s)", d.reason);
@@ -1128,10 +1128,10 @@ void CheckCalibratedJudges(harness::Ctx& ctx) {
 }
 
 void CheckSchemaFirst(harness::Ctx& ctx) {
-  gateWorld(ctx);
+  hGateWorld(ctx);
   const auto d = gate("v-tag");
   std::vector<std::string> tagged;
-  for (const auto& r : gateScored(ctx)) {
+  for (const auto& r : hGateScored(ctx)) {
     const std::string& id = r.conversation_id();
     const int p = std::atoi(id.substr(id.rfind('-') + 1).c_str()) % 20;
     if (p == 4 || p == 8 || p == 12 || p == 16) tagged.push_back(id);
@@ -1141,7 +1141,7 @@ void CheckSchemaFirst(harness::Ctx& ctx) {
 }
 
 void CheckShipDecision(harness::Ctx& ctx) {
-  auto& peer = gateWorld(ctx);
+  auto& peer = hGateWorld(ctx);
   const auto early = gate("v-early");
   ctx.Assert(!early.ship, "v-early's correctness is 0.65, under kMinScore = 0.8, and it shipped (%s)", early.reason);
   const auto regress = gate("v-regress");
@@ -1159,7 +1159,7 @@ void CheckShipDecision(harness::Ctx& ctx) {
   ctx.Assert(within.ship, "helpfulness 0.94 is 0.01 below the baseline 0.95, within kMaxRegression = 0.02, and the gate refused (%s)", within.reason);
   // Correctness exactly at kMinScore = 0.8 (the baseline lowered to 0.8) ships; 0.795 does not.
   ctx.Redis.Do("HSET", "gtx:baseline", "correctness", "0.8");
-  peer.misses = {{"correctness", gateIndices({1, 2, 3})}};
+  peer.misses = {{"correctness", hGateIndices({1, 2, 3})}};
   const auto atFloor = gate("v-good");
   ctx.Assert(atFloor.ship, "correctness 0.8 is exactly kMinScore = 0.8, at least the floor, and the gate refused (%s)", atFloor.reason);
   peer.misses["correctness"].insert(4);

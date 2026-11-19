@@ -738,7 +738,7 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
 type harnessReadBody struct {
 	State          string           \`json:"state"\`
@@ -755,17 +755,17 @@ func harnessShow(b harnessReadBody) string {
 	return string(out)
 }
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readJobFor(ctx *harness.Ctx, jobID, tenant string) {
-	ctx.NoError(store.CreateJob(readBg, jobID, tenant, "email.send", map[string]any{"to": "ada@example.com", "template": "welcome"}), "CreateJob")
+func hReadJobFor(ctx *harness.Ctx, jobID, tenant string) {
+	ctx.NoError(store.CreateJob(hReadBg, jobID, tenant, "email.send", map[string]any{"to": "ada@example.com", "template": "welcome"}), "CreateJob")
 }
 
-func readGet(ctx *harness.Ctx, c *harness.HTTP, jobID string) harnessReadBody {
+func hReadGet(ctx *harness.Ctx, c *harness.HTTP, jobID string) harnessReadBody {
 	r := c.Get("/v1/jobs/"+jobID, "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 200, "GET /v1/jobs/%s (%s)", jobID, r.Text())
 	var body harnessReadBody
@@ -774,24 +774,24 @@ func readGet(ctx *harness.Ctx, c *harness.HTTP, jobID string) harnessReadBody {
 }
 
 func CheckStatusRoute(ctx *harness.Ctx) {
-	readJobFor(ctx, "job-1", "t-1")
-	readJobFor(ctx, "job-2", "t-1")
-	got, _ := queue.Claim(readBg, "w-1")
+	hReadJobFor(ctx, "job-1", "t-1")
+	hReadJobFor(ctx, "job-2", "t-1")
+	got, _ := queue.Claim(hReadBg, "w-1")
 	ctx.Equal(got, "job-1", "the harness's claim")
-	store.BeginAttempt(readBg, "job-1")
-	store.RecordAttempt(readBg, "job-1", 1, "INVALID_ARGUMENT: template welcome-v9 does not exist")
-	queue.Bury(readBg, "job-1", "permanent_error")
-	c := readAPI(ctx)
-	queued := readGet(ctx, c, "job-2")
+	store.BeginAttempt(hReadBg, "job-1")
+	store.RecordAttempt(hReadBg, "job-1", 1, "INVALID_ARGUMENT: template welcome-v9 does not exist")
+	queue.Bury(hReadBg, "job-1", "permanent_error")
+	c := hReadAPI(ctx)
+	queued := hReadGet(ctx, c, "job-2")
 	ctx.Assert(queued.State == "queued" && queued.Attempts == 0 && len(queued.AttemptHistory) == 0, "a queued job reads %s", harnessShow(queued))
-	dead := readGet(ctx, c, "job-1")
+	dead := hReadGet(ctx, c, "job-1")
 	ctx.Assert(dead.State == "dead" && dead.DeadReason != nil && *dead.DeadReason == "permanent_error", "a buried job must read dead with its dead_reason, got %s", harnessShow(dead))
 	ctx.Assert(len(dead.AttemptHistory) == 1 && strings.HasPrefix(dead.AttemptHistory[0]["error"].(string), "INVALID_ARGUMENT"), "the attempt history must carry each attempt's error, got %v", dead.AttemptHistory)
 }
 
 func CheckTenant404(ctx *harness.Ctx) {
-	readJobFor(ctx, "job-1", "t-1")
-	c := readAPI(ctx)
+	hReadJobFor(ctx, "job-1", "t-1")
+	c := hReadAPI(ctx)
 	missing := c.Get("/v1/jobs/job-404", "X-Tenant-Id", "t-2")
 	foreign := c.Get("/v1/jobs/job-1", "X-Tenant-Id", "t-2")
 	own := c.Get("/v1/jobs/job-1", "X-Tenant-Id", "t-1")
@@ -802,41 +802,41 @@ func CheckTenant404(ctx *harness.Ctx) {
 }
 
 func CheckStalledClaim(ctx *harness.Ctx) {
-	readJobFor(ctx, "job-1", "t-1")
-	got, _ := queue.Claim(readBg, "w-1")
+	hReadJobFor(ctx, "job-1", "t-1")
+	got, _ := queue.Claim(hReadBg, "w-1")
 	ctx.Equal(got, "job-1", "the harness's claim")
-	c := readAPI(ctx)
-	ctx.Equal(readGet(ctx, c, "job-1").State, "running", "a job claimed a moment ago; its state")
+	c := hReadAPI(ctx)
+	ctx.Equal(hReadGet(ctx, c, "job-1").State, "running", "a job claimed a moment ago; its state")
 	ctx.Clock.Advance(59)
-	before := readGet(ctx, c, "job-1")
+	before := hReadGet(ctx, c, "job-1")
 	ctx.Assert(before.State == "running", "1 s before its claim deadline the job reads %s: it is still running", harnessShow(before))
 	ctx.Clock.Advance(1) // the deadline itself: the worker died; no reaper has run
-	at := readGet(ctx, c, "job-1")
+	at := hReadGet(ctx, c, "job-1")
 	ctx.Assert(at.State == "stalled", "at its claim deadline (score equal to now) the job reads %s: a claim whose score is at or before now is stalled", harnessShow(at))
 	ctx.Clock.Advance(1)
-	late := readGet(ctx, c, "job-1")
+	late := hReadGet(ctx, c, "job-1")
 	ctx.Assert(late.State == "stalled", "61 s after the claim, with its deadline past, the job reads %q: compare the jobs:inflight score with now and report stalled", late.State)
 	ctx.Assert(late.RetryOverdue != nil && !*late.RetryOverdue, "a stalled claim is not a retry: retry_overdue must stay false, got %s", harnessShow(late))
 }
 
 func CheckRetryOverdue(ctx *harness.Ctx) {
-	readJobFor(ctx, "job-1", "t-1")
-	got, _ := queue.Claim(readBg, "w-1")
+	hReadJobFor(ctx, "job-1", "t-1")
+	got, _ := queue.Claim(hReadBg, "w-1")
 	ctx.Equal(got, "job-1", "the harness's claim")
 	due := ctx.Clock.Now() + 2000
-	ctx.NoError(queue.RetryLater(readBg, "job-1", due), "RetryLater")
-	readJobFor(ctx, "job-2", "t-1")
-	c := readAPI(ctx)
-	queued := readGet(ctx, c, "job-2")
+	ctx.NoError(queue.RetryLater(hReadBg, "job-1", due), "RetryLater")
+	hReadJobFor(ctx, "job-2", "t-1")
+	c := hReadAPI(ctx)
+	queued := hReadGet(ctx, c, "job-2")
 	ctx.Assert(queued.RetryOverdue != nil && !*queued.RetryOverdue, "a queued job must read retry_overdue false, got %s", harnessShow(queued))
-	ahead := readGet(ctx, c, "job-1")
+	ahead := hReadGet(ctx, c, "job-1")
 	ctx.Assert(ahead.State == "retrying" && ahead.NextRetryAtMs != nil && *ahead.NextRetryAtMs == due, "a job retrying in 2 s reads %s", harnessShow(ahead))
 	ctx.Assert(ahead.RetryOverdue != nil && !*ahead.RetryOverdue, "with the retry still ahead the read must say retry_overdue false, got %s", harnessShow(ahead))
 	ctx.Clock.Advance(2) // the retry time itself
-	at := readGet(ctx, c, "job-1")
+	at := hReadGet(ctx, c, "job-1")
 	ctx.Assert(at.RetryOverdue != nil && *at.RetryOverdue, "at its retry time (score equal to now) the job reads %s: a retry whose score is at or before now is overdue", harnessShow(at))
 	ctx.Clock.Advance(1) // the reaper is behind
-	late := readGet(ctx, c, "job-1")
+	late := hReadGet(ctx, c, "job-1")
 	ctx.Equal(late.State, "retrying", "an overdue retry is still retrying; the state")
 	ctx.Assert(late.RetryOverdue != nil && *late.RetryOverdue, "3 s after its retry time the job reads %s: a next_retry_at_ms in the past must come with retry_overdue true", harnessShow(late))
 }
@@ -852,7 +852,7 @@ func CheckRetryOverdue(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP readAPI(harness::Ctx& ctx) {
+harness::HTTP hReadAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -860,11 +860,11 @@ harness::HTTP readAPI(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-void readJobFor(const std::string& job_id, const std::string& tenant) {
+void hReadJobFor(const std::string& job_id, const std::string& tenant) {
   store::createJob(job_id, tenant, "email.send", nlohmann::json{{"to", "ada@example.com"}, {"template", "welcome"}});
 }
 
-nlohmann::json readGet(harness::Ctx& ctx, harness::HTTP& c, const std::string& job_id) {
+nlohmann::json hReadGet(harness::Ctx& ctx, harness::HTTP& c, const std::string& job_id) {
   const auto r = c.Get("/v1/jobs/" + job_id, "X-Tenant-Id", "t-1");
   ctx.Equal(r.Status, 200, "GET /v1/jobs/%s (%s)", job_id, r.Text());
   return nlohmann::json::parse(r.Text(), nullptr, false);
@@ -873,24 +873,24 @@ nlohmann::json readGet(harness::Ctx& ctx, harness::HTTP& c, const std::string& j
 }  // namespace
 
 void CheckStatusRoute(harness::Ctx& ctx) {
-  readJobFor("job-1", "t-1");
-  readJobFor("job-2", "t-1");
+  hReadJobFor("job-1", "t-1");
+  hReadJobFor("job-2", "t-1");
   ctx.Equal(queue::claim("w-1").value_or(""), "job-1", "the harness's claim");
   store::beginAttempt("job-1");
   store::recordAttempt("job-1", 1, "INVALID_ARGUMENT: template welcome-v9 does not exist");
   queue::bury("job-1", "permanent_error");
-  auto c = readAPI(ctx);
-  const auto queued = readGet(ctx, c, "job-2");
+  auto c = hReadAPI(ctx);
+  const auto queued = hReadGet(ctx, c, "job-2");
   ctx.Assert(queued.value("state", "") == "queued" && queued.value("attempts", -1) == 0 && queued["attempt_history"].empty(), "a queued job reads %s", queued.dump());
-  const auto dead = readGet(ctx, c, "job-1");
+  const auto dead = hReadGet(ctx, c, "job-1");
   ctx.Assert(dead.value("state", "") == "dead" && dead["dead_reason"] == "permanent_error", "a buried job must read dead with its dead_reason, got %s", dead.dump());
   const auto& history = dead["attempt_history"];
   ctx.Assert(history.size() == 1 && history[0].value("error", "").rfind("INVALID_ARGUMENT", 0) == 0, "the attempt history must carry each attempt's error, got %s", history.dump());
 }
 
 void CheckTenant404(harness::Ctx& ctx) {
-  readJobFor("job-1", "t-1");
-  auto c = readAPI(ctx);
+  hReadJobFor("job-1", "t-1");
+  auto c = hReadAPI(ctx);
   const auto missing = c.Get("/v1/jobs/job-404", "X-Tenant-Id", "t-2");
   const auto foreign = c.Get("/v1/jobs/job-1", "X-Tenant-Id", "t-2");
   const auto own = c.Get("/v1/jobs/job-1", "X-Tenant-Id", "t-1");
@@ -901,40 +901,40 @@ void CheckTenant404(harness::Ctx& ctx) {
 }
 
 void CheckStalledClaim(harness::Ctx& ctx) {
-  readJobFor("job-1", "t-1");
+  hReadJobFor("job-1", "t-1");
   ctx.Equal(queue::claim("w-1").value_or(""), "job-1", "the harness's claim");
-  auto c = readAPI(ctx);
-  ctx.Equal(readGet(ctx, c, "job-1").value("state", ""), "running", "a job claimed a moment ago; its state");
+  auto c = hReadAPI(ctx);
+  ctx.Equal(hReadGet(ctx, c, "job-1").value("state", ""), "running", "a job claimed a moment ago; its state");
   ctx.Clock.Advance(59);
-  const auto before = readGet(ctx, c, "job-1");
+  const auto before = hReadGet(ctx, c, "job-1");
   ctx.Assert(before.value("state", "") == "running", "1 s before its claim deadline the job reads %s: it is still running", before.dump());
   ctx.Clock.Advance(1);  // the deadline itself: the worker died; no reaper has run
-  const auto at = readGet(ctx, c, "job-1");
+  const auto at = hReadGet(ctx, c, "job-1");
   ctx.Assert(at.value("state", "") == "stalled", "at its claim deadline (score equal to now) the job reads %s: a claim whose score is at or before now is stalled", at.dump());
   ctx.Clock.Advance(1);
-  const auto late = readGet(ctx, c, "job-1");
+  const auto late = hReadGet(ctx, c, "job-1");
   const std::string state = late.value("state", "");
   ctx.Assert(state == "stalled", "61 s after the claim, with its deadline past, the job reads %q: compare the jobs:inflight score with now and report stalled", state);
   ctx.Assert(late.contains("retry_overdue") && late["retry_overdue"] == false, "a stalled claim is not a retry: retry_overdue must stay false, got %s", late.dump());
 }
 
 void CheckRetryOverdue(harness::Ctx& ctx) {
-  readJobFor("job-1", "t-1");
+  hReadJobFor("job-1", "t-1");
   ctx.Equal(queue::claim("w-1").value_or(""), "job-1", "the harness's claim");
   const long long due = ctx.Clock.Now() + 2000;
   queue::retryLater("job-1", due);
-  readJobFor("job-2", "t-1");
-  auto c = readAPI(ctx);
-  const auto queued = readGet(ctx, c, "job-2");
+  hReadJobFor("job-2", "t-1");
+  auto c = hReadAPI(ctx);
+  const auto queued = hReadGet(ctx, c, "job-2");
   ctx.Assert(queued.contains("retry_overdue") && queued["retry_overdue"] == false, "a queued job must read retry_overdue false, got %s", queued.dump());
-  const auto ahead = readGet(ctx, c, "job-1");
+  const auto ahead = hReadGet(ctx, c, "job-1");
   ctx.Assert(ahead.value("state", "") == "retrying" && ahead["next_retry_at_ms"] == due, "a job retrying in 2 s reads %s", ahead.dump());
   ctx.Assert(ahead.contains("retry_overdue") && ahead["retry_overdue"] == false, "with the retry still ahead the read must say retry_overdue false, got %s", ahead.dump());
   ctx.Clock.Advance(2);  // the retry time itself
-  const auto at = readGet(ctx, c, "job-1");
+  const auto at = hReadGet(ctx, c, "job-1");
   ctx.Assert(at.contains("retry_overdue") && at["retry_overdue"] == true, "at its retry time (score equal to now) the job reads %s: a retry whose score is at or before now is overdue", at.dump());
   ctx.Clock.Advance(1);  // the reaper is behind
-  const auto late = readGet(ctx, c, "job-1");
+  const auto late = hReadGet(ctx, c, "job-1");
   ctx.Equal(late.value("state", ""), "retrying", "an overdue retry is still retrying; the state");
   ctx.Assert(late.contains("retry_overdue") && late["retry_overdue"] == true, "3 s after its retry time the job reads %s: a next_retry_at_ms in the past must come with retry_overdue true", late.dump());
 }

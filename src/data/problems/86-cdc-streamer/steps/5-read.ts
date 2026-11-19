@@ -913,7 +913,7 @@ const (
 	hCritical = int64(512 * 1024 * 1024)
 )
 
-var lagBg = context.Background()
+var hLagBg = context.Background()
 
 type hSlotEntry struct {
 	head, restart int64
@@ -950,13 +950,13 @@ func hLagSetup(ctx *harness.Ctx) *hLagWorld {
 
 // subscribe creates an acme subscription whose slot is e (none when slot is false), confirmed at confirmed (none when < 0).
 func (w *hLagWorld) subscribe(e hSlotEntry, confirmed int64, slot bool) *store.Subscription {
-	sub, err := store.CreateSubscription(lagBg, "acme", "orders", []string{"id", "status"}, "warehouse-1")
+	sub, err := store.CreateSubscription(hLagBg, "acme", "orders", []string{"id", "status"}, "warehouse-1")
 	w.ctx.NoError(err, "creating the subscription")
 	if slot {
 		w.source.slots[sub.Slot] = e
 	}
 	if confirmed >= 0 {
-		_, err = cursor.Confirm(lagBg, sub.ID, "orders", confirmed)
+		_, err = cursor.Confirm(hLagBg, sub.ID, "orders", confirmed)
 		w.ctx.NoError(err, "confirming the cursor")
 	}
 	return sub
@@ -1019,7 +1019,7 @@ func CheckSlotHealth(ctx *harness.Ctx) {
 	idle := w.subscribe(hSlotEntry{5000, 3000, false}, 4000, true)
 	dropped := w.subscribe(hSlotEntry{}, 4000, false)
 	halted := w.subscribe(hSlotEntry{5000, 3000, true}, 4000, true)
-	ctx.NoError(store.SetStatus(lagBg, halted.ID, "slot_lost"), "marking the subscription slot_lost")
+	ctx.NoError(store.SetStatus(hLagBg, halted.ID, "slot_lost"), "marking the subscription slot_lost")
 	flaky := w.subscribe(hSlotEntry{5000, 3000, true}, 4000, true)
 	got := hBody(w.lag(idle.ID, "acme"))
 	ctx.Assert(got["slot_active"] == false && got["state"] == "critical", "a slot no consumer holds read %v: the database retains WAL for it until the disk fills. Expected state critical", got)
@@ -1058,7 +1058,7 @@ func CheckSlotHealth(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr int64_t kFar = 2LL * 1024 * 1024 * 1024;  // 2 GiB of WAL: critical whatever the threshold below 1 GiB
+constexpr int64_t kHFar = 2LL * 1024 * 1024 * 1024;  // 2 GiB of WAL: critical whatever the threshold below 1 GiB
 constexpr int64_t kHarnessCritical = 512LL * 1024 * 1024;
 
 // Slots by name: head_lsn, restart_lsn, active; a slot not listed was dropped.
@@ -1113,15 +1113,15 @@ nlohmann::json hBody(const harness::Response& r) {
 void CheckRoute(harness::Ctx& ctx) {
   HLagWorld& w = hLagSetup(ctx);
   const auto near = hSubscribe(w, 5000, 3000, true, 4000);
-  const auto far = hSubscribe(w, 4000 + kFar, 1000, true, 4000);
+  const auto far = hSubscribe(w, 4000 + kHFar, 1000, true, 4000);
   auto r = hLag(ctx, w, near.id);
   ctx.Equal(r.Status, 200, "GET /v1/subscriptions/%s/lag (%s)", near.id, r.Text());
   const nlohmann::json want = {{"subscription_id", near.id}, {"confirmed_lsn", 4000}, {"head_lsn", 5000},
                                {"lag_bytes", 1000},          {"slot_active", true},   {"state", "ok"}};
   ctx.Equal(hBody(r), want, "the lag read");
   auto got = hBody(hLag(ctx, w, far.id));
-  ctx.Assert(got.value("lag_bytes", int64_t{0}) == kFar && got.value("state", "") == "critical",
-             "2 GiB behind the head the read answered %s, expected lag_bytes %d and state critical", got.dump(), kFar);
+  ctx.Assert(got.value("lag_bytes", int64_t{0}) == kHFar && got.value("state", "") == "critical",
+             "2 GiB behind the head the read answered %s, expected lag_bytes %d and state critical", got.dump(), kHFar);
   const auto below = hSubscribe(w, 4000 + kHarnessCritical - 1, 1000, true, 4000);
   got = hBody(hLag(ctx, w, below.id));
   ctx.Assert(got["lag_bytes"] == kHarnessCritical - 1 && got["state"] == "ok", "one byte short of kCriticalLagBytes (512 MiB) the read answered %s, expected state ok", got.dump());
@@ -1146,9 +1146,9 @@ void CheckTenantScope(harness::Ctx& ctx) {
 
 void CheckUnconfirmedLag(harness::Ctx& ctx) {
   HLagWorld& w = hLagSetup(ctx);
-  const auto sub = hSubscribe(w, 1000 + kFar, 1000, true, -1);
+  const auto sub = hSubscribe(w, 1000 + kHFar, 1000, true, -1);
   const auto got = hBody(hLag(ctx, w, sub.id));
-  ctx.Equal(got.value("lag_bytes", int64_t{0}), kFar,
+  ctx.Equal(got.value("lag_bytes", int64_t{0}), kHFar,
             "a subscription that confirmed nothing is behind by everything since the slot's restart_lsn; lag_bytes");
   ctx.Assert(got.contains("confirmed_lsn") && got["confirmed_lsn"].is_null() && got.value("state", "") == "critical",
              "with nothing confirmed and 2 GiB retained the read answered %s, expected confirmed_lsn null and state critical", got.dump());

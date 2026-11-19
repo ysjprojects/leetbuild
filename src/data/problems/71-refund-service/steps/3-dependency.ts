@@ -928,12 +928,12 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
-// pspPeer is the PSP stand-in: Refund is idempotent on the idempotency-key metadata, refuses a
+// HPspPeer is the PSP stand-in: Refund is idempotent on the idempotency-key metadata, refuses a
 // disputed charge, and while drop > 0 pays the refund out but loses the answer (UNAVAILABLE).
 // GetRefund answers statuses[refundID] when set (FAILED, PROCESSING).
-type pspPeer struct {
+type HPspPeer struct {
 	pb.UnimplementedPspServer
 	byKey    map[string]string
 	applied  map[string]string
@@ -943,7 +943,7 @@ type pspPeer struct {
 	drop     int
 }
 
-func (p *pspPeer) Refund(ctx context.Context, req *pb.RefundRequest) (*pb.RefundReply, error) {
+func (p *HPspPeer) Refund(ctx context.Context, req *pb.RefundRequest) (*pb.RefundReply, error) {
 	key := ""
 	if md, ok := metadata.FromIncomingContext(ctx); ok {
 		if values := md.Get("idempotency-key"); len(values) > 0 {
@@ -973,7 +973,7 @@ func (p *pspPeer) Refund(ctx context.Context, req *pb.RefundRequest) (*pb.Refund
 	return &pb.RefundReply{PspRef: ref, Status: "SUCCEEDED"}, nil
 }
 
-func (p *pspPeer) GetRefund(_ context.Context, req *pb.GetRefundRequest) (*pb.RefundStatus, error) {
+func (p *HPspPeer) GetRefund(_ context.Context, req *pb.GetRefundRequest) (*pb.RefundStatus, error) {
 	if forced, ok := p.statuses[req.GetRefundId()]; ok {
 		return &pb.RefundStatus{RefundId: req.GetRefundId(), Status: forced}, nil
 	}
@@ -984,33 +984,33 @@ func (p *pspPeer) GetRefund(_ context.Context, req *pb.GetRefundRequest) (*pb.Re
 	return &pb.RefundStatus{RefundId: req.GetRefundId(), Status: "SUCCEEDED", PspRef: ref}, nil
 }
 
-type clientSeed struct {
+type HClientSeed struct {
 	id     string
 	amount int64
 }
 
-func clientServe(ctx *harness.Ctx, payment string, refunds ...clientSeed) *pspPeer {
-	peer := &pspPeer{byKey: map[string]string{}, applied: map[string]string{}, statuses: map[string]string{}}
+func hClientServe(ctx *harness.Ctx, payment string, refunds ...HClientSeed) *HPspPeer {
+	peer := &HPspPeer{byKey: map[string]string{}, applied: map[string]string{}, statuses: map[string]string{}}
 	pb.RegisterPspServer(ctx.GRPC.Server(""), peer)
-	records.AddPayment(clientBg, payment, "t1", 10000)
+	records.AddPayment(hClientBg, payment, "t1", 10000)
 	for _, r := range refunds {
-		ledger.Claim(clientBg, payment, r.id, r.amount, 10000)
-		records.InsertRefund(clientBg, r.id, "t1", payment, r.amount, "damaged", "")
+		ledger.Claim(hClientBg, payment, r.id, r.amount, 10000)
+		records.InsertRefund(hClientBg, r.id, "t1", payment, r.amount, "damaged", "")
 	}
 	return peer
 }
 
-func clientPay(ctx *harness.Ctx, refundID string) string {
-	got, err := refundViaPSP(clientBg, refundID)
+func hClientPay(ctx *harness.Ctx, refundID string) string {
+	got, err := refundViaPSP(hClientBg, refundID)
 	ctx.NoError(err, "refundViaPSP(%s)", refundID)
 	return got
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientServe(ctx, "pay_1", clientSeed{"rf-1", 3000})
+	hClientServe(ctx, "pay_1", HClientSeed{"rf-1", 3000})
 	ctx.GRPC.SetLatency("Refund", 10.0, "")
 	before := ctx.Clock.Now()
-	got := clientPay(ctx, "rf-1")
+	got := hClientPay(ctx, "rf-1")
 	ctx.Assert(len(ctx.GRPC.CallsTo("Refund", "")) > 0, "refundViaPSP made no Refund call")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Refund", "")), 3, "with the PSP slower than the deadline (DEADLINE_EXCEEDED leaves the outcome unknown and is retried) the Refund calls")
 	for _, method := range []string{"Refund", "GetRefund"} {
@@ -1019,33 +1019,33 @@ func CheckDeadline(ctx *harness.Ctx) {
 			ctx.Assert(4500*time.Millisecond <= call.Timeout && call.Timeout <= 5500*time.Millisecond, "a %s call carries a %v deadline, expected pspDeadline = 5 s", method, call.Timeout)
 		}
 	}
-	ctx.Assert(got == "PENDING" && records.FindRefund(clientBg, "rf-1").Status == "PENDING", "with the PSP slower than the deadline on every attempt refundViaPSP answered %q, expected PENDING: nobody knows whether it paid", got)
+	ctx.Assert(got == "PENDING" && records.FindRefund(hClientBg, "rf-1").Status == "PENDING", "with the PSP slower than the deadline on every attempt refundViaPSP answered %q, expected PENDING: nobody knows whether it paid", got)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 21, "refundViaPSP took %.0f s against a PSP that does not answer, expected at most 3 attempts of 5 s and one GetRefund", waited)
 }
 
 func CheckStableKey(ctx *harness.Ctx) {
-	peer := clientServe(ctx, "pay_1", clientSeed{"rf-1", 3000})
+	peer := hClientServe(ctx, "pay_1", HClientSeed{"rf-1", 3000})
 	peer.drop = 1
-	got := clientPay(ctx, "rf-1")
+	got := hClientPay(ctx, "rf-1")
 	ctx.Assert(len(peer.keys) > 0, "refundViaPSP made no Refund call")
 	for _, key := range peer.keys {
 		ctx.Assert(key == "rf-1", "the Refund calls carried idempotency-key %v, expected rf-1 on every attempt: a fresh key makes a retry a second refund", peer.keys)
 	}
 	ctx.Equal(got, "CONFIRMED", "the PSP paid rf-1 and lost the first answer; refundViaPSP's status")
-	clientPay(ctx, "rf-1")
+	hClientPay(ctx, "rf-1")
 	ctx.Equal(peer.payouts, []string{"rf-1:3000"}, "after a lost answer and a re-run the PSP must pay one refund of 3000 once; the payouts")
-	ctx.Equal(records.FindRefund(clientBg, "rf-1").PspRef, "re_1", "the record's psp_ref")
+	ctx.Equal(records.FindRefund(hClientBg, "rf-1").PspRef, "re_1", "the record's psp_ref")
 }
 
 func CheckRetryPolicy(ctx *harness.Ctx) {
-	clientServe(ctx, "pay_1", clientSeed{"rf-1", 3000}, clientSeed{"rf-2", 2000}, clientSeed{"rf-3", 1000}, clientSeed{"rf-4", 1000})
+	hClientServe(ctx, "pay_1", HClientSeed{"rf-1", 3000}, HClientSeed{"rf-2", 2000}, HClientSeed{"rf-3", 1000}, HClientSeed{"rf-4", 1000})
 	ctx.GRPC.Fail("Refund", codes.Unavailable, "", 2, "")
-	got := clientPay(ctx, "rf-1")
+	got := hClientPay(ctx, "rf-1")
 	calls := len(ctx.GRPC.CallsTo("Refund", ""))
 	ctx.Assert(got == "CONFIRMED" && calls == 3, "with two UNAVAILABLE answers then a success refundViaPSP answered %q after %d calls, expected CONFIRMED after 3", got, calls)
 	ctx.GRPC.Fail("Refund", codes.InvalidArgument, "amount_minor exceeds the charge", 1, "")
-	got = clientPay(ctx, "rf-2")
+	got = hClientPay(ctx, "rf-2")
 	calls = len(ctx.GRPC.CallsTo("Refund", "")) - 3
 	ctx.Assert(got == "REJECTED" && calls == 1, "an INVALID_ARGUMENT answered %q after %d calls, expected REJECTED after 1: a refusal is not retried", got, calls)
 	others := []struct {
@@ -1055,55 +1055,55 @@ func CheckRetryPolicy(ctx *harness.Ctx) {
 	}{{"rf-3", codes.Internal, "INTERNAL"}, {"rf-4", codes.ResourceExhausted, "RESOURCE_EXHAUSTED"}}
 	for n, other := range others {
 		ctx.GRPC.Fail("Refund", other.code, "the PSP broke", 1, "")
-		got = clientPay(ctx, other.id)
+		got = hClientPay(ctx, other.id)
 		calls = len(ctx.GRPC.CallsTo("Refund", "")) - 4 - n
-		row := records.FindRefund(clientBg, other.id)
+		row := records.FindRefund(hClientBg, other.id)
 		ctx.Assert(calls == 1 && got == "PENDING" && row.Status == "PENDING", "%s answered %q after %d Refund calls and left the row %s, expected PENDING after 1: only DEADLINE_EXCEEDED and UNAVAILABLE are retried, and another code is no refusal", other.name, got, calls, row.Status)
 	}
-	ctx.Equal(ledger.RefundedTotal(clientBg, "pay_1"), 5000, "only the refusal of rf-2 gives its reservation back; the ledger")
+	ctx.Equal(ledger.RefundedTotal(hClientBg, "pay_1"), 5000, "only the refusal of rf-2 gives its reservation back; the ledger")
 }
 
 func CheckPendingReconcile(ctx *harness.Ctx) {
-	peer := clientServe(ctx, "pay_1", clientSeed{"rf-1", 3000}, clientSeed{"rf-2", 2000})
+	peer := hClientServe(ctx, "pay_1", HClientSeed{"rf-1", 3000}, HClientSeed{"rf-2", 2000})
 	peer.drop = 3
-	got := clientPay(ctx, "rf-1")
-	row := records.FindRefund(clientBg, "rf-1")
+	got := hClientPay(ctx, "rf-1")
+	row := records.FindRefund(hClientBg, "rf-1")
 	ctx.Assert(got == "CONFIRMED" && row.Status == "CONFIRMED" && row.PspRef == "re_1", "the PSP paid rf-1 but every answer was lost: refundViaPSP answered %q and the record holds %s %q, expected CONFIRMED with re_1 from GetRefund", got, row.Status, row.PspRef)
 	ctx.GRPC.Fail("Refund", codes.Unavailable, "", 3, "")
-	got = clientPay(ctx, "rf-2")
-	row = records.FindRefund(clientBg, "rf-2")
+	got = hClientPay(ctx, "rf-2")
+	row = records.FindRefund(hClientBg, "rf-2")
 	ctx.Assert(got == "PENDING" && row.Status == "PENDING", "with the PSP down for every attempt and GetRefund answering NOT_FOUND, refundViaPSP answered %q and the record holds %s, expected PENDING", got, row.Status)
-	ctx.Equal(ledger.RefundedTotal(clientBg, "pay_1"), 5000, "an unknown outcome keeps its reservation; the ledger")
-	records.InsertRefund(clientBg, "rf-3", "t1", "pay_1", 1000, "damaged", "")
-	ledger.Claim(clientBg, "pay_1", "rf-3", 1000, 10000)
+	ctx.Equal(ledger.RefundedTotal(hClientBg, "pay_1"), 5000, "an unknown outcome keeps its reservation; the ledger")
+	records.InsertRefund(hClientBg, "rf-3", "t1", "pay_1", 1000, "damaged", "")
+	ledger.Claim(hClientBg, "pay_1", "rf-3", 1000, 10000)
 	peer.statuses["rf-3"] = "PROCESSING"
 	ctx.GRPC.Fail("Refund", codes.Unavailable, "", 3, "")
-	got = clientPay(ctx, "rf-3")
-	row = records.FindRefund(clientBg, "rf-3")
+	got = hClientPay(ctx, "rf-3")
+	row = records.FindRefund(hClientBg, "rf-3")
 	ctx.Assert(len(ctx.GRPC.CallsTo("GetRefund", "")) > 0 && got == "PENDING" && row.Status == "PENDING", "with the PSP down and GetRefund answering PROCESSING, refundViaPSP answered %q and the record holds %s, expected PENDING: only SUCCEEDED and FAILED settle a refund", got, row.Status)
-	ctx.Equal(ledger.RefundedTotal(clientBg, "pay_1"), 6000, "a refund still PROCESSING keeps its reservation; the ledger")
+	ctx.Equal(ledger.RefundedTotal(hClientBg, "pay_1"), 6000, "a refund still PROCESSING keeps its reservation; the ledger")
 }
 
 func CheckTerminalRelease(ctx *harness.Ctx) {
-	peer := clientServe(ctx, "pay_disputed", clientSeed{"rf-1", 3000}, clientSeed{"rf-2", 4000})
-	records.MarkConfirmed(clientBg, "rf-1", "re_0")
-	got := clientPay(ctx, "rf-2")
-	ctx.Assert(got == "REJECTED" && records.FindRefund(clientBg, "rf-2").Status == "REJECTED", "the PSP refused rf-2 with FAILED_PRECONDITION; refundViaPSP answered %q, expected REJECTED", got)
-	total := ledger.RefundedTotal(clientBg, "pay_disputed")
+	peer := hClientServe(ctx, "pay_disputed", HClientSeed{"rf-1", 3000}, HClientSeed{"rf-2", 4000})
+	records.MarkConfirmed(hClientBg, "rf-1", "re_0")
+	got := hClientPay(ctx, "rf-2")
+	ctx.Assert(got == "REJECTED" && records.FindRefund(hClientBg, "rf-2").Status == "REJECTED", "the PSP refused rf-2 with FAILED_PRECONDITION; refundViaPSP answered %q, expected REJECTED", got)
+	total := ledger.RefundedTotal(hClientBg, "pay_disputed")
 	held := ctx.Redis.HGetAll("refunded:pay_disputed")
 	_, stillHeld := held["rf-2"]
 	_, kept := held["rf-1"]
 	ctx.Assert(total == 3000 && !stillHeld && kept, "after the refusal the ledger holds %d over %v, expected 3000 over rf-1: release exactly the refused refund's reservation", total, held)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Refund", "")), 1, "a refusal is not retried; the Refund calls")
 	// The PSP's answers are lost, and GetRefund reports the refund FAILED: a refusal too.
-	records.InsertRefund(clientBg, "rf-3", "t1", "pay_disputed", 1000, "damaged", "")
-	ledger.Claim(clientBg, "pay_disputed", "rf-3", 1000, 10000)
+	records.InsertRefund(hClientBg, "rf-3", "t1", "pay_disputed", 1000, "damaged", "")
+	ledger.Claim(hClientBg, "pay_disputed", "rf-3", 1000, 10000)
 	peer.statuses["rf-3"] = "FAILED"
 	ctx.GRPC.Fail("Refund", codes.Unavailable, "", 3, "")
-	got = clientPay(ctx, "rf-3")
-	row := records.FindRefund(clientBg, "rf-3")
+	got = hClientPay(ctx, "rf-3")
+	row := records.FindRefund(hClientBg, "rf-3")
 	ctx.Assert(got == "REJECTED" && row.Status == "REJECTED", "GetRefund reported rf-3 FAILED; refundViaPSP answered %q and the record holds %s, expected REJECTED", got, row.Status)
-	total = ledger.RefundedTotal(clientBg, "pay_disputed")
+	total = ledger.RefundedTotal(hClientBg, "pay_disputed")
 	held = ctx.Redis.HGetAll("refunded:pay_disputed")
 	_, failedHeld := held["rf-3"]
 	_, kept = held["rf-1"]
@@ -1127,7 +1127,7 @@ namespace {
 // The PSP stand-in: Refund is idempotent on the idempotency-key metadata, refuses a disputed charge,
 // and while drop > 0 pays the refund out but loses the answer (UNAVAILABLE). GetRefund answers
 // statuses[refund_id] when set (FAILED, PROCESSING).
-class PspPeer final : public refundd::Psp::Service {
+class HPspPeer final : public refundd::Psp::Service {
  public:
   std::map<std::string, std::string> by_key;
   std::map<std::string, std::string> applied;
@@ -1172,10 +1172,10 @@ class PspPeer final : public refundd::Psp::Service {
   }
 };
 
-PspPeer& clientServe(harness::Ctx& ctx, const std::string& payment, const std::vector<std::pair<std::string, long long>>& refunds) {
-  static PspPeer* peer = nullptr;
+HPspPeer& hClientServe(harness::Ctx& ctx, const std::string& payment, const std::vector<std::pair<std::string, long long>>& refunds) {
+  static HPspPeer* peer = nullptr;
   delete peer;
-  peer = new PspPeer;
+  peer = new HPspPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   records::addPayment(payment, "t1", 10000);
   for (const auto& [refund_id, amount] : refunds) {
@@ -1185,7 +1185,7 @@ PspPeer& clientServe(harness::Ctx& ctx, const std::string& payment, const std::v
   return *peer;
 }
 
-std::string clientText(const std::vector<std::string>& items) {
+std::string hClientText(const std::vector<std::string>& items) {
   std::string out;
   for (const auto& item : items) out += (out.empty() ? "" : ", ") + item;
   return "[" + out + "]";
@@ -1194,7 +1194,7 @@ std::string clientText(const std::vector<std::string>& items) {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  clientServe(ctx, "pay_1", {{"rf-1", 3000}});
+  hClientServe(ctx, "pay_1", {{"rf-1", 3000}});
   ctx.GRPC.SetLatency("Refund", 10.0);
   const int64_t before = ctx.Clock.Now();
   const std::string got = refundViaPsp("rf-1");
@@ -1213,12 +1213,12 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckStableKey(harness::Ctx& ctx) {
-  PspPeer& peer = clientServe(ctx, "pay_1", {{"rf-1", 3000}});
+  HPspPeer& peer = hClientServe(ctx, "pay_1", {{"rf-1", 3000}});
   peer.drop = 1;
   const std::string got = refundViaPsp("rf-1");
   bool stable = !peer.keys.empty();
   for (const auto& key : peer.keys) stable = stable && key == "rf-1";
-  ctx.Assert(stable, "the Refund calls carried idempotency-key %s, expected rf-1 on every attempt: a fresh key makes a retry a second refund", clientText(peer.keys));
+  ctx.Assert(stable, "the Refund calls carried idempotency-key %s, expected rf-1 on every attempt: a fresh key makes a retry a second refund", hClientText(peer.keys));
   ctx.Equal(got, "CONFIRMED", "the PSP paid rf-1 and lost the first answer; refundViaPsp's status");
   refundViaPsp("rf-1");
   ctx.Equal(peer.payouts, std::vector<std::string>{"rf-1:3000"}, "after a lost answer and a re-run the PSP must pay one refund of 3000 once; the payouts");
@@ -1226,7 +1226,7 @@ void CheckStableKey(harness::Ctx& ctx) {
 }
 
 void CheckRetryPolicy(harness::Ctx& ctx) {
-  clientServe(ctx, "pay_1", {{"rf-1", 3000}, {"rf-2", 2000}, {"rf-3", 1000}, {"rf-4", 1000}});
+  hClientServe(ctx, "pay_1", {{"rf-1", 3000}, {"rf-2", 2000}, {"rf-3", 1000}, {"rf-4", 1000}});
   ctx.GRPC.Fail("Refund", grpc::StatusCode::UNAVAILABLE, "", 2);
   std::string got = refundViaPsp("rf-1");
   size_t calls = ctx.GRPC.CallsTo("Refund").size();
@@ -1251,7 +1251,7 @@ void CheckRetryPolicy(harness::Ctx& ctx) {
 }
 
 void CheckPendingReconcile(harness::Ctx& ctx) {
-  PspPeer& peer = clientServe(ctx, "pay_1", {{"rf-1", 3000}, {"rf-2", 2000}});
+  HPspPeer& peer = hClientServe(ctx, "pay_1", {{"rf-1", 3000}, {"rf-2", 2000}});
   peer.drop = 3;
   std::string got = refundViaPsp("rf-1");
   auto row = *records::findRefund("rf-1");
@@ -1277,7 +1277,7 @@ void CheckPendingReconcile(harness::Ctx& ctx) {
 }
 
 void CheckTerminalRelease(harness::Ctx& ctx) {
-  PspPeer& peer = clientServe(ctx, "pay_disputed", {{"rf-1", 3000}, {"rf-2", 4000}});
+  HPspPeer& peer = hClientServe(ctx, "pay_disputed", {{"rf-1", 3000}, {"rf-2", 4000}});
   records::markConfirmed("rf-1", "re_0");
   const std::string got = refundViaPsp("rf-2");
   ctx.Assert(got == "REJECTED" && records::findRefund("rf-2")->status == "REJECTED",

@@ -700,23 +700,23 @@ import (
 	"leetbuild/harness"
 )
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func eventsClaimed(ctx *harness.Ctx, jobID, worker string) {
-	ctx.NoError(store.CreateJob(eventsBg, jobID, "t-1", "email.send", map[string]any{"to": "ada@example.com", "template": "welcome"}), "CreateJob")
-	got, err := queue.Claim(eventsBg, worker)
+func hEventsClaimed(ctx *harness.Ctx, jobID, worker string) {
+	ctx.NoError(store.CreateJob(hEventsBg, jobID, "t-1", "email.send", map[string]any{"to": "ada@example.com", "template": "welcome"}), "CreateJob")
+	got, err := queue.Claim(hEventsBg, worker)
 	ctx.NoError(err, "Claim")
 	ctx.Equal(got, jobID, "the harness's claim")
-	store.BeginAttempt(eventsBg, jobID)
+	store.BeginAttempt(hEventsBg, jobID)
 }
 
-func eventsComplete(ctx *harness.Ctx, jobID, worker string, durationMs int64) bool {
-	done, err := complete(eventsBg, jobID, worker, durationMs)
+func hEventsComplete(ctx *harness.Ctx, jobID, worker string, durationMs int64) bool {
+	done, err := complete(hEventsBg, jobID, worker, durationMs)
 	ctx.NoError(err, "complete(%s, %s)", jobID, worker)
 	return done
 }
 
-func eventsAll(ctx *harness.Ctx) []map[string]any {
+func hEventsAll(ctx *harness.Ctx) []map[string]any {
 	out := []map[string]any{}
 	for _, r := range ctx.Kafka.Records(topic) {
 		var e map[string]any
@@ -727,10 +727,10 @@ func eventsAll(ctx *harness.Ctx) []map[string]any {
 }
 
 func CheckEventEnvelope(ctx *harness.Ctx) {
-	eventsClaimed(ctx, "job-1", "w-1")
-	ctx.Assert(eventsComplete(ctx, "job-1", "w-1", 840), "completing an attempt the worker holds must return true")
+	hEventsClaimed(ctx, "job-1", "w-1")
+	ctx.Assert(hEventsComplete(ctx, "job-1", "w-1", 840), "completing an attempt the worker holds must return true")
 	ctx.Settle()
-	all := eventsAll(ctx)
+	all := hEventsAll(ctx)
 	ctx.Equal(len(all), 1, "one completed attempt's records on job.event")
 	ctx.Equal(all[0], map[string]any{"job_id": "job-1", "kind": "completed", "attempts": float64(1), "duration_ms": float64(840), "worker": "w-1"}, "the event")
 	outbox := ctx.Redis.LRange("jobs:outbox", 0, -1)
@@ -738,12 +738,12 @@ func CheckEventEnvelope(ctx *harness.Ctx) {
 }
 
 func CheckJobKey(ctx *harness.Ctx) {
-	eventsClaimed(ctx, "job-1", "w-1")
-	eventsClaimed(ctx, "job-2", "w-2")
+	hEventsClaimed(ctx, "job-1", "w-1")
+	hEventsClaimed(ctx, "job-2", "w-2")
 	// job-1's first attempt ran on w-3 and failed; its second runs on w-1
-	ctx.NoError(publish(eventsBg, jobEvent{JobID: "job-1", Kind: "failed", Attempts: 1, DurationMs: 30000, Worker: "w-3"}), "publish")
-	ctx.Assert(eventsComplete(ctx, "job-1", "w-1", 900), "job-1 completes")
-	ctx.Assert(eventsComplete(ctx, "job-2", "w-2", 450), "job-2 completes")
+	ctx.NoError(publish(hEventsBg, jobEvent{JobID: "job-1", Kind: "failed", Attempts: 1, DurationMs: 30000, Worker: "w-3"}), "publish")
+	ctx.Assert(hEventsComplete(ctx, "job-1", "w-1", 900), "job-1 completes")
+	ctx.Assert(hEventsComplete(ctx, "job-2", "w-2", 450), "job-2 completes")
 	ctx.Settle()
 	keys := ctx.Kafka.Keys(topic)
 	sort.Strings(keys)
@@ -758,25 +758,25 @@ func CheckJobKey(ctx *harness.Ctx) {
 }
 
 func CheckCompletedAfterAck(ctx *harness.Ctx) {
-	eventsClaimed(ctx, "job-1", "w-1")
+	hEventsClaimed(ctx, "job-1", "w-1")
 	ctx.Clock.Advance(61) // w-1 was too slow: the claim expired and the job went to w-2
-	queue.ReturnExpired(eventsBg)
-	got, _ := queue.Claim(eventsBg, "w-2")
+	queue.ReturnExpired(hEventsBg)
+	got, _ := queue.Claim(hEventsBg, "w-2")
 	ctx.Equal(got, "job-1", "w-2's claim")
-	done := eventsComplete(ctx, "job-1", "w-1", 61000)
+	done := hEventsComplete(ctx, "job-1", "w-1", 61000)
 	ctx.Settle()
 	ctx.Assert(!done, "complete returned true for a claim w-1 no longer holds")
-	ctx.Assert(len(ctx.Kafka.Records(topic)) == 0, "w-1 lost its claim, yet it published %v: the history says the job finished while w-2 is still running it. Ack first and publish only when the ack succeeded", eventsAll(ctx))
-	ctx.Assert(eventsComplete(ctx, "job-1", "w-2", 700), "the worker holding the claim must complete the job")
+	ctx.Assert(len(ctx.Kafka.Records(topic)) == 0, "w-1 lost its claim, yet it published %v: the history says the job finished while w-2 is still running it. Ack first and publish only when the ack succeeded", hEventsAll(ctx))
+	ctx.Assert(hEventsComplete(ctx, "job-1", "w-2", 700), "the worker holding the claim must complete the job")
 	ctx.Settle()
-	all := eventsAll(ctx)
+	all := hEventsAll(ctx)
 	ctx.Assert(len(all) == 1 && all[0]["worker"] == "w-2", "the completion must be published once, by w-2: %v", all)
 }
 
 func CheckOutboxOnRejection(ctx *harness.Ctx) {
-	eventsClaimed(ctx, "job-1", "w-1")
+	hEventsClaimed(ctx, "job-1", "w-1")
 	ctx.Kafka.FailNext(topic, 1)
-	done, err := complete(eventsBg, "job-1", "w-1", 840)
+	done, err := complete(hEventsBg, "job-1", "w-1", 840)
 	ctx.NoError(err, "complete must not fail when the broker refused the record (the event goes to the outbox and the worker goes on)")
 	ctx.Settle()
 	rows := ctx.Redis.LRange("jobs:outbox", 0, -1)
@@ -785,7 +785,7 @@ func CheckOutboxOnRejection(ctx *harness.Ctx) {
 	json.Unmarshal([]byte(rows[0]), &row)
 	ctx.Assert(row["job_id"] == "job-1" && row["kind"] == "completed" && row["attempts"] == float64(1) && row["duration_ms"] == float64(840) && row["worker"] == "w-1", "the outbox row must be the event itself, {job_id: job-1, kind: completed, attempts: 1, duration_ms: 840, worker: w-1}, got %s: the relay republishes the row as it is", rows[0])
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 0, "nothing reached the topic for the refused record; records")
-	job := store.GetJob(eventsBg, "job-1")
+	job := store.GetJob(hEventsBg, "job-1")
 	ctx.Assert(done && job.State == "completed", "the job is done whatever the broker said: complete returned %v and the job is %+v", done, job)
 }
 `,
@@ -804,19 +804,19 @@ func CheckOutboxOnRejection(ctx *harness.Ctx) {
 
 namespace {
 
-void eventsClaimed(harness::Ctx& ctx, const std::string& job_id, const std::string& worker) {
+void hEventsClaimed(harness::Ctx& ctx, const std::string& job_id, const std::string& worker) {
   store::createJob(job_id, "t-1", "email.send", nlohmann::json{{"to", "ada@example.com"}, {"template", "welcome"}});
   ctx.Equal(queue::claim(worker).value_or(""), job_id, "the harness's claim");
   store::beginAttempt(job_id);
 }
 
 // Serve the producer's delivery reports, as the worker's loop would between jobs.
-void eventsSettle(harness::Ctx& ctx) {
+void hEventsSettle(harness::Ctx& ctx) {
   ctx.Settle();
   producer->poll(0);
 }
 
-std::vector<nlohmann::json> eventsAll(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsAll(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
   for (const auto& r : ctx.Kafka.Records(kTopic)) out.push_back(nlohmann::json::parse(r.Value.value_or("null"), nullptr, false));
   return out;
@@ -825,10 +825,10 @@ std::vector<nlohmann::json> eventsAll(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckEventEnvelope(harness::Ctx& ctx) {
-  eventsClaimed(ctx, "job-1", "w-1");
+  hEventsClaimed(ctx, "job-1", "w-1");
   ctx.Assert(complete("job-1", "w-1", 840), "completing an attempt the worker holds must return true");
-  eventsSettle(ctx);
-  const auto all = eventsAll(ctx);
+  hEventsSettle(ctx);
+  const auto all = hEventsAll(ctx);
   ctx.Equal(all.size(), 1, "one completed attempt's records on job.event");
   ctx.Equal(all[0], nlohmann::json({{"job_id", "job-1"}, {"kind", "completed"}, {"attempts", 1}, {"duration_ms", 840}, {"worker", "w-1"}}), "the event");
   const auto outbox = ctx.Redis.LRange("jobs:outbox", 0, -1);
@@ -836,13 +836,13 @@ void CheckEventEnvelope(harness::Ctx& ctx) {
 }
 
 void CheckJobKey(harness::Ctx& ctx) {
-  eventsClaimed(ctx, "job-1", "w-1");
-  eventsClaimed(ctx, "job-2", "w-2");
+  hEventsClaimed(ctx, "job-1", "w-1");
+  hEventsClaimed(ctx, "job-2", "w-2");
   // job-1's first attempt ran on w-3 and failed; its second runs on w-1
   publish(nlohmann::json{{"job_id", "job-1"}, {"kind", "failed"}, {"attempts", 1}, {"duration_ms", 30000}, {"worker", "w-3"}});
   ctx.Assert(complete("job-1", "w-1", 900), "job-1 completes");
   ctx.Assert(complete("job-2", "w-2", 450), "job-2 completes");
-  eventsSettle(ctx);
+  hEventsSettle(ctx);
   auto keys = ctx.Kafka.Keys(kTopic);
   std::sort(keys.begin(), keys.end());
   ctx.Equal(keys, std::vector<std::string>{"job-1", "job-1", "job-2"}, "the record keys (keyed by worker, a job retried on another worker has its history split across partitions)");
@@ -854,22 +854,22 @@ void CheckJobKey(harness::Ctx& ctx) {
 }
 
 void CheckCompletedAfterAck(harness::Ctx& ctx) {
-  eventsClaimed(ctx, "job-1", "w-1");
+  hEventsClaimed(ctx, "job-1", "w-1");
   ctx.Clock.Advance(61);  // w-1 was too slow: the claim expired and the job went to w-2
   queue::returnExpired();
   ctx.Equal(queue::claim("w-2").value_or(""), "job-1", "w-2's claim");
   const bool done = complete("job-1", "w-1", 61000);
-  eventsSettle(ctx);
+  hEventsSettle(ctx);
   ctx.Assert(!done, "complete returned true for a claim w-1 no longer holds");
-  ctx.Assert(ctx.Kafka.Records(kTopic).empty(), "w-1 lost its claim, yet it published %d completed event(s): the history says the job finished while w-2 is still running it. Ack first and publish only when the ack succeeded", eventsAll(ctx).size());
+  ctx.Assert(ctx.Kafka.Records(kTopic).empty(), "w-1 lost its claim, yet it published %d completed event(s): the history says the job finished while w-2 is still running it. Ack first and publish only when the ack succeeded", hEventsAll(ctx).size());
   ctx.Assert(complete("job-1", "w-2", 700), "the worker holding the claim must complete the job");
-  eventsSettle(ctx);
-  const auto all = eventsAll(ctx);
+  hEventsSettle(ctx);
+  const auto all = hEventsAll(ctx);
   ctx.Assert(all.size() == 1 && all[0].value("worker", "") == "w-2", "the completion must be published once, by w-2 (%d records)", all.size());
 }
 
 void CheckOutboxOnRejection(harness::Ctx& ctx) {
-  eventsClaimed(ctx, "job-1", "w-1");
+  hEventsClaimed(ctx, "job-1", "w-1");
   ctx.Kafka.FailNext(kTopic, 1);
   bool done = false;
   try {
@@ -877,7 +877,7 @@ void CheckOutboxOnRejection(harness::Ctx& ctx) {
   } catch (const std::exception& e) {
     ctx.Fatalf("complete threw when the broker refused the record: %s; the event goes to the outbox and the worker goes on", e.what());
   }
-  eventsSettle(ctx);
+  hEventsSettle(ctx);
   const auto rows = ctx.Redis.LRange("jobs:outbox", 0, -1);
   ctx.Equal(rows.size(), 1, "the broker refused the completed event: it must be kept for the relay; outbox rows");
   const auto row = nlohmann::json::parse(rows.empty() ? "{}" : rows[0], nullptr, false);

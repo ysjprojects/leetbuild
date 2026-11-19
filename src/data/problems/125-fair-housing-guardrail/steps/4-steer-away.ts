@@ -871,31 +871,31 @@ const (
 
 var hTurnPolicy = store.Policy{Version: "fh-2024-05-21", StopPhrases: []string{"no section 8"}}
 
-type classifierPeer struct {
+type HClassifierPeer struct {
 	pb.UnimplementedClassifierServer
 }
 
-func (classifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
+func (HClassifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
 	if strings.Contains(strings.ToLower(req.GetText()), "latino") {
 		return &pb.ClassifyReply{Score: 0.92, Label: "national_origin"}, nil
 	}
 	return &pb.ClassifyReply{Score: 0.04}, nil
 }
 
-type judgePeer struct {
+type HJudgePeer struct {
 	pb.UnimplementedJudgeServer
 }
 
-func (judgePeer) Assess(context.Context, *pb.AssessRequest) (*pb.Assessment, error) {
+func (HJudgePeer) Assess(context.Context, *pb.AssessRequest) (*pb.Assessment, error) {
 	return &pb.Assessment{Compliant: true}, nil
 }
 
 // assistantPeer steers on a neighborhood question; under instructions it complies, unless asked about the people.
-type assistantPeer struct {
+type HAssistantPeer struct {
 	pb.UnimplementedAssistantServer
 }
 
-func (assistantPeer) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
+func (HAssistantPeer) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
 	q := req.GetQuestion()
 	if !strings.Contains(q, "neighborhood") {
 		return &pb.CompleteReply{Answer: hNeutralA}, nil
@@ -907,9 +907,9 @@ func (assistantPeer) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.C
 }
 
 func hAPI(ctx *harness.Ctx) *harness.HTTP {
-	pb.RegisterClassifierServer(ctx.GRPC.Server("classifier:9000"), classifierPeer{})
-	pb.RegisterJudgeServer(ctx.GRPC.Server("judge:9000"), judgePeer{})
-	pb.RegisterAssistantServer(ctx.GRPC.Server("model:9000"), assistantPeer{})
+	pb.RegisterClassifierServer(ctx.GRPC.Server("classifier:9000"), HClassifierPeer{})
+	pb.RegisterJudgeServer(ctx.GRPC.Server("judge:9000"), HJudgePeer{})
+	pb.RegisterAssistantServer(ctx.GRPC.Server("model:9000"), HAssistantPeer{})
 	cache.Publish(context.Background(), hTurnPolicy)
 	mux := http.NewServeMux()
 	register(mux)
@@ -1022,7 +1022,7 @@ const std::string kHBlockedQ = "Which buildings have no section 8 tenants?";
 const std::string kHSteeringA = "Beacon Hill is mostly Latino families, so you would fit right in.";
 const std::string kHCompliantA = "Columbia City and Rainier Beach have three-bedroom homes in your budget near light rail.";
 
-class ClassifierPeer final : public fairhousing::Classifier::Service {
+class HClassifierPeer final : public fairhousing::Classifier::Service {
  public:
   grpc::Status Classify(grpc::ServerContext*, const fairhousing::ClassifyRequest* req, fairhousing::ClassifyReply* out) override {
     std::string text = req->text();
@@ -1034,7 +1034,7 @@ class ClassifierPeer final : public fairhousing::Classifier::Service {
   }
 };
 
-class JudgePeer final : public fairhousing::Judge::Service {
+class HJudgePeer final : public fairhousing::Judge::Service {
  public:
   grpc::Status Assess(grpc::ServerContext*, const fairhousing::AssessRequest*, fairhousing::Assessment* out) override {
     out->set_compliant(true);
@@ -1043,7 +1043,7 @@ class JudgePeer final : public fairhousing::Judge::Service {
 };
 
 // Steers on a neighborhood question; under instructions it complies, unless asked about the people.
-class AssistantPeer final : public fairhousing::Assistant::Service {
+class HAssistantPeer final : public fairhousing::Assistant::Service {
  public:
   grpc::Status Complete(grpc::ServerContext*, const fairhousing::CompleteRequest* req, fairhousing::CompleteReply* out) override {
     const std::string& q = req->question();
@@ -1059,9 +1059,9 @@ class AssistantPeer final : public fairhousing::Assistant::Service {
 };
 
 struct HPeers {
-  ClassifierPeer classifier;
-  JudgePeer judge;
-  AssistantPeer assistant;
+  HClassifierPeer classifier;
+  HJudgePeer judge;
+  HAssistantPeer assistant;
 };
 
 harness::HTTP hApi(harness::Ctx& ctx) {

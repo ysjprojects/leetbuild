@@ -854,23 +854,23 @@ import (
 )
 
 // clientWindow is 2026-03-10T09:00:00Z.
-const clientWindow int64 = 1773133200
+const kHClientWindow int64 = 1773133200
 
 // jobsPeer runs every Trigger it receives.
-type jobsPeer struct {
+type HJobsPeer struct {
 	pb.UnimplementedJobRunnerServer
 	runs int
 }
 
-func (j *jobsPeer) Trigger(_ context.Context, _ *pb.TriggerRequest) (*pb.TriggerReply, error) {
+func (j *HJobsPeer) Trigger(_ context.Context, _ *pb.TriggerRequest) (*pb.TriggerReply, error) {
 	j.runs++
 	return &pb.TriggerReply{RunId: fmt.Sprintf("run-%d", j.runs)}, nil
 }
 
 // clientWorld is a stored schedule, the job service the harness serves, and step 2's fireWindow,
 // which the harness stands in for: SET NX EX 300 on the lease, the trigger, the ledger row.
-func clientWorld(ctx *harness.Ctx, policy string) *store.Schedule {
-	pb.RegisterJobRunnerServer(ctx.GRPC.Server(""), &jobsPeer{})
+func hClientWorld(ctx *harness.Ctx, policy string) *store.Schedule {
+	pb.RegisterJobRunnerServer(ctx.GRPC.Server(""), &HJobsPeer{})
 	s := &store.Schedule{ID: "s1", Tenant: "t1", Cron: "*/5 * * * *", Timezone: "UTC", JobRef: "billing.invoice", MisfirePolicy: policy}
 	ctx.NoError(store.Put(context.Background(), s), "storing the schedule")
 	fireWindow = func(c context.Context, scheduleID string, tick int64, owner string, trigger func(string, int64) error) (string, error) {
@@ -887,15 +887,15 @@ func clientWorld(ctx *harness.Ctx, policy string) *store.Schedule {
 }
 
 // clientMissed is n consecutive windows of a five-minute schedule, from 09:00.
-func clientMissed(n int) []int64 {
+func hClientMissed(n int) []int64 {
 	out := make([]int64, n)
 	for k := range out {
-		out[k] = clientWindow + int64(300*k)
+		out[k] = kHClientWindow + int64(300*k)
 	}
 	return out
 }
 
-func clientRun(ctx *harness.Ctx, s *store.Schedule, windows []int64) map[int64]string {
+func hClientRun(ctx *harness.Ctx, s *store.Schedule, windows []int64) map[int64]string {
 	var out map[int64]string
 	var err error
 	returned := ctx.Drain(func() {
@@ -907,7 +907,7 @@ func clientRun(ctx *harness.Ctx, s *store.Schedule, windows []int64) map[int64]s
 	return out
 }
 
-func clientTriggered(ctx *harness.Ctx) []string {
+func hClientTriggered(ctx *harness.Ctx) []string {
 	out := []string{}
 	for _, c := range ctx.GRPC.CallsTo("Trigger", "") {
 		req, _ := c.Request.(*pb.TriggerRequest)
@@ -916,7 +916,7 @@ func clientTriggered(ctx *harness.Ctx) []string {
 	return out
 }
 
-func clientLedger(ctx *harness.Ctx) map[int64]string {
+func hClientLedger(ctx *harness.Ctx) map[int64]string {
 	runs, err := store.Runs(context.Background(), "s1")
 	ctx.NoError(err, "reading the ledger")
 	out := map[int64]string{}
@@ -927,83 +927,83 @@ func clientLedger(ctx *harness.Ctx) map[int64]string {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	s := clientWorld(ctx, "catch_up")
+	s := hClientWorld(ctx, "catch_up")
 	ctx.GRPC.SetLatency("Trigger", 2.0, "")
 	// Two windows in one pass: each Trigger carries its own 3 s, not what is left of the pass's.
-	out := clientRun(ctx, s, []int64{clientWindow, clientWindow + 300})
-	ctx.Assert(out[clientWindow] == "fired" && out[clientWindow+300] == "fired", "a job service that answers in 2 s ended two windows of one pass %v, expected both fired: every Trigger gets its own 3 s deadline", out)
+	out := hClientRun(ctx, s, []int64{kHClientWindow, kHClientWindow + 300})
+	ctx.Assert(out[kHClientWindow] == "fired" && out[kHClientWindow+300] == "fired", "a job service that answers in 2 s ended two windows of one pass %v, expected both fired: every Trigger gets its own 3 s deadline", out)
 	for _, call := range ctx.GRPC.CallsTo("Trigger", "") {
 		ctx.Assert(call.HasDeadline(), "the Trigger call carries no deadline: a job service that hangs holds the scheduler's pass with it")
 		ctx.Assert(2500*time.Millisecond <= call.Timeout && call.Timeout <= 3500*time.Millisecond, "a Trigger deadline is %v, expected about 3 s for every call", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Trigger", 10.0, "")
 	before := ctx.Clock.Now()
-	out = clientRun(ctx, s, []int64{clientWindow + 600})
+	out = hClientRun(ctx, s, []int64{kHClientWindow + 600})
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Equal(out[clientWindow+600], "error", "a job service that takes 10 s must end the window as error once the 3 s deadline passed; the outcome")
+	ctx.Equal(out[kHClientWindow+600], "error", "a job service that takes 10 s must end the window as error once the 3 s deadline passed; the outcome")
 	calls := len(ctx.GRPC.CallsTo("Trigger", "")) - 2
 	ctx.Assert(calls == 1, "the timed-out window got %d Trigger calls, expected 1: the job service may have started the run, so a second call can run it twice", calls)
 	ctx.Assert(waited <= 3.5, "the timed-out window took %.1f s, expected about 3 s", waited)
-	ctx.Equal(clientLedger(ctx)[clientWindow+600], "error:trigger_failed", "the ledger row for the timed-out window")
+	ctx.Equal(hClientLedger(ctx)[kHClientWindow+600], "error:trigger_failed", "the ledger row for the timed-out window")
 }
 
 func CheckSingleAttempt(ctx *harness.Ctx) {
-	s := clientWorld(ctx, "catch_up")
+	s := hClientWorld(ctx, "catch_up")
 	failures := []struct {
 		name string
 		code codes.Code
 	}{{"UNAVAILABLE", codes.Unavailable}, {"DEADLINE_EXCEEDED", codes.DeadlineExceeded}, {"RESOURCE_EXHAUSTED", codes.ResourceExhausted}, {"INTERNAL", codes.Internal}}
 	for k, f := range failures {
-		window := clientWindow + int64(300*k)
+		window := kHClientWindow + int64(300*k)
 		before := len(ctx.GRPC.CallsTo("Trigger", ""))
 		ctx.GRPC.Fail("Trigger", f.code, "job service restarting", 1, "")
-		out := clientRun(ctx, s, []int64{window})
+		out := hClientRun(ctx, s, []int64{window})
 		calls := len(ctx.GRPC.CallsTo("Trigger", "")) - before
 		ctx.Assert(calls == 1, "one window against a job service that answers %s got %d Trigger calls, expected 1: the job service runs every Trigger it receives, so the window is recorded as error and the next pass decides", f.name, calls)
 		ctx.Equal(out[window], "error", "runMissed's outcome for the window that failed with %s", f.name)
-		ctx.Equal(clientLedger(ctx)[window], "error:trigger_failed", "the ledger row for the window that failed with %s", f.name)
+		ctx.Equal(hClientLedger(ctx)[window], "error:trigger_failed", "the ledger row for the window that failed with %s", f.name)
 	}
 }
 
 func CheckPolicySkip(ctx *harness.Ctx) {
-	s := clientWorld(ctx, "skip")
-	missed := clientMissed(4)
-	out := clientRun(ctx, s, missed)
-	ctx.Assert(len(clientTriggered(ctx)) == 0, "a skip schedule with 4 missed windows sent %d Trigger calls (%q), expected none", len(clientTriggered(ctx)), clientTriggered(ctx))
+	s := hClientWorld(ctx, "skip")
+	missed := hClientMissed(4)
+	out := hClientRun(ctx, s, missed)
+	ctx.Assert(len(hClientTriggered(ctx)) == 0, "a skip schedule with 4 missed windows sent %d Trigger calls (%q), expected none", len(hClientTriggered(ctx)), hClientTriggered(ctx))
 	expected := map[int64]string{}
 	outcomes := map[int64]string{}
 	for _, w := range missed {
 		expected[w] = "skipped:policy_skip"
 		outcomes[w] = "skipped"
 	}
-	ctx.Equal(clientLedger(ctx), expected, "the ledger runs:s1 (every missed window as skipped/policy_skip: a window with no row reads as a misfire nobody decided)")
+	ctx.Equal(hClientLedger(ctx), expected, "the ledger runs:s1 (every missed window as skipped/policy_skip: a window with no row reads as a misfire nobody decided)")
 	ctx.Equal(out, outcomes, "runMissed's outcomes")
 }
 
 func CheckFireOnce(ctx *harness.Ctx) {
-	s := clientWorld(ctx, "fire_once_now")
-	missed := clientMissed(4)
-	out := clientRun(ctx, s, []int64{missed[3], missed[2], missed[1], missed[0]})
+	s := hClientWorld(ctx, "fire_once_now")
+	missed := hClientMissed(4)
+	out := hClientRun(ctx, s, []int64{missed[3], missed[2], missed[1], missed[0]})
 	newest := cron.FormatInstant(missed[3])
-	ctx.Assert(len(clientTriggered(ctx)) == 1 && clientTriggered(ctx)[0] == newest, "a fire_once_now schedule with 4 missed windows triggered %q, expected one Trigger for the newest window %s", clientTriggered(ctx), newest)
+	ctx.Assert(len(hClientTriggered(ctx)) == 1 && hClientTriggered(ctx)[0] == newest, "a fire_once_now schedule with 4 missed windows triggered %q, expected one Trigger for the newest window %s", hClientTriggered(ctx), newest)
 	expected := map[int64]string{missed[0]: "skipped:coalesced", missed[1]: "skipped:coalesced", missed[2]: "skipped:coalesced", missed[3]: "fired:"}
-	ctx.Equal(clientLedger(ctx), expected, "the ledger runs:s1 (the 3 older windows skipped/coalesced, the newest fired)")
+	ctx.Equal(hClientLedger(ctx), expected, "the ledger runs:s1 (the 3 older windows skipped/coalesced, the newest fired)")
 	ctx.Equal(out[missed[3]], "fired", "runMissed's outcome for the newest window")
 }
 
 func CheckCatchUpCap(ctx *harness.Ctx) {
-	s := clientWorld(ctx, "catch_up")
-	missed := clientMissed(8)
+	s := hClientWorld(ctx, "catch_up")
+	missed := hClientMissed(8)
 	// The caller's list is in no particular order: the oldest five are the oldest by time.
-	clientRun(ctx, s, []int64{missed[3], missed[7], missed[0], missed[5], missed[1], missed[6], missed[2], missed[4]})
+	hClientRun(ctx, s, []int64{missed[3], missed[7], missed[0], missed[5], missed[1], missed[6], missed[2], missed[4]})
 	expected := []string{}
 	rows := map[int64]string{}
 	for _, w := range missed[:5] {
 		expected = append(expected, cron.FormatInstant(w))
 		rows[w] = "fired:"
 	}
-	ctx.Assert(fmt.Sprint(clientTriggered(ctx)) == fmt.Sprint(expected), "a catch_up schedule with 8 missed windows triggered %q, expected the 5 oldest in order: an unbounded catch-up turns one pause into a burst on the job's database", clientTriggered(ctx))
-	ctx.Equal(clientLedger(ctx), rows, "the ledger runs:s1 (the 5 oldest fired, the 3 newest without a row, owed to the next pass)")
+	ctx.Assert(fmt.Sprint(hClientTriggered(ctx)) == fmt.Sprint(expected), "a catch_up schedule with 8 missed windows triggered %q, expected the 5 oldest in order: an unbounded catch-up turns one pause into a burst on the job's database", hClientTriggered(ctx))
+	ctx.Equal(hClientLedger(ctx), rows, "the ledger runs:s1 (the 5 oldest fired, the 3 newest without a row, owed to the next pass)")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1021,10 +1021,10 @@ func CheckCatchUpCap(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr int64_t kClientWindow = 1773133200;  // 2026-03-10T09:00:00Z
+constexpr int64_t kHClientWindow = 1773133200;  // 2026-03-10T09:00:00Z
 
 // Runs every Trigger it receives.
-class JobsPeer final : public cronjobs::JobRunner::Service {
+class HJobsPeer final : public cronjobs::JobRunner::Service {
  public:
   int runs = 0;
 
@@ -1036,10 +1036,10 @@ class JobsPeer final : public cronjobs::JobRunner::Service {
 };
 
 // A stored schedule and the job service the harness serves.
-cronsched::Schedule clientWorld(harness::Ctx& ctx, const std::string& policy) {
-  static JobsPeer* jobs = nullptr;
+cronsched::Schedule hClientWorld(harness::Ctx& ctx, const std::string& policy) {
+  static HJobsPeer* jobs = nullptr;
   delete jobs;
-  jobs = new JobsPeer;
+  jobs = new HJobsPeer;
   ctx.GRPC.Server("")->RegisterService(jobs);
   const cronsched::Schedule s{"s1", "t1", "*/5 * * * *", "UTC", "billing.invoice", policy, ""};
   cronsched::store::Put(s);
@@ -1047,26 +1047,26 @@ cronsched::Schedule clientWorld(harness::Ctx& ctx, const std::string& policy) {
 }
 
 // n consecutive windows of a five-minute schedule, from 09:00.
-std::vector<int64_t> clientMissed(int n) {
+std::vector<int64_t> hClientMissed(int n) {
   std::vector<int64_t> out;
-  for (int k = 0; k < n; k++) out.push_back(kClientWindow + 300 * k);
+  for (int k = 0; k < n; k++) out.push_back(kHClientWindow + 300 * k);
   return out;
 }
 
-std::map<int64_t, std::string> clientRun(harness::Ctx& ctx, const cronsched::Schedule& s, const std::vector<int64_t>& windows) {
+std::map<int64_t, std::string> hClientRun(harness::Ctx& ctx, const cronsched::Schedule& s, const std::vector<int64_t>& windows) {
   std::map<int64_t, std::string> out;
   const bool returned = ctx.Drain([&] { out = runMissed(s, windows, "a"); });
   ctx.Assert(returned, "runMissed never returned: it kept calling Trigger until the runtime stopped it");
   return out;
 }
 
-std::vector<std::string> clientTriggered(harness::Ctx& ctx) {
+std::vector<std::string> hClientTriggered(harness::Ctx& ctx) {
   std::vector<std::string> out;
   for (const auto& c : ctx.GRPC.CallsTo("Trigger")) out.push_back(c.Request<cronjobs::TriggerRequest>().window());
   return out;
 }
 
-std::map<int64_t, std::string> clientLedger() {
+std::map<int64_t, std::string> hClientLedger() {
   std::map<int64_t, std::string> out;
   for (const auto& r : cronsched::store::Runs("s1")) out[r.window] = r.outcome + ":" + r.reason;
   return out;
@@ -1075,11 +1075,11 @@ std::map<int64_t, std::string> clientLedger() {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  const auto s = clientWorld(ctx, "catch_up");
+  const auto s = hClientWorld(ctx, "catch_up");
   ctx.GRPC.SetLatency("Trigger", 2.0);
   // Two windows in one pass: each Trigger carries its own 3 s, not what is left of the pass's.
-  auto out = clientRun(ctx, s, {kClientWindow, kClientWindow + 300});
-  ctx.Assert(out[kClientWindow] == "fired" && out[kClientWindow + 300] == "fired",
+  auto out = hClientRun(ctx, s, {kHClientWindow, kHClientWindow + 300});
+  ctx.Assert(out[kHClientWindow] == "fired" && out[kHClientWindow + 300] == "fired",
              "a job service that answers in 2 s ended two windows of one pass %v, expected both fired: every Trigger gets its own 3 s "
              "deadline",
              out);
@@ -1090,9 +1090,9 @@ void CheckDeadline(harness::Ctx& ctx) {
   }
   ctx.GRPC.SetLatency("Trigger", 10.0);
   const int64_t before = ctx.Clock.Now();
-  out = clientRun(ctx, s, {kClientWindow + 600});
+  out = hClientRun(ctx, s, {kHClientWindow + 600});
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Equal(out[kClientWindow + 600], "error",
+  ctx.Equal(out[kHClientWindow + 600], "error",
             "a job service that takes 10 s must end the window as error once the 3 s deadline passed; the outcome");
   const size_t calls = ctx.GRPC.CallsTo("Trigger").size() - 2;
   ctx.Assert(calls == 1,
@@ -1100,76 +1100,76 @@ void CheckDeadline(harness::Ctx& ctx) {
              "it twice",
              calls);
   ctx.Assert(waited <= 3.5, "the timed-out window took %.1f s, expected about 3 s", waited);
-  ctx.Equal(clientLedger()[kClientWindow + 600], "error:trigger_failed", "the ledger row for the timed-out window");
+  ctx.Equal(hClientLedger()[kHClientWindow + 600], "error:trigger_failed", "the ledger row for the timed-out window");
 }
 
 void CheckSingleAttempt(harness::Ctx& ctx) {
-  const auto s = clientWorld(ctx, "catch_up");
+  const auto s = hClientWorld(ctx, "catch_up");
   const std::vector<std::pair<std::string, grpc::StatusCode>> failures = {{"UNAVAILABLE", grpc::StatusCode::UNAVAILABLE},
                                                                           {"DEADLINE_EXCEEDED", grpc::StatusCode::DEADLINE_EXCEEDED},
                                                                           {"RESOURCE_EXHAUSTED", grpc::StatusCode::RESOURCE_EXHAUSTED},
                                                                           {"INTERNAL", grpc::StatusCode::INTERNAL}};
   for (size_t k = 0; k < failures.size(); k++) {
     const auto& [name, code] = failures[k];
-    const int64_t window = kClientWindow + 300 * static_cast<int64_t>(k);
+    const int64_t window = kHClientWindow + 300 * static_cast<int64_t>(k);
     const size_t before = ctx.GRPC.CallsTo("Trigger").size();
     ctx.GRPC.Fail("Trigger", code, "job service restarting", 1);
-    auto out = clientRun(ctx, s, {window});
+    auto out = hClientRun(ctx, s, {window});
     const size_t calls = ctx.GRPC.CallsTo("Trigger").size() - before;
     ctx.Assert(calls == 1,
                "one window against a job service that answers %s got %d Trigger calls, expected 1: the job service runs every Trigger "
                "it receives, so the window is recorded as error and the next pass decides",
                name, calls);
     ctx.Equal(out[window], "error", "runMissed's outcome for the window that failed with %s", name);
-    ctx.Equal(clientLedger()[window], "error:trigger_failed", "the ledger row for the window that failed with %s", name);
+    ctx.Equal(hClientLedger()[window], "error:trigger_failed", "the ledger row for the window that failed with %s", name);
   }
 }
 
 void CheckPolicySkip(harness::Ctx& ctx) {
-  const auto s = clientWorld(ctx, "skip");
-  const auto missed = clientMissed(4);
-  const auto out = clientRun(ctx, s, missed);
-  ctx.Assert(clientTriggered(ctx).empty(), "a skip schedule with 4 missed windows sent %d Trigger calls (%q), expected none",
-             clientTriggered(ctx).size(), clientTriggered(ctx));
+  const auto s = hClientWorld(ctx, "skip");
+  const auto missed = hClientMissed(4);
+  const auto out = hClientRun(ctx, s, missed);
+  ctx.Assert(hClientTriggered(ctx).empty(), "a skip schedule with 4 missed windows sent %d Trigger calls (%q), expected none",
+             hClientTriggered(ctx).size(), hClientTriggered(ctx));
   std::map<int64_t, std::string> expected;
   std::map<int64_t, std::string> outcomes;
   for (const int64_t w : missed) {
     expected[w] = "skipped:policy_skip";
     outcomes[w] = "skipped";
   }
-  ctx.Equal(clientLedger(), expected,
+  ctx.Equal(hClientLedger(), expected,
             "the ledger runs:s1 (every missed window as skipped/policy_skip: a window with no row reads as a misfire nobody decided)");
   ctx.Equal(out, outcomes, "runMissed's outcomes");
 }
 
 void CheckFireOnce(harness::Ctx& ctx) {
-  const auto s = clientWorld(ctx, "fire_once_now");
-  const auto missed = clientMissed(4);
-  auto out = clientRun(ctx, s, {missed[3], missed[2], missed[1], missed[0]});
+  const auto s = hClientWorld(ctx, "fire_once_now");
+  const auto missed = hClientMissed(4);
+  auto out = hClientRun(ctx, s, {missed[3], missed[2], missed[1], missed[0]});
   const std::string newest = cronsched::cron::FormatInstant(missed[3]);
-  ctx.Equal(clientTriggered(ctx), std::vector<std::string>{newest},
+  ctx.Equal(hClientTriggered(ctx), std::vector<std::string>{newest},
             "a fire_once_now schedule with 4 missed windows must send one Trigger, for the newest window; the windows triggered");
   const std::map<int64_t, std::string> expected = {
       {missed[0], "skipped:coalesced"}, {missed[1], "skipped:coalesced"}, {missed[2], "skipped:coalesced"}, {missed[3], "fired:"}};
-  ctx.Equal(clientLedger(), expected, "the ledger runs:s1 (the 3 older windows skipped/coalesced, the newest fired)");
+  ctx.Equal(hClientLedger(), expected, "the ledger runs:s1 (the 3 older windows skipped/coalesced, the newest fired)");
   ctx.Equal(out[missed[3]], "fired", "runMissed's outcome for the newest window");
 }
 
 void CheckCatchUpCap(harness::Ctx& ctx) {
-  const auto s = clientWorld(ctx, "catch_up");
-  const auto missed = clientMissed(8);
+  const auto s = hClientWorld(ctx, "catch_up");
+  const auto missed = hClientMissed(8);
   // The caller's list is in no particular order: the oldest five are the oldest by time.
-  clientRun(ctx, s, {missed[3], missed[7], missed[0], missed[5], missed[1], missed[6], missed[2], missed[4]});
+  hClientRun(ctx, s, {missed[3], missed[7], missed[0], missed[5], missed[1], missed[6], missed[2], missed[4]});
   std::vector<std::string> expected;
   std::map<int64_t, std::string> rows;
   for (int k = 0; k < 5; k++) {
     expected.push_back(cronsched::cron::FormatInstant(missed[k]));
     rows[missed[k]] = "fired:";
   }
-  ctx.Equal(clientTriggered(ctx), expected,
+  ctx.Equal(hClientTriggered(ctx), expected,
             "a catch_up schedule with 8 missed windows must trigger the 5 oldest in order (an unbounded catch-up turns one pause into a "
             "burst on the job's database); the windows triggered");
-  ctx.Equal(clientLedger(), rows, "the ledger runs:s1 (the 5 oldest fired, the 3 newest without a row, owed to the next pass)");
+  ctx.Equal(hClientLedger(), rows, "the ledger runs:s1 (the 5 oldest fired, the 3 newest without a row, owed to the next pass)");
 }
 `,
   },

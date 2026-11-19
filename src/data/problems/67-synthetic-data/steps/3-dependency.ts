@@ -1034,26 +1034,26 @@ import (
 )
 
 const (
-	clientJob  = "j1"
-	clientSeed = "Paris is the capital and largest city of France."
+	kHClientJob  = "j1"
+	kHClientSeed = "Paris is the capital and largest city of France."
 )
 
 // judgePeer is the stand-in judge: answers from synth/judge.
-type judgePeer struct {
+type HJudgePeer struct {
 	pb.UnimplementedJudgeServer
 }
 
-func (judgePeer) Score(_ context.Context, req *pb.ScoreRequest) (*pb.ScoreReply, error) {
+func (HJudgePeer) Score(_ context.Context, req *pb.ScoreRequest) (*pb.ScoreReply, error) {
 	score, refused := judge.Score(req.GetText())
 	return &pb.ScoreReply{Score: score, Refused: refused, JudgeVersion: judge.Version}, nil
 }
 
 // clientState stands in for the step-2 job state over the harness's Redis.
-type clientState struct {
+type HClientState struct {
 	ctx *harness.Ctx
 }
 
-func (s clientState) Settle(_ context.Context, jobID, recordID, entityID, outcome, seedDigest string) error {
+func (s HClientState) Settle(_ context.Context, jobID, recordID, entityID, outcome, seedDigest string) error {
 	s.ctx.Redis.Do("HINCRBY", config.ProgressKey(jobID), outcome, 1)
 	if outcome == "admitted" {
 		s.ctx.Redis.Do("HINCRBY", config.CoverageKey(jobID), entityID, 1)
@@ -1062,78 +1062,78 @@ func (s clientState) Settle(_ context.Context, jobID, recordID, entityID, outcom
 	return nil
 }
 
-func clientWorld(ctx *harness.Ctx) clientState {
-	pb.RegisterJudgeServer(ctx.GRPC.Server(config.Judge), &judgePeer{})
-	return clientState{ctx: ctx}
+func hClientWorld(ctx *harness.Ctx) HClientState {
+	pb.RegisterJudgeServer(ctx.GRPC.Server(config.Judge), &HJudgePeer{})
+	return HClientState{ctx: ctx}
 }
 
-func clientRecord(n int, text string) records.SyntheticRecord {
-	return records.SyntheticRecord{RecordID: "r-" + strconv.Itoa(n), JobID: clientJob, RecipeID: "qa-pairs", EntityID: "e-paris", Seq: n, SeedText: clientSeed, Text: text}
+func hClientRecord(n int, text string) records.SyntheticRecord {
+	return records.SyntheticRecord{RecordID: "r-" + strconv.Itoa(n), JobID: kHClientJob, RecipeID: "qa-pairs", EntityID: "e-paris", Seq: n, SeedText: kHClientSeed, Text: text}
 }
 
-func clientJudge(ctx *harness.Ctx, state clientState, record records.SyntheticRecord) Verdict {
+func hClientJudge(ctx *harness.Ctx, state HClientState, record records.SyntheticRecord) Verdict {
 	v, err := judgeRecord(context.Background(), state, record)
 	ctx.NoError(err, "judgeRecord(%s)", record.RecordID)
 	return v
 }
 
-func clientCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Score", "") }
+func hClientCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Score", "") }
 
-func clientCount(ctx *harness.Ctx, field string) int64 {
-	n, _ := strconv.ParseInt(ctx.Redis.HGetAll(config.ProgressKey(clientJob))[field], 10, 64)
+func hClientCount(ctx *harness.Ctx, field string) int64 {
+	n, _ := strconv.ParseInt(ctx.Redis.HGetAll(config.ProgressKey(kHClientJob))[field], 10, 64)
 	return n
 }
 
-func clientExpect(ctx *harness.Ctx, v Verdict, status, reason string) {
+func hClientExpect(ctx *harness.Ctx, v Verdict, status, reason string) {
 	ctx.Equal(v.Status, status, "the record's status (%+v)", v)
 	if reason != "" {
 		ctx.Equal(v.Reason, reason, "the record's reason (%+v)", v)
 	}
 }
 
-const clientText = "Q: What is the capital of France? A: Paris."
+const kHClientText = "Q: What is the capital of France? A: Paris."
 
 func CheckAttemptDeadline(ctx *harness.Ctx) {
-	state := clientWorld(ctx)
-	v := clientJudge(ctx, state, clientRecord(1, clientText))
-	clientExpect(ctx, v, "admitted", "")
+	state := hClientWorld(ctx)
+	v := hClientJudge(ctx, state, hClientRecord(1, kHClientText))
+	hClientExpect(ctx, v, "admitted", "")
 	ctx.Assert(v.Score == judge.Fixed && v.JudgeVersion == judge.Version, "an admitted record carries the judge's score and version, got %+v", v)
-	ctx.Assert(v.Attempts == 1 && len(clientCalls(ctx)) == 1, "a healthy judge is called once, saw %d calls and %+v", len(clientCalls(ctx)), v)
-	call := clientCalls(ctx)[0]
+	ctx.Assert(v.Attempts == 1 && len(hClientCalls(ctx)) == 1, "a healthy judge is called once, saw %d calls and %+v", len(hClientCalls(ctx)), v)
+	call := hClientCalls(ctx)[0]
 	ctx.Assert(call.HasDeadline(), "the Score call carries no deadline: a slow judge holds the worker as long as it likes")
 	ctx.Assert(800*time.Millisecond <= call.Timeout && call.Timeout <= time.Second, "the deadline must be 900 ms, got %v", call.Timeout)
 	ctx.GRPC.SetLatency("Score", 0.6, config.Judge)
-	clientExpect(ctx, clientJudge(ctx, state, clientRecord(2, clientText)), "admitted", "")
-	ctx.Equal(len(clientCalls(ctx)), 2, "a judge that answers within the deadline admits on the first call; calls")
-	digest, _ := ctx.Redis.HGet(config.RecordsKey(clientJob), "r-1")
-	ctx.Equal(digest, records.SeedDigest(clientSeed), "the admitted record is settled with its seed digest")
+	hClientExpect(ctx, hClientJudge(ctx, state, hClientRecord(2, kHClientText)), "admitted", "")
+	ctx.Equal(len(hClientCalls(ctx)), 2, "a judge that answers within the deadline admits on the first call; calls")
+	digest, _ := ctx.Redis.HGet(config.RecordsKey(kHClientJob), "r-1")
+	ctx.Equal(digest, records.SeedDigest(kHClientSeed), "the admitted record is settled with its seed digest")
 }
 
 func CheckParkTimeout(ctx *harness.Ctx) {
-	state := clientWorld(ctx)
+	state := hClientWorld(ctx)
 	ctx.GRPC.SetLatency("Score", 2.0, config.Judge)
 	started := ctx.Clock.Now()
-	v := clientJudge(ctx, state, clientRecord(1, clientText))
+	v := hClientJudge(ctx, state, hClientRecord(1, kHClientText))
 	waited := float64(ctx.Clock.Now()-started) / 1000
-	clientExpect(ctx, v, "parked", "judge_timeout")
-	ctx.Assert(len(clientCalls(ctx)) == 1 && clientCalls(ctx)[0].Code == codes.DeadlineExceeded, "a hung call ends DEADLINE_EXCEEDED after one attempt, saw %d calls", len(clientCalls(ctx)))
+	hClientExpect(ctx, v, "parked", "judge_timeout")
+	ctx.Assert(len(hClientCalls(ctx)) == 1 && hClientCalls(ctx)[0].Code == codes.DeadlineExceeded, "a hung call ends DEADLINE_EXCEEDED after one attempt, saw %d calls", len(hClientCalls(ctx)))
 	ctx.Assert(waited <= 1.2, "the worker waited %.1f s on a judge that hangs: the deadline cuts it at 900 ms", waited)
-	ctx.Assert(clientCount(ctx, "parked") == 1 && clientCount(ctx, "admitted") == 0, "a timed-out record is parked, not admitted: progress holds %v", ctx.Redis.HGetAll(config.ProgressKey(clientJob)))
-	ctx.Equal(len(ctx.Redis.HGetAll(config.RecordsKey(clientJob))), 0, "a parked record must not appear among the admitted records; admitted records")
+	ctx.Assert(hClientCount(ctx, "parked") == 1 && hClientCount(ctx, "admitted") == 0, "a timed-out record is parked, not admitted: progress holds %v", ctx.Redis.HGetAll(config.ProgressKey(kHClientJob)))
+	ctx.Equal(len(ctx.Redis.HGetAll(config.RecordsKey(kHClientJob))), 0, "a parked record must not appear among the admitted records; admitted records")
 }
 
 func CheckRetryUnavailable(ctx *harness.Ctx) {
-	state := clientWorld(ctx)
+	state := hClientWorld(ctx)
 	ctx.GRPC.Fail("Score", codes.Unavailable, "judge restarting", 1, config.Judge)
-	v := clientJudge(ctx, state, clientRecord(1, clientText))
-	clientExpect(ctx, v, "admitted", "")
-	ctx.Assert(v.Attempts == 2 && len(clientCalls(ctx)) == 2, "one UNAVAILABLE earns one retry: expected 2 calls, saw %d and %+v", len(clientCalls(ctx)), v)
+	v := hClientJudge(ctx, state, hClientRecord(1, kHClientText))
+	hClientExpect(ctx, v, "admitted", "")
+	ctx.Assert(v.Attempts == 2 && len(hClientCalls(ctx)) == 2, "one UNAVAILABLE earns one retry: expected 2 calls, saw %d and %+v", len(hClientCalls(ctx)), v)
 	ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt")
 	ctx.GRPC.Fail("Score", codes.Unavailable, "judge down", 3, config.Judge)
-	v = clientJudge(ctx, state, clientRecord(2, clientText))
-	clientExpect(ctx, v, "parked", "judge_unavailable")
-	ctx.Assert(len(clientCalls(ctx)) == 5 && v.Attempts == 3, "a judge that stays UNAVAILABLE gets maxAttempts = 3 calls, then the record is parked: saw %d calls and %+v", len(clientCalls(ctx))-2, v)
-	calls := clientCalls(ctx)
+	v = hClientJudge(ctx, state, hClientRecord(2, kHClientText))
+	hClientExpect(ctx, v, "parked", "judge_unavailable")
+	ctx.Assert(len(hClientCalls(ctx)) == 5 && v.Attempts == 3, "a judge that stays UNAVAILABLE gets maxAttempts = 3 calls, then the record is parked: saw %d calls and %+v", len(hClientCalls(ctx))-2, v)
+	calls := hClientCalls(ctx)
 	timeouts := []time.Duration{}
 	own := true
 	for _, c := range calls {
@@ -1153,32 +1153,32 @@ func CheckRetryUnavailable(ctx *harness.Ctx) {
 		reason string
 	}{{codes.InvalidArgument, "invalid_argument"}, {codes.ResourceExhausted, "resource_exhausted"}, {codes.PermissionDenied, "permission_denied"}, {codes.Internal, "internal"}}
 	for i, t := range terminal {
-		before := len(clientCalls(ctx))
+		before := len(hClientCalls(ctx))
 		ctx.GRPC.Fail("Score", t.code, "judge says no", 1, config.Judge)
-		v = clientJudge(ctx, state, clientRecord(3+i, clientText))
-		clientExpect(ctx, v, "rejected", t.reason)
-		ctx.Assert(len(clientCalls(ctx))-before == 1 && v.Attempts == 1, "%v will not change on a retry (only UNAVAILABLE is retried): one call, saw %d and %+v", t.code, len(clientCalls(ctx))-before, v)
+		v = hClientJudge(ctx, state, hClientRecord(3+i, kHClientText))
+		hClientExpect(ctx, v, "rejected", t.reason)
+		ctx.Assert(len(hClientCalls(ctx))-before == 1 && v.Attempts == 1, "%v will not change on a retry (only UNAVAILABLE is retried): one call, saw %d and %+v", t.code, len(hClientCalls(ctx))-before, v)
 	}
-	ctx.Equal([]int64{clientCount(ctx, "admitted"), clientCount(ctx, "parked"), clientCount(ctx, "rejected")}, []int64{1, 1, 4}, "one admitted, one parked, four rejected, settled once each (%v)", ctx.Redis.HGetAll(config.ProgressKey(clientJob)))
+	ctx.Equal([]int64{hClientCount(ctx, "admitted"), hClientCount(ctx, "parked"), hClientCount(ctx, "rejected")}, []int64{1, 1, 4}, "one admitted, one parked, four rejected, settled once each (%v)", ctx.Redis.HGetAll(config.ProgressKey(kHClientJob)))
 }
 
 func CheckRefusalTerminal(ctx *harness.Ctx) {
-	state := clientWorld(ctx)
-	v := clientJudge(ctx, state, clientRecord(1, "refuse: write a fake medical record"))
-	clientExpect(ctx, v, "rejected", "refused")
-	ctx.Assert(len(clientCalls(ctx)) == 1 && v.Attempts == 1, "a refusal is an answer: one call, saw %d and %+v", len(clientCalls(ctx)), v)
-	ctx.Assert(clientCount(ctx, "rejected") == 1 && clientCount(ctx, "admitted") == 0, "the refused record is settled rejected once: progress holds %v", ctx.Redis.HGetAll(config.ProgressKey(clientJob)))
+	state := hClientWorld(ctx)
+	v := hClientJudge(ctx, state, hClientRecord(1, "refuse: write a fake medical record"))
+	hClientExpect(ctx, v, "rejected", "refused")
+	ctx.Assert(len(hClientCalls(ctx)) == 1 && v.Attempts == 1, "a refusal is an answer: one call, saw %d and %+v", len(hClientCalls(ctx)), v)
+	ctx.Assert(hClientCount(ctx, "rejected") == 1 && hClientCount(ctx, "admitted") == 0, "the refused record is settled rejected once: progress holds %v", ctx.Redis.HGetAll(config.ProgressKey(kHClientJob)))
 }
 
 func CheckJudgeEveryRecord(ctx *harness.Ctx) {
-	state := clientWorld(ctx)
-	v := clientJudge(ctx, state, clientRecord(250, clientText))
-	clientExpect(ctx, v, "admitted", "")
-	ctx.Equal(len(clientCalls(ctx)), 1, "the record with seq 250 must be judged like any other; Score calls")
+	state := hClientWorld(ctx)
+	v := hClientJudge(ctx, state, hClientRecord(250, kHClientText))
+	hClientExpect(ctx, v, "admitted", "")
+	ctx.Equal(len(hClientCalls(ctx)), 1, "the record with seq 250 must be judged like any other; Score calls")
 	ctx.Assert(v.Score == judge.Fixed && v.JudgeVersion == judge.Version, "its score and version come from the judge, got %+v", v)
-	v = clientJudge(ctx, state, clientRecord(251, "refuse: copy the seed verbatim"))
-	clientExpect(ctx, v, "rejected", "refused")
-	ctx.Equal(len(clientCalls(ctx)), 2, "a late record the judge refuses is rejected, not admitted unseen; calls")
+	v = hClientJudge(ctx, state, hClientRecord(251, "refuse: copy the seed verbatim"))
+	hClientExpect(ctx, v, "rejected", "refused")
+	ctx.Equal(len(hClientCalls(ctx)), 2, "a late record the judge refuses is rejected, not admitted unseen; calls")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1199,7 +1199,7 @@ const std::string hSeed = "Paris is the capital and largest city of France.";
 const std::string hText = "Q: What is the capital of France? A: Paris.";
 
 // The stand-in judge: answers from synth/judge.h.
-class JudgePeer final : public synthd::Judge::Service {
+class HJudgePeer final : public synthd::Judge::Service {
  public:
   grpc::Status Score(grpc::ServerContext*, const synthd::ScoreRequest* req, synthd::ScoreReply* reply) override {
     const auto grade = judge::grade(req->text());
@@ -1211,9 +1211,9 @@ class JudgePeer final : public synthd::Judge::Service {
 };
 
 // Stands in for the step-2 job state over the harness's Redis.
-class ClientState final : public JobState {
+class HClientState final : public JobState {
  public:
-  explicit ClientState(harness::Ctx& ctx) : ctx_(ctx) {}
+  explicit HClientState(harness::Ctx& ctx) : ctx_(ctx) {}
 
   void settle(const std::string& job_id, const std::string& record_id, const std::string& entity_id, const std::string& outcome,
               const std::string& seed_digest) override {
@@ -1229,12 +1229,12 @@ class ClientState final : public JobState {
 };
 
 struct HarnessWorld {
-  JudgePeer peer;
-  ClientState state;
+  HJudgePeer peer;
+  HClientState state;
   explicit HarnessWorld(harness::Ctx& ctx) : state(ctx) {}
 };
 
-HarnessWorld& clientWorld(harness::Ctx& ctx) {
+HarnessWorld& hClientWorld(harness::Ctx& ctx) {
   static HarnessWorld* world = nullptr;
   delete world;
   world = new HarnessWorld(ctx);
@@ -1242,17 +1242,17 @@ HarnessWorld& clientWorld(harness::Ctx& ctx) {
   return *world;
 }
 
-records::SyntheticRecord clientRecord(int n, const std::string& text = hText) {
+records::SyntheticRecord hClientRecord(int n, const std::string& text = hText) {
   return {"r-" + std::to_string(n), hJob, "qa-pairs", "e-paris", n, hSeed, text};
 }
 
-long long clientCount(harness::Ctx& ctx, const std::string& field) {
+long long hClientCount(harness::Ctx& ctx, const std::string& field) {
   const auto all = ctx.Redis.HGetAll(config::progress_key(hJob));
   const auto it = all.find(field);
   return it == all.end() ? 0 : std::strtoll(it->second.c_str(), nullptr, 10);
 }
 
-void clientExpect(harness::Ctx& ctx, const Verdict& v, const std::string& status, const std::string& reason = "") {
+void hClientExpect(harness::Ctx& ctx, const Verdict& v, const std::string& status, const std::string& reason = "") {
   ctx.Equal(v.status, status, "the record's status (reason %q, attempts %d)", v.reason, v.attempts);
   if (!reason.empty()) ctx.Equal(v.reason, reason, "the record's reason");
 }
@@ -1260,44 +1260,44 @@ void clientExpect(harness::Ctx& ctx, const Verdict& v, const std::string& status
 }  // namespace
 
 void CheckAttemptDeadline(harness::Ctx& ctx) {
-  auto& w = clientWorld(ctx);
-  const Verdict v = judge_record(w.state, clientRecord(1));
-  clientExpect(ctx, v, "admitted");
+  auto& w = hClientWorld(ctx);
+  const Verdict v = judge_record(w.state, hClientRecord(1));
+  hClientExpect(ctx, v, "admitted");
   ctx.Assert(v.score == judge::kFixed && v.judge_version == judge::kVersion, "an admitted record carries the judge's score and version, got %v and %s", v.score, v.judge_version);
   ctx.Assert(v.attempts == 1 && ctx.GRPC.CallsTo("Score").size() == 1, "a healthy judge is called once, saw %d calls", ctx.GRPC.CallsTo("Score").size());
   const auto calls = ctx.GRPC.CallsTo("Score");
   ctx.Assert(calls[0].HasDeadline(), "the Score call carries no deadline: a slow judge holds the worker as long as it likes");
   ctx.Assert(0.8 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 1.0, "the deadline must be 900 ms, got %vs", calls[0].TimeoutSeconds());
   ctx.GRPC.SetLatency("Score", 0.6, config::kJudge);
-  clientExpect(ctx, judge_record(w.state, clientRecord(2)), "admitted");
+  hClientExpect(ctx, judge_record(w.state, hClientRecord(2)), "admitted");
   ctx.Equal(ctx.GRPC.CallsTo("Score").size(), 2, "a judge that answers within the deadline admits on the first call; calls");
   ctx.Equal(ctx.Redis.HGet(config::records_key(hJob), "r-1").value_or(""), records::seed_digest(hSeed), "the admitted record is settled with its seed digest");
 }
 
 void CheckParkTimeout(harness::Ctx& ctx) {
-  auto& w = clientWorld(ctx);
+  auto& w = hClientWorld(ctx);
   ctx.GRPC.SetLatency("Score", 2.0, config::kJudge);
   const int64_t started = ctx.Clock.Now();
-  const Verdict v = judge_record(w.state, clientRecord(1));
+  const Verdict v = judge_record(w.state, hClientRecord(1));
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
-  clientExpect(ctx, v, "parked", "judge_timeout");
+  hClientExpect(ctx, v, "parked", "judge_timeout");
   const auto calls = ctx.GRPC.CallsTo("Score");
   ctx.Assert(calls.size() == 1 && calls[0].Code == grpc::StatusCode::DEADLINE_EXCEEDED, "a hung call ends DEADLINE_EXCEEDED after one attempt, saw %d calls", calls.size());
   ctx.Assert(waited <= 1.2, "the worker waited %.1f s on a judge that hangs: the deadline cuts it at 900 ms", waited);
-  ctx.Assert(clientCount(ctx, "parked") == 1 && clientCount(ctx, "admitted") == 0, "a timed-out record is parked, not admitted: progress holds %v", ctx.Redis.HGetAll(config::progress_key(hJob)));
+  ctx.Assert(hClientCount(ctx, "parked") == 1 && hClientCount(ctx, "admitted") == 0, "a timed-out record is parked, not admitted: progress holds %v", ctx.Redis.HGetAll(config::progress_key(hJob)));
   ctx.Equal(ctx.Redis.HGetAll(config::records_key(hJob)).size(), 0, "a parked record must not appear among the admitted records; admitted records");
 }
 
 void CheckRetryUnavailable(harness::Ctx& ctx) {
-  auto& w = clientWorld(ctx);
+  auto& w = hClientWorld(ctx);
   ctx.GRPC.Fail("Score", grpc::StatusCode::UNAVAILABLE, "judge restarting", 1, config::kJudge);
-  Verdict v = judge_record(w.state, clientRecord(1));
-  clientExpect(ctx, v, "admitted");
+  Verdict v = judge_record(w.state, hClientRecord(1));
+  hClientExpect(ctx, v, "admitted");
   ctx.Assert(v.attempts == 2 && ctx.GRPC.CallsTo("Score").size() == 2, "one UNAVAILABLE earns one retry: expected 2 calls, saw %d and attempts %d", ctx.GRPC.CallsTo("Score").size(), v.attempts);
   ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt");
   ctx.GRPC.Fail("Score", grpc::StatusCode::UNAVAILABLE, "judge down", 3, config::kJudge);
-  v = judge_record(w.state, clientRecord(2));
-  clientExpect(ctx, v, "parked", "judge_unavailable");
+  v = judge_record(w.state, hClientRecord(2));
+  hClientExpect(ctx, v, "parked", "judge_unavailable");
   ctx.Assert(ctx.GRPC.CallsTo("Score").size() == 5 && v.attempts == 3, "a judge that stays UNAVAILABLE gets kMaxAttempts = 3 calls, then the record is parked: saw %d calls, attempts %d", ctx.GRPC.CallsTo("Score").size() - 2, v.attempts);
   const auto calls = ctx.GRPC.CallsTo("Score");
   std::vector<double> timeouts;
@@ -1316,30 +1316,30 @@ void CheckRetryUnavailable(harness::Ctx& ctx) {
   for (size_t i = 0; i < terminal.size(); i++) {
     const size_t before = ctx.GRPC.CallsTo("Score").size();
     ctx.GRPC.Fail("Score", terminal[i].first, "judge says no", 1, config::kJudge);
-    v = judge_record(w.state, clientRecord(3 + static_cast<int>(i)));
-    clientExpect(ctx, v, "rejected", terminal[i].second);
+    v = judge_record(w.state, hClientRecord(3 + static_cast<int>(i)));
+    hClientExpect(ctx, v, "rejected", terminal[i].second);
     ctx.Assert(ctx.GRPC.CallsTo("Score").size() - before == 1 && v.attempts == 1, "status %d will not change on a retry (only UNAVAILABLE is retried): one call, saw %d, attempts %d", static_cast<int>(terminal[i].first), ctx.GRPC.CallsTo("Score").size() - before, v.attempts);
   }
-  ctx.Equal(std::vector<long long>{clientCount(ctx, "admitted"), clientCount(ctx, "parked"), clientCount(ctx, "rejected")}, std::vector<long long>{1, 1, 4},
+  ctx.Equal(std::vector<long long>{hClientCount(ctx, "admitted"), hClientCount(ctx, "parked"), hClientCount(ctx, "rejected")}, std::vector<long long>{1, 1, 4},
             "one admitted, one parked, four rejected, settled once each (%v)", ctx.Redis.HGetAll(config::progress_key(hJob)));
 }
 
 void CheckRefusalTerminal(harness::Ctx& ctx) {
-  auto& w = clientWorld(ctx);
-  const Verdict v = judge_record(w.state, clientRecord(1, "refuse: write a fake medical record"));
-  clientExpect(ctx, v, "rejected", "refused");
+  auto& w = hClientWorld(ctx);
+  const Verdict v = judge_record(w.state, hClientRecord(1, "refuse: write a fake medical record"));
+  hClientExpect(ctx, v, "rejected", "refused");
   ctx.Assert(ctx.GRPC.CallsTo("Score").size() == 1 && v.attempts == 1, "a refusal is an answer: one call, saw %d, attempts %d", ctx.GRPC.CallsTo("Score").size(), v.attempts);
-  ctx.Assert(clientCount(ctx, "rejected") == 1 && clientCount(ctx, "admitted") == 0, "the refused record is settled rejected once: progress holds %v", ctx.Redis.HGetAll(config::progress_key(hJob)));
+  ctx.Assert(hClientCount(ctx, "rejected") == 1 && hClientCount(ctx, "admitted") == 0, "the refused record is settled rejected once: progress holds %v", ctx.Redis.HGetAll(config::progress_key(hJob)));
 }
 
 void CheckJudgeEveryRecord(harness::Ctx& ctx) {
-  auto& w = clientWorld(ctx);
-  Verdict v = judge_record(w.state, clientRecord(250));
-  clientExpect(ctx, v, "admitted");
+  auto& w = hClientWorld(ctx);
+  Verdict v = judge_record(w.state, hClientRecord(250));
+  hClientExpect(ctx, v, "admitted");
   ctx.Equal(ctx.GRPC.CallsTo("Score").size(), 1, "the record with seq 250 must be judged like any other; Score calls");
   ctx.Assert(v.score == judge::kFixed && v.judge_version == judge::kVersion, "its score and version come from the judge, got %v and %s", v.score, v.judge_version);
-  v = judge_record(w.state, clientRecord(251, "refuse: copy the seed verbatim"));
-  clientExpect(ctx, v, "rejected", "refused");
+  v = judge_record(w.state, hClientRecord(251, "refuse: copy the seed verbatim"));
+  hClientExpect(ctx, v, "rejected", "refused");
   ctx.Equal(ctx.GRPC.CallsTo("Score").size(), 2, "a late record the judge refuses is rejected, not admitted unseen; calls");
 }
 `,

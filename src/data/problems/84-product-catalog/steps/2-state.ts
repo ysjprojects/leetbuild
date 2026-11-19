@@ -862,8 +862,8 @@ using json = nlohmann::json;
 
 namespace {
 
-const json kV1 = {{"version", 1}, {"product_id", "p-1"}, {"title", "Kettle"}, {"price_cents", 3499}, {"tax_class", "standard"}};
-const json kV2 = {{"version", 2}, {"product_id", "p-1"}, {"title", "Kettle, 2 L"}, {"price_cents", 3999}, {"tax_class", "standard"}};
+const json kHV1 = {{"version", 1}, {"product_id", "p-1"}, {"title", "Kettle"}, {"price_cents", 3499}, {"tax_class", "standard"}};
+const json kHV2 = {{"version", 2}, {"product_id", "p-1"}, {"title", "Kettle, 2 L"}, {"price_cents", 3999}, {"tax_class", "standard"}};
 
 json hVariant(const json& base, long version, const std::string& title) {
   json out = base;
@@ -880,7 +880,7 @@ json hMustRead(harness::Ctx& ctx) {
 
 void hWhole(harness::Ctx& ctx, const std::optional<json>& seen, const std::string& when) {
   ctx.Assert(seen.has_value(), "a read %s found no snapshot: the pointer named a version whose snapshot was not written yet", when);
-  ctx.Assert(*seen == kV1 || *seen == kV2, "a read %s saw %s: a mix of version 1 and version 2. A reader must see one whole version", when, seen->dump());
+  ctx.Assert(*seen == kHV1 || *seen == kHV2, "a read %s saw %s: a mix of version 1 and version 2. A reader must see one whole version", when, seen->dump());
 }
 
 // A probe's outcome: whether it fired, what the call returned, what it threw.
@@ -926,8 +926,8 @@ void hSettled(harness::Ctx& ctx, const HRival& r, const std::string& what) {
 // current) lands right after the first command that touches key: exactly one may win, and the
 // storefront then serves the winner. Returns the winner's version.
 long hRace(harness::Ctx& ctx, const std::string& key, long mine, long rival, long current) {
-  const json rival_snapshot = hVariant(kV2, rival, "Kettle, " + std::to_string(rival) + " L");
-  const json mine_snapshot = hVariant(kV2, mine, "Kettle, " + std::to_string(mine) + " L");
+  const json rival_snapshot = hVariant(kHV2, rival, "Kettle, " + std::to_string(rival) + " L");
+  const json mine_snapshot = hVariant(kHV2, mine, "Kettle, " + std::to_string(mine) + " L");
   const auto probe = hRivalPublish(ctx, key, rival, rival_snapshot, current);
   const bool moved = publishSnapshot("p-1", mine, mine_snapshot, current);
   hSettled(ctx, *probe, key);
@@ -940,13 +940,13 @@ long hRace(harness::Ctx& ctx, const std::string& key, long mine, long rival, lon
 }  // namespace
 
 void CheckNoFieldSwap(harness::Ctx& ctx) {
-  ctx.Equal(publishSnapshot("p-1", 1, kV1, 0), true, "the first publish (nothing published yet, expected 0) must move the pointer; moved");
-  ctx.Equal(hMustRead(ctx), kV1, "after publishing version 1, readPublished");
+  ctx.Equal(publishSnapshot("p-1", 1, kHV1, 0), true, "the first publish (nothing published yet, expected 0) must move the pointer; moved");
+  ctx.Equal(hMustRead(ctx), kHV1, "after publishing version 1, readPublished");
   // A storefront read lands while the publish of version 2 is writing: it must see one whole version.
   const auto shared = hRivalRead(ctx, "catalog:p-1");
   const auto versioned = hRivalRead(ctx, "catalog:p-1:v2");
   const auto pointer = hRivalRead(ctx, "catalog:p-1:published");
-  ctx.Equal(publishSnapshot("p-1", 2, kV2, 1), true, "publishing version 2 over version 1 (expected 1) must move the pointer; moved");
+  ctx.Equal(publishSnapshot("p-1", 2, kHV2, 1), true, "publishing version 2 over version 1 (expected 1) must move the pointer; moved");
   for (const auto& probe : {shared, versioned}) {
     if (!probe->fired) continue;
     hSettled(ctx, *probe, "the key");
@@ -956,12 +956,12 @@ void CheckNoFieldSwap(harness::Ctx& ctx) {
   hWhole(ctx, pointer->seen, "right after the pointer moved");
   ctx.Equal(ctx.Redis.Type("catalog:p-1"), "none", "catalog:p-1 exists: the fields of every version share one hash, so a reader can see two versions in one response. Write the whole version under catalog:p-1:v2; its type");
   const auto raw = ctx.Redis.Get("catalog:p-1:v2");
-  ctx.Assert(raw && json::parse(*raw) == kV2, "catalog:p-1:v2 holds %q, expected the whole version 2 as one JSON document", raw.value_or(""));
-  ctx.Equal(hMustRead(ctx), kV2, "after the second publish, readPublished");
+  ctx.Assert(raw && json::parse(*raw) == kHV2, "catalog:p-1:v2 holds %q, expected the whole version 2 as one JSON document", raw.value_or(""));
+  ctx.Equal(hMustRead(ctx), kHV2, "after the second publish, readPublished");
 }
 
 void CheckOnePointer(harness::Ctx& ctx) {
-  publishSnapshot("p-1", 1, kV1, 0);
+  publishSnapshot("p-1", 1, kHV1, 0);
   const auto keys = ctx.Redis.Keys("catalog:p-1*");
   ctx.Equal(ctx.Redis.Get("catalog:p-1:published"), std::optional<std::string>("1"), "catalog:p-1:published must hold the published version 1 (keys: %q)", keys);
   std::vector<std::string> regional;
@@ -973,29 +973,29 @@ void CheckOnePointer(harness::Ctx& ctx) {
 }
 
 void CheckSingleRead(harness::Ctx& ctx) {
-  publishSnapshot("p-1", 1, kV1, 0);
+  publishSnapshot("p-1", 1, kHV1, 0);
   // Version 2 is published right after the read resolved the pointer: the read must still answer one whole version.
-  const auto rival = hRivalPublish(ctx, "catalog:p-1:published", 2, kV2, 1);
+  const auto rival = hRivalPublish(ctx, "catalog:p-1:published", 2, kHV2, 1);
   const json seen = hMustRead(ctx);
   hSettled(ctx, *rival, "catalog:p-1:published");
   ctx.Equal(rival->moved, true, "the publish of version 2 that landed during the read must move the pointer; moved");
   hWhole(ctx, seen, "racing a publish");
-  ctx.Equal(hMustRead(ctx), kV2, "after the race, readPublished");
+  ctx.Equal(hMustRead(ctx), kHV2, "after the race, readPublished");
 }
 
 void CheckCasSwap(harness::Ctx& ctx) {
-  ctx.Equal(publishSnapshot("p-1", 1, kV1, 0), true, "the first publish must move the pointer; moved");
-  ctx.Equal(publishSnapshot("p-1", 2, kV2, 1), true, "a publish that expected version 1 while 1 is published must move the pointer; moved");
-  ctx.Equal(publishSnapshot("p-1", 3, hVariant(kV2, 3, "Kettle, 3 L"), 1), false, "a publish that expected version 1 while 2 is published lost the race: the pointer must not move; moved");
+  ctx.Equal(publishSnapshot("p-1", 1, kHV1, 0), true, "the first publish must move the pointer; moved");
+  ctx.Equal(publishSnapshot("p-1", 2, kHV2, 1), true, "a publish that expected version 1 while 1 is published must move the pointer; moved");
+  ctx.Equal(publishSnapshot("p-1", 3, hVariant(kHV2, 3, "Kettle, 3 L"), 1), false, "a publish that expected version 1 while 2 is published lost the race: the pointer must not move; moved");
   ctx.Equal(ctx.Redis.Get("catalog:p-1:published"), std::optional<std::string>("2"), "catalog:p-1:published after a stale publish");
-  ctx.Equal(hMustRead(ctx), kV2, "the storefront after a stale publish");
+  ctx.Equal(hMustRead(ctx), kHV2, "the storefront after a stale publish");
   // Another publisher lands between this publish's snapshot write and its swap.
   long current = hRace(ctx, "catalog:p-1:v4", 4, 9, 2);
   // A rival lands right after this publish touched the pointer: a check made outside the script is stale by then.
   current = hRace(ctx, "catalog:p-1:published", 10, 11, current);
   // expected 0 means nothing is published yet; once a version is live such a publish lost.
   const json live = hMustRead(ctx);
-  ctx.Equal(publishSnapshot("p-1", 12, hVariant(kV2, 12, "Kettle, 12 L"), 0), false, "a publish that expected nothing published (0) while a version is live must not move the pointer; moved");
+  ctx.Equal(publishSnapshot("p-1", 12, hVariant(kHV2, 12, "Kettle, 12 L"), 0), false, "a publish that expected nothing published (0) while a version is live must not move the pointer; moved");
   ctx.Assert(hMustRead(ctx) == live, "the storefront serves %s after a publish that expected nothing published, expected version %v", hMustRead(ctx).dump(), current);
 }
 `,

@@ -892,7 +892,7 @@ import (
 	"leetbuild/harness"
 )
 
-type readBody struct {
+type HReadBody struct {
 	Series []struct {
 		Series string           \`json:"series"\`
 		Points []map[string]any \`json:"points"\`
@@ -902,22 +902,22 @@ type readBody struct {
 	NextCursor *string \`json:"next_cursor"\`
 }
 
-func readClient(ctx *harness.Ctx) *harness.HTTP {
+func hReadClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readSeed(ctx *harness.Ctx, tenant string, samples ...model.Sample) {
+func hReadSeed(ctx *harness.Ctx, tenant string, samples ...model.Sample) {
 	_, err := windows.MergeBatch(context.Background(), tenant, "seed", samples)
 	ctx.NoError(err, "seeding the windows")
 }
 
-func readSample(host string, ts int64, value float64) model.Sample {
+func hReadSample(host string, ts int64, value float64) model.Sample {
 	return model.Sample{Metric: "cpu_seconds", Labels: map[string]string{"host": host}, Timestamp: ts, Value: value}
 }
 
-func readPages(ctx *harness.Ctx, c *harness.HTTP, params url.Values) ([]int, []string) {
+func hReadPages(ctx *harness.Ctx, c *harness.HTTP, params url.Values) ([]int, []string) {
 	pages := []int{}
 	seen := []string{}
 	cursor := ""
@@ -925,9 +925,9 @@ func readPages(ctx *harness.Ctx, c *harness.HTTP, params url.Values) ([]int, []s
 		if cursor != "" {
 			params.Set("cursor", cursor)
 		}
-		r := readGet(c, params, "acme")
+		r := hReadGet(c, params, "acme")
 		ctx.Equal(r.Status, 200, "a page query (%s)", r.Text())
-		var body readBody
+		var body HReadBody
 		r.Decode(&body)
 		pages = append(pages, len(body.Series))
 		for _, s := range body.Series {
@@ -941,7 +941,7 @@ func readPages(ctx *harness.Ctx, c *harness.HTTP, params url.Values) ([]int, []s
 	return pages, seen
 }
 
-func readGet(c *harness.HTTP, params url.Values, tenant string) *harness.Response {
+func hReadGet(c *harness.HTTP, params url.Values, tenant string) *harness.Response {
 	path := "/v1/series?" + params.Encode()
 	if tenant == "" {
 		return c.Get(path)
@@ -949,12 +949,12 @@ func readGet(c *harness.HTTP, params url.Values, tenant string) *harness.Respons
 	return c.Get(path, "X-Tenant-Id", tenant)
 }
 
-func readRange(now, span int64) url.Values {
+func hReadRange(now, span int64) url.Values {
 	return url.Values{"metric": {"cpu_seconds"}, "from": {fmt.Sprint(now - span)}, "to": {fmt.Sprint(now)}}
 }
 
-func readNames(r *harness.Response) []string {
-	var body readBody
+func hReadNames(r *harness.Response) []string {
+	var body HReadBody
 	r.Decode(&body)
 	out := []string{}
 	for _, s := range body.Series {
@@ -965,27 +965,27 @@ func readNames(r *harness.Response) []string {
 
 func CheckRoute(ctx *harness.Ctx) {
 	now := ctx.Clock.Now() / 1000
-	readSeed(ctx, "acme", readSample("a", now-100, 1), readSample("a", now-95, 1), readSample("a", now-40, 1))
-	c := readClient(ctx)
-	r := readGet(c, readRange(now, 3600), "acme")
+	hReadSeed(ctx, "acme", hReadSample("a", now-100, 1), hReadSample("a", now-95, 1), hReadSample("a", now-40, 1))
+	c := hReadClient(ctx)
+	r := hReadGet(c, hReadRange(now, 3600), "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/series (%s)", r.Text())
-	var body readBody
+	var body HReadBody
 	r.Decode(&body)
-	ctx.Equal(readNames(r), []string{"cpu_seconds{host=a}"}, "the series listed")
+	ctx.Equal(hReadNames(r), []string{"cpu_seconds{host=a}"}, "the series listed")
 	total := 0.0
 	for _, p := range body.Series[0].Points {
 		n, _ := p["count"].(float64)
 		total += n
 	}
 	ctx.Equal(total, 3, "the samples counted by the points of cpu_seconds{host=a}")
-	r = readGet(c, readRange(now, 3600), "")
+	r = hReadGet(c, hReadRange(now, 3600), "")
 	ctx.Equal(r.Status, 401, "a query without X-Tenant-Id")
 }
 
 func CheckRangeCap(ctx *harness.Ctx) {
 	now := ctx.Clock.Now() / 1000
-	readSeed(ctx, "acme", readSample("a", now-100, 1))
-	c := readClient(ctx)
+	hReadSeed(ctx, "acme", hReadSample("a", now-100, 1))
+	c := hReadClient(ctx)
 	cases := []struct {
 		params url.Values
 		what   string
@@ -995,14 +995,14 @@ func CheckRangeCap(ctx *harness.Ctx) {
 		{url.Values{"metric": {"cpu_seconds"}, "from": {"yesterday"}, "to": {fmt.Sprint(now)}}, "with from=yesterday"},
 		{url.Values{"metric": {"cpu_seconds"}, "from": {fmt.Sprint(now)}, "to": {fmt.Sprint(now - 60)}}, "with to before from"},
 		{url.Values{"metric": {"cpu_seconds"}, "from": {fmt.Sprint(now)}, "to": {fmt.Sprint(now)}}, "with to equal to from"},
-		{readRange(now, 7*3600), "spanning 7 hours"},
-		{readRange(now, 6*3600+1), "spanning 6 hours and 1 second"},
+		{hReadRange(now, 7*3600), "spanning 7 hours"},
+		{hReadRange(now, 6*3600+1), "spanning 6 hours and 1 second"},
 	}
 	for _, tc := range cases {
-		r := readGet(c, tc.params, "acme")
+		r := hReadGet(c, tc.params, "acme")
 		ctx.Assert(r.Status == 400 && strings.Contains(r.Text(), "invalid_range"), "a query %s answered %d %.120s, expected 400 invalid_range: an open range scans every window the index holds", tc.what, r.Status, r.Text())
 	}
-	r := readGet(c, readRange(now, 6*3600), "acme")
+	r := hReadGet(c, hReadRange(now, 6*3600), "acme")
 	ctx.Equal(r.Status, 200, "a query spanning exactly 6 hours (%s)", r.Text())
 }
 
@@ -1010,23 +1010,23 @@ func CheckSeriesPage(ctx *harness.Ctx) {
 	now := ctx.Clock.Now() / 1000
 	samples := []model.Sample{}
 	for i := 0; i < 120; i++ {
-		samples = append(samples, readSample(fmt.Sprintf("h%03d", i), now-100, 1))
+		samples = append(samples, hReadSample(fmt.Sprintf("h%03d", i), now-100, 1))
 		if i < 100 {
-			disk := readSample(fmt.Sprintf("h%03d", i), now-100, 1)
+			disk := hReadSample(fmt.Sprintf("h%03d", i), now-100, 1)
 			disk.Metric = "disk_bytes"
 			samples = append(samples, disk)
 		}
 	}
-	readSeed(ctx, "acme", samples...)
-	c := readClient(ctx)
-	pages, seen := readPages(ctx, c, readRange(now, 3600))
+	hReadSeed(ctx, "acme", samples...)
+	c := hReadClient(ctx)
+	pages, seen := hReadPages(ctx, c, hReadRange(now, 3600))
 	ctx.Equal(pages, []int{50, 50, 20}, "120 series must come back in pages of 50 following next_cursor (one response with every series is one scan per series); the page sizes")
 	for i := 1; i < len(seen); i++ {
 		ctx.Assert(seen[i-1] < seen[i], "the pages must list each series once, in series order: %s came before %s", seen[i-1], seen[i])
 	}
-	disk := readRange(now, 3600)
+	disk := hReadRange(now, 3600)
 	disk.Set("metric", "disk_bytes")
-	pages, _ = readPages(ctx, c, disk)
+	pages, _ = hReadPages(ctx, c, disk)
 	ctx.Equal(pages, []int{50, 50}, "100 series following next_cursor: after the last series next_cursor is null, not a cursor to an empty page; the page sizes")
 }
 
@@ -1035,12 +1035,12 @@ func CheckDownsample(ctx *harness.Ctx) {
 	bucket := (now - 600) - (now-600)%60
 	samples := []model.Sample{}
 	for i := int64(0); i < 6; i++ {
-		samples = append(samples, readSample("a", bucket+10*i, 1))
+		samples = append(samples, hReadSample("a", bucket+10*i, 1))
 	}
-	readSeed(ctx, "acme", append(samples, readSample("a", bucket+60, 2), readSample("a", bucket-60, 9), readSample("b", bucket+20, 5))...)
+	hReadSeed(ctx, "acme", append(samples, hReadSample("a", bucket+60, 2), hReadSample("a", bucket-60, 9), hReadSample("b", bucket+20, 5))...)
 	params := url.Values{"metric": {"cpu_seconds"}, "from": {fmt.Sprint(bucket - 30)}, "to": {fmt.Sprint(now)}}
-	r := readGet(readClient(ctx), params, "acme")
-	var body readBody
+	r := hReadGet(hReadClient(ctx), params, "acme")
+	var body HReadBody
 	r.Decode(&body)
 	points := map[string][]map[string]any{}
 	for _, s := range body.Series {
@@ -1056,15 +1056,15 @@ func CheckDownsample(ctx *harness.Ctx) {
 
 func CheckTenantIsolation(ctx *harness.Ctx) {
 	now := ctx.Clock.Now() / 1000
-	readSeed(ctx, "acme", readSample("a", now-100, 1))
-	readSeed(ctx, "globex", readSample("g", now-100, 1))
-	c := readClient(ctx)
-	params := readRange(now, 3600)
+	hReadSeed(ctx, "acme", hReadSample("a", now-100, 1))
+	hReadSeed(ctx, "globex", hReadSample("g", now-100, 1))
+	c := hReadClient(ctx)
+	params := hReadRange(now, 3600)
 	params.Set("tenant", "globex")
-	r := readGet(c, params, "acme")
-	ctx.Assert(r.Status == 200 && strings.Join(readNames(r), ",") == "cpu_seconds{host=a}", "acme asked with ?tenant=globex and got %d %.160s: the tenant comes from X-Tenant-Id, never from the query", r.Status, r.Text())
+	r := hReadGet(c, params, "acme")
+	ctx.Assert(r.Status == 200 && strings.Join(hReadNames(r), ",") == "cpu_seconds{host=a}", "acme asked with ?tenant=globex and got %d %.160s: the tenant comes from X-Tenant-Id, never from the query", r.Status, r.Text())
 	params.Set("tenant", "acme")
-	r = readGet(c, params, "")
+	r = hReadGet(c, params, "")
 	ctx.Equal(r.Status, 401, "a query with ?tenant=acme and no X-Tenant-Id")
 }
 `,
@@ -1084,9 +1084,9 @@ func CheckTenantIsolation(ctx *harness.Ctx) {
 
 namespace {
 
-using ReadParams = std::vector<std::pair<std::string, std::string>>;
+using HReadParams = std::vector<std::pair<std::string, std::string>>;
 
-harness::HTTP readClient(harness::Ctx& ctx) {
+harness::HTTP hReadClient(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1094,11 +1094,11 @@ harness::HTTP readClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-metrics::Sample readSample(const std::string& host, long long ts, double value = 1, const std::string& metric = "cpu_seconds") {
+metrics::Sample hReadSample(const std::string& host, long long ts, double value = 1, const std::string& metric = "cpu_seconds") {
   return metrics::Sample{metric, {{"host", host}}, ts, value};
 }
 
-std::string readEscape(const std::string& text) {
+std::string hReadEscape(const std::string& text) {
   std::string out;
   for (unsigned char c : text) {
     if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
@@ -1112,22 +1112,22 @@ std::string readEscape(const std::string& text) {
   return out;
 }
 
-harness::Response readGet(harness::HTTP& c, const ReadParams& params, const std::string& tenant = "acme") {
+harness::Response hReadGet(harness::HTTP& c, const HReadParams& params, const std::string& tenant = "acme") {
   std::string path = "/v1/series?";
-  for (const auto& [k, v] : params) path += k + "=" + readEscape(v) + "&";
+  for (const auto& [k, v] : params) path += k + "=" + hReadEscape(v) + "&";
   if (tenant.empty()) return c.Get(path);
   return c.Get(path, "X-Tenant-Id", tenant);
 }
 
-ReadParams readRange(long long now, long long span = 3600, const std::string& metric = "cpu_seconds") {
+HReadParams hReadRange(long long now, long long span = 3600, const std::string& metric = "cpu_seconds") {
   return {{"metric", metric}, {"from", std::to_string(now - span)}, {"to", std::to_string(now)}};
 }
 
-nlohmann::json readJson(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hReadJson(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
-std::vector<std::string> readNames(const harness::Response& r) {
+std::vector<std::string> hReadNames(const harness::Response& r) {
   std::vector<std::string> out;
-  const auto b = readJson(r);
+  const auto b = hReadJson(r);
   if (b.is_object() && b.contains("series")) {
     for (const auto& s : b["series"]) out.push_back(s.value("series", ""));
   }
@@ -1135,19 +1135,19 @@ std::vector<std::string> readNames(const harness::Response& r) {
 }
 
 // Follows next_cursor from the first page: the page sizes and every series listed, in order.
-std::pair<std::vector<int>, std::vector<std::string>> readPages(harness::Ctx& ctx, harness::HTTP& c, const ReadParams& first) {
+std::pair<std::vector<int>, std::vector<std::string>> hReadPages(harness::Ctx& ctx, harness::HTTP& c, const HReadParams& first) {
   std::vector<int> pages;
   std::vector<std::string> seen;
   std::string cursor;
   for (int i = 0; i < 5; i++) {
-    ReadParams params = first;
+    HReadParams params = first;
     if (!cursor.empty()) params.push_back({"cursor", cursor});
-    const auto r = readGet(c, params);
+    const auto r = hReadGet(c, params);
     ctx.Equal(r.Status, 200, "a page query (%s)", r.Text());
-    const auto names = readNames(r);
+    const auto names = hReadNames(r);
     pages.push_back(static_cast<int>(names.size()));
     seen.insert(seen.end(), names.begin(), names.end());
-    const auto b = readJson(r);
+    const auto b = hReadJson(r);
     if (!b.contains("next_cursor") || !b["next_cursor"].is_string() || b["next_cursor"].get<std::string>().empty()) break;
     cursor = b["next_cursor"].get<std::string>();
   }
@@ -1158,37 +1158,37 @@ std::pair<std::vector<int>, std::vector<std::string>> readPages(harness::Ctx& ct
 
 void CheckRoute(harness::Ctx& ctx) {
   const long long now = ctx.Clock.Now() / 1000;
-  metrics::mergeBatch("acme", "seed", {readSample("a", now - 100), readSample("a", now - 95), readSample("a", now - 40)});
-  auto c = readClient(ctx);
-  auto r = readGet(c, readRange(now));
+  metrics::mergeBatch("acme", "seed", {hReadSample("a", now - 100), hReadSample("a", now - 95), hReadSample("a", now - 40)});
+  auto c = hReadClient(ctx);
+  auto r = hReadGet(c, hReadRange(now));
   ctx.Equal(r.Status, 200, "GET /v1/series (%s)", r.Text());
-  ctx.Equal(readNames(r), std::vector<std::string>{"cpu_seconds{host=a}"}, "the series listed");
+  ctx.Equal(hReadNames(r), std::vector<std::string>{"cpu_seconds{host=a}"}, "the series listed");
   long long total = 0;
-  const auto listed = readJson(r);
+  const auto listed = hReadJson(r);
   for (const auto& p : listed["series"][0]["points"]) total += p.value("count", 0LL);
   ctx.Equal(total, 3, "the samples counted by the points of cpu_seconds{host=a}");
-  r = readGet(c, readRange(now), "");
+  r = hReadGet(c, hReadRange(now), "");
   ctx.Equal(r.Status, 401, "a query without X-Tenant-Id");
 }
 
 void CheckRangeCap(harness::Ctx& ctx) {
   const long long now = ctx.Clock.Now() / 1000;
-  metrics::mergeBatch("acme", "seed", {readSample("a", now - 100)});
-  auto c = readClient(ctx);
-  const std::vector<std::pair<ReadParams, std::string>> cases = {
+  metrics::mergeBatch("acme", "seed", {hReadSample("a", now - 100)});
+  auto c = hReadClient(ctx);
+  const std::vector<std::pair<HReadParams, std::string>> cases = {
       {{{"metric", "cpu_seconds"}, {"to", std::to_string(now)}}, "without from"},
       {{{"metric", "cpu_seconds"}, {"from", std::to_string(now - 60)}}, "without to"},
       {{{"metric", "cpu_seconds"}, {"from", "yesterday"}, {"to", std::to_string(now)}}, "with from=yesterday"},
       {{{"metric", "cpu_seconds"}, {"from", std::to_string(now)}, {"to", std::to_string(now - 60)}}, "with to before from"},
       {{{"metric", "cpu_seconds"}, {"from", std::to_string(now)}, {"to", std::to_string(now)}}, "with to equal to from"},
-      {readRange(now, 7 * 3600), "spanning 7 hours"},
-      {readRange(now, 6 * 3600 + 1), "spanning 6 hours and 1 second"},
+      {hReadRange(now, 7 * 3600), "spanning 7 hours"},
+      {hReadRange(now, 6 * 3600 + 1), "spanning 6 hours and 1 second"},
   };
   for (const auto& [params, what] : cases) {
-    const auto r = readGet(c, params);
+    const auto r = hReadGet(c, params);
     ctx.Assert(r.Status == 400 && r.Text().find("invalid_range") != std::string::npos, "a query %s answered %d %s, expected 400 invalid_range: an open range scans every window the index holds", what, r.Status, r.Text().substr(0, 120));
   }
-  const auto r = readGet(c, readRange(now, 6 * 3600));
+  const auto r = hReadGet(c, hReadRange(now, 6 * 3600));
   ctx.Equal(r.Status, 200, "a query spanning exactly 6 hours (%s)", r.Text());
 }
 
@@ -1198,31 +1198,31 @@ void CheckSeriesPage(harness::Ctx& ctx) {
   for (int i = 0; i < 120; i++) {
     char host[8];
     std::snprintf(host, sizeof host, "h%03d", i);
-    samples.push_back(readSample(host, now - 100));
-    if (i < 100) samples.push_back(readSample(host, now - 100, 1, "disk_bytes"));
+    samples.push_back(hReadSample(host, now - 100));
+    if (i < 100) samples.push_back(hReadSample(host, now - 100, 1, "disk_bytes"));
   }
   metrics::mergeBatch("acme", "seed", samples);
-  auto c = readClient(ctx);
-  const auto [pages, seen] = readPages(ctx, c, readRange(now));
+  auto c = hReadClient(ctx);
+  const auto [pages, seen] = hReadPages(ctx, c, hReadRange(now));
   ctx.Equal(pages, {50, 50, 20}, "120 series must come back in pages of 50 following next_cursor (one response with every series is one scan per series); the page sizes");
   for (size_t i = 1; i < seen.size(); i++) {
     ctx.Assert(seen[i - 1] < seen[i], "the pages must list each series once, in series order: %s came before %s", seen[i - 1], seen[i]);
   }
-  ctx.Equal(readPages(ctx, c, readRange(now, 3600, "disk_bytes")).first, {50, 50}, "100 series following next_cursor: after the last series next_cursor is null, not a cursor to an empty page; the page sizes");
+  ctx.Equal(hReadPages(ctx, c, hReadRange(now, 3600, "disk_bytes")).first, {50, 50}, "100 series following next_cursor: after the last series next_cursor is null, not a cursor to an empty page; the page sizes");
 }
 
 void CheckDownsample(harness::Ctx& ctx) {
   const long long now = ctx.Clock.Now() / 1000;
   const long long bucket = (now - 600) - (now - 600) % 60;
   std::vector<metrics::Sample> samples;
-  for (int i = 0; i < 6; i++) samples.push_back(readSample("a", bucket + 10 * i));
-  samples.push_back(readSample("a", bucket + 60, 2));
-  samples.push_back(readSample("a", bucket - 60, 9));
-  samples.push_back(readSample("b", bucket + 20, 5));
+  for (int i = 0; i < 6; i++) samples.push_back(hReadSample("a", bucket + 10 * i));
+  samples.push_back(hReadSample("a", bucket + 60, 2));
+  samples.push_back(hReadSample("a", bucket - 60, 9));
+  samples.push_back(hReadSample("b", bucket + 20, 5));
   metrics::mergeBatch("acme", "seed", samples);
-  auto c = readClient(ctx);
-  const auto r = readGet(c, {{"metric", "cpu_seconds"}, {"from", std::to_string(bucket - 30)}, {"to", std::to_string(now)}});
-  const auto b = readJson(r);
+  auto c = hReadClient(ctx);
+  const auto r = hReadGet(c, {{"metric", "cpu_seconds"}, {"from", std::to_string(bucket - 30)}, {"to", std::to_string(now)}});
+  const auto b = hReadJson(r);
   nlohmann::json points = nlohmann::json::object();
   if (b.is_object() && b.contains("series") && b["series"].is_array()) {
     for (const auto& s : b["series"]) points[s.value("series", "?")] = s.contains("points") ? s["points"] : nlohmann::json();
@@ -1238,15 +1238,15 @@ void CheckDownsample(harness::Ctx& ctx) {
 
 void CheckTenantIsolation(harness::Ctx& ctx) {
   const long long now = ctx.Clock.Now() / 1000;
-  metrics::mergeBatch("acme", "seed", {readSample("a", now - 100)});
-  metrics::mergeBatch("globex", "seed", {readSample("g", now - 100)});
-  auto c = readClient(ctx);
-  ReadParams params = readRange(now);
+  metrics::mergeBatch("acme", "seed", {hReadSample("a", now - 100)});
+  metrics::mergeBatch("globex", "seed", {hReadSample("g", now - 100)});
+  auto c = hReadClient(ctx);
+  HReadParams params = hReadRange(now);
   params.push_back({"tenant", "globex"});
-  auto r = readGet(c, params);
-  ctx.Assert(r.Status == 200 && readNames(r) == std::vector<std::string>{"cpu_seconds{host=a}"}, "acme asked with ?tenant=globex and got %d %s: the tenant comes from X-Tenant-Id, never from the query", r.Status, r.Text().substr(0, 160));
+  auto r = hReadGet(c, params);
+  ctx.Assert(r.Status == 200 && hReadNames(r) == std::vector<std::string>{"cpu_seconds{host=a}"}, "acme asked with ?tenant=globex and got %d %s: the tenant comes from X-Tenant-Id, never from the query", r.Status, r.Text().substr(0, 160));
   params.back().second = "acme";
-  r = readGet(c, params, "");
+  r = hReadGet(c, params, "");
   ctx.Equal(r.Status, 401, "a query with ?tenant=acme and no X-Tenant-Id");
 }
 `,

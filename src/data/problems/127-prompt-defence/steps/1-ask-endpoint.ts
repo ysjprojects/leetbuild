@@ -1169,43 +1169,43 @@ import (
 )
 
 const (
-	askDocID = "contract-7"
-	askDoc   = "The notice period is thirty days. Either party may end the contract in writing."
-	askFirst = "The notice period is thirty days."
+	kHAskDocID = "contract-7"
+	kHAskDoc   = "The notice period is thirty days. Either party may end the contract in writing."
+	kHAskFirst = "The notice period is thirty days."
 )
 
 // askQuestions are the questions respond received, in order.
-var askQuestions []string
+var hAskQuestions []string
 
 // askFull holds the users whose window the admit stand-in reports full.
-var askFull map[string]bool
+var hAskFull map[string]bool
 
 // askClient serves the learner's route over stand-ins for steps 2 and 4: every user but u-busy (and
 // those in askFull) is admitted, sessions are kept nowhere, and respond answers the document's first
 // sentence.
-func askClient(ctx *harness.Ctx) *harness.HTTP {
-	askQuestions = nil
-	askFull = map[string]bool{}
-	ctx.Redis.Set("doc:"+askDocID, askDoc)
+func hAskClient(ctx *harness.Ctx) *harness.HTTP {
+	hAskQuestions = nil
+	hAskFull = map[string]bool{}
+	ctx.Redis.Set("doc:"+kHAskDocID, kHAskDoc)
 	admit = func(_ context.Context, user string) (types.Admission, error) {
-		if user == "u-busy" || askFull[user] {
+		if user == "u-busy" || hAskFull[user] {
 			return types.Admission{OK: false, RetryAfter: 17}, nil
 		}
 		return types.Admission{OK: true, Remaining: 29}, nil
 	}
 	remember = func(context.Context, string, string, string) error { return nil }
 	respond = func(_ context.Context, _, _, document, question string) (types.Decision, error) {
-		askQuestions = append(askQuestions, question)
+		hAskQuestions = append(hAskQuestions, question)
 		sum := sha256.Sum256([]byte(document))
 		first := model.FirstSentence(document)
-		return types.Decision{RequestID: fmt.Sprintf("r-%d", len(askQuestions)), DocumentHash: hex.EncodeToString(sum[:]), Answer: first, Spans: []string{first}, Signals: []string{}}, nil
+		return types.Decision{RequestID: fmt.Sprintf("r-%d", len(hAskQuestions)), DocumentHash: hex.EncodeToString(sum[:]), Answer: first, Spans: []string{first}, Signals: []string{}}, nil
 	}
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func askPost(c *harness.HTTP, question, user, key, doc string) *harness.Response {
+func hAskPost(c *harness.HTTP, question, user, key, doc string) *harness.Response {
 	body := map[string]any{"document_id": doc, "question": question}
 	headers := []string{}
 	if user != "" {
@@ -1217,14 +1217,14 @@ func askPost(c *harness.HTTP, question, user, key, doc string) *harness.Response
 	return c.Post("/v1/ask", body, headers...)
 }
 
-func askField(ctx *harness.Ctx, r *harness.Response, field string) any {
+func hAskField(ctx *harness.Ctx, r *harness.Response, field string) any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	return body[field]
 }
 
 // askWords is n tokens or pairs: prefix+"w0" to prefix+"w<n-1>", joined by spaces.
-func askWords(n int, prefix string) string {
+func hAskWords(n int, prefix string) string {
 	words := make([]string, n)
 	for i := range words {
 		words[i] = fmt.Sprintf("%sw%d", prefix, i)
@@ -1233,101 +1233,101 @@ func askWords(n int, prefix string) string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := askClient(ctx)
-	r := askPost(c, "What is the notice period?", "u-ana", "k-1", askDocID)
+	c := hAskClient(ctx)
+	r := hAskPost(c, "What is the notice period?", "u-ana", "k-1", kHAskDocID)
 	ctx.Equal(r.Status, 200, "a valid question (%s)", r.Text())
 	for _, f := range []string{"request_id", "document_hash", "answer", "spans", "refused", "signals", "signature"} {
 		body, _ := r.JSON().(map[string]any)
 		_, ok := body[f]
 		ctx.Assert(ok, "the 200 body lacks %s: %s", f, r.Text())
 	}
-	ctx.Assert(askField(ctx, r, "answer") == askFirst && askField(ctx, r, "refused") == false, "the decision answers from the document: %s", r.Text())
-	ctx.Equal(askPost(c, "Hi?", "", "k-2", askDocID).Status, 401, "without X-User-Id")
-	ctx.Equal(askPost(c, "What is the notice period?", "u-ana", "k-3", "missing-doc").Status, 404, "an unknown document")
-	before := len(askQuestions)
-	r = askPost(c, "What is the notice period?", "u-busy", "k-4", askDocID)
+	ctx.Assert(hAskField(ctx, r, "answer") == kHAskFirst && hAskField(ctx, r, "refused") == false, "the decision answers from the document: %s", r.Text())
+	ctx.Equal(hAskPost(c, "Hi?", "", "k-2", kHAskDocID).Status, 401, "without X-User-Id")
+	ctx.Equal(hAskPost(c, "What is the notice period?", "u-ana", "k-3", "missing-doc").Status, 404, "an unknown document")
+	before := len(hAskQuestions)
+	r = hAskPost(c, "What is the notice period?", "u-busy", "k-4", kHAskDocID)
 	ctx.Equal(r.Status, 429, "a user whose window is full")
 	ctx.Equal(r.Header.Get("Retry-After"), "17", "a 429 carries the admission's Retry-After")
-	ctx.Equal(len(askQuestions), before, "a refused user must not reach respond; calls")
+	ctx.Equal(len(hAskQuestions), before, "a refused user must not reach respond; calls")
 }
 
 func CheckControlChars(ctx *harness.Ctx) {
-	c := askClient(ctx)
+	c := hAskClient(ctx)
 	question := strings.Repeat("\\x08", 400) + strings.Repeat("\\\\b", 450) + "What is the notice period?"
-	r := askPost(c, question, "u-ana", "k-1", askDocID)
+	r := hAskPost(c, question, "u-ana", "k-1", kHAskDocID)
 	ctx.Equal(r.Status, 200, "a question that is the real question once its controls are stripped")
-	ctx.Assert(len(askQuestions) == 1, "the question must reach respond once")
-	got := askQuestions[0]
+	ctx.Assert(len(hAskQuestions) == 1, "the question must reach respond once")
+	got := hAskQuestions[0]
 	ctx.Assert(!strings.Contains(got, "\\x08") && !strings.Contains(got, "\\\\b"), "respond received %d backspaces and %d typed \\\\b escapes: strip controlChars before the question is measured or used", strings.Count(got, "\\x08"), strings.Count(got, "\\\\b"))
 	ctx.Equal(got, "What is the notice period?", "the question respond receives")
-	r = askPost(c, "\\x00\\x07\\\\r\\\\b\\x7f", "u-ana", "k-2", askDocID)
+	r = hAskPost(c, "\\x00\\x07\\\\r\\\\b\\x7f", "u-ana", "k-2", kHAskDocID)
 	ctx.Equal(r.Status, 400, "a question of nothing but control characters")
-	ctx.Equal(len(askQuestions), 1, "an empty question must not reach respond; calls")
-	r = askPost(c, "\\x1b\\x0c\\x0e\\x1fWhat is\\tthe\\r notice\\nperiod?", "u-ana", "k-3", askDocID)
+	ctx.Equal(len(hAskQuestions), 1, "an empty question must not reach respond; calls")
+	r = hAskPost(c, "\\x1b\\x0c\\x0e\\x1fWhat is\\tthe\\r notice\\nperiod?", "u-ana", "k-3", kHAskDocID)
 	ctx.Equal(r.Status, 200, "a question with ESC, FF, SO, US and CR in it, once they are stripped")
-	ctx.Equal(len(askQuestions), 2, "the question must reach respond; calls")
-	ctx.Equal(askQuestions[1], "What is\\tthe notice\\nperiod?", "controlChars covers \\\\x00-\\\\x08, \\\\x0b-\\\\x1f and \\\\x7f while tab and newline stay: the question respond receives")
+	ctx.Equal(len(hAskQuestions), 2, "the question must reach respond; calls")
+	ctx.Equal(hAskQuestions[1], "What is\\tthe notice\\nperiod?", "controlChars covers \\\\x00-\\\\x08, \\\\x0b-\\\\x1f and \\\\x7f while tab and newline stay: the question respond receives")
 }
 
 func CheckTokenCap(ctx *harness.Ctx) {
-	c := askClient(ctx)
+	c := hAskClient(ctx)
 	words := make([]string, 190)
 	for i := range words {
 		words[i] = fmt.Sprintf("clause%03dwording", i)
 	}
 	wordy := strings.Join(words, " ")
-	ctx.Equal(askPost(c, wordy, "u-ana", "k-wordy", askDocID).Status, 200, "a %d-character question of 190 tokens is under the 512-token cap: the cap counts tokens, not characters", len(wordy))
+	ctx.Equal(hAskPost(c, wordy, "u-ana", "k-wordy", kHAskDocID).Status, 200, "a %d-character question of 190 tokens is under the 512-token cap: the cap counts tokens, not characters", len(wordy))
 	var dense strings.Builder
 	for i := 0; i < 300; i++ {
 		fmt.Fprintf(&dense, "%c%d.", 'a'+rune(i%26), i/26)
 	}
-	before := len(askQuestions)
-	ctx.Equal(askPost(c, dense.String(), "u-ana", "k-dense", askDocID).Status, 413, "a %d-character question of 600 tokens", dense.Len())
-	ctx.Equal(len(askQuestions), before, "a question over the cap must not reach respond; calls")
-	exact := askWords(512, "")
-	ctx.Equal(askPost(c, exact, "u-ana", "k-512", askDocID).Status, 200, "a question of exactly 512 tokens is at the cap")
-	before = len(askQuestions)
-	ctx.Equal(askPost(c, exact+" w512", "u-ana", "k-513", askDocID).Status, 413, "a question of 513 tokens is over the 512-token cap")
-	ctx.Equal(len(askQuestions), before, "a question over the cap must not reach respond; calls")
+	before := len(hAskQuestions)
+	ctx.Equal(hAskPost(c, dense.String(), "u-ana", "k-dense", kHAskDocID).Status, 413, "a %d-character question of 600 tokens", dense.Len())
+	ctx.Equal(len(hAskQuestions), before, "a question over the cap must not reach respond; calls")
+	exact := hAskWords(512, "")
+	ctx.Equal(hAskPost(c, exact, "u-ana", "k-512", kHAskDocID).Status, 200, "a question of exactly 512 tokens is at the cap")
+	before = len(hAskQuestions)
+	ctx.Equal(hAskPost(c, exact+" w512", "u-ana", "k-513", kHAskDocID).Status, 413, "a question of 513 tokens is over the 512-token cap")
+	ctx.Equal(len(hAskQuestions), before, "a question over the cap must not reach respond; calls")
 }
 
 func CheckRepeatRatio(ctx *harness.Ctx) {
-	c := askClient(ctx)
+	c := hAskClient(ctx)
 	repeats := [][2]string{
 		{strings.Repeat("jq_THREADS ", 100), "jq_THREADS x100"},
 		{strings.Repeat("/goto maiden ", 40), "/goto maiden x40"},
 		{strings.Repeat("dog ", 64), "dog x64, exactly minRepeatTokens"},
-		{askWords(31, "dog ") + " dog dog", "64 tokens, dog 33 times (ratio 0.52)"},
+		{hAskWords(31, "dog ") + " dog dog", "64 tokens, dog 33 times (ratio 0.52)"},
 	}
 	for i, q := range repeats {
-		ctx.Equal(askPost(c, q[0], "u-ana", fmt.Sprintf("k-rep-%d", i), askDocID).Status, 422, "%s repeats one sequence over more than half of 64 or more tokens", q[1])
+		ctx.Equal(hAskPost(c, q[0], "u-ana", fmt.Sprintf("k-rep-%d", i), kHAskDocID).Status, 422, "%s repeats one sequence over more than half of 64 or more tokens", q[1])
 	}
-	ctx.Equal(len(askQuestions), 0, "a repeated-token question must not reach respond; calls")
-	ctx.Equal(askPost(c, strings.Repeat("dog ", 63), "u-ana", "k-63", askDocID).Status, 200, "a 63-token repeat is under minRepeatTokens = 64")
-	ctx.Equal(askPost(c, askWords(32, "dog "), "u-ana", "k-half", askDocID).Status, 200, "64 tokens with dog 32 times is a repeat ratio of exactly 0.5, not above maxRepeatRatio")
-	ctx.Equal(askPost(c, strings.Repeat("dog ", 40), "u-ana", "k-short", askDocID).Status, 200, "a 40-token repeat is under minRepeatTokens = 64")
+	ctx.Equal(len(hAskQuestions), 0, "a repeated-token question must not reach respond; calls")
+	ctx.Equal(hAskPost(c, strings.Repeat("dog ", 63), "u-ana", "k-63", kHAskDocID).Status, 200, "a 63-token repeat is under minRepeatTokens = 64")
+	ctx.Equal(hAskPost(c, hAskWords(32, "dog "), "u-ana", "k-half", kHAskDocID).Status, 200, "64 tokens with dog 32 times is a repeat ratio of exactly 0.5, not above maxRepeatRatio")
+	ctx.Equal(hAskPost(c, strings.Repeat("dog ", 40), "u-ana", "k-short", kHAskDocID).Status, 200, "a 40-token repeat is under minRepeatTokens = 64")
 	varied := make([]string, 80)
 	for i := range varied {
 		varied[i] = fmt.Sprintf("w%d", i)
 	}
-	ctx.Equal(askPost(c, strings.Join(varied, " "), "u-ana", "k-varied", askDocID).Status, 200, "a varied 80-token question")
+	ctx.Equal(hAskPost(c, strings.Join(varied, " "), "u-ana", "k-varied", kHAskDocID).Status, 200, "a varied 80-token question")
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c := askClient(ctx)
-	ctx.Equal(askPost(c, "What is the notice period?", "u-ana", "", askDocID).Status, 400, "a question without Idempotency-Key")
-	ctx.Equal(len(askQuestions), 0, "a question without Idempotency-Key must not reach respond; calls")
-	first := askPost(c, "What is the notice period?", "u-ana", "k-7", askDocID)
-	replay := askPost(c, "What is the notice period?", "u-ana", "k-7", askDocID)
+	c := hAskClient(ctx)
+	ctx.Equal(hAskPost(c, "What is the notice period?", "u-ana", "", kHAskDocID).Status, 400, "a question without Idempotency-Key")
+	ctx.Equal(len(hAskQuestions), 0, "a question without Idempotency-Key must not reach respond; calls")
+	first := hAskPost(c, "What is the notice period?", "u-ana", "k-7", kHAskDocID)
+	replay := hAskPost(c, "What is the notice period?", "u-ana", "k-7", kHAskDocID)
 	ctx.Assert(first.Status == 200 && replay.Status == 200, "the question and its replay answered %d and %d", first.Status, replay.Status)
-	ctx.Equal(askField(ctx, replay, "request_id"), askField(ctx, first, "request_id"), "a replay of the same (user, Idempotency-Key) must return the stored decision; request_id")
-	ctx.Equal(len(askQuestions), 1, "a client retry must not cost a second model call: look up (user, key) first; respond calls")
-	other := askPost(c, "What is the notice period?", "u-ben", "k-7", askDocID)
-	ctx.Assert(other.Status == 200 && askField(ctx, other, "request_id") != askField(ctx, first, "request_id"), "another user with the same key gets an answer of their own")
-	askFull["u-ana"] = true
-	again := askPost(c, "What is the notice period?", "u-ana", "k-7", askDocID)
+	ctx.Equal(hAskField(ctx, replay, "request_id"), hAskField(ctx, first, "request_id"), "a replay of the same (user, Idempotency-Key) must return the stored decision; request_id")
+	ctx.Equal(len(hAskQuestions), 1, "a client retry must not cost a second model call: look up (user, key) first; respond calls")
+	other := hAskPost(c, "What is the notice period?", "u-ben", "k-7", kHAskDocID)
+	ctx.Assert(other.Status == 200 && hAskField(ctx, other, "request_id") != hAskField(ctx, first, "request_id"), "another user with the same key gets an answer of their own")
+	hAskFull["u-ana"] = true
+	again := hAskPost(c, "What is the notice period?", "u-ana", "k-7", kHAskDocID)
 	ctx.Equal(again.Status, 200, "with u-ana's window full, a replay of k-7: asks.Get answers the stored decision before admit spends the window")
-	ctx.Equal(askField(ctx, again, "request_id"), askField(ctx, first, "request_id"), "a replay with the window full answers the stored decision; request_id")
+	ctx.Equal(hAskField(ctx, again, "request_id"), hAskField(ctx, first, "request_id"), "a replay with the window full answers the stored decision; request_id")
 }
 `,
     cpp: `#include <leetbuild/harness.h>

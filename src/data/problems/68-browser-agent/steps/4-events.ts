@@ -828,7 +828,7 @@ const (
 	hCanary    = "hunter2-CANARY-7731"
 )
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
 func hTestStep(sessionID string, index int, action, target, text string) trace.Step {
 	return trace.Step{SessionID: sessionID, StepIndex: index, Action: action, Target: target, Text: text, Outcome: "ok",
@@ -843,9 +843,9 @@ func hDecode(raw []byte) map[string]any {
 
 func CheckSessionKey(ctx *harness.Ctx) {
 	for index := 1; index <= 4; index++ {
-		ctx.NoError(publishStep(eventsBg, hTestStep("s-1", index, "click", "#buy", "")), "publishStep(s-1, %d)", index)
+		ctx.NoError(publishStep(hEventsBg, hTestStep("s-1", index, "click", "#buy", "")), "publishStep(s-1, %d)", index)
 		if index < 4 {
-			ctx.NoError(publishStep(eventsBg, hTestStep("s-2", index, "click", "#buy", "")), "publishStep(s-2, %d)", index)
+			ctx.NoError(publishStep(hEventsBg, hTestStep("s-2", index, "click", "#buy", "")), "publishStep(s-2, %d)", index)
 		}
 	}
 	records := ctx.Kafka.Records(hStepTopic)
@@ -869,7 +869,7 @@ func CheckSessionKey(ctx *harness.Ctx) {
 }
 
 func CheckNoTypedValues(ctx *harness.Ctx) {
-	ctx.NoError(publishStep(eventsBg, hTestStep("s-1", 3, "type", "#password", hCanary)), "publishStep")
+	ctx.NoError(publishStep(hEventsBg, hTestStep("s-1", 3, "type", "#password", hCanary)), "publishStep")
 	records := ctx.Kafka.Records(hStepTopic)
 	ctx.Equal(len(records), 1, "one published step; records on %s", hStepTopic)
 	raw := string(records[0].Value)
@@ -899,13 +899,13 @@ func CheckAppendBeforeCommit(ctx *harness.Ctx) {
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
 		atCommit = append(atCommit, ctx.Redis.HLen("browser:trace:s-1"))
 	})
-	ctx.Drain(func() { runTraceConsumer(eventsBg) })
+	ctx.Drain(func() { runTraceConsumer(hEventsBg) })
 	ctx.Assert(len(atCommit) > 0, "the consumer never committed an offset")
 	ctx.Assert(atCommit[0] >= 1, "at the first commit the trace of s-1 held %d steps: the offset was committed before the step was appended, so a crash in between loses it", atCommit[0])
 	for i, n := range atCommit {
 		ctx.Assert(n >= int64(i+1), "the trace lengths at each commit were %v: every commit must follow its append", atCommit)
 	}
-	events, err := trace.ReadTrace(eventsBg, "s-1")
+	events, err := trace.ReadTrace(hEventsBg, "s-1")
 	ctx.NoError(err, "ReadTrace(s-1)")
 	steps := []int{}
 	for _, e := range events {

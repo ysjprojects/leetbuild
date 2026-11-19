@@ -727,37 +727,37 @@ import (
 	"leetbuild/harness"
 )
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
 const (
-	eventsTopic = "approval.event"
-	eventsWhy   = "offsite for the platform team"
+	kHEventsTopic = "approval.event"
+	kHEventsWhy   = "offsite for the platform team"
 )
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsSetup(ctx *harness.Ctx) {
+func hEventsSetup(ctx *harness.Ctx) {
 	for requestID, approvers := range map[string][]string{"r-1": {"u-mgr", "u-dir", "u-cfo"}, "r-2": {"u-mgr", "u-dir"}} {
-		record := &store.Request{RequestID: requestID, Tenant: "t-acme", Requester: "u-req", ChainID: "spend", ChainVersion: 3, Approvers: approvers, Why: eventsWhy, AmountCents: 1250000}
-		ctx.NoError(store.Put(eventsBg, record, ""), "store.Put(%s)", requestID)
-		ctx.NoError(chain.StartChain(eventsBg, requestID, approvers), "chain.StartChain(%s)", requestID)
+		record := &store.Request{RequestID: requestID, Tenant: "t-acme", Requester: "u-req", ChainID: "spend", ChainVersion: 3, Approvers: approvers, Why: kHEventsWhy, AmountCents: 1250000}
+		ctx.NoError(store.Put(hEventsBg, record, ""), "store.Put(%s)", requestID)
+		ctx.NoError(chain.StartChain(hEventsBg, requestID, approvers), "chain.StartChain(%s)", requestID)
 	}
 }
 
-func eventsDecide(ctx *harness.Ctx, requestID string, step int, actor string) chain.Outcome {
-	o, err := recordDecision(eventsBg, requestID, step, actor, "approved")
+func hEventsDecide(ctx *harness.Ctx, requestID string, step int, actor string) chain.Outcome {
+	o, err := recordDecision(hEventsBg, requestID, step, actor, "approved")
 	ctx.NoError(err, "recordDecision(%s, %d, %s)", requestID, step, actor)
 	return o
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	var rows []HEventsRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -765,34 +765,34 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckRequestKey(ctx *harness.Ctx) {
-	eventsSetup(ctx)
-	eventsDecide(ctx, "r-1", 0, "u-mgr")
-	eventsDecide(ctx, "r-2", 0, "u-mgr")
-	eventsDecide(ctx, "r-1", 1, "u-dir")
+	hEventsSetup(ctx)
+	hEventsDecide(ctx, "r-1", 0, "u-mgr")
+	hEventsDecide(ctx, "r-2", 0, "u-mgr")
+	hEventsDecide(ctx, "r-1", 1, "u-dir")
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three decisions must produce three records on approval.event; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"r-1", "r-2", "r-1"}, "the records must be keyed by the request ids")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"r-1", "r-2", "r-1"}, "the records must be keyed by the request ids")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both r-1 events must land on one partition, or a consumer reads step 1 before step 0; the partitions")
 }
 
 func CheckIdsOnly(ctx *harness.Ctx) {
-	eventsSetup(ctx)
-	eventsDecide(ctx, "r-1", 0, "u-mgr")
+	hEventsSetup(ctx)
+	hEventsDecide(ctx, "r-1", 0, "u-mgr")
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one decision must produce one record; the records")
-	ctx.Assert(!strings.Contains(values[0], eventsWhy) && !strings.Contains(values[0], "1250000"), "the event carries the request's content: %s", values[0])
+	ctx.Assert(!strings.Contains(values[0], kHEventsWhy) && !strings.Contains(values[0], "1250000"), "the event carries the request's content: %s", values[0])
 	var event map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &event), "the event must be JSON")
 	ctx.Equal(event, map[string]any{"request_id": "r-1", "step": 0.0, "actor": "u-mgr", "decision": "approved", "status": "pending"}, "the event")
-	eventsDecide(ctx, "r-2", 0, "u-mgr")
-	eventsDecide(ctx, "r-2", 1, "u-dir")
-	_, err := recordDecision(eventsBg, "r-1", 1, "u-dir", "rejected")
+	hEventsDecide(ctx, "r-2", 0, "u-mgr")
+	hEventsDecide(ctx, "r-2", 1, "u-dir")
+	_, err := recordDecision(hEventsBg, "r-1", 1, "u-dir", "rejected")
 	ctx.NoError(err, "recordDecision(r-1, 1, u-dir, rejected)")
 	ctx.Settle()
 	var statuses []string
-	for _, value := range ctx.Kafka.Values(eventsTopic)[1:] {
+	for _, value := range ctx.Kafka.Values(kHEventsTopic)[1:] {
 		var e map[string]any
 		ctx.NoError(json.Unmarshal([]byte(value), &e), "the event must be JSON")
 		statuses = append(statuses, fmt.Sprintf("%v/%v/%v", e["request_id"], e["step"], e["status"]))
@@ -801,50 +801,50 @@ func CheckIdsOnly(ctx *harness.Ctx) {
 }
 
 func CheckCommitFirst(ctx *harness.Ctx) {
-	eventsSetup(ctx)
-	atCommit := ctx.Redis.After("approval:r-1:state", func() any { return len(ctx.Kafka.Records(eventsTopic)) })
-	outcome := eventsDecide(ctx, "r-1", 0, "u-mgr")
+	hEventsSetup(ctx)
+	atCommit := ctx.Redis.After("approval:r-1:state", func() any { return len(ctx.Kafka.Records(kHEventsTopic)) })
+	outcome := hEventsDecide(ctx, "r-1", 0, "u-mgr")
 	ctx.Settle()
 	ctx.Assert(atCommit.Fired, "recordDecision never committed the decision (nothing touched approval:r-1:state)")
 	ctx.Equal(atCommit.Result, 0, "commit first, then produce; the records on the topic when the decision was committed")
-	ctx.Assert(outcome.Advanced && len(ctx.Kafka.Records(eventsTopic)) == 1, "the committed decision %+v must still be produced once", outcome)
-	stale := eventsDecide(ctx, "r-1", 0, "u-mgr")
+	ctx.Assert(outcome.Advanced && len(ctx.Kafka.Records(kHEventsTopic)) == 1, "the committed decision %+v must still be produced once", outcome)
+	stale := hEventsDecide(ctx, "r-1", 0, "u-mgr")
 	ctx.Settle()
 	ctx.Assert(!stale.Advanced, "a repeated decision answered %+v", stale)
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "a decision the chain refused must not be announced; the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "a decision the chain refused must not be announced; the records")
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
-	eventsSetup(ctx)
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsDecide(ctx, "r-1", 0, "u-mgr")
+	hEventsSetup(ctx)
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsDecide(ctx, "r-1", 0, "u-mgr")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	eventsDecide(ctx, "r-1", 1, "u-dir")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hEventsDecide(ctx, "r-1", 1, "u-dir")
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	eventsSetup(ctx)
-	eventsDecide(ctx, "r-2", 0, "u-mgr")
+	hEventsSetup(ctx)
+	hEventsDecide(ctx, "r-2", 0, "u-mgr")
 	ctx.Settle()
-	ctx.Assert(len(eventsOutbox(ctx)) == 0 && len(ctx.Kafka.Records(eventsTopic)) == 1, "a delivered event left outbox rows %+v: the relay would publish it a second time", eventsOutbox(ctx))
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	outcome := eventsDecide(ctx, "r-1", 0, "u-mgr")
+	ctx.Assert(len(hEventsOutbox(ctx)) == 0 && len(ctx.Kafka.Records(kHEventsTopic)) == 1, "a delivered event left outbox rows %+v: the relay would publish it a second time", hEventsOutbox(ctx))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	outcome := hEventsDecide(ctx, "r-1", 0, "u-mgr")
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the trail never hears of the decision; the rows")
-	ctx.Equal(rows[0], eventsRow{Topic: eventsTopic, Key: "r-1", Payload: map[string]any{"request_id": "r-1", "step": 0.0, "actor": "u-mgr", "decision": "approved", "status": "pending"}}, "the outbox row (topic, key r-1 and the event as payload)")
+	ctx.Equal(rows[0], HEventsRow{Topic: kHEventsTopic, Key: "r-1", Payload: map[string]any{"request_id": "r-1", "step": 0.0, "actor": "u-mgr", "decision": "approved", "status": "pending"}}, "the outbox row (topic, key r-1 and the event as payload)")
 	index, _ := ctx.Redis.HGet("approval:r-1:state", "step_index")
 	ctx.Assert(outcome.Advanced && index == "1", "the decision must stay committed when only the produce failed, got %+v", outcome)
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	eventsDecide(ctx, "r-1", 1, "u-dir")
+	hEventsDecide(ctx, "r-1", 1, "u-dir")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "recordDecision waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["step"] == 1.0, "no delivery report within the window and the outbox holds %+v", rows)
 }
 `,
@@ -861,18 +861,18 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "approval.event";
-const std::string kEventsWhy = "offsite for the platform team";
+const std::string kHEventsTopic = "approval.event";
+const std::string kHEventsWhy = "offsite for the platform team";
 
-void eventsSetup() {
+void hEventsSetup() {
   const std::vector<std::pair<std::string, std::vector<std::string>>> requests = {{"r-1", {"u-mgr", "u-dir", "u-cfo"}}, {"r-2", {"u-mgr", "u-dir"}}};
   for (const auto& [request_id, approvers] : requests) {
-    store::put(store::Request{request_id, "t-acme", "u-req", "spend", 3, approvers, kEventsWhy, 1250000}, "");
+    store::put(store::Request{request_id, "t-acme", "u-req", "spend", 3, approvers, kHEventsWhy, 1250000}, "");
     chain::startChain(request_id, approvers);
   }
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -882,31 +882,31 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-long payloadStep(const nlohmann::json& row) {
+long hPayloadStep(const nlohmann::json& row) {
   return row.contains("payload") && row["payload"].is_object() ? row["payload"].value("step", -1L) : -1L;
 }
 
 }  // namespace
 
 void CheckRequestKey(harness::Ctx& ctx) {
-  eventsSetup();
+  hEventsSetup();
   recordDecision("r-1", 0, "u-mgr", "approved");
   recordDecision("r-2", 0, "u-mgr", "approved");
   recordDecision("r-1", 1, "u-dir", "approved");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three decisions must produce three records on approval.event; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"r-1", "r-2", "r-1"}, "the records must be keyed by the request ids");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"r-1", "r-2", "r-1"}, "the records must be keyed by the request ids");
   ctx.Equal(records[0].Partition, records[2].Partition, "both r-1 events must land on one partition, or a consumer reads step 1 before step 0; the partitions");
 }
 
 void CheckIdsOnly(harness::Ctx& ctx) {
-  eventsSetup();
+  hEventsSetup();
   recordDecision("r-1", 0, "u-mgr", "approved");
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one decision must produce one record; the records");
-  ctx.Assert(values[0].find(kEventsWhy) == std::string::npos && values[0].find("1250000") == std::string::npos, "the event carries the request's content: %s", values[0]);
+  ctx.Assert(values[0].find(kHEventsWhy) == std::string::npos && values[0].find("1250000") == std::string::npos, "the event carries the request's content: %s", values[0]);
   const nlohmann::json expected = {{"request_id", "r-1"}, {"step", 0}, {"actor", "u-mgr"}, {"decision", "approved"}, {"status", "pending"}};
   ctx.Equal(nlohmann::json::parse(values[0], nullptr, false), expected, "the event");
   recordDecision("r-2", 0, "u-mgr", "approved");
@@ -914,7 +914,7 @@ void CheckIdsOnly(harness::Ctx& ctx) {
   recordDecision("r-1", 1, "u-dir", "rejected");
   ctx.Settle();
   std::vector<std::string> statuses;
-  const auto all = ctx.Kafka.Values(kEventsTopic);
+  const auto all = ctx.Kafka.Values(kHEventsTopic);
   for (size_t i = 1; i < all.size(); i++) {
     const auto e = nlohmann::json::parse(all[i], nullptr, false);
     statuses.push_back(e.is_object() ? e.value("request_id", "") + "/" + std::to_string(e.value("step", -1)) + "/" + e.value("status", "") : all[i]);
@@ -923,52 +923,52 @@ void CheckIdsOnly(harness::Ctx& ctx) {
 }
 
 void CheckCommitFirst(harness::Ctx& ctx) {
-  eventsSetup();
+  hEventsSetup();
   auto atCommit = std::make_shared<long>(-1);
-  ctx.Redis.After("approval:r-1:state", [&ctx, atCommit] { *atCommit = static_cast<long>(ctx.Kafka.Records(kEventsTopic).size()); });
+  ctx.Redis.After("approval:r-1:state", [&ctx, atCommit] { *atCommit = static_cast<long>(ctx.Kafka.Records(kHEventsTopic).size()); });
   const chain::Outcome outcome = recordDecision("r-1", 0, "u-mgr", "approved");
   ctx.Settle();
   ctx.Assert(*atCommit >= 0, "recordDecision never committed the decision (nothing touched approval:r-1:state)");
   ctx.Equal(*atCommit, 0, "commit first, then produce; the records on the topic when the decision was committed");
-  ctx.Assert(outcome.advanced && ctx.Kafka.Records(kEventsTopic).size() == 1, "the committed decision must still be produced once (advanced %t, records %d)", outcome.advanced, ctx.Kafka.Records(kEventsTopic).size());
+  ctx.Assert(outcome.advanced && ctx.Kafka.Records(kHEventsTopic).size() == 1, "the committed decision must still be produced once (advanced %t, records %d)", outcome.advanced, ctx.Kafka.Records(kHEventsTopic).size());
   const chain::Outcome stale = recordDecision("r-1", 0, "u-mgr", "approved");
   ctx.Settle();
   ctx.Assert(!stale.advanced, "a repeated decision answered advanced true");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "a decision the chain refused must not be announced; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "a decision the chain refused must not be announced; the records");
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
-  eventsSetup();
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  hEventsSetup();
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
   recordDecision("r-1", 0, "u-mgr", "approved");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
   recordDecision("r-1", 1, "u-dir", "approved");
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  eventsSetup();
+  hEventsSetup();
   recordDecision("r-2", 0, "u-mgr", "approved");
   ctx.Settle();
-  ctx.Assert(eventsOutbox(ctx).empty() && ctx.Kafka.Records(kEventsTopic).size() == 1, "a delivered event left %d outbox rows: the relay would publish it a second time", eventsOutbox(ctx).size());
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ctx.Assert(hEventsOutbox(ctx).empty() && ctx.Kafka.Records(kHEventsTopic).size() == 1, "a delivered event left %d outbox rows: the relay would publish it a second time", hEventsOutbox(ctx).size());
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   const chain::Outcome outcome = recordDecision("r-1", 0, "u-mgr", "approved");
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the trail never hears of the decision; the rows");
-  const nlohmann::json expected = {{"topic", kEventsTopic}, {"key", "r-1"}, {"payload", {{"request_id", "r-1"}, {"step", 0}, {"actor", "u-mgr"}, {"decision", "approved"}, {"status", "pending"}}}};
+  const nlohmann::json expected = {{"topic", kHEventsTopic}, {"key", "r-1"}, {"payload", {{"request_id", "r-1"}, {"step", 0}, {"actor", "u-mgr"}, {"decision", "approved"}, {"status", "pending"}}}};
   ctx.Assert(rows[0] == expected, "the outbox row is %s, expected %s", rows[0].dump(), expected.dump());
   ctx.Assert(outcome.advanced && ctx.Redis.HGet("approval:r-1:state", "step_index") == std::optional<std::string>("1"), "the decision must stay committed when only the produce failed");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   recordDecision("r-1", 1, "u-dir", "approved");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "recordDecision waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && payloadStep(rows[1]) == 1, "no delivery report within the window and the outbox holds %d rows", rows.size());
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && hPayloadStep(rows[1]) == 1, "no delivery report within the window and the outbox holds %d rows", rows.size());
 }
 `,
   },

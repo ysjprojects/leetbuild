@@ -638,11 +638,11 @@ import (
 	pb "chat/gen/chat"
 )
 
-const recentKey = "recent:room-7"
+const kHRecentKey = "recent:room-7"
 
-var recentBg = context.Background()
+var hRecentBg = context.Background()
 
-func recentMsg(i int, room string) *pb.ServerMsg {
+func hRecentMsg(i int, room string) *pb.ServerMsg {
 	user := "bo"
 	if i%2 == 1 {
 		user = "ana"
@@ -650,18 +650,18 @@ func recentMsg(i int, room string) *pb.ServerMsg {
 	return &pb.ServerMsg{Room: room, User: user, Text: fmt.Sprintf("m%d", i), Ts: 1700000000000 + int64(i)}
 }
 
-func rememberMsg(ctx *harness.Ctx, room string, msg *pb.ServerMsg) {
-	ctx.NoError(remember(recentBg, room, msg), "remember(ctx, %q, %v) returned an error", room, msg)
+func hRememberMsg(ctx *harness.Ctx, room string, msg *pb.ServerMsg) {
+	ctx.NoError(remember(hRecentBg, room, msg), "remember(ctx, %q, %v) returned an error", room, msg)
 }
 
-func recentOf(ctx *harness.Ctx, room string) []*pb.ServerMsg {
-	got, err := recent(recentBg, room)
+func hRecentOf(ctx *harness.Ctx, room string) []*pb.ServerMsg {
+	got, err := recent(hRecentBg, room)
 	ctx.NoError(err, "recent(ctx, %q) returned an error", room)
 	return got
 }
 
 // storedRecent is the list as Redis holds it, head first, parsed back into ServerMsgs.
-func storedRecent(ctx *harness.Ctx, key string) []*pb.ServerMsg {
+func hStoredRecent(ctx *harness.Ctx, key string) []*pb.ServerMsg {
 	var out []*pb.ServerMsg
 	for _, v := range ctx.Redis.LRange(key, 0, -1) {
 		msg := &pb.ServerMsg{}
@@ -671,7 +671,7 @@ func storedRecent(ctx *harness.Ctx, key string) []*pb.ServerMsg {
 	return out
 }
 
-func recentTexts(msgs []*pb.ServerMsg) []string {
+func hRecentTexts(msgs []*pb.ServerMsg) []string {
 	texts := make([]string, len(msgs))
 	for i, msg := range msgs {
 		texts[i] = msg.GetText()
@@ -680,43 +680,43 @@ func recentTexts(msgs []*pb.ServerMsg) []string {
 }
 
 func CheckLpush(ctx *harness.Ctx) {
-	rememberMsg(ctx, "room-7", recentMsg(1, "room-7"))
-	rememberMsg(ctx, "room-7", recentMsg(2, "room-7"))
-	rememberMsg(ctx, "room-8", recentMsg(3, "room-8"))
-	ctx.Equal(ctx.Redis.Type(recentKey), "list", "the type of recent:room-7 (keys: %s)", harness.Show(ctx.Redis.Keys("*")))
-	list := storedRecent(ctx, recentKey)
-	ctx.Equal(recentTexts(list), []string{"m2", "m1"}, "recent:room-7 head first: LPUSH puts the newest at the head")
-	ctx.Assert(proto.Equal(list[1], recentMsg(1, "room-7")), "the stored JSON parses back to %v, expected %v", list[1], recentMsg(1, "room-7"))
-	other := recentTexts(storedRecent(ctx, "recent:room-8"))
+	hRememberMsg(ctx, "room-7", hRecentMsg(1, "room-7"))
+	hRememberMsg(ctx, "room-7", hRecentMsg(2, "room-7"))
+	hRememberMsg(ctx, "room-8", hRecentMsg(3, "room-8"))
+	ctx.Equal(ctx.Redis.Type(kHRecentKey), "list", "the type of recent:room-7 (keys: %s)", harness.Show(ctx.Redis.Keys("*")))
+	list := hStoredRecent(ctx, kHRecentKey)
+	ctx.Equal(hRecentTexts(list), []string{"m2", "m1"}, "recent:room-7 head first: LPUSH puts the newest at the head")
+	ctx.Assert(proto.Equal(list[1], hRecentMsg(1, "room-7")), "the stored JSON parses back to %v, expected %v", list[1], hRecentMsg(1, "room-7"))
+	other := hRecentTexts(hStoredRecent(ctx, "recent:room-8"))
 	ctx.Equal(other, []string{"m3"}, "recent:room-8: one list per room")
 }
 
 func CheckTrim(ctx *harness.Ctx) {
 	for i := 1; i <= 55; i++ {
-		rememberMsg(ctx, "room-7", recentMsg(i, "room-7"))
+		hRememberMsg(ctx, "room-7", hRecentMsg(i, "room-7"))
 	}
-	n := ctx.Redis.LLen(recentKey)
+	n := ctx.Redis.LLen(kHRecentKey)
 	ctx.Equal(n, 50, "after 55 messages the entries in recent:room-7 (LTRIM 0 49 after every push)")
-	list := storedRecent(ctx, recentKey)
+	list := hStoredRecent(ctx, kHRecentKey)
 	first, last := list[0].GetText(), list[len(list)-1].GetText()
 	ctx.Assert(first == "m55" && last == "m6", "the list runs %s .. %s, expected m55 .. m6: trimming must drop the oldest, not the newest", first, last)
 }
 
 func CheckExpire(ctx *harness.Ctx) {
-	rememberMsg(ctx, "room-7", recentMsg(1, "room-7"))
-	ttl := ctx.Redis.TTL(recentKey)
+	hRememberMsg(ctx, "room-7", hRecentMsg(1, "room-7"))
+	ttl := ctx.Redis.TTL(kHRecentKey)
 	ctx.Assert(3500 <= ttl && ttl <= 3600, "recent:room-7 has TTL %d, expected 3600 s", ttl)
 	ctx.Clock.Advance(1800)
-	rememberMsg(ctx, "room-7", recentMsg(2, "room-7"))
-	ttl = ctx.Redis.TTL(recentKey)
+	hRememberMsg(ctx, "room-7", hRecentMsg(2, "room-7"))
+	ttl = ctx.Redis.TTL(kHRecentKey)
 	ctx.Assert(3500 <= ttl && ttl <= 3600, "a new message must restart the hour: TTL is %d after the second remember, expected 3600", ttl)
 	ctx.Clock.Advance(3601)
-	ctx.Equal(ctx.Redis.Exists(recentKey), 0, "a room quiet for an hour must drop out of Redis: recent:room-7 exists")
+	ctx.Equal(ctx.Redis.Exists(kHRecentKey), 0, "a room quiet for an hour must drop out of Redis: recent:room-7 exists")
 }
 
 func CheckPipelined(ctx *harness.Ctx) {
 	before := len(ctx.Redis.RoundTrips())
-	rememberMsg(ctx, "room-7", recentMsg(1, "room-7"))
+	hRememberMsg(ctx, "room-7", hRecentMsg(1, "room-7"))
 	trips := ctx.Redis.RoundTrips()[before:]
 	var direct []string
 	for _, trip := range trips {
@@ -735,25 +735,25 @@ func CheckPipelined(ctx *harness.Ctx) {
 	}
 	ctx.Equal(commands, []string{"LPUSH", "LTRIM", "EXPIRE"}, "the commands the pipeline queued, in order")
 	ctx.Assert(trip[0] == "MULTI", "the pipeline must be a MULTI (rdb.TxPipelined) so no reader ever sees the list at 51")
-	list := storedRecent(ctx, recentKey)
-	ttl := ctx.Redis.TTL(recentKey)
+	list := hStoredRecent(ctx, kHRecentKey)
+	ttl := ctx.Redis.TTL(kHRecentKey)
 	ctx.Assert(len(list) == 1 && list[0].GetText() == "m1" && 3500 <= ttl && ttl <= 3600, "after exec the list must hold the message with its TTL set")
 }
 
 func CheckChronological(ctx *harness.Ctx) {
-	got := recentOf(ctx, "room-7")
+	got := hRecentOf(ctx, "room-7")
 	ctx.Assert(len(got) == 0, "a quiet room must give an empty list, got %v", got)
 	for i := 1; i <= 3; i++ {
-		rememberMsg(ctx, "room-7", recentMsg(i, "room-7"))
+		hRememberMsg(ctx, "room-7", hRecentMsg(i, "room-7"))
 	}
-	got = recentOf(ctx, "room-7")
+	got = hRecentOf(ctx, "room-7")
 	ctx.Assert(!slices.Contains(got, nil), "recent must return ServerMsg objects, got %v", got)
-	ctx.Equal(recentTexts(got), []string{"m1", "m2", "m3"}, "recent(ctx, %q) oldest first", "room-7")
-	ctx.Assert(proto.Equal(got[0], recentMsg(1, "room-7")), "recent()[0] is %v, expected %v", got[0], recentMsg(1, "room-7"))
+	ctx.Equal(hRecentTexts(got), []string{"m1", "m2", "m3"}, "recent(ctx, %q) oldest first", "room-7")
+	ctx.Assert(proto.Equal(got[0], hRecentMsg(1, "room-7")), "recent()[0] is %v, expected %v", got[0], hRecentMsg(1, "room-7"))
 	for i := 4; i <= 60; i++ {
-		rememberMsg(ctx, "room-7", recentMsg(i, "room-7"))
+		hRememberMsg(ctx, "room-7", hRecentMsg(i, "room-7"))
 	}
-	texts := recentTexts(recentOf(ctx, "room-7"))
+	texts := hRecentTexts(hRecentOf(ctx, "room-7"))
 	want := make([]string, 50)
 	for i := range want {
 		want[i] = fmt.Sprintf("m%d", i+11)
@@ -768,9 +768,9 @@ func CheckChronological(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string recentKey = "recent:room-7";
+const std::string kHRecentKey = "recent:room-7";
 
-ServerMsg recentMsg(int i, const std::string& room) {
+ServerMsg hRecentMsg(int i, const std::string& room) {
   ServerMsg msg;
   msg.set_room(room);
   msg.set_user(i % 2 == 1 ? "ana" : "bo");
@@ -780,7 +780,7 @@ ServerMsg recentMsg(int i, const std::string& room) {
 }
 
 // The list as Redis holds it, head first, parsed back into ServerMsgs.
-std::vector<ServerMsg> storedRecent(harness::Ctx& ctx, const std::string& key) {
+std::vector<ServerMsg> hStoredRecent(harness::Ctx& ctx, const std::string& key) {
   std::vector<ServerMsg> out;
   for (const auto& v : ctx.Redis.LRange(key, 0, -1)) {
     ServerMsg msg;
@@ -790,7 +790,7 @@ std::vector<ServerMsg> storedRecent(harness::Ctx& ctx, const std::string& key) {
   return out;
 }
 
-std::vector<std::string> recentTexts(const std::vector<ServerMsg>& msgs) {
+std::vector<std::string> hRecentTexts(const std::vector<ServerMsg>& msgs) {
   std::vector<std::string> texts;
   for (const auto& msg : msgs) texts.push_back(msg.text());
   return texts;
@@ -799,42 +799,42 @@ std::vector<std::string> recentTexts(const std::vector<ServerMsg>& msgs) {
 }  // namespace
 
 void CheckLpush(harness::Ctx& ctx) {
-  remember("room-7", recentMsg(1, "room-7"));
-  remember("room-7", recentMsg(2, "room-7"));
-  remember("room-8", recentMsg(3, "room-8"));
-  ctx.Equal(ctx.Redis.Type(recentKey), "list", "the type of recent:room-7 (keys: %q)", ctx.Redis.Keys("*"));
-  const auto list = storedRecent(ctx, recentKey);
-  ctx.Equal(recentTexts(list), {"m2", "m1"}, "recent:room-7 head first: LPUSH puts the newest at the head");
-  ctx.Assert(list[1].SerializeAsString() == recentMsg(1, "room-7").SerializeAsString(), "the stored JSON parses back to %s, expected %s",
-             list[1].ShortDebugString(), recentMsg(1, "room-7").ShortDebugString());
-  ctx.Equal(recentTexts(storedRecent(ctx, "recent:room-8")), {"m3"}, "recent:room-8: one list per room");
+  remember("room-7", hRecentMsg(1, "room-7"));
+  remember("room-7", hRecentMsg(2, "room-7"));
+  remember("room-8", hRecentMsg(3, "room-8"));
+  ctx.Equal(ctx.Redis.Type(kHRecentKey), "list", "the type of recent:room-7 (keys: %q)", ctx.Redis.Keys("*"));
+  const auto list = hStoredRecent(ctx, kHRecentKey);
+  ctx.Equal(hRecentTexts(list), {"m2", "m1"}, "recent:room-7 head first: LPUSH puts the newest at the head");
+  ctx.Assert(list[1].SerializeAsString() == hRecentMsg(1, "room-7").SerializeAsString(), "the stored JSON parses back to %s, expected %s",
+             list[1].ShortDebugString(), hRecentMsg(1, "room-7").ShortDebugString());
+  ctx.Equal(hRecentTexts(hStoredRecent(ctx, "recent:room-8")), {"m3"}, "recent:room-8: one list per room");
 }
 
 void CheckTrim(harness::Ctx& ctx) {
-  for (int i = 1; i <= 55; i++) remember("room-7", recentMsg(i, "room-7"));
-  ctx.Equal(ctx.Redis.LLen(recentKey), 50, "after 55 messages the entries in recent:room-7 (LTRIM 0 49 after every push)");
-  const auto list = storedRecent(ctx, recentKey);
+  for (int i = 1; i <= 55; i++) remember("room-7", hRecentMsg(i, "room-7"));
+  ctx.Equal(ctx.Redis.LLen(kHRecentKey), 50, "after 55 messages the entries in recent:room-7 (LTRIM 0 49 after every push)");
+  const auto list = hStoredRecent(ctx, kHRecentKey);
   const std::string first = list.front().text(), last = list.back().text();
   ctx.Assert(first == "m55" && last == "m6",
              "the list runs %s .. %s, expected m55 .. m6: trimming must drop the oldest, not the newest", first, last);
 }
 
 void CheckExpire(harness::Ctx& ctx) {
-  remember("room-7", recentMsg(1, "room-7"));
-  long long ttl = ctx.Redis.TTL(recentKey);
+  remember("room-7", hRecentMsg(1, "room-7"));
+  long long ttl = ctx.Redis.TTL(kHRecentKey);
   ctx.Assert(3500 <= ttl && ttl <= 3600, "recent:room-7 has TTL %d, expected 3600 s", ttl);
   ctx.Clock.Advance(1800);
-  remember("room-7", recentMsg(2, "room-7"));
-  ttl = ctx.Redis.TTL(recentKey);
+  remember("room-7", hRecentMsg(2, "room-7"));
+  ttl = ctx.Redis.TTL(kHRecentKey);
   ctx.Assert(3500 <= ttl && ttl <= 3600,
              "a new message must restart the hour: TTL is %d after the second remember, expected 3600", ttl);
   ctx.Clock.Advance(3601);
-  ctx.Equal(ctx.Redis.Exists(recentKey), 0, "a room quiet for an hour must drop out of Redis: recent:room-7 exists");
+  ctx.Equal(ctx.Redis.Exists(kHRecentKey), 0, "a room quiet for an hour must drop out of Redis: recent:room-7 exists");
 }
 
 void CheckPipelined(harness::Ctx& ctx) {
   const size_t before = ctx.Redis.RoundTrips().size();
-  remember("room-7", recentMsg(1, "room-7"));
+  remember("room-7", hRecentMsg(1, "room-7"));
   const auto all = ctx.Redis.RoundTrips();
   const std::vector<std::vector<std::string>> trips(all.begin() + static_cast<long>(before), all.end());
   std::vector<std::string> direct;
@@ -850,24 +850,24 @@ void CheckPipelined(harness::Ctx& ctx) {
     if (c != "MULTI" && c != "EXEC") commands.push_back(c);
   ctx.Equal(commands, {"LPUSH", "LTRIM", "EXPIRE"}, "the commands the pipeline queued, in order");
   ctx.Assert(trip[0] == "MULTI", "the pipeline must be a MULTI (redis.transaction()) so no reader ever sees the list at 51");
-  const auto list = storedRecent(ctx, recentKey);
-  const long long ttl = ctx.Redis.TTL(recentKey);
+  const auto list = hStoredRecent(ctx, kHRecentKey);
+  const long long ttl = ctx.Redis.TTL(kHRecentKey);
   ctx.Assert(list.size() == 1 && list[0].text() == "m1" && 3500 <= ttl && ttl <= 3600,
              "after exec the list must hold the message with its TTL set");
 }
 
 void CheckChronological(harness::Ctx& ctx) {
   auto got = recent("room-7");
-  ctx.Assert(got.empty(), "a quiet room must give an empty list, got %v", recentTexts(got));
-  for (int i = 1; i <= 3; i++) remember("room-7", recentMsg(i, "room-7"));
+  ctx.Assert(got.empty(), "a quiet room must give an empty list, got %v", hRecentTexts(got));
+  for (int i = 1; i <= 3; i++) remember("room-7", hRecentMsg(i, "room-7"));
   got = recent("room-7");
-  ctx.Equal(recentTexts(got), {"m1", "m2", "m3"}, "recent(%q) oldest first", "room-7");
-  ctx.Assert(got[0].SerializeAsString() == recentMsg(1, "room-7").SerializeAsString(), "recent()[0] is %s, expected %s", got[0].ShortDebugString(),
-             recentMsg(1, "room-7").ShortDebugString());
-  for (int i = 4; i <= 60; i++) remember("room-7", recentMsg(i, "room-7"));
+  ctx.Equal(hRecentTexts(got), {"m1", "m2", "m3"}, "recent(%q) oldest first", "room-7");
+  ctx.Assert(got[0].SerializeAsString() == hRecentMsg(1, "room-7").SerializeAsString(), "recent()[0] is %s, expected %s", got[0].ShortDebugString(),
+             hRecentMsg(1, "room-7").ShortDebugString());
+  for (int i = 4; i <= 60; i++) remember("room-7", hRecentMsg(i, "room-7"));
   std::vector<std::string> want;
   for (int i = 0; i < 50; i++) want.push_back("m" + std::to_string(i + 11));
-  ctx.Equal(recentTexts(recent("room-7")), want, "after 60 messages recent(%q) must be m11 .. m60 oldest first", "room-7");
+  ctx.Equal(hRecentTexts(recent("room-7")), want, "after 60 messages recent(%q) must be m11 .. m60 oldest first", "room-7");
 }
 `,
   },

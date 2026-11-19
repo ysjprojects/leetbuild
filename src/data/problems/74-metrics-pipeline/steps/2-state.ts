@@ -664,17 +664,17 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func stateSample(ctx *harness.Ctx, host string, value float64, ago int64) model.Sample {
+func hStateSample(ctx *harness.Ctx, host string, value float64, ago int64) model.Sample {
 	return model.Sample{Metric: "http_requests", Labels: map[string]string{"host": host}, Timestamp: ctx.Clock.Now()/1000 - ago, Value: value}
 }
 
-func stateKey(tenant string, s model.Sample) string {
+func hStateKey(tenant string, s model.Sample) string {
 	return "win:" + tenant + ":" + model.SeriesID(s.Metric, s.Labels) + ":" + strconv.FormatInt(model.WindowStart(s.Timestamp), 10)
 }
 
-func stateTotal(ctx *harness.Ctx) int {
+func hStateTotal(ctx *harness.Ctx) int {
 	n := 0
 	for _, key := range ctx.Redis.Keys("win:*") {
 		count, _ := ctx.Redis.HGet(key, "count")
@@ -684,17 +684,17 @@ func stateTotal(ctx *harness.Ctx) int {
 	return n
 }
 
-func stateMerge(ctx *harness.Ctx, tenant, batchID string, samples []model.Sample) bool {
-	applied, err := mergeBatch(stateBg, tenant, batchID, samples)
+func hStateMerge(ctx *harness.Ctx, tenant, batchID string, samples []model.Sample) bool {
+	applied, err := mergeBatch(hStateBg, tenant, batchID, samples)
 	ctx.NoError(err, "mergeBatch(%s, %s) failed", tenant, batchID)
 	return applied
 }
 
 func CheckWindowKey(ctx *harness.Ctx) {
-	s := stateSample(ctx, "a", 1, 5)
-	stateMerge(ctx, "acme", "b-1", []model.Sample{s})
-	stateMerge(ctx, "globex", "b-1", []model.Sample{s})
-	want := []string{stateKey("acme", s), stateKey("globex", s)}
+	s := hStateSample(ctx, "a", 1, 5)
+	hStateMerge(ctx, "acme", "b-1", []model.Sample{s})
+	hStateMerge(ctx, "globex", "b-1", []model.Sample{s})
+	want := []string{hStateKey("acme", s), hStateKey("globex", s)}
 	ctx.Equal(ctx.Redis.Keys("win:*"), want, "acme and globex each sent one sample of the same series: without the tenant in the key their counters add up; the window keys")
 	for _, key := range want {
 		count, _ := ctx.Redis.HGet(key, "count")
@@ -703,18 +703,18 @@ func CheckWindowKey(ctx *harness.Ctx) {
 }
 
 func CheckAtomicMerge(ctx *harness.Ctx) {
-	batch := []model.Sample{stateSample(ctx, "a", 1.5, 5), stateSample(ctx, "a", 2.25, 5), stateSample(ctx, "b", 4, 35)}
-	seen := ctx.Redis.After("idx:acme:http_requests", func() any { return stateTotal(ctx) })
-	applied := stateMerge(ctx, "acme", "b-1", batch)
+	batch := []model.Sample{hStateSample(ctx, "a", 1.5, 5), hStateSample(ctx, "a", 2.25, 5), hStateSample(ctx, "b", 4, 35)}
+	seen := ctx.Redis.After("idx:acme:http_requests", func() any { return hStateTotal(ctx) })
+	applied := hStateMerge(ctx, "acme", "b-1", batch)
 	ctx.Assert(seen.Fired, "mergeBatch never indexed the batch under idx:acme:http_requests")
 	ctx.Assert(seen.Result == 0 || seen.Result == 3, "a reader that looked while the batch was being merged saw %v of its 3 samples: a crash at that moment leaves exactly that much. Apply the batch in one script", seen.Result)
-	ctx.Assert(applied && stateTotal(ctx) == 3, "after the merge the windows count %d samples (mergeBatch returned %v), expected 3", stateTotal(ctx), applied)
+	ctx.Assert(applied && hStateTotal(ctx) == 3, "after the merge the windows count %d samples (mergeBatch returned %v), expected 3", hStateTotal(ctx), applied)
 	for i, want := range []struct {
 		count string
 		sum   float64
 	}{{"2", 3.75}, {"1", 4}} {
 		s := batch[i*2]
-		key := stateKey("acme", s)
+		key := hStateKey("acme", s)
 		stored := ctx.Redis.HGetAll(key)
 		sum, err := strconv.ParseFloat(stored["sum"], 64)
 		ctx.Assert(stored["count"] == want.count && err == nil && sum == want.sum, "%s holds %v, expected count %s and sum %v: each sample adds its exact value", key, stored, want.count, want.sum)
@@ -724,8 +724,8 @@ func CheckAtomicMerge(ctx *harness.Ctx) {
 }
 
 func CheckWindowTtl(ctx *harness.Ctx) {
-	s, older := stateSample(ctx, "a", 1, 5), stateSample(ctx, "b", 1, 35)
-	stateMerge(ctx, "acme", "b-1", []model.Sample{s, older})
+	s, older := hStateSample(ctx, "a", 1, 5), hStateSample(ctx, "b", 1, 35)
+	hStateMerge(ctx, "acme", "b-1", []model.Sample{s, older})
 	keys := map[int64]string{}
 	for _, k := range ctx.Redis.Keys("win:*") {
 		start, _ := strconv.ParseInt(k[strings.LastIndex(k, ":")+1:], 10, 64)
@@ -742,24 +742,24 @@ func CheckWindowTtl(ctx *harness.Ctx) {
 	key := keys[model.WindowStart(s.Timestamp)]
 	expected := model.WindowStart(s.Timestamp) + 10 + 86400 - now
 	ctx.Clock.Advance(4)
-	stateMerge(ctx, "acme", "b-2", []model.Sample{s})
+	hStateMerge(ctx, "acme", "b-2", []model.Sample{s})
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(ttl >= expected-5 && ttl <= expected-3, "4 s later another write moved the TTL of %s to %d, expected %d: the expiry is an instant fixed by the window, not a day after the last write", key, ttl, expected-4)
 }
 
 func CheckDedupeBatch(ctx *harness.Ctx) {
-	batch := []model.Sample{stateSample(ctx, "a", 1, 5), stateSample(ctx, "b", 2, 5)}
-	claimed := ctx.Redis.After("batch:acme:b-1", func() any { return stateTotal(ctx) })
-	ctx.Equal(stateMerge(ctx, "acme", "b-1", batch), true, "the first delivery of batch b-1 must be applied; applied")
+	batch := []model.Sample{hStateSample(ctx, "a", 1, 5), hStateSample(ctx, "b", 2, 5)}
+	claimed := ctx.Redis.After("batch:acme:b-1", func() any { return hStateTotal(ctx) })
+	ctx.Equal(hStateMerge(ctx, "acme", "b-1", batch), true, "the first delivery of batch b-1 must be applied; applied")
 	ctx.Assert(claimed.Fired, "mergeBatch never claimed batch:acme:b-1")
 	ctx.Assert(claimed.Result == 2, "the moment batch:acme:b-1 was claimed the windows held %v of its 2 samples: a crash right after a claim made outside the script loses the batch, and its retry is refused. Claim inside the script", claimed.Result)
-	again := stateMerge(ctx, "acme", "b-1", batch)
-	ctx.Equal(stateTotal(ctx), 2, "batch b-1 delivered twice: a redelivered batch is applied once; the samples in the windows")
+	again := hStateMerge(ctx, "acme", "b-1", batch)
+	ctx.Equal(hStateTotal(ctx), 2, "batch b-1 delivered twice: a redelivered batch is applied once; the samples in the windows")
 	ctx.Equal(again, false, "the redelivery of batch b-1; applied")
 	ttl := ctx.Redis.TTL("batch:acme:b-1")
 	ctx.Assert(ttl >= 86398 && ttl <= 86400, "batch:acme:b-1 has TTL %d, expected the claim to last ClaimTTLSeconds, a day (SET … NX EX 86400)", ttl)
-	ctx.Assert(stateMerge(ctx, "acme", "b-2", batch) && stateTotal(ctx) == 4, "a new batch id must be applied; the windows count %d", stateTotal(ctx))
-	ctx.Equal(stateMerge(ctx, "globex", "b-1", batch), true, "batch ids are per tenant: globex's b-1 is a different batch; applied")
+	ctx.Assert(hStateMerge(ctx, "acme", "b-2", batch) && hStateTotal(ctx) == 4, "a new batch id must be applied; the windows count %d", hStateTotal(ctx))
+	ctx.Equal(hStateMerge(ctx, "globex", "b-1", batch), true, "batch ids are per tenant: globex's b-1 is a different batch; applied")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -775,15 +775,15 @@ func CheckDedupeBatch(ctx *harness.Ctx) {
 
 namespace {
 
-metrics::Sample stateSample(harness::Ctx& ctx, const std::string& host = "a", double value = 1, long long ago = 5) {
+metrics::Sample hStateSample(harness::Ctx& ctx, const std::string& host = "a", double value = 1, long long ago = 5) {
   return metrics::Sample{"http_requests", {{"host", host}}, ctx.Clock.Now() / 1000 - ago, value};
 }
 
-std::string stateKey(const std::string& tenant, const metrics::Sample& s) {
+std::string hStateKey(const std::string& tenant, const metrics::Sample& s) {
   return "win:" + tenant + ":" + metrics::seriesId(s.metric, s.labels) + ":" + std::to_string(metrics::windowStart(s.timestamp));
 }
 
-long long stateTotal(harness::Ctx& ctx) {
+long long hStateTotal(harness::Ctx& ctx) {
   long long n = 0;
   for (const auto& key : ctx.Redis.Keys("win:*")) {
     const auto count = ctx.Redis.HGet(key, "count");
@@ -795,25 +795,25 @@ long long stateTotal(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckWindowKey(harness::Ctx& ctx) {
-  const auto s = stateSample(ctx);
+  const auto s = hStateSample(ctx);
   mergeBatch("acme", "b-1", {s});
   mergeBatch("globex", "b-1", {s});
-  const std::vector<std::string> want = {stateKey("acme", s), stateKey("globex", s)};
+  const std::vector<std::string> want = {hStateKey("acme", s), hStateKey("globex", s)};
   ctx.Equal(ctx.Redis.Keys("win:*"), want, "acme and globex each sent one sample of the same series: without the tenant in the key their counters add up; the window keys");
   for (const auto& key : want) ctx.Equal(ctx.Redis.HGet(key, "count"), std::optional<std::string>("1"), "%s's count", key);
 }
 
 void CheckAtomicMerge(harness::Ctx& ctx) {
-  const std::vector<metrics::Sample> batch = {stateSample(ctx, "a", 1.5), stateSample(ctx, "a", 2.25), stateSample(ctx, "b", 4, 35)};
+  const std::vector<metrics::Sample> batch = {hStateSample(ctx, "a", 1.5), hStateSample(ctx, "a", 2.25), hStateSample(ctx, "b", 4, 35)};
   auto seen = std::make_shared<long long>(-1);
-  ctx.Redis.After("idx:acme:http_requests", [&ctx, seen] { *seen = stateTotal(ctx); });
+  ctx.Redis.After("idx:acme:http_requests", [&ctx, seen] { *seen = hStateTotal(ctx); });
   const bool applied = mergeBatch("acme", "b-1", batch);
   ctx.Assert(*seen >= 0, "mergeBatch never indexed the batch under idx:acme:http_requests");
   ctx.Assert(*seen == 0 || *seen == 3, "a reader that looked while the batch was being merged saw %d of its 3 samples: a crash at that moment leaves exactly that much. Apply the batch in one script", *seen);
-  ctx.Assert(applied && stateTotal(ctx) == 3, "after the merge the windows count %d samples (mergeBatch returned %t), expected 3", stateTotal(ctx), applied);
+  ctx.Assert(applied && hStateTotal(ctx) == 3, "after the merge the windows count %d samples (mergeBatch returned %t), expected 3", hStateTotal(ctx), applied);
   const std::vector<std::tuple<metrics::Sample, std::string, double>> wants = {{batch[0], "2", 3.75}, {batch[2], "1", 4.0}};
   for (const auto& [s, count, sum] : wants) {
-    const auto key = stateKey("acme", s);
+    const auto key = hStateKey("acme", s);
     const auto stored = ctx.Redis.HGetAll(key);
     ctx.Assert(stored.count("count") && stored.at("count") == count && stored.count("sum") && std::stod(stored.at("sum")) == sum,
                "%s holds %v, expected count %s and sum %v: each sample adds its exact value", key, stored, count, sum);
@@ -824,8 +824,8 @@ void CheckAtomicMerge(harness::Ctx& ctx) {
 }
 
 void CheckWindowTtl(harness::Ctx& ctx) {
-  const auto s = stateSample(ctx);
-  const auto older = stateSample(ctx, "b", 1, 35);
+  const auto s = hStateSample(ctx);
+  const auto older = hStateSample(ctx, "b", 1, 35);
   mergeBatch("acme", "b-1", {s, older});
   std::map<long long, std::string> keys;
   for (const auto& k : ctx.Redis.Keys("win:*")) keys[std::stoll(k.substr(k.rfind(':') + 1))] = k;
@@ -846,18 +846,18 @@ void CheckWindowTtl(harness::Ctx& ctx) {
 }
 
 void CheckDedupeBatch(harness::Ctx& ctx) {
-  const std::vector<metrics::Sample> batch = {stateSample(ctx, "a", 1), stateSample(ctx, "b", 2)};
+  const std::vector<metrics::Sample> batch = {hStateSample(ctx, "a", 1), hStateSample(ctx, "b", 2)};
   auto claimed = std::make_shared<long long>(-1);
-  ctx.Redis.After("batch:acme:b-1", [&ctx, claimed] { *claimed = stateTotal(ctx); });
+  ctx.Redis.After("batch:acme:b-1", [&ctx, claimed] { *claimed = hStateTotal(ctx); });
   ctx.Equal(mergeBatch("acme", "b-1", batch), true, "the first delivery of batch b-1 must be applied; applied");
   ctx.Assert(*claimed >= 0, "mergeBatch never claimed batch:acme:b-1");
   ctx.Assert(*claimed == 2, "the moment batch:acme:b-1 was claimed the windows held %d of its 2 samples: a crash right after a claim made outside the script loses the batch, and its retry is refused. Claim inside the script", *claimed);
   const bool again = mergeBatch("acme", "b-1", batch);
-  ctx.Equal(stateTotal(ctx), 2, "batch b-1 delivered twice: a redelivered batch is applied once; the samples in the windows");
+  ctx.Equal(hStateTotal(ctx), 2, "batch b-1 delivered twice: a redelivered batch is applied once; the samples in the windows");
   ctx.Equal(again, false, "the redelivery of batch b-1; applied");
   const long long ttl = ctx.Redis.TTL("batch:acme:b-1");
   ctx.Assert(ttl >= 86398 && ttl <= 86400, "batch:acme:b-1 has TTL %d, expected the claim to last kClaimTtlSeconds, a day (SET … NX EX 86400)", ttl);
-  ctx.Assert(mergeBatch("acme", "b-2", batch) && stateTotal(ctx) == 4, "a new batch id must be applied; the windows count %d", stateTotal(ctx));
+  ctx.Assert(mergeBatch("acme", "b-2", batch) && hStateTotal(ctx) == 4, "a new batch id must be applied; the windows count %d", hStateTotal(ctx));
   ctx.Equal(mergeBatch("globex", "b-1", batch), true, "batch ids are per tenant: globex's b-1 is a different batch; applied");
 }
 `,

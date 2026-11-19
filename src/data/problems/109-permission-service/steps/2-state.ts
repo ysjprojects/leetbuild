@@ -661,10 +661,10 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
 // revokeElsewhere is another replica revoking g-1 the way the task asks: the grant store commits, then the version moves (and the key goes).
-func revokeElsewhere(ctx *harness.Ctx) {
+func hRevokeElsewhere(ctx *harness.Ctx) {
 	ctx.Redis.Do("DEL", "grant:g-1")
 	ctx.Redis.Do("SREM", "grants:ada", "g-1")
 	ctx.Redis.Do("INCR", "perm:grant_version")
@@ -672,24 +672,24 @@ func revokeElsewhere(ctx *harness.Ctx) {
 }
 
 func CheckEveryScope(ctx *harness.Ctx) {
-	g := grantRole(stateBg, "ada", "team_admin", "team:eng", "olu")
-	ctx.Assert(slices.Contains(effectivePermissions(stateBg, "ada", "team:eng"), "team:write"), "a team_admin at team:eng must hold team:write there")
-	ctx.Assert(slices.Contains(effectivePermissions(stateBg, "ada", "project:eng/api"), "team:write"), "team:eng covers project:eng/api: ada must hold team:write there")
+	g := grantRole(hStateBg, "ada", "team_admin", "team:eng", "olu")
+	ctx.Assert(slices.Contains(effectivePermissions(hStateBg, "ada", "team:eng"), "team:write"), "a team_admin at team:eng must hold team:write there")
+	ctx.Assert(slices.Contains(effectivePermissions(hStateBg, "ada", "project:eng/api"), "team:write"), "team:eng covers project:eng/api: ada must hold team:write there")
 	ttl := ctx.Redis.TTL("perm:ada:team:eng")
 	ctx.Assert(ttl > 290 && ttl <= 300, "perm:ada:team:eng has a TTL of %d s, expected 300", ttl)
-	revokeGrant(stateBg, g.GrantID)
+	revokeGrant(hStateBg, g.GrantID)
 	for _, scope := range []string{"team:eng", "project:eng/api"} {
-		seen := effectivePermissions(stateBg, "ada", scope)
+		seen := effectivePermissions(hStateBg, "ada", scope)
 		ctx.Assert(!slices.Contains(seen, "team:write"), "after ada's team_admin grant at team:eng was revoked, a read at %s still answers %v: the invalidation must reach every cached scope the grant covered", scope, seen)
 	}
-	grantRole(stateBg, "ada", "developer", "team:eng", "olu")
-	seen := effectivePermissions(stateBg, "ada", "project:eng/api")
+	grantRole(hStateBg, "ada", "developer", "team:eng", "olu")
+	seen := effectivePermissions(hStateBg, "ada", "project:eng/api")
 	ctx.Assert(slices.Contains(seen, "code:write"), "after developer was granted at team:eng, a read at project:eng/api answers %v", seen)
 }
 
 func CheckAfterCommit(ctx *harness.Ctx) {
-	g := grantRole(stateBg, "ada", "team_admin", "team:eng", "olu")
-	ctx.Assert(slices.Contains(effectivePermissions(stateBg, "ada", "team:eng"), "team:write"), "a team_admin at team:eng must hold team:write there")
+	g := grantRole(hStateBg, "ada", "team_admin", "team:eng", "olu")
+	ctx.Assert(slices.Contains(effectivePermissions(hStateBg, "ada", "team:eng"), "team:write"), "a team_admin at team:eng must hold team:write there")
 	// What a read landing at the moment the revocation first touches the cache would find in the grant store.
 	var seen []bool
 	atInvalidation := func() any {
@@ -700,33 +700,33 @@ func CheckAfterCommit(ctx *harness.Ctx) {
 	}
 	ctx.Redis.After("perm:ada:team:eng", atInvalidation)
 	ctx.Redis.After("perm:grant_version", atInvalidation)
-	revokeGrant(stateBg, g.GrantID)
+	revokeGrant(hStateBg, g.GrantID)
 	ctx.Assert(len(seen) > 0, "revokeGrant touched neither perm:ada:team:eng nor perm:grant_version: nothing invalidates the cached set")
 	ctx.Assert(!seen[0], "revokeGrant invalidated the cache while g-1 was still in the grant store: a read landing there derives the set the revocation removes and caches it. Write the grant first, then invalidate")
-	after := effectivePermissions(stateBg, "ada", "team:eng")
+	after := effectivePermissions(hStateBg, "ada", "team:eng")
 	ctx.Assert(!slices.Contains(after, "team:write"), "after the revocation ada still holds %v", after)
 	var held []int64
 	ctx.Redis.After("perm:grant_version", func() any {
 		held = append(held, ctx.Redis.SCard("grants:ada"))
 		return nil
 	})
-	grantRole(stateBg, "ada", "developer", "team:eng", "olu")
+	grantRole(hStateBg, "ada", "developer", "team:eng", "olu")
 	ctx.Assert(len(held) > 0, "grantRole never touched perm:grant_version: nothing invalidates the cached sets")
 	ctx.Assert(held[0] == 1, "grantRole moved perm:grant_version before the grant store held the new grant: a read landing there derives the set without it and stamps it with the new version, so the grant stays invisible for the TTL. Write the grant first, then invalidate")
-	now := effectivePermissions(stateBg, "ada", "team:eng")
+	now := effectivePermissions(hStateBg, "ada", "team:eng")
 	ctx.Assert(slices.Contains(now, "code:write"), "after developer was granted at team:eng ada holds %v", now)
 }
 
 func CheckStampBeforeDerive(ctx *harness.Ctx) {
-	grantRole(stateBg, "ada", "team_admin", "team:eng", "olu")
+	grantRole(hStateBg, "ada", "team_admin", "team:eng", "olu")
 	// A read misses and derives ada's set; another replica revokes g-1 right after the read loaded it.
 	probe := ctx.Redis.After("grant:g-1", func() any {
-		revokeElsewhere(ctx)
+		hRevokeElsewhere(ctx)
 		return nil
 	})
-	first := effectivePermissions(stateBg, "ada", "team:eng")
+	first := effectivePermissions(hStateBg, "ada", "team:eng")
 	ctx.Assert(probe.Fired, "the read never loaded ada's grant g-1 from the grant store")
-	after := effectivePermissions(stateBg, "ada", "team:eng")
+	after := effectivePermissions(hStateBg, "ada", "team:eng")
 	ctx.Assert(!slices.Contains(after, "team:write"), "the read that was deriving when the revocation committed cached %v, and the next read still answers %v: stamp the entry with the version read before deriving, and serve it only while that version is current", first, after)
 }
 `,
@@ -740,12 +740,12 @@ func CheckStampBeforeDerive(ctx *harness.Ctx) {
 
 namespace {
 
-bool holds(const std::vector<std::string>& permissions, const std::string& p) {
+bool hHolds(const std::vector<std::string>& permissions, const std::string& p) {
   return std::find(permissions.begin(), permissions.end(), p) != permissions.end();
 }
 
 // Another replica revoking g-1 the way the task asks: the grant store commits, then the version moves (and the key goes).
-void revokeElsewhere(harness::Ctx& ctx) {
+void hRevokeElsewhere(harness::Ctx& ctx) {
   ctx.Redis.Do("DEL", "grant:g-1");
   ctx.Redis.Do("SREM", "grants:ada", "g-1");
   ctx.Redis.Do("INCR", "perm:grant_version");
@@ -756,23 +756,23 @@ void revokeElsewhere(harness::Ctx& ctx) {
 
 void CheckEveryScope(harness::Ctx& ctx) {
   const grants::Grant g = grantRole("ada", "team_admin", "team:eng", "olu");
-  ctx.Assert(holds(effectivePermissions("ada", "team:eng"), "team:write"), "a team_admin at team:eng must hold team:write there");
-  ctx.Assert(holds(effectivePermissions("ada", "project:eng/api"), "team:write"), "team:eng covers project:eng/api: ada must hold team:write there");
+  ctx.Assert(hHolds(effectivePermissions("ada", "team:eng"), "team:write"), "a team_admin at team:eng must hold team:write there");
+  ctx.Assert(hHolds(effectivePermissions("ada", "project:eng/api"), "team:write"), "team:eng covers project:eng/api: ada must hold team:write there");
   const long long ttl = ctx.Redis.TTL("perm:ada:team:eng");
   ctx.Assert(ttl > 290 && ttl <= 300, "perm:ada:team:eng has a TTL of %d s, expected 300", ttl);
   revokeGrant(g.grant_id);
   for (const std::string scope : {"team:eng", "project:eng/api"}) {
     const auto seen = effectivePermissions("ada", scope);
-    ctx.Assert(!holds(seen, "team:write"), "after ada's team_admin grant at team:eng was revoked, a read at %s still answers %v: the invalidation must reach every cached scope the grant covered", scope, seen);
+    ctx.Assert(!hHolds(seen, "team:write"), "after ada's team_admin grant at team:eng was revoked, a read at %s still answers %v: the invalidation must reach every cached scope the grant covered", scope, seen);
   }
   grantRole("ada", "developer", "team:eng", "olu");
   const auto seen = effectivePermissions("ada", "project:eng/api");
-  ctx.Assert(holds(seen, "code:write"), "after developer was granted at team:eng, a read at project:eng/api answers %v", seen);
+  ctx.Assert(hHolds(seen, "code:write"), "after developer was granted at team:eng, a read at project:eng/api answers %v", seen);
 }
 
 void CheckAfterCommit(harness::Ctx& ctx) {
   const grants::Grant g = grantRole("ada", "team_admin", "team:eng", "olu");
-  ctx.Assert(holds(effectivePermissions("ada", "team:eng"), "team:write"), "a team_admin at team:eng must hold team:write there");
+  ctx.Assert(hHolds(effectivePermissions("ada", "team:eng"), "team:write"), "a team_admin at team:eng must hold team:write there");
   // What a read landing at the moment the revocation first touches the cache would find in the grant store.
   std::vector<bool> seen;
   const auto atInvalidation = [&ctx, &seen] {
@@ -784,14 +784,14 @@ void CheckAfterCommit(harness::Ctx& ctx) {
   ctx.Assert(!seen.empty(), "revokeGrant touched neither perm:ada:team:eng nor perm:grant_version: nothing invalidates the cached set");
   ctx.Assert(!seen[0], "revokeGrant invalidated the cache while g-1 was still in the grant store: a read landing there derives the set the revocation removes and caches it. Write the grant first, then invalidate");
   const auto after = effectivePermissions("ada", "team:eng");
-  ctx.Assert(!holds(after, "team:write"), "after the revocation ada still holds %v", after);
+  ctx.Assert(!hHolds(after, "team:write"), "after the revocation ada still holds %v", after);
   std::vector<long long> held;
   ctx.Redis.After("perm:grant_version", [&ctx, &held] { held.push_back(ctx.Redis.SCard("grants:ada")); });
   grantRole("ada", "developer", "team:eng", "olu");
   ctx.Assert(!held.empty(), "grantRole never touched perm:grant_version: nothing invalidates the cached sets");
   ctx.Assert(held[0] == 1, "grantRole moved perm:grant_version before the grant store held the new grant: a read landing there derives the set without it and stamps it with the new version, so the grant stays invisible for the TTL. Write the grant first, then invalidate");
   const auto now = effectivePermissions("ada", "team:eng");
-  ctx.Assert(holds(now, "code:write"), "after developer was granted at team:eng ada holds %v", now);
+  ctx.Assert(hHolds(now, "code:write"), "after developer was granted at team:eng ada holds %v", now);
 }
 
 void CheckStampBeforeDerive(harness::Ctx& ctx) {
@@ -800,12 +800,12 @@ void CheckStampBeforeDerive(harness::Ctx& ctx) {
   bool fired = false;
   ctx.Redis.After("grant:g-1", [&ctx, &fired] {
     fired = true;
-    revokeElsewhere(ctx);
+    hRevokeElsewhere(ctx);
   });
   const auto first = effectivePermissions("ada", "team:eng");
   ctx.Assert(fired, "the read never loaded ada's grant g-1 from the grant store");
   const auto after = effectivePermissions("ada", "team:eng");
-  ctx.Assert(!holds(after, "team:write"), "the read that was deriving when the revocation committed cached %v, and the next read still answers %v: stamp the entry with the version read before deriving, and serve it only while that version is current", first, after);
+  ctx.Assert(!hHolds(after, "team:write"), "the read that was deriving when the revocation committed cached %v, and the next read still answers %v: stamp the entry with the version read before deriving, and serve it only while that version is current", first, after);
 }
 `,
   },

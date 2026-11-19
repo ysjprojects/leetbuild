@@ -755,23 +755,23 @@ import (
 	"leetbuild/harness"
 )
 
-const apiTenant = "t-1"
+const kHApiTenant = "t-1"
 
 var (
-	apiProducts = []catalog.Product{
+	hApiProducts = []catalog.Product{
 		{ID: "p-1", Title: "Steel Kettle", Brand: "acme", Category: "kitchen", PriceCents: 3499, InStock: true, CostCents: 1200},
 		{ID: "p-2", Title: "Glass Kettle", Brand: "brew", Category: "kitchen", PriceCents: 2999, InStock: false, CostCents: 900},
 		{ID: "p-3", Title: "Kettle Descaler", Brand: "acme", Category: "cleaning", PriceCents: 899, InStock: true, CostCents: 150},
 	}
-	apiOther   = catalog.Product{ID: "p-9", Title: "Copper Kettle", Brand: "acme", Category: "kitchen", PriceCents: 5999, InStock: true, CostCents: 3000}
-	apiAllowed = []string{"brand", "category", "in_stock", "max_price", "min_price"}
+	hApiOther   = catalog.Product{ID: "p-9", Title: "Copper Kettle", Brand: "acme", Category: "kitchen", PriceCents: 5999, InStock: true, CostCents: 3000}
+	hApiAllowed = []string{"brand", "category", "in_stock", "max_price", "min_price"}
 )
 
 func hAPI(ctx *harness.Ctx) *harness.HTTP {
-	for _, p := range apiProducts {
-		catalog.PutProduct(context.Background(), apiTenant, p)
+	for _, p := range hApiProducts {
+		catalog.PutProduct(context.Background(), kHApiTenant, p)
 	}
-	catalog.PutProduct(context.Background(), "t-2", apiOther)
+	catalog.PutProduct(context.Background(), "t-2", hApiOther)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
@@ -782,7 +782,7 @@ func hSearchFor(c *harness.HTTP, params map[string]string) *harness.Response {
 	for k, v := range params {
 		values.Set(k, v)
 	}
-	return c.Get("/v1/search?"+values.Encode(), "X-Tenant-Id", apiTenant)
+	return c.Get("/v1/search?"+values.Encode(), "X-Tenant-Id", kHApiTenant)
 }
 
 func hHitIDs(r *harness.Response) []string {
@@ -848,7 +848,7 @@ func CheckFilterAllowlist(ctx *harness.Ctx) {
 	}
 	r.Decode(&body)
 	sort.Strings(body.Allowed)
-	ctx.Equal(body.Allowed, apiAllowed, "the 400 must carry the allowed list")
+	ctx.Equal(body.Allowed, hApiAllowed, "the 400 must carry the allowed list")
 	r = hSearchFor(c, map[string]string{"q": "kettle", "filters": \`{"brand": "acme", "price_cents": "899"}\`})
 	ctx.Assert(r.Status == 400 && strings.Contains(r.Text(), "price_cents"), "a filter on brand and price_cents answered %d %s: every field outside allowedFilterFields is 400 naming it, not only cost_cents", r.Status, r.Text())
 	r = hSearchFor(c, map[string]string{"q": "kettle", "filters": \`{"brand": "acme", "max_price": "1000"}\`})

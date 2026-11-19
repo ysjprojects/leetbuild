@@ -728,20 +728,20 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-type readCharge struct {
+type HReadCharge struct {
 	reference string
 	total     int64
 }
 
 // readPeer answers GetInvoice from what it charged: totals per invoice id.
-type readPeer struct {
+type HReadPeer struct {
 	pb.UnimplementedProcessorServer
-	charged map[string]readCharge
+	charged map[string]HReadCharge
 }
 
-func (p *readPeer) GetInvoice(_ context.Context, req *pb.GetInvoiceRequest) (*pb.ProcessorInvoice, error) {
+func (p *HReadPeer) GetInvoice(_ context.Context, req *pb.GetInvoiceRequest) (*pb.ProcessorInvoice, error) {
 	found, ok := p.charged[req.GetInvoiceId()]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "no charge for %s", req.GetInvoiceId())
@@ -749,7 +749,7 @@ func (p *readPeer) GetInvoice(_ context.Context, req *pb.GetInvoiceRequest) (*pb
 	return &pb.ProcessorInvoice{InvoiceId: req.GetInvoiceId(), State: "charged", Reference: found.reference, TotalCents: found.total}, nil
 }
 
-type readLine struct {
+type HReadLine struct {
 	InvoiceID           string         \`json:"invoice_id"\`
 	State               string         \`json:"state"\`
 	Reference           string         \`json:"reference"\`
@@ -759,40 +759,40 @@ type readLine struct {
 	Reconciled          *bool          \`json:"reconciled"\`
 }
 
-func readWorld(ctx *harness.Ctx) (*harness.HTTP, *readPeer) {
-	p := &readPeer{charged: map[string]readCharge{}}
+func hReadWorld(ctx *harness.Ctx) (*harness.HTTP, *HReadPeer) {
+	p := &HReadPeer{charged: map[string]HReadCharge{}}
 	pb.RegisterProcessorServer(ctx.GRPC.Server(""), p)
-	store.PutSubscription(readBg, "sub_1", "t-acme", "scale", "2026-02-01", "2026-04-01")
-	store.PutSubscription(readBg, "sub_2", "t-other", "scale", "2026-02-01", "2026-04-01")
+	store.PutSubscription(hReadBg, "sub_1", "t-acme", "scale", "2026-02-01", "2026-04-01")
+	store.PutSubscription(hReadBg, "sub_2", "t-other", "scale", "2026-02-01", "2026-04-01")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux), p
 }
 
 // readCharged stores a charged invoice the processor holds for total.
-func readCharged(p *readPeer, subscriptionID, periodStart, periodEnd string, amount, total int64) string {
-	invoice := store.OpenInvoice(readBg, subscriptionID, periodStart, periodEnd, amount)
+func hReadCharged(p *HReadPeer, subscriptionID, periodStart, periodEnd string, amount, total int64) string {
+	invoice := store.OpenInvoice(hReadBg, subscriptionID, periodStart, periodEnd, amount)
 	reference := "ch_" + invoice.InvoiceID
-	store.MarkCharged(readBg, invoice.InvoiceID, reference)
-	p.charged[invoice.InvoiceID] = readCharge{reference, total}
+	store.MarkCharged(hReadBg, invoice.InvoiceID, reference)
+	p.charged[invoice.InvoiceID] = HReadCharge{reference, total}
 	return invoice.InvoiceID
 }
 
-func readLedger(ctx *harness.Ctx, c *harness.HTTP) []readLine {
+func hReadLedger(ctx *harness.Ctx, c *harness.HTTP) []HReadLine {
 	r := c.Get("/v1/subscriptions/sub_1/invoices", "X-Tenant-Id", "t-acme")
 	ctx.Equal(r.Status, 200, "GET /v1/subscriptions/sub_1/invoices (%s)", r.Text())
 	var body struct {
-		Invoices []readLine \`json:"invoices"\`
+		Invoices []HReadLine \`json:"invoices"\`
 	}
 	r.Decode(&body)
 	return body.Invoices
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c, p := readWorld(ctx)
-	first := readCharged(p, "sub_1", "2026-02-01", "2026-03-01", 9900, 9900)
-	second := readCharged(p, "sub_1", "2026-03-01", "2026-04-01", 9900, 9900)
-	invoices := readLedger(ctx, c)
+	c, p := hReadWorld(ctx)
+	first := hReadCharged(p, "sub_1", "2026-02-01", "2026-03-01", 9900, 9900)
+	second := hReadCharged(p, "sub_1", "2026-03-01", "2026-04-01", 9900, 9900)
+	invoices := hReadLedger(ctx, c)
 	var ids []string
 	for _, i := range invoices {
 		ids = append(ids, i.InvoiceID)
@@ -802,8 +802,8 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckTenant(ctx *harness.Ctx) {
-	c, p := readWorld(ctx)
-	readCharged(p, "sub_2", "2026-03-01", "2026-04-01", 9900, 9900)
+	c, p := hReadWorld(ctx)
+	hReadCharged(p, "sub_2", "2026-03-01", "2026-04-01", 9900, 9900)
 	anonymous := c.Get("/v1/subscriptions/sub_1/invoices")
 	ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id")
 	foreign := c.Get("/v1/subscriptions/sub_2/invoices", "X-Tenant-Id", "t-acme")
@@ -815,32 +815,32 @@ func CheckTenant(ctx *harness.Ctx) {
 }
 
 func CheckStoredInvoices(ctx *harness.Ctx) {
-	c, p := readWorld(ctx)
-	prorated := readCharged(p, "sub_1", "2026-03-01", "2026-04-01", 4790, 4790)
-	invoices := readLedger(ctx, c)
+	c, p := hReadWorld(ctx)
+	prorated := hReadCharged(p, "sub_1", "2026-03-01", "2026-04-01", 4790, 4790)
+	invoices := hReadLedger(ctx, c)
 	ctx.Assert(len(invoices) == 1 && invoices[0].AmountCents == 4790, "the prorated invoice %s was billed 4790 cents and the ledger reports %+v: report the stored amount, not the plan price", prorated, invoices)
 }
 
 func CheckCredits(ctx *harness.Ctx) {
-	c, p := readWorld(ctx)
-	invoiceID := readCharged(p, "sub_1", "2026-03-01", "2026-04-01", 9900, 9900)
-	credit := store.GrantCredit(readBg, invoiceID, 500, "service outage")
-	line := readLedger(ctx, c)[0]
+	c, p := hReadWorld(ctx)
+	invoiceID := hReadCharged(p, "sub_1", "2026-03-01", "2026-04-01", 9900, 9900)
+	credit := store.GrantCredit(hReadBg, invoiceID, 500, "service outage")
+	line := hReadLedger(ctx, c)[0]
 	ctx.Equal(line.AmountCents, int64(9900), "an invoice billed 9900 with a 500 credit: the amount stays what was billed; amount_cents")
 	ctx.Equal(line.Credits, []store.Credit{credit}, "the credit must be listed as its own line; credits")
 }
 
 func CheckReconciled(ctx *harness.Ctx) {
-	c, p := readWorld(ctx)
-	once := readCharged(p, "sub_1", "2026-01-01", "2026-02-01", 9900, 9900)
-	store.GrantCredit(readBg, once, 500, "service outage")
-	twice := readCharged(p, "sub_1", "2026-02-01", "2026-03-01", 9900, 19800)
-	unknown := store.OpenInvoice(readBg, "sub_1", "2026-03-01", "2026-04-01", 9900).InvoiceID
+	c, p := hReadWorld(ctx)
+	once := hReadCharged(p, "sub_1", "2026-01-01", "2026-02-01", 9900, 9900)
+	store.GrantCredit(hReadBg, once, 500, "service outage")
+	twice := hReadCharged(p, "sub_1", "2026-02-01", "2026-03-01", 9900, 19800)
+	unknown := store.OpenInvoice(hReadBg, "sub_1", "2026-03-01", "2026-04-01", 9900).InvoiceID
 	// The store still reads open (the run crashed before recording), yet the processor charged it.
-	stale := store.OpenInvoice(readBg, "sub_1", "2026-04-01", "2026-05-01", 9900).InvoiceID
-	p.charged[stale] = readCharge{"ch_" + stale, 9900}
-	invoices := map[string]readLine{}
-	for _, i := range readLedger(ctx, c) {
+	stale := store.OpenInvoice(hReadBg, "sub_1", "2026-04-01", "2026-05-01", 9900).InvoiceID
+	p.charged[stale] = HReadCharge{"ch_" + stale, 9900}
+	invoices := map[string]HReadLine{}
+	for _, i := range hReadLedger(ctx, c) {
 		invoices[i.InvoiceID] = i
 	}
 	tiesOut := func(id string, total int64, reconciled bool, what string) {
@@ -872,15 +872,15 @@ func CheckReconciled(ctx *harness.Ctx) {
 
 namespace {
 
-struct ReadCharge {
+struct HReadCharge {
   std::string reference;
   long long total = 0;
 };
 
 // Answers GetInvoice from what it charged: totals per invoice id.
-class ReadPeer final : public subbilling::Processor::Service {
+class HReadPeer final : public subbilling::Processor::Service {
  public:
-  std::map<std::string, ReadCharge> charged;
+  std::map<std::string, HReadCharge> charged;
 
   grpc::Status GetInvoice(grpc::ServerContext*, const subbilling::GetInvoiceRequest* req, subbilling::ProcessorInvoice* out) override {
     const auto it = charged.find(req->invoice_id());
@@ -893,10 +893,10 @@ class ReadPeer final : public subbilling::Processor::Service {
   }
 };
 
-ReadPeer& readWorld(harness::Ctx& ctx) {
-  static ReadPeer* peer = nullptr;
+HReadPeer& hReadWorld(harness::Ctx& ctx) {
+  static HReadPeer* peer = nullptr;
   delete peer;
-  peer = new ReadPeer;
+  peer = new HReadPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   store::putSubscription("sub_1", "t-acme", "scale", "2026-02-01", "2026-04-01");
   store::putSubscription("sub_2", "t-other", "scale", "2026-02-01", "2026-04-01");
@@ -912,7 +912,7 @@ harness::HTTP hReadAPI(harness::Ctx& ctx) {
 }
 
 // A stored, charged invoice the processor holds for total.
-std::string readCharged(ReadPeer& peer, const std::string& subscription_id, const std::string& start, const std::string& stop, long long amount,
+std::string hReadCharged(HReadPeer& peer, const std::string& subscription_id, const std::string& start, const std::string& stop, long long amount,
                         long long total) {
   const store::Invoice invoice = store::openInvoice(subscription_id, start, stop, amount);
   const std::string reference = "ch_" + invoice.invoice_id;
@@ -921,7 +921,7 @@ std::string readCharged(ReadPeer& peer, const std::string& subscription_id, cons
   return invoice.invoice_id;
 }
 
-nlohmann::json readLedger(harness::Ctx& ctx, harness::HTTP& c) {
+nlohmann::json hReadLedger(harness::Ctx& ctx, harness::HTTP& c) {
   const auto r = c.Get("/v1/subscriptions/sub_1/invoices", "X-Tenant-Id", "t-acme");
   ctx.Equal(r.Status, 200, "GET /v1/subscriptions/sub_1/invoices (%s)", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
@@ -932,11 +932,11 @@ nlohmann::json readLedger(harness::Ctx& ctx, harness::HTTP& c) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  ReadPeer& peer = readWorld(ctx);
+  HReadPeer& peer = hReadWorld(ctx);
   auto c = hReadAPI(ctx);
-  const std::string first = readCharged(peer, "sub_1", "2026-02-01", "2026-03-01", 9900, 9900);
-  const std::string second = readCharged(peer, "sub_1", "2026-03-01", "2026-04-01", 9900, 9900);
-  const auto invoices = readLedger(ctx, c);
+  const std::string first = hReadCharged(peer, "sub_1", "2026-02-01", "2026-03-01", 9900, 9900);
+  const std::string second = hReadCharged(peer, "sub_1", "2026-03-01", "2026-04-01", 9900, 9900);
+  const auto invoices = hReadLedger(ctx, c);
   std::vector<std::string> ids;
   for (const auto& i : invoices) ids.push_back(i.value("invoice_id", ""));
   ctx.Equal(ids, {first, second}, "the ledger must list the invoices oldest first");
@@ -944,9 +944,9 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckTenant(harness::Ctx& ctx) {
-  ReadPeer& peer = readWorld(ctx);
+  HReadPeer& peer = hReadWorld(ctx);
   auto c = hReadAPI(ctx);
-  readCharged(peer, "sub_2", "2026-03-01", "2026-04-01", 9900, 9900);
+  hReadCharged(peer, "sub_2", "2026-03-01", "2026-04-01", 9900, 9900);
   const auto anonymous = c.Get("/v1/subscriptions/sub_1/invoices");
   ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id");
   const auto foreign = c.Get("/v1/subscriptions/sub_2/invoices", "X-Tenant-Id", "t-acme");
@@ -960,20 +960,20 @@ void CheckTenant(harness::Ctx& ctx) {
 }
 
 void CheckStoredInvoices(harness::Ctx& ctx) {
-  ReadPeer& peer = readWorld(ctx);
+  HReadPeer& peer = hReadWorld(ctx);
   auto c = hReadAPI(ctx);
-  const std::string prorated = readCharged(peer, "sub_1", "2026-03-01", "2026-04-01", 4790, 4790);
-  const auto invoices = readLedger(ctx, c);
+  const std::string prorated = hReadCharged(peer, "sub_1", "2026-03-01", "2026-04-01", 4790, 4790);
+  const auto invoices = hReadLedger(ctx, c);
   ctx.Assert(invoices.size() == 1 && invoices[0].value("amount_cents", 0LL) == 4790,
              "the prorated invoice %s was billed 4790 cents and the ledger reports %s: report the stored amount, not the plan price", prorated, invoices.dump());
 }
 
 void CheckCredits(harness::Ctx& ctx) {
-  ReadPeer& peer = readWorld(ctx);
+  HReadPeer& peer = hReadWorld(ctx);
   auto c = hReadAPI(ctx);
-  const std::string invoice_id = readCharged(peer, "sub_1", "2026-03-01", "2026-04-01", 9900, 9900);
+  const std::string invoice_id = hReadCharged(peer, "sub_1", "2026-03-01", "2026-04-01", 9900, 9900);
   const store::Credit credit = store::grantCredit(invoice_id, 500, "service outage");
-  const auto line = readLedger(ctx, c)[0];
+  const auto line = hReadLedger(ctx, c)[0];
   ctx.Equal(line.value("amount_cents", 0LL), 9900LL, "an invoice billed 9900 with a 500 credit: the amount stays what was billed; amount_cents");
   nlohmann::json want = nlohmann::json::array();
   want.push_back(nlohmann::json{{"credit_id", credit.credit_id}, {"amount_cents", 500}, {"reason", "service outage"}});
@@ -982,17 +982,17 @@ void CheckCredits(harness::Ctx& ctx) {
 }
 
 void CheckReconciled(harness::Ctx& ctx) {
-  ReadPeer& peer = readWorld(ctx);
+  HReadPeer& peer = hReadWorld(ctx);
   auto c = hReadAPI(ctx);
-  const std::string once = readCharged(peer, "sub_1", "2026-01-01", "2026-02-01", 9900, 9900);
+  const std::string once = hReadCharged(peer, "sub_1", "2026-01-01", "2026-02-01", 9900, 9900);
   store::grantCredit(once, 500, "service outage");
-  const std::string twice = readCharged(peer, "sub_1", "2026-02-01", "2026-03-01", 9900, 19800);
+  const std::string twice = hReadCharged(peer, "sub_1", "2026-02-01", "2026-03-01", 9900, 19800);
   const std::string unknown = store::openInvoice("sub_1", "2026-03-01", "2026-04-01", 9900).invoice_id;
   // The store still reads open (the run crashed before recording), yet the processor charged it.
   const std::string stale = store::openInvoice("sub_1", "2026-04-01", "2026-05-01", 9900).invoice_id;
   peer.charged[stale] = {"ch_" + stale, 9900};
   std::map<std::string, nlohmann::json> invoices;
-  for (const auto& i : readLedger(ctx, c)) invoices[i.value("invoice_id", "")] = i;
+  for (const auto& i : hReadLedger(ctx, c)) invoices[i.value("invoice_id", "")] = i;
   const auto tiesOut = [&](const std::string& id, long long total, bool reconciled, const std::string& what) {
     const auto& line = invoices[id];
     const bool ok = line.is_object() && line.contains("processor_total_cents") && line["processor_total_cents"] == total &&

@@ -740,20 +740,20 @@ func CheckDurableClaim(ctx *harness.Ctx) {
 
 namespace {
 
-const Handles kAda = {{"email", "ada@example.com"}, {"phone", "+442079460958"}};
-const std::string kEmailKey = "handle:email:ada@example.com";
-const std::string kPhoneKey = "handle:phone:+442079460958";
+const Handles kHAda = {{"email", "ada@example.com"}, {"phone", "+442079460958"}};
+const std::string kHEmailKey = "handle:email:ada@example.com";
+const std::string kHPhoneKey = "handle:phone:+442079460958";
 
 std::string harnessHolder(harness::Ctx& ctx, const std::string& key) { return ctx.Redis.Get(key).value_or(""); }
 
 }  // namespace
 
 void CheckClaim(harness::Ctx& ctx) {
-  ctx.Equal(claimHandles("u-1", kAda), true, "claiming two free handles must succeed; won");
-  ctx.Equal(harnessHolder(ctx, kEmailKey), "u-1", "%s must hold the owner", kEmailKey);
-  ctx.Equal(harnessHolder(ctx, kPhoneKey), "u-1", "%s must hold the owner", kPhoneKey);
+  ctx.Equal(claimHandles("u-1", kHAda), true, "claiming two free handles must succeed; won");
+  ctx.Equal(harnessHolder(ctx, kHEmailKey), "u-1", "%s must hold the owner", kHEmailKey);
+  ctx.Equal(harnessHolder(ctx, kHPhoneKey), "u-1", "%s must hold the owner", kHPhoneKey);
   ctx.Equal(ownerOf("email", "ada@example.com").value_or(""), "u-1", "ownerOf(email, ada@example.com)");
-  releaseHandles("u-1", kAda);
+  releaseHandles("u-1", kHAda);
   ctx.Assert(ctx.Redis.Keys("handle:*").empty(), "after u-1 released its own handles Redis still holds %v", ctx.Redis.Keys("handle:*"));
 }
 
@@ -765,7 +765,7 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
     std::optional<std::string> err;
   };
   auto rival = std::make_shared<Rival>();
-  ctx.Redis.After(kEmailKey, [rival] {
+  ctx.Redis.After(kHEmailKey, [rival] {
     rival->fired = true;
     try {
       rival->won = claimHandles("u-2", {{"email", "ada@example.com"}});
@@ -774,36 +774,36 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
     }
   });
   const bool won = claimHandles("u-1", {{"email", "ada@example.com"}});
-  ctx.Assert(rival->fired, "nothing touched %s", kEmailKey);
+  ctx.Assert(rival->fired, "nothing touched %s", kHEmailKey);
   ctx.Assert(!rival->err, "the rival claim failed: %s", rival->err.value_or(""));
   ctx.Assert(!(won && rival->won), "two signups for ada@example.com in the same instant both claimed it (u-1: %t, u-2: %t): a check and a separate write let both through. Claim with one SET NX", won, rival->won);
   ctx.Assert(won || rival->won, "neither of two signups for ada@example.com claimed it");
-  ctx.Equal(harnessHolder(ctx, kEmailKey), won ? "u-1" : "u-2", "%s must hold the signup whose claim succeeded", kEmailKey);
+  ctx.Equal(harnessHolder(ctx, kHEmailKey), won ? "u-1" : "u-2", "%s must hold the signup whose claim succeeded", kHEmailKey);
 }
 
 void CheckOwnerRelease(harness::Ctx& ctx) {
-  ctx.Equal(claimHandles("u-1", kAda), true, "claiming two free handles must succeed; won");
+  ctx.Equal(claimHandles("u-1", kHAda), true, "claiming two free handles must succeed; won");
   // A second signup with a new address and u-1's phone loses on the phone.
   ctx.Equal(claimHandles("u-2", {{"email", "eve@example.com"}, {"phone", "+442079460958"}}), false, "a signup with a phone u-1 holds must be refused; won");
-  ctx.Equal(harnessHolder(ctx, kPhoneKey), "u-1", "after u-2's refused signup the refused signup deleted u-1's claim (release only the handles you own); %s holds", kPhoneKey);
+  ctx.Equal(harnessHolder(ctx, kHPhoneKey), "u-1", "after u-2's refused signup the refused signup deleted u-1's claim (release only the handles you own); %s holds", kHPhoneKey);
   ctx.Equal(harnessHolder(ctx, "handle:email:eve@example.com"), "", "the refused signup must not keep its claim on eve@example.com; it holds");
-  releaseHandles("u-2", kAda);
-  ctx.Assert(harnessHolder(ctx, kEmailKey) == "u-1" && harnessHolder(ctx, kPhoneKey) == "u-1", "releaseHandles(u-2, …) deleted claims that belong to u-1");
+  releaseHandles("u-2", kHAda);
+  ctx.Assert(harnessHolder(ctx, kHEmailKey) == "u-1" && harnessHolder(ctx, kHPhoneKey) == "u-1", "releaseHandles(u-2, …) deleted claims that belong to u-1");
   ctx.Equal(claimHandles("u-3", {{"email", "zoe@example.com"}, {"phone", "+442079460958"}}), false, "a third signup must not claim the phone u-1 owns; won");
   // u-1 gives its address back while the handle changes hands: right after the release's first command on the key, u-4 holds it.
   auto handover = std::make_shared<bool>(false);
-  ctx.Redis.After(kEmailKey, [&ctx, handover] {
+  ctx.Redis.After(kHEmailKey, [&ctx, handover] {
     *handover = true;
-    ctx.Redis.Set(kEmailKey, "u-4");
+    ctx.Redis.Set(kHEmailKey, "u-4");
   });
   releaseHandles("u-1", {{"email", "ada@example.com"}});
-  ctx.Assert(*handover, "releaseHandles(u-1, …) never touched %s", kEmailKey);
-  ctx.Equal(harnessHolder(ctx, kEmailKey), "u-4", "%s passed to u-4 between the release's read and its delete; u-1's release must not delete u-4's claim (compare and delete in one script), and the key holds", kEmailKey);
+  ctx.Assert(*handover, "releaseHandles(u-1, …) never touched %s", kHEmailKey);
+  ctx.Equal(harnessHolder(ctx, kHEmailKey), "u-4", "%s passed to u-4 between the release's read and its delete; u-1's release must not delete u-4's claim (compare and delete in one script), and the key holds", kHEmailKey);
 }
 
 void CheckDurableClaim(harness::Ctx& ctx) {
-  ctx.Equal(claimHandles("u-1", kAda), true, "claiming two free handles must succeed; won");
-  for (const std::string& key : {kEmailKey, kPhoneKey}) {
+  ctx.Equal(claimHandles("u-1", kHAda), true, "claiming two free handles must succeed; won");
+  for (const std::string& key : {kHEmailKey, kHPhoneKey}) {
     const long long ttl = ctx.Redis.TTL(key);
     ctx.Assert(ttl == -1, "%s expires in %d s: once it lapses a second account can take a live account's handle. A claim lasts as long as the account", key, ttl);
   }

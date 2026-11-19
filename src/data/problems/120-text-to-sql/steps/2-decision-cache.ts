@@ -971,9 +971,9 @@ import (
 	"leetbuild/harness"
 )
 
-const decisionsQuestion = "Trips in Seattle last week"
+const kHDecisionsQuestion = "Trips in Seattle last week"
 
-func decisionsPicker() (TablePicker, *int) {
+func hDecisionsPicker() (TablePicker, *int) {
 	picks := 0
 	return func(_ context.Context, question, workspace string) ([]string, error) {
 		picks++
@@ -981,35 +981,35 @@ func decisionsPicker() (TablePicker, *int) {
 	}, &picks
 }
 
-func decisionsTables(ctx *harness.Ctx, workspace, question string, pick TablePicker) []string {
+func hDecisionsTables(ctx *harness.Ctx, workspace, question string, pick TablePicker) []string {
 	tables, err := tablesFor(context.Background(), workspace, question, pick)
 	ctx.NoError(err, "tablesFor(%q, %q)", workspace, question)
 	return tables
 }
 
-func decisionsReserve(ctx *harness.Ctx, user string) (bool, int64) {
+func hDecisionsReserve(ctx *harness.Ctx, user string) (bool, int64) {
 	allowed, retryAfter, err := reserve(context.Background(), user)
 	ctx.NoError(err, "reserve(%q)", user)
 	return allowed, retryAfter
 }
 
 func CheckNormalisedKey(ctx *harness.Ctx) {
-	pick, picks := decisionsPicker()
-	first := decisionsTables(ctx, "mobility", decisionsQuestion, pick)
+	pick, picks := hDecisionsPicker()
+	first := hDecisionsTables(ctx, "mobility", kHDecisionsQuestion, pick)
 	ctx.Equal(first, []string{"trips", "drivers"}, "a miss returns the table agent's pick")
-	again := decisionsTables(ctx, "mobility", "  trips IN seattle\\tlast   week ", pick)
+	again := hDecisionsTables(ctx, "mobility", "  trips IN seattle\\tlast   week ", pick)
 	ctx.Equal(*picks, 1, "the same question with other capitals and spacing asked the table agent again (normalise before you hash); picks")
 	ctx.Equal(again, first, "the cache hit must return the cached tables")
 	sum := sha256.Sum256([]byte("trips in seattle last week"))
 	key := "decision:mobility:" + hex.EncodeToString(sum[:])
 	_, ok := ctx.Redis.Get(key)
 	ctx.Assert(ok, "the decision must live at decision:{workspace}:{sha256 of the normalised question}, keys are %v", ctx.Redis.Keys("decision:*"))
-	ads := decisionsTables(ctx, "ads", decisionsQuestion, pick)
+	ads := hDecisionsTables(ctx, "ads", kHDecisionsQuestion, pick)
 	ctx.Assert(*picks == 2 && len(ads) == 1 && ads[0] == "ad_campaigns", "an Ads question must not read Mobility's decision: %d picks, tables %v", *picks, ads)
 }
 
 func CheckDecisionTtl(ctx *harness.Ctx) {
-	pick, picks := decisionsPicker()
+	pick, picks := hDecisionsPicker()
 	sum := sha256.Sum256([]byte("trips in seattle last week"))
 	key := "decision:mobility:" + hex.EncodeToString(sum[:])
 	watched, fired, written := false, false, int64(0)
@@ -1024,32 +1024,32 @@ func CheckDecisionTtl(ctx *harness.Ctx) {
 		}
 		return pick(c, question, workspace)
 	}
-	decisionsTables(ctx, "mobility", decisionsQuestion, pickAndWatch)
+	hDecisionsTables(ctx, "mobility", kHDecisionsQuestion, pickAndWatch)
 	keys := ctx.Redis.Keys("decision:*")
 	ctx.Equal(len(keys), 1, "one question, one decision entry; entries")
 	ttl := ctx.Redis.TTL(keys[0])
 	ctx.Assert(ttl > 86000 && ttl <= 86400, "the decision has TTL %d: it must expire after 86400 s", ttl)
 	ctx.Assert(fired, "the decision was never written to %s", key)
 	ctx.Assert(written > 86000 && written <= 86400, "right after the decision was written its TTL was %d: write it with its expiry in the same command, or a crash in between leaves it forever", written)
-	decisionsTables(ctx, "mobility", decisionsQuestion, pick)
+	hDecisionsTables(ctx, "mobility", kHDecisionsQuestion, pick)
 	ctx.Equal(*picks, 1, "within the day the decision is served from the cache; picks")
 	ctx.Clock.Advance(43200)
-	decisionsTables(ctx, "mobility", decisionsQuestion, pick)
+	hDecisionsTables(ctx, "mobility", kHDecisionsQuestion, pick)
 	ctx.Equal(*picks, 1, "half a day later the decision is still served from the cache; picks")
 	ctx.Clock.Advance(43201)
-	decisionsTables(ctx, "mobility", decisionsQuestion, pick)
+	hDecisionsTables(ctx, "mobility", kHDecisionsQuestion, pick)
 	ctx.Equal(*picks, 2, "a day after it was written the table agent must be asked again, however often the entry was read (the workspace may have been re-curated); picks")
 }
 
 func CheckAtomicBudget(ctx *harness.Ctx) {
-	allowed, _ := decisionsReserve(ctx, "ana")
+	allowed, _ := hDecisionsReserve(ctx, "ana")
 	ctx.Assert(allowed, "a user's first query is within budget")
 	used, _ := ctx.Redis.Get("budget:ana")
 	ctx.Equal(used, "1", "budget:ana")
 	ttl := ctx.Redis.TTL("budget:ana")
 	ctx.Assert(ttl > 0 && ttl <= 3600, "budget:ana has TTL %d: the window must expire 3600 s after the first query, or the user is locked out for good", ttl)
 	ctx.Clock.Advance(1800)
-	allowed, _ = decisionsReserve(ctx, "ana")
+	allowed, _ = hDecisionsReserve(ctx, "ana")
 	used, _ = ctx.Redis.Get("budget:ana")
 	ctx.Assert(allowed && used == "2", "ana's second query counts 2, holds %q", used)
 	ttl = ctx.Redis.TTL("budget:ana")
@@ -1059,7 +1059,7 @@ func CheckAtomicBudget(ctx *harness.Ctx) {
 		eveFired, eveTTL = true, ctx.Redis.TTL("budget:eve")
 		return nil
 	})
-	allowed, _ = decisionsReserve(ctx, "eve")
+	allowed, _ = hDecisionsReserve(ctx, "eve")
 	ctx.Assert(allowed && eveFired, "eve's first query is within budget and touches budget:eve")
 	ctx.Assert(eveTTL > 0 && eveTTL <= 3600, "right after the command that created budget:eve its TTL was %d: the EXPIRE belongs in the same script, or a crash in between locks eve out for good", eveTTL)
 	ctx.Redis.Set("budget:bo", 49, "EX", 1800)
@@ -1075,7 +1075,7 @@ func CheckAtomicBudget(ctx *harness.Ctx) {
 		other = true
 		return nil
 	})
-	mine, _ := decisionsReserve(ctx, "bo")
+	mine, _ := hDecisionsReserve(ctx, "bo")
 	ctx.Assert(fired, "reserve never touched budget:bo")
 	winners := 0
 	for _, won := range []bool{mine, other} {
@@ -1087,22 +1087,22 @@ func CheckAtomicBudget(ctx *harness.Ctx) {
 	bo, _ := ctx.Redis.Get("budget:bo")
 	ctx.Equal(bo, "50", "budget:bo must stop at 50")
 	ctx.Clock.Advance(1801)
-	allowed, _ = decisionsReserve(ctx, "ana")
+	allowed, _ = hDecisionsReserve(ctx, "ana")
 	used, _ = ctx.Redis.Get("budget:ana")
 	ctx.Assert(allowed && used == "1", "after the hour the window starts over at 1, holds %q", used)
 }
 
 func CheckBudgetFirst(ctx *harness.Ctx) {
-	pick, picks := decisionsPicker()
+	pick, picks := hDecisionsPicker()
 	ctx.Redis.Set("budget:cy", 50, "EX", 1200)
-	out, err := propose(context.Background(), "cy", "mobility", decisionsQuestion, pick)
+	out, err := propose(context.Background(), "cy", "mobility", kHDecisionsQuestion, pick)
 	ctx.NoError(err, "propose for cy")
 	ctx.Equal(out.Status, "over_budget", "a user at 50 queries")
 	ctx.Equal(*picks, 0, "the table agent was called for a user already over budget (reserve before the agent call); picks")
 	ctx.Assert(out.RetryAfter >= 1190 && out.RetryAfter <= 1200, "RetryAfter must be the window's TTL (about 1200 s), got %d", out.RetryAfter)
 	cy, _ := ctx.Redis.Get("budget:cy")
 	ctx.Equal(cy, "50", "a refused query must not count; budget:cy")
-	out, err = propose(context.Background(), "dee", "mobility", decisionsQuestion, pick)
+	out, err = propose(context.Background(), "dee", "mobility", kHDecisionsQuestion, pick)
 	ctx.NoError(err, "propose for dee")
 	ctx.Assert(out.Status == "proposed" && len(out.Tables) == 2 && out.Tables[0] == "trips", "a user within budget gets the proposal, got %+v", out)
 	dee, _ := ctx.Redis.Get("budget:dee")

@@ -928,26 +928,26 @@ import (
 	"leetbuild/harness"
 )
 
-const classifiedGroup = "metadata-store"
+const kHClassifiedGroup = "metadata-store"
 
-var classifiedTags = map[string]string{"passport_no": "Personal.ID", "merchant_id": "None"}
+var hClassifiedTags = map[string]string{"passport_no": "Personal.ID", "merchant_id": "None"}
 
-func classifiedPublish(ctx *harness.Ctx, entity string, version int64, tier int, tags map[string]string) bool {
+func hClassifiedPublish(ctx *harness.Ctx, entity string, version int64, tier int, tags map[string]string) bool {
 	ok, err := publishClassified(context.Background(), entity, tier, tags, "team-logistics", version)
 	ctx.NoError(err, "publishClassified(%s, version %d)", entity, version)
 	return ok
 }
 
-type classifiedRow struct {
+type HClassifiedRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func classifiedOutbox(ctx *harness.Ctx) []classifiedRow {
-	var rows []classifiedRow
+func hClassifiedOutbox(ctx *harness.Ctx) []HClassifiedRow {
+	var rows []HClassifiedRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row classifiedRow
+		var row HClassifiedRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -955,9 +955,9 @@ func classifiedOutbox(ctx *harness.Ctx) []classifiedRow {
 }
 
 func CheckEntityKey(ctx *harness.Ctx) {
-	classifiedPublish(ctx, "deliveries", 1, 1, classifiedTags)
-	classifiedPublish(ctx, "orders", 1, 4, map[string]string{"order_id": "None"})
-	classifiedPublish(ctx, "deliveries", 2, 1, classifiedTags)
+	hClassifiedPublish(ctx, "deliveries", 1, 1, hClassifiedTags)
+	hClassifiedPublish(ctx, "orders", 1, 4, map[string]string{"order_id": "None"})
+	hClassifiedPublish(ctx, "deliveries", 2, 1, hClassifiedTags)
 	ctx.Settle()
 	records := ctx.Kafka.Records(classifiedTopic)
 	ctx.Equal(ctx.Kafka.Keys(classifiedTopic), []string{"deliveries", "orders", "deliveries"}, "the records must be keyed by entity: one table's versions share a key")
@@ -969,11 +969,11 @@ func CheckEntityKey(ctx *harness.Ctx) {
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
 	ctx.Kafka.LoseAcks(classifiedTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	ok := classifiedPublish(ctx, "deliveries", 1, 1, classifiedTags)
+	ok := hClassifiedPublish(ctx, "deliveries", 1, 1, hClassifiedTags)
 	ctx.Settle()
 	ctx.Equal(ok, true, "publishClassified's result for an event the broker took")
 	ctx.Equal(len(ctx.Kafka.Records(classifiedTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	classifiedPublish(ctx, "deliveries", 2, 1, classifiedTags)
+	hClassifiedPublish(ctx, "deliveries", 2, 1, hClassifiedTags)
 	ctx.Settle()
 	ctx.Kafka.Failover(classifiedTopic) // the partition leader dies right after acknowledging
 	ctx.Equal(len(ctx.Kafka.Records(classifiedTopic)), 2, "a leader failover must not lose an acknowledged event (acks=all); the records")
@@ -981,32 +981,32 @@ func CheckIdempotentAcks(ctx *harness.Ctx) {
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	ctx.Kafka.FailNext(classifiedTopic, 1)
-	ok := classifiedPublish(ctx, "deliveries", 1, 1, classifiedTags)
+	ok := hClassifiedPublish(ctx, "deliveries", 1, 1, hClassifiedTags)
 	ctx.Settle()
-	rows := classifiedOutbox(ctx)
+	rows := hClassifiedOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker failed the delivery: without an outbox row the tier change is gone from the metadata store; the rows")
 	ctx.Assert(rows[0].Topic == classifiedTopic && rows[0].Key == "deliveries" && rows[0].Payload["version"] == float64(1), "the outbox row is %v, expected the topic, the entity as key and the payload", rows[0])
 	ctx.Equal(rows[0].Payload, map[string]any{"entity": "deliveries", "tier": float64(1), "tags": map[string]any{"passport_no": "Personal.ID", "merchant_id": "None"}, "verified_by": "team-logistics", "version": float64(1)}, "the outbox row must carry the whole event as its payload")
 	ctx.Equal(ok, false, "publishClassified's result after a failed delivery")
 	ctx.Kafka.StallFor(classifiedTopic, 3) // a slow broker: the acknowledgement comes after 3 s, inside the window
-	ok = classifiedPublish(ctx, "deliveries", 2, 1, classifiedTags)
+	ok = hClassifiedPublish(ctx, "deliveries", 2, 1, hClassifiedTags)
 	ctx.Settle()
-	ctx.Assert(ok && len(classifiedOutbox(ctx)) == 1, "a broker that acknowledged after 3 s got publishClassified returning %v with %d new outbox row(s): wait up to 5 s for the report", ok, len(classifiedOutbox(ctx))-1)
+	ctx.Assert(ok && len(hClassifiedOutbox(ctx)) == 1, "a broker that acknowledged after 3 s got publishClassified returning %v with %d new outbox row(s): wait up to 5 s for the report", ok, len(hClassifiedOutbox(ctx))-1)
 	ctx.Equal(len(ctx.Kafka.Records(classifiedTopic)), 1, "the slowly acknowledged event must be on the topic; records")
 	ctx.Kafka.Stall(classifiedTopic) // the broker stops answering
 	started := ctx.Clock.Now()
-	ok = classifiedPublish(ctx, "deliveries", 3, 1, classifiedTags)
+	ok = hClassifiedPublish(ctx, "deliveries", 3, 1, hClassifiedTags)
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(waited <= 6, "publishClassified waited %.0f s on a broker that does not answer, expected at most 5", waited)
 	ctx.Settle()
-	rows = classifiedOutbox(ctx)
+	rows = hClassifiedOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["version"] == float64(3), "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishClassified's result without a delivery report")
 }
 
 func CheckVersionGuard(ctx *harness.Ctx) {
 	// payments is at version 5 in the catalogue already, from before this consumer started.
-	tagsJSON, _ := json.Marshal(classifiedTags)
+	tagsJSON, _ := json.Marshal(hClassifiedTags)
 	ctx.Redis.Do("HSET", "catalog:payments", "tier", 1, "tags", string(tagsJSON), "version", 5)
 	events := []struct {
 		entity        string
@@ -1019,7 +1019,7 @@ func CheckVersionGuard(ctx *harness.Ctx) {
 		{"payments", 4, 4},
 	}
 	for _, e := range events {
-		event, _ := json.Marshal(map[string]any{"entity": e.entity, "tier": e.tier, "tags": classifiedTags, "verified_by": "team-logistics", "version": e.version})
+		event, _ := json.Marshal(map[string]any{"entity": e.entity, "tier": e.tier, "tags": hClassifiedTags, "verified_by": "team-logistics", "version": e.version})
 		ctx.Kafka.SeedPartition(classifiedTopic, 0, e.entity, event)
 	}
 	var atCommit []string
@@ -1042,7 +1042,7 @@ func CheckVersionGuard(ctx *harness.Ctx) {
 	ctx.Assert(orders["version"] == "1" && orders["tier"] == "3", "orders version 1, the first of another table, left the catalogue at %v: versions are compared per entity", orders)
 	payments := ctx.Redis.HGetAll("catalog:payments")
 	ctx.Assert(payments["version"] == "5" && payments["tier"] == "1", "payments version 4 arrived with the catalogue already at version 5 and left %v: compare with store.CatalogVersion, what the metadata store holds", payments)
-	ctx.Equal(ctx.Kafka.Lag(classifiedGroup, classifiedTopic), 0, "a skipped version must be committed too; records left")
+	ctx.Equal(ctx.Kafka.Lag(kHClassifiedGroup, classifiedTopic), 0, "a skipped version must be committed too; records left")
 }
 `,
     cpp: `#include <leetbuild/harness.h>

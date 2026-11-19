@@ -736,13 +736,13 @@ import (
 )
 
 const (
-	apiTrace = "4bf92f3577b34da6a3ce929d0e0e4736"
-	apiRoot  = "00f067aa0ba902b7"
-	apiChild = "00f067aa0ba902b8"
+	kHApiTrace = "4bf92f3577b34da6a3ce929d0e0e4736"
+	kHApiRoot  = "00f067aa0ba902b7"
+	kHApiChild = "00f067aa0ba902b8"
 )
 
-func apiSpan(over map[string]any) map[string]any {
-	span := map[string]any{"trace_id": apiTrace, "span_id": apiRoot, "parent_span_id": "", "service": "checkout", "start_ms": 1712345678901, "duration_ms": 412}
+func hApiSpan(over map[string]any) map[string]any {
+	span := map[string]any{"trace_id": kHApiTrace, "span_id": kHApiRoot, "parent_span_id": "", "service": "checkout", "start_ms": 1712345678901, "duration_ms": 412}
 	for k, v := range over {
 		span[k] = v
 	}
@@ -759,20 +759,20 @@ func hPost(c *harness.HTTP, body map[string]any) *harness.Response {
 	return c.Post("/v1/spans", body, "X-Tenant-Id", "acme")
 }
 
-func nothingStored(ctx *harness.Ctx, why string) {
+func hNothingStored(ctx *harness.Ctx, why string) {
 	keys := ctx.Redis.Keys("trace:*")
 	ctx.Assert(len(keys) == 0, "%s, yet Redis now holds %q: a rejection must be answered before InsertSpan", why, keys)
 }
 
-func loadAPITrace(ctx *harness.Ctx) *assembly.Trace {
-	trace, err := assembly.LoadTrace(context.Background(), apiTrace)
-	ctx.NoError(err, "LoadTrace(%s)", apiTrace)
+func hLoadAPITrace(ctx *harness.Ctx) *assembly.Trace {
+	trace, err := assembly.LoadTrace(context.Background(), kHApiTrace)
+	ctx.NoError(err, "LoadTrace(%s)", kHApiTrace)
 	return trace
 }
 
 func CheckRoute(ctx *harness.Ctx) {
 	c := hAPI(ctx)
-	r := hPost(c, apiSpan(nil))
+	r := hPost(c, hApiSpan(nil))
 	ctx.Equal(r.Status, 202, "POST /v1/spans with a valid root span (%s)", r.Text())
 	var body struct {
 		SpanID    string \`json:"span_id"\`
@@ -780,29 +780,29 @@ func CheckRoute(ctx *harness.Ctx) {
 		Count     int    \`json:"count"\`
 	}
 	r.Decode(&body)
-	ctx.Assert(body.SpanID == apiRoot && body.Duplicate != nil && !*body.Duplicate && body.Count == 1, "the 202 must report the span as new, count 1; got %s", r.Text())
-	r = hPost(c, apiSpan(map[string]any{"span_id": apiChild, "parent_span_id": apiRoot, "service": "payments", "start_ms": 1712345678950, "duration_ms": 120}))
+	ctx.Assert(body.SpanID == kHApiRoot && body.Duplicate != nil && !*body.Duplicate && body.Count == 1, "the 202 must report the span as new, count 1; got %s", r.Text())
+	r = hPost(c, hApiSpan(map[string]any{"span_id": kHApiChild, "parent_span_id": kHApiRoot, "service": "payments", "start_ms": 1712345678950, "duration_ms": 120}))
 	ctx.Equal(r.Status, 202, "a valid child span (%s)", r.Text())
-	trace := loadAPITrace(ctx)
+	trace := hLoadAPITrace(ctx)
 	ctx.Assert(trace != nil && trace.Owner == "acme", "the trace must be stored for tenant acme, Redis holds %+v", trace)
 	ids := []string{}
 	for _, s := range trace.Spans {
 		ids = append(ids, s.SpanID)
 	}
-	ctx.Equal(ids, []string{apiRoot, apiChild}, "both spans must be stored; the span ids")
+	ctx.Equal(ids, []string{kHApiRoot, kHApiChild}, "both spans must be stored; the span ids")
 }
 
 func CheckTenantRequired(ctx *harness.Ctx) {
 	c := hAPI(ctx)
-	r := c.Post("/v1/spans", apiSpan(nil))
+	r := c.Post("/v1/spans", hApiSpan(nil))
 	ctx.Equal(r.Status, 401, "a span with X-Tenant-Id missing must be refused (%s)", r.Text())
-	nothingStored(ctx, "the span had no tenant")
-	r = c.Post("/v1/spans", apiSpan(nil), "X-Tenant-Id", "")
+	hNothingStored(ctx, "the span had no tenant")
+	r = c.Post("/v1/spans", hApiSpan(nil), "X-Tenant-Id", "")
 	ctx.Equal(r.Status, 401, "a span with X-Tenant-Id empty must be refused (%s)", r.Text())
-	nothingStored(ctx, "the span had no tenant")
-	r = hPost(c, apiSpan(nil))
+	hNothingStored(ctx, "the span had no tenant")
+	r = hPost(c, hApiSpan(nil))
 	ctx.Equal(r.Status, 202, "the same span with X-Tenant-Id acme (%s)", r.Text())
-	ctx.Equal(loadAPITrace(ctx).Owner, "acme", "the trace must belong to the tenant that sent it; its owner")
+	ctx.Equal(hLoadAPITrace(ctx).Owner, "acme", "the trace must belong to the tenant that sent it; its owner")
 }
 
 func CheckIdShape(ctx *harness.Ctx) {
@@ -811,32 +811,32 @@ func CheckIdShape(ctx *harness.Ctx) {
 		why  string
 		body map[string]any
 	}{
-		{"a trace id one character short", apiSpan(map[string]any{"trace_id": apiTrace[:31]})},
-		{"a trace id one character long", apiSpan(map[string]any{"trace_id": apiTrace + "0"})},
-		{"a trace id with a trailing newline", apiSpan(map[string]any{"trace_id": apiTrace + "\\n"})},
-		{"an uppercase trace id", apiSpan(map[string]any{"trace_id": strings.ToUpper(apiTrace)})},
-		{"a span id of 15 characters", apiSpan(map[string]any{"span_id": apiRoot[:15]})},
-		{"a span id of 17 characters", apiSpan(map[string]any{"span_id": apiRoot + "0"})},
-		{"a span id with a non-hex character", apiSpan(map[string]any{"span_id": "00f067aa0ba902bz"})},
-		{"a parent id that is not a span id", apiSpan(map[string]any{"span_id": apiChild, "parent_span_id": "root"})},
-		{"an uppercase parent id of 16 characters", apiSpan(map[string]any{"span_id": apiChild, "parent_span_id": strings.ToUpper(apiRoot)})},
-		{"a parent id of 17 characters", apiSpan(map[string]any{"span_id": apiChild, "parent_span_id": apiRoot + "0"})},
+		{"a trace id one character short", hApiSpan(map[string]any{"trace_id": kHApiTrace[:31]})},
+		{"a trace id one character long", hApiSpan(map[string]any{"trace_id": kHApiTrace + "0"})},
+		{"a trace id with a trailing newline", hApiSpan(map[string]any{"trace_id": kHApiTrace + "\\n"})},
+		{"an uppercase trace id", hApiSpan(map[string]any{"trace_id": strings.ToUpper(kHApiTrace)})},
+		{"a span id of 15 characters", hApiSpan(map[string]any{"span_id": kHApiRoot[:15]})},
+		{"a span id of 17 characters", hApiSpan(map[string]any{"span_id": kHApiRoot + "0"})},
+		{"a span id with a non-hex character", hApiSpan(map[string]any{"span_id": "00f067aa0ba902bz"})},
+		{"a parent id that is not a span id", hApiSpan(map[string]any{"span_id": kHApiChild, "parent_span_id": "root"})},
+		{"an uppercase parent id of 16 characters", hApiSpan(map[string]any{"span_id": kHApiChild, "parent_span_id": strings.ToUpper(kHApiRoot)})},
+		{"a parent id of 17 characters", hApiSpan(map[string]any{"span_id": kHApiChild, "parent_span_id": kHApiRoot + "0"})},
 	}
 	for _, b := range bad {
 		r := hPost(c, b.body)
 		ctx.Equal(r.Status, 422, "%s must be refused (%s)", b.why, r.Text())
-		nothingStored(ctx, b.why+" was refused")
+		hNothingStored(ctx, b.why+" was refused")
 	}
-	r := hPost(c, apiSpan(nil))
+	r := hPost(c, hApiSpan(nil))
 	ctx.Equal(r.Status, 202, "a well-formed root span (%s)", r.Text())
 }
 
 func CheckSelfParent(ctx *harness.Ctx) {
 	c := hAPI(ctx)
-	r := hPost(c, apiSpan(map[string]any{"span_id": apiChild, "parent_span_id": apiChild}))
+	r := hPost(c, hApiSpan(map[string]any{"span_id": kHApiChild, "parent_span_id": kHApiChild}))
 	ctx.Equal(r.Status, 422, "a span whose parent_span_id is its own span_id must be refused (%s)", r.Text())
-	nothingStored(ctx, "the span named itself as its parent")
-	r = hPost(c, apiSpan(map[string]any{"span_id": apiChild, "parent_span_id": apiRoot}))
+	hNothingStored(ctx, "the span named itself as its parent")
+	r = hPost(c, hApiSpan(map[string]any{"span_id": kHApiChild, "parent_span_id": kHApiRoot}))
 	ctx.Equal(r.Status, 202, "a child of another span (%s)", r.Text())
 }
 
@@ -846,19 +846,19 @@ func CheckDurationRange(ctx *harness.Ctx) {
 		why   string
 		value any
 	}{{"a negative duration_ms", -5}, {"412 ms sent in nanoseconds", 412000000}, {"one millisecond over 30 minutes", 1800001}, {"a fractional duration_ms", 412.5}} {
-		r := hPost(c, apiSpan(map[string]any{"duration_ms": b.value}))
+		r := hPost(c, hApiSpan(map[string]any{"duration_ms": b.value}))
 		ctx.Equal(r.Status, 422, "%s (%v) must be refused (%s)", b.why, b.value, r.Text())
-		nothingStored(ctx, b.why+" was refused")
+		hNothingStored(ctx, b.why+" was refused")
 	}
-	r := hPost(c, apiSpan(map[string]any{"duration_ms": 1800000}))
+	r := hPost(c, hApiSpan(map[string]any{"duration_ms": 1800000}))
 	ctx.Equal(r.Status, 202, "duration_ms 1800000 (exactly 30 minutes) (%s)", r.Text())
-	r = hPost(c, apiSpan(map[string]any{"span_id": apiChild, "parent_span_id": apiRoot, "duration_ms": 0}))
+	r = hPost(c, hApiSpan(map[string]any{"span_id": kHApiChild, "parent_span_id": kHApiRoot, "duration_ms": 0}))
 	ctx.Equal(r.Status, 202, "duration_ms 0 (a span that took under a millisecond) (%s)", r.Text())
 	durations := map[string]int64{}
-	for _, s := range loadAPITrace(ctx).Spans {
+	for _, s := range hLoadAPITrace(ctx).Spans {
 		durations[s.SpanID] = s.DurationMs
 	}
-	ctx.Equal(durations, map[string]int64{apiRoot: 1800000, apiChild: 0}, "the stored durations must be the ones sent; duration_ms by span")
+	ctx.Equal(durations, map[string]int64{kHApiRoot: 1800000, kHApiChild: 0}, "the stored durations must be the ones sent; duration_ms by span")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -874,12 +874,12 @@ func CheckDurationRange(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTrace = "4bf92f3577b34da6a3ce929d0e0e4736";
-const std::string kRoot = "00f067aa0ba902b7";
-const std::string kChild = "00f067aa0ba902b8";
+const std::string kHTrace = "4bf92f3577b34da6a3ce929d0e0e4736";
+const std::string kHRoot = "00f067aa0ba902b7";
+const std::string kHChild = "00f067aa0ba902b8";
 
 nlohmann::json hSpan(const nlohmann::json& over = nlohmann::json::object()) {
-  nlohmann::json s = {{"trace_id", kTrace}, {"span_id", kRoot}, {"parent_span_id", ""}, {"service", "checkout"}, {"start_ms", 1712345678901LL}, {"duration_ms", 412}};
+  nlohmann::json s = {{"trace_id", kHTrace}, {"span_id", kHRoot}, {"parent_span_id", ""}, {"service", "checkout"}, {"start_ms", 1712345678901LL}, {"duration_ms", 412}};
   s.update(over);
   return s;
 }
@@ -896,7 +896,7 @@ harness::Response hPost(harness::HTTP& c, const nlohmann::json& body) {
   return c.Post("/v1/spans", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme");
 }
 
-void nothingStored(harness::Ctx& ctx, const std::string& why) {
+void hNothingStored(harness::Ctx& ctx, const std::string& why) {
   const auto keys = ctx.Redis.Keys("trace:*");
   ctx.Assert(keys.empty(), "%s, yet Redis now holds %q: a rejection must be answered before insertSpan", why, keys);
 }
@@ -908,52 +908,52 @@ void CheckRoute(harness::Ctx& ctx) {
   auto r = hPost(c, hSpan());
   ctx.Equal(r.Status, 202, "POST /v1/spans with a valid root span (%s)", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
-  ctx.Assert(body.is_object() && body.value("span_id", "") == kRoot && body.value("duplicate", true) == false && body.value("count", 0) == 1,
+  ctx.Assert(body.is_object() && body.value("span_id", "") == kHRoot && body.value("duplicate", true) == false && body.value("count", 0) == 1,
              "the 202 must report the span as new, count 1; got %s", r.Text());
-  r = hPost(c, hSpan({{"span_id", kChild}, {"parent_span_id", kRoot}, {"service", "payments"}, {"start_ms", 1712345678950LL}, {"duration_ms", 120}}));
+  r = hPost(c, hSpan({{"span_id", kHChild}, {"parent_span_id", kHRoot}, {"service", "payments"}, {"start_ms", 1712345678950LL}, {"duration_ms", 120}}));
   ctx.Equal(r.Status, 202, "a valid child span (%s)", r.Text());
-  const auto trace = assembly::loadTrace(kTrace);
+  const auto trace = assembly::loadTrace(kHTrace);
   ctx.Assert(trace && trace->owner == "acme", "the trace must be stored for tenant acme, its owner is %q", trace ? trace->owner : "");
   std::vector<std::string> ids;
   for (const auto& s : trace->spans) ids.push_back(s.span_id);
-  ctx.Equal(ids, {kRoot, kChild}, "both spans must be stored; the span ids");
+  ctx.Equal(ids, {kHRoot, kHChild}, "both spans must be stored; the span ids");
 }
 
 void CheckTenantRequired(harness::Ctx& ctx) {
   auto c = hApi(ctx);
   auto r = c.Post("/v1/spans", hSpan().dump(), "Content-Type", "application/json");
   ctx.Equal(r.Status, 401, "a span with X-Tenant-Id missing must be refused (%s)", r.Text());
-  nothingStored(ctx, "the span had no tenant");
+  hNothingStored(ctx, "the span had no tenant");
   r = c.Post("/v1/spans", hSpan().dump(), "Content-Type", "application/json", "X-Tenant-Id", "");
   ctx.Equal(r.Status, 401, "a span with X-Tenant-Id empty must be refused (%s)", r.Text());
-  nothingStored(ctx, "the span had no tenant");
+  hNothingStored(ctx, "the span had no tenant");
   r = hPost(c, hSpan());
   ctx.Equal(r.Status, 202, "the same span with X-Tenant-Id acme (%s)", r.Text());
-  ctx.Equal(assembly::loadTrace(kTrace)->owner, "acme", "the trace must belong to the tenant that sent it; its owner");
+  ctx.Equal(assembly::loadTrace(kHTrace)->owner, "acme", "the trace must belong to the tenant that sent it; its owner");
 }
 
 void CheckIdShape(harness::Ctx& ctx) {
   auto c = hApi(ctx);
-  std::string upper = kTrace;
+  std::string upper = kHTrace;
   for (char& ch : upper) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-  std::string upperRoot = kRoot;
+  std::string upperRoot = kHRoot;
   for (char& ch : upperRoot) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
   const std::vector<std::pair<std::string, nlohmann::json>> bad = {
-      {"a trace id one character short", hSpan({{"trace_id", kTrace.substr(0, 31)}})},
-      {"a trace id one character long", hSpan({{"trace_id", kTrace + "0"}})},
-      {"a trace id with a trailing newline", hSpan({{"trace_id", kTrace + "\\n"}})},
+      {"a trace id one character short", hSpan({{"trace_id", kHTrace.substr(0, 31)}})},
+      {"a trace id one character long", hSpan({{"trace_id", kHTrace + "0"}})},
+      {"a trace id with a trailing newline", hSpan({{"trace_id", kHTrace + "\\n"}})},
       {"an uppercase trace id", hSpan({{"trace_id", upper}})},
-      {"a span id of 15 characters", hSpan({{"span_id", kRoot.substr(0, 15)}})},
-      {"a span id of 17 characters", hSpan({{"span_id", kRoot + "0"}})},
+      {"a span id of 15 characters", hSpan({{"span_id", kHRoot.substr(0, 15)}})},
+      {"a span id of 17 characters", hSpan({{"span_id", kHRoot + "0"}})},
       {"a span id with a non-hex character", hSpan({{"span_id", "00f067aa0ba902bz"}})},
-      {"a parent id that is not a span id", hSpan({{"span_id", kChild}, {"parent_span_id", "root"}})},
-      {"an uppercase parent id of 16 characters", hSpan({{"span_id", kChild}, {"parent_span_id", upperRoot}})},
-      {"a parent id of 17 characters", hSpan({{"span_id", kChild}, {"parent_span_id", kRoot + "0"}})},
+      {"a parent id that is not a span id", hSpan({{"span_id", kHChild}, {"parent_span_id", "root"}})},
+      {"an uppercase parent id of 16 characters", hSpan({{"span_id", kHChild}, {"parent_span_id", upperRoot}})},
+      {"a parent id of 17 characters", hSpan({{"span_id", kHChild}, {"parent_span_id", kHRoot + "0"}})},
   };
   for (const auto& [why, body] : bad) {
     const auto r = hPost(c, body);
     ctx.Equal(r.Status, 422, "%s must be refused (%s)", why, r.Text());
-    nothingStored(ctx, why + " was refused");
+    hNothingStored(ctx, why + " was refused");
   }
   const auto r = hPost(c, hSpan());
   ctx.Equal(r.Status, 202, "a well-formed root span (%s)", r.Text());
@@ -961,10 +961,10 @@ void CheckIdShape(harness::Ctx& ctx) {
 
 void CheckSelfParent(harness::Ctx& ctx) {
   auto c = hApi(ctx);
-  auto r = hPost(c, hSpan({{"span_id", kChild}, {"parent_span_id", kChild}}));
+  auto r = hPost(c, hSpan({{"span_id", kHChild}, {"parent_span_id", kHChild}}));
   ctx.Equal(r.Status, 422, "a span whose parent_span_id is its own span_id must be refused (%s)", r.Text());
-  nothingStored(ctx, "the span named itself as its parent");
-  r = hPost(c, hSpan({{"span_id", kChild}, {"parent_span_id", kRoot}}));
+  hNothingStored(ctx, "the span named itself as its parent");
+  r = hPost(c, hSpan({{"span_id", kHChild}, {"parent_span_id", kHRoot}}));
   ctx.Equal(r.Status, 202, "a child of another span (%s)", r.Text());
 }
 
@@ -975,17 +975,17 @@ void CheckDurationRange(harness::Ctx& ctx) {
   for (const auto& [why, value] : bad) {
     const auto r = hPost(c, hSpan({{"duration_ms", value}}));
     ctx.Equal(r.Status, 422, "%s (%s) must be refused (%s)", why, value.dump(), r.Text());
-    nothingStored(ctx, why + " was refused");
+    hNothingStored(ctx, why + " was refused");
   }
   auto r = hPost(c, hSpan({{"duration_ms", 1800000}}));
   ctx.Equal(r.Status, 202, "duration_ms 1800000 (exactly 30 minutes) (%s)", r.Text());
-  r = hPost(c, hSpan({{"span_id", kChild}, {"parent_span_id", kRoot}, {"duration_ms", 0}}));
+  r = hPost(c, hSpan({{"span_id", kHChild}, {"parent_span_id", kHRoot}, {"duration_ms", 0}}));
   ctx.Equal(r.Status, 202, "duration_ms 0 (a span that took under a millisecond) (%s)", r.Text());
-  const auto stored = assembly::loadTrace(kTrace);
+  const auto stored = assembly::loadTrace(kHTrace);
   ctx.Assert(stored.has_value(), "the trace must be stored after the accepted spans");
   std::map<std::string, long long> durations;
   for (const auto& s : stored->spans) durations[s.span_id] = s.duration_ms;
-  ctx.Equal(durations, std::map<std::string, long long>{{kRoot, 1800000}, {kChild, 0}}, "the stored durations must be the ones sent; duration_ms by span");
+  ctx.Equal(durations, std::map<std::string, long long>{{kHRoot, 1800000}, {kHChild, 0}}, "the stored durations must be the ones sent; duration_ms by span");
 }
 `,
   },

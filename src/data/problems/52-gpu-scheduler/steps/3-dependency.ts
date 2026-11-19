@@ -1089,14 +1089,14 @@ import (
 )
 
 const (
-	clientInfer   = "registry/infer:1"
-	clientMissing = "registry/missing:9"
-	clientCrash   = "registry/crash:1"
-	clientHang    = "registry/hang:1"
+	kHClientInfer   = "registry/infer:1"
+	kHClientMissing = "registry/missing:9"
+	kHClientCrash   = "registry/crash:1"
+	kHClientHang    = "registry/hang:1"
 )
 
 // agentPeer is the node agent: the image decides what Health reports (the hang image wedges the first node it is started on). The placement's status at the first poll is remembered.
-type agentPeer struct {
+type HAgentPeer struct {
 	pb.UnimplementedNodeAgentServer
 	ctx               *harness.Ctx
 	images            map[string]string
@@ -1105,14 +1105,14 @@ type agentPeer struct {
 	starts            map[string]int
 }
 
-func (a *agentPeer) Start(_ context.Context, req *pb.StartRequest) (*pb.StartReply, error) {
+func (a *HAgentPeer) Start(_ context.Context, req *pb.StartRequest) (*pb.StartReply, error) {
 	a.images[req.GetPlacementId()] = req.GetImage()
 	a.polls[req.GetPlacementId()] = 0
 	a.starts[req.GetPlacementId()]++
 	return &pb.StartReply{ContainerId: "c-" + req.GetPlacementId()}, nil
 }
 
-func (a *agentPeer) Health(_ context.Context, req *pb.HealthRequest) (*pb.HealthReply, error) {
+func (a *HAgentPeer) Health(_ context.Context, req *pb.HealthRequest) (*pb.HealthReply, error) {
 	pid := req.GetPlacementId()
 	image, ok := a.images[pid]
 	if !ok {
@@ -1124,24 +1124,24 @@ func (a *agentPeer) Health(_ context.Context, req *pb.HealthRequest) (*pb.Health
 		a.statusAtFirstPoll[pid] = s
 	}
 	switch {
-	case image == clientMissing:
+	case image == kHClientMissing:
 		return &pb.HealthReply{Status: pb.HealthStatus_FAILED, Reason: "image pull failed: " + image + " not found"}, nil
-	case image == clientCrash:
+	case image == kHClientCrash:
 		return &pb.HealthReply{Status: pb.HealthStatus_FAILED, Reason: "container exited with code 1"}, nil
-	case (image == clientHang && a.starts[pid] == 1) || a.polls[pid] < 2:
+	case (image == kHClientHang && a.starts[pid] == 1) || a.polls[pid] < 2:
 		return &pb.HealthReply{Status: pb.HealthStatus_STARTING}, nil
 	}
 	return &pb.HealthReply{Status: pb.HealthStatus_HEALTHY}, nil
 }
 
-func clientNode(ctx *harness.Ctx, id string) {
+func hClientNode(ctx *harness.Ctx, id string) {
 	ctx.Redis.Do("HSET", "node:"+id, "gpu_type", "a100", "capacity", 8, "allocated", 0)
 	ctx.Redis.Do("SADD", "nodes", id)
 	ctx.Redis.Do("SET", "heartbeat:"+id, "1", "EX", 30)
 }
 
 // clientLedger stands in for allocate and release (state.go, step 2).
-func clientLedger(ctx *harness.Ctx) {
+func hClientLedger(ctx *harness.Ctx) {
 	allocate = func(_ context.Context, nodeID, placementID string, count int) (string, error) {
 		if ctx.Redis.Exists("heartbeat:"+nodeID) == 0 {
 			return "NO_HEARTBEAT", nil
@@ -1173,134 +1173,134 @@ func clientLedger(ctx *harness.Ctx) {
 	}
 }
 
-func clientWorld(ctx *harness.Ctx, nodes ...string) *agentPeer {
+func hClientWorld(ctx *harness.Ctx, nodes ...string) *HAgentPeer {
 	if len(nodes) == 0 {
 		nodes = []string{"gpu-1", "gpu-2"}
 	}
 	for _, id := range nodes {
-		clientNode(ctx, id)
+		hClientNode(ctx, id)
 	}
-	clientLedger(ctx)
-	peer := &agentPeer{ctx: ctx, images: map[string]string{}, polls: map[string]int{}, statusAtFirstPoll: map[string]string{}, starts: map[string]int{}}
+	hClientLedger(ctx)
+	peer := &HAgentPeer{ctx: ctx, images: map[string]string{}, polls: map[string]int{}, statusAtFirstPoll: map[string]string{}, starts: map[string]int{}}
 	pb.RegisterNodeAgentServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func clientAllocated(ctx *harness.Ctx, id string) int {
+func hClientAllocated(ctx *harness.Ctx, id string) int {
 	v, _ := ctx.Redis.HGet("node:"+id, "allocated")
 	n, _ := strconv.Atoi(v)
 	return n
 }
 
-func clientStarts(ctx *harness.Ctx, id string) int { return len(ctx.GRPC.CallsTo("Start", id+":50051")) }
+func hClientStarts(ctx *harness.Ctx, id string) int { return len(ctx.GRPC.CallsTo("Start", id+":50051")) }
 
 // clientBeat: the agents keep reporting in while the virtual clock runs on, heartbeats that outlast the next slow start.
-func clientBeat(ctx *harness.Ctx) {
+func hClientBeat(ctx *harness.Ctx) {
 	for _, id := range []string{"gpu-1", "gpu-2"} {
 		ctx.Redis.Do("SET", "heartbeat:"+id, "1", "EX", 90)
 	}
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	outcome := startPlacement(context.Background(), "p-1", clientInfer, 4, []string{"gpu-1", "gpu-2"})
+	hClientWorld(ctx)
+	outcome := startPlacement(context.Background(), "p-1", kHClientInfer, 4, []string{"gpu-1", "gpu-2"})
 	ctx.Equal(outcome.Status, "running", "a healthy start (%+v)", outcome)
 	call := ctx.GRPC.CallsTo("Start", "")[0]
 	ctx.Assert(call.HasDeadline(), "the Start call carries no deadline: an agent that stalls holds the scheduler for as long as it likes")
 	ctx.Assert(call.Timeout.Seconds() >= 1 && call.Timeout.Seconds() <= 20, "the Start deadline must be config.StartDeadline = 20 s at most, got %v", call.Timeout)
 	ctx.GRPC.SetLatency("Start", 25, "gpu-1:50051")
 	before := ctx.Clock.Now()
-	outcome = startPlacement(context.Background(), "p-2", clientInfer, 4, []string{"gpu-1", "gpu-2"})
+	outcome = startPlacement(context.Background(), "p-2", kHClientInfer, 4, []string{"gpu-1", "gpu-2"})
 	ctx.Equal(outcome, Outcome{Status: "running", NodeID: "gpu-2"}, "with gpu-1's agent 25 s slow the placement must run on gpu-2 after DEADLINE_EXCEEDED")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited < 25, "the scheduler waited %.0f s for gpu-1's agent: the deadline is 20 s", waited)
-	clientBeat(ctx)
+	hClientBeat(ctx)
 	ctx.GRPC.SetLatency("Start", 15, "gpu-1:50051")
-	outcome = startPlacement(context.Background(), "p-3", clientInfer, 2, []string{"gpu-1", "gpu-2"})
+	outcome = startPlacement(context.Background(), "p-3", kHClientInfer, 2, []string{"gpu-1", "gpu-2"})
 	ctx.Equal(outcome, Outcome{Status: "running", NodeID: "gpu-1"}, "with gpu-1's agent answering Start in 15 s the placement must run on gpu-1, inside its 20 s deadline")
 	ctx.GRPC.SetLatency("Start", 0, "gpu-1:50051")
 	ctx.GRPC.SetLatency("Health", 30, "gpu-1:50051")
-	clientBeat(ctx)
+	hClientBeat(ctx)
 	before = ctx.Clock.Now()
-	outcome = startPlacement(context.Background(), "p-4", clientInfer, 2, []string{"gpu-1", "gpu-2"})
+	outcome = startPlacement(context.Background(), "p-4", kHClientInfer, 2, []string{"gpu-1", "gpu-2"})
 	ctx.Equal(outcome, Outcome{Status: "running", NodeID: "gpu-2"}, "with gpu-1's Health answering in 30 s the placement must run on gpu-2 once the 20 s budget is spent")
 	waited = float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited < 25, "the scheduler waited %.0f s on gpu-1's Health: every Health call carries what is left of the node's 20 s budget", waited)
 }
 
 func CheckHealthGate(ctx *harness.Ctx) {
-	peer := clientWorld(ctx)
-	outcome := startPlacement(context.Background(), "p-1", clientInfer, 4, []string{"gpu-1"})
+	peer := hClientWorld(ctx)
+	outcome := startPlacement(context.Background(), "p-1", kHClientInfer, 4, []string{"gpu-1"})
 	ctx.Equal(outcome, Outcome{Status: "running", NodeID: "gpu-1"}, "a healthy start")
 	ctx.Assert(peer.polls["p-1"] >= 2, "Health was polled %d times for p-1: poll it until the agent reports HEALTHY (it reports STARTING first)", peer.polls["p-1"])
 	ctx.Equal(peer.statusAtFirstPoll["p-1"], "allocated", "placement:p-1 at the first Health poll (running is written only after HEALTHY)")
 	s, _ := ctx.Redis.HGet("placement:p-1", "status")
 	ctx.Equal(s, "running", "after HEALTHY the placement is running; its status")
-	outcome = startPlacement(context.Background(), "p-2", clientCrash, 2, []string{"gpu-1"})
+	outcome = startPlacement(context.Background(), "p-2", kHClientCrash, 2, []string{"gpu-1"})
 	ctx.Equal(outcome.Status, "failed", "a container that exited at once was reported %+v: FAILED is not running; the status", outcome)
 	s, _ = ctx.Redis.HGet("placement:p-2", "status")
 	ctx.Assert(s != "running", "a placement whose container exited must not read running")
 }
 
 func CheckImagePullStop(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	outcome := startPlacement(context.Background(), "p-1", clientMissing, 4, []string{"gpu-1", "gpu-2"})
+	hClientWorld(ctx)
+	outcome := startPlacement(context.Background(), "p-1", kHClientMissing, 4, []string{"gpu-1", "gpu-2"})
 	ctx.Equal(outcome.Status, "failed", "an image that cannot be pulled (%+v); the status", outcome)
 	ctx.Assert(strings.Contains(outcome.Reason, "image pull failed"), "the failure must carry the agent's reason, got %q", outcome.Reason)
-	ctx.Equal(clientStarts(ctx, "gpu-2"), 0, "an image that cannot be pulled on gpu-1 cannot be pulled on gpu-2 either: Start calls to gpu-2")
+	ctx.Equal(hClientStarts(ctx, "gpu-2"), 0, "an image that cannot be pulled on gpu-1 cannot be pulled on gpu-2 either: Start calls to gpu-2")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Start", "")), 1, "Start calls for one bad image")
-	ctx.Equal(clientAllocated(ctx, "gpu-1"), 0, "GPUs still booked on gpu-1 for a placement that failed")
+	ctx.Equal(hClientAllocated(ctx, "gpu-1"), 0, "GPUs still booked on gpu-1 for a placement that failed")
 }
 
 func CheckRollback(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	outcome := startPlacement(context.Background(), "p-1", clientHang, 4, []string{"gpu-1", "gpu-2"})
+	hClientWorld(ctx)
+	outcome := startPlacement(context.Background(), "p-1", kHClientHang, 4, []string{"gpu-1", "gpu-2"})
 	ctx.Equal(outcome, Outcome{Status: "running", NodeID: "gpu-2"}, "a container that never reports healthy on gpu-1 must be retried on gpu-2")
-	ctx.Equal(clientAllocated(ctx, "gpu-1"), 0, "GPUs booked on gpu-1 after its start timed out: release the booking before trying the next node")
+	ctx.Equal(hClientAllocated(ctx, "gpu-1"), 0, "GPUs booked on gpu-1 after its start timed out: release the booking before trying the next node")
 	ctx.Assert(!ctx.Redis.SIsMember("node:gpu-1:placements", "p-1"), "p-1 must be released from gpu-1")
-	ctx.Equal(clientAllocated(ctx, "gpu-2"), 4, "GPUs gpu-2 holds for the running placement")
+	ctx.Equal(hClientAllocated(ctx, "gpu-2"), 4, "GPUs gpu-2 holds for the running placement")
 	ctx.GRPC.Fail("Start", codes.Unavailable, "agent restarting", 1, "gpu-2:50051")
-	outcome = startPlacement(context.Background(), "p-2", clientInfer, 2, []string{"gpu-2", "gpu-1"})
+	outcome = startPlacement(context.Background(), "p-2", kHClientInfer, 2, []string{"gpu-2", "gpu-1"})
 	ctx.Equal(outcome, Outcome{Status: "running", NodeID: "gpu-1"}, "with gpu-2's agent UNAVAILABLE the placement must run on gpu-1")
-	ctx.Equal(clientAllocated(ctx, "gpu-2"), 4, "GPUs gpu-2 holds after a refused start (the 4 of p-1 only)")
+	ctx.Equal(hClientAllocated(ctx, "gpu-2"), 4, "GPUs gpu-2 holds after a refused start (the 4 of p-1 only)")
 	// gpu-1's agent takes 15 s to acknowledge Start, then the hang image never turns healthy there.
-	clientBeat(ctx)
+	hClientBeat(ctx)
 	ctx.GRPC.SetLatency("Start", 15, "gpu-1:50051")
 	before := ctx.Clock.Now()
-	outcome = startPlacement(context.Background(), "p-3", clientHang, 4, []string{"gpu-1", "gpu-2"})
+	outcome = startPlacement(context.Background(), "p-3", kHClientHang, 4, []string{"gpu-1", "gpu-2"})
 	ctx.Equal(outcome, Outcome{Status: "running", NodeID: "gpu-2"}, "a slow Start followed by a container that never reports healthy on gpu-1 must be retried on gpu-2")
 	onGPU2 := ctx.GRPC.CallsTo("Start", "gpu-2:50051")
 	retried := float64(onGPU2[len(onGPU2)-1].Started.UnixMilli()-before) / 1000
 	ctx.Assert(retried < 22, "gpu-2 was tried %.0f s after the start on gpu-1 began: one node's budget is config.StartDeadline (20 s) for the Start call and the Health polling together", retried)
-	ctx.Equal(clientAllocated(ctx, "gpu-1"), 2, "GPUs gpu-1 holds (the 2 of p-2 only): release p-3 when its budget is spent")
+	ctx.Equal(hClientAllocated(ctx, "gpu-1"), 2, "GPUs gpu-1 holds (the 2 of p-2 only): release p-3 when its budget is spent")
 }
 
 func CheckRetryClassification(ctx *harness.Ctx) {
-	clientWorld(ctx, "gpu-1", "gpu-2", "gpu-3", "gpu-4", "gpu-5")
+	hClientWorld(ctx, "gpu-1", "gpu-2", "gpu-3", "gpu-4", "gpu-5")
 	ctx.GRPC.Fail("Start", codes.InvalidArgument, "gpu_count must be positive", 1, "gpu-1:50051")
-	outcome := startPlacement(context.Background(), "p-1", clientInfer, 4, []string{"gpu-1", "gpu-2"})
+	outcome := startPlacement(context.Background(), "p-1", kHClientInfer, 4, []string{"gpu-1", "gpu-2"})
 	ctx.Equal(outcome.Status, "failed", "INVALID_ARGUMENT from the agent (%+v): an argument error is the same on every node; the status", outcome)
-	ctx.Equal(clientStarts(ctx, "gpu-2"), 0, "an argument error must not be retried on gpu-2: Start calls to gpu-2")
-	ctx.Equal(clientAllocated(ctx, "gpu-1"), 0, "the booking on gpu-1 must be released")
+	ctx.Equal(hClientStarts(ctx, "gpu-2"), 0, "an argument error must not be retried on gpu-2: Start calls to gpu-2")
+	ctx.Equal(hClientAllocated(ctx, "gpu-1"), 0, "the booking on gpu-1 must be released")
 	for _, code := range []codes.Code{codes.ResourceExhausted, codes.FailedPrecondition, codes.Aborted, codes.Internal} {
 		ctx.GRPC.Fail("Start", code, "refused by the agent", 1, "gpu-1:50051")
-		tried := clientStarts(ctx, "gpu-2")
-		outcome = startPlacement(context.Background(), "p-"+strings.ToLower(code.String()), clientInfer, 4, []string{"gpu-1", "gpu-2"})
-		ctx.Assert(outcome.Status == "failed" && clientStarts(ctx, "gpu-2") == tried, "%v from gpu-1's agent answered %+v (Start calls to gpu-2: %d before, %d after): only DEADLINE_EXCEEDED, UNAVAILABLE and a spent budget move to another node", code, outcome, tried, clientStarts(ctx, "gpu-2"))
-		ctx.Equal(clientAllocated(ctx, "gpu-1"), 0, "the booking on gpu-1 must be released after %v", code)
+		tried := hClientStarts(ctx, "gpu-2")
+		outcome = startPlacement(context.Background(), "p-"+strings.ToLower(code.String()), kHClientInfer, 4, []string{"gpu-1", "gpu-2"})
+		ctx.Assert(outcome.Status == "failed" && hClientStarts(ctx, "gpu-2") == tried, "%v from gpu-1's agent answered %+v (Start calls to gpu-2: %d before, %d after): only DEADLINE_EXCEEDED, UNAVAILABLE and a spent budget move to another node", code, outcome, tried, hClientStarts(ctx, "gpu-2"))
+		ctx.Equal(hClientAllocated(ctx, "gpu-1"), 0, "the booking on gpu-1 must be released after %v", code)
 	}
 	ctx.GRPC.Fail("Start", codes.Unavailable, "agent restarting", 2, "")
-	outcome = startPlacement(context.Background(), "p-2", clientInfer, 4, []string{"gpu-1", "gpu-2", "gpu-3", "gpu-4"})
+	outcome = startPlacement(context.Background(), "p-2", kHClientInfer, 4, []string{"gpu-1", "gpu-2", "gpu-3", "gpu-4"})
 	ctx.Equal(outcome, Outcome{Status: "running", NodeID: "gpu-3"}, "with gpu-1 and gpu-2 UNAVAILABLE the third start (config.MaxStartAttempts = 3) must run on gpu-3")
-	ctx.Assert(clientAllocated(ctx, "gpu-1") == 0 && clientAllocated(ctx, "gpu-2") == 0, "the unavailable nodes must be released")
+	ctx.Assert(hClientAllocated(ctx, "gpu-1") == 0 && hClientAllocated(ctx, "gpu-2") == 0, "the unavailable nodes must be released")
 	ctx.GRPC.Fail("Start", codes.Unavailable, "agent restarting", 5, "")
 	before := len(ctx.GRPC.CallsTo("Start", ""))
-	outcome = startPlacement(context.Background(), "p-3", clientInfer, 4, []string{"gpu-1", "gpu-2", "gpu-4", "gpu-5", "gpu-3"})
+	outcome = startPlacement(context.Background(), "p-3", kHClientInfer, 4, []string{"gpu-1", "gpu-2", "gpu-4", "gpu-5", "gpu-3"})
 	ctx.Equal(outcome.Status, "failed", "five agents UNAVAILABLE (%+v); the status", outcome)
 	total := len(ctx.GRPC.CallsTo("Start", "")) - before
 	ctx.Assert(1 <= total && total <= 3, "%d Start calls for one placement across unavailable agents: config.MaxStartAttempts is 3", total)
 	for _, id := range []string{"gpu-1", "gpu-2", "gpu-4", "gpu-5"} {
-		ctx.Equal(clientAllocated(ctx, id), 0, "every failed node must be released: %s", id)
+		ctx.Equal(hClientAllocated(ctx, id), 0, "every failed node must be released: %s", id)
 	}
 }
 `,
@@ -1313,15 +1313,15 @@ func CheckRetryClassification(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kInfer = "registry/infer:1";
-const std::string kMissing = "registry/missing:9";
-const std::string kCrash = "registry/crash:1";
-const std::string kHang = "registry/hang:1";
+const std::string kHInfer = "registry/infer:1";
+const std::string kHMissing = "registry/missing:9";
+const std::string kHCrash = "registry/crash:1";
+const std::string kHHang = "registry/hang:1";
 
-harness::Ctx* clientCtx = nullptr;
+harness::Ctx* hClientCtx = nullptr;
 
 // The node agent: the image decides what Health reports (the hang image wedges the first node it is started on). The placement's status at the first poll is remembered.
-class AgentPeer final : public gpusched::NodeAgent::Service {
+class HAgentPeer final : public gpusched::NodeAgent::Service {
  public:
   std::map<std::string, std::string> images;
   std::map<std::string, int> polls;
@@ -1340,15 +1340,15 @@ class AgentPeer final : public gpusched::NodeAgent::Service {
     const std::string pid = req->placement_id();
     if (!images.count(pid)) return grpc::Status(grpc::StatusCode::NOT_FOUND, "no placement " + pid + " on this node");
     polls[pid]++;
-    if (polls[pid] == 1) statusAtFirstPoll[pid] = clientCtx->Redis.HGet("placement:" + pid, "status").value_or("");
+    if (polls[pid] == 1) statusAtFirstPoll[pid] = hClientCtx->Redis.HGet("placement:" + pid, "status").value_or("");
     const std::string& image = images[pid];
-    if (image == kMissing) {
+    if (image == kHMissing) {
       reply->set_status(gpusched::FAILED);
       reply->set_reason("image pull failed: " + image + " not found");
-    } else if (image == kCrash) {
+    } else if (image == kHCrash) {
       reply->set_status(gpusched::FAILED);
       reply->set_reason("container exited with code 1");
-    } else if ((image == kHang && starts[pid] == 1) || polls[pid] < 2) {
+    } else if ((image == kHHang && starts[pid] == 1) || polls[pid] < 2) {
       reply->set_status(gpusched::STARTING);
     } else {
       reply->set_status(gpusched::HEALTHY);
@@ -1357,32 +1357,32 @@ class AgentPeer final : public gpusched::NodeAgent::Service {
   }
 };
 
-AgentPeer* clientPeer = nullptr;
+HAgentPeer* hClientPeer = nullptr;
 
-void clientNode(harness::Ctx& ctx, const std::string& id) {
+void hClientNode(harness::Ctx& ctx, const std::string& id) {
   ctx.Redis.Do("HSET", "node:" + id, "gpu_type", "a100", "capacity", 8, "allocated", 0);
   ctx.Redis.Do("SADD", "nodes", id);
   ctx.Redis.Do("SET", "heartbeat:" + id, "1", "EX", 30);
 }
 
-AgentPeer& clientWorld(harness::Ctx& ctx, const std::vector<std::string>& nodes = {"gpu-1", "gpu-2"}) {
-  clientCtx = &ctx;
-  for (const auto& id : nodes) clientNode(ctx, id);
-  delete clientPeer;
-  clientPeer = new AgentPeer;
-  ctx.GRPC.Server("")->RegisterService(clientPeer);
-  return *clientPeer;
+HAgentPeer& hClientWorld(harness::Ctx& ctx, const std::vector<std::string>& nodes = {"gpu-1", "gpu-2"}) {
+  hClientCtx = &ctx;
+  for (const auto& id : nodes) hClientNode(ctx, id);
+  delete hClientPeer;
+  hClientPeer = new HAgentPeer;
+  ctx.GRPC.Server("")->RegisterService(hClientPeer);
+  return *hClientPeer;
 }
 
-int clientAllocated(harness::Ctx& ctx, const std::string& id) {
+int hClientAllocated(harness::Ctx& ctx, const std::string& id) {
   const auto v = ctx.Redis.HGet("node:" + id, "allocated");
   return v ? std::stoi(*v) : 0;
 }
 
-size_t clientStarts(harness::Ctx& ctx, const std::string& id) { return ctx.GRPC.CallsTo("Start", id + ":50051").size(); }
+size_t hClientStarts(harness::Ctx& ctx, const std::string& id) { return ctx.GRPC.CallsTo("Start", id + ":50051").size(); }
 
 // The agents keep reporting in while the virtual clock runs on: heartbeats that outlast the next slow start.
-void clientBeat(harness::Ctx& ctx) {
+void hClientBeat(harness::Ctx& ctx) {
   for (const std::string id : {"gpu-1", "gpu-2"}) ctx.Redis.Do("SET", "heartbeat:" + id, "1", "EX", 90);
 }
 
@@ -1390,7 +1390,7 @@ void clientBeat(harness::Ctx& ctx) {
 
 // The ledger (state.cpp, step 2) as the harness stands in for it.
 std::string allocate(const std::string& node_id, const std::string& placement_id, int count) {
-  harness::Ctx& ctx = *clientCtx;
+  harness::Ctx& ctx = *hClientCtx;
   if (ctx.Redis.Exists("heartbeat:" + node_id) == 0) return "NO_HEARTBEAT";
   if (ctx.Redis.SIsMember("node:" + node_id + ":placements", placement_id)) return "ALLOCATED";
   const auto fields = ctx.Redis.HGetAll("node:" + node_id);
@@ -1404,7 +1404,7 @@ std::string allocate(const std::string& node_id, const std::string& placement_id
 }
 
 bool release(const std::string& node_id, const std::string& placement_id) {
-  harness::Ctx& ctx = *clientCtx;
+  harness::Ctx& ctx = *hClientCtx;
   if (!ctx.Redis.SIsMember("node:" + node_id + ":placements", placement_id)) return false;
   const auto count = ctx.Redis.HGet("placement:" + placement_id, "count");
   ctx.Redis.Do("HINCRBY", "node:" + node_id, "allocated", -(count ? std::stoi(*count) : 0));
@@ -1414,29 +1414,29 @@ bool release(const std::string& node_id, const std::string& placement_id) {
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  clientWorld(ctx);
-  Outcome outcome = start_placement("p-1", kInfer, 4, {"gpu-1", "gpu-2"});
+  hClientWorld(ctx);
+  Outcome outcome = start_placement("p-1", kHInfer, 4, {"gpu-1", "gpu-2"});
   ctx.Equal(outcome.status, "running", "a healthy start (%s)", outcome.reason);
   const auto call = ctx.GRPC.CallsTo("Start")[0];
   ctx.Assert(call.HasDeadline(), "the Start call carries no deadline: an agent that stalls holds the scheduler for as long as it likes");
   ctx.Assert(1 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 20, "the Start deadline must be kStartDeadline = 20 s at most, got %vs", call.TimeoutSeconds());
   ctx.GRPC.SetLatency("Start", 25, "gpu-1:50051");
   const int64_t before = ctx.Clock.Now();
-  outcome = start_placement("p-2", kInfer, 4, {"gpu-1", "gpu-2"});
+  outcome = start_placement("p-2", kHInfer, 4, {"gpu-1", "gpu-2"});
   ctx.Assert(outcome.status == "running" && outcome.node_id == "gpu-2", "with gpu-1's agent 25 s slow the placement must run on gpu-2 after DEADLINE_EXCEEDED, got %s on %q", outcome.status, outcome.node_id);
   double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited < 25, "the scheduler waited %.0f s for gpu-1's agent: the deadline is 20 s", waited);
-  clientBeat(ctx);
+  hClientBeat(ctx);
   ctx.GRPC.SetLatency("Start", 15, "gpu-1:50051");
-  outcome = start_placement("p-3", kInfer, 2, {"gpu-1", "gpu-2"});
+  outcome = start_placement("p-3", kHInfer, 2, {"gpu-1", "gpu-2"});
   ctx.Assert(outcome.status == "running" && outcome.node_id == "gpu-1",
              "with gpu-1's agent answering Start in 15 s the placement must run on gpu-1, inside its 20 s deadline, got %s on %q (%s)", outcome.status,
              outcome.node_id, outcome.reason);
   ctx.GRPC.SetLatency("Start", 0, "gpu-1:50051");
   ctx.GRPC.SetLatency("Health", 30, "gpu-1:50051");
-  clientBeat(ctx);
+  hClientBeat(ctx);
   const int64_t healthBefore = ctx.Clock.Now();
-  outcome = start_placement("p-4", kInfer, 2, {"gpu-1", "gpu-2"});
+  outcome = start_placement("p-4", kHInfer, 2, {"gpu-1", "gpu-2"});
   ctx.Assert(outcome.status == "running" && outcome.node_id == "gpu-2",
              "with gpu-1's Health answering in 30 s the placement must run on gpu-2 once the 20 s budget is spent, got %s on %q (%s)", outcome.status,
              outcome.node_id, outcome.reason);
@@ -1445,43 +1445,43 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckHealthGate(harness::Ctx& ctx) {
-  AgentPeer& peer = clientWorld(ctx);
-  Outcome outcome = start_placement("p-1", kInfer, 4, {"gpu-1"});
+  HAgentPeer& peer = hClientWorld(ctx);
+  Outcome outcome = start_placement("p-1", kHInfer, 4, {"gpu-1"});
   ctx.Assert(outcome.status == "running" && outcome.node_id == "gpu-1", "a healthy start answered %s (%s)", outcome.status, outcome.reason);
   ctx.Assert(peer.polls["p-1"] >= 2, "Health was polled %d times for p-1: poll it until the agent reports HEALTHY (it reports STARTING first)", peer.polls["p-1"]);
   ctx.Equal(peer.statusAtFirstPoll["p-1"], "allocated", "placement:p-1 at the first Health poll (running is written only after HEALTHY)");
   ctx.Equal(ctx.Redis.HGet("placement:p-1", "status"), "running", "after HEALTHY the placement is running; its status");
-  outcome = start_placement("p-2", kCrash, 2, {"gpu-1"});
+  outcome = start_placement("p-2", kHCrash, 2, {"gpu-1"});
   ctx.Equal(outcome.status, "failed", "a container that exited at once: FAILED is not running; the status");
   ctx.Assert(ctx.Redis.HGet("placement:p-2", "status") != "running", "a placement whose container exited must not read running");
 }
 
 void CheckImagePullStop(harness::Ctx& ctx) {
-  clientWorld(ctx);
-  const Outcome outcome = start_placement("p-1", kMissing, 4, {"gpu-1", "gpu-2"});
+  hClientWorld(ctx);
+  const Outcome outcome = start_placement("p-1", kHMissing, 4, {"gpu-1", "gpu-2"});
   ctx.Equal(outcome.status, "failed", "an image that cannot be pulled; the status");
   ctx.Assert(outcome.reason.find("image pull failed") != std::string::npos, "the failure must carry the agent's reason, got %q", outcome.reason);
-  ctx.Equal(clientStarts(ctx, "gpu-2"), 0, "an image that cannot be pulled on gpu-1 cannot be pulled on gpu-2 either: Start calls to gpu-2");
+  ctx.Equal(hClientStarts(ctx, "gpu-2"), 0, "an image that cannot be pulled on gpu-1 cannot be pulled on gpu-2 either: Start calls to gpu-2");
   ctx.Equal(ctx.GRPC.CallsTo("Start").size(), 1, "Start calls for one bad image");
-  ctx.Equal(clientAllocated(ctx, "gpu-1"), 0, "GPUs still booked on gpu-1 for a placement that failed");
+  ctx.Equal(hClientAllocated(ctx, "gpu-1"), 0, "GPUs still booked on gpu-1 for a placement that failed");
 }
 
 void CheckRollback(harness::Ctx& ctx) {
-  clientWorld(ctx);
-  Outcome outcome = start_placement("p-1", kHang, 4, {"gpu-1", "gpu-2"});
+  hClientWorld(ctx);
+  Outcome outcome = start_placement("p-1", kHHang, 4, {"gpu-1", "gpu-2"});
   ctx.Assert(outcome.status == "running" && outcome.node_id == "gpu-2", "a container that never reports healthy on gpu-1 must be retried on gpu-2, got %s on %q (%s)", outcome.status, outcome.node_id, outcome.reason);
-  ctx.Equal(clientAllocated(ctx, "gpu-1"), 0, "GPUs booked on gpu-1 after its start timed out: release the booking before trying the next node");
+  ctx.Equal(hClientAllocated(ctx, "gpu-1"), 0, "GPUs booked on gpu-1 after its start timed out: release the booking before trying the next node");
   ctx.Assert(!ctx.Redis.SIsMember("node:gpu-1:placements", "p-1"), "p-1 must be released from gpu-1");
-  ctx.Equal(clientAllocated(ctx, "gpu-2"), 4, "GPUs gpu-2 holds for the running placement");
+  ctx.Equal(hClientAllocated(ctx, "gpu-2"), 4, "GPUs gpu-2 holds for the running placement");
   ctx.GRPC.Fail("Start", grpc::StatusCode::UNAVAILABLE, "agent restarting", 1, "gpu-2:50051");
-  outcome = start_placement("p-2", kInfer, 2, {"gpu-2", "gpu-1"});
+  outcome = start_placement("p-2", kHInfer, 2, {"gpu-2", "gpu-1"});
   ctx.Assert(outcome.status == "running" && outcome.node_id == "gpu-1", "with gpu-2's agent UNAVAILABLE the placement must run on gpu-1, got %s on %q", outcome.status, outcome.node_id);
-  ctx.Equal(clientAllocated(ctx, "gpu-2"), 4, "GPUs gpu-2 holds after a refused start (the 4 of p-1 only)");
+  ctx.Equal(hClientAllocated(ctx, "gpu-2"), 4, "GPUs gpu-2 holds after a refused start (the 4 of p-1 only)");
   // gpu-1's agent takes 15 s to acknowledge Start, then the hang image never turns healthy there.
-  clientBeat(ctx);
+  hClientBeat(ctx);
   ctx.GRPC.SetLatency("Start", 15, "gpu-1:50051");
   const int64_t before = ctx.Clock.Now();
-  outcome = start_placement("p-3", kHang, 4, {"gpu-1", "gpu-2"});
+  outcome = start_placement("p-3", kHHang, 4, {"gpu-1", "gpu-2"});
   ctx.Assert(outcome.status == "running" && outcome.node_id == "gpu-2",
              "a slow Start followed by a container that never reports healthy on gpu-1 must be retried on gpu-2, got %s on %q (%s)", outcome.status,
              outcome.node_id, outcome.reason);
@@ -1489,43 +1489,43 @@ void CheckRollback(harness::Ctx& ctx) {
   const int64_t startedMs = std::chrono::duration_cast<std::chrono::milliseconds>(onGpu2.back().Started.time_since_epoch()).count();
   const double retried = static_cast<double>(startedMs - before) / 1000;
   ctx.Assert(retried < 22, "gpu-2 was tried %.0f s after the start on gpu-1 began: one node's budget is kStartDeadline (20 s) for the Start call and the Health polling together", retried);
-  ctx.Equal(clientAllocated(ctx, "gpu-1"), 2, "GPUs gpu-1 holds (the 2 of p-2 only): release p-3 when its budget is spent");
+  ctx.Equal(hClientAllocated(ctx, "gpu-1"), 2, "GPUs gpu-1 holds (the 2 of p-2 only): release p-3 when its budget is spent");
 }
 
 void CheckRetryClassification(harness::Ctx& ctx) {
-  clientWorld(ctx, {"gpu-1", "gpu-2", "gpu-3", "gpu-4", "gpu-5"});
+  hClientWorld(ctx, {"gpu-1", "gpu-2", "gpu-3", "gpu-4", "gpu-5"});
   ctx.GRPC.Fail("Start", grpc::StatusCode::INVALID_ARGUMENT, "gpu_count must be positive", 1, "gpu-1:50051");
-  Outcome outcome = start_placement("p-1", kInfer, 4, {"gpu-1", "gpu-2"});
+  Outcome outcome = start_placement("p-1", kHInfer, 4, {"gpu-1", "gpu-2"});
   ctx.Equal(outcome.status, "failed", "INVALID_ARGUMENT from the agent: an argument error is the same on every node; the status");
-  ctx.Equal(clientStarts(ctx, "gpu-2"), 0, "an argument error must not be retried on gpu-2: Start calls to gpu-2");
-  ctx.Equal(clientAllocated(ctx, "gpu-1"), 0, "the booking on gpu-1 must be released");
+  ctx.Equal(hClientStarts(ctx, "gpu-2"), 0, "an argument error must not be retried on gpu-2: Start calls to gpu-2");
+  ctx.Equal(hClientAllocated(ctx, "gpu-1"), 0, "the booking on gpu-1 must be released");
   const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {{grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
                                                                           {grpc::StatusCode::FAILED_PRECONDITION, "FAILED_PRECONDITION"},
                                                                           {grpc::StatusCode::ABORTED, "ABORTED"},
                                                                           {grpc::StatusCode::INTERNAL, "INTERNAL"}};
   for (const auto& [code, name] : terminal) {
     ctx.GRPC.Fail("Start", code, "refused by the agent", 1, "gpu-1:50051");
-    const size_t tried = clientStarts(ctx, "gpu-2");
-    outcome = start_placement("p-" + name, kInfer, 4, {"gpu-1", "gpu-2"});
-    ctx.Assert(outcome.status == "failed" && clientStarts(ctx, "gpu-2") == tried,
+    const size_t tried = hClientStarts(ctx, "gpu-2");
+    outcome = start_placement("p-" + name, kHInfer, 4, {"gpu-1", "gpu-2"});
+    ctx.Assert(outcome.status == "failed" && hClientStarts(ctx, "gpu-2") == tried,
                "%s from gpu-1's agent answered %s on %q (Start calls to gpu-2: %d before, %d after): only DEADLINE_EXCEEDED, UNAVAILABLE and a "
                "spent budget move to another node",
-               name, outcome.status, outcome.node_id, tried, clientStarts(ctx, "gpu-2"));
-    ctx.Equal(clientAllocated(ctx, "gpu-1"), 0, "the booking on gpu-1 must be released after %s", name);
+               name, outcome.status, outcome.node_id, tried, hClientStarts(ctx, "gpu-2"));
+    ctx.Equal(hClientAllocated(ctx, "gpu-1"), 0, "the booking on gpu-1 must be released after %s", name);
   }
   ctx.GRPC.Fail("Start", grpc::StatusCode::UNAVAILABLE, "agent restarting", 2);
-  outcome = start_placement("p-2", kInfer, 4, {"gpu-1", "gpu-2", "gpu-3", "gpu-4"});
+  outcome = start_placement("p-2", kHInfer, 4, {"gpu-1", "gpu-2", "gpu-3", "gpu-4"});
   ctx.Assert(outcome.status == "running" && outcome.node_id == "gpu-3",
              "with gpu-1 and gpu-2 UNAVAILABLE the third start (kMaxStartAttempts = 3) must run on gpu-3, got %s on %q (%s)", outcome.status, outcome.node_id,
              outcome.reason);
-  ctx.Assert(clientAllocated(ctx, "gpu-1") == 0 && clientAllocated(ctx, "gpu-2") == 0, "the unavailable nodes must be released");
+  ctx.Assert(hClientAllocated(ctx, "gpu-1") == 0 && hClientAllocated(ctx, "gpu-2") == 0, "the unavailable nodes must be released");
   ctx.GRPC.Fail("Start", grpc::StatusCode::UNAVAILABLE, "agent restarting", 5);
   const int before = static_cast<int>(ctx.GRPC.CallsTo("Start").size());
-  outcome = start_placement("p-3", kInfer, 4, {"gpu-1", "gpu-2", "gpu-4", "gpu-5", "gpu-3"});
+  outcome = start_placement("p-3", kHInfer, 4, {"gpu-1", "gpu-2", "gpu-4", "gpu-5", "gpu-3"});
   ctx.Equal(outcome.status, "failed", "five agents UNAVAILABLE; the status");
   const int total = static_cast<int>(ctx.GRPC.CallsTo("Start").size()) - before;
   ctx.Assert(1 <= total && total <= 3, "%d Start calls for one placement across unavailable agents: kMaxStartAttempts is 3", total);
-  for (const std::string id : {"gpu-1", "gpu-2", "gpu-4", "gpu-5"}) ctx.Equal(clientAllocated(ctx, id), 0, "every failed node must be released: %s", id);
+  for (const std::string id : {"gpu-1", "gpu-2", "gpu-4", "gpu-5"}) ctx.Equal(hClientAllocated(ctx, id), 0, "every failed node must be released: %s", id);
 }
 `,
   },

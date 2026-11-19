@@ -852,9 +852,9 @@ import (
 	"leetbuild/harness"
 )
 
-var apiBg = context.Background()
+var hApiBg = context.Background()
 
-type apiReply struct {
+type HApiReply struct {
 	RefundID       string \`json:"refund_id"\`
 	PaymentID      string \`json:"payment_id"\`
 	AmountMinor    int64  \`json:"amount_minor"\`
@@ -862,15 +862,15 @@ type apiReply struct {
 	RemainingMinor int64  \`json:"remaining_minor"\`
 }
 
-func apiServer(ctx *harness.Ctx) *harness.HTTP {
-	records.AddPayment(apiBg, "pay_1", "t1", 10000)
-	records.AddPayment(apiBg, "pay_2", "t2", 8000)
+func hApiServer(ctx *harness.Ctx) *harness.HTTP {
+	records.AddPayment(hApiBg, "pay_1", "t1", 10000)
+	records.AddPayment(hApiBg, "pay_2", "t2", 8000)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiPost(c *harness.HTTP, amount int64, paymentID, reason, tenant, key string) *harness.Response {
+func hApiPost(c *harness.HTTP, amount int64, paymentID, reason, tenant, key string) *harness.Response {
 	headers := []string{"Content-Type", "application/json"}
 	if tenant != "" {
 		headers = append(headers, "X-Tenant-Id", tenant)
@@ -881,74 +881,74 @@ func apiPost(c *harness.HTTP, amount int64, paymentID, reason, tenant, key strin
 	return c.Post("/v1/refunds", map[string]any{"payment_id": paymentID, "amount_minor": amount, "reason_code": reason}, headers...)
 }
 
-func apiDecode(r *harness.Response) apiReply {
-	var body apiReply
+func hApiDecode(r *harness.Response) HApiReply {
+	var body HApiReply
 	json.Unmarshal([]byte(r.Text()), &body)
 	return body
 }
 
-// apiLedgerTotal reads the ledger's total straight from the server (inside a probe).
-func apiLedgerTotal(ctx *harness.Ctx, paymentID string) int64 {
+// hApiLedgerTotal reads the ledger's total straight from the server (inside a probe).
+func hApiLedgerTotal(ctx *harness.Ctx, paymentID string) int64 {
 	raw, _ := ctx.Redis.HGet("refunded:"+paymentID, "total")
 	n, _ := strconv.ParseInt(raw, 10, 64)
 	return n
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiServer(ctx)
-	r := apiPost(c, 2500, "pay_1", "damaged", "t1", "k-1")
+	c := hApiServer(ctx)
+	r := hApiPost(c, 2500, "pay_1", "damaged", "t1", "k-1")
 	ctx.Equal(r.Status, 201, "POST /v1/refunds (%s)", r.Text())
-	body := apiDecode(r)
+	body := hApiDecode(r)
 	ctx.Assert(body.Status == "PENDING" && body.AmountMinor == 2500 && body.PaymentID == "pay_1", "the refund answered %s, expected pay_1, 2500, PENDING", r.Text())
 	ctx.Equal(body.RemainingMinor, 7500, "remaining_minor after 2500 of a 10000 payment")
-	rows := records.ListRefunds(apiBg, "pay_1")
+	rows := records.ListRefunds(hApiBg, "pay_1")
 	ctx.Assert(len(rows) == 1 && rows[0].RefundID == body.RefundID, "the records of pay_1 hold %v, expected the refund %s", rows, body.RefundID)
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := apiServer(ctx)
-	anonymous := apiPost(c, 2500, "pay_1", "damaged", "", "k-1")
-	foreign := apiPost(c, 2500, "pay_2", "damaged", "t1", "k-2")
-	missing := apiPost(c, 2500, "pay_404", "damaged", "t1", "k-3")
+	c := hApiServer(ctx)
+	anonymous := hApiPost(c, 2500, "pay_1", "damaged", "", "k-1")
+	foreign := hApiPost(c, 2500, "pay_2", "damaged", "t1", "k-2")
+	missing := hApiPost(c, 2500, "pay_404", "damaged", "t1", "k-3")
 	ctx.Equal(anonymous.Status, 401, "a refund without X-Tenant-Id")
 	ctx.Equal(foreign.Status, 404, "tenant t1 refunding t2's payment pay_2 (a foreign payment looks missing)")
 	ctx.Equal(missing.Status, 404, "a missing payment")
-	ctx.Assert(len(records.ListRefunds(apiBg, "pay_2")) == 0 && ledger.RefundedTotal(apiBg, "pay_2") == 0, "t1's request wrote %v against t2's payment", records.ListRefunds(apiBg, "pay_2"))
-	ctx.Equal(len(records.ListRefunds(apiBg, "pay_1")), 0, "a request without a tenant must write no refund; the refunds")
+	ctx.Assert(len(records.ListRefunds(hApiBg, "pay_2")) == 0 && ledger.RefundedTotal(hApiBg, "pay_2") == 0, "t1's request wrote %v against t2's payment", records.ListRefunds(hApiBg, "pay_2"))
+	ctx.Equal(len(records.ListRefunds(hApiBg, "pay_1")), 0, "a request without a tenant must write no refund; the refunds")
 }
 
 func CheckAmountValid(ctx *harness.Ctx) {
-	c := apiServer(ctx)
+	c := hApiServer(ctx)
 	cases := []struct {
 		amount int64
 		reason string
 	}{{0, "damaged"}, {-2500, "damaged"}, {2500, "because"}, {2500, "damage"}, {2500, ""}}
 	for n, tc := range cases {
-		r := apiPost(c, tc.amount, "pay_1", tc.reason, "t1", fmt.Sprintf("k-%d", n))
+		r := hApiPost(c, tc.amount, "pay_1", tc.reason, "t1", fmt.Sprintf("k-%d", n))
 		ctx.Equal(r.Status, 400, "amount_minor=%d, reason_code=%q", tc.amount, tc.reason)
 	}
-	ctx.Equal(len(records.ListRefunds(apiBg, "pay_1")), 0, "refused requests must write no refund; the refunds")
-	ctx.Equal(ledger.RefundedTotal(apiBg, "pay_1"), 0, "refused requests must leave the ledger; its total")
-	r := apiPost(c, 1, "pay_1", "goodwill", "t1", "k-9")
+	ctx.Equal(len(records.ListRefunds(hApiBg, "pay_1")), 0, "refused requests must write no refund; the refunds")
+	ctx.Equal(ledger.RefundedTotal(hApiBg, "pay_1"), 0, "refused requests must leave the ledger; its total")
+	r := hApiPost(c, 1, "pay_1", "goodwill", "t1", "k-9")
 	ctx.Equal(r.Status, 201, "amount_minor=1 with reason goodwill (%s)", r.Text())
 }
 
 func CheckCap(ctx *harness.Ctx) {
-	c := apiServer(ctx)
-	first := apiPost(c, 6000, "pay_1", "damaged", "t1", "k-1")
-	over := apiPost(c, 5000, "pay_1", "damaged", "t1", "k-2")
-	rest := apiPost(c, 4000, "pay_1", "damaged", "t1", "k-3")
-	ctx.Assert(first.Status == 201 && apiDecode(first).RemainingMinor == 4000, "6000 of a 10000 payment answered %d %s, expected 201 with remaining_minor 4000", first.Status, first.Text())
+	c := hApiServer(ctx)
+	first := hApiPost(c, 6000, "pay_1", "damaged", "t1", "k-1")
+	over := hApiPost(c, 5000, "pay_1", "damaged", "t1", "k-2")
+	rest := hApiPost(c, 4000, "pay_1", "damaged", "t1", "k-3")
+	ctx.Assert(first.Status == 201 && hApiDecode(first).RemainingMinor == 4000, "6000 of a 10000 payment answered %d %s, expected 201 with remaining_minor 4000", first.Status, first.Text())
 	ctx.Equal(over.Status, 422, "5000 more on a 10000 payment with 6000 refunded (the payment would refund 11000; %s)", over.Text())
-	ctx.Equal(apiDecode(over).RemainingMinor, 4000, "the 422's remaining_minor (%s)", over.Text())
-	ctx.Assert(rest.Status == 201 && apiDecode(rest).RemainingMinor == 0, "the last 4000 answered %d %s, expected 201 with remaining_minor 0", rest.Status, rest.Text())
-	ctx.Equal(ledger.RefundedTotal(apiBg, "pay_1"), 10000, "after 6000 and 4000 were accepted the ledger of pay_1 must hold both (claim each amount with ledger.Claim)")
-	ctx.Equal(len(records.ListRefunds(apiBg, "pay_1")), 2, "a refused claim writes no row; the refunds")
+	ctx.Equal(hApiDecode(over).RemainingMinor, 4000, "the 422's remaining_minor (%s)", over.Text())
+	ctx.Assert(rest.Status == 201 && hApiDecode(rest).RemainingMinor == 0, "the last 4000 answered %d %s, expected 201 with remaining_minor 0", rest.Status, rest.Text())
+	ctx.Equal(ledger.RefundedTotal(hApiBg, "pay_1"), 10000, "after 6000 and 4000 were accepted the ledger of pay_1 must hold both (claim each amount with ledger.Claim)")
+	ctx.Equal(len(records.ListRefunds(hApiBg, "pay_1")), 2, "a refused claim writes no row; the refunds")
 	// Another server claims 8000 of pay_3 between this request's first ledger command and the next.
-	records.AddPayment(apiBg, "pay_3", "t1", 10000)
+	records.AddPayment(hApiBg, "pay_3", "t1", 10000)
 	var raced []bool
 	ctx.Redis.After("refunded:pay_3", func() any {
-		fits := apiLedgerTotal(ctx, "pay_3")+8000 <= 10000
+		fits := hApiLedgerTotal(ctx, "pay_3")+8000 <= 10000
 		if fits {
 			ctx.Redis.Do("HSET", "refunded:pay_3", "rf-other", 8000)
 			ctx.Redis.Do("HINCRBY", "refunded:pay_3", "total", 8000)
@@ -956,9 +956,9 @@ func CheckCap(ctx *harness.Ctx) {
 		raced = append(raced, fits)
 		return nil
 	})
-	r := apiPost(c, 2500, "pay_3", "damaged", "t1", "k-4")
+	r := hApiPost(c, 2500, "pay_3", "damaged", "t1", "k-4")
 	ctx.Assert(len(raced) > 0, "a refund of pay_3 never touched its ledger refunded:pay_3")
-	rows := records.ListRefunds(apiBg, "pay_3")
+	rows := records.ListRefunds(hApiBg, "pay_3")
 	var claimed int64
 	for _, row := range rows {
 		claimed += row.AmountMinor
@@ -966,37 +966,37 @@ func CheckCap(ctx *harness.Ctx) {
 	if len(raced) > 0 && raced[0] {
 		claimed += 8000
 	}
-	held := ledger.RefundedTotal(apiBg, "pay_3")
+	held := ledger.RefundedTotal(hApiBg, "pay_3")
 	ctx.Assert(claimed == held && held <= 10000 && (r.Status == 201) == (len(rows) > 0), "while another server claimed 8000 of the 10000 payment pay_3, 2500 answered %d %s, the ledger holds %d and the rows plus that claim %d: the claim's answer is the only cap", r.Status, r.Text(), held, claimed)
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c := apiServer(ctx)
-	none := apiPost(c, 2500, "pay_1", "damaged", "t1", "")
+	c := hApiServer(ctx)
+	none := hApiPost(c, 2500, "pay_1", "damaged", "t1", "")
 	ctx.Equal(none.Status, 400, "a refund without Idempotency-Key")
-	first := apiPost(c, 2500, "pay_1", "damaged", "t1", "k-1")
+	first := hApiPost(c, 2500, "pay_1", "damaged", "t1", "k-1")
 	var ledgerSeen []int64
-	ctx.Redis.After("refunded:pay_1", func() any { ledgerSeen = append(ledgerSeen, apiLedgerTotal(ctx, "pay_1")); return nil })
-	retry := apiPost(c, 2500, "pay_1", "damaged", "t1", "k-1")
+	ctx.Redis.After("refunded:pay_1", func() any { ledgerSeen = append(ledgerSeen, hApiLedgerTotal(ctx, "pay_1")); return nil })
+	retry := hApiPost(c, 2500, "pay_1", "damaged", "t1", "k-1")
 	retrySaw := append([]int64(nil), ledgerSeen...)
-	other := apiPost(c, 2500, "pay_1", "damaged", "t1", "k-2")
-	t2 := apiPost(c, 2500, "pay_2", "damaged", "t2", "k-1")
-	records.AddPayment(apiBg, "pay_3", "t1", 10000)
-	moved := apiPost(c, 2500, "pay_3", "damaged", "t1", "k-1")
-	last := apiPost(c, 5000, "pay_1", "damaged", "t1", "k-3")
-	lastRetry := apiPost(c, 5000, "pay_1", "damaged", "t1", "k-3")
+	other := hApiPost(c, 2500, "pay_1", "damaged", "t1", "k-2")
+	t2 := hApiPost(c, 2500, "pay_2", "damaged", "t2", "k-1")
+	records.AddPayment(hApiBg, "pay_3", "t1", 10000)
+	moved := hApiPost(c, 2500, "pay_3", "damaged", "t1", "k-1")
+	last := hApiPost(c, 5000, "pay_1", "damaged", "t1", "k-3")
+	lastRetry := hApiPost(c, 5000, "pay_1", "damaged", "t1", "k-3")
 	ctx.Equal(first.Status, 201, "the first refund (%s)", first.Text())
-	ctx.Assert((retry.Status == 200 || retry.Status == 201) && apiDecode(retry).RefundID == apiDecode(first).RefundID, "a retry with the same key answered %s, expected the first refund %s", retry.Text(), apiDecode(first).RefundID)
+	ctx.Assert((retry.Status == 200 || retry.Status == 201) && hApiDecode(retry).RefundID == hApiDecode(first).RefundID, "a retry with the same key answered %s, expected the first refund %s", retry.Text(), hApiDecode(first).RefundID)
 	for _, seen := range retrySaw {
 		ctx.Assert(seen == 2500, "while the retry of k-1 was answered, the ledger of pay_1 held %d, expected 2500: a replay reserves nothing, not even for a moment", seen)
 	}
-	ctx.Assert(apiDecode(other).RefundID != apiDecode(first).RefundID, "a new key must create a new refund")
-	id := apiDecode(t2).RefundID
-	ctx.Assert(t2.Status == 201 && id != apiDecode(first).RefundID && id != apiDecode(other).RefundID, "tenant t2 using key k-1 answered %s: keys belong to a tenant", t2.Text())
-	ctx.Assert(len(records.ListRefunds(apiBg, "pay_3")) == 0 && ledger.RefundedTotal(apiBg, "pay_3") == 0, "tenant t1 reusing key k-1 on its payment pay_3 answered %d %s and refunded pay_3: the key belongs to (tenant, key), and k-1 already names %s", moved.Status, moved.Text(), apiDecode(first).RefundID)
-	ctx.Assert(last.Status == 201 && (lastRetry.Status == 200 || lastRetry.Status == 201) && apiDecode(lastRetry).RefundID == apiDecode(last).RefundID, "the retry of the refund that used pay_1's last 5000 answered %d %s, expected the refund %s: look the key up before claiming", lastRetry.Status, lastRetry.Text(), apiDecode(last).RefundID)
-	rows := records.ListRefunds(apiBg, "pay_1")
-	total := ledger.RefundedTotal(apiBg, "pay_1")
+	ctx.Assert(hApiDecode(other).RefundID != hApiDecode(first).RefundID, "a new key must create a new refund")
+	id := hApiDecode(t2).RefundID
+	ctx.Assert(t2.Status == 201 && id != hApiDecode(first).RefundID && id != hApiDecode(other).RefundID, "tenant t2 using key k-1 answered %s: keys belong to a tenant", t2.Text())
+	ctx.Assert(len(records.ListRefunds(hApiBg, "pay_3")) == 0 && ledger.RefundedTotal(hApiBg, "pay_3") == 0, "tenant t1 reusing key k-1 on its payment pay_3 answered %d %s and refunded pay_3: the key belongs to (tenant, key), and k-1 already names %s", moved.Status, moved.Text(), hApiDecode(first).RefundID)
+	ctx.Assert(last.Status == 201 && (lastRetry.Status == 200 || lastRetry.Status == 201) && hApiDecode(lastRetry).RefundID == hApiDecode(last).RefundID, "the retry of the refund that used pay_1's last 5000 answered %d %s, expected the refund %s: look the key up before claiming", lastRetry.Status, lastRetry.Text(), hApiDecode(last).RefundID)
+	rows := records.ListRefunds(hApiBg, "pay_1")
+	total := ledger.RefundedTotal(hApiBg, "pay_1")
 	ctx.Assert(len(rows) == 3 && total == 10000, "keys k-1 and k-3 (each sent twice) and k-2 left %d refunds and a ledger of %d, expected 3 refunds and 10000: a replay is not a second refund", len(rows), total)
 }
 `,
@@ -1012,7 +1012,7 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP apiServer(harness::Ctx& ctx) {
+harness::HTTP hApiServer(harness::Ctx& ctx) {
   records::addPayment("pay_1", "t1", 10000);
   records::addPayment("pay_2", "t2", 8000);
   static httplib::Server* svr = nullptr;
@@ -1022,7 +1022,7 @@ harness::HTTP apiServer(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response apiPost(harness::HTTP& c, long long amount, const std::string& payment_id, const std::string& reason,
+harness::Response hApiPost(harness::HTTP& c, long long amount, const std::string& payment_id, const std::string& reason,
                           const std::string& tenant, const std::string& key) {
   std::vector<std::string> headers = {"Content-Type", "application/json"};
   if (!tenant.empty()) headers.insert(headers.end(), {"X-Tenant-Id", tenant});
@@ -1031,13 +1031,13 @@ harness::Response apiPost(harness::HTTP& c, long long amount, const std::string&
   return c.Send("POST", "/v1/refunds", body.dump(), headers);
 }
 
-nlohmann::json apiBody(const harness::Response& r) {
+nlohmann::json hApiBody(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : nlohmann::json::object();
 }
 
 // The ledger's total straight from the server (inside a probe).
-long long apiLedgerTotal(harness::Ctx& ctx, const std::string& payment_id) {
+long long hApiLedgerTotal(harness::Ctx& ctx, const std::string& payment_id) {
   const auto raw = ctx.Redis.HGet("refunded:" + payment_id, "total");
   return raw ? std::stoll(*raw) : 0;
 }
@@ -1045,10 +1045,10 @@ long long apiLedgerTotal(harness::Ctx& ctx, const std::string& payment_id) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = apiServer(ctx);
-  const auto r = apiPost(c, 2500, "pay_1", "damaged", "t1", "k-1");
+  auto c = hApiServer(ctx);
+  const auto r = hApiPost(c, 2500, "pay_1", "damaged", "t1", "k-1");
   ctx.Equal(r.Status, 201, "POST /v1/refunds (%s)", r.Text());
-  const auto body = apiBody(r);
+  const auto body = hApiBody(r);
   ctx.Assert(body.value("status", "") == "PENDING" && body.value("amount_minor", 0LL) == 2500 && body.value("payment_id", "") == "pay_1",
              "the refund answered %s, expected pay_1, 2500, PENDING", r.Text());
   ctx.Equal(body.value("remaining_minor", -1LL), 7500, "remaining_minor after 2500 of a 10000 payment");
@@ -1058,10 +1058,10 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = apiServer(ctx);
-  const auto anonymous = apiPost(c, 2500, "pay_1", "damaged", "", "k-1");
-  const auto foreign = apiPost(c, 2500, "pay_2", "damaged", "t1", "k-2");
-  const auto missing = apiPost(c, 2500, "pay_404", "damaged", "t1", "k-3");
+  auto c = hApiServer(ctx);
+  const auto anonymous = hApiPost(c, 2500, "pay_1", "damaged", "", "k-1");
+  const auto foreign = hApiPost(c, 2500, "pay_2", "damaged", "t1", "k-2");
+  const auto missing = hApiPost(c, 2500, "pay_404", "damaged", "t1", "k-3");
   ctx.Equal(anonymous.Status, 401, "a refund without X-Tenant-Id");
   ctx.Equal(foreign.Status, 404, "tenant t1 refunding t2's payment pay_2 (a foreign payment looks missing)");
   ctx.Equal(missing.Status, 404, "a missing payment");
@@ -1070,28 +1070,28 @@ void CheckTenantScope(harness::Ctx& ctx) {
 }
 
 void CheckAmountValid(harness::Ctx& ctx) {
-  auto c = apiServer(ctx);
+  auto c = hApiServer(ctx);
   const std::vector<std::pair<long long, std::string>> cases = {{0, "damaged"}, {-2500, "damaged"}, {2500, "because"}, {2500, "damage"}, {2500, ""}};
   for (size_t n = 0; n < cases.size(); n++) {
-    const auto r = apiPost(c, cases[n].first, "pay_1", cases[n].second, "t1", "k-" + std::to_string(n));
+    const auto r = hApiPost(c, cases[n].first, "pay_1", cases[n].second, "t1", "k-" + std::to_string(n));
     ctx.Equal(r.Status, 400, "amount_minor=%d, reason_code=%q", cases[n].first, cases[n].second);
   }
   ctx.Equal(records::listRefunds("pay_1").size(), 0, "refused requests must write no refund; the refunds");
   ctx.Equal(ledger::refundedTotal("pay_1"), 0, "refused requests must leave the ledger; its total");
-  const auto r = apiPost(c, 1, "pay_1", "goodwill", "t1", "k-9");
+  const auto r = hApiPost(c, 1, "pay_1", "goodwill", "t1", "k-9");
   ctx.Equal(r.Status, 201, "amount_minor=1 with reason goodwill (%s)", r.Text());
 }
 
 void CheckCap(harness::Ctx& ctx) {
-  auto c = apiServer(ctx);
-  const auto first = apiPost(c, 6000, "pay_1", "damaged", "t1", "k-1");
-  const auto over = apiPost(c, 5000, "pay_1", "damaged", "t1", "k-2");
-  const auto rest = apiPost(c, 4000, "pay_1", "damaged", "t1", "k-3");
-  ctx.Assert(first.Status == 201 && apiBody(first).value("remaining_minor", -1LL) == 4000,
+  auto c = hApiServer(ctx);
+  const auto first = hApiPost(c, 6000, "pay_1", "damaged", "t1", "k-1");
+  const auto over = hApiPost(c, 5000, "pay_1", "damaged", "t1", "k-2");
+  const auto rest = hApiPost(c, 4000, "pay_1", "damaged", "t1", "k-3");
+  ctx.Assert(first.Status == 201 && hApiBody(first).value("remaining_minor", -1LL) == 4000,
              "6000 of a 10000 payment answered %d %s, expected 201 with remaining_minor 4000", first.Status, first.Text());
   ctx.Equal(over.Status, 422, "5000 more on a 10000 payment with 6000 refunded (the payment would refund 11000; %s)", over.Text());
-  ctx.Equal(apiBody(over).value("remaining_minor", -1LL), 4000, "the 422's remaining_minor (%s)", over.Text());
-  ctx.Assert(rest.Status == 201 && apiBody(rest).value("remaining_minor", -1LL) == 0,
+  ctx.Equal(hApiBody(over).value("remaining_minor", -1LL), 4000, "the 422's remaining_minor (%s)", over.Text());
+  ctx.Assert(rest.Status == 201 && hApiBody(rest).value("remaining_minor", -1LL) == 0,
              "the last 4000 answered %d %s, expected 201 with remaining_minor 0", rest.Status, rest.Text());
   ctx.Equal(ledger::refundedTotal("pay_1"), 10000,
             "after 6000 and 4000 were accepted the ledger of pay_1 must hold both (claim each amount with ledger::claim)");
@@ -1100,14 +1100,14 @@ void CheckCap(harness::Ctx& ctx) {
   records::addPayment("pay_3", "t1", 10000);
   std::vector<bool> raced;
   ctx.Redis.After("refunded:pay_3", [&] {
-    const bool fits = apiLedgerTotal(ctx, "pay_3") + 8000 <= 10000;
+    const bool fits = hApiLedgerTotal(ctx, "pay_3") + 8000 <= 10000;
     if (fits) {
       ctx.Redis.Do("HSET", "refunded:pay_3", "rf-other", 8000);
       ctx.Redis.Do("HINCRBY", "refunded:pay_3", "total", 8000);
     }
     raced.push_back(fits);
   });
-  const auto r = apiPost(c, 2500, "pay_3", "damaged", "t1", "k-4");
+  const auto r = hApiPost(c, 2500, "pay_3", "damaged", "t1", "k-4");
   ctx.Assert(!raced.empty(), "a refund of pay_3 never touched its ledger refunded:pay_3");
   const auto rows = records::listRefunds("pay_3");
   long long claimed = !raced.empty() && raced[0] ? 8000 : 0;
@@ -1119,36 +1119,36 @@ void CheckCap(harness::Ctx& ctx) {
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  auto c = apiServer(ctx);
-  const auto none = apiPost(c, 2500, "pay_1", "damaged", "t1", "");
+  auto c = hApiServer(ctx);
+  const auto none = hApiPost(c, 2500, "pay_1", "damaged", "t1", "");
   ctx.Equal(none.Status, 400, "a refund without Idempotency-Key");
-  const auto first = apiPost(c, 2500, "pay_1", "damaged", "t1", "k-1");
+  const auto first = hApiPost(c, 2500, "pay_1", "damaged", "t1", "k-1");
   std::vector<long long> ledger_seen;
-  ctx.Redis.After("refunded:pay_1", [&] { ledger_seen.push_back(apiLedgerTotal(ctx, "pay_1")); });
-  const auto retry = apiPost(c, 2500, "pay_1", "damaged", "t1", "k-1");
+  ctx.Redis.After("refunded:pay_1", [&] { ledger_seen.push_back(hApiLedgerTotal(ctx, "pay_1")); });
+  const auto retry = hApiPost(c, 2500, "pay_1", "damaged", "t1", "k-1");
   const std::vector<long long> retry_saw = ledger_seen;
-  const auto other = apiPost(c, 2500, "pay_1", "damaged", "t1", "k-2");
-  const auto t2 = apiPost(c, 2500, "pay_2", "damaged", "t2", "k-1");
+  const auto other = hApiPost(c, 2500, "pay_1", "damaged", "t1", "k-2");
+  const auto t2 = hApiPost(c, 2500, "pay_2", "damaged", "t2", "k-1");
   records::addPayment("pay_3", "t1", 10000);
-  const auto moved = apiPost(c, 2500, "pay_3", "damaged", "t1", "k-1");
-  const auto last = apiPost(c, 5000, "pay_1", "damaged", "t1", "k-3");
-  const auto last_retry = apiPost(c, 5000, "pay_1", "damaged", "t1", "k-3");
-  const std::string first_id = apiBody(first).value("refund_id", "");
-  const std::string other_id = apiBody(other).value("refund_id", "");
-  const std::string last_id = apiBody(last).value("refund_id", "");
+  const auto moved = hApiPost(c, 2500, "pay_3", "damaged", "t1", "k-1");
+  const auto last = hApiPost(c, 5000, "pay_1", "damaged", "t1", "k-3");
+  const auto last_retry = hApiPost(c, 5000, "pay_1", "damaged", "t1", "k-3");
+  const std::string first_id = hApiBody(first).value("refund_id", "");
+  const std::string other_id = hApiBody(other).value("refund_id", "");
+  const std::string last_id = hApiBody(last).value("refund_id", "");
   ctx.Equal(first.Status, 201, "the first refund (%s)", first.Text());
-  ctx.Assert((retry.Status == 200 || retry.Status == 201) && apiBody(retry).value("refund_id", "") == first_id,
+  ctx.Assert((retry.Status == 200 || retry.Status == 201) && hApiBody(retry).value("refund_id", "") == first_id,
              "a retry with the same key answered %s, expected the first refund %s", retry.Text(), first_id);
   for (const long long seen : retry_saw) {
     ctx.Assert(seen == 2500, "while the retry of k-1 was answered, the ledger of pay_1 held %d, expected 2500: a replay reserves nothing, not even for a moment", seen);
   }
   ctx.Assert(other_id != first_id, "a new key must create a new refund");
-  const std::string t2_id = apiBody(t2).value("refund_id", "");
+  const std::string t2_id = hApiBody(t2).value("refund_id", "");
   ctx.Assert(t2.Status == 201 && t2_id != first_id && t2_id != other_id, "tenant t2 using key k-1 answered %s: keys belong to a tenant", t2.Text());
   ctx.Assert(records::listRefunds("pay_3").empty() && ledger::refundedTotal("pay_3") == 0,
              "tenant t1 reusing key k-1 on its payment pay_3 answered %d %s and refunded pay_3: the key belongs to (tenant, key), and k-1 already names %s",
              moved.Status, moved.Text(), first_id);
-  ctx.Assert(last.Status == 201 && (last_retry.Status == 200 || last_retry.Status == 201) && apiBody(last_retry).value("refund_id", "") == last_id,
+  ctx.Assert(last.Status == 201 && (last_retry.Status == 200 || last_retry.Status == 201) && hApiBody(last_retry).value("refund_id", "") == last_id,
              "the retry of the refund that used pay_1's last 5000 answered %d %s, expected the refund %s: look the key up before claiming",
              last_retry.Status, last_retry.Text(), last_id);
   const size_t rows = records::listRefunds("pay_1").size();

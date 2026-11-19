@@ -824,11 +824,11 @@ var (
 	hScores = map[string]float64{hAtLowText: 0.15, hBandOKText: 0.20, hBandBadText: 0.25, hLeaningText: 0.40, hEdgeText: 0.35, hHighText: 0.92}
 )
 
-type classifierPeer struct {
+type HClassifierPeer struct {
 	pb.UnimplementedClassifierServer
 }
 
-func (classifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
+func (HClassifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
 	score, ok := hScores[req.GetText()]
 	if !ok {
 		score = 0.04
@@ -840,11 +840,11 @@ func (classifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.
 	return &pb.ClassifyReply{Score: score, Label: label}, nil
 }
 
-type judgePeer struct {
+type HJudgePeer struct {
 	pb.UnimplementedJudgeServer
 }
 
-func (judgePeer) Assess(_ context.Context, req *pb.AssessRequest) (*pb.Assessment, error) {
+func (HJudgePeer) Assess(_ context.Context, req *pb.AssessRequest) (*pb.Assessment, error) {
 	if req.GetText() == hBandBadText || req.GetText() == hAtLowText {
 		return &pb.Assessment{Compliant: false, Reason: "familial_status"}, nil
 	}
@@ -852,8 +852,8 @@ func (judgePeer) Assess(_ context.Context, req *pb.AssessRequest) (*pb.Assessmen
 }
 
 func hServeTiers(ctx *harness.Ctx) {
-	pb.RegisterClassifierServer(ctx.GRPC.Server("classifier:9000"), classifierPeer{})
-	pb.RegisterJudgeServer(ctx.GRPC.Server("judge:9000"), judgePeer{})
+	pb.RegisterClassifierServer(ctx.GRPC.Server("classifier:9000"), HClassifierPeer{})
+	pb.RegisterJudgeServer(ctx.GRPC.Server("judge:9000"), HJudgePeer{})
 }
 
 func CheckStoplistFirst(ctx *harness.Ctx) {
@@ -954,7 +954,7 @@ const std::string kHHigh = "Beacon Hill is mostly Latino families, so you would 
 // The classifier's score for each text (0.04 for any other); the judge finds kHBandBad and kHAtLow non-compliant.
 const std::map<std::string, double> kHScores = {{kHAtLow, 0.15}, {kHBandOk, 0.20}, {kHBandBad, 0.25}, {kHLeaning, 0.40}, {kHEdge, 0.35}, {kHHigh, 0.92}};
 
-class ClassifierPeer final : public fairhousing::Classifier::Service {
+class HClassifierPeer final : public fairhousing::Classifier::Service {
  public:
   grpc::Status Classify(grpc::ServerContext*, const fairhousing::ClassifyRequest* req, fairhousing::ClassifyReply* out) override {
     const auto it = kHScores.find(req->text());
@@ -965,7 +965,7 @@ class ClassifierPeer final : public fairhousing::Classifier::Service {
   }
 };
 
-class JudgePeer final : public fairhousing::Judge::Service {
+class HJudgePeer final : public fairhousing::Judge::Service {
  public:
   grpc::Status Assess(grpc::ServerContext*, const fairhousing::AssessRequest* req, fairhousing::Assessment* out) override {
     const bool flagged = req->text() == kHBandBad || req->text() == kHAtLow;
@@ -976,8 +976,8 @@ class JudgePeer final : public fairhousing::Judge::Service {
 };
 
 struct HPeers {
-  ClassifierPeer classifier;
-  JudgePeer judge;
+  HClassifierPeer classifier;
+  HJudgePeer judge;
 };
 
 void hServeTiers(harness::Ctx& ctx) {

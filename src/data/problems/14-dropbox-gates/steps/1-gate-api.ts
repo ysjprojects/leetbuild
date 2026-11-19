@@ -1773,29 +1773,29 @@ import (
 	"leetbuild/harness"
 )
 
-func shareOf(variant string, pct any) map[string]any { return map[string]any{"variant": variant, "pct": pct} }
+func hShareOf(variant string, pct any) map[string]any { return map[string]any{"variant": variant, "pct": pct} }
 
 var (
-	threeWayMix = []any{shareOf("RED_BUTTON", 33), shareOf("BLUE_BUTTON", 33), shareOf("CONTROL", 34)}
-	gateFixture = map[string]any{"populations": []any{
-		map[string]any{"match": map[string]any{"locale": "de"}, "mix": threeWayMix},
-		map[string]any{"match": map[string]any{}, "mix": []any{shareOf("BLUE_BUTTON", 100)}},
+	hThreeWayMix = []any{hShareOf("RED_BUTTON", 33), hShareOf("BLUE_BUTTON", 33), hShareOf("CONTROL", 34)}
+	hGateFixture = map[string]any{"populations": []any{
+		map[string]any{"match": map[string]any{"locale": "de"}, "mix": hThreeWayMix},
+		map[string]any{"match": map[string]any{}, "mix": []any{hShareOf("BLUE_BUTTON", 100)}},
 	}}
-	onFixture       = map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": []any{shareOf("ON", 100)}}}}
-	notFoundFixture = map[string]any{"error": "not_found"}
+	hOnFixture       = map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": []any{hShareOf("ON", 100)}}}}
+	hNotFoundFixture = map[string]any{"error": "not_found"}
 )
 
 // mixOf is RED_BUTTON, BLUE_BUTTON, CONTROL with the given shares, in that order.
-func mixOf(pcts ...any) []any {
+func hMixOf(pcts ...any) []any {
 	var mix []any
 	for i, pct := range pcts {
-		mix = append(mix, shareOf([]string{"RED_BUTTON", "BLUE_BUTTON", "CONTROL"}[i], pct))
+		mix = append(mix, hShareOf([]string{"RED_BUTTON", "BLUE_BUTTON", "CONTROL"}[i], pct))
 	}
 	return mix
 }
 
 // gatePut is PUT /gates/{name}; an empty editor or ifMatch leaves that header out.
-func gatePut(c *harness.HTTP, name string, body any, editor, ifMatch string) *harness.Response {
+func hGatePut(c *harness.HTTP, name string, body any, editor, ifMatch string) *harness.Response {
 	var header []string
 	if editor != "" {
 		header = append(header, "X-Editor", editor)
@@ -1807,7 +1807,7 @@ func gatePut(c *harness.HTTP, name string, body any, editor, ifMatch string) *ha
 }
 
 // jsonValue is v as JSON sees it (maps, []any, float64), nil when it is not JSON.
-func jsonValue(v any) any {
+func hJsonValue(v any) any {
 	var raw []byte
 	switch b := v.(type) {
 	case string:
@@ -1825,35 +1825,35 @@ func jsonValue(v any) any {
 }
 
 // gateObject is the response body as a JSON object (nil when it is not one).
-func gateObject(r *harness.Response) map[string]any {
-	obj, _ := jsonValue(r.Body).(map[string]any)
+func hGateObject(r *harness.Response) map[string]any {
+	obj, _ := hJsonValue(r.Body).(map[string]any)
 	return obj
 }
 
 // publishedGate is the gate stored in the hash gates, parsed (nil when there is none).
-func publishedGate(ctx *harness.Ctx, name string) map[string]any {
+func hPublishedGate(ctx *harness.Ctx, name string) map[string]any {
 	raw, ok := ctx.Redis.HGet("gates", name)
 	if !ok {
 		return nil
 	}
-	obj, _ := jsonValue(raw).(map[string]any)
+	obj, _ := hJsonValue(raw).(map[string]any)
 	return obj
 }
 
-func gateHistory(ctx *harness.Ctx, name string) []any {
+func hGateHistory(ctx *harness.Ctx, name string) []any {
 	entries := []any{}
 	for _, raw := range ctx.Redis.LRange("gate:"+name+":history", 0, -1) {
-		entries = append(entries, jsonValue(raw))
+		entries = append(entries, hJsonValue(raw))
 	}
 	return entries
 }
 
-func assertUntouched(ctx *harness.Ctx, what string) {
+func hAssertUntouched(ctx *harness.Ctx, what string) {
 	keys := ctx.Redis.Keys("*")
 	ctx.Assert(len(keys) == 0, "%s must write nothing, but Redis now holds %q", what, keys)
 }
 
-func wholeSeconds(v any) (float64, bool) {
+func hWholeSeconds(v any) (float64, bool) {
 	f, ok := v.(float64)
 	return f, ok && f == math.Trunc(f)
 }
@@ -1864,113 +1864,113 @@ func CheckValidate(ctx *harness.Ctx) {
 		what, name string
 		body       any
 	}{
-		{"shares adding up to 99", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": mixOf(33, 33, 33)}}}},
-		{"shares adding up to 101", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": mixOf(34, 33, 34)}}}},
-		{"a negative share (-10 + 110)", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": mixOf(-10, 110)}}}},
-		{"a fractional share (33.5 + 66.5)", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": mixOf(33.5, 66.5)}}}},
+		{"shares adding up to 99", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": hMixOf(33, 33, 33)}}}},
+		{"shares adding up to 101", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": hMixOf(34, 33, 34)}}}},
+		{"a negative share (-10 + 110)", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": hMixOf(-10, 110)}}}},
+		{"a fractional share (33.5 + 66.5)", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": hMixOf(33.5, 66.5)}}}},
 		{"a share without a pct", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": []any{map[string]any{"variant": "ON"}}}}}},
-		{"the lowercase variant 'red_button'", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": []any{shareOf("red_button", 100)}}}}},
-		{"the lowercase default 'off'", "button_color", map[string]any{"default": "off", "populations": onFixture["populations"]}},
+		{"the lowercase variant 'red_button'", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": []any{hShareOf("red_button", 100)}}}}},
+		{"the lowercase default 'off'", "button_color", map[string]any{"default": "off", "populations": hOnFixture["populations"]}},
 		{"an empty mix", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": []any{}}}}},
 		{"an empty populations list", "button_color", map[string]any{"populations": []any{}}},
 		{"no populations at all", "button_color", map[string]any{"seed": "button_color"}},
-		{"a population without a match", "button_color", map[string]any{"populations": []any{map[string]any{"mix": mixOf(50, 50)}}}},
-		{"a match value that is not a string", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{"locale": 7}, "mix": mixOf(50, 50)}}}},
-		{"the name 'Button_Color' (upper case)", "Button_Color", onFixture},
-		{"the name 'ab' (too short)", "ab", onFixture},
-		{"the name '1st_gate' (starts with a digit)", "1st_gate", onFixture},
-		{"a 65-character name", strings.Repeat("a", 65), onFixture},
+		{"a population without a match", "button_color", map[string]any{"populations": []any{map[string]any{"mix": hMixOf(50, 50)}}}},
+		{"a match value that is not a string", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{"locale": 7}, "mix": hMixOf(50, 50)}}}},
+		{"the name 'Button_Color' (upper case)", "Button_Color", hOnFixture},
+		{"the name 'ab' (too short)", "ab", hOnFixture},
+		{"the name '1st_gate' (starts with a digit)", "1st_gate", hOnFixture},
+		{"a 65-character name", strings.Repeat("a", 65), hOnFixture},
 	}
 	for _, b := range bad {
-		r := gatePut(c, b.name, b.body, "tomm", "")
+		r := hGatePut(c, b.name, b.body, "tomm", "")
 		ctx.Equal(r.Status, 400, "PUT /gates/%s with %s", b.name, b.what)
-		data := gateObject(r)
+		data := hGateObject(r)
 		ctx.Equal(data["error"], "invalid_gate", "the error of PUT /gates/%s with %s (body %s)", b.name, b.what, r.Text())
 		reason, ok := data["reason"].(string)
 		ctx.Assert(ok && reason != "", "the 400 for %s must carry a reason string, got %s", b.what, r.Text())
 	}
-	assertUntouched(ctx, "a rejected gate")
-	r := gatePut(c, "button_color", map[string]any{"populations": []any{}}, "", "")
-	ctx.Assert(r.Status == 400 && gateObject(r)["error"] == "invalid_gate", "the shape is checked before the editor: a malformed gate without X-Editor answered %d %s, expected 400 invalid_gate", r.Status, r.Text())
-	assertUntouched(ctx, "a rejected gate")
-	r = gatePut(c, "button_color", gateFixture, "tomm", "")
+	hAssertUntouched(ctx, "a rejected gate")
+	r := hGatePut(c, "button_color", map[string]any{"populations": []any{}}, "", "")
+	ctx.Assert(r.Status == 400 && hGateObject(r)["error"] == "invalid_gate", "the shape is checked before the editor: a malformed gate without X-Editor answered %d %s, expected 400 invalid_gate", r.Status, r.Text())
+	hAssertUntouched(ctx, "a rejected gate")
+	r = hGatePut(c, "button_color", hGateFixture, "tomm", "")
 	ctx.Equal(r.Status, 201, "a valid gate (answered %s)", r.Text())
-	r = gatePut(c, strings.Repeat("a", 64), onFixture, "tomm", "")
+	r = hGatePut(c, strings.Repeat("a", 64), hOnFixture, "tomm", "")
 	ctx.Equal(r.Status, 201, "a 64-character name is within ^[a-z][a-z0-9_]{2,63}$")
-	ctx.Assert(publishedGate(ctx, "button_color") != nil, "the accepted gate must be stored in the hash gates")
+	ctx.Assert(hPublishedGate(ctx, "button_color") != nil, "the accepted gate must be stored in the hash gates")
 }
 
 func CheckCreatedUpdated(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
 	now := float64(ctx.Clock.Now() / 1000)
-	r := gatePut(c, "dark_mode", onFixture, "ana", "")
+	r := hGatePut(c, "dark_mode", hOnFixture, "ana", "")
 	ctx.Equal(r.Status, 201, "the first PUT of dark_mode must answer 201 Created")
-	gate := gateObject(r)
+	gate := hGateObject(r)
 	ctx.Equal(gate["version"], 1, "a new gate must be version 1")
 	ctx.Equal(r.Header.Get("ETag"), \`"1"\`, "the 201 must carry the header ETag: %q (the version, quoted)", \`"1"\`)
 	overrides, isList := gate["overrides"].([]any)
 	ctx.Assert(gate["name"] == "dark_mode" && gate["seed"] == "dark_mode" && gate["default"] == "OFF" && isList && len(overrides) == 0, "seed defaults to the name, default to OFF, overrides to []; the answer was %s", r.Text())
 	ctx.Equal(gate["updated_by"], "ana", "updated_by must be the X-Editor (ana)")
-	updatedAt, whole := wholeSeconds(gate["updated_at"])
+	updatedAt, whole := hWholeSeconds(gate["updated_at"])
 	ctx.Assert(whole && math.Abs(updatedAt-now) <= 5, "updated_at must be the time of the write in seconds, got %v", gate["updated_at"])
 	storedRaw, _ := ctx.Redis.HGet("gates", "dark_mode")
-	ctx.Equal(jsonValue(r.Body), publishedGate(ctx, "dark_mode"), "the answer must be the stored gate (answered %s, stored %s)", r.Text(), storedRaw)
-	r = gatePut(c, "dark_mode", map[string]any{"seed": "dark_mode_v2", "default": "ON", "populations": onFixture["populations"]}, "bo", "")
+	ctx.Equal(hJsonValue(r.Body), hPublishedGate(ctx, "dark_mode"), "the answer must be the stored gate (answered %s, stored %s)", r.Text(), storedRaw)
+	r = hGatePut(c, "dark_mode", map[string]any{"seed": "dark_mode_v2", "default": "ON", "populations": hOnFixture["populations"]}, "bo", "")
 	ctx.Equal(r.Status, 200, "updating an existing gate must answer 200")
-	gate = gateObject(r)
+	gate = hGateObject(r)
 	ctx.Assert(gate["version"] == 2.0 && r.Header.Get("ETag") == \`"2"\`, "the update must bump the version to 2 and answer ETag %q: got version %v, ETag %q", \`"2"\`, gate["version"], r.Header.Get("ETag"))
 	ctx.Assert(gate["seed"] == "dark_mode_v2" && gate["default"] == "ON" && gate["updated_by"] == "bo", "the update must replace the gate's fields (seed, default, updated_by): %s", r.Text())
-	r = gatePut(c, "dark_mode", onFixture, "bo", "")
-	ctx.Assert(r.Status == 200 && gateObject(r)["version"] == 3.0, "a third PUT must be version 3, got %d %s", r.Status, r.Text())
-	r = gatePut(c, "other_gate", onFixture, "tomm", "")
-	ctx.Assert(r.Status == 201 && gateObject(r)["version"] == 1.0, "every gate counts its own versions: a new gate is version 1 even after three edits elsewhere (gates:version is the global counter, not the gate's); got %d %s", r.Status, r.Text())
+	r = hGatePut(c, "dark_mode", hOnFixture, "bo", "")
+	ctx.Assert(r.Status == 200 && hGateObject(r)["version"] == 3.0, "a third PUT must be version 3, got %d %s", r.Status, r.Text())
+	r = hGatePut(c, "other_gate", hOnFixture, "tomm", "")
+	ctx.Assert(r.Status == 201 && hGateObject(r)["version"] == 1.0, "every gate counts its own versions: a new gate is version 1 even after three edits elsewhere (gates:version is the global counter, not the gate's); got %d %s", r.Status, r.Text())
 	r = c.Get("/gates/dark_mode")
 	ctx.Equal(r.Status, 200, "GET /gates/dark_mode")
 	storedRaw, _ = ctx.Redis.HGet("gates", "dark_mode")
-	ctx.Equal(jsonValue(r.Body), publishedGate(ctx, "dark_mode"), "GET must answer the stored gate (got %s, stored %s)", r.Text(), storedRaw)
+	ctx.Equal(hJsonValue(r.Body), hPublishedGate(ctx, "dark_mode"), "GET must answer the stored gate (got %s, stored %s)", r.Text(), storedRaw)
 	ctx.Equal(r.Header.Get("ETag"), \`"3"\`, "GET must carry the ETag of the stored version")
 	r = c.Get("/gates/ghost")
 	ctx.Equal(r.Status, 404, "GET of an unknown gate")
-	ctx.Equal(jsonValue(r.Body), jsonValue(notFoundFixture), "the 404 body (%s)", r.Text())
+	ctx.Equal(hJsonValue(r.Body), hJsonValue(hNotFoundFixture), "the 404 body (%s)", r.Text())
 }
 
 func CheckIfMatch(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
 	for range 2 {
-		gatePut(c, "other", onFixture, "tomm", "") // gates:version is 2 before button_color exists
+		hGatePut(c, "other", hOnFixture, "tomm", "") // gates:version is 2 before button_color exists
 	}
-	gatePut(c, "button_color", gateFixture, "tomm", "")
-	gatePut(c, "button_color", gateFixture, "tomm", "") // button_color is version 2, gates:version 4
-	before := publishedGate(ctx, "button_color")
-	r := gatePut(c, "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": []any{shareOf("CONTROL", 100)}}}}, "tomm", \`"1"\`)
+	hGatePut(c, "button_color", hGateFixture, "tomm", "")
+	hGatePut(c, "button_color", hGateFixture, "tomm", "") // button_color is version 2, gates:version 4
+	before := hPublishedGate(ctx, "button_color")
+	r := hGatePut(c, "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": []any{hShareOf("CONTROL", 100)}}}}, "tomm", \`"1"\`)
 	ctx.Equal(r.Status, 412, "If-Match: %s against version 2", \`"1"\`)
-	ctx.Equal(jsonValue(r.Body), jsonValue(map[string]any{"error": "version_conflict", "current": 2}), "the 412 body (%s)", r.Text())
-	ctx.Equal(publishedGate(ctx, "button_color"), before, "a 412 must write nothing, but the stored gate changed")
+	ctx.Equal(hJsonValue(r.Body), hJsonValue(map[string]any{"error": "version_conflict", "current": 2}), "the 412 body (%s)", r.Text())
+	ctx.Equal(hPublishedGate(ctx, "button_color"), before, "a 412 must write nothing, but the stored gate changed")
 	version, _ := ctx.Redis.Get("gates:version")
 	ctx.Equal(version, "4", "a 412 must not bump gates:version")
-	ctx.Equal(len(gateHistory(ctx, "button_color")), 2, "a 412 must not add a history entry; entries in the history")
-	r = gatePut(c, "button_color", gateFixture, "tomm", \`"2"\`)
-	ctx.Assert(r.Status == 200 && gateObject(r)["version"] == 3.0, "If-Match: %s against version 2 must be accepted (200, version 3), got %d %s: compare with the gate's own version, not gates:version", \`"2"\`, r.Status, r.Text())
-	r = gatePut(c, "button_color", gateFixture, "tomm", "3")
-	ctx.Assert(r.Status == 200 && gateObject(r)["version"] == 4.0, "an unquoted If-Match: 3 against version 3 must be accepted too, got %d %s", r.Status, r.Text())
-	r = gatePut(c, "button_color", gateFixture, "tomm", \`"9"\`)
-	ctx.Assert(r.Status == 412 && gateObject(r)["current"] == 4.0, "If-Match: %s against version 4 must answer 412 with current 4, got %d %s", \`"9"\`, r.Status, r.Text())
-	r = gatePut(c, "button_color", gateFixture, "tomm", "")
-	ctx.Assert(r.Status == 200 && gateObject(r)["version"] == 5.0, "a PUT without If-Match is accepted (last writer wins is the caller's choice), got %d %s", r.Status, r.Text())
+	ctx.Equal(len(hGateHistory(ctx, "button_color")), 2, "a 412 must not add a history entry; entries in the history")
+	r = hGatePut(c, "button_color", hGateFixture, "tomm", \`"2"\`)
+	ctx.Assert(r.Status == 200 && hGateObject(r)["version"] == 3.0, "If-Match: %s against version 2 must be accepted (200, version 3), got %d %s: compare with the gate's own version, not gates:version", \`"2"\`, r.Status, r.Text())
+	r = hGatePut(c, "button_color", hGateFixture, "tomm", "3")
+	ctx.Assert(r.Status == 200 && hGateObject(r)["version"] == 4.0, "an unquoted If-Match: 3 against version 3 must be accepted too, got %d %s", r.Status, r.Text())
+	r = hGatePut(c, "button_color", hGateFixture, "tomm", \`"9"\`)
+	ctx.Assert(r.Status == 412 && hGateObject(r)["current"] == 4.0, "If-Match: %s against version 4 must answer 412 with current 4, got %d %s", \`"9"\`, r.Status, r.Text())
+	r = hGatePut(c, "button_color", hGateFixture, "tomm", "")
+	ctx.Assert(r.Status == 200 && hGateObject(r)["version"] == 5.0, "a PUT without If-Match is accepted (last writer wins is the caller's choice), got %d %s", r.Status, r.Text())
 }
 
 func CheckHistory(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
-	r := gatePut(c, "button_color", gateFixture, "", "")
+	r := hGatePut(c, "button_color", hGateFixture, "", "")
 	ctx.Equal(r.Status, 400, "a PUT without X-Editor")
-	ctx.Equal(jsonValue(r.Body), jsonValue(map[string]any{"error": "editor_required"}), "the 400 body (%s)", r.Text())
-	assertUntouched(ctx, "a PUT without X-Editor")
+	ctx.Equal(hJsonValue(r.Body), hJsonValue(map[string]any{"error": "editor_required"}), "the 400 body (%s)", r.Text())
+	hAssertUntouched(ctx, "a PUT without X-Editor")
 	now := float64(ctx.Clock.Now() / 1000)
-	gatePut(c, "button_color", gateFixture, "ana", "")
+	hGatePut(c, "button_color", hGateFixture, "ana", "")
 	ctx.Clock.Advance(60)
-	gatePut(c, "button_color", gateFixture, "bo", "")
-	ctx.Equal(publishedGate(ctx, "button_color")["updated_by"], "bo", "the stored gate's updated_by must be the X-Editor of the last accepted PUT (bo)")
-	entries := gateHistory(ctx, "button_color")
+	hGatePut(c, "button_color", hGateFixture, "bo", "")
+	ctx.Equal(hPublishedGate(ctx, "button_color")["updated_by"], "bo", "the stored gate's updated_by must be the X-Editor of the last accepted PUT (bo)")
+	entries := hGateHistory(ctx, "button_color")
 	ctx.Equal(len(entries), 2, "two accepted PUTs must leave two entries in gate:button_color:history")
 	var got []string
 	var at []float64
@@ -1978,7 +1978,7 @@ func CheckHistory(ctx *harness.Ctx) {
 	for _, e := range entries {
 		entry, _ := e.(map[string]any)
 		got = append(got, fmt.Sprintf("%v %v %v", entry["version"], entry["by"], entry["change"]))
-		seconds, whole := wholeSeconds(entry["at"])
+		seconds, whole := hWholeSeconds(entry["at"])
 		allWhole = allWhole && whole
 		at = append(at, seconds)
 	}
@@ -1986,18 +1986,18 @@ func CheckHistory(ctx *harness.Ctx) {
 	ctx.Assert(allWhole && at[1] >= now-5 && at[0]-at[1] >= 59, "each entry's at is the time of its write in seconds (the second came a minute later): %v", entries)
 	r = c.Get("/gates/button_color/history")
 	ctx.Equal(r.Status, 200, "GET /gates/button_color/history")
-	ctx.Equal(jsonValue(r.Body), map[string]any{"entries": entries}, "GET /gates/button_color/history must answer the stored entries newest first (answered %s)", r.Text())
+	ctx.Equal(hJsonValue(r.Body), map[string]any{"entries": entries}, "GET /gates/button_color/history must answer the stored entries newest first (answered %s)", r.Text())
 	r = c.Get("/gates/ghost/history")
-	notFound, _ := json.Marshal(notFoundFixture)
-	ctx.Assert(r.Status == 404 && fmt.Sprint(jsonValue(r.Body)) == fmt.Sprint(jsonValue(notFoundFixture)), "the history of an unknown gate answered %d %s, expected 404 %s", r.Status, r.Text(), notFound)
-	gatePut(c, "button_color", gateFixture, "tomm", \`"1"\`)
-	gatePut(c, "button_color", map[string]any{"populations": []any{}}, "tomm", "")
-	gatePut(c, "button_color", gateFixture, "", "")
-	ctx.Equal(len(gateHistory(ctx, "button_color")), 2, "rejected requests (412, invalid gate, missing editor) must not add history entries; entries in the history")
+	notFound, _ := json.Marshal(hNotFoundFixture)
+	ctx.Assert(r.Status == 404 && fmt.Sprint(hJsonValue(r.Body)) == fmt.Sprint(hJsonValue(hNotFoundFixture)), "the history of an unknown gate answered %d %s, expected 404 %s", r.Status, r.Text(), notFound)
+	hGatePut(c, "button_color", hGateFixture, "tomm", \`"1"\`)
+	hGatePut(c, "button_color", map[string]any{"populations": []any{}}, "tomm", "")
+	hGatePut(c, "button_color", hGateFixture, "", "")
+	ctx.Equal(len(hGateHistory(ctx, "button_color")), 2, "rejected requests (412, invalid gate, missing editor) must not add history entries; entries in the history")
 	for i := range 103 {
-		gatePut(c, "button_color", gateFixture, fmt.Sprintf("bot%d", i), "")
+		hGatePut(c, "button_color", hGateFixture, fmt.Sprintf("bot%d", i), "")
 	}
-	entries = gateHistory(ctx, "button_color")
+	entries = hGateHistory(ctx, "button_color")
 	ctx.Equal(len(entries), 100, "the history is capped at the last 100 entries (LTRIM 0 99); entries in the history")
 	first, _ := entries[0].(map[string]any)
 	last, _ := entries[99].(map[string]any)
@@ -2005,7 +2005,7 @@ func CheckHistory(ctx *harness.Ctx) {
 }
 
 // loaderGate is a gate as step 2's loader parses it from the hash (its Gate's JSON fields).
-type loaderGate struct {
+type HLoaderGate struct {
 	Seed        string \`json:"seed"\`
 	Default     string \`json:"default"\`
 	Populations []struct {
@@ -2024,22 +2024,22 @@ type loaderGate struct {
 
 // loaderView is step 2's loader over what this step published. Go judges one step's file at a time, so the
 // harness reads the hash the way step 2's refresh does and decides the way its getVariant does.
-type loaderView struct {
+type HLoaderView struct {
 	ctx     *harness.Ctx
 	version int
-	gates   map[string]loaderGate
+	gates   map[string]HLoaderGate
 }
 
 // refresh loads gates:version and the hash gates; it reports whether the version moved from the empty snapshot's 0.
-func (l *loaderView) refresh() bool {
+func (l *HLoaderView) refresh() bool {
 	raw, _ := l.ctx.Redis.Get("gates:version")
 	version, _ := strconv.Atoi(raw)
 	if version == l.version {
 		return false
 	}
-	gates := map[string]loaderGate{}
+	gates := map[string]HLoaderGate{}
 	for name, body := range l.ctx.Redis.HGetAll("gates") {
-		var gate loaderGate
+		var gate HLoaderGate
 		l.ctx.NoError(json.Unmarshal([]byte(body), &gate), "step 2's loader cannot parse the stored gate %s (%s)", name, body)
 		gates[name] = gate
 	}
@@ -2047,7 +2047,7 @@ func (l *loaderView) refresh() bool {
 	return true
 }
 
-func (l *loaderView) getVariant(name string, attrs map[string]string) string {
+func (l *HLoaderView) getVariant(name string, attrs map[string]string) string {
 	gate, ok := l.gates[name]
 	if !ok {
 		return "OFF"
@@ -2083,9 +2083,9 @@ func (l *loaderView) getVariant(name string, attrs map[string]string) string {
 func CheckPublished(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
 	probe := ctx.Redis.After("gates:version", func() any {
-		return []any{publishedGate(ctx, "button_color") != nil, ctx.Redis.LLen("gate:button_color:history")}
+		return []any{hPublishedGate(ctx, "button_color") != nil, ctx.Redis.LLen("gate:button_color:history")}
 	})
-	r := gatePut(c, "button_color", gateFixture, "tomm", "")
+	r := hGatePut(c, "button_color", hGateFixture, "tomm", "")
 	ctx.Equal(r.Status, 201, "PUT /gates/button_color (answered %q)", strings.TrimSpace(r.Text()))
 	ctx.Assert(probe.Fired, "an accepted PUT must INCR gates:version — the signal step 2's loader polls")
 	ctx.NoError(probe.Err, "reading Redis when gates:version moved")
@@ -2098,9 +2098,9 @@ func CheckPublished(ctx *harness.Ctx) {
 		state = "already"
 	}
 	ctx.Assert(inHash && entries == 1, "at the instant gates:version moved, the gate was %s in the hash and the history held %d entries: HSET, INCR, LPUSH and LTRIM belong to one MULTI/EXEC so a loader never sees one without the others", state, entries)
-	gatePut(c, "dark_mode", onFixture, "ana", "")
+	hGatePut(c, "dark_mode", hOnFixture, "ana", "")
 	overrides := []any{map[string]any{"user_id": "tomm", "variant": "RED_BUTTON", "expires_at": ctx.Clock.Now()/1000 + 3600}}
-	gatePut(c, "button_color", map[string]any{"populations": gateFixture["populations"], "overrides": overrides}, "tomm", "")
+	hGatePut(c, "button_color", map[string]any{"populations": hGateFixture["populations"], "overrides": overrides}, "tomm", "")
 	version, _ := ctx.Redis.Get("gates:version")
 	ctx.Equal(version, "3", "three accepted writes must leave gates:version at 3: INCR exactly once per accepted write")
 	var fields []string
@@ -2109,7 +2109,7 @@ func CheckPublished(ctx *harness.Ctx) {
 	}
 	sort.Strings(fields)
 	ctx.Equal(fields, []string{"button_color", "dark_mode"}, "the hash gates must hold one field per gate")
-	gate := publishedGate(ctx, "button_color")
+	gate := hPublishedGate(ctx, "button_color")
 	ctx.Assert(gate != nil, "button_color must be stored in the hash gates")
 	var lacking []string
 	for _, f := range []string{"name", "seed", "default", "populations", "overrides", "version", "updated_at", "updated_by"} {
@@ -2118,14 +2118,14 @@ func CheckPublished(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Assert(len(lacking) == 0, "the stored JSON must carry every field (name, seed, default, populations, overrides, version, updated_at, updated_by), it lacks %q", lacking)
-	ctx.Equal(gate["populations"], jsonValue(gateFixture["populations"]), "populations must be stored as sent — an ordered list of {match, mix}, mix an ordered list of {variant, pct}")
+	ctx.Equal(gate["populations"], hJsonValue(hGateFixture["populations"]), "populations must be stored as sent — an ordered list of {match, mix}, mix an ordered list of {variant, pct}")
 	storedGate, _ := json.Marshal(gate)
-	ctx.Assert(fmt.Sprint(gate["overrides"]) == fmt.Sprint(jsonValue(overrides)) && gate["version"] == 2.0 && gate["name"] == "button_color" && gate["seed"] == "button_color" && gate["default"] == "OFF", "the stored button_color must be version 2 with its overrides and defaults, stored %s", storedGate)
-	gatePut(c, "button_color", gateFixture, "tomm", \`"1"\`)
-	gatePut(c, "button_color", map[string]any{"populations": []any{}}, "tomm", "")
+	ctx.Assert(fmt.Sprint(gate["overrides"]) == fmt.Sprint(hJsonValue(overrides)) && gate["version"] == 2.0 && gate["name"] == "button_color" && gate["seed"] == "button_color" && gate["default"] == "OFF", "the stored button_color must be version 2 with its overrides and defaults, stored %s", storedGate)
+	hGatePut(c, "button_color", hGateFixture, "tomm", \`"1"\`)
+	hGatePut(c, "button_color", map[string]any{"populations": []any{}}, "tomm", "")
 	version, _ = ctx.Redis.Get("gates:version")
 	ctx.Equal(version, "3", "rejected writes must not move gates:version")
-	loader := &loaderView{ctx: ctx}
+	loader := &HLoaderView{ctx: ctx}
 	ctx.Equal(loader.refresh(), true, "step 2's loader must see a new gates:version and load the hash")
 	ctx.Equal(loader.version, 3, "the version step 2's loader read from gates:version")
 	ctx.Equal(loader.getVariant("dark_mode", map[string]string{"user_id": "ana"}), "ON", "step 2's loader must find dark_mode in the hash and serve its ON population: the stored JSON is not what the loader expects")
@@ -2151,31 +2151,31 @@ func CheckPublished(ctx *harness.Ctx) {
 
 namespace {
 
-using njson = nlohmann::json;
+using HNjson = nlohmann::json;
 
-njson shareOf(const std::string& variant, const njson& pct) { return {{"variant", variant}, {"pct", pct}}; }
+HNjson hShareOf(const std::string& variant, const HNjson& pct) { return {{"variant", variant}, {"pct", pct}}; }
 
-const njson threeWayMix = njson::array({shareOf("RED_BUTTON", 33), shareOf("BLUE_BUTTON", 33), shareOf("CONTROL", 34)});
-const njson gateFixture = {{"populations",
-                            njson::array({{{"match", {{"locale", "de"}}}, {"mix", threeWayMix}},
-                                          {{"match", njson::object()}, {"mix", njson::array({shareOf("BLUE_BUTTON", 100)})}}})}};
-const njson onFixture = {
-    {"populations", njson::array({{{"match", njson::object()}, {"mix", njson::array({shareOf("ON", 100)})}}})}};
-const njson notFoundFixture = {{"error", "not_found"}};
+const HNjson kHThreeWayMix = HNjson::array({hShareOf("RED_BUTTON", 33), hShareOf("BLUE_BUTTON", 33), hShareOf("CONTROL", 34)});
+const HNjson kHGateFixture = {{"populations",
+                            HNjson::array({{{"match", {{"locale", "de"}}}, {"mix", kHThreeWayMix}},
+                                          {{"match", HNjson::object()}, {"mix", HNjson::array({hShareOf("BLUE_BUTTON", 100)})}}})}};
+const HNjson kHOnFixture = {
+    {"populations", HNjson::array({{{"match", HNjson::object()}, {"mix", HNjson::array({hShareOf("ON", 100)})}}})}};
+const HNjson kHNotFoundFixture = {{"error", "not_found"}};
 
 // mixOf is RED_BUTTON, BLUE_BUTTON, CONTROL with the given shares, in that order.
-njson mixOf(std::vector<njson> pcts) {
+HNjson hMixOf(std::vector<HNjson> pcts) {
   static const char* names[] = {"RED_BUTTON", "BLUE_BUTTON", "CONTROL"};
-  njson mix = njson::array();
-  for (size_t i = 0; i < pcts.size(); i++) mix.push_back(shareOf(names[i], pcts[i]));
+  HNjson mix = HNjson::array();
+  for (size_t i = 0; i < pcts.size(); i++) mix.push_back(hShareOf(names[i], pcts[i]));
   return mix;
 }
 
 // One population matching everyone with the given mix.
-njson everyone(const njson& mix) { return {{"populations", njson::array({{{"match", njson::object()}, {"mix", mix}}})}}; }
+HNjson hEveryone(const HNjson& mix) { return {{"populations", HNjson::array({{{"match", HNjson::object()}, {"mix", mix}}})}}; }
 
 // gatePut is PUT /gates/{name}; an empty editor or ifMatch leaves that header out.
-harness::Response gatePut(harness::HTTP& c, const std::string& name, const njson& body, const std::string& editor,
+harness::Response hGatePut(harness::HTTP& c, const std::string& name, const HNjson& body, const std::string& editor,
                           const std::string& ifMatch) {
   std::vector<std::string> header;
   if (!editor.empty()) header.insert(header.end(), {"X-Editor", editor});
@@ -2184,28 +2184,28 @@ harness::Response gatePut(harness::HTTP& c, const std::string& name, const njson
 }
 
 // jsonValue is text as JSON sees it, nil when it is not JSON.
-harness::Any jsonValue(const std::string& text) { return harness::ParseJSON(text).value_or(harness::Any()); }
+harness::Any hJsonValue(const std::string& text) { return harness::ParseJSON(text).value_or(harness::Any()); }
 
 // publishedGate is the gate stored in the hash gates, parsed (nil when there is none).
-harness::Any publishedGate(harness::Ctx& ctx, const std::string& name) {
+harness::Any hPublishedGate(harness::Ctx& ctx, const std::string& name) {
   const auto raw = ctx.Redis.HGet("gates", name);
   if (!raw) return harness::Any();
-  const harness::Any obj = jsonValue(*raw);
+  const harness::Any obj = hJsonValue(*raw);
   return obj.IsObject() ? obj : harness::Any();
 }
 
-std::vector<harness::Any> gateHistory(harness::Ctx& ctx, const std::string& name) {
+std::vector<harness::Any> hGateHistory(harness::Ctx& ctx, const std::string& name) {
   std::vector<harness::Any> entries;
-  for (const auto& raw : ctx.Redis.LRange("gate:" + name + ":history", 0, -1)) entries.push_back(jsonValue(raw));
+  for (const auto& raw : ctx.Redis.LRange("gate:" + name + ":history", 0, -1)) entries.push_back(hJsonValue(raw));
   return entries;
 }
 
-void assertUntouched(harness::Ctx& ctx, const std::string& what) {
+void hAssertUntouched(harness::Ctx& ctx, const std::string& what) {
   const auto keys = ctx.Redis.Keys("*");
   ctx.Assert(keys.empty(), "%s must write nothing, but Redis now holds %q", what, keys);
 }
 
-bool wholeSeconds(const harness::Any& v) { return v.IsNumber() && v.Float() == std::trunc(v.Float()); }
+bool hWholeSeconds(const harness::Any& v) { return v.IsNumber() && v.Float() == std::trunc(v.Float()); }
 
 }  // namespace
 
@@ -2213,141 +2213,141 @@ void CheckValidate(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
   struct Bad {
     std::string what, name;
-    njson body;
+    HNjson body;
   };
   const std::vector<Bad> bad = {
-      {"shares adding up to 99", "button_color", everyone(mixOf({33, 33, 33}))},
-      {"shares adding up to 101", "button_color", everyone(mixOf({34, 33, 34}))},
-      {"a negative share (-10 + 110)", "button_color", everyone(mixOf({-10, 110}))},
-      {"a fractional share (33.5 + 66.5)", "button_color", everyone(mixOf({33.5, 66.5}))},
-      {"a share without a pct", "button_color", everyone(njson::array({{{"variant", "ON"}}}))},
-      {"the lowercase variant 'red_button'", "button_color", everyone(njson::array({shareOf("red_button", 100)}))},
-      {"the lowercase default 'off'", "button_color", {{"default", "off"}, {"populations", onFixture["populations"]}}},
-      {"an empty mix", "button_color", everyone(njson::array())},
-      {"an empty populations list", "button_color", {{"populations", njson::array()}}},
+      {"shares adding up to 99", "button_color", hEveryone(hMixOf({33, 33, 33}))},
+      {"shares adding up to 101", "button_color", hEveryone(hMixOf({34, 33, 34}))},
+      {"a negative share (-10 + 110)", "button_color", hEveryone(hMixOf({-10, 110}))},
+      {"a fractional share (33.5 + 66.5)", "button_color", hEveryone(hMixOf({33.5, 66.5}))},
+      {"a share without a pct", "button_color", hEveryone(HNjson::array({{{"variant", "ON"}}}))},
+      {"the lowercase variant 'red_button'", "button_color", hEveryone(HNjson::array({hShareOf("red_button", 100)}))},
+      {"the lowercase default 'off'", "button_color", {{"default", "off"}, {"populations", kHOnFixture["populations"]}}},
+      {"an empty mix", "button_color", hEveryone(HNjson::array())},
+      {"an empty populations list", "button_color", {{"populations", HNjson::array()}}},
       {"no populations at all", "button_color", {{"seed", "button_color"}}},
-      {"a population without a match", "button_color", {{"populations", njson::array({{{"mix", mixOf({50, 50})}}})}}},
+      {"a population without a match", "button_color", {{"populations", HNjson::array({{{"mix", hMixOf({50, 50})}}})}}},
       {"a match value that is not a string", "button_color",
-       {{"populations", njson::array({{{"match", {{"locale", 7}}}, {"mix", mixOf({50, 50})}}})}}},
-      {"the name 'Button_Color' (upper case)", "Button_Color", onFixture},
-      {"the name 'ab' (too short)", "ab", onFixture},
-      {"the name '1st_gate' (starts with a digit)", "1st_gate", onFixture},
-      {"a 65-character name", std::string(65, 'a'), onFixture},
+       {{"populations", HNjson::array({{{"match", {{"locale", 7}}}, {"mix", hMixOf({50, 50})}}})}}},
+      {"the name 'Button_Color' (upper case)", "Button_Color", kHOnFixture},
+      {"the name 'ab' (too short)", "ab", kHOnFixture},
+      {"the name '1st_gate' (starts with a digit)", "1st_gate", kHOnFixture},
+      {"a 65-character name", std::string(65, 'a'), kHOnFixture},
   };
   for (const auto& b : bad) {
-    auto r = gatePut(c, b.name, b.body, "tomm", "");
+    auto r = hGatePut(c, b.name, b.body, "tomm", "");
     ctx.Equal(r.Status, 400, "PUT /gates/%s with %s", b.name, b.what);
-    const harness::Any data = jsonValue(r.Text());
+    const harness::Any data = hJsonValue(r.Text());
     ctx.Equal(data["error"], "invalid_gate", "the error of PUT /gates/%s with %s (body %s)", b.name, b.what, r.Text());
     ctx.Assert(data["reason"].IsString() && !data["reason"].String().empty(),
                "the 400 for %s must carry a reason string, got %s", b.what, r.Text());
   }
-  assertUntouched(ctx, "a rejected gate");
-  auto r = gatePut(c, "button_color", {{"populations", njson::array()}}, "", "");
-  ctx.Assert(r.Status == 400 && jsonValue(r.Text())["error"] == "invalid_gate",
+  hAssertUntouched(ctx, "a rejected gate");
+  auto r = hGatePut(c, "button_color", {{"populations", HNjson::array()}}, "", "");
+  ctx.Assert(r.Status == 400 && hJsonValue(r.Text())["error"] == "invalid_gate",
              "the shape is checked before the editor: a malformed gate without X-Editor answered %d %s, expected 400 "
              "invalid_gate",
              r.Status, r.Text());
-  assertUntouched(ctx, "a rejected gate");
-  r = gatePut(c, "button_color", gateFixture, "tomm", "");
+  hAssertUntouched(ctx, "a rejected gate");
+  r = hGatePut(c, "button_color", kHGateFixture, "tomm", "");
   ctx.Equal(r.Status, 201, "a valid gate (answered %s)", r.Text());
-  r = gatePut(c, std::string(64, 'a'), onFixture, "tomm", "");
+  r = hGatePut(c, std::string(64, 'a'), kHOnFixture, "tomm", "");
   ctx.Equal(r.Status, 201, "a 64-character name is within ^[a-z][a-z0-9_]{2,63}$");
-  ctx.Assert(!publishedGate(ctx, "button_color").IsNil(), "the accepted gate must be stored in the hash gates");
+  ctx.Assert(!hPublishedGate(ctx, "button_color").IsNil(), "the accepted gate must be stored in the hash gates");
 }
 
 void CheckCreatedUpdated(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
   const double now = static_cast<double>(ctx.Clock.Now() / 1000);
-  auto r = gatePut(c, "dark_mode", onFixture, "ana", "");
+  auto r = hGatePut(c, "dark_mode", kHOnFixture, "ana", "");
   ctx.Equal(r.Status, 201, "the first PUT of dark_mode must answer 201 Created");
-  harness::Any gate = jsonValue(r.Text());
+  harness::Any gate = hJsonValue(r.Text());
   ctx.Equal(gate["version"], 1, "a new gate must be version 1");
   ctx.Equal(r.HeaderValue("ETag"), R"("1")", "the 201 must carry the header ETag: %q (the version, quoted)", R"("1")");
   ctx.Assert(gate["name"] == "dark_mode" && gate["seed"] == "dark_mode" && gate["default"] == "OFF" &&
                  gate["overrides"].IsArray() && gate["overrides"].Len() == 0,
              "seed defaults to the name, default to OFF, overrides to []; the answer was %s", r.Text());
   ctx.Equal(gate["updated_by"], "ana", "updated_by must be the X-Editor (ana)");
-  ctx.Assert(wholeSeconds(gate["updated_at"]) && std::abs(gate["updated_at"].Float() - now) <= 5,
+  ctx.Assert(hWholeSeconds(gate["updated_at"]) && std::abs(gate["updated_at"].Float() - now) <= 5,
              "updated_at must be the time of the write in seconds, got %v", gate["updated_at"]);
   auto storedRaw = ctx.Redis.HGet("gates", "dark_mode").value_or("");
-  ctx.Equal(jsonValue(r.Text()), publishedGate(ctx, "dark_mode"), "the answer must be the stored gate (answered %s, stored %s)",
+  ctx.Equal(hJsonValue(r.Text()), hPublishedGate(ctx, "dark_mode"), "the answer must be the stored gate (answered %s, stored %s)",
             r.Text(), storedRaw);
-  r = gatePut(c, "dark_mode", {{"seed", "dark_mode_v2"}, {"default", "ON"}, {"populations", onFixture["populations"]}}, "bo", "");
+  r = hGatePut(c, "dark_mode", {{"seed", "dark_mode_v2"}, {"default", "ON"}, {"populations", kHOnFixture["populations"]}}, "bo", "");
   ctx.Equal(r.Status, 200, "updating an existing gate must answer 200");
-  gate = jsonValue(r.Text());
+  gate = hJsonValue(r.Text());
   ctx.Assert(gate["version"] == 2.0 && r.HeaderValue("ETag") == R"("2")",
              "the update must bump the version to 2 and answer ETag %q: got version %v, ETag %q", R"("2")", gate["version"],
              r.HeaderValue("ETag"));
   ctx.Assert(gate["seed"] == "dark_mode_v2" && gate["default"] == "ON" && gate["updated_by"] == "bo",
              "the update must replace the gate's fields (seed, default, updated_by): %s", r.Text());
-  r = gatePut(c, "dark_mode", onFixture, "bo", "");
-  ctx.Assert(r.Status == 200 && jsonValue(r.Text())["version"] == 3.0, "a third PUT must be version 3, got %d %s", r.Status,
+  r = hGatePut(c, "dark_mode", kHOnFixture, "bo", "");
+  ctx.Assert(r.Status == 200 && hJsonValue(r.Text())["version"] == 3.0, "a third PUT must be version 3, got %d %s", r.Status,
              r.Text());
-  r = gatePut(c, "other_gate", onFixture, "tomm", "");
-  ctx.Assert(r.Status == 201 && jsonValue(r.Text())["version"] == 1.0,
+  r = hGatePut(c, "other_gate", kHOnFixture, "tomm", "");
+  ctx.Assert(r.Status == 201 && hJsonValue(r.Text())["version"] == 1.0,
              "every gate counts its own versions: a new gate is version 1 even after three edits elsewhere "
              "(gates:version is the global counter, not the gate's); got %d %s",
              r.Status, r.Text());
   r = c.Get("/gates/dark_mode");
   ctx.Equal(r.Status, 200, "GET /gates/dark_mode");
   storedRaw = ctx.Redis.HGet("gates", "dark_mode").value_or("");
-  ctx.Equal(jsonValue(r.Text()), publishedGate(ctx, "dark_mode"), "GET must answer the stored gate (got %s, stored %s)",
+  ctx.Equal(hJsonValue(r.Text()), hPublishedGate(ctx, "dark_mode"), "GET must answer the stored gate (got %s, stored %s)",
             r.Text(), storedRaw);
   ctx.Equal(r.HeaderValue("ETag"), R"("3")", "GET must carry the ETag of the stored version");
   r = c.Get("/gates/ghost");
   ctx.Equal(r.Status, 404, "GET of an unknown gate");
-  ctx.Equal(jsonValue(r.Text()), jsonValue(notFoundFixture.dump()), "the 404 body (%s)", r.Text());
+  ctx.Equal(hJsonValue(r.Text()), hJsonValue(kHNotFoundFixture.dump()), "the 404 body (%s)", r.Text());
 }
 
 void CheckIfMatch(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  for (int i = 0; i < 2; i++) gatePut(c, "other", onFixture, "tomm", "");  // gates:version is 2 before button_color exists
-  gatePut(c, "button_color", gateFixture, "tomm", "");
-  gatePut(c, "button_color", gateFixture, "tomm", "");  // button_color is version 2, gates:version 4
-  const harness::Any before = publishedGate(ctx, "button_color");
-  auto r = gatePut(c, "button_color", everyone(njson::array({shareOf("CONTROL", 100)})), "tomm", R"("1")");
+  for (int i = 0; i < 2; i++) hGatePut(c, "other", kHOnFixture, "tomm", "");  // gates:version is 2 before button_color exists
+  hGatePut(c, "button_color", kHGateFixture, "tomm", "");
+  hGatePut(c, "button_color", kHGateFixture, "tomm", "");  // button_color is version 2, gates:version 4
+  const harness::Any before = hPublishedGate(ctx, "button_color");
+  auto r = hGatePut(c, "button_color", hEveryone(HNjson::array({hShareOf("CONTROL", 100)})), "tomm", R"("1")");
   ctx.Equal(r.Status, 412, "If-Match: %s against version 2", R"("1")");
-  ctx.Equal(jsonValue(r.Text()), jsonValue(R"({"error":"version_conflict","current":2})"), "the 412 body (%s)", r.Text());
-  ctx.Equal(publishedGate(ctx, "button_color"), before, "a 412 must write nothing, but the stored gate changed");
+  ctx.Equal(hJsonValue(r.Text()), hJsonValue(R"({"error":"version_conflict","current":2})"), "the 412 body (%s)", r.Text());
+  ctx.Equal(hPublishedGate(ctx, "button_color"), before, "a 412 must write nothing, but the stored gate changed");
   ctx.Equal(ctx.Redis.Get("gates:version").value_or(""), "4", "a 412 must not bump gates:version");
-  ctx.Equal(gateHistory(ctx, "button_color").size(), 2, "a 412 must not add a history entry; entries in the history");
-  r = gatePut(c, "button_color", gateFixture, "tomm", R"("2")");
-  ctx.Assert(r.Status == 200 && jsonValue(r.Text())["version"] == 3.0,
+  ctx.Equal(hGateHistory(ctx, "button_color").size(), 2, "a 412 must not add a history entry; entries in the history");
+  r = hGatePut(c, "button_color", kHGateFixture, "tomm", R"("2")");
+  ctx.Assert(r.Status == 200 && hJsonValue(r.Text())["version"] == 3.0,
              "If-Match: %s against version 2 must be accepted (200, version 3), got %d %s: compare with the gate's own "
              "version, not gates:version",
              R"("2")", r.Status, r.Text());
-  r = gatePut(c, "button_color", gateFixture, "tomm", "3");
-  ctx.Assert(r.Status == 200 && jsonValue(r.Text())["version"] == 4.0,
+  r = hGatePut(c, "button_color", kHGateFixture, "tomm", "3");
+  ctx.Assert(r.Status == 200 && hJsonValue(r.Text())["version"] == 4.0,
              "an unquoted If-Match: 3 against version 3 must be accepted too, got %d %s", r.Status, r.Text());
-  r = gatePut(c, "button_color", gateFixture, "tomm", R"("9")");
-  ctx.Assert(r.Status == 412 && jsonValue(r.Text())["current"] == 4.0,
+  r = hGatePut(c, "button_color", kHGateFixture, "tomm", R"("9")");
+  ctx.Assert(r.Status == 412 && hJsonValue(r.Text())["current"] == 4.0,
              "If-Match: %s against version 4 must answer 412 with current 4, got %d %s", R"("9")", r.Status, r.Text());
-  r = gatePut(c, "button_color", gateFixture, "tomm", "");
-  ctx.Assert(r.Status == 200 && jsonValue(r.Text())["version"] == 5.0,
+  r = hGatePut(c, "button_color", kHGateFixture, "tomm", "");
+  ctx.Assert(r.Status == 200 && hJsonValue(r.Text())["version"] == 5.0,
              "a PUT without If-Match is accepted (last writer wins is the caller's choice), got %d %s", r.Status, r.Text());
 }
 
 void CheckHistory(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  auto r = gatePut(c, "button_color", gateFixture, "", "");
+  auto r = hGatePut(c, "button_color", kHGateFixture, "", "");
   ctx.Equal(r.Status, 400, "a PUT without X-Editor");
-  ctx.Equal(jsonValue(r.Text()), jsonValue(R"({"error":"editor_required"})"), "the 400 body (%s)", r.Text());
-  assertUntouched(ctx, "a PUT without X-Editor");
+  ctx.Equal(hJsonValue(r.Text()), hJsonValue(R"({"error":"editor_required"})"), "the 400 body (%s)", r.Text());
+  hAssertUntouched(ctx, "a PUT without X-Editor");
   const double now = static_cast<double>(ctx.Clock.Now() / 1000);
-  gatePut(c, "button_color", gateFixture, "ana", "");
+  hGatePut(c, "button_color", kHGateFixture, "ana", "");
   ctx.Clock.Advance(60);
-  gatePut(c, "button_color", gateFixture, "bo", "");
-  ctx.Equal(publishedGate(ctx, "button_color")["updated_by"], "bo",
+  hGatePut(c, "button_color", kHGateFixture, "bo", "");
+  ctx.Equal(hPublishedGate(ctx, "button_color")["updated_by"], "bo",
             "the stored gate's updated_by must be the X-Editor of the last accepted PUT (bo)");
-  auto entries = gateHistory(ctx, "button_color");
+  auto entries = hGateHistory(ctx, "button_color");
   ctx.Equal(entries.size(), 2, "two accepted PUTs must leave two entries in gate:button_color:history");
   std::vector<std::string> got;
   std::vector<double> at;
   bool allWhole = true;
   for (const auto& entry : entries) {
     got.push_back(entry["version"].Format() + " " + entry["by"].Format() + " " + entry["change"].Format());
-    allWhole = allWhole && wholeSeconds(entry["at"]);
+    allWhole = allWhole && hWholeSeconds(entry["at"]);
     at.push_back(entry["at"].Float());
   }
   ctx.Equal(got, {"2 bo updated", "1 ana created"},
@@ -2356,18 +2356,18 @@ void CheckHistory(harness::Ctx& ctx) {
              "each entry's at is the time of its write in seconds (the second came a minute later): %v", entries);
   r = c.Get("/gates/button_color/history");
   ctx.Equal(r.Status, 200, "GET /gates/button_color/history");
-  ctx.Equal(jsonValue(r.Text()), harness::Any(std::map<std::string, harness::Any>{{"entries", harness::Any(entries)}}),
+  ctx.Equal(hJsonValue(r.Text()), harness::Any(std::map<std::string, harness::Any>{{"entries", harness::Any(entries)}}),
             "GET /gates/button_color/history must answer the stored entries newest first (answered %s)", r.Text());
   r = c.Get("/gates/ghost/history");
-  ctx.Assert(r.Status == 404 && jsonValue(r.Text()) == jsonValue(notFoundFixture.dump()),
-             "the history of an unknown gate answered %d %s, expected 404 %s", r.Status, r.Text(), notFoundFixture.dump());
-  gatePut(c, "button_color", gateFixture, "tomm", R"("1")");
-  gatePut(c, "button_color", {{"populations", njson::array()}}, "tomm", "");
-  gatePut(c, "button_color", gateFixture, "", "");
-  ctx.Equal(gateHistory(ctx, "button_color").size(), 2,
+  ctx.Assert(r.Status == 404 && hJsonValue(r.Text()) == hJsonValue(kHNotFoundFixture.dump()),
+             "the history of an unknown gate answered %d %s, expected 404 %s", r.Status, r.Text(), kHNotFoundFixture.dump());
+  hGatePut(c, "button_color", kHGateFixture, "tomm", R"("1")");
+  hGatePut(c, "button_color", {{"populations", HNjson::array()}}, "tomm", "");
+  hGatePut(c, "button_color", kHGateFixture, "", "");
+  ctx.Equal(hGateHistory(ctx, "button_color").size(), 2,
             "rejected requests (412, invalid gate, missing editor) must not add history entries; entries in the history");
-  for (int i = 0; i < 103; i++) gatePut(c, "button_color", gateFixture, "bot" + std::to_string(i), "");
-  entries = gateHistory(ctx, "button_color");
+  for (int i = 0; i < 103; i++) hGatePut(c, "button_color", kHGateFixture, "bot" + std::to_string(i), "");
+  entries = hGateHistory(ctx, "button_color");
   ctx.Equal(entries.size(), 100, "the history is capped at the last 100 entries (LTRIM 0 99); entries in the history");
   ctx.Assert(entries[0]["version"] == 105.0 && entries[99]["version"] == 6.0,
              "the cap keeps the newest 100: versions 105 down to 6, found %v down to %v", entries[0]["version"],
@@ -2377,23 +2377,23 @@ void CheckHistory(harness::Ctx& ctx) {
 namespace {
 
 // A gate as step 2's loader parses it from the hash.
-struct LoaderGate {
+struct HLoaderGate {
   std::string seed, default_variant;
   harness::Any populations, overrides;
 };
 
 // loaderView is step 2's loader over what this step published: only this step's file is compiled, so
 // the harness reads the hash the way step 2's refresh does and decides the way its get_variant does.
-struct LoaderView {
+struct HLoaderView {
   harness::Ctx& ctx;
   int version = 0;
-  std::map<std::string, LoaderGate> gates;
+  std::map<std::string, HLoaderGate> gates;
 
   // refresh loads gates:version and the hash gates; it reports whether the version moved from the empty snapshot's 0.
   bool refresh() {
     const int now = std::atoi(ctx.Redis.Get("gates:version").value_or("0").c_str());
     if (now == version) return false;
-    std::map<std::string, LoaderGate> loaded;
+    std::map<std::string, HLoaderGate> loaded;
     for (const auto& [name, body] : ctx.Redis.HGetAll("gates")) {
       const auto gate = harness::ParseJSON(body);
       ctx.Assert(gate && gate->IsObject(), "step 2's loader cannot parse the stored gate %s (%s)", name, body);
@@ -2407,7 +2407,7 @@ struct LoaderView {
   std::string getVariant(const std::string& name, std::map<std::string, std::string> attrs) {
     const auto found = gates.find(name);
     if (found == gates.end()) return "OFF";
-    const LoaderGate& gate = found->second;
+    const HLoaderGate& gate = found->second;
     const int64_t now = ctx.Clock.Now() / 1000;
     for (const auto& o : gate.overrides.Items()) {
       if (o["user_id"] == attrs["user_id"] && o["expires_at"].Int() > now) return o["variant"].String();
@@ -2437,10 +2437,10 @@ void CheckPublished(harness::Ctx& ctx) {
   long long entriesSeen = 0;
   ctx.Redis.After("gates:version", [&] {
     fired = true;
-    inHash = !publishedGate(ctx, "button_color").IsNil();
+    inHash = !hPublishedGate(ctx, "button_color").IsNil();
     entriesSeen = ctx.Redis.LLen("gate:button_color:history");
   });
-  auto r = gatePut(c, "button_color", gateFixture, "tomm", "");
+  auto r = hGatePut(c, "button_color", kHGateFixture, "tomm", "");
   std::string answered = r.Text();
   while (!answered.empty() && std::isspace(static_cast<unsigned char>(answered.back()))) answered.pop_back();
   ctx.Equal(r.Status, 201, "PUT /gates/button_color (answered %q)", answered);
@@ -2449,17 +2449,17 @@ void CheckPublished(harness::Ctx& ctx) {
              "at the instant gates:version moved, the gate was %s in the hash and the history held %d entries: HSET, "
              "INCR, LPUSH and LTRIM belong to one MULTI/EXEC so a loader never sees one without the others",
              inHash ? "already" : "not yet", entriesSeen);
-  gatePut(c, "dark_mode", onFixture, "ana", "");
-  const njson overrides =
-      njson::array({{{"user_id", "tomm"}, {"variant", "RED_BUTTON"}, {"expires_at", ctx.Clock.Now() / 1000 + 3600}}});
-  gatePut(c, "button_color", {{"populations", gateFixture["populations"]}, {"overrides", overrides}}, "tomm", "");
+  hGatePut(c, "dark_mode", kHOnFixture, "ana", "");
+  const HNjson overrides =
+      HNjson::array({{{"user_id", "tomm"}, {"variant", "RED_BUTTON"}, {"expires_at", ctx.Clock.Now() / 1000 + 3600}}});
+  hGatePut(c, "button_color", {{"populations", kHGateFixture["populations"]}, {"overrides", overrides}}, "tomm", "");
   ctx.Equal(ctx.Redis.Get("gates:version").value_or(""), "3",
             "three accepted writes must leave gates:version at 3: INCR exactly once per accepted write");
   std::vector<std::string> fields;
   for (const auto& [name, body] : ctx.Redis.HGetAll("gates")) fields.push_back(name);
   std::sort(fields.begin(), fields.end());
   ctx.Equal(fields, {"button_color", "dark_mode"}, "the hash gates must hold one field per gate");
-  const harness::Any gate = publishedGate(ctx, "button_color");
+  const harness::Any gate = hPublishedGate(ctx, "button_color");
   ctx.Assert(!gate.IsNil(), "button_color must be stored in the hash gates");
   std::vector<std::string> lacking;
   for (const std::string f : {"name", "seed", "default", "populations", "overrides", "version", "updated_at", "updated_by"}) {
@@ -2469,16 +2469,16 @@ void CheckPublished(harness::Ctx& ctx) {
              "the stored JSON must carry every field (name, seed, default, populations, overrides, version, updated_at, "
              "updated_by), it lacks %q",
              lacking);
-  ctx.Equal(gate["populations"], jsonValue(gateFixture["populations"].dump()),
+  ctx.Equal(gate["populations"], hJsonValue(kHGateFixture["populations"].dump()),
             "populations must be stored as sent — an ordered list of {match, mix}, mix an ordered list of {variant, pct}");
-  ctx.Assert(gate["overrides"] == jsonValue(overrides.dump()) && gate["version"] == 2.0 && gate["name"] == "button_color" &&
+  ctx.Assert(gate["overrides"] == hJsonValue(overrides.dump()) && gate["version"] == 2.0 && gate["name"] == "button_color" &&
                  gate["seed"] == "button_color" && gate["default"] == "OFF",
              "the stored button_color must be version 2 with its overrides and defaults, stored %s",
              ctx.Redis.HGet("gates", "button_color").value_or(""));
-  gatePut(c, "button_color", gateFixture, "tomm", R"("1")");
-  gatePut(c, "button_color", {{"populations", njson::array()}}, "tomm", "");
+  hGatePut(c, "button_color", kHGateFixture, "tomm", R"("1")");
+  hGatePut(c, "button_color", {{"populations", HNjson::array()}}, "tomm", "");
   ctx.Equal(ctx.Redis.Get("gates:version").value_or(""), "3", "rejected writes must not move gates:version");
-  LoaderView loader{ctx};
+  HLoaderView loader{ctx};
   ctx.Equal(loader.refresh(), true, "step 2's loader must see a new gates:version and load the hash");
   ctx.Equal(loader.version, 3, "the version step 2's loader read from gates:version");
   ctx.Equal(loader.getVariant("dark_mode", {{"user_id", "ana"}}), "ON",

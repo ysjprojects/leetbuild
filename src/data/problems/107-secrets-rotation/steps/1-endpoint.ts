@@ -751,48 +751,48 @@ import (
 	"leetbuild/harness"
 )
 
-const apiMaterial = "pg-password-CANARY-41d7"
+const kHApiMaterial = "pg-password-CANARY-41d7"
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiCreate(c *harness.HTTP, name string, extra map[string]any, header ...string) *harness.Response {
-	body := map[string]any{"name": name, "material": apiMaterial}
+func hApiCreate(c *harness.HTTP, name string, extra map[string]any, header ...string) *harness.Response {
+	body := map[string]any{"name": name, "material": kHApiMaterial}
 	for k, v := range extra {
 		body[k] = v
 	}
 	return c.Post("/v1/secrets", body, header...)
 }
 
-func apiCreated(ctx *harness.Ctx, r *harness.Response, what string) map[string]any {
+func hApiCreated(ctx *harness.Ctx, r *harness.Response, what string) map[string]any {
 	ctx.Equal(r.Status, 201, "%s (%s)", what, r.Text())
 	out, _ := r.JSON().(map[string]any)
 	return out
 }
 
 func CheckCreateRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	anonymous := apiCreate(c, "payments-db", nil)
+	c := hApiClient(ctx)
+	anonymous := hApiCreate(c, "payments-db", nil)
 	ctx.Equal(anonymous.Status, 401, "a create without X-Operator-Id")
-	first := apiCreated(ctx, apiCreate(c, "payments-db", nil, "X-Operator-Id", "op-ana"), "POST /v1/secrets")
-	second := apiCreated(ctx, apiCreate(c, "payments-db", nil, "X-Operator-Id", "op-ana"), "a second POST /v1/secrets for the same name")
+	first := hApiCreated(ctx, hApiCreate(c, "payments-db", nil, "X-Operator-Id", "op-ana"), "POST /v1/secrets")
+	second := hApiCreated(ctx, hApiCreate(c, "payments-db", nil, "X-Operator-Id", "op-ana"), "a second POST /v1/secrets for the same name")
 	ctx.Assert(first["name"] == "payments-db" && first["version_id"] == "v1", "the first create must answer name payments-db and version_id v1, got %v", first)
 	ctx.Equal(second["version_id"], "v2", "the second create's version_id")
 	stored := vault.GetVersion(context.Background(), "payments-db", "v1")
-	ctx.Assert(stored != nil && stored.Material == apiMaterial, "the vault must hold version v1 with its material, it holds %+v", stored)
+	ctx.Assert(stored != nil && stored.Material == kHApiMaterial, "the vault must hold version v1 with its material, it holds %+v", stored)
 }
 
 func CheckMaterialSealed(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiCreate(c, "payments-db", map[string]any{"rotation_seconds": 3600}, "X-Operator-Id", "op-ana")
-	body := apiCreated(ctx, r, "POST /v1/secrets")
+	c := hApiClient(ctx)
+	r := hApiCreate(c, "payments-db", map[string]any{"rotation_seconds": 3600}, "X-Operator-Id", "op-ana")
+	body := hApiCreated(ctx, r, "POST /v1/secrets")
 	_, leaked := body["material"]
 	ctx.Assert(!leaked, "the 201 body carries the material: %s. Answer publicVersion(record): ids, fingerprint and window only", r.Text())
-	ctx.Assert(!strings.Contains(r.Text(), apiMaterial), "the 201 body carries the material under another name: %s", r.Text())
-	sum := sha256.Sum256([]byte(apiMaterial))
+	ctx.Assert(!strings.Contains(r.Text(), kHApiMaterial), "the 201 body carries the material under another name: %s", r.Text())
+	sum := sha256.Sum256([]byte(kHApiMaterial))
 	ctx.Equal(body["fingerprint"], hex.EncodeToString(sum[:]), "the 201 body must carry the SHA-256 fingerprint")
 	for _, field := range []string{"name", "version_id", "rotation_seconds", "created_at", "rotate_at"} {
 		_, ok := body[field]
@@ -805,13 +805,13 @@ func CheckMaterialSealed(ctx *harness.Ctx) {
 }
 
 func CheckAuditIdsOnly(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	var logged bytes.Buffer
 	log.SetOutput(&logged)
-	r := apiCreate(c, "payments-db", nil, "X-Operator-Id", "op-ana")
+	r := hApiCreate(c, "payments-db", nil, "X-Operator-Id", "op-ana")
 	log.SetOutput(os.Stderr)
-	apiCreated(ctx, r, "POST /v1/secrets")
-	ctx.Assert(!strings.Contains(logged.String(), apiMaterial), "the material reached the logs: %q. The audit line carries the operator, the name, the version id and the fingerprint", strings.TrimSpace(logged.String()))
+	hApiCreated(ctx, r, "POST /v1/secrets")
+	ctx.Assert(!strings.Contains(logged.String(), kHApiMaterial), "the material reached the logs: %q. The audit line carries the operator, the name, the version id and the fingerprint", strings.TrimSpace(logged.String()))
 	var lines []string
 	for _, line := range strings.Split(logged.String(), "\\n") {
 		if strings.Contains(line, "op-ana") && strings.Contains(line, "v1") {
@@ -819,7 +819,7 @@ func CheckAuditIdsOnly(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Assert(len(lines) > 0, "the create must write an audit line naming the operator and version v1, the logs hold %q", strings.TrimSpace(logged.String()))
-	sum := sha256.Sum256([]byte(apiMaterial))
+	sum := sha256.Sum256([]byte(kHApiMaterial))
 	fingerprint := hex.EncodeToString(sum[:])
 	found := false
 	for _, line := range lines {
@@ -829,22 +829,22 @@ func CheckAuditIdsOnly(ctx *harness.Ctx) {
 }
 
 func CheckRotationPolicy(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	fallback := apiCreated(ctx, apiCreate(c, "default-interval", nil, "X-Operator-Id", "op-ana"), "POST /v1/secrets without rotation_seconds")
+	c := hApiClient(ctx)
+	fallback := hApiCreated(ctx, hApiCreate(c, "default-interval", nil, "X-Operator-Id", "op-ana"), "POST /v1/secrets without rotation_seconds")
 	ctx.Equal(fallback["rotation_seconds"], 2592000, "a create without rotation_seconds must get the 30-day default")
 	created, _ := fallback["created_at"].(float64)
 	ctx.Equal(fallback["rotate_at"], created+2592000, "rotate_at must be created_at + rotation_seconds")
 	for _, bad := range []int{0, 299, 7776001} {
 		name := fmt.Sprintf("bad-%d", bad)
-		r := apiCreate(c, name, map[string]any{"rotation_seconds": bad}, "X-Operator-Id", "op-ana")
+		r := hApiCreate(c, name, map[string]any{"rotation_seconds": bad}, "X-Operator-Id", "op-ana")
 		ctx.Equal(r.Status, 400, "rotation_seconds=%d (the interval lies within 300..7776000)", bad)
 		ctx.Equal(len(vault.Versions(context.Background(), name)), 0, "a create refused for rotation_seconds=%d still wrote a version; the versions", bad)
 	}
 	for _, edge := range []int{300, 7776000} {
-		r := apiCreated(ctx, apiCreate(c, fmt.Sprintf("edge-%d", edge), map[string]any{"rotation_seconds": edge}, "X-Operator-Id", "op-ana"), fmt.Sprintf("POST /v1/secrets with rotation_seconds=%d, a bound of 300..7776000", edge))
+		r := hApiCreated(ctx, hApiCreate(c, fmt.Sprintf("edge-%d", edge), map[string]any{"rotation_seconds": edge}, "X-Operator-Id", "op-ana"), fmt.Sprintf("POST /v1/secrets with rotation_seconds=%d, a bound of 300..7776000", edge))
 		ctx.Equal(r["rotation_seconds"], edge, "rotation_seconds=%d must be kept as given", edge)
 	}
-	hourly := apiCreated(ctx, apiCreate(c, "hourly", map[string]any{"rotation_seconds": 3600}, "X-Operator-Id", "op-ana"), "POST /v1/secrets with rotation_seconds=3600")
+	hourly := hApiCreated(ctx, hApiCreate(c, "hourly", map[string]any{"rotation_seconds": 3600}, "X-Operator-Id", "op-ana"), "POST /v1/secrets with rotation_seconds=3600")
 	hourlyCreated, _ := hourly["created_at"].(float64)
 	ctx.Equal(hourly["rotate_at"], hourlyCreated+3600, "rotate_at must be created_at + 3600")
 }

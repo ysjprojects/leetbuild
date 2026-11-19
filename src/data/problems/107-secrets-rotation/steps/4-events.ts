@@ -785,67 +785,67 @@ import (
 )
 
 const (
-	eventsTopic    = "secret.event"
-	eventsName     = "payments-db"
-	eventsMaterial = "pg-password-CANARY-41d7"
+	kHEventsTopic    = "secret.event"
+	kHEventsName     = "payments-db"
+	kHEventsMaterial = "pg-password-CANARY-41d7"
 )
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func eventsSetup() {
-	vault.CreateVersion(eventsBg, eventsName, eventsMaterial, 3600, "op-ana")
-	vault.CreateVersion(eventsBg, eventsName, eventsMaterial+"-2", 3600, "op-ana")
+func hEventsSetup() {
+	vault.CreateVersion(hEventsBg, kHEventsName, kHEventsMaterial, 3600, "op-ana")
+	vault.CreateVersion(hEventsBg, kHEventsName, kHEventsMaterial+"-2", 3600, "op-ana")
 }
 
-func eventsPayload(ctx *harness.Ctx, value []byte) map[string]any {
+func hEventsPayload(ctx *harness.Ctx, value []byte) map[string]any {
 	var p map[string]any
 	ctx.Assert(json.Unmarshal(value, &p) == nil, "the record's value is not JSON: %s", value)
 	return p
 }
 
-func eventsRotate(ctx *harness.Ctx, versionID string) {
-	_, err := rotate(eventsBg, eventsName, versionID)
-	ctx.NoError(err, "rotate(%s, %s) failed", eventsName, versionID)
+func hEventsRotate(ctx *harness.Ctx, versionID string) {
+	_, err := rotate(hEventsBg, kHEventsName, versionID)
+	ctx.NoError(err, "rotate(%s, %s) failed", kHEventsName, versionID)
 }
 
-func eventsPublish(ctx *harness.Ctx, eventType, versionID string) {
-	_, err := publishEvent(eventsBg, eventType, eventsName, versionID)
+func hEventsPublish(ctx *harness.Ctx, eventType, versionID string) {
+	_, err := publishEvent(hEventsBg, eventType, kHEventsName, versionID)
 	ctx.NoError(err, "publishEvent(%s, %s) failed", eventType, versionID)
 }
 
 func CheckSecretKey(ctx *harness.Ctx) {
-	eventsSetup()
-	eventsPublish(ctx, "created", "v1")
-	eventsRotate(ctx, "v1")
-	eventsPublish(ctx, "created", "v2")
-	eventsRotate(ctx, "v2")
-	eventsPublish(ctx, "retired", "v1")
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 5, "five lifecycle events must produce five records on %s; the records", eventsTopic)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{eventsName, eventsName, eventsName, eventsName, eventsName}, "records must be keyed by the secret name (keyed by anything else, one secret's history scatters across partitions)")
+	hEventsSetup()
+	hEventsPublish(ctx, "created", "v1")
+	hEventsRotate(ctx, "v1")
+	hEventsPublish(ctx, "created", "v2")
+	hEventsRotate(ctx, "v2")
+	hEventsPublish(ctx, "retired", "v1")
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 5, "five lifecycle events must produce five records on %s; the records", kHEventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{kHEventsName, kHEventsName, kHEventsName, kHEventsName, kHEventsName}, "records must be keyed by the secret name (keyed by anything else, one secret's history scatters across partitions)")
 	for _, r := range records {
-		ctx.Assert(r.Partition == records[0].Partition, "%s's events landed on partitions %d and %d: one secret's history must stay on one partition, in order", eventsName, records[0].Partition, r.Partition)
+		ctx.Assert(r.Partition == records[0].Partition, "%s's events landed on partitions %d and %d: one secret's history must stay on one partition, in order", kHEventsName, records[0].Partition, r.Partition)
 	}
 	var types []string
 	for _, r := range records {
-		t, _ := eventsPayload(ctx, r.Value)["type"].(string)
+		t, _ := hEventsPayload(ctx, r.Value)["type"].(string)
 		types = append(types, t)
 	}
 	ctx.Equal(types, []string{"created", "activated", "created", "activated", "retired"}, "the events must keep their order on the partition")
 }
 
 func CheckNoMaterial(ctx *harness.Ctx) {
-	eventsSetup()
-	createdAt := float64(vault.GetVersion(eventsBg, eventsName, "v1").CreatedAt)
+	hEventsSetup()
+	createdAt := float64(vault.GetVersion(hEventsBg, kHEventsName, "v1").CreatedAt)
 	ctx.Clock.Advance(120) // the rotation happens two minutes after the version was created
-	eventsRotate(ctx, "v1")
-	record := ctx.Kafka.Records(eventsTopic)[0]
-	ctx.Assert(!strings.Contains(string(record.Value), eventsMaterial), "the event carries the material: %s. The topic is retained and replicated; carry the fingerprint", record.Value)
-	p := eventsPayload(ctx, record.Value)
+	hEventsRotate(ctx, "v1")
+	record := ctx.Kafka.Records(kHEventsTopic)[0]
+	ctx.Assert(!strings.Contains(string(record.Value), kHEventsMaterial), "the event carries the material: %s. The topic is retained and replicated; carry the fingerprint", record.Value)
+	p := hEventsPayload(ctx, record.Value)
 	_, has := p["material"]
 	ctx.Assert(!has, "the event has a material field: %v", p)
-	ctx.Assert(p["type"] == "activated" && p["secret"] == eventsName && p["version_id"] == "v1" && p["fingerprint"] == vault.Fingerprint(eventsMaterial),
-		"the event must carry type activated, secret %s, version_id v1 and the version's fingerprint, got %v", eventsName, p)
+	ctx.Assert(p["type"] == "activated" && p["secret"] == kHEventsName && p["version_id"] == "v1" && p["fingerprint"] == vault.Fingerprint(kHEventsMaterial),
+		"the event must carry type activated, secret %s, version_id v1 and the version's fingerprint, got %v", kHEventsName, p)
 	at, ok := p["at"].(float64)
 	ctx.Assert(ok && at == float64(int64(at)) && at > 0, "the event must carry the time as whole seconds (at), got %v", p["at"])
 	ctx.Assert(at >= createdAt+120 && at <= createdAt+125, "the event's at is %.0f, but v1 was created at %.0f and rotated 120 s later: at is when the event happened", at, createdAt)
@@ -856,26 +856,26 @@ func CheckNoMaterial(ctx *harness.Ctx) {
 }
 
 func CheckPublishAfterSwap(ctx *harness.Ctx) {
-	eventsSetup()
+	hEventsSetup()
 	// The moment the pointer moves, what is already on the topic.
-	atSwap := ctx.Redis.After("secret:payments-db:active", func() any { return len(ctx.Kafka.Records(eventsTopic)) })
-	eventsRotate(ctx, "v1")
+	atSwap := ctx.Redis.After("secret:payments-db:active", func() any { return len(ctx.Kafka.Records(kHEventsTopic)) })
+	hEventsRotate(ctx, "v1")
 	ctx.Assert(atSwap.Fired, "rotate never moved secret:payments-db:active")
 	ctx.Equal(atSwap.Result, 0, "when the pointer moved the topic already held records: the event announced a version consumers could not resolve yet. Activate, then produce; records at the swap")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after the rotation, the records on the topic")
-	valid, err := rotation.ValidVersions(eventsBg, eventsName)
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after the rotation, the records on the topic")
+	valid, err := rotation.ValidVersions(hEventsBg, kHEventsName)
 	ctx.NoError(err, "ValidVersions failed")
 	ctx.Equal(valid, []string{"v1"}, "after the rotation; ValidVersions")
-	ctx.Assert(vault.GetVersion(eventsBg, eventsName, "v1").ActivatedAt != 0, "the activation must be recorded on v1 (vault.RecordActivation)")
+	ctx.Assert(vault.GetVersion(hEventsBg, kHEventsName, "v1").ActivatedAt != 0, "the activation must be recorded on v1 (vault.RecordActivation)")
 }
 
 func CheckDurableProducer(ctx *harness.Ctx) {
-	eventsSetup()
-	eventsRotate(ctx, "v1")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "one rotation, the records on the topic")
-	eventsRotate(ctx, "v2")
-	lost := ctx.Kafka.Failover(eventsTopic)
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged the event. Use RequireAll; the records on the topic", lost)
+	hEventsSetup()
+	hEventsRotate(ctx, "v1")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "one rotation, the records on the topic")
+	hEventsRotate(ctx, "v2")
+	lost := ctx.Kafka.Failover(kHEventsTopic)
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged the event. Use RequireAll; the records on the topic", lost)
 }
 `,
     cpp: `#include <leetbuild/harness.h>

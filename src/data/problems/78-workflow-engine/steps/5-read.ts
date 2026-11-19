@@ -696,9 +696,9 @@ import (
 )
 
 var (
-	readBg = context.Background()
-	readV3 = []string{"create_account", "send_welcome"}
-	readV4 = []string{"create_account", "send_welcome", "notify_sales"}
+	hReadBg = context.Background()
+	hReadV3 = []string{"create_account", "send_welcome"}
+	hReadV4 = []string{"create_account", "send_welcome", "notify_sales"}
 )
 
 type hReadBody struct {
@@ -711,10 +711,10 @@ type hReadBody struct {
 	Status            string   \`json:"status"\`
 }
 
-func readSetup(ctx *harness.Ctx) (*harness.HTTP, string) {
-	definitions.Put(readBg, "signup", 3, readV3, [][]string{{"create_account", "send_welcome"}})
-	definitions.Put(readBg, "signup", 4, readV4, [][]string{{"create_account", "send_welcome"}, {"send_welcome", "notify_sales"}})
-	run := runs.Create(readBg, "t1", "signup", 3, readV3, map[string]any{"email": "ada@example.com"}, 50)
+func hReadSetup(ctx *harness.Ctx) (*harness.HTTP, string) {
+	definitions.Put(hReadBg, "signup", 3, hReadV3, [][]string{{"create_account", "send_welcome"}})
+	definitions.Put(hReadBg, "signup", 4, hReadV4, [][]string{{"create_account", "send_welcome"}, {"send_welcome", "notify_sales"}})
+	run := runs.Create(hReadBg, "t1", "signup", 3, hReadV3, map[string]any{"email": "ada@example.com"}, 50)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux), run.RunID
@@ -738,7 +738,7 @@ func hDecodeRead(r *harness.Response) hReadBody {
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c, runID := readSetup(ctx)
+	c, runID := hReadSetup(ctx)
 	ctx.Equal(hReadAs(c, runID, "").Status, 401, "a request without X-Tenant-Id; the status")
 	foreign := hReadAs(c, runID, "t2")
 	ctx.Equal(foreign.Status, 404, "tenant t2 reading t1's run must get exactly what an unknown run gets; the status")
@@ -752,7 +752,7 @@ func CheckTenantScope(ctx *harness.Ctx) {
 }
 
 func CheckView(ctx *harness.Ctx) {
-	c, runID := readSetup(ctx)
+	c, runID := hReadSetup(ctx)
 	fresh := hDecodeRead(hReadAs(c, runID, "t1")).Completed
 	now := time.Now().Unix()
 	hReadSetCheckpoint(ctx, runID, "send_welcome", "create_account", now)
@@ -761,26 +761,26 @@ func CheckView(ctx *harness.Ctx) {
 	finished := hDecodeRead(hReadAs(c, runID, "t1")).Completed
 	ctx.Equal(r.Status, 200, "GET /v1/runs/%s (%s); the status", runID, r.Text())
 	body := hDecodeRead(r)
-	ctx.Assert(body.DefinitionVersion == 3 && strings.Join(body.PinnedSteps, ",") == strings.Join(readV3, ","), "a version-3 run answered %s: it must report version 3 and its pinned steps, not the newest definition", r.Text())
+	ctx.Assert(body.DefinitionVersion == 3 && strings.Join(body.PinnedSteps, ",") == strings.Join(hReadV3, ","), "a version-3 run answered %s: it must report version 3 and its pinned steps, not the newest definition", r.Text())
 	ctx.Assert(body.CurrentStep == "send_welcome" && strings.Join(body.Completed, ",") == "create_account", "the body says current_step %q, completed %q; the checkpoint says send_welcome after create_account", body.CurrentStep, body.Completed)
 	ctx.Equal(body.CheckpointAt, now, "checkpoint_at must be the checkpoint's updated_at")
 	ctx.Assert(len(fresh) == 0, "a run that finished no step yet (completed '') reports completed %q, expected an empty list", fresh)
-	ctx.Assert(strings.Join(finished, ",") == "create_account,send_welcome" && len(finished) == 2, "a checkpoint whose completed is 'create_account,send_welcome' reports completed %q, expected %q", finished, readV3)
+	ctx.Assert(strings.Join(finished, ",") == "create_account,send_welcome" && len(finished) == 2, "a checkpoint whose completed is 'create_account,send_welcome' reports completed %q, expected %q", finished, hReadV3)
 }
 
 func CheckPending(ctx *harness.Ctx) {
-	c, runID := readSetup(ctx)
+	c, runID := hReadSetup(ctx)
 	hReadSetCheckpoint(ctx, runID, "send_welcome", "create_account", time.Now().Unix())
-	ledger.Record(readBg, runID+":create_account", "acct-1")
+	ledger.Record(hReadBg, runID+":create_account", "acct-1")
 	ctx.Equal(hDecodeRead(hReadAs(c, runID, "t1")).PendingEffects, []string{"send_welcome"}, "with create_account recorded in the ledger, pending_effects")
 	// A worker recorded send_welcome's effect and stopped before the checkpoint moved: the ledger, not the checkpoint, says what is pending.
-	ledger.Record(readBg, runID+":send_welcome", "m-1")
+	ledger.Record(hReadBg, runID+":send_welcome", "m-1")
 	after := hDecodeRead(hReadAs(c, runID, "t1")).PendingEffects
 	ctx.Assert(len(after) == 0, "with both effects recorded in the ledger and the checkpoint still at send_welcome, pending_effects is %q, expected an empty list: it comes from the ledger", after)
 }
 
 func CheckStatus(ctx *harness.Ctx) {
-	c, runID := readSetup(ctx)
+	c, runID := hReadSetup(ctx)
 	now := time.Now().Unix()
 	for _, tc := range []struct {
 		age  int64
@@ -809,8 +809,8 @@ func CheckStatus(ctx *harness.Ctx) {
 
 namespace {
 
-const std::vector<std::string> kV3 = {"create_account", "send_welcome"};
-const std::vector<std::string> kV4 = {"create_account", "send_welcome", "notify_sales"};
+const std::vector<std::string> kHV3 = {"create_account", "send_welcome"};
+const std::vector<std::string> kHV4 = {"create_account", "send_welcome", "notify_sales"};
 
 struct HReadFixture {
   harness::HTTP c;
@@ -818,9 +818,9 @@ struct HReadFixture {
 };
 
 HReadFixture hReadSetup(harness::Ctx& ctx) {
-  definitions::put("signup", 3, kV3, {{"create_account", "send_welcome"}});
-  definitions::put("signup", 4, kV4, {{"create_account", "send_welcome"}, {"send_welcome", "notify_sales"}});
-  const runs::Run run = runs::create("t1", "signup", 3, kV3, nlohmann::json{{"email", "ada@example.com"}}, 50);
+  definitions::put("signup", 3, kHV3, {{"create_account", "send_welcome"}});
+  definitions::put("signup", 4, kHV4, {{"create_account", "send_welcome"}, {"send_welcome", "notify_sales"}});
+  const runs::Run run = runs::create("t1", "signup", 3, kHV3, nlohmann::json{{"email", "ada@example.com"}}, 50);
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -872,12 +872,12 @@ void CheckView(harness::Ctx& ctx) {
   const auto finished = hReadBody(f.c.Get("/v1/runs/" + f.run_id, "X-Tenant-Id", "t1"));
   ctx.Equal(r.Status, 200, "GET /v1/runs/%s (%s); the status", f.run_id, r.Text());
   const auto b = hReadBody(r);
-  ctx.Assert(b.value("definition_version", 0L) == 3 && b.value("pinned_steps", std::vector<std::string>{}) == kV3, "a version-3 run answered %s: it must report version 3 and its pinned steps, not the newest definition", r.Text());
+  ctx.Assert(b.value("definition_version", 0L) == 3 && b.value("pinned_steps", std::vector<std::string>{}) == kHV3, "a version-3 run answered %s: it must report version 3 and its pinned steps, not the newest definition", r.Text());
   ctx.Assert(b.value("current_step", "") == "send_welcome" && b.value("completed", std::vector<std::string>{}) == std::vector<std::string>{"create_account"},
              "the body is %s; the checkpoint says send_welcome after create_account", r.Text());
   ctx.Equal(b.value("checkpoint_at", 0LL), now, "checkpoint_at must be the checkpoint's updated_at");
   ctx.Assert(fresh.contains("completed") && fresh["completed"] == nlohmann::json::array(), "a run that finished no step yet (completed '') must report completed []; the body is %s", fresh.dump());
-  ctx.Equal(finished.value("completed", std::vector<std::string>{}), kV3, "a checkpoint whose completed is 'create_account,send_welcome'; completed");
+  ctx.Equal(finished.value("completed", std::vector<std::string>{}), kHV3, "a checkpoint whose completed is 'create_account,send_welcome'; completed");
 }
 
 void CheckPending(harness::Ctx& ctx) {

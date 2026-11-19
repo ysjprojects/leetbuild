@@ -858,86 +858,86 @@ import (
 	"leetbuild/harness"
 )
 
-const readJobID = "j1"
+const kHReadJobID = "j1"
 
 var (
-	readCoverage = map[string]any{"e-paris": float64(4), "e-lima": float64(2)}
-	readRecords  = map[string]any{}
+	hReadCoverage = map[string]any{"e-paris": float64(4), "e-lima": float64(2)}
+	hReadRecords  = map[string]any{}
 )
 
-func readClient(ctx *harness.Ctx) *harness.HTTP {
-	row, _ := json.Marshal(map[string]any{"job_id": readJobID, "status": "queued", "seed_dataset": "wiki-qa", "seed_version": "2026-04-01", "recipe": "qa-pairs", "max_records": 1000, "tenant": "t1"})
-	ctx.Redis.Set("synth:job:"+readJobID, string(row))
-	ctx.Redis.Do("HSET", "synth:progress:"+readJobID, "generated", 10, "admitted", 6, "parked", 3, "rejected", 1, "throttled", 4, "updated_at", 1790000000)
-	ctx.Redis.Do("HSET", "synth:coverage:"+readJobID, "e-paris", 4, "e-lima", 2)
+func hReadClient(ctx *harness.Ctx) *harness.HTTP {
+	row, _ := json.Marshal(map[string]any{"job_id": kHReadJobID, "status": "queued", "seed_dataset": "wiki-qa", "seed_version": "2026-04-01", "recipe": "qa-pairs", "max_records": 1000, "tenant": "t1"})
+	ctx.Redis.Set("synth:job:"+kHReadJobID, string(row))
+	ctx.Redis.Do("HSET", "synth:progress:"+kHReadJobID, "generated", 10, "admitted", 6, "parked", 3, "rejected", 1, "throttled", 4, "updated_at", 1790000000)
+	ctx.Redis.Do("HSET", "synth:coverage:"+kHReadJobID, "e-paris", 4, "e-lima", 2)
 	for i := 1; i <= 6; i++ {
 		id := "r-" + strconv.Itoa(i)
 		digest := strings.Repeat("0"+strconv.Itoa(i), 32)
-		readRecords[id] = digest
-		ctx.Redis.Do("HSET", "synth:records:"+readJobID, id, digest)
+		hReadRecords[id] = digest
+		ctx.Redis.Do("HSET", "synth:records:"+kHReadJobID, id, digest)
 	}
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readGet(c *harness.HTTP, job, tenant string) *harness.Response {
+func hReadGet(c *harness.HTTP, job, tenant string) *harness.Response {
 	return c.Get("/v1/synthetic/jobs/"+job, "X-Tenant-Id", tenant)
 }
 
-func readBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hReadBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the report must be a JSON object: %s", r.Text())
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	r := readGet(c, readJobID, "t1")
+	c := hReadClient(ctx)
+	r := hReadGet(c, kHReadJobID, "t1")
 	ctx.Equal(r.Status, 200, "the owner's report (%s)", r.Text())
-	body := readBody(ctx, r)
-	ctx.Assert(body["job_id"] == readJobID && body["status"] == "queued" && body["seed_dataset"] == "wiki-qa", "the report carries the job: %s", r.Text())
+	body := hReadBody(ctx, r)
+	ctx.Assert(body["job_id"] == kHReadJobID && body["status"] == "queued" && body["seed_dataset"] == "wiki-qa", "the report carries the job: %s", r.Text())
 	ctx.Assert(body["generated"] == float64(10) && body["throttled"] == float64(4), "the report carries the progress counts: %s", r.Text())
 	ctx.Assert(body["recipe"] == "qa-pairs" && body["max_records"] == float64(1000), "the report carries the job's recipe and max_records: %s", r.Text())
 	ctx.Equal(body["updated_at"], float64(1790000000), "the report carries updated_at from the progress hash; updated_at")
-	ctx.Equal(readGet(c, "j-missing", "t1").Status, 404, "an unknown job")
-	ctx.Equal(c.Get("/v1/synthetic/jobs/"+readJobID).Status, 401, "without X-Tenant-Id the report")
+	ctx.Equal(hReadGet(c, "j-missing", "t1").Status, 404, "an unknown job")
+	ctx.Equal(c.Get("/v1/synthetic/jobs/"+kHReadJobID).Status, 401, "without X-Tenant-Id the report")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	r := readGet(c, readJobID, "t2")
+	c := hReadClient(ctx)
+	r := hReadGet(c, kHReadJobID, "t2")
 	ctx.Equal(r.Status, 404, "tenant t2 reading t1's job (the same answer as a missing job)")
 	ctx.Assert(!strings.Contains(r.Text(), "wiki-qa") && !strings.Contains(r.Text(), "qa-pairs"), "the refusal leaks the job: %s", r.Text())
-	missing := readGet(c, "j-missing", "t2")
-	ctx.Equal(strings.ReplaceAll(r.Text(), readJobID, "{id}"), strings.ReplaceAll(missing.Text(), "j-missing", "{id}"), "another tenant's job must answer exactly like a missing one, or the difference tells t2 the job exists; the body")
-	ctx.Equal(readGet(c, readJobID, "t1").Status, 200, "the owner still reads its job")
+	missing := hReadGet(c, "j-missing", "t2")
+	ctx.Equal(strings.ReplaceAll(r.Text(), kHReadJobID, "{id}"), strings.ReplaceAll(missing.Text(), "j-missing", "{id}"), "another tenant's job must answer exactly like a missing one, or the difference tells t2 the job exists; the body")
+	ctx.Equal(hReadGet(c, kHReadJobID, "t1").Status, 200, "the owner still reads its job")
 }
 
 func CheckParkedApart(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	body := readBody(ctx, readGet(c, readJobID, "t1"))
+	c := hReadClient(ctx)
+	body := hReadBody(ctx, hReadGet(c, kHReadJobID, "t1"))
 	got := []any{body["generated"], body["admitted"], body["parked"], body["rejected"]}
 	ctx.Equal(got, []any{float64(10), float64(6), float64(3), float64(1)}, "the progress hash says 10 generated, 6 admitted, 3 parked, 1 rejected (a record the judge never scored is not admitted); generated, admitted, parked, rejected")
-	ctx.Redis.Do("HINCRBY", "synth:progress:"+readJobID, "generated", 2) // two records generated, not judged yet
-	body = readBody(ctx, readGet(c, readJobID, "t1"))
+	ctx.Redis.Do("HINCRBY", "synth:progress:"+kHReadJobID, "generated", 2) // two records generated, not judged yet
+	body = hReadBody(ctx, hReadGet(c, kHReadJobID, "t1"))
 	got = []any{body["generated"], body["admitted"], body["parked"], body["rejected"]}
 	ctx.Equal(got, []any{float64(12), float64(6), float64(3), float64(1)}, "with two records generated and not yet judged the progress hash says 12 generated, 6 admitted, 3 parked, 1 rejected (every count is read as stored, none derived from the others); generated, admitted, parked, rejected")
 }
 
 func CheckCoverage(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	body := readBody(ctx, readGet(c, readJobID, "t1"))
-	ctx.Equal(body["coverage"], readCoverage, "coverage must be the per-entity map")
-	ctx.Redis.Do("HINCRBY", "synth:coverage:"+readJobID, "e-rome", 1)
-	body = readBody(ctx, readGet(c, readJobID, "t1"))
+	c := hReadClient(ctx)
+	body := hReadBody(ctx, hReadGet(c, kHReadJobID, "t1"))
+	ctx.Equal(body["coverage"], hReadCoverage, "coverage must be the per-entity map")
+	ctx.Redis.Do("HINCRBY", "synth:coverage:"+kHReadJobID, "e-rome", 1)
+	body = hReadBody(ctx, hReadGet(c, kHReadJobID, "t1"))
 	ctx.Equal(body["coverage"], map[string]any{"e-paris": float64(4), "e-lima": float64(2), "e-rome": float64(1)}, "an admission that lands between two reads shows in the second")
 }
 
 func CheckProvenance(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	body := readBody(ctx, readGet(c, readJobID, "t1"))
-	ctx.Equal(body["records"], readRecords, "records must map every admitted record id to its stored seed digest")
+	c := hReadClient(ctx)
+	body := hReadBody(ctx, hReadGet(c, kHReadJobID, "t1"))
+	ctx.Equal(body["records"], hReadRecords, "records must map every admitted record id to its stored seed digest")
 }
 `,
     cpp: `#include <leetbuild/harness.h>

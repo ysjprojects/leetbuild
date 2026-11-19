@@ -661,57 +661,57 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func stateCampaign() store.Campaign {
+func hStateCampaign() store.Campaign {
 	return store.Campaign{
 		CampaignID: "c-1", AdvertiserID: "adv-1", Version: 1, State: "active", Placement: "home-top", CreativeID: "cr-c-1",
 		BidMicros: 1000, FreqCap: 2, FreqWindowS: 3600, PacedBudgetMicros: 3000, GoalImpressions: 1000, StartTs: 0, EndTs: 86400,
 	}
 }
 
-func stateReserve(ctx *harness.Ctx, c store.Campaign, user string) Reservation {
-	got, err := reserve(stateBg, c, user, 1000)
+func hStateReserve(ctx *harness.Ctx, c store.Campaign, user string) Reservation {
+	got, err := reserve(hStateBg, c, user, 1000)
 	ctx.NoError(err, "reserve(c-1, %s, 1000)", user)
 	return got
 }
 
-func stateGet(ctx *harness.Ctx, key string) string {
+func hStateGet(ctx *harness.Ctx, key string) string {
 	v, _ := ctx.Redis.Get(key)
 	return v
 }
 
 func CheckNoBurn(ctx *harness.Ctx) {
-	c := stateCampaign()
+	c := hStateCampaign()
 	for n := int64(1); n <= 2; n++ {
-		got := stateReserve(ctx, c, "u-1")
+		got := hStateReserve(ctx, c, "u-1")
 		ctx.Assert(got.Allowed && got.Seen == n, "reserve #%d for u-1 (freq_cap 2) answered %+v, expected allowed with seen %d", n, got, n)
 	}
-	refused := stateReserve(ctx, c, "u-1")
+	refused := hStateReserve(ctx, c, "u-1")
 	ctx.Equal(refused.Allowed, false, "a third serve for u-1 with freq_cap 2 must be refused; allowed")
-	ctx.Equal(stateGet(ctx, "freq:c-1:u-1"), "2", "a serve that was never shown must not burn one of the user's impressions (compare before INCR); freq:c-1:u-1 after the refusal")
-	ctx.Equal(stateGet(ctx, "pace:c-1"), "2000", "pace:c-1 after a refused serve")
+	ctx.Equal(hStateGet(ctx, "freq:c-1:u-1"), "2", "a serve that was never shown must not burn one of the user's impressions (compare before INCR); freq:c-1:u-1 after the refusal")
+	ctx.Equal(hStateGet(ctx, "pace:c-1"), "2000", "pace:c-1 after a refused serve")
 	ctx.Assert(refused.Seen == 2 && refused.SpentMicros == 2000, "the refusal answered %+v, expected seen 2 and spent_micros 2000: the counters after the decision, which moved neither", refused)
 	ctx.Redis.Set("pace:c-1", "3000")
-	broke := stateReserve(ctx, c, "u-2")
+	broke := hStateReserve(ctx, c, "u-2")
 	ctx.Equal(broke.Allowed, false, "a serve with the budget spent must be refused; allowed")
-	u2 := stateGet(ctx, "freq:c-1:u-2")
+	u2 := hStateGet(ctx, "freq:c-1:u-2")
 	ctx.Assert(u2 == "" || u2 == "0", "a serve refused for budget moved freq:c-1:u-2 to %s: u-2 never saw the ad", u2)
-	ctx.Equal(stateGet(ctx, "pace:c-1"), "3000", "pace:c-1 after a serve refused for budget")
+	ctx.Equal(hStateGet(ctx, "pace:c-1"), "3000", "pace:c-1 after a serve refused for budget")
 }
 
 func CheckOneDecision(ctx *harness.Ctx) {
-	c := stateCampaign()
+	c := hStateCampaign()
 	c.FreqCap = 10
 	c.PacedBudgetMicros = 2000
 	ctx.Redis.Set("pace:c-1", "1000")
 	// Another app server's serve lands right after this one first touches the pacing counter.
 	rival := ctx.Redis.After("pace:c-1", func() any {
-		got, err := reserve(stateBg, c, "u-2", 1000)
+		got, err := reserve(hStateBg, c, "u-2", 1000)
 		ctx.NoError(err, "the rival reserve failed")
 		return got
 	})
-	mine := stateReserve(ctx, c, "u-1")
+	mine := hStateReserve(ctx, c, "u-1")
 	ctx.Assert(rival.Fired, "reserve never touched pace:c-1")
 	ctx.Assert(rival.Err == nil, "the rival reserve failed: %v", rival.Err)
 	theirs, _ := rival.Result.(Reservation)
@@ -721,19 +721,19 @@ func CheckOneDecision(ctx *harness.Ctx) {
 			allowed++
 		}
 	}
-	ctx.Equal(allowed, 1, "two serves raced for the last 1000 micros of a 2000-micro budget (pace:c-1 is now %s): the read and the increment must be one atomic decision; serves allowed", stateGet(ctx, "pace:c-1"))
-	ctx.Equal(stateGet(ctx, "pace:c-1"), "2000", "pace:c-1 after the race must not pass the 2000-micro budget")
+	ctx.Equal(allowed, 1, "two serves raced for the last 1000 micros of a 2000-micro budget (pace:c-1 is now %s): the read and the increment must be one atomic decision; serves allowed", hStateGet(ctx, "pace:c-1"))
+	ctx.Equal(hStateGet(ctx, "pace:c-1"), "2000", "pace:c-1 after the race must not pass the 2000-micro budget")
 	// The same race on the user's counter: u-3 has one impression left under freq_cap 2.
-	capped := stateCampaign()
+	capped := hStateCampaign()
 	capped.CampaignID = "c-2"
 	capped.PacedBudgetMicros = 1000000
 	ctx.Redis.Set("freq:c-2:u-3", "1")
 	rivalUser := ctx.Redis.After("freq:c-2:u-3", func() any {
-		got, err := reserve(stateBg, capped, "u-3", 1000)
+		got, err := reserve(hStateBg, capped, "u-3", 1000)
 		ctx.NoError(err, "the rival reserve failed")
 		return got
 	})
-	mineUser := stateReserve(ctx, capped, "u-3")
+	mineUser := hStateReserve(ctx, capped, "u-3")
 	ctx.Assert(rivalUser.Fired, "reserve never touched freq:c-2:u-3")
 	ctx.Assert(rivalUser.Err == nil, "the rival reserve failed: %v", rivalUser.Err)
 	theirsUser, _ := rivalUser.Result.(Reservation)
@@ -743,30 +743,30 @@ func CheckOneDecision(ctx *harness.Ctx) {
 			allowedUser++
 		}
 	}
-	ctx.Equal(allowedUser, 1, "two serves for u-3 raced for the last impression under freq_cap 2 (freq:c-2:u-3 is now %s): the cap must be read inside the same script that increments it; serves allowed", stateGet(ctx, "freq:c-2:u-3"))
-	ctx.Equal(stateGet(ctx, "freq:c-2:u-3"), "2", "freq:c-2:u-3 after the race must not pass the cap of 2")
+	ctx.Equal(allowedUser, 1, "two serves for u-3 raced for the last impression under freq_cap 2 (freq:c-2:u-3 is now %s): the cap must be read inside the same script that increments it; serves allowed", hStateGet(ctx, "freq:c-2:u-3"))
+	ctx.Equal(hStateGet(ctx, "freq:c-2:u-3"), "2", "freq:c-2:u-3 after the race must not pass the cap of 2")
 }
 
 func CheckWindowTtl(ctx *harness.Ctx) {
-	c := stateCampaign()
+	c := hStateCampaign()
 	c.FreqCap = 5
 	c.PacedBudgetMicros = 1000000
 	// Read the TTL right after the command that first touches the key (-2: it does not exist yet, a plain read).
 	// A crash between the INCR and a separate EXPIRE would leave a cap that never rolls off.
 	atCreate := ctx.Redis.After("freq:c-1:u-1", func() any { return ctx.Redis.TTL("freq:c-1:u-1") })
-	stateReserve(ctx, c, "u-1")
+	hStateReserve(ctx, c, "u-1")
 	ctx.Assert(atCreate.Fired, "reserve never touched freq:c-1:u-1")
 	created, _ := atCreate.Result.(int64)
 	ctx.Assert(created == -2 || (3590 <= created && created <= 3600), "right after the command that created freq:c-1:u-1 its TTL was %d, expected the 3600 s frequency window set by the same script that creates the key: a separate EXPIRE leaves a window where the cap never rolls off", created)
 	ttl := ctx.Redis.TTL("freq:c-1:u-1")
 	ctx.Assert(3590 <= ttl && ttl <= 3600, "freq:c-1:u-1 has TTL %d after the first impression, expected the campaign's 3600 s frequency window: without it the cap never rolls off", ttl)
 	ctx.Clock.Advance(600)
-	stateReserve(ctx, c, "u-1")
+	hStateReserve(ctx, c, "u-1")
 	ttl = ctx.Redis.TTL("freq:c-1:u-1")
 	ctx.Assert(2990 <= ttl && ttl <= 3000, "freq:c-1:u-1 has TTL %d after a second impression 600 s later, expected about 3000: the window starts at the first impression (EXPIRE when INCR returns 1)", ttl)
 	ctx.Clock.Advance(3001)
 	ctx.Equal(ctx.Redis.Exists("freq:c-1:u-1"), 0, "freq:c-1:u-1 after the frequency window")
-	got := stateReserve(ctx, c, "u-1")
+	got := hStateReserve(ctx, c, "u-1")
 	ctx.Assert(got.Allowed && got.Seen == 1, "after the window ended u-1's next serve answered %+v, expected allowed with seen 1", got)
 }
 `,
@@ -780,7 +780,7 @@ func CheckWindowTtl(ctx *harness.Ctx) {
 
 namespace {
 
-store::Campaign stateCampaign() {
+store::Campaign hStateCampaign() {
   store::Campaign c;
   c.campaign_id = "c-1";
   c.advertiser_id = "adv-1";
@@ -798,14 +798,14 @@ store::Campaign stateCampaign() {
   return c;
 }
 
-std::string stateGet(harness::Ctx& ctx, const std::string& key) { return ctx.Redis.Get(key).value_or(""); }
+std::string hStateGet(harness::Ctx& ctx, const std::string& key) { return ctx.Redis.Get(key).value_or(""); }
 
-std::string stateShow(const Reservation& r) {
+std::string hStateShow(const Reservation& r) {
   return std::string("{allowed ") + (r.allowed ? "true" : "false") + ", seen " + std::to_string(r.seen) + ", spent_micros " + std::to_string(r.spent_micros) + "}";
 }
 
 // A probe's outcome: whether it fired, what the rival reserve returned, what it threw.
-struct StateRival {
+struct HStateRival {
   bool fired = false;
   Reservation got;
   std::optional<std::string> err;
@@ -814,31 +814,31 @@ struct StateRival {
 }  // namespace
 
 void CheckNoBurn(harness::Ctx& ctx) {
-  const store::Campaign c = stateCampaign();
+  const store::Campaign c = hStateCampaign();
   for (long long n = 1; n <= 2; n++) {
     const Reservation got = reserve(c, "u-1", 1000);
-    ctx.Assert(got.allowed && got.seen == n, "reserve #%d for u-1 (freq_cap 2) answered %s, expected allowed with seen %d", n, stateShow(got), n);
+    ctx.Assert(got.allowed && got.seen == n, "reserve #%d for u-1 (freq_cap 2) answered %s, expected allowed with seen %d", n, hStateShow(got), n);
   }
   const Reservation refused = reserve(c, "u-1", 1000);
   ctx.Equal(refused.allowed, false, "a third serve for u-1 with freq_cap 2 must be refused; allowed");
-  ctx.Equal(stateGet(ctx, "freq:c-1:u-1"), std::string("2"), "a serve that was never shown must not burn one of the user's impressions (compare before INCR); freq:c-1:u-1 after the refusal");
-  ctx.Equal(stateGet(ctx, "pace:c-1"), std::string("2000"), "pace:c-1 after a refused serve");
-  ctx.Assert(refused.seen == 2 && refused.spent_micros == 2000, "the refusal answered %s, expected seen 2 and spent_micros 2000: the counters after the decision, which moved neither", stateShow(refused));
+  ctx.Equal(hStateGet(ctx, "freq:c-1:u-1"), std::string("2"), "a serve that was never shown must not burn one of the user's impressions (compare before INCR); freq:c-1:u-1 after the refusal");
+  ctx.Equal(hStateGet(ctx, "pace:c-1"), std::string("2000"), "pace:c-1 after a refused serve");
+  ctx.Assert(refused.seen == 2 && refused.spent_micros == 2000, "the refusal answered %s, expected seen 2 and spent_micros 2000: the counters after the decision, which moved neither", hStateShow(refused));
   ctx.Redis.Set("pace:c-1", "3000");
   const Reservation broke = reserve(c, "u-2", 1000);
   ctx.Equal(broke.allowed, false, "a serve with the budget spent must be refused; allowed");
-  const std::string u2 = stateGet(ctx, "freq:c-1:u-2");
+  const std::string u2 = hStateGet(ctx, "freq:c-1:u-2");
   ctx.Assert(u2.empty() || u2 == "0", "a serve refused for budget moved freq:c-1:u-2 to %s: u-2 never saw the ad", u2);
-  ctx.Equal(stateGet(ctx, "pace:c-1"), std::string("3000"), "pace:c-1 after a serve refused for budget");
+  ctx.Equal(hStateGet(ctx, "pace:c-1"), std::string("3000"), "pace:c-1 after a serve refused for budget");
 }
 
 void CheckOneDecision(harness::Ctx& ctx) {
-  store::Campaign c = stateCampaign();
+  store::Campaign c = hStateCampaign();
   c.freq_cap = 10;
   c.paced_budget_micros = 2000;
   ctx.Redis.Set("pace:c-1", "1000");
   // Another app server's serve lands right after this one first touches the pacing counter.
-  auto rival = std::make_shared<StateRival>();
+  auto rival = std::make_shared<HStateRival>();
   ctx.Redis.After("pace:c-1", [rival, c] {
     rival->fired = true;
     try {
@@ -851,14 +851,14 @@ void CheckOneDecision(harness::Ctx& ctx) {
   ctx.Assert(rival->fired, "reserve never touched pace:c-1");
   ctx.Assert(!rival->err, "the rival reserve failed: %s", rival->err.value_or(""));
   const int allowed = (mine.allowed ? 1 : 0) + (rival->got.allowed ? 1 : 0);
-  ctx.Equal(allowed, 1, "two serves raced for the last 1000 micros of a 2000-micro budget (pace:c-1 is now %s): the read and the increment must be one atomic decision; serves allowed", stateGet(ctx, "pace:c-1"));
-  ctx.Equal(stateGet(ctx, "pace:c-1"), std::string("2000"), "pace:c-1 after the race must not pass the 2000-micro budget");
+  ctx.Equal(allowed, 1, "two serves raced for the last 1000 micros of a 2000-micro budget (pace:c-1 is now %s): the read and the increment must be one atomic decision; serves allowed", hStateGet(ctx, "pace:c-1"));
+  ctx.Equal(hStateGet(ctx, "pace:c-1"), std::string("2000"), "pace:c-1 after the race must not pass the 2000-micro budget");
   // The same race on the user's counter: u-3 has one impression left under freq_cap 2.
-  store::Campaign capped = stateCampaign();
+  store::Campaign capped = hStateCampaign();
   capped.campaign_id = "c-2";
   capped.paced_budget_micros = 1000000;
   ctx.Redis.Set("freq:c-2:u-3", "1");
-  auto rivalUser = std::make_shared<StateRival>();
+  auto rivalUser = std::make_shared<HStateRival>();
   ctx.Redis.After("freq:c-2:u-3", [rivalUser, capped] {
     rivalUser->fired = true;
     try {
@@ -871,12 +871,12 @@ void CheckOneDecision(harness::Ctx& ctx) {
   ctx.Assert(rivalUser->fired, "reserve never touched freq:c-2:u-3");
   ctx.Assert(!rivalUser->err, "the rival reserve failed: %s", rivalUser->err.value_or(""));
   const int allowedUser = (mineUser.allowed ? 1 : 0) + (rivalUser->got.allowed ? 1 : 0);
-  ctx.Equal(allowedUser, 1, "two serves for u-3 raced for the last impression under freq_cap 2 (freq:c-2:u-3 is now %s): the cap must be read inside the same script that increments it; serves allowed", stateGet(ctx, "freq:c-2:u-3"));
-  ctx.Equal(stateGet(ctx, "freq:c-2:u-3"), std::string("2"), "freq:c-2:u-3 after the race must not pass the cap of 2");
+  ctx.Equal(allowedUser, 1, "two serves for u-3 raced for the last impression under freq_cap 2 (freq:c-2:u-3 is now %s): the cap must be read inside the same script that increments it; serves allowed", hStateGet(ctx, "freq:c-2:u-3"));
+  ctx.Equal(hStateGet(ctx, "freq:c-2:u-3"), std::string("2"), "freq:c-2:u-3 after the race must not pass the cap of 2");
 }
 
 void CheckWindowTtl(harness::Ctx& ctx) {
-  store::Campaign c = stateCampaign();
+  store::Campaign c = hStateCampaign();
   c.freq_cap = 5;
   c.paced_budget_micros = 1000000;
   // Read the TTL right after the command that first touches the key (-2: it does not exist yet, a plain read).
@@ -901,7 +901,7 @@ void CheckWindowTtl(harness::Ctx& ctx) {
   ctx.Clock.Advance(3001);
   ctx.Equal(ctx.Redis.Exists("freq:c-1:u-1"), 0, "freq:c-1:u-1 after the frequency window");
   const Reservation got = reserve(c, "u-1", 1000);
-  ctx.Assert(got.allowed && got.seen == 1, "after the window ended u-1's next serve answered %s, expected allowed with seen 1", stateShow(got));
+  ctx.Assert(got.allowed && got.seen == 1, "after the window ended u-1's next serve answered %s, expected allowed with seen 1", hStateShow(got));
 }
 `,
   },

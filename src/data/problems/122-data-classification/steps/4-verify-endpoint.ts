@@ -828,29 +828,29 @@ import (
 )
 
 const (
-	verifyOwner = "team-logistics"
-	verifyHash  = "4f2a"
+	kHVerifyOwner = "team-logistics"
+	kHVerifyHash  = "4f2a"
 )
 
-var verifyPending = map[string]string{"merchant_id": "None", "passport_no": "None", "customer_email": "Personal.Contact_Info"}
+var hVerifyPending = map[string]string{"merchant_id": "None", "passport_no": "None", "customer_email": "Personal.Contact_Info"}
 
-func verifyAPI(ctx *harness.Ctx) *harness.HTTP {
-	ctx.Redis.Do("HSET", "verify:deliveries", "owner", verifyOwner, "schema_hash", verifyHash, "state", "pending")
-	raw, _ := json.Marshal(verifyPending)
-	ctx.Redis.Set("classify:deliveries:"+verifyHash, string(raw))
+func hVerifyAPI(ctx *harness.Ctx) *harness.HTTP {
+	ctx.Redis.Do("HSET", "verify:deliveries", "owner", kHVerifyOwner, "schema_hash", kHVerifyHash, "state", "pending")
+	raw, _ := json.Marshal(hVerifyPending)
+	ctx.Redis.Set("classify:deliveries:"+kHVerifyHash, string(raw))
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func verifyAs(c *harness.HTTP, body any, user string) *harness.Response {
+func hVerifyAs(c *harness.HTTP, body any, user string) *harness.Response {
 	if user == "" {
 		return c.Post("/v1/entities/deliveries/verify", body)
 	}
 	return c.Post("/v1/entities/deliveries/verify", body, "X-User-Id", user)
 }
 
-type verifyAnswer struct {
+type HVerifyAnswer struct {
 	Entity     string            \`json:"entity"\`
 	Tier       int               \`json:"tier"\`
 	Tags       map[string]string \`json:"tags"\`
@@ -858,47 +858,47 @@ type verifyAnswer struct {
 	Version    int               \`json:"version"\`
 }
 
-func verifyDecode(r *harness.Response) verifyAnswer {
-	var answer verifyAnswer
+func hVerifyDecode(r *harness.Response) HVerifyAnswer {
+	var answer HVerifyAnswer
 	r.Decode(&answer)
 	return answer
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := verifyAPI(ctx)
-	r := verifyAs(c, map[string]any{"action": "ack"}, verifyOwner)
+	c := hVerifyAPI(ctx)
+	r := hVerifyAs(c, map[string]any{"action": "ack"}, kHVerifyOwner)
 	ctx.Equal(r.Status, 200, "the owner's ack (%s)", r.Text())
-	answer := verifyDecode(r)
+	answer := hVerifyDecode(r)
 	ctx.Assert(answer.Entity == "deliveries" && answer.Version == 1, "the ack answered %s, expected the entity and version 1", r.Text())
-	ctx.Equal(answer.Tags, verifyPending, "the ack must answer the pending tags")
+	ctx.Equal(answer.Tags, hVerifyPending, "the ack must answer the pending tags")
 	ctx.Equal(ctx.Redis.HGetAll("entity:deliveries")["version"], "1", "entity:deliveries version after the ack")
 }
 
 func CheckOwnerOnly(ctx *harness.Ctx) {
-	c := verifyAPI(ctx)
-	r := verifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "None"}}, "team-growth")
+	c := hVerifyAPI(ctx)
+	r := hVerifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "None"}}, "team-growth")
 	ctx.Equal(r.Status, 403, "team-growth verifying team-logistics' table (only the owner verifies)")
 	ctx.Equal(len(ctx.Redis.HGetAll("entity:deliveries")), 0, "a refused verification must store nothing; fields stored")
-	r = verifyAs(c, map[string]any{"action": "ack"}, "")
+	r = hVerifyAs(c, map[string]any{"action": "ack"}, "")
 	ctx.Equal(r.Status, 401, "a verification without X-User-Id")
-	naming := map[string]any{"action": "ack", "user": verifyOwner, "owner": verifyOwner, "verified_by": verifyOwner}
-	r = verifyAs(c, naming, "")
+	naming := map[string]any{"action": "ack", "user": kHVerifyOwner, "owner": kHVerifyOwner, "verified_by": kHVerifyOwner}
+	r = hVerifyAs(c, naming, "")
 	ctx.Equal(r.Status, 401, "a verification without X-User-Id but naming the owner in its body (the caller is the header, never the body)")
-	r = verifyAs(c, naming, "team-growth")
+	r = hVerifyAs(c, naming, "team-growth")
 	ctx.Equal(r.Status, 403, "team-growth naming the owner in its body")
 	ctx.Equal(len(ctx.Redis.HGetAll("entity:deliveries")), 0, "refused verifications must store nothing; fields stored")
-	r = verifyAs(c, map[string]any{"action": "ack"}, verifyOwner)
+	r = hVerifyAs(c, map[string]any{"action": "ack"}, kHVerifyOwner)
 	ctx.Equal(r.Status, 200, "the owner's own ack (%s)", r.Text())
 }
 
 func CheckTierServerSide(ctx *harness.Ctx) {
-	c := verifyAPI(ctx)
-	r := verifyAs(c, map[string]any{"action": "ack", "tier": 4}, verifyOwner)
+	c := hVerifyAPI(ctx)
+	r := hVerifyAs(c, map[string]any{"action": "ack", "tier": 4}, kHVerifyOwner)
 	ctx.Equal(r.Status, 200, "the owner's ack (%s)", r.Text())
-	ctx.Equal(verifyDecode(r).Tier, 2, "acknowledged tags with Personal.Contact_Info: the tier comes from the tags, not the body; tier")
-	r = verifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "Personal.ID"}, "tier": 4}, verifyOwner)
+	ctx.Equal(hVerifyDecode(r).Tier, 2, "acknowledged tags with Personal.Contact_Info: the tier comes from the tags, not the body; tier")
+	r = hVerifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "Personal.ID"}, "tier": 4}, kHVerifyOwner)
 	ctx.Equal(r.Status, 200, "the owner's edit (%s)", r.Text())
-	ctx.Equal(verifyDecode(r).Tier, 1, "passport_no tagged Personal.ID with \\"tier\\": 4 in the body; tier")
+	ctx.Equal(hVerifyDecode(r).Tier, 1, "passport_no tagged Personal.ID with \\"tier\\": 4 in the body; tier")
 	ctx.Equal(ctx.Redis.HGetAll("entity:deliveries")["tier"], "1", "the stored tier access control reads")
 	// Each edit applies to the pending tags {merchant_id: None, passport_no: None, customer_email: Personal.Contact_Info}.
 	cases := []struct {
@@ -917,16 +917,16 @@ func CheckTierServerSide(ctx *harness.Ctx) {
 		if tc.want == 4 {
 			bodyTier = 1
 		}
-		r = verifyAs(c, map[string]any{"action": "edit", "tags": tc.edits, "tier": bodyTier}, verifyOwner)
+		r = hVerifyAs(c, map[string]any{"action": "edit", "tags": tc.edits, "tier": bodyTier}, kHVerifyOwner)
 		ctx.Equal(r.Status, 200, "the owner's edit %v (%s)", tc.edits, r.Text())
 		merged := map[string]string{}
-		for k, v := range verifyPending {
+		for k, v := range hVerifyPending {
 			merged[k] = v
 		}
 		for k, v := range tc.edits {
 			merged[k] = v
 		}
-		answer := verifyDecode(r)
+		answer := hVerifyDecode(r)
 		ctx.Equal(answer.Tags, merged, "the edit %v must answer the pending tags with the edit applied", tc.edits)
 		ctx.Equal(answer.Tier, tc.want, "the edit %v (%s): Personal.ID is Tier 1, Personal.Name or Personal.Contact_Info Tier 2, Geo.Geohash Tier 3, else Tier 4, over all the entity's tags; tier", tc.edits, tc.why)
 		ctx.Equal(ctx.Redis.HGetAll("entity:deliveries")["tier"], strconv.Itoa(tc.want), "the stored tier after the edit %v", tc.edits)
@@ -934,32 +934,32 @@ func CheckTierServerSide(ctx *harness.Ctx) {
 }
 
 func CheckTagWhitelist(ctx *harness.Ctx) {
-	c := verifyAPI(ctx)
-	r := verifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "Public"}}, verifyOwner)
+	c := hVerifyAPI(ctx)
+	r := hVerifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "Public"}}, kHVerifyOwner)
 	ctx.Equal(r.Status, 400, "an edit with the tag Public (not in the tag library)")
-	r = verifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "Personal.ID", "merchant_id": "Public"}}, verifyOwner)
+	r = hVerifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "Personal.ID", "merchant_id": "Public"}}, kHVerifyOwner)
 	ctx.Equal(r.Status, 400, "an edit with one known tag and the tag Public (one tag outside the library refuses the edit)")
-	r = verifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "personal.id"}}, verifyOwner)
+	r = hVerifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "personal.id"}}, kHVerifyOwner)
 	ctx.Equal(r.Status, 400, "an edit with the tag personal.id (the library is case-sensitive)")
-	r = verifyAs(c, map[string]any{"action": "approve"}, verifyOwner)
+	r = hVerifyAs(c, map[string]any{"action": "approve"}, kHVerifyOwner)
 	ctx.Equal(r.Status, 400, "the action approve (actions are ack and edit)")
-	r = verifyAs(c, map[string]any{"tags": map[string]string{"passport_no": "Personal.ID"}}, verifyOwner)
+	r = hVerifyAs(c, map[string]any{"tags": map[string]string{"passport_no": "Personal.ID"}}, kHVerifyOwner)
 	ctx.Equal(r.Status, 400, "a verification without an action (actions are ack and edit)")
 	ctx.Equal(len(ctx.Redis.HGetAll("entity:deliveries")), 0, "refused verifications must store nothing; fields stored")
 }
 
 func CheckAudit(ctx *harness.Ctx) {
-	c := verifyAPI(ctx)
-	r := verifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "Personal.ID"}}, verifyOwner)
+	c := hVerifyAPI(ctx)
+	r := hVerifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "Personal.ID"}}, kHVerifyOwner)
 	ctx.Equal(r.Status, 200, "the owner's edit (%s)", r.Text())
-	ctx.Equal(verifyDecode(r).VerifiedBy, verifyOwner, "the response's verified_by")
+	ctx.Equal(hVerifyDecode(r).VerifiedBy, kHVerifyOwner, "the response's verified_by")
 	var entries [][2]string
 	for _, raw := range ctx.Redis.LRange("audit:deliveries", 0, -1) {
 		var entry struct{ User, Action string }
 		json.Unmarshal([]byte(raw), &entry)
 		entries = append(entries, [2]string{entry.User, entry.Action})
 	}
-	ctx.Equal(entries, [][2]string{{verifyOwner, "edit"}}, "audit:deliveries must hold one entry for the owner's edit")
+	ctx.Equal(entries, [][2]string{{kHVerifyOwner, "edit"}}, "audit:deliveries must hold one entry for the owner's edit")
 }
 `,
     cpp: `#include <leetbuild/harness.h>

@@ -836,19 +836,19 @@ import (
 	"leetbuild/harness"
 )
 
-const clientStart = 1793747840
+const kHClientStart = 1793747840
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
 // shardPeer is a shard writer: it stores each window once per window id and refuses the ids in full.
-type shardPeer struct {
+type HShardPeer struct {
 	pb.UnimplementedMetricsWriterServer
 	stored   map[string]int64
 	received []string
 	full     map[string]bool
 }
 
-func (s *shardPeer) WriteWindows(_ context.Context, req *pb.WriteRequest) (*pb.WriteReply, error) {
+func (s *HShardPeer) WriteWindows(_ context.Context, req *pb.WriteRequest) (*pb.WriteReply, error) {
 	accepted := []string{}
 	for _, w := range req.GetWindows() {
 		s.received = append(s.received, w.GetWindowId())
@@ -867,10 +867,10 @@ func (s *shardPeer) WriteWindows(_ context.Context, req *pb.WriteRequest) (*pb.W
 	return &pb.WriteReply{Accepted: accepted}, nil
 }
 
-func clientSetup(ctx *harness.Ctx, start int64) (map[string]*shardPeer, []model.Window, map[string][]string) {
-	shards := map[string]*shardPeer{}
+func hClientSetup(ctx *harness.Ctx, start int64) (map[string]*HShardPeer, []model.Window, map[string][]string) {
+	shards := map[string]*HShardPeer{}
 	for _, target := range model.Shards {
-		peer := &shardPeer{stored: map[string]int64{}, full: map[string]bool{}}
+		peer := &HShardPeer{stored: map[string]int64{}, full: map[string]bool{}}
 		shards[target] = peer
 		pb.RegisterMetricsWriterServer(ctx.GRPC.Server(target), peer)
 	}
@@ -888,7 +888,7 @@ func clientSetup(ctx *harness.Ctx, start int64) (map[string]*shardPeer, []model.
 	return shards, windows, by
 }
 
-func clientResult(ctx *harness.Ctx, res any, when string) model.FlushResult {
+func hClientResult(ctx *harness.Ctx, res any, when string) model.FlushResult {
 	result, ok := res.(model.FlushResult)
 	ctx.Assert(ok, "%s, flushWindows returned %v, expected a model.FlushResult with Accepted and Pending: one boolean cannot say which windows to resend", when, res)
 	return result
@@ -900,7 +900,7 @@ func hSortedIDs(ids []string) []string {
 	return out
 }
 
-func clientDeadlines(ctx *harness.Ctx, calls []harness.Call, when string) {
+func hClientDeadlines(ctx *harness.Ctx, calls []harness.Call, when string) {
 	ctx.Assert(len(calls) > 0, "%s, no WriteWindows call was made", when)
 	for _, call := range calls {
 		ctx.Assert(call.HasDeadline(), "%s, a WriteWindows call carries no deadline: one hung shard holds the whole flush", when)
@@ -909,23 +909,23 @@ func clientDeadlines(ctx *harness.Ctx, calls []harness.Call, when string) {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	_, windows, _ := clientSetup(ctx, clientStart)
-	res := any(flushWindows(clientBg, windows))
-	clientDeadlines(ctx, ctx.GRPC.CallsTo("WriteWindows", ""), "with every shard healthy")
-	clientResult(ctx, res, "with every shard healthy")
+	_, windows, _ := hClientSetup(ctx, kHClientStart)
+	res := any(flushWindows(hClientBg, windows))
+	hClientDeadlines(ctx, ctx.GRPC.CallsTo("WriteWindows", ""), "with every shard healthy")
+	hClientResult(ctx, res, "with every shard healthy")
 	slow := model.Shards[1]
 	ctx.GRPC.SetLatency("WriteWindows", 30, slow)
 	later := []model.Window{}
 	want := []string{}
 	for _, w := range windows {
-		w.Start = clientStart + 10
+		w.Start = kHClientStart + 10
 		later = append(later, w)
 		if model.ShardFor(w.Series) == slow {
 			want = append(want, model.WindowID(w))
 		}
 	}
 	before := ctx.Clock.Now()
-	result := clientResult(ctx, any(flushWindows(clientBg, later)), "with "+slow+" hanging")
+	result := hClientResult(ctx, any(flushWindows(hClientBg, later)), "with "+slow+" hanging")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 6.5, "the flush waited %.1f s on a hung shard: three rounds of a 2 s deadline is 6 s", waited)
 	hung := ctx.GRPC.CallsTo("WriteWindows", slow)
@@ -933,18 +933,18 @@ func CheckDeadline(ctx *harness.Ctx) {
 		hung = hung[1:] // the first call is from the healthy flush above
 	}
 	ctx.Equal(len(hung), 3, "%s hung: one call per round, flushAttempts = 3; the calls it got in that flush", slow)
-	clientDeadlines(ctx, hung, "with "+slow+" hanging")
+	hClientDeadlines(ctx, hung, "with "+slow+" hanging")
 	ctx.Equal(len(result.Pending), 1, "with %s hanging only its windows are pending; the shards with pending windows (%v)", slow, result.Pending)
 	ctx.Equal(hSortedIDs(result.Pending[slow]), hSortedIDs(want), "with %s hanging, its pending windows", slow)
 }
 
 func CheckPerShardResult(ctx *harness.Ctx) {
-	shards, windows, by := clientSetup(ctx, clientStart)
+	shards, windows, by := hClientSetup(ctx, kHClientStart)
 	down, picky := model.Shards[2], model.Shards[0]
 	ctx.GRPC.Stop(down)
 	refused := by[picky][0]
 	shards[picky].full[refused] = true
-	result := clientResult(ctx, any(flushWindows(clientBg, windows)), fmt.Sprintf("with %s down and %s refusing %s", down, picky, refused))
+	result := hClientResult(ctx, any(flushWindows(hClientBg, windows)), fmt.Sprintf("with %s down and %s refusing %s", down, picky, refused))
 	ctx.Equal(len(result.Pending), 2, "the shards with pending windows (%v), expected %s and %s", result.Pending, picky, down)
 	ctx.Equal(hSortedIDs(result.Pending[picky]), []string{refused}, "%s refused one window; its pending ids", picky)
 	ctx.Equal(hSortedIDs(result.Pending[down]), by[down], "%s is down; its pending ids", down)
@@ -965,10 +965,10 @@ func CheckPerShardResult(ctx *harness.Ctx) {
 }
 
 func CheckRetryFailedOnly(ctx *harness.Ctx) {
-	shards, windows, by := clientSetup(ctx, clientStart)
+	shards, windows, by := hClientSetup(ctx, kHClientStart)
 	flaky := model.Shards[0]
 	ctx.GRPC.Fail("WriteWindows", codes.Unavailable, "shard restarting", 1, flaky)
-	res := any(flushWindows(clientBg, windows))
+	res := any(flushWindows(hClientBg, windows))
 	for _, target := range model.Shards {
 		want := 1
 		if target == flaky {
@@ -977,17 +977,17 @@ func CheckRetryFailedOnly(ctx *harness.Ctx) {
 		ctx.Equal(len(ctx.GRPC.CallsTo("WriteWindows", target)), want, "one failure on %s: only the windows still pending are sent again; the calls to %s", flaky, target)
 		ctx.Equal(len(shards[target].received), len(by[target]), "%s must receive each of its windows once (a healthy shard sent its windows again); the windows it received", target)
 	}
-	result := clientResult(ctx, res, "after "+flaky+" recovered")
+	result := hClientResult(ctx, res, "after "+flaky+" recovered")
 	ctx.Assert(len(result.Pending) == 0 && len(result.Accepted) == len(windows), "after the retry every window is accepted, got %+v", result)
 }
 
 func CheckWindowId(ctx *harness.Ctx) {
-	shards, windows, by := clientSetup(ctx, clientStart)
-	flushWindows(clientBg, windows)
+	shards, windows, by := hClientSetup(ctx, kHClientStart)
+	flushWindows(hClientBg, windows)
 	for _, target := range model.Shards {
 		ctx.Equal(hSortedIDs(shards[target].received), by[target], "%s must receive each window with window_id = model.WindowID(w) (tenant/series@start): without an id a shard cannot tell a resend from a new window; the ids", target)
 	}
-	flushWindows(clientBg, windows) // the next tick resends: an earlier reply was lost
+	flushWindows(hClientBg, windows) // the next tick resends: an earlier reply was lost
 	stored := 0
 	for _, s := range shards {
 		stored += len(s.stored)
@@ -1007,10 +1007,10 @@ func CheckWindowId(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr long long kStart = 1793747840;
+constexpr long long kHStart = 1793747840;
 
 // A shard writer: stores each window once per window id, refuses the ids in full.
-class ShardPeer final : public metricsd::MetricsWriter::Service {
+class HShardPeer final : public metricsd::MetricsWriter::Service {
  public:
   std::map<std::string, long long> stored;
   std::vector<std::string> received;
@@ -1027,17 +1027,17 @@ class ShardPeer final : public metricsd::MetricsWriter::Service {
   }
 };
 
-struct ClientWorld {
-  std::map<std::string, ShardPeer*> shards;
+struct HClientWorld {
+  std::map<std::string, HShardPeer*> shards;
   std::vector<metrics::Window> windows;
   std::map<std::string, std::vector<std::string>> by;
 };
 
-ClientWorld clientSetup(harness::Ctx& ctx, long long start = kStart) {
-  static std::array<ShardPeer, 3>* peers = nullptr;
+HClientWorld hClientSetup(harness::Ctx& ctx, long long start = kHStart) {
+  static std::array<HShardPeer, 3>* peers = nullptr;
   delete peers;
-  peers = new std::array<ShardPeer, 3>;
-  ClientWorld s;
+  peers = new std::array<HShardPeer, 3>;
+  HClientWorld s;
   for (size_t i = 0; i < metrics::kShards.size(); i++) {
     s.shards[metrics::kShards[i]] = &(*peers)[i];
     ctx.GRPC.Server(metrics::kShards[i])->RegisterService(&(*peers)[i]);
@@ -1053,7 +1053,7 @@ ClientWorld clientSetup(harness::Ctx& ctx, long long start = kStart) {
 }
 
 template <class R>
-metrics::FlushResult clientResult(harness::Ctx& ctx, const R& res, const std::string& when) {
+metrics::FlushResult hClientResult(harness::Ctx& ctx, const R& res, const std::string& when) {
   if constexpr (std::is_same_v<R, metrics::FlushResult>) {
     return res;
   } else {
@@ -1069,7 +1069,7 @@ std::vector<std::string> hSortedIds(std::vector<std::string> ids) {
 
 // Every call after the first skip ones carries the full 2 s deadline; returns how many were checked.
 template <class Calls>
-size_t clientDeadlines(harness::Ctx& ctx, const Calls& calls, size_t skip, const std::string& when) {
+size_t hClientDeadlines(harness::Ctx& ctx, const Calls& calls, size_t skip, const std::string& when) {
   size_t checked = 0;
   for (size_t i = skip; i < calls.size(); i++, checked++) {
     ctx.Assert(calls[i].HasDeadline(), "%s, a WriteWindows call carries no deadline: one hung shard holds the whole flush", when);
@@ -1081,37 +1081,37 @@ size_t clientDeadlines(harness::Ctx& ctx, const Calls& calls, size_t skip, const
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  auto s = clientSetup(ctx);
+  auto s = hClientSetup(ctx);
   const auto res = flushWindows(s.windows);
-  ctx.Assert(clientDeadlines(ctx, ctx.GRPC.CallsTo("WriteWindows"), 0, "with every shard healthy") > 0, "no WriteWindows call was made");
-  clientResult(ctx, res, "with every shard healthy");
+  ctx.Assert(hClientDeadlines(ctx, ctx.GRPC.CallsTo("WriteWindows"), 0, "with every shard healthy") > 0, "no WriteWindows call was made");
+  hClientResult(ctx, res, "with every shard healthy");
   const std::string slow = metrics::kShards[1];
   ctx.GRPC.SetLatency("WriteWindows", 30, slow);
   std::vector<metrics::Window> later;
   std::vector<std::string> want;
   for (metrics::Window w : s.windows) {
-    w.start = kStart + 10;
+    w.start = kHStart + 10;
     later.push_back(w);
     if (metrics::shardFor(w.series) == slow) want.push_back(metrics::windowId(w));
   }
   const int64_t before = ctx.Clock.Now();
-  const auto result = clientResult(ctx, flushWindows(later), "with " + slow + " hanging");
+  const auto result = hClientResult(ctx, flushWindows(later), "with " + slow + " hanging");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 6.5, "the flush waited %.1f s on a hung shard: three rounds of a 2 s deadline is 6 s", waited);
   const auto hung = ctx.GRPC.CallsTo("WriteWindows", slow);
   ctx.Equal(hung.empty() ? 0 : hung.size() - 1, 3, "%s hung: one call per round, kFlushAttempts = 3; the calls it got in that flush", slow);
-  clientDeadlines(ctx, hung, 1, "with " + slow + " hanging");
+  hClientDeadlines(ctx, hung, 1, "with " + slow + " hanging");
   ctx.Equal(result.pending.size(), 1, "with %s hanging only its windows are pending; the shards with pending windows", slow);
   ctx.Equal(hSortedIds(result.pending.count(slow) ? result.pending.at(slow) : std::vector<std::string>{}), hSortedIds(want), "with %s hanging, its pending windows", slow);
 }
 
 void CheckPerShardResult(harness::Ctx& ctx) {
-  auto s = clientSetup(ctx);
+  auto s = hClientSetup(ctx);
   const std::string down = metrics::kShards[2], picky = metrics::kShards[0];
   ctx.GRPC.Stop(down);
   const std::string refused = s.by[picky][0];
   s.shards[picky]->full.insert(refused);
-  const auto result = clientResult(ctx, flushWindows(s.windows), "with " + down + " down and " + picky + " refusing " + refused);
+  const auto result = hClientResult(ctx, flushWindows(s.windows), "with " + down + " down and " + picky + " refusing " + refused);
   ctx.Equal(result.pending.size(), 2, "the shards with pending windows, expected %s and %s", picky, down);
   ctx.Equal(result.pending.count(picky) ? hSortedIds(result.pending.at(picky)) : std::vector<std::string>{}, std::vector<std::string>{refused}, "%s refused one window; its pending ids", picky);
   ctx.Equal(result.pending.count(down) ? hSortedIds(result.pending.at(down)) : std::vector<std::string>{}, s.by[down], "%s is down; its pending ids", down);
@@ -1128,7 +1128,7 @@ void CheckPerShardResult(harness::Ctx& ctx) {
 }
 
 void CheckRetryFailedOnly(harness::Ctx& ctx) {
-  auto s = clientSetup(ctx);
+  auto s = hClientSetup(ctx);
   const std::string flaky = metrics::kShards[0];
   ctx.GRPC.Fail("WriteWindows", grpc::StatusCode::UNAVAILABLE, "shard restarting", 1, flaky);
   const auto res = flushWindows(s.windows);
@@ -1136,12 +1136,12 @@ void CheckRetryFailedOnly(harness::Ctx& ctx) {
     ctx.Equal(ctx.GRPC.CallsTo("WriteWindows", target).size(), target == flaky ? 2 : 1, "one failure on %s: only the windows still pending are sent again; the calls to %s", flaky, target);
     ctx.Equal(s.shards[target]->received.size(), s.by[target].size(), "%s must receive each of its windows once (a healthy shard sent its windows again); the windows it received", target);
   }
-  const auto result = clientResult(ctx, res, "after " + flaky + " recovered");
+  const auto result = hClientResult(ctx, res, "after " + flaky + " recovered");
   ctx.Assert(result.pending.empty() && result.accepted.size() == s.windows.size(), "after the retry every window is accepted, got %d accepted and %d shards pending", result.accepted.size(), result.pending.size());
 }
 
 void CheckWindowId(harness::Ctx& ctx) {
-  auto s = clientSetup(ctx);
+  auto s = hClientSetup(ctx);
   flushWindows(s.windows);
   for (const auto& target : metrics::kShards) {
     ctx.Equal(hSortedIds(s.shards[target]->received), s.by[target], "%s must receive each window with window_id = metrics::windowId(w) (tenant/series@start): without an id a shard cannot tell a resend from a new window; the ids", target);

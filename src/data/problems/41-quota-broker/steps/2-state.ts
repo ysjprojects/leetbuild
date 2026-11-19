@@ -794,7 +794,7 @@ const (
 
 var hStateBg = context.Background()
 
-func hashReserved(ctx *harness.Ctx, key string) int64 {
+func hHashReserved(ctx *harness.Ctx, key string) int64 {
 	raw, _ := ctx.Redis.HGet(key, "reserved")
 	n, _ := strconv.ParseInt(raw, 10, 64)
 	return n
@@ -805,7 +805,7 @@ func hLedgerReserved(ctx *harness.Ctx) int64 {
 	var total int64
 	for _, key := range ctx.Redis.Keys("quota:research*") {
 		if ctx.Redis.Type(key) == "hash" {
-			total += hashReserved(ctx, key)
+			total += hHashReserved(ctx, key)
 		}
 	}
 	return total
@@ -828,9 +828,9 @@ func CheckWindowKey(ctx *harness.Ctx) {
 	ctx.Assert(first != "", "a reserve of 6 of research's 8 units in an empty window was refused")
 	second := hMustReserve(ctx, kHStateW2, "gpu-a100", 6)
 	ctx.Assert(second != "", "a reserve of 6 units in the next window (%s) was refused: the 14:00 jobs spent the 15:00 quota (keys: %q). Keep one hash per window", kHStateW2, ctx.Redis.Keys("quota:research*"))
-	ctx.Assert(hashReserved(ctx, "quota:research:"+kHStateW1) == 6 && hashReserved(ctx, "quota:research:"+kHStateW2) == 6, "each window's hash must hold reserved 6, Redis holds %q", ctx.Redis.Keys("quota:research*"))
+	ctx.Assert(hHashReserved(ctx, "quota:research:"+kHStateW1) == 6 && hHashReserved(ctx, "quota:research:"+kHStateW2) == 6, "each window's hash must hold reserved 6, Redis holds %q", ctx.Redis.Keys("quota:research*"))
 	ctx.Equal(hMustRelease(ctx, first), true, "releasing the 14:00 reservation; released")
-	ctx.Assert(hashReserved(ctx, "quota:research:"+kHStateW1) == 0 && hashReserved(ctx, "quota:research:"+kHStateW2) == 6, "the release must refund the window its reservation recorded: 14:00 holds %d, 15:00 holds %d", hashReserved(ctx, "quota:research:"+kHStateW1), hashReserved(ctx, "quota:research:"+kHStateW2))
+	ctx.Assert(hHashReserved(ctx, "quota:research:"+kHStateW1) == 0 && hHashReserved(ctx, "quota:research:"+kHStateW2) == 6, "the release must refund the window its reservation recorded: 14:00 holds %d, 15:00 holds %d", hHashReserved(ctx, "quota:research:"+kHStateW1), hHashReserved(ctx, "quota:research:"+kHStateW2))
 }
 
 func CheckAtomicTake(ctx *harness.Ctx) {
@@ -936,7 +936,7 @@ const std::string kHW1 = "2026-11-02T14:00Z";
 const std::string kHW2 = "2026-11-02T15:00Z";
 const std::string kHW3 = "2026-11-02T16:00Z";
 
-long long hashReserved(harness::Ctx& ctx, const std::string& key) {
+long long hHashReserved(harness::Ctx& ctx, const std::string& key) {
   const auto raw = ctx.Redis.HGet(key, "reserved");
   return raw && !raw->empty() ? std::stoll(*raw) : 0;
 }
@@ -945,7 +945,7 @@ long long hashReserved(harness::Ctx& ctx, const std::string& key) {
 long long hLedgerReserved(harness::Ctx& ctx) {
   long long total = 0;
   for (const auto& key : ctx.Redis.Keys("quota:research*")) {
-    if (ctx.Redis.Type(key) == "hash") total += hashReserved(ctx, key);
+    if (ctx.Redis.Type(key) == "hash") total += hHashReserved(ctx, key);
   }
   return total;
 }
@@ -978,9 +978,9 @@ void CheckWindowKey(harness::Ctx& ctx) {
   ctx.Assert(first.has_value(), "a reserve of 6 of research's 8 units in an empty window was refused");
   const auto second = reserve("research", kHW2, "gpu-a100", 6);
   ctx.Assert(second.has_value(), "a reserve of 6 units in the next window (%s) was refused: the 14:00 jobs spent the 15:00 quota (keys: %q). Keep one hash per window", kHW2, ctx.Redis.Keys("quota:research*"));
-  ctx.Assert(hashReserved(ctx, "quota:research:" + kHW1) == 6 && hashReserved(ctx, "quota:research:" + kHW2) == 6, "each window's hash must hold reserved 6, Redis holds %q", ctx.Redis.Keys("quota:research*"));
+  ctx.Assert(hHashReserved(ctx, "quota:research:" + kHW1) == 6 && hHashReserved(ctx, "quota:research:" + kHW2) == 6, "each window's hash must hold reserved 6, Redis holds %q", ctx.Redis.Keys("quota:research*"));
   ctx.Equal(release("research", *first), true, "releasing the 14:00 reservation; released");
-  ctx.Assert(hashReserved(ctx, "quota:research:" + kHW1) == 0 && hashReserved(ctx, "quota:research:" + kHW2) == 6, "the release must refund the window its reservation recorded: 14:00 holds %d, 15:00 holds %d", hashReserved(ctx, "quota:research:" + kHW1), hashReserved(ctx, "quota:research:" + kHW2));
+  ctx.Assert(hHashReserved(ctx, "quota:research:" + kHW1) == 0 && hHashReserved(ctx, "quota:research:" + kHW2) == 6, "the release must refund the window its reservation recorded: 14:00 holds %d, 15:00 holds %d", hHashReserved(ctx, "quota:research:" + kHW1), hHashReserved(ctx, "quota:research:" + kHW2));
 }
 
 void CheckAtomicTake(harness::Ctx& ctx) {

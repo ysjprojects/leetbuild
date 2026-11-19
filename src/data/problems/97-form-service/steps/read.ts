@@ -894,9 +894,9 @@ import (
 	"leetbuild/harness"
 )
 
-var readSchema = store.Schema{"name": 80, "email": 80, "phone": 20, "message": 200}
+var hReadSchema = store.Schema{"name": 80, "email": 80, "phone": 20, "message": 200}
 
-type readPage struct {
+type HReadPage struct {
 	Items []struct {
 		SubmissionID string            \`json:"submission_id"\`
 		Values       map[string]string \`json:"values"\`
@@ -904,7 +904,7 @@ type readPage struct {
 	NextCursor *string \`json:"next_cursor"\`
 }
 
-type readExport struct {
+type HReadExport struct {
 	File string \`json:"file"\`
 	Rows []struct {
 		SubmissionID string            \`json:"submission_id"\`
@@ -912,7 +912,7 @@ type readExport struct {
 	} \`json:"rows"\`
 }
 
-func readAdd(ctx *harness.Ctx, i int, name string) {
+func hReadAdd(ctx *harness.Ctx, i int, name string) {
 	if name == "" {
 		name = fmt.Sprintf("Person %d", i)
 	}
@@ -920,17 +920,17 @@ func readAdd(ctx *harness.Ctx, i int, name string) {
 	ctx.NoError(err, "InsertSubmission")
 }
 
-func readSetup(ctx *harness.Ctx, n int, name string) *harness.HTTP {
-	ctx.NoError(store.DefineForm(context.Background(), "f-1", "u-owner", readSchema, readSchema), "DefineForm")
+func hReadSetup(ctx *harness.Ctx, n int, name string) *harness.HTTP {
+	ctx.NoError(store.DefineForm(context.Background(), "f-1", "u-owner", hReadSchema, hReadSchema), "DefineForm")
 	for i := 1; i <= n; i++ {
-		readAdd(ctx, i, name)
+		hReadAdd(ctx, i, name)
 	}
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readIDs(p readPage) []string {
+func hReadIDs(p HReadPage) []string {
 	ids := []string{}
 	for _, item := range p.Items {
 		ids = append(ids, item.SubmissionID)
@@ -939,7 +939,7 @@ func readIDs(p readPage) []string {
 }
 
 func CheckOwnerRole(ctx *harness.Ctx) {
-	c := readSetup(ctx, 3, "")
+	c := hReadSetup(ctx, 3, "")
 	r := c.Get("/v1/forms/f-1/submissions", "X-User-Id", "u-member")
 	ctx.Equal(r.Status, 403, "a user who does not own form f-1 listed its submissions")
 	r = c.Post("/v1/forms/f-1/exports", nil, "X-User-Id", "u-member")
@@ -949,16 +949,16 @@ func CheckOwnerRole(ctx *harness.Ctx) {
 	r = c.Post("/v1/forms/f-1/exports", nil)
 	ctx.Equal(r.Status, 401, "an export without X-User-Id")
 	r = c.Get("/v1/forms/f-1/submissions", "X-User-Id", "u-owner")
-	var page readPage
+	var page HReadPage
 	r.Decode(&page)
 	ctx.Assert(r.Status == 200 && len(page.Items) == 3, "the owner's list answered %d %s, expected the 3 submissions", r.Status, r.Text())
 }
 
 func CheckRedactedDefault(ctx *harness.Ctx) {
-	c := readSetup(ctx, 3, "")
+	c := hReadSetup(ctx, 3, "")
 	r := c.Get("/v1/forms/f-1/submissions", "X-User-Id", "u-owner")
 	ctx.Equal(r.Status, 200, "the owner's list (%s)", r.Text())
-	var page readPage
+	var page HReadPage
 	r.Decode(&page)
 	ctx.Assert(len(page.Items) > 0, "the list is empty: %s", r.Text())
 	for _, item := range page.Items {
@@ -969,10 +969,10 @@ func CheckRedactedDefault(ctx *harness.Ctx) {
 }
 
 func CheckAuditedExport(ctx *harness.Ctx) {
-	c := readSetup(ctx, 3, "")
+	c := hReadSetup(ctx, 3, "")
 	r := c.Post("/v1/forms/f-1/exports", nil, "X-User-Id", "u-owner")
 	ctx.Equal(r.Status, 200, "the owner's export (%s)", r.Text())
-	var body readExport
+	var body HReadExport
 	r.Decode(&body)
 	emails := []string{}
 	for _, row := range body.Rows {
@@ -990,11 +990,11 @@ func CheckAuditedExport(ctx *harness.Ctx) {
 }
 
 func CheckGeneratedFilename(ctx *harness.Ctx) {
-	c := readSetup(ctx, 1, "../../etc/passwd")
+	c := hReadSetup(ctx, 1, "../../etc/passwd")
 	first := c.Post("/v1/forms/f-1/exports", nil, "X-User-Id", "u-owner")
 	second := c.Post("/v1/forms/f-1/exports", nil, "X-User-Id", "u-owner")
 	ctx.Equal(first.Status, 200, "the owner's export (%s)", first.Text())
-	var a, b readExport
+	var a, b HReadExport
 	first.Decode(&a)
 	second.Decode(&b)
 	ctx.Assert(!strings.ContainsAny(a.File, "/\\\\") && !strings.Contains(a.File, ".."), "the export file is named %q: a submitted name chose a path for the export tool", a.File)
@@ -1003,19 +1003,19 @@ func CheckGeneratedFilename(ctx *harness.Ctx) {
 }
 
 func CheckCursorPagination(ctx *harness.Ctx) {
-	c := readSetup(ctx, 5, "")
-	var page readPage
+	c := hReadSetup(ctx, 5, "")
+	var page HReadPage
 	c.Get("/v1/forms/f-1/submissions?limit=2", "X-User-Id", "u-owner").Decode(&page)
-	ctx.Equal(readIDs(page), []string{"sub-5", "sub-4"}, "the first page must hold the newest two")
+	ctx.Equal(hReadIDs(page), []string{"sub-5", "sub-4"}, "the first page must hold the newest two")
 	ctx.Assert(page.NextCursor != nil && *page.NextCursor != "", "the first page carries no next_cursor: a list that pages by offset repeats rows when someone submits between two pages")
-	readAdd(ctx, 6, "") // someone submits while the owner reads
-	var second readPage
+	hReadAdd(ctx, 6, "") // someone submits while the owner reads
+	var second HReadPage
 	c.Get("/v1/forms/f-1/submissions?limit=2&cursor="+*page.NextCursor, "X-User-Id", "u-owner").Decode(&second)
-	ctx.Equal(readIDs(second), []string{"sub-3", "sub-2"}, "after a new submission, the second page")
+	ctx.Equal(hReadIDs(second), []string{"sub-3", "sub-2"}, "after a new submission, the second page")
 	ctx.Assert(second.NextCursor != nil, "the second page carries no next_cursor")
-	var third readPage
+	var third HReadPage
 	c.Get("/v1/forms/f-1/submissions?limit=2&cursor="+*second.NextCursor, "X-User-Id", "u-owner").Decode(&third)
-	ctx.Equal(readIDs(third), []string{"sub-1"}, "the last page")
+	ctx.Equal(hReadIDs(third), []string{"sub-1"}, "the last page")
 	ctx.Assert(third.NextCursor == nil || *third.NextCursor == "", "the last page must carry no next_cursor, got %s", harness.Show(third.NextCursor))
 }
 `,

@@ -782,17 +782,17 @@ import (
 	"inventory/store"
 )
 
-var clientReservation = store.Reservation{
+var hClientReservation = store.Reservation{
 	ReservationID: "r-1", Tenant: "t1", IdempotencyKey: "k-1", SKU: "sku-1", Quantity: 3, Status: "reserved",
 }
 
 // warehousePeer keeps one allocation per reservation id.
-type warehousePeer struct {
+type HWarehousePeer struct {
 	pb.UnimplementedWarehouseServer
 	allocations map[string]string
 }
 
-func (w *warehousePeer) ConfirmReservation(_ context.Context, req *pb.ConfirmRequest) (*pb.ConfirmReply, error) {
+func (w *HWarehousePeer) ConfirmReservation(_ context.Context, req *pb.ConfirmRequest) (*pb.ConfirmReply, error) {
 	if _, ok := w.allocations[req.GetReservationId()]; !ok {
 		w.allocations[req.GetReservationId()] = fmt.Sprintf("c-%d", len(w.allocations)+1)
 	}
@@ -800,48 +800,48 @@ func (w *warehousePeer) ConfirmReservation(_ context.Context, req *pb.ConfirmReq
 }
 
 // clientWorld is a stored reservation of 3 units holding them in Redis, and the warehouse the harness serves.
-func clientWorld(ctx *harness.Ctx) {
-	pb.RegisterWarehouseServer(ctx.GRPC.Server(""), &warehousePeer{allocations: map[string]string{}})
+func hClientWorld(ctx *harness.Ctx) {
+	pb.RegisterWarehouseServer(ctx.GRPC.Server(""), &HWarehousePeer{allocations: map[string]string{}})
 	ctx.Redis.Set("stock:sku-1", 7)
 	ctx.Redis.Do("HSET", "holds:sku-1", "r-1", 3)
 	ctx.Redis.Set("hold:r-1", 3, "EX", 900)
-	r := clientReservation
+	r := hClientReservation
 	ctx.NoError(store.Put(context.Background(), &r), "storing the reservation")
 }
 
-func clientConfirm(ctx *harness.Ctx) string {
-	r := clientReservation
+func hClientConfirm(ctx *harness.Ctx) string {
+	r := hClientReservation
 	result, err := confirmReservation(context.Background(), &r)
 	ctx.NoError(err, "confirmReservation")
 	return result
 }
 
-func clientStatus(ctx *harness.Ctx) string {
+func hClientStatus(ctx *harness.Ctx) string {
 	status, _ := ctx.Redis.HGet("reservation:r-1", "status")
 	return status
 }
 
-func clientUnits(ctx *harness.Ctx) string {
+func hClientUnits(ctx *harness.Ctx) string {
 	units, _ := ctx.Redis.Get("stock:sku-1")
 	return units
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientWorld(ctx)
+	hClientWorld(ctx)
 	ctx.GRPC.SetLatency("ConfirmReservation", 1.5, "")
-	ctx.Equal(clientConfirm(ctx), "confirmed", "a warehouse that answers in 1.5 s must confirm the reservation; the result")
+	ctx.Equal(hClientConfirm(ctx), "confirmed", "a warehouse that answers in 1.5 s must confirm the reservation; the result")
 	call := ctx.GRPC.CallsTo("ConfirmReservation", "")[0]
 	ctx.Assert(call.HasDeadline(), "ConfirmReservation carries no deadline: a warehouse that hangs holds the request, and the buyer, open")
 	ctx.Assert(1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "the ConfirmReservation deadline is %v, expected about 2 s", call.Timeout)
-	ctx.Equal(clientStatus(ctx), "confirmed", "the stored reservation's status")
+	ctx.Equal(hClientStatus(ctx), "confirmed", "the stored reservation's status")
 	_, held := ctx.Redis.HGet("holds:sku-1", "r-1")
-	ctx.Assert(!held && clientUnits(ctx) == "7", "after the confirmation holds:sku-1 is %v and stock:sku-1 %s: the hold must become a sale", ctx.Redis.HGetAll("holds:sku-1"), clientUnits(ctx))
+	ctx.Assert(!held && hClientUnits(ctx) == "7", "after the confirmation holds:sku-1 is %v and stock:sku-1 %s: the hold must become a sale", ctx.Redis.HGetAll("holds:sku-1"), hClientUnits(ctx))
 }
 
 func CheckRetrySameId(ctx *harness.Ctx) {
-	clientWorld(ctx)
+	hClientWorld(ctx)
 	ctx.GRPC.Fail("ConfirmReservation", codes.Unavailable, "warehouse restarting", 1, "")
-	ctx.Equal(clientConfirm(ctx), "confirmed", "a warehouse that was UNAVAILABLE once must confirm the reservation after a retry; the result")
+	ctx.Equal(hClientConfirm(ctx), "confirmed", "a warehouse that was UNAVAILABLE once must confirm the reservation after a retry; the result")
 	var ids []string
 	for _, c := range ctx.GRPC.CallsTo("ConfirmReservation", "") {
 		req, _ := c.Request.(*pb.ConfirmRequest)
@@ -851,18 +851,18 @@ func CheckRetrySameId(ctx *harness.Ctx) {
 }
 
 func CheckUnansweredPending(ctx *harness.Ctx) {
-	clientWorld(ctx)
+	hClientWorld(ctx)
 	ctx.GRPC.Fail("ConfirmReservation", codes.Unavailable, "warehouse down", 2, "")
-	result := clientConfirm(ctx)
+	result := hClientConfirm(ctx)
 	ctx.Equal(len(ctx.GRPC.CallsTo("ConfirmReservation", "")), 2, "a warehouse that stays UNAVAILABLE gets MAX_CONFIRM_ATTEMPTS = 2 calls; the calls")
 	ctx.Equal(result, "pending", "no attempt was answered, so the warehouse may have allocated; the result")
-	ctx.Equal(clientStatus(ctx), "pending", "the stored reservation's status")
+	ctx.Equal(hClientStatus(ctx), "pending", "the stored reservation's status")
 	quantity, _ := ctx.Redis.HGet("holds:sku-1", "r-1")
 	ctx.Assert(quantity == "3" && ctx.Redis.Exists("hold:r-1") == 1, "the hold of a pending reservation was dropped: its units may already be allocated in the warehouse")
-	ctx.Equal(clientUnits(ctx), "7", "stock:sku-1 (a pending reservation's units must not go back to the counter)")
+	ctx.Equal(hClientUnits(ctx), "7", "stock:sku-1 (a pending reservation's units must not go back to the counter)")
 	// A warehouse that hangs: every attempt runs into its own deadline.
 	ctx.GRPC.SetLatency("ConfirmReservation", 30, "")
-	again := clientConfirm(ctx)
+	again := hClientConfirm(ctx)
 	hung := ctx.GRPC.CallsTo("ConfirmReservation", "")[2:]
 	ctx.Equal(len(hung), 2, "a warehouse that never answers gets MAX_CONFIRM_ATTEMPTS = 2 calls (DEADLINE_EXCEEDED is retried like UNAVAILABLE); the calls")
 	for _, call := range hung {
@@ -870,22 +870,22 @@ func CheckUnansweredPending(ctx *harness.Ctx) {
 	}
 	ctx.Equal(again, "pending", "a warehouse that never answered may have allocated; the result")
 	quantity, _ = ctx.Redis.HGet("holds:sku-1", "r-1")
-	ctx.Assert(quantity == "3" && clientUnits(ctx) == "7", "after a hung warehouse holds:sku-1 is %v and stock:sku-1 %s: a pending reservation keeps its hold", ctx.Redis.HGetAll("holds:sku-1"), clientUnits(ctx))
+	ctx.Assert(quantity == "3" && hClientUnits(ctx) == "7", "after a hung warehouse holds:sku-1 is %v and stock:sku-1 %s: a pending reservation keeps its hold", ctx.Redis.HGetAll("holds:sku-1"), hClientUnits(ctx))
 }
 
 func CheckRejectionFinal(ctx *harness.Ctx) {
-	clientWorld(ctx)
+	hClientWorld(ctx)
 	ctx.GRPC.Fail("ConfirmReservation", codes.FailedPrecondition, "not enough units in the warehouse", 1, "")
-	result := clientConfirm(ctx)
+	result := hClientConfirm(ctx)
 	ctx.Equal(len(ctx.GRPC.CallsTo("ConfirmReservation", "")), 1, "FAILED_PRECONDITION is a verdict; the calls to the warehouse")
 	ctx.Equal(result, "rejected", "confirmReservation's result")
-	ctx.Assert(clientUnits(ctx) == "10" && len(ctx.Redis.HGetAll("holds:sku-1")) == 0, "after the refusal stock:sku-1 is %s and holds:sku-1 %v: the 3 units go back once", clientUnits(ctx), ctx.Redis.HGetAll("holds:sku-1"))
-	ctx.Equal(clientStatus(ctx), "rejected", "the stored reservation's status")
+	ctx.Assert(hClientUnits(ctx) == "10" && len(ctx.Redis.HGetAll("holds:sku-1")) == 0, "after the refusal stock:sku-1 is %s and holds:sku-1 %v: the 3 units go back once", hClientUnits(ctx), ctx.Redis.HGetAll("holds:sku-1"))
+	ctx.Equal(hClientStatus(ctx), "rejected", "the stored reservation's status")
 	// Codes other than DEADLINE_EXCEEDED and UNAVAILABLE are not retried either: one call each, whatever the outcome.
 	for _, code := range []codes.Code{codes.Internal, codes.PermissionDenied} {
 		ctx.GRPC.Fail("ConfirmReservation", code, "warehouse error", 1, "")
 		before := len(ctx.GRPC.CallsTo("ConfirmReservation", ""))
-		r := clientReservation
+		r := hClientReservation
 		confirmReservation(context.Background(), &r) // the outcome is the client's choice; only the calls are checked
 		ctx.Equal(len(ctx.GRPC.CallsTo("ConfirmReservation", ""))-before, 1, "a warehouse that answered %s is not retried (only DEADLINE_EXCEEDED and UNAVAILABLE are); the calls", code)
 	}
@@ -902,10 +902,10 @@ func CheckRejectionFinal(ctx *harness.Ctx) {
 
 namespace {
 
-const inventory::Reservation kClientReservation{"r-1", "t1", "k-1", "sku-1", 3, "reserved", 0};
+const inventory::Reservation kHClientReservation{"r-1", "t1", "k-1", "sku-1", 3, "reserved", 0};
 
 // One allocation per reservation id.
-class WarehousePeer final : public inventoryd::Warehouse::Service {
+class HWarehousePeer final : public inventoryd::Warehouse::Service {
  public:
   std::map<std::string, std::string> allocations;
 
@@ -917,57 +917,57 @@ class WarehousePeer final : public inventoryd::Warehouse::Service {
 };
 
 // A stored reservation of 3 units holding them in Redis, and the warehouse the harness serves.
-void clientWorld(harness::Ctx& ctx) {
-  static WarehousePeer* warehouse = nullptr;
+void hClientWorld(harness::Ctx& ctx) {
+  static HWarehousePeer* warehouse = nullptr;
   delete warehouse;
-  warehouse = new WarehousePeer;
+  warehouse = new HWarehousePeer;
   ctx.GRPC.Server("")->RegisterService(warehouse);
   ctx.Redis.Do("SET", "stock:sku-1", 7);
   ctx.Redis.Do("HSET", "holds:sku-1", "r-1", 3);
   ctx.Redis.Do("SET", "hold:r-1", 3, "EX", 900);
-  inventory::store::Put(kClientReservation);
+  inventory::store::Put(kHClientReservation);
 }
 
-std::string clientStatus(harness::Ctx& ctx) { return ctx.Redis.HGet("reservation:r-1", "status").value_or(""); }
+std::string hClientStatus(harness::Ctx& ctx) { return ctx.Redis.HGet("reservation:r-1", "status").value_or(""); }
 
-std::string clientUnits(harness::Ctx& ctx) { return ctx.Redis.Get("stock:sku-1").value_or(""); }
+std::string hClientUnits(harness::Ctx& ctx) { return ctx.Redis.Get("stock:sku-1").value_or(""); }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  clientWorld(ctx);
+  hClientWorld(ctx);
   ctx.GRPC.SetLatency("ConfirmReservation", 1.5);
-  ctx.Equal(confirmReservation(kClientReservation), "confirmed", "a warehouse that answers in 1.5 s must confirm the reservation; the result");
+  ctx.Equal(confirmReservation(kHClientReservation), "confirmed", "a warehouse that answers in 1.5 s must confirm the reservation; the result");
   const auto call = ctx.GRPC.CallsTo("ConfirmReservation")[0];
   ctx.Assert(call.HasDeadline(), "ConfirmReservation carries no deadline: a warehouse that hangs holds the request, and the buyer, open");
   ctx.Assert(1.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 2.5, "the ConfirmReservation deadline is %vs, expected about 2 s", call.TimeoutSeconds());
-  ctx.Equal(clientStatus(ctx), "confirmed", "the stored reservation's status");
-  ctx.Assert(!ctx.Redis.HGet("holds:sku-1", "r-1") && clientUnits(ctx) == "7",
-             "after the confirmation holds:sku-1 is %v and stock:sku-1 %s: the hold must become a sale", ctx.Redis.HGetAll("holds:sku-1"), clientUnits(ctx));
+  ctx.Equal(hClientStatus(ctx), "confirmed", "the stored reservation's status");
+  ctx.Assert(!ctx.Redis.HGet("holds:sku-1", "r-1") && hClientUnits(ctx) == "7",
+             "after the confirmation holds:sku-1 is %v and stock:sku-1 %s: the hold must become a sale", ctx.Redis.HGetAll("holds:sku-1"), hClientUnits(ctx));
 }
 
 void CheckRetrySameId(harness::Ctx& ctx) {
-  clientWorld(ctx);
+  hClientWorld(ctx);
   ctx.GRPC.Fail("ConfirmReservation", grpc::StatusCode::UNAVAILABLE, "warehouse restarting", 1);
-  ctx.Equal(confirmReservation(kClientReservation), "confirmed", "a warehouse that was UNAVAILABLE once must confirm the reservation after a retry; the result");
+  ctx.Equal(confirmReservation(kHClientReservation), "confirmed", "a warehouse that was UNAVAILABLE once must confirm the reservation after a retry; the result");
   std::vector<std::string> ids;
   for (const auto& c : ctx.GRPC.CallsTo("ConfirmReservation")) ids.push_back(c.Request<inventoryd::ConfirmRequest>().reservation_id());
   ctx.Equal(ids, {"r-1", "r-1"}, "the attempts' reservation ids (the warehouse allocates once per id, a new id is a second allocation)");
 }
 
 void CheckUnansweredPending(harness::Ctx& ctx) {
-  clientWorld(ctx);
+  hClientWorld(ctx);
   ctx.GRPC.Fail("ConfirmReservation", grpc::StatusCode::UNAVAILABLE, "warehouse down", 2);
-  const std::string result = confirmReservation(kClientReservation);
+  const std::string result = confirmReservation(kHClientReservation);
   ctx.Equal(ctx.GRPC.CallsTo("ConfirmReservation").size(), 2, "a warehouse that stays UNAVAILABLE gets MAX_CONFIRM_ATTEMPTS = 2 calls; the calls");
   ctx.Equal(result, "pending", "no attempt was answered, so the warehouse may have allocated; the result");
-  ctx.Equal(clientStatus(ctx), "pending", "the stored reservation's status");
+  ctx.Equal(hClientStatus(ctx), "pending", "the stored reservation's status");
   ctx.Assert(ctx.Redis.HGet("holds:sku-1", "r-1").value_or("") == "3" && ctx.Redis.Exists("hold:r-1") == 1,
              "the hold of a pending reservation was dropped: its units may already be allocated in the warehouse");
-  ctx.Equal(clientUnits(ctx), "7", "stock:sku-1 (a pending reservation's units must not go back to the counter)");
+  ctx.Equal(hClientUnits(ctx), "7", "stock:sku-1 (a pending reservation's units must not go back to the counter)");
   // A warehouse that hangs: every attempt runs into its own deadline.
   ctx.GRPC.SetLatency("ConfirmReservation", 30);
-  const std::string again = confirmReservation(kClientReservation);
+  const std::string again = confirmReservation(kHClientReservation);
   const auto calls = ctx.GRPC.CallsTo("ConfirmReservation");
   ctx.Equal(calls.size(), 4, "a warehouse that never answers gets MAX_CONFIRM_ATTEMPTS = 2 calls (DEADLINE_EXCEEDED is retried like UNAVAILABLE); the calls so far");
   for (size_t i = 2; i < calls.size(); i++) {
@@ -976,26 +976,26 @@ void CheckUnansweredPending(harness::Ctx& ctx) {
                calls[i].TimeoutSeconds());
   }
   ctx.Equal(again, "pending", "a warehouse that never answered may have allocated; the result");
-  ctx.Assert(ctx.Redis.HGet("holds:sku-1", "r-1").value_or("") == "3" && clientUnits(ctx) == "7",
-             "after a hung warehouse holds:sku-1 is %v and stock:sku-1 %s: a pending reservation keeps its hold", ctx.Redis.HGetAll("holds:sku-1"), clientUnits(ctx));
+  ctx.Assert(ctx.Redis.HGet("holds:sku-1", "r-1").value_or("") == "3" && hClientUnits(ctx) == "7",
+             "after a hung warehouse holds:sku-1 is %v and stock:sku-1 %s: a pending reservation keeps its hold", ctx.Redis.HGetAll("holds:sku-1"), hClientUnits(ctx));
 }
 
 void CheckRejectionFinal(harness::Ctx& ctx) {
-  clientWorld(ctx);
+  hClientWorld(ctx);
   ctx.GRPC.Fail("ConfirmReservation", grpc::StatusCode::FAILED_PRECONDITION, "not enough units in the warehouse", 1);
-  const std::string result = confirmReservation(kClientReservation);
+  const std::string result = confirmReservation(kHClientReservation);
   ctx.Equal(ctx.GRPC.CallsTo("ConfirmReservation").size(), 1, "FAILED_PRECONDITION is a verdict; the calls to the warehouse");
   ctx.Equal(result, "rejected", "confirmReservation's result");
-  ctx.Assert(clientUnits(ctx) == "10" && ctx.Redis.HGetAll("holds:sku-1").empty(),
-             "after the refusal stock:sku-1 is %s and holds:sku-1 %v: the 3 units go back once", clientUnits(ctx), ctx.Redis.HGetAll("holds:sku-1"));
-  ctx.Equal(clientStatus(ctx), "rejected", "the stored reservation's status");
+  ctx.Assert(hClientUnits(ctx) == "10" && ctx.Redis.HGetAll("holds:sku-1").empty(),
+             "after the refusal stock:sku-1 is %s and holds:sku-1 %v: the 3 units go back once", hClientUnits(ctx), ctx.Redis.HGetAll("holds:sku-1"));
+  ctx.Equal(hClientStatus(ctx), "rejected", "the stored reservation's status");
   // Codes other than DEADLINE_EXCEEDED and UNAVAILABLE are not retried either: one call each, whatever the outcome.
   for (const auto& [code, name] : std::vector<std::pair<grpc::StatusCode, std::string>>{{grpc::StatusCode::INTERNAL, "INTERNAL"},
                                                                                       {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}}) {
     ctx.GRPC.Fail("ConfirmReservation", code, "warehouse error", 1);
     const size_t before = ctx.GRPC.CallsTo("ConfirmReservation").size();
     try {
-      confirmReservation(kClientReservation);
+      confirmReservation(kHClientReservation);
     } catch (...) {
       // the outcome is the client's choice; only the calls are checked
     }

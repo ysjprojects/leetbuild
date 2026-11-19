@@ -1038,43 +1038,43 @@ import (
 )
 
 var (
-	stateBg   = context.Background()
-	stateUser = map[string]string{"user_id": "u-7", "country": "US"}
+	hStateBg   = context.Background()
+	hStateUser = map[string]string{"user_id": "u-7", "country": "US"}
 )
 
-func stateFlag(rollout int) Flag {
+func hStateFlag(rollout int) Flag {
 	return Flag{Default: false, Rollout: rollout, Salt: "2026"}
 }
 
-func stateSnap(version int64, rollout int, keys ...string) Snapshot {
+func hStateSnap(version int64, rollout int, keys ...string) Snapshot {
 	s := Snapshot{Version: version, Flags: map[string]Flag{}}
 	for _, k := range keys {
-		s.Flags[k] = stateFlag(rollout)
+		s.Flags[k] = hStateFlag(rollout)
 	}
 	return s
 }
 
-func statePublish(ctx *harness.Ctx, s Snapshot) bool {
-	moved, err := publishSnapshot(stateBg, s)
+func hStatePublish(ctx *harness.Ctx, s Snapshot) bool {
+	moved, err := publishSnapshot(hStateBg, s)
 	ctx.NoError(err, "publishSnapshot(version %d) failed", s.Version)
 	return moved
 }
 
-func stateEval(ctx *harness.Ctx, key string, attrs map[string]string) *Decision {
-	d, err := evaluate(stateBg, key, attrs)
+func hStateEval(ctx *harness.Ctx, key string, attrs map[string]string) *Decision {
+	d, err := evaluate(hStateBg, key, attrs)
 	ctx.NoError(err, "evaluate(%s) failed", key)
 	return d
 }
 
-type statePair struct {
+type HStatePair struct {
 	decisions []*Decision
 	err       error
 }
 
-func stateRead() statePair {
-	var out statePair
+func hStateRead() HStatePair {
+	var out HStatePair
 	for _, key := range []string{"checkout", "payments"} {
-		d, err := evaluate(stateBg, key, stateUser)
+		d, err := evaluate(hStateBg, key, hStateUser)
 		if err != nil {
 			out.err = err
 		}
@@ -1083,7 +1083,7 @@ func stateRead() statePair {
 	return out
 }
 
-func stateConsistent(ctx *harness.Ctx, p statePair, when string) {
+func hStateConsistent(ctx *harness.Ctx, p HStatePair, when string) {
 	ctx.NoError(p.err, "a read %s failed", when)
 	ctx.Assert(p.decisions[0] != nil && p.decisions[1] != nil, "a read %s found no flag: %+v", when, p.decisions)
 	a, b := p.decisions[0], p.decisions[1]
@@ -1093,8 +1093,8 @@ func stateConsistent(ctx *harness.Ctx, p statePair, when string) {
 	}
 }
 
-// stateLand is another replica's publish of s, landing once between two of the learner's commands.
-func stateLand(ctx *harness.Ctx, s Snapshot) func() any {
+// hStateLand is another replica's publish of s, landing once between two of the learner's commands.
+func hStateLand(ctx *harness.Ctx, s Snapshot) func() any {
 	landed := false
 	return func() any {
 		if landed {
@@ -1109,60 +1109,60 @@ func stateLand(ctx *harness.Ctx, s Snapshot) func() any {
 }
 
 func CheckOneSnapshot(ctx *harness.Ctx) {
-	ctx.Equal(statePublish(ctx, stateSnap(1, 0, "checkout", "payments")), true, "the first snapshot must be applied; applied")
+	ctx.Equal(hStatePublish(ctx, hStateSnap(1, 0, "checkout", "payments")), true, "the first snapshot must be applied; applied")
 	// A request lands while version 2 is being written: it must see one whole rule set.
-	var seen []statePair
+	var seen []HStatePair
 	for _, key := range []string{"flags:rule:checkout", "flags:snapshot"} {
 		ctx.Redis.After(key, func() any {
-			seen = append(seen, stateRead())
+			seen = append(seen, hStateRead())
 			return nil
 		})
 	}
-	ctx.Equal(statePublish(ctx, stateSnap(2, 100, "checkout", "payments")), true, "version 2 over version 1 must be applied; applied")
+	ctx.Equal(hStatePublish(ctx, hStateSnap(2, 100, "checkout", "payments")), true, "version 2 over version 1 must be applied; applied")
 	for _, p := range seen {
-		stateConsistent(ctx, p, "during the publish of version 2")
+		hStateConsistent(ctx, p, "during the publish of version 2")
 	}
-	after := stateRead()
-	stateConsistent(ctx, after, "after the publish")
+	after := hStateRead()
+	hStateConsistent(ctx, after, "after the publish")
 	ctx.Equal(after.decisions[0].Version, int64(2), "after publishing version 2, the version evaluate answers")
-	ctx.Equal(statePublish(ctx, stateSnap(3, 100, "checkout")), true, "version 3 must be applied; applied")
-	stale := stateEval(ctx, "payments", stateUser)
+	ctx.Equal(hStatePublish(ctx, hStateSnap(3, 100, "checkout")), true, "version 3 must be applied; applied")
+	stale := hStateEval(ctx, "payments", hStateUser)
 	ctx.Assert(stale == nil, "payments is not in version 3, yet it still evaluates to %+v: per-flag keys outlive the snapshot that dropped them", stale)
-	s, err := readSnapshot(stateBg)
+	s, err := readSnapshot(hStateBg)
 	ctx.NoError(err, "readSnapshot failed")
 	ctx.Assert(s != nil && s.Version == 3 && len(s.Flags) == 1, "readSnapshot gives %+v, expected version 3 with checkout only", s)
 	stored, _ := ctx.Redis.Get("flags:snapshot:version")
 	ctx.Equal(stored, "3", "after version 3, flags:snapshot:version must hold the version beside the snapshot; the value")
 	// Version 4 lands while evaluate reads: the decision and its version must come from one read.
-	write := stateLand(ctx, stateSnap(4, 0, "checkout"))
+	write := hStateLand(ctx, hStateSnap(4, 0, "checkout"))
 	readSnap, readVersion := ctx.Redis.After("flags:snapshot", write), ctx.Redis.After("flags:snapshot:version", write)
-	d := stateEval(ctx, "checkout", stateUser)
+	d := hStateEval(ctx, "checkout", hStateUser)
 	ctx.Assert(readSnap.Fired || readVersion.Fired, "evaluate read nothing under flags:snapshot")
 	ctx.Assert(d != nil && d.Value == (d.Version == 3), "version 4 (rollout 0) landed while evaluate was reading version 3 (rollout 100), and evaluate answered %+v: the decision and its version came from two reads. Read the snapshot once", d)
 }
 
 func CheckNewerOnly(ctx *harness.Ctx) {
-	ctx.Equal(statePublish(ctx, stateSnap(2, 100, "checkout", "payments")), true, "the first snapshot must be applied; applied")
-	late := statePublish(ctx, stateSnap(1, 0, "checkout", "payments"))
+	ctx.Equal(hStatePublish(ctx, hStateSnap(2, 100, "checkout", "payments")), true, "the first snapshot must be applied; applied")
+	late := hStatePublish(ctx, hStateSnap(1, 0, "checkout", "payments"))
 	ctx.Equal(late, false, "a publisher that was slow applied version 1 over version 2: the rollout went back. Only a newer version may replace the snapshot; applied")
-	s, err := readSnapshot(stateBg)
+	s, err := readSnapshot(hStateBg)
 	ctx.NoError(err, "readSnapshot failed")
 	ctx.Assert(s != nil && s.Version == 2, "after the late version 1 the snapshot is %+v, expected version 2", s)
-	d := stateEval(ctx, "checkout", stateUser)
+	d := hStateEval(ctx, "checkout", hStateUser)
 	ctx.Assert(d != nil && d.Version == 2 && d.Value, "after the late version 1 evaluate answers %+v, expected version 2 in the rollout", d)
-	ctx.Equal(statePublish(ctx, stateSnap(3, 0, "checkout", "payments")), true, "a newer version (3) must be applied; applied")
-	ctx.Equal(stateEval(ctx, "checkout", stateUser).Version, int64(3), "after version 3, the version evaluate answers")
-	again := statePublish(ctx, stateSnap(3, 100, "checkout"))
-	s, err = readSnapshot(stateBg)
+	ctx.Equal(hStatePublish(ctx, hStateSnap(3, 0, "checkout", "payments")), true, "a newer version (3) must be applied; applied")
+	ctx.Equal(hStateEval(ctx, "checkout", hStateUser).Version, int64(3), "after version 3, the version evaluate answers")
+	again := hStatePublish(ctx, hStateSnap(3, 100, "checkout"))
+	s, err = readSnapshot(hStateBg)
 	ctx.NoError(err, "readSnapshot failed")
 	ctx.Assert(!again && s != nil && s.Version == 3 && len(s.Flags) == 2, "a second publish of version 3 answered %t and left %+v: only a newer version may replace the snapshot, an equal one may not", again, s)
-	ctx.Equal(statePublish(ctx, stateSnap(10, 100, "checkout")), true, "version 10 over version 3 was refused: versions compare as numbers, not as text; applied")
-	ctx.Equal(statePublish(ctx, stateSnap(9, 0, "checkout")), false, "version 9 replaced version 10: versions compare as numbers, not as text; applied")
+	ctx.Equal(hStatePublish(ctx, hStateSnap(10, 100, "checkout")), true, "version 10 over version 3 was refused: versions compare as numbers, not as text; applied")
+	ctx.Equal(hStatePublish(ctx, hStateSnap(9, 0, "checkout")), false, "version 9 replaced version 10: versions compare as numbers, not as text; applied")
 	// Another replica publishes version 12 between two of this publisher's commands.
-	probe := ctx.Redis.After("flags:snapshot:version", stateLand(ctx, stateSnap(12, 100, "checkout")))
-	statePublish(ctx, stateSnap(11, 0, "checkout"))
+	probe := ctx.Redis.After("flags:snapshot:version", hStateLand(ctx, hStateSnap(12, 100, "checkout")))
+	hStatePublish(ctx, hStateSnap(11, 0, "checkout"))
 	ctx.Assert(probe.Fired, "publishing version 11 never touched flags:snapshot:version")
-	s, err = readSnapshot(stateBg)
+	s, err = readSnapshot(hStateBg)
 	ctx.NoError(err, "readSnapshot failed")
 	ctx.Assert(s != nil && s.Version == 12 && s.Flags["checkout"].Rollout == 100, "version 12 landed while version 11 was being published, and the snapshot is now %+v: version 11 overwrote a newer one because the compare and the write were separate round trips. Compare and replace in one script", s)
 }
@@ -1195,10 +1195,10 @@ func CheckBucketPerFlag(ctx *harness.Ctx) {
 	}
 	want := int(hashing.Fnv1a32("2026.checkout.u-7") % 100)
 	ctx.Equal(bucket("checkout", "u-7", "2026"), want, "bucket(checkout, u-7, 2026) must be Fnv1a32(\\"2026.checkout.u-7\\") %% 100")
-	statePublish(ctx, stateSnap(1, 50, "checkout", "payments"))
+	hStatePublish(ctx, hStateSnap(1, 50, "checkout", "payments"))
 	for i := 0; i < 40; i++ {
 		user := fmt.Sprintf("u-%d", i)
-		d := stateEval(ctx, "checkout", map[string]string{"user_id": user})
+		d := hStateEval(ctx, "checkout", map[string]string{"user_id": user})
 		b := bucket("checkout", user, "2026")
 		ctx.Assert(d != nil && d.Bucket == b && d.Value == (b < 50), "evaluate(checkout, %s) answered %+v, but the user's bucket is %d at a 50%% rollout", user, d, b)
 	}
@@ -1220,31 +1220,31 @@ func CheckBucketPerFlag(ctx *harness.Ctx) {
 
 namespace {
 
-const std::map<std::string, std::string> kStateUser = {{"user_id", "u-7"}, {"country", "US"}};
+const std::map<std::string, std::string> kHStateUser = {{"user_id", "u-7"}, {"country", "US"}};
 
-nlohmann::json stateSnap(long long version, int rollout, const std::vector<std::string>& keys) {
+nlohmann::json hStateSnap(long long version, int rollout, const std::vector<std::string>& keys) {
   nlohmann::json flags = nlohmann::json::object();
   for (const auto& k : keys) flags[k] = {{"default", false}, {"rules", nlohmann::json::array()}, {"rollout", rollout}, {"salt", "2026"}, {"killed", false}};
   return {{"version", version}, {"flags", flags}};
 }
 
-struct StatePair {
+struct HStatePair {
   std::vector<std::optional<nlohmann::json>> decisions;
   std::string error;
 };
 
-StatePair stateRead() {
-  StatePair out;
+HStatePair hStateRead() {
+  HStatePair out;
   try {
-    out.decisions.push_back(evaluate("checkout", kStateUser));
-    out.decisions.push_back(evaluate("payments", kStateUser));
+    out.decisions.push_back(evaluate("checkout", kHStateUser));
+    out.decisions.push_back(evaluate("payments", kHStateUser));
   } catch (const std::exception& e) {
     out.error = e.what();
   }
   return out;
 }
 
-void stateConsistent(harness::Ctx& ctx, const StatePair& p, const std::string& when) {
+void hStateConsistent(harness::Ctx& ctx, const HStatePair& p, const std::string& when) {
   ctx.Assert(p.error.empty(), "a read %s threw: %s", when, p.error);
   ctx.Assert(p.decisions.size() == 2 && p.decisions[0] && p.decisions[1], "a read %s found no flag", when);
   const long long a = p.decisions[0]->value("version", 0LL);
@@ -1256,7 +1256,7 @@ void stateConsistent(harness::Ctx& ctx, const StatePair& p, const std::string& w
 }
 
 // Another replica's publish of snapshot, landing once between two of the learner's commands.
-std::function<void()> stateLand(harness::Ctx& ctx, const nlohmann::json& snapshot, std::shared_ptr<bool> landed) {
+std::function<void()> hStateLand(harness::Ctx& ctx, const nlohmann::json& snapshot, std::shared_ptr<bool> landed) {
   return [&ctx, snapshot, landed] {
     if (*landed) return;
     *landed = true;
@@ -1268,53 +1268,53 @@ std::function<void()> stateLand(harness::Ctx& ctx, const nlohmann::json& snapsho
 }  // namespace
 
 void CheckOneSnapshot(harness::Ctx& ctx) {
-  ctx.Equal(publishSnapshot(stateSnap(1, 0, {"checkout", "payments"})), true, "the first snapshot must be applied; applied");
+  ctx.Equal(publishSnapshot(hStateSnap(1, 0, {"checkout", "payments"})), true, "the first snapshot must be applied; applied");
   // A request lands while version 2 is being written: it must see one whole rule set.
-  auto seen = std::make_shared<std::vector<StatePair>>();
-  for (const std::string key : {"flags:rule:checkout", "flags:snapshot"}) ctx.Redis.After(key, [seen] { seen->push_back(stateRead()); });
-  ctx.Equal(publishSnapshot(stateSnap(2, 100, {"checkout", "payments"})), true, "version 2 over version 1 must be applied; applied");
-  for (const auto& p : *seen) stateConsistent(ctx, p, "during the publish of version 2");
-  const StatePair after = stateRead();
-  stateConsistent(ctx, after, "after the publish");
+  auto seen = std::make_shared<std::vector<HStatePair>>();
+  for (const std::string key : {"flags:rule:checkout", "flags:snapshot"}) ctx.Redis.After(key, [seen] { seen->push_back(hStateRead()); });
+  ctx.Equal(publishSnapshot(hStateSnap(2, 100, {"checkout", "payments"})), true, "version 2 over version 1 must be applied; applied");
+  for (const auto& p : *seen) hStateConsistent(ctx, p, "during the publish of version 2");
+  const HStatePair after = hStateRead();
+  hStateConsistent(ctx, after, "after the publish");
   ctx.Equal(after.decisions[0]->value("version", 0LL), 2LL, "after publishing version 2, the version evaluate answers");
-  ctx.Equal(publishSnapshot(stateSnap(3, 100, {"checkout"})), true, "version 3 must be applied; applied");
-  const auto stale = evaluate("payments", kStateUser);
+  ctx.Equal(publishSnapshot(hStateSnap(3, 100, {"checkout"})), true, "version 3 must be applied; applied");
+  const auto stale = evaluate("payments", kHStateUser);
   ctx.Assert(!stale, "payments is not in version 3, yet it still evaluates to %s: per-flag keys outlive the snapshot that dropped them", stale ? stale->dump() : "");
   const auto s = readSnapshot();
-  ctx.Assert(s && *s == stateSnap(3, 100, {"checkout"}), "readSnapshot gives %s, expected version 3 exactly", s ? s->dump() : "nothing");
+  ctx.Assert(s && *s == hStateSnap(3, 100, {"checkout"}), "readSnapshot gives %s, expected version 3 exactly", s ? s->dump() : "nothing");
   ctx.Equal(ctx.Redis.Get("flags:snapshot:version").value_or(""), std::string("3"), "after version 3, flags:snapshot:version must hold the version beside the snapshot; the value");
   // Version 4 lands while evaluate reads: the decision and its version must come from one read.
   auto landed = std::make_shared<bool>(false);
-  const auto write = stateLand(ctx, stateSnap(4, 0, {"checkout"}), landed);
+  const auto write = hStateLand(ctx, hStateSnap(4, 0, {"checkout"}), landed);
   ctx.Redis.After("flags:snapshot", write);
   ctx.Redis.After("flags:snapshot:version", write);
-  const auto d = evaluate("checkout", kStateUser);
+  const auto d = evaluate("checkout", kHStateUser);
   ctx.Assert(*landed, "evaluate read nothing under flags:snapshot");
   ctx.Assert(d && d->value("value", false) == (d->value("version", 0LL) == 3), "version 4 (rollout 0) landed while evaluate was reading version 3 (rollout 100), and evaluate answered %s: the decision and its version came from two reads. Read the snapshot once", d ? d->dump() : "nothing");
 }
 
 void CheckNewerOnly(harness::Ctx& ctx) {
-  ctx.Equal(publishSnapshot(stateSnap(2, 100, {"checkout", "payments"})), true, "the first snapshot must be applied; applied");
-  const bool late = publishSnapshot(stateSnap(1, 0, {"checkout", "payments"}));
+  ctx.Equal(publishSnapshot(hStateSnap(2, 100, {"checkout", "payments"})), true, "the first snapshot must be applied; applied");
+  const bool late = publishSnapshot(hStateSnap(1, 0, {"checkout", "payments"}));
   ctx.Equal(late, false, "a publisher that was slow applied version 1 over version 2: the rollout went back. Only a newer version may replace the snapshot; applied");
   const auto s = readSnapshot();
-  ctx.Assert(s && *s == stateSnap(2, 100, {"checkout", "payments"}), "after the late version 1 the snapshot is %s, expected version 2", s ? s->dump() : "nothing");
-  const auto d = evaluate("checkout", kStateUser);
+  ctx.Assert(s && *s == hStateSnap(2, 100, {"checkout", "payments"}), "after the late version 1 the snapshot is %s, expected version 2", s ? s->dump() : "nothing");
+  const auto d = evaluate("checkout", kHStateUser);
   ctx.Assert(d && d->value("version", 0LL) == 2 && d->value("value", false), "after the late version 1 evaluate answers %s, expected version 2 in the rollout", d ? d->dump() : "nothing");
-  ctx.Equal(publishSnapshot(stateSnap(3, 0, {"checkout", "payments"})), true, "a newer version (3) must be applied; applied");
-  ctx.Equal(evaluate("checkout", kStateUser)->value("version", 0LL), 3LL, "after version 3, the version evaluate answers");
-  const bool again = publishSnapshot(stateSnap(3, 100, {"checkout"}));
+  ctx.Equal(publishSnapshot(hStateSnap(3, 0, {"checkout", "payments"})), true, "a newer version (3) must be applied; applied");
+  ctx.Equal(evaluate("checkout", kHStateUser)->value("version", 0LL), 3LL, "after version 3, the version evaluate answers");
+  const bool again = publishSnapshot(hStateSnap(3, 100, {"checkout"}));
   const auto kept = readSnapshot();
-  ctx.Assert(!again && kept && *kept == stateSnap(3, 0, {"checkout", "payments"}), "a second publish of version 3 answered %t and left %s: only a newer version may replace the snapshot, an equal one may not", again, kept ? kept->dump() : "nothing");
-  ctx.Equal(publishSnapshot(stateSnap(10, 100, {"checkout"})), true, "version 10 over version 3 was refused: versions compare as numbers, not as text; applied");
-  ctx.Equal(publishSnapshot(stateSnap(9, 0, {"checkout"})), false, "version 9 replaced version 10: versions compare as numbers, not as text; applied");
+  ctx.Assert(!again && kept && *kept == hStateSnap(3, 0, {"checkout", "payments"}), "a second publish of version 3 answered %t and left %s: only a newer version may replace the snapshot, an equal one may not", again, kept ? kept->dump() : "nothing");
+  ctx.Equal(publishSnapshot(hStateSnap(10, 100, {"checkout"})), true, "version 10 over version 3 was refused: versions compare as numbers, not as text; applied");
+  ctx.Equal(publishSnapshot(hStateSnap(9, 0, {"checkout"})), false, "version 9 replaced version 10: versions compare as numbers, not as text; applied");
   // Another replica publishes version 12 between two of this publisher's commands.
   auto landed = std::make_shared<bool>(false);
-  ctx.Redis.After("flags:snapshot:version", stateLand(ctx, stateSnap(12, 100, {"checkout"}), landed));
-  publishSnapshot(stateSnap(11, 0, {"checkout"}));
+  ctx.Redis.After("flags:snapshot:version", hStateLand(ctx, hStateSnap(12, 100, {"checkout"}), landed));
+  publishSnapshot(hStateSnap(11, 0, {"checkout"}));
   ctx.Assert(*landed, "publishing version 11 never touched flags:snapshot:version");
   const auto now = readSnapshot();
-  ctx.Assert(now && *now == stateSnap(12, 100, {"checkout"}), "version 12 landed while version 11 was being published, and the snapshot is now %s: version 11 overwrote a newer one because the compare and the write were separate round trips. Compare and replace in one script", now ? now->dump() : "nothing");
+  ctx.Assert(now && *now == hStateSnap(12, 100, {"checkout"}), "version 12 landed while version 11 was being published, and the snapshot is now %s: version 11 overwrote a newer one because the compare and the write were separate round trips. Compare and replace in one script", now ? now->dump() : "nothing");
 }
 
 void CheckBucketPerFlag(harness::Ctx& ctx) {
@@ -1335,7 +1335,7 @@ void CheckBucketPerFlag(harness::Ctx& ctx) {
   }
   const int want = static_cast<int>(hashing::fnv1a32("2026.checkout.u-7") % 100);
   ctx.Equal(bucket("checkout", "u-7", "2026"), want, "bucket(checkout, u-7, 2026) must be fnv1a32(\\"2026.checkout.u-7\\") %% 100");
-  publishSnapshot(stateSnap(1, 50, {"checkout", "payments"}));
+  publishSnapshot(hStateSnap(1, 50, {"checkout", "payments"}));
   for (int i = 0; i < 40; i++) {
     const std::string user = "u-" + std::to_string(i);
     const auto d = evaluate("checkout", {{"user_id", user}});

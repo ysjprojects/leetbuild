@@ -582,31 +582,31 @@ import (
 
 const hTopic = "usage.rollup"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func payloadOf(ctx *harness.Ctx, value []byte) map[string]any {
+func hPayloadOf(ctx *harness.Ctx, value []byte) map[string]any {
 	var p map[string]any
 	ctx.Assert(json.Unmarshal(value, &p) == nil, "the record's value is not JSON: %s", value)
 	return p
 }
 
-func mustReport(ctx *harness.Ctx, requestID string, units int64, gateway string) ledger.Applied {
-	applied, err := reportUsage(eventsBg, "acct_1", requestID, "/v1/generate", units, gateway)
+func hMustReport(ctx *harness.Ctx, requestID string, units int64, gateway string) ledger.Applied {
+	applied, err := reportUsage(hEventsBg, "acct_1", requestID, "/v1/generate", units, gateway)
 	ctx.NoError(err, "reportUsage(acct_1, %s) failed", requestID)
 	return applied
 }
 
 func CheckTopic(ctx *harness.Ctx) {
-	mustReport(ctx, "req_1", 1200, "gw-eu-1")
+	hMustReport(ctx, "req_1", 1200, "gw-eu-1")
 	records := ctx.Kafka.Records(hTopic)
 	ctx.Equal(len(records), 1, "one counted report; the records on %s", hTopic)
-	event := payloadOf(ctx, records[0].Value)
+	event := hPayloadOf(ctx, records[0].Value)
 	ctx.Assert(event["account"] == "acct_1" && event["units"] == float64(1200), "the event must name the account and its 1200 units, got %v", event)
 }
 
 func CheckAccountKey(ctx *harness.Ctx) {
-	mustReport(ctx, "req_1", 1200, "gw-eu-1")
-	mustReport(ctx, "req_2", 300, "gw-us-2")
+	hMustReport(ctx, "req_1", 1200, "gw-eu-1")
+	hMustReport(ctx, "req_2", 300, "gw-us-2")
 	records := ctx.Kafka.Records(hTopic)
 	ctx.Equal(ctx.Kafka.Keys(hTopic), []string{"acct_1", "acct_1"}, "two reports of acct_1 through two gateways must be keyed by the account (keyed by anything else, one account's hour scatters across partitions); the keys")
 	ctx.Assert(len(records) == 2 && records[0].Partition == records[1].Partition, "acct_1's events must stay on one partition, in order; they landed on %v", records)
@@ -616,27 +616,27 @@ func CheckAfterCommit(ctx *harness.Ctx) {
 	w := ledger.CurrentWindow()
 	// The moment the count commits, what is already on the topic.
 	atCommit := ctx.Redis.After(ledger.WindowKey("acct_1", w), func() any { return len(ctx.Kafka.Records(hTopic)) })
-	mustReport(ctx, "req_1", 1200, "gw-eu-1")
+	hMustReport(ctx, "req_1", 1200, "gw-eu-1")
 	ctx.Assert(atCommit.Fired, "reportUsage never counted the report in the window")
 	ctx.Equal(atCommit.Result, 0, "when the count ran the topic already held events: an event went out for usage the window had not counted. Count, then produce; events at the count")
-	mustReport(ctx, "req_1", 1200, "gw-us-2")
+	hMustReport(ctx, "req_1", 1200, "gw-us-2")
 	records := ctx.Kafka.Records(hTopic)
 	ctx.Equal(len(records), 1, "one request id reported twice: a retry ApplyUsage did not count must publish nothing, or the rollup reads double; the events")
-	event := payloadOf(ctx, records[0].Value)
+	event := hPayloadOf(ctx, records[0].Value)
 	ctx.Assert(event["window"] == float64(w) && event["total"] == float64(1200) && event["over"] == false, "the event must carry the window %d, the window total 1200 and over false from the count, got %v", w, event)
 	// Two more reports on a 1500-unit plan: one lands exactly on the cap, one goes past it.
-	ledger.SetPlanCap(eventsBg, "acct_1", 1500)
-	mustReport(ctx, "req_2", 300, "gw-us-2")
-	mustReport(ctx, "req_3", 100, "gw-us-2")
+	ledger.SetPlanCap(hEventsBg, "acct_1", 1500)
+	hMustReport(ctx, "req_2", 300, "gw-us-2")
+	hMustReport(ctx, "req_3", 100, "gw-us-2")
 	all := ctx.Kafka.Records(hTopic)
 	ctx.Equal(len(all), 3, "three counted reports; the events")
-	atCap, past := payloadOf(ctx, all[1].Value), payloadOf(ctx, all[2].Value)
+	atCap, past := hPayloadOf(ctx, all[1].Value), hPayloadOf(ctx, all[2].Value)
 	ctx.Assert(atCap["units"] == float64(300) && atCap["total"] == float64(1500) && atCap["over"] == false, "a report of 300 that brings the window to exactly its 1500-unit cap must carry units 300, total 1500 and over false from the count, got %v", atCap)
 	ctx.Assert(past["units"] == float64(100) && past["total"] == float64(1600) && past["over"] == true, "a report of 100 that takes the window to 1600 of a 1500-unit plan must carry units 100, total 1600 and over true from the count, got %v", past)
 }
 
 func CheckAcksAll(ctx *harness.Ctx) {
-	mustReport(ctx, "req_1", 1200, "gw-eu-1")
+	hMustReport(ctx, "req_1", 1200, "gw-eu-1")
 	lost := ctx.Kafka.Failover(hTopic)
 	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 1, "a leader failover lost %d rollup event(s): with RequireOne the leader alone acknowledged it. Use RequireAll; the events", lost)
 }
@@ -655,7 +655,7 @@ namespace {
 
 const std::string kHTopic = "usage.rollup";
 
-json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
+json hPayloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   try {
     return json::parse(record.Value.value_or(""));
   } catch (const std::exception& e) {
@@ -669,7 +669,7 @@ void CheckTopic(harness::Ctx& ctx) {
   reportUsage("acct_1", "req_1", "/v1/generate", 1200, "gw-eu-1");
   const auto records = ctx.Kafka.Records(kHTopic);
   ctx.Equal(records.size(), 1, "one counted report; the records on %s", kHTopic);
-  const json event = payloadOf(ctx, records[0]);
+  const json event = hPayloadOf(ctx, records[0]);
   ctx.Assert(event.value("account", "") == "acct_1" && event.value("units", 0LL) == 1200, "the event must name the account and its 1200 units, got %s", event.dump());
 }
 
@@ -692,7 +692,7 @@ void CheckAfterCommit(harness::Ctx& ctx) {
   reportUsage("acct_1", "req_1", "/v1/generate", 1200, "gw-us-2");
   const auto records = ctx.Kafka.Records(kHTopic);
   ctx.Equal(records.size(), 1, "one request id reported twice: a retry applyUsage did not count must publish nothing, or the rollup reads double; the events");
-  const json event = payloadOf(ctx, records[0]);
+  const json event = hPayloadOf(ctx, records[0]);
   ctx.Assert(event.value("window", 0LL) == w && event.value("total", 0LL) == 1200 && event.contains("over") && event["over"] == false,
              "the event must carry the window %d, the window total 1200 and over false from the count, got %s", w, event.dump());
   // Two more reports on a 1500-unit plan: one lands exactly on the cap, one goes past it.
@@ -701,8 +701,8 @@ void CheckAfterCommit(harness::Ctx& ctx) {
   reportUsage("acct_1", "req_3", "/v1/generate", 100, "gw-us-2");
   const auto all = ctx.Kafka.Records(kHTopic);
   ctx.Equal(all.size(), 3, "three counted reports; the events");
-  const json atCap = payloadOf(ctx, all[1]);
-  const json past = payloadOf(ctx, all[2]);
+  const json atCap = hPayloadOf(ctx, all[1]);
+  const json past = hPayloadOf(ctx, all[2]);
   ctx.Assert(atCap.value("units", 0LL) == 300 && atCap.value("total", 0LL) == 1500 && atCap.contains("over") && atCap["over"] == false,
              "a report of 300 that brings the window to exactly its 1500-unit cap must carry units 300, total 1500 and over false from the count, got %s", atCap.dump());
   ctx.Assert(past.value("units", 0LL) == 100 && past.value("total", 0LL) == 1600 && past.contains("over") && past["over"] == true,

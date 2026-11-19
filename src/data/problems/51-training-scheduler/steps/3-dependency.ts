@@ -706,25 +706,25 @@ import (
 	"leetbuild/harness"
 )
 
-var preemptBg = context.Background()
+var hPreemptBg = context.Background()
 
 // workerPeer is a worker agent: the jobs in running write a checkpoint when asked, except those in noCheckpoint.
-type workerPeer struct {
+type HWorkerPeer struct {
 	pb.UnimplementedWorkerServer
 	h            *harness.Ctx
 	running      map[string]bool
 	noCheckpoint map[string]bool
 	saved        int
-	atTerminate  map[string]terminateSeen
+	atTerminate  map[string]HTerminateSeen
 }
 
 // terminateSeen is the run row's checkpoint, and whether the run waited in training:queue, when Terminate arrived.
-type terminateSeen struct {
+type HTerminateSeen struct {
 	checkpoint string
 	queued     bool
 }
 
-func (w *workerPeer) Checkpoint(_ context.Context, req *pb.CheckpointRequest) (*pb.CheckpointReply, error) {
+func (w *HWorkerPeer) Checkpoint(_ context.Context, req *pb.CheckpointRequest) (*pb.CheckpointReply, error) {
 	if !w.running[req.GetRunId()] {
 		return nil, status.Errorf(codes.NotFound, "run %s is not running: there is nothing left to checkpoint", req.GetRunId())
 	}
@@ -735,9 +735,9 @@ func (w *workerPeer) Checkpoint(_ context.Context, req *pb.CheckpointRequest) (*
 	return &pb.CheckpointReply{Supported: true, CheckpointId: fmt.Sprintf("ckpt-%s-%d", req.GetRunId(), w.saved)}, nil
 }
 
-func (w *workerPeer) Terminate(_ context.Context, req *pb.TerminateRequest) (*pb.TerminateReply, error) {
-	seen := terminateSeen{}
-	if run := runs.Get(preemptBg, req.GetRunId()); run != nil {
+func (w *HWorkerPeer) Terminate(_ context.Context, req *pb.TerminateRequest) (*pb.TerminateReply, error) {
+	seen := HTerminateSeen{}
+	if run := runs.Get(hPreemptBg, req.GetRunId()); run != nil {
 		seen.checkpoint = run.CheckpointID
 	}
 	_, seen.queued = w.h.Redis.ZScore("training:queue", req.GetRunId())
@@ -746,37 +746,37 @@ func (w *workerPeer) Terminate(_ context.Context, req *pb.TerminateRequest) (*pb
 	return &pb.TerminateReply{}, nil
 }
 
-func hSetup(ctx *harness.Ctx) *workerPeer {
-	w := &workerPeer{h: ctx, running: map[string]bool{}, noCheckpoint: map[string]bool{}, atTerminate: map[string]terminateSeen{}}
+func hSetup(ctx *harness.Ctx) *HWorkerPeer {
+	w := &HWorkerPeer{h: ctx, running: map[string]bool{}, noCheckpoint: map[string]bool{}, atTerminate: map[string]HTerminateSeen{}}
 	pb.RegisterWorkerServer(ctx.GRPC.Server(""), w)
 	return w
 }
 
-func runningRun(ctx *harness.Ctx, w *workerPeer, runID string, band int, at int64) {
-	ctx.NoError(runs.Put(preemptBg, &runs.Run{RunID: runID, Tenant: "t1", RecipeVersion: "llama-ft-v3", DatasetVersion: "ds-1", Priority: 8 - 3*band, Band: band,
+func hRunningRun(ctx *harness.Ctx, w *HWorkerPeer, runID string, band int, at int64) {
+	ctx.NoError(runs.Put(hPreemptBg, &runs.Run{RunID: runID, Tenant: "t1", RecipeVersion: "llama-ft-v3", DatasetVersion: "ds-1", Priority: 8 - 3*band, Band: band,
 		State: "running", EnqueuedAtMs: at, Worker: "w-1", Nodes: []string{"n1", "n2"}, CheckpointID: "ckpt-old"}), "runs.Put")
 	w.running[runID] = true
 }
 
-func mustPreempt(ctx *harness.Ctx, runID string) bool {
-	ok, err := preempt(preemptBg, runID)
+func hMustPreempt(ctx *harness.Ctx, runID string) bool {
+	ok, err := preempt(hPreemptBg, runID)
 	ctx.NoError(err, "preempt(%s)", runID)
 	return ok
 }
 
-func methodName(c harness.Call) string { return c.Method[strings.LastIndex(c.Method, "/")+1:] }
+func hMethodName(c harness.Call) string { return c.Method[strings.LastIndex(c.Method, "/")+1:] }
 
-func workerMethods(ctx *harness.Ctx) []string {
+func hWorkerMethods(ctx *harness.Ctx) []string {
 	out := []string{}
 	for _, c := range ctx.GRPC.Calls() {
-		if name := methodName(c); name == "Checkpoint" || name == "Terminate" {
+		if name := hMethodName(c); name == "Checkpoint" || name == "Terminate" {
 			out = append(out, name)
 		}
 	}
 	return out
 }
 
-func terminateReasons(ctx *harness.Ctx) []string {
+func hTerminateReasons(ctx *harness.Ctx) []string {
 	out := []string{}
 	for _, c := range ctx.GRPC.CallsTo("Terminate", "") {
 		out = append(out, c.Request.(*pb.TerminateRequest).GetReason())
@@ -786,11 +786,11 @@ func terminateReasons(ctx *harness.Ctx) []string {
 
 func CheckCheckpointFirst(ctx *harness.Ctx) {
 	w := hSetup(ctx)
-	runningRun(ctx, w, "run-a", 1, ctx.Clock.Now())
-	ctx.Equal(mustPreempt(ctx, "run-a"), true, "a job that checkpointed must be preempted")
-	ctx.Equal(workerMethods(ctx), []string{"Checkpoint", "Terminate"}, "ask for the checkpoint, wait for its id, then terminate; the worker's calls")
-	ctx.Equal(runs.Get(preemptBg, "run-a").CheckpointID, "ckpt-run-a-1", "the run row's checkpoint (the worker answered ckpt-run-a-1)")
-	ctx.Equal(terminateReasons(ctx), []string{"preempted"}, "the Terminate reasons")
+	hRunningRun(ctx, w, "run-a", 1, ctx.Clock.Now())
+	ctx.Equal(hMustPreempt(ctx, "run-a"), true, "a job that checkpointed must be preempted")
+	ctx.Equal(hWorkerMethods(ctx), []string{"Checkpoint", "Terminate"}, "ask for the checkpoint, wait for its id, then terminate; the worker's calls")
+	ctx.Equal(runs.Get(hPreemptBg, "run-a").CheckpointID, "ckpt-run-a-1", "the run row's checkpoint (the worker answered ckpt-run-a-1)")
+	ctx.Equal(hTerminateReasons(ctx), []string{"preempted"}, "the Terminate reasons")
 	ctx.Equal(ctx.GRPC.CallsTo("Checkpoint", "")[0].Request.(*pb.CheckpointRequest).GetGraceS(), int32(30), "the job is told how long it has; the CheckpointRequest's grace_s")
 	ctx.Equal(w.atTerminate["run-a"].checkpoint, "ckpt-run-a-1", "record the checkpoint before the process is stopped; the run row's checkpoint when Terminate reached the worker")
 }
@@ -798,23 +798,23 @@ func CheckCheckpointFirst(ctx *harness.Ctx) {
 func CheckGraceDeadline(ctx *harness.Ctx) {
 	w := hSetup(ctx)
 	t0 := ctx.Clock.Now()
-	runningRun(ctx, w, "run-a", 1, t0)
+	hRunningRun(ctx, w, "run-a", 1, t0)
 	ctx.GRPC.SetLatency("Checkpoint", 120, "") // the job hangs while it writes its checkpoint
 	before := ctx.Clock.Now()
-	ctx.Equal(mustPreempt(ctx, "run-a"), true, "a job that ran out of grace must still be preempted")
+	ctx.Equal(hMustPreempt(ctx, "run-a"), true, "a job that ran out of grace must still be preempted")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	calls := ctx.GRPC.CallsTo("Checkpoint", "")
 	ctx.Assert(len(calls) == 1 && calls[0].HasDeadline() && calls[0].Timeout >= 29*time.Second && calls[0].Timeout <= 31*time.Second, "the Checkpoint call must carry a deadline of GRACE_S = 30 s")
 	ctx.Assert(waited <= 31, "preempt waited %.0f s for a job that never finished its checkpoint: wait GRACE_S at most", waited)
-	ctx.Equal(terminateReasons(ctx), []string{"grace_deadline_exceeded"}, "the Terminate reasons")
-	ctx.Equal(runs.Get(preemptBg, "run-a").CheckpointID, "ckpt-old", "the run resumes from the checkpoint it had; its checkpoint")
+	ctx.Equal(hTerminateReasons(ctx), []string{"grace_deadline_exceeded"}, "the Terminate reasons")
+	ctx.Equal(runs.Get(hPreemptBg, "run-a").CheckpointID, "ckpt-old", "the run resumes from the checkpoint it had; its checkpoint")
 	score, queued := ctx.Redis.ZScore("training:queue", "run-a")
 	ctx.Assert(queued && int64(score) == queue.PositionScore(1, t0), "run-a, preempted on the deadline path, waits with score %.0f (queued %t), expected its own position %d", score, queued, queue.PositionScore(1, t0))
 	// Any other failure of Checkpoint is not a grace that ran out: nothing is terminated.
 	ctx.GRPC.SetLatency("Checkpoint", 0, "")
-	runningRun(ctx, w, "run-b", 1, t0+1)
+	hRunningRun(ctx, w, "run-b", 1, t0+1)
 	ctx.GRPC.Fail("Checkpoint", codes.Unavailable, "the worker agent is restarting", 1, "")
-	preempt(preemptBg, "run-b") // an error is one way to report it; terminating is not
+	preempt(hPreemptBg, "run-b") // an error is one way to report it; terminating is not
 	_, stopped := w.atTerminate["run-b"]
 	ctx.Assert(!stopped && w.running["run-b"], "a Checkpoint that failed with UNAVAILABLE terminated run-b without a checkpoint: only DEADLINE_EXCEEDED stops the job anyway")
 	_, requeued := ctx.Redis.ZScore("training:queue", "run-b")
@@ -823,29 +823,29 @@ func CheckGraceDeadline(ctx *harness.Ctx) {
 
 func CheckNoCheckpointSupport(ctx *harness.Ctx) {
 	w := hSetup(ctx)
-	runningRun(ctx, w, "run-a", 1, ctx.Clock.Now())
+	hRunningRun(ctx, w, "run-a", 1, ctx.Clock.Now())
 	w.noCheckpoint["run-a"] = true
-	ctx.Equal(mustPreempt(ctx, "run-a"), false, "preempt's result for a job that cannot checkpoint")
+	ctx.Equal(hMustPreempt(ctx, "run-a"), false, "preempt's result for a job that cannot checkpoint")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Terminate", "")), 0, "a job that cannot checkpoint must not be terminated (its training since the start would be lost); the Terminate calls")
 	ctx.Assert(w.running["run-a"], "the job is no longer running on the worker")
-	ctx.Equal(runs.Get(preemptBg, "run-a").State, "running", "the run row's state")
+	ctx.Equal(runs.Get(hPreemptBg, "run-a").State, "running", "the run row's state")
 	_, queued := ctx.Redis.ZScore("training:queue", "run-a")
 	ctx.Assert(!queued, "a run that keeps running must not also be queued")
-	ctx.Equal(runs.Get(preemptBg, "run-a").CheckpointID, "ckpt-old", "the job wrote no checkpoint, so the run keeps ckpt-old; its checkpoint")
+	ctx.Equal(runs.Get(hPreemptBg, "run-a").CheckpointID, "ckpt-old", "the job wrote no checkpoint, so the run keeps ckpt-old; its checkpoint")
 }
 
 func CheckRequeuePreempted(ctx *harness.Ctx) {
 	w := hSetup(ctx)
 	t0 := ctx.Clock.Now()
-	runningRun(ctx, w, "run-a", 1, t0)
-	ctx.NoError(runs.Put(preemptBg, &runs.Run{RunID: "run-b", Tenant: "t1", RecipeVersion: "llama-ft-v3", DatasetVersion: "ds-1", Priority: 5, Band: 1, State: "queued", EnqueuedAtMs: t0 + 5000}), "runs.Put")
-	ctx.NoError(queue.Enqueue(preemptBg, "run-b", 1, t0+5000), "queue.Enqueue")
-	ctx.Equal(mustPreempt(ctx, "run-a"), true, "a job that checkpointed must be preempted")
+	hRunningRun(ctx, w, "run-a", 1, t0)
+	ctx.NoError(runs.Put(hPreemptBg, &runs.Run{RunID: "run-b", Tenant: "t1", RecipeVersion: "llama-ft-v3", DatasetVersion: "ds-1", Priority: 5, Band: 1, State: "queued", EnqueuedAtMs: t0 + 5000}), "runs.Put")
+	ctx.NoError(queue.Enqueue(hPreemptBg, "run-b", 1, t0+5000), "queue.Enqueue")
+	ctx.Equal(hMustPreempt(ctx, "run-a"), true, "a job that checkpointed must be preempted")
 	score, queued := ctx.Redis.ZScore("training:queue", "run-a")
 	ctx.Assert(queued && int64(score) == queue.PositionScore(1, t0), "run-a waits with score %.0f (queued %t), expected its own position %d: a preempted run must not vanish or lose its place", score, queued, queue.PositionScore(1, t0))
-	ctx.Equal(runs.Get(preemptBg, "run-a").State, "queued", "the preempted run's state")
+	ctx.Equal(runs.Get(hPreemptBg, "run-a").State, "queued", "the preempted run's state")
 	ctx.Assert(!w.atTerminate["run-a"].queued, "run-a was already in training:queue when Terminate reached the worker: another worker could start it while the old process still trains. Queue it once it is stopped")
-	head, err := queue.ClaimNext(preemptBg, "w-2", t0+6000)
+	head, err := queue.ClaimNext(hPreemptBg, "w-2", t0+6000)
 	ctx.NoError(err, "queue.ClaimNext")
 	ctx.Equal(head, "run-a", "run-a was submitted before run-b and resumes first; the next claim")
 }
@@ -860,7 +860,7 @@ func CheckRequeuePreempted(ctx *harness.Ctx) {
 namespace {
 
 // A worker agent: the jobs in running write a checkpoint when asked, except those in no_checkpoint.
-class WorkerPeer final : public trainsched::Worker::Service {
+class HWorkerPeer final : public trainsched::Worker::Service {
  public:
   harness::Ctx* h = nullptr;
   std::set<std::string> running;
@@ -891,16 +891,16 @@ class WorkerPeer final : public trainsched::Worker::Service {
   }
 };
 
-WorkerPeer& hSetup(harness::Ctx& ctx) {
-  static WorkerPeer* peer = nullptr;
+HWorkerPeer& hSetup(harness::Ctx& ctx) {
+  static HWorkerPeer* peer = nullptr;
   delete peer;
-  peer = new WorkerPeer;
+  peer = new HWorkerPeer;
   peer->h = &ctx;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-void runningRun(WorkerPeer& w, const std::string& run_id, int band, long long at) {
+void hRunningRun(HWorkerPeer& w, const std::string& run_id, int band, long long at) {
   runs::Run run;
   run.run_id = run_id;
   run.tenant = "t1";
@@ -917,7 +917,7 @@ void runningRun(WorkerPeer& w, const std::string& run_id, int band, long long at
   w.running.insert(run_id);
 }
 
-bool mustPreempt(harness::Ctx& ctx, const std::string& run_id) {
+bool hMustPreempt(harness::Ctx& ctx, const std::string& run_id) {
   try {
     return preempt(run_id);
   } catch (const std::exception& e) {
@@ -926,18 +926,18 @@ bool mustPreempt(harness::Ctx& ctx, const std::string& run_id) {
   return false;
 }
 
-std::string methodName(const harness::Call& c) { return c.Method.substr(c.Method.rfind('/') + 1); }
+std::string hMethodName(const harness::Call& c) { return c.Method.substr(c.Method.rfind('/') + 1); }
 
-std::vector<std::string> workerMethods(harness::Ctx& ctx) {
+std::vector<std::string> hWorkerMethods(harness::Ctx& ctx) {
   std::vector<std::string> out;
   for (const auto& c : ctx.GRPC.Calls()) {
-    const std::string name = methodName(c);
+    const std::string name = hMethodName(c);
     if (name == "Checkpoint" || name == "Terminate") out.push_back(name);
   }
   return out;
 }
 
-std::vector<std::string> terminateReasons(harness::Ctx& ctx) {
+std::vector<std::string> hTerminateReasons(harness::Ctx& ctx) {
   std::vector<std::string> out;
   for (const auto& c : ctx.GRPC.CallsTo("Terminate")) out.push_back(c.Request<trainsched::TerminateRequest>().reason());
   return out;
@@ -947,11 +947,11 @@ std::vector<std::string> terminateReasons(harness::Ctx& ctx) {
 
 void CheckCheckpointFirst(harness::Ctx& ctx) {
   auto& w = hSetup(ctx);
-  runningRun(w, "run-a", 1, ctx.Clock.Now());
-  ctx.Equal(mustPreempt(ctx, "run-a"), true, "a job that checkpointed must be preempted");
-  ctx.Equal(workerMethods(ctx), {"Checkpoint", "Terminate"}, "ask for the checkpoint, wait for its id, then terminate; the worker's calls");
+  hRunningRun(w, "run-a", 1, ctx.Clock.Now());
+  ctx.Equal(hMustPreempt(ctx, "run-a"), true, "a job that checkpointed must be preempted");
+  ctx.Equal(hWorkerMethods(ctx), {"Checkpoint", "Terminate"}, "ask for the checkpoint, wait for its id, then terminate; the worker's calls");
   ctx.Equal(runs::get("run-a")->checkpoint_id, "ckpt-run-a-1", "the run row's checkpoint (the worker answered ckpt-run-a-1)");
-  ctx.Equal(terminateReasons(ctx), {"preempted"}, "the Terminate reasons");
+  ctx.Equal(hTerminateReasons(ctx), {"preempted"}, "the Terminate reasons");
   ctx.Equal(ctx.GRPC.CallsTo("Checkpoint")[0].Request<trainsched::CheckpointRequest>().grace_s(), 30, "the job is told how long it has; the CheckpointRequest's grace_s");
   ctx.Equal(w.at_terminate["run-a"].first, "ckpt-run-a-1", "record the checkpoint before the process is stopped; the run row's checkpoint when Terminate reached the worker");
 }
@@ -959,23 +959,23 @@ void CheckCheckpointFirst(harness::Ctx& ctx) {
 void CheckGraceDeadline(harness::Ctx& ctx) {
   auto& w = hSetup(ctx);
   const long long t0 = ctx.Clock.Now();
-  runningRun(w, "run-a", 1, t0);
+  hRunningRun(w, "run-a", 1, t0);
   ctx.GRPC.SetLatency("Checkpoint", 120);  // the job hangs while it writes its checkpoint
   const long long before = ctx.Clock.Now();
-  ctx.Equal(mustPreempt(ctx, "run-a"), true, "a job that ran out of grace must still be preempted");
+  ctx.Equal(hMustPreempt(ctx, "run-a"), true, "a job that ran out of grace must still be preempted");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   const auto calls = ctx.GRPC.CallsTo("Checkpoint");
   ctx.Assert(calls.size() == 1 && calls[0].HasDeadline() && calls[0].TimeoutSeconds() >= 29 && calls[0].TimeoutSeconds() <= 31,
              "the Checkpoint call must carry a deadline of GRACE_S = 30 s");
   ctx.Assert(waited <= 31, "preempt waited %.0f s for a job that never finished its checkpoint: wait GRACE_S at most", waited);
-  ctx.Equal(terminateReasons(ctx), {"grace_deadline_exceeded"}, "the Terminate reasons");
+  ctx.Equal(hTerminateReasons(ctx), {"grace_deadline_exceeded"}, "the Terminate reasons");
   ctx.Equal(runs::get("run-a")->checkpoint_id, "ckpt-old", "the run resumes from the checkpoint it had; its checkpoint");
   const auto score = ctx.Redis.ZScore("training:queue", "run-a");
   ctx.Assert(score && static_cast<long long>(*score) == queue::positionScore(1, t0),
              "run-a, preempted on the deadline path, waits with score %.0f, expected its own position %d", score.value_or(-1), queue::positionScore(1, t0));
   // Any other failure of Checkpoint is not a grace that ran out: nothing is terminated.
   ctx.GRPC.SetLatency("Checkpoint", 0);
-  runningRun(w, "run-b", 1, t0 + 1);
+  hRunningRun(w, "run-b", 1, t0 + 1);
   ctx.GRPC.Fail("Checkpoint", grpc::StatusCode::UNAVAILABLE, "the worker agent is restarting");
   try {
     preempt("run-b");
@@ -988,9 +988,9 @@ void CheckGraceDeadline(harness::Ctx& ctx) {
 
 void CheckNoCheckpointSupport(harness::Ctx& ctx) {
   auto& w = hSetup(ctx);
-  runningRun(w, "run-a", 1, ctx.Clock.Now());
+  hRunningRun(w, "run-a", 1, ctx.Clock.Now());
   w.no_checkpoint.insert("run-a");
-  ctx.Equal(mustPreempt(ctx, "run-a"), false, "preempt's result for a job that cannot checkpoint");
+  ctx.Equal(hMustPreempt(ctx, "run-a"), false, "preempt's result for a job that cannot checkpoint");
   ctx.Equal(ctx.GRPC.CallsTo("Terminate").size(), 0, "a job that cannot checkpoint must not be terminated (its training since the start would be lost); the Terminate calls");
   ctx.Assert(w.running.count("run-a") == 1, "the job is no longer running on the worker");
   ctx.Equal(runs::get("run-a")->state, "running", "the run row's state");
@@ -1001,7 +1001,7 @@ void CheckNoCheckpointSupport(harness::Ctx& ctx) {
 void CheckRequeuePreempted(harness::Ctx& ctx) {
   auto& w = hSetup(ctx);
   const long long t0 = ctx.Clock.Now();
-  runningRun(w, "run-a", 1, t0);
+  hRunningRun(w, "run-a", 1, t0);
   runs::Run b;
   b.run_id = "run-b";
   b.tenant = "t1";
@@ -1013,7 +1013,7 @@ void CheckRequeuePreempted(harness::Ctx& ctx) {
   b.enqueued_at_ms = t0 + 5000;
   runs::put(b);
   queue::enqueue("run-b", 1, t0 + 5000);
-  ctx.Equal(mustPreempt(ctx, "run-a"), true, "a job that checkpointed must be preempted");
+  ctx.Equal(hMustPreempt(ctx, "run-a"), true, "a job that checkpointed must be preempted");
   const auto score = ctx.Redis.ZScore("training:queue", "run-a");
   ctx.Assert(score && static_cast<long long>(*score) == queue::positionScore(1, t0),
              "run-a waits with score %.0f, expected its own position %d: a preempted run must not vanish or lose its place", score.value_or(-1), queue::positionScore(1, t0));

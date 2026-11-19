@@ -749,35 +749,35 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
 // exchangePeer bids 1200 micros for c-9 on every slot.
-type exchangePeer struct {
+type HExchangePeer struct {
 	pb.UnimplementedExchangeServer
 }
 
-func (exchangePeer) SelectAd(_ context.Context, _ *pb.SelectAdRequest) (*pb.Bid, error) {
+func (HExchangePeer) SelectAd(_ context.Context, _ *pb.SelectAdRequest) (*pb.Bid, error) {
 	return &pb.Bid{CampaignId: "c-9", CreativeId: "cr-c-9", PriceMicros: 1200}, nil
 }
 
 var (
-	clientBid  = store.Ad{CampaignID: "c-9", CreativeID: "cr-c-9", PriceMicros: 1200}
-	clientPaid = Selection{Ad: clientBid, Kind: "paid"}
+	hClientBid  = store.Ad{CampaignID: "c-9", CreativeID: "cr-c-9", PriceMicros: 1200}
+	hClientPaid = Selection{Ad: hClientBid, Kind: "paid"}
 )
 
-func clientPeer(ctx *harness.Ctx) {
-	pb.RegisterExchangeServer(ctx.GRPC.Server(""), exchangePeer{})
+func hClientPeer(ctx *harness.Ctx) {
+	pb.RegisterExchangeServer(ctx.GRPC.Server(""), HExchangePeer{})
 }
 
-func clientSelect(ctx *harness.Ctx, why string) Selection {
-	got, err := selectAd(clientBg, "home-top", "u-1")
+func hClientSelect(ctx *harness.Ctx, why string) Selection {
+	got, err := selectAd(hClientBg, "home-top", "u-1")
 	ctx.NoError(err, "%s: selectAd", why)
 	return got
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientPeer(ctx)
-	ctx.Equal(clientSelect(ctx, "with the exchange answering"), clientPaid, "with the exchange answering, selectAd must return the paid bid")
+	hClientPeer(ctx)
+	ctx.Equal(hClientSelect(ctx, "with the exchange answering"), hClientPaid, "with the exchange answering, selectAd must return the paid bid")
 	calls := ctx.GRPC.CallsTo("SelectAd", "")
 	ctx.Equal(len(calls), 1, "one serve's SelectAd calls")
 	ctx.Assert(calls[0].HasDeadline(), "SelectAd carries no deadline: a stalled exchange holds the page")
@@ -785,39 +785,39 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckOneCall(ctx *harness.Ctx) {
-	clientPeer(ctx)
+	hClientPeer(ctx)
 	ctx.GRPC.Fail("SelectAd", codes.Unavailable, "", 3, "")
-	selectAd(clientBg, "home-top", "u-1")
+	selectAd(hClientBg, "home-top", "u-1")
 	calls := len(ctx.GRPC.CallsTo("SelectAd", ""))
 	ctx.Equal(calls, 1, "with the exchange down one serve must make one SelectAd call, not pay for the outage on every try; the calls")
 	ctx.Equal(ctx.Clock.Sleeps(), 0, "selectAd must not sleep inside the request; the sleeps")
 	ctx.GRPC.ClearFailures()
 	ctx.GRPC.SetLatency("SelectAd", 5.0, "")
 	before := ctx.Clock.Now()
-	selectAd(clientBg, "home-top", "u-1")
+	selectAd(hClientBg, "home-top", "u-1")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 0.16, "with the exchange taking 5 s the serve waited %.2f s, expected one 150 ms deadline", waited)
 	ctx.Equal(len(ctx.GRPC.CallsTo("SelectAd", "")), 2, "a slow exchange gets one call per serve; the calls")
 }
 
 func CheckHouseFallback(ctx *harness.Ctx) {
-	clientPeer(ctx)
+	hClientPeer(ctx)
 	ctx.GRPC.SetLatency("SelectAd", 5.0, "")
 	want := Selection{Ad: store.HouseAd, Kind: "house", Fallback: true, FallbackReason: "deadline_exceeded"}
-	ctx.Equal(clientSelect(ctx, "with the exchange past its deadline"), want, "with the exchange past its deadline selectAd must return the marked house ad (an empty slot is revenue lost with nothing to count)")
+	ctx.Equal(hClientSelect(ctx, "with the exchange past its deadline"), want, "with the exchange past its deadline selectAd must return the marked house ad (an empty slot is revenue lost with nothing to count)")
 	ctx.GRPC.SetLatency("SelectAd", 0, "")
 	ctx.GRPC.Fail("SelectAd", codes.Unavailable, "", 1, "")
 	want.FallbackReason = "unavailable"
-	ctx.Equal(clientSelect(ctx, "with the exchange UNAVAILABLE"), want, "with the exchange UNAVAILABLE selectAd must return the house ad with fallback_reason unavailable")
-	ctx.Equal(clientSelect(ctx, "once the exchange answers again"), clientPaid, "once the exchange answers again selectAd must return the paid bid")
+	ctx.Equal(hClientSelect(ctx, "with the exchange UNAVAILABLE"), want, "with the exchange UNAVAILABLE selectAd must return the house ad with fallback_reason unavailable")
+	ctx.Equal(hClientSelect(ctx, "once the exchange answers again"), hClientPaid, "once the exchange answers again selectAd must return the paid bid")
 }
 
 func CheckPropagateErrors(ctx *harness.Ctx) {
-	clientPeer(ctx)
+	hClientPeer(ctx)
 	terminal := []codes.Code{codes.InvalidArgument, codes.NotFound, codes.PermissionDenied, codes.ResourceExhausted, codes.Internal}
 	for i, code := range terminal {
 		ctx.GRPC.Fail("SelectAd", code, "the exchange refused the request", 1, "")
-		got, err := selectAd(clientBg, "home-top", "u-1")
+		got, err := selectAd(hClientBg, "home-top", "u-1")
 		ctx.Assert(err != nil, "%v from the exchange answered %+v: only DEADLINE_EXCEEDED and UNAVAILABLE serve the house ad, any other status is a refusal to surface. Return an error wrapping ErrExchange", code, got)
 		ctx.ErrorIs(err, ErrExchange, "%v returned %v", code, err)
 		ctx.Equal(len(ctx.GRPC.CallsTo("SelectAd", "")), i+1, "a refused request fails the same way, send it once; the SelectAd calls after %v", code)
@@ -836,7 +836,7 @@ func CheckPropagateErrors(ctx *harness.Ctx) {
 namespace {
 
 // Bids 1200 micros for c-9 on every slot.
-class ExchangePeer final : public adserved::Exchange::Service {
+class HExchangePeer final : public adserved::Exchange::Service {
  public:
   grpc::Status SelectAd(grpc::ServerContext*, const adserved::SelectAdRequest*, adserved::Bid* out) override {
     out->set_campaign_id("c-9");
@@ -846,25 +846,25 @@ class ExchangePeer final : public adserved::Exchange::Service {
   }
 };
 
-void clientPeer(harness::Ctx& ctx) {
-  static ExchangePeer* peer = nullptr;
+void hClientPeer(harness::Ctx& ctx) {
+  static HExchangePeer* peer = nullptr;
   delete peer;
-  peer = new ExchangePeer;
+  peer = new HExchangePeer;
   ctx.GRPC.Server("")->RegisterService(peer);
 }
 
-std::string clientShow(const Selection& s) {
+std::string hClientShow(const Selection& s) {
   return "{ad " + s.ad.campaign_id + "/" + s.ad.creative_id + "/" + std::to_string(s.ad.price_micros) + ", kind " + s.kind +
          ", fallback " + (s.fallback ? "true" : "false") + ", fallback_reason \\"" + s.fallback_reason + "\\"}";
 }
 
-bool clientSame(const Selection& s, const std::string& campaign, const std::string& creative, long long price, const std::string& kind, bool fallback,
+bool hClientSame(const Selection& s, const std::string& campaign, const std::string& creative, long long price, const std::string& kind, bool fallback,
                 const std::string& reason) {
   return s.ad.campaign_id == campaign && s.ad.creative_id == creative && s.ad.price_micros == price && s.kind == kind && s.fallback == fallback &&
          s.fallback_reason == reason;
 }
 
-Selection clientSelect(harness::Ctx& ctx, const std::string& why) {
+Selection hClientSelect(harness::Ctx& ctx, const std::string& why) {
   try {
     return selectAd("home-top", "u-1");
   } catch (const std::exception& e) {
@@ -872,7 +872,7 @@ Selection clientSelect(harness::Ctx& ctx, const std::string& why) {
   }
 }
 
-void clientQuiet() {
+void hClientQuiet() {
   try {
     selectAd("home-top", "u-1");
   } catch (const ExchangeError&) {
@@ -882,9 +882,9 @@ void clientQuiet() {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  clientPeer(ctx);
-  const Selection got = clientSelect(ctx, "with the exchange answering");
-  ctx.Assert(clientSame(got, "c-9", "cr-c-9", 1200, "paid", false, ""), "with the exchange answering, selectAd returned %s, expected the paid bid", clientShow(got));
+  hClientPeer(ctx);
+  const Selection got = hClientSelect(ctx, "with the exchange answering");
+  ctx.Assert(hClientSame(got, "c-9", "cr-c-9", 1200, "paid", false, ""), "with the exchange answering, selectAd returned %s, expected the paid bid", hClientShow(got));
   const auto calls = ctx.GRPC.CallsTo("SelectAd");
   ctx.Equal(calls.size(), 1, "one serve's SelectAd calls");
   ctx.Assert(calls[0].HasDeadline(), "SelectAd carries no deadline: a stalled exchange holds the page");
@@ -893,37 +893,37 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckOneCall(harness::Ctx& ctx) {
-  clientPeer(ctx);
+  hClientPeer(ctx);
   ctx.GRPC.Fail("SelectAd", grpc::StatusCode::UNAVAILABLE, "", 3);
-  clientQuiet();
+  hClientQuiet();
   ctx.Equal(ctx.GRPC.CallsTo("SelectAd").size(), 1, "with the exchange down one serve must make one SelectAd call, not pay for the outage on every try; the calls");
   ctx.Equal(ctx.Clock.Sleeps(), 0, "selectAd must not sleep inside the request; the sleeps");
   ctx.GRPC.ClearFailures();
   ctx.GRPC.SetLatency("SelectAd", 5.0);
   const int64_t before = ctx.Clock.Now();
-  clientQuiet();
+  hClientQuiet();
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 0.16, "with the exchange taking 5 s the serve waited %.2f s, expected one 150 ms deadline", waited);
   ctx.Equal(ctx.GRPC.CallsTo("SelectAd").size(), 2, "a slow exchange gets one call per serve; the calls");
 }
 
 void CheckHouseFallback(harness::Ctx& ctx) {
-  clientPeer(ctx);
+  hClientPeer(ctx);
   ctx.GRPC.SetLatency("SelectAd", 5.0);
-  Selection got = clientSelect(ctx, "with the exchange past its deadline");
-  ctx.Assert(clientSame(got, "house", "house-default", 0, "house", true, "deadline_exceeded"),
-             "with the exchange past its deadline selectAd returned %s, expected the marked house ad: an empty slot is revenue lost with nothing to count", clientShow(got));
+  Selection got = hClientSelect(ctx, "with the exchange past its deadline");
+  ctx.Assert(hClientSame(got, "house", "house-default", 0, "house", true, "deadline_exceeded"),
+             "with the exchange past its deadline selectAd returned %s, expected the marked house ad: an empty slot is revenue lost with nothing to count", hClientShow(got));
   ctx.GRPC.SetLatency("SelectAd", 0);
   ctx.GRPC.Fail("SelectAd", grpc::StatusCode::UNAVAILABLE);
-  got = clientSelect(ctx, "with the exchange UNAVAILABLE");
-  ctx.Assert(clientSame(got, "house", "house-default", 0, "house", true, "unavailable"),
-             "with the exchange UNAVAILABLE selectAd returned %s, expected the house ad with fallback_reason unavailable", clientShow(got));
-  got = clientSelect(ctx, "once the exchange answers again");
-  ctx.Assert(clientSame(got, "c-9", "cr-c-9", 1200, "paid", false, ""), "once the exchange answers again selectAd returned %s, expected the paid bid", clientShow(got));
+  got = hClientSelect(ctx, "with the exchange UNAVAILABLE");
+  ctx.Assert(hClientSame(got, "house", "house-default", 0, "house", true, "unavailable"),
+             "with the exchange UNAVAILABLE selectAd returned %s, expected the house ad with fallback_reason unavailable", hClientShow(got));
+  got = hClientSelect(ctx, "once the exchange answers again");
+  ctx.Assert(hClientSame(got, "c-9", "cr-c-9", 1200, "paid", false, ""), "once the exchange answers again selectAd returned %s, expected the paid bid", hClientShow(got));
 }
 
 void CheckPropagateErrors(harness::Ctx& ctx) {
-  clientPeer(ctx);
+  hClientPeer(ctx);
   const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
       {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"}, {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"},
       {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}, {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
@@ -943,7 +943,7 @@ void CheckPropagateErrors(harness::Ctx& ctx) {
       ctx.Fatalf("%s threw %s: %s, expected ExchangeError", name, harness::CurrentExceptionType(), e.what());
     }
     ctx.Assert(raised, "%s from the exchange answered %s: only DEADLINE_EXCEEDED and UNAVAILABLE serve the house ad, any other status is a refusal to surface. Throw ExchangeError", name,
-               clientShow(got));
+               hClientShow(got));
     ctx.Equal(ctx.GRPC.CallsTo("SelectAd").size(), serves, "a refused request fails the same way, send it once; the SelectAd calls after %s", name);
   }
 }

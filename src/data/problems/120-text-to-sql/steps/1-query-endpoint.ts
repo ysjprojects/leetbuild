@@ -1210,42 +1210,42 @@ import (
 	"leetbuild/harness"
 )
 
-const apiQuestion = "How many trips completed in Seattle yesterday?"
+const kHApiQuestion = "How many trips completed in Seattle yesterday?"
 
-var apiGood = map[string]any{"question": apiQuestion, "workspace": "mobility"}
+var hApiGood = map[string]any{"question": kHApiQuestion, "workspace": "mobility"}
 
 // agentsPeer is the stand-in agents: answers from querygen/agents.
-type agentsPeer struct {
+type HAgentsPeer struct {
 	pb.UnimplementedAgentsServer
 }
 
-func (agentsPeer) Intent(_ context.Context, req *pb.IntentRequest) (*pb.IntentReply, error) {
+func (HAgentsPeer) Intent(_ context.Context, req *pb.IntentRequest) (*pb.IntentReply, error) {
 	return &pb.IntentReply{Workspace: agents.Intent(req.GetQuestion())}, nil
 }
 
-func (agentsPeer) PickTables(_ context.Context, req *pb.PickTablesRequest) (*pb.PickTablesReply, error) {
+func (HAgentsPeer) PickTables(_ context.Context, req *pb.PickTablesRequest) (*pb.PickTablesReply, error) {
 	return &pb.PickTablesReply{Tables: agents.PickTables(req.GetQuestion(), req.GetWorkspace())}, nil
 }
 
-func (agentsPeer) PruneColumns(_ context.Context, req *pb.PruneColumnsRequest) (*pb.PruneColumnsReply, error) {
+func (HAgentsPeer) PruneColumns(_ context.Context, req *pb.PruneColumnsRequest) (*pb.PruneColumnsReply, error) {
 	return &pb.PruneColumnsReply{Schemas: agents.PruneColumns(req.GetQuestion(), req.GetSchemas())}, nil
 }
 
-func (agentsPeer) Generate(_ context.Context, req *pb.GenerateRequest) (*pb.GenerateReply, error) {
+func (HAgentsPeer) Generate(_ context.Context, req *pb.GenerateRequest) (*pb.GenerateReply, error) {
 	if agents.PromptTokens(req.GetSchemas()) > agents.ContextLimitTokens {
 		return nil, status.Error(codes.InvalidArgument, "prompt is over the model's context window")
 	}
 	return &pb.GenerateReply{Text: agents.Generate(req.GetQuestion(), req.GetWorkspace(), req.GetSchemas())}, nil
 }
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
-	pb.RegisterAgentsServer(ctx.GRPC.Server(config.Agents), &agentsPeer{})
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
+	pb.RegisterAgentsServer(ctx.GRPC.Server(config.Agents), &HAgentsPeer{})
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiCalls(ctx *harness.Ctx, methods ...string) int {
+func hApiCalls(ctx *harness.Ctx, methods ...string) int {
 	if len(methods) == 0 {
 		methods = []string{"Intent", "PickTables", "PruneColumns", "Generate"}
 	}
@@ -1256,7 +1256,7 @@ func apiCalls(ctx *harness.Ctx, methods ...string) int {
 	return n
 }
 
-func apiPost(c *harness.HTTP, body map[string]any, user, key string) *harness.Response {
+func hApiPost(c *harness.HTTP, body map[string]any, user, key string) *harness.Response {
 	var headers []string
 	if user != "" {
 		headers = append(headers, "X-User-Id", user)
@@ -1267,95 +1267,95 @@ func apiPost(c *harness.HTTP, body map[string]any, user, key string) *harness.Re
 	return c.Post("/v1/queries", body, headers...)
 }
 
-func apiBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hApiBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	return body
 }
 
-func apiOK(status int) bool { return status >= 200 && status < 300 }
+func hApiOK(status int) bool { return status >= 200 && status < 300 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiGood, "ana", "k-1")
-	ctx.Assert(apiOK(r.Status), "a valid question answered %d: %s", r.Status, r.Text())
-	body := apiBody(ctx, r)
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiGood, "ana", "k-1")
+	ctx.Assert(hApiOK(r.Status), "a valid question answered %d: %s", r.Status, r.Text())
+	body := hApiBody(ctx, r)
 	id, _ := body["query_id"].(string)
 	ctx.Assert(id != "", "the answer needs a query_id: %s", r.Text())
 	ctx.Equal(body["workspace"], "mobility", "the answer carries the workspace")
 	ctx.Equal(body["tables_proposed"], []any{"trips", "drivers"}, "tables_proposed must be the table agent's pick for mobility (trips, drivers)")
 	_, stored := ctx.Redis.Get("query:" + id)
 	ctx.Assert(stored, "the record must be in the query store (query:{query_id}): keys %v", ctx.Redis.Keys("*"))
-	ctx.Equal(apiPost(c, apiGood, "", "k-2").Status, 401, "without X-User-Id the request")
+	ctx.Equal(hApiPost(c, hApiGood, "", "k-2").Status, 401, "without X-User-Id the request")
 }
 
 func CheckQuestionCap(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	for _, q := range []string{"", "   "} {
-		r := apiPost(c, map[string]any{"question": q, "workspace": "mobility"}, "ana", "k-empty")
+		r := hApiPost(c, map[string]any{"question": q, "workspace": "mobility"}, "ana", "k-empty")
 		ctx.Equal(r.Status, 400, "question %q", q)
 	}
-	r := apiPost(c, map[string]any{"question": strings.Repeat("x", 2001), "workspace": "mobility"}, "ana", "k-long")
+	r := hApiPost(c, map[string]any{"question": strings.Repeat("x", 2001), "workspace": "mobility"}, "ana", "k-long")
 	ctx.Equal(r.Status, 413, "a 2001-character question (a pasted document must not reach the agents)")
-	ctx.Equal(apiCalls(ctx), 0, "rejected questions reached the agents (refuse before the first call); agent calls")
+	ctx.Equal(hApiCalls(ctx), 0, "rejected questions reached the agents (refuse before the first call); agent calls")
 	ctx.Equal(len(ctx.Redis.Keys("query:*")), 0, "a rejected question must store nothing; records")
-	r = apiPost(c, map[string]any{"question": strings.Repeat("y", 2000), "workspace": "mobility"}, "ana", "k-max")
-	ctx.Assert(apiOK(r.Status), "exactly 2000 characters is allowed, got %d: %s", r.Status, r.Text())
-	r = apiPost(c, map[string]any{"question": strings.Repeat("é", 2000), "workspace": "mobility"}, "ana", "k-accent")
-	ctx.Assert(apiOK(r.Status), "2000 characters of 'é' (4000 bytes in UTF-8) is allowed, got %d: %s; count characters, not bytes", r.Status, r.Text())
+	r = hApiPost(c, map[string]any{"question": strings.Repeat("y", 2000), "workspace": "mobility"}, "ana", "k-max")
+	ctx.Assert(hApiOK(r.Status), "exactly 2000 characters is allowed, got %d: %s", r.Status, r.Text())
+	r = hApiPost(c, map[string]any{"question": strings.Repeat("é", 2000), "workspace": "mobility"}, "ana", "k-accent")
+	ctx.Assert(hApiOK(r.Status), "2000 characters of 'é' (4000 bytes in UTF-8) is allowed, got %d: %s; count characters, not bytes", r.Status, r.Text())
 }
 
 func CheckWorkspaceAllowlist(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, map[string]any{"question": apiQuestion, "workspace": "finance"}, "ana", "k-fin")
+	c := hApiClient(ctx)
+	r := hApiPost(c, map[string]any{"question": kHApiQuestion, "workspace": "finance"}, "ana", "k-fin")
 	ctx.Equal(r.Status, 400, "workspace 'finance' is not a system workspace")
-	ctx.Equal(apiCalls(ctx), 0, "a caller's unknown workspace reached the agents (check it against config.SystemWorkspaces first); agent calls")
-	r = apiPost(c, map[string]any{"question": "offtopic: what did payroll pay contractors in October?"}, "ana", "k-off")
+	ctx.Equal(hApiCalls(ctx), 0, "a caller's unknown workspace reached the agents (check it against config.SystemWorkspaces first); agent calls")
+	r = hApiPost(c, map[string]any{"question": "offtopic: what did payroll pay contractors in October?"}, "ana", "k-off")
 	ctx.Equal(r.Status, 422, "the intent agent answered 'hr-payroll', which is no system workspace (%s)", r.Text())
-	ctx.Equal(apiCalls(ctx, "PickTables"), 0, "an intent answer outside the system workspaces went on to the table agent; PickTables calls")
+	ctx.Equal(hApiCalls(ctx, "PickTables"), 0, "an intent answer outside the system workspaces went on to the table agent; PickTables calls")
 	ctx.Equal(len(ctx.Redis.Keys("query:*")), 0, "a refused question must store nothing; records")
-	r = apiPost(c, map[string]any{"question": "Which campaign spent the most last week?"}, "ana", "k-ads")
-	ctx.Assert(apiOK(r.Status) && apiBody(ctx, r)["workspace"] == "ads", "without a workspace the intent agent's 'ads' must be used: %d %s", r.Status, r.Text())
-	intents := apiCalls(ctx, "Intent")
-	r = apiPost(c, map[string]any{"question": apiQuestion, "workspace": "core-services"}, "ana", "k-core")
-	ctx.Assert(apiOK(r.Status) && apiBody(ctx, r)["workspace"] == "core-services", "a system workspace the caller names is used as given: %d %s", r.Status, r.Text())
-	ctx.Equal(apiCalls(ctx, "Intent"), intents, "with a valid workspace in the body the intent agent must not be asked; Intent calls")
+	r = hApiPost(c, map[string]any{"question": "Which campaign spent the most last week?"}, "ana", "k-ads")
+	ctx.Assert(hApiOK(r.Status) && hApiBody(ctx, r)["workspace"] == "ads", "without a workspace the intent agent's 'ads' must be used: %d %s", r.Status, r.Text())
+	intents := hApiCalls(ctx, "Intent")
+	r = hApiPost(c, map[string]any{"question": kHApiQuestion, "workspace": "core-services"}, "ana", "k-core")
+	ctx.Assert(hApiOK(r.Status) && hApiBody(ctx, r)["workspace"] == "core-services", "a system workspace the caller names is used as given: %d %s", r.Status, r.Text())
+	ctx.Equal(hApiCalls(ctx, "Intent"), intents, "with a valid workspace in the body the intent agent must not be asked; Intent calls")
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	ctx.Equal(apiPost(c, apiGood, "ana", "").Status, 400, "a request without Idempotency-Key")
-	ctx.Equal(apiCalls(ctx), 0, "a request without Idempotency-Key reached the agents; agent calls")
-	first := apiPost(c, apiGood, "ana", "k-7")
-	ctx.Assert(apiOK(first.Status), "the first request answered %d: %s", first.Status, first.Text())
-	picks := apiCalls(ctx, "PickTables")
-	replay := apiPost(c, apiGood, "ana", "k-7")
+	c := hApiClient(ctx)
+	ctx.Equal(hApiPost(c, hApiGood, "ana", "").Status, 400, "a request without Idempotency-Key")
+	ctx.Equal(hApiCalls(ctx), 0, "a request without Idempotency-Key reached the agents; agent calls")
+	first := hApiPost(c, hApiGood, "ana", "k-7")
+	ctx.Assert(hApiOK(first.Status), "the first request answered %d: %s", first.Status, first.Text())
+	picks := hApiCalls(ctx, "PickTables")
+	replay := hApiPost(c, hApiGood, "ana", "k-7")
 	ctx.Equal(replay.Status, 200, "a replay of the same (user, Idempotency-Key) must answer the stored query")
-	ctx.Equal(apiBody(ctx, replay)["query_id"], apiBody(ctx, first)["query_id"], "the replay must return the same query")
-	ctx.Equal(apiCalls(ctx, "PickTables"), picks, "a replay ran the agents again (the client retried, the chain must not); PickTables calls")
-	other := apiPost(c, apiGood, "ben", "k-7")
-	ctx.Assert(apiOK(other.Status) && apiBody(ctx, other)["query_id"] != apiBody(ctx, first)["query_id"], "another user reusing the key gets their own query (keys are per user)")
+	ctx.Equal(hApiBody(ctx, replay)["query_id"], hApiBody(ctx, first)["query_id"], "the replay must return the same query")
+	ctx.Equal(hApiCalls(ctx, "PickTables"), picks, "a replay ran the agents again (the client retried, the chain must not); PickTables calls")
+	other := hApiPost(c, hApiGood, "ben", "k-7")
+	ctx.Assert(hApiOK(other.Status) && hApiBody(ctx, other)["query_id"] != hApiBody(ctx, first)["query_id"], "another user reusing the key gets their own query (keys are per user)")
 	ctx.Equal(len(ctx.Redis.Keys("query:*")), 2, "two users, two queries; records")
 	ads := map[string]any{"question": "Which campaign spent the most last week?"}
-	adsFirst := apiPost(c, ads, "ana", "k-8")
-	ctx.Assert(apiOK(adsFirst.Status), "a question without a workspace answered %d: %s", adsFirst.Status, adsFirst.Text())
-	before := apiCalls(ctx)
-	adsReplay := apiPost(c, ads, "ana", "k-8")
-	ctx.Assert(adsReplay.Status == 200 && apiBody(ctx, adsReplay)["query_id"] == apiBody(ctx, adsFirst)["query_id"], "a replay of a question without a workspace must answer 200 with the stored query: %d %s", adsReplay.Status, adsReplay.Text())
-	ctx.Equal(apiBody(ctx, adsReplay)["tables_proposed"], apiBody(ctx, adsFirst)["tables_proposed"], "the replay answers the stored record")
-	ctx.Equal(apiCalls(ctx), before, "a replay of a question without a workspace called the agents (a replay calls no agent, not even Intent); agent calls")
+	adsFirst := hApiPost(c, ads, "ana", "k-8")
+	ctx.Assert(hApiOK(adsFirst.Status), "a question without a workspace answered %d: %s", adsFirst.Status, adsFirst.Text())
+	before := hApiCalls(ctx)
+	adsReplay := hApiPost(c, ads, "ana", "k-8")
+	ctx.Assert(adsReplay.Status == 200 && hApiBody(ctx, adsReplay)["query_id"] == hApiBody(ctx, adsFirst)["query_id"], "a replay of a question without a workspace must answer 200 with the stored query: %d %s", adsReplay.Status, adsReplay.Text())
+	ctx.Equal(hApiBody(ctx, adsReplay)["tables_proposed"], hApiBody(ctx, adsFirst)["tables_proposed"], "the replay answers the stored record")
+	ctx.Equal(hApiCalls(ctx), before, "a replay of a question without a workspace called the agents (a replay calls no agent, not even Intent); agent calls")
 }
 
 func CheckPendingAck(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiGood, "ana", "k-ack")
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiGood, "ana", "k-ack")
 	ctx.Equal(r.Status, 202, "a proposal waiting for the user's ACK")
-	body := apiBody(ctx, r)
+	body := hApiBody(ctx, r)
 	ctx.Equal(body["status"], "pending_ack", "status")
 	ctx.Equal(body["tables_proposed"], []any{"trips", "drivers"}, "tables_proposed must be the table agent's pick")
 	acked, _ := body["tables_acked"].([]any)
 	ctx.Assert(acked != nil && len(acked) == 0 && body["sql"] == "", "nothing is ACKed or generated yet: %s", r.Text())
-	ctx.Equal(apiCalls(ctx, "Generate"), 0, "Generate ran before the user ACKed the tables; Generate calls")
+	ctx.Equal(hApiCalls(ctx, "Generate"), 0, "Generate ran before the user ACKed the tables; Generate calls")
 	id, _ := body["query_id"].(string)
 	raw, _ := ctx.Redis.Get("query:" + id)
 	var stored map[string]any

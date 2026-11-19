@@ -980,56 +980,56 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func stateEnqueue(ctx *harness.Ctx, runID string, band int, at int64) {
-	ctx.NoError(runs.Put(stateBg, &runs.Run{RunID: runID, Tenant: "t1", RecipeVersion: "llama-ft-v3", DatasetVersion: "ds-1", Priority: 8 - 3*band, Band: band, State: "queued", EnqueuedAtMs: at}), "runs.Put")
-	ctx.NoError(enqueue(stateBg, runID, band, at), "enqueue(%s)", runID)
+func hStateEnqueue(ctx *harness.Ctx, runID string, band int, at int64) {
+	ctx.NoError(runs.Put(hStateBg, &runs.Run{RunID: runID, Tenant: "t1", RecipeVersion: "llama-ft-v3", DatasetVersion: "ds-1", Priority: 8 - 3*band, Band: band, State: "queued", EnqueuedAtMs: at}), "runs.Put")
+	ctx.NoError(enqueue(hStateBg, runID, band, at), "enqueue(%s)", runID)
 }
 
-func stateClaim(ctx *harness.Ctx, worker string, nowMs int64) string {
-	id, err := claimNext(stateBg, worker, nowMs)
+func hStateClaim(ctx *harness.Ctx, worker string, nowMs int64) string {
+	id, err := claimNext(hStateBg, worker, nowMs)
 	ctx.NoError(err, "claimNext(%s)", worker)
 	return id
 }
 
-func stateReap(ctx *harness.Ctx, nowMs int64) int {
-	n, err := reapExpired(stateBg, nowMs)
+func hStateReap(ctx *harness.Ctx, nowMs int64) int {
+	n, err := reapExpired(hStateBg, nowMs)
 	ctx.NoError(err, "reapExpired")
 	return n
 }
 
-func stateConfirm(ctx *harness.Ctx, runID, worker string) bool {
-	ok, err := confirmStart(stateBg, runID, worker)
+func hStateConfirm(ctx *harness.Ctx, runID, worker string) bool {
+	ok, err := confirmStart(hStateBg, runID, worker)
 	ctx.NoError(err, "confirmStart(%s, %s)", runID, worker)
 	return ok
 }
 
 func CheckQueueOrder(ctx *harness.Ctx) {
 	t0 := ctx.Clock.Now()
-	stateEnqueue(ctx, "run-a", 1, t0+1000)
-	stateEnqueue(ctx, "run-b", 0, t0+3000)
-	stateEnqueue(ctx, "run-c", 1, t0+500)
-	stateEnqueue(ctx, "run-0", 2, t0)
+	hStateEnqueue(ctx, "run-a", 1, t0+1000)
+	hStateEnqueue(ctx, "run-b", 0, t0+3000)
+	hStateEnqueue(ctx, "run-c", 1, t0+500)
+	hStateEnqueue(ctx, "run-0", 2, t0)
 	order := []string{}
 	for i := 0; i < 4; i++ {
-		order = append(order, stateClaim(ctx, fmt.Sprintf("w-%d", i), t0+5000))
+		order = append(order, hStateClaim(ctx, fmt.Sprintf("w-%d", i), t0+5000))
 	}
 	ctx.Equal(order, []string{"run-b", "run-c", "run-a", "run-0"}, "the queue must serve run-b (band 0), then band 1 in submission order (run-c before run-a), then run-0 (band 2); the order")
-	ctx.Equal(stateClaim(ctx, "w-9", t0+5000), "", "claimNext on an empty queue")
+	ctx.Equal(hStateClaim(ctx, "w-9", t0+5000), "", "claimNext on an empty queue")
 }
 
 func CheckSingleClaim(ctx *harness.Ctx) {
 	now := ctx.Clock.Now()
-	stateEnqueue(ctx, "run-a", 1, now)
+	hStateEnqueue(ctx, "run-a", 1, now)
 	// Another scheduler replica claims right after this one first touches the queue.
 	theirs := ""
 	rival := ctx.Redis.After("training:queue", func() any {
-		id, _ := claimNext(stateBg, "w-2", now)
+		id, _ := claimNext(hStateBg, "w-2", now)
 		theirs = id
 		return id
 	})
-	mine := stateClaim(ctx, "w-1", now)
+	mine := hStateClaim(ctx, "w-1", now)
 	ctx.Assert(rival.Fired, "claimNext never touched training:queue")
 	winners := []string{}
 	if mine == "run-a" {
@@ -1041,7 +1041,7 @@ func CheckSingleClaim(ctx *harness.Ctx) {
 	ctx.Assert(len(winners) == 1, "two schedulers claimed run-a at once and %d got it (%v): the other claim landed between your read of the head and your ZREM. Read, remove and lease in one Lua script", len(winners), winners)
 	holder, _ := ctx.Redis.Get("training:lease:run-a")
 	ctx.Equal(holder, winners[0], "training:lease:run-a must name the winner of the claim")
-	ctx.Equal(runs.Get(stateBg, "run-a").Worker, winners[0], "the run row's worker must be the winner of the claim")
+	ctx.Equal(runs.Get(hStateBg, "run-a").Worker, winners[0], "the run row's worker must be the winner of the claim")
 	ttl := ctx.Redis.PTTL("training:lease:run-a")
 	ctx.Assert(ttl > 0 && ttl <= 15000, "the claim left training:lease:run-a with PTTL %d: set the lease with PX LEASE_TTL_MS in the claim script", ttl)
 	deadline, _ := ctx.Redis.ZScore("training:leases", "run-a")
@@ -1050,32 +1050,32 @@ func CheckSingleClaim(ctx *harness.Ctx) {
 
 func CheckConfirmGuarded(ctx *harness.Ctx) {
 	t0 := ctx.Clock.Now()
-	stateEnqueue(ctx, "run-a", 1, t0)
-	ctx.Equal(stateClaim(ctx, "w-1", t0), "run-a", "the only queued run must be claimed")
+	hStateEnqueue(ctx, "run-a", 1, t0)
+	ctx.Equal(hStateClaim(ctx, "w-1", t0), "run-a", "the only queued run must be claimed")
 	ctx.Clock.Advance(16) // w-1 died during startup
-	ctx.Equal(stateReap(ctx, t0+16000), 1, "the lease of run-a ran out: reapExpired must return it")
-	ctx.Equal(stateClaim(ctx, "w-2", t0+16000), "run-a", "run-a must be claimable again once its lease ran out")
-	late := stateConfirm(ctx, "run-a", "w-1")
+	ctx.Equal(hStateReap(ctx, t0+16000), 1, "the lease of run-a ran out: reapExpired must return it")
+	ctx.Equal(hStateClaim(ctx, "w-2", t0+16000), "run-a", "run-a must be claimable again once its lease ran out")
+	late := hStateConfirm(ctx, "run-a", "w-1")
 	ctx.Assert(!late, "w-1, whose lease ran out and whose run went to w-2, confirmed run-a: two workers would train it. Confirm only for the worker the lease names")
-	run := runs.Get(stateBg, "run-a")
+	run := runs.Get(hStateBg, "run-a")
 	ctx.Assert(run.State == "starting" && run.Worker == "w-2", "after the late confirm the run reads state %q worker %q, expected starting on w-2", run.State, run.Worker)
-	ctx.Equal(stateConfirm(ctx, "run-a", "w-2"), true, "the worker that holds the lease must be able to confirm")
-	ctx.Equal(runs.Get(stateBg, "run-a").State, "running", "a confirmed run's state")
+	ctx.Equal(hStateConfirm(ctx, "run-a", "w-2"), true, "the worker that holds the lease must be able to confirm")
+	ctx.Equal(runs.Get(hStateBg, "run-a").State, "running", "a confirmed run's state")
 	_, left := ctx.Redis.ZScore("training:leases", "run-a")
 	ctx.Assert(!left, "a confirmed run left its deadline in training:leases: the reaper would requeue a running run")
 	// The lease runs out and w-4 claims run-b right after w-3's confirm first touches the lease.
 	t1 := t0 + 16000
-	stateEnqueue(ctx, "run-b", 1, t1)
-	ctx.Equal(stateClaim(ctx, "w-3", t1), "run-b", "run-b, the only queued run, must be claimed")
+	hStateEnqueue(ctx, "run-b", 1, t1)
+	ctx.Equal(hStateClaim(ctx, "w-3", t1), "run-b", "run-b, the only queued run, must be claimed")
 	theirs := ""
 	rival := ctx.Redis.After("training:lease:run-b", func() any {
-		reapExpired(stateBg, t1+20000)
-		theirs, _ = claimNext(stateBg, "w-4", t1+20000)
+		reapExpired(hStateBg, t1+20000)
+		theirs, _ = claimNext(hStateBg, "w-4", t1+20000)
 		return theirs
 	})
-	confirmed := stateConfirm(ctx, "run-b", "w-3")
+	confirmed := hStateConfirm(ctx, "run-b", "w-3")
 	ctx.Assert(rival.Fired, "confirmStart never touched training:lease:run-b")
-	raced := runs.Get(stateBg, "run-b")
+	raced := runs.Get(hStateBg, "run-b")
 	if theirs == "run-b" {
 		holder, _ := ctx.Redis.Get("training:lease:run-b")
 		ctx.Assert(!confirmed && holder == "w-4" && raced.State == "starting" && raced.Worker == "w-4", "w-4 claimed run-b between w-3's lease check and its writes, yet w-3's confirm returned %t and left lease %q, state %q, worker %q: check the lease and confirm in one script", confirmed, holder, raced.State, raced.Worker)
@@ -1086,18 +1086,18 @@ func CheckConfirmGuarded(ctx *harness.Ctx) {
 
 func CheckReapKeepsPosition(ctx *harness.Ctx) {
 	t0 := ctx.Clock.Now()
-	stateEnqueue(ctx, "run-a", 0, t0)
-	ctx.Equal(stateClaim(ctx, "w-1", t0), "run-a", "the only queued run must be claimed")
-	stateEnqueue(ctx, "run-b", 0, t0+5000)
-	stateEnqueue(ctx, "run-c", 1, t0+100)
-	ctx.Equal(stateReap(ctx, t0+14999), 0, "reapExpired must leave a lease that has not run out; the runs reaped")
+	hStateEnqueue(ctx, "run-a", 0, t0)
+	ctx.Equal(hStateClaim(ctx, "w-1", t0), "run-a", "the only queued run must be claimed")
+	hStateEnqueue(ctx, "run-b", 0, t0+5000)
+	hStateEnqueue(ctx, "run-c", 1, t0+100)
+	ctx.Equal(hStateReap(ctx, t0+14999), 0, "reapExpired must leave a lease that has not run out; the runs reaped")
 	ctx.Clock.Advance(16) // w-1 died during startup
-	ctx.Equal(stateReap(ctx, t0+16000), 1, "the lease of run-a ran out: reapExpired must return it")
+	ctx.Equal(hStateReap(ctx, t0+16000), 1, "the lease of run-a ran out: reapExpired must return it")
 	score, _ := ctx.Redis.ZScore("training:queue", "run-a")
 	ctx.Assert(int64(score) == t0, "run-a came back with score %.0f, expected its original position %d (band 0, submitted at %d)", score, t0, t0)
 	order := []string{}
 	for i := 0; i < 3; i++ {
-		order = append(order, stateClaim(ctx, "w-2", t0+16000))
+		order = append(order, hStateClaim(ctx, "w-2", t0+16000))
 	}
 	ctx.Equal(order, []string{"run-a", "run-b", "run-c"}, "after the reap run-a, submitted before run-b, must keep its place; the order")
 }
@@ -1110,7 +1110,7 @@ func CheckReapKeepsPosition(ctx *harness.Ctx) {
 
 namespace {
 
-void stateEnqueue(const std::string& run_id, int band, long long at) {
+void hStateEnqueue(const std::string& run_id, int band, long long at) {
   runs::Run run;
   run.run_id = run_id;
   run.tenant = "t1";
@@ -1130,10 +1130,10 @@ std::string hClaimed(long long now_ms, const std::string& worker) { return claim
 
 void CheckQueueOrder(harness::Ctx& ctx) {
   const long long t0 = ctx.Clock.Now();
-  stateEnqueue("run-a", 1, t0 + 1000);
-  stateEnqueue("run-b", 0, t0 + 3000);
-  stateEnqueue("run-c", 1, t0 + 500);
-  stateEnqueue("run-0", 2, t0);
+  hStateEnqueue("run-a", 1, t0 + 1000);
+  hStateEnqueue("run-b", 0, t0 + 3000);
+  hStateEnqueue("run-c", 1, t0 + 500);
+  hStateEnqueue("run-0", 2, t0);
   std::vector<std::string> order;
   for (int i = 0; i < 4; i++) order.push_back(hClaimed(t0 + 5000, "w-" + std::to_string(i)));
   ctx.Equal(order, {"run-b", "run-c", "run-a", "run-0"},
@@ -1143,7 +1143,7 @@ void CheckQueueOrder(harness::Ctx& ctx) {
 
 void CheckSingleClaim(harness::Ctx& ctx) {
   const long long now = ctx.Clock.Now();
-  stateEnqueue("run-a", 1, now);
+  hStateEnqueue("run-a", 1, now);
   // Another scheduler replica claims right after this one first touches the queue.
   bool fired = false;
   std::string theirs;
@@ -1169,7 +1169,7 @@ void CheckSingleClaim(harness::Ctx& ctx) {
 
 void CheckConfirmGuarded(harness::Ctx& ctx) {
   const long long t0 = ctx.Clock.Now();
-  stateEnqueue("run-a", 1, t0);
+  hStateEnqueue("run-a", 1, t0);
   ctx.Equal(hClaimed(t0, "w-1"), "run-a", "the only queued run must be claimed");
   ctx.Clock.Advance(16);  // w-1 died during startup
   ctx.Equal(reapExpired(t0 + 16000), 1, "the lease of run-a ran out: reapExpired must return it");
@@ -1183,7 +1183,7 @@ void CheckConfirmGuarded(harness::Ctx& ctx) {
   ctx.Assert(!ctx.Redis.ZScore("training:leases", "run-a").has_value(), "a confirmed run left its deadline in training:leases: the reaper would requeue a running run");
   // The lease runs out and w-4 claims run-b right after w-3's confirm first touches the lease.
   const long long t1 = t0 + 16000;
-  stateEnqueue("run-b", 1, t1);
+  hStateEnqueue("run-b", 1, t1);
   ctx.Equal(hClaimed(t1, "w-3"), "run-b", "run-b, the only queued run, must be claimed");
   bool fired = false;
   std::string theirs;
@@ -1207,10 +1207,10 @@ void CheckConfirmGuarded(harness::Ctx& ctx) {
 
 void CheckReapKeepsPosition(harness::Ctx& ctx) {
   const long long t0 = ctx.Clock.Now();
-  stateEnqueue("run-a", 0, t0);
+  hStateEnqueue("run-a", 0, t0);
   ctx.Equal(hClaimed(t0, "w-1"), "run-a", "the only queued run must be claimed");
-  stateEnqueue("run-b", 0, t0 + 5000);
-  stateEnqueue("run-c", 1, t0 + 100);
+  hStateEnqueue("run-b", 0, t0 + 5000);
+  hStateEnqueue("run-c", 1, t0 + 100);
   ctx.Equal(reapExpired(t0 + 14999), 0, "reapExpired must leave a lease that has not run out; the runs reaped");
   ctx.Clock.Advance(16);  // w-1 died during startup
   ctx.Equal(reapExpired(t0 + 16000), 1, "the lease of run-a ran out: reapExpired must return it");

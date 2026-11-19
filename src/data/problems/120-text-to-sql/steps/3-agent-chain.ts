@@ -1141,38 +1141,38 @@ import (
 	"leetbuild/harness"
 )
 
-const chainQuestion = "How many trips completed in Seattle yesterday?"
+const kHChainQuestion = "How many trips completed in Seattle yesterday?"
 
-var chainWide = []string{"trips_tier1", "drivers_tier1"}
+var hChainWide = []string{"trips_tier1", "drivers_tier1"}
 
 // chainOddAnswers are the answers the stand-in model gives for these question prefixes, ahead of querygen/agents.
-var chainOddAnswers = [][2]string{
+var hChainOddAnswers = [][2]string{
 	{"array:", \`["SELECT * FROM trips"]\`},
 	{"numsql:", \`{"sql": 42, "explanation": "Trips."}\`},
 	{"noexpl:", \`{"sql": "SELECT * FROM trips WHERE datestr = '2026-11-01'"}\`},
 }
 
 // chainDying counts the Generate calls the stand-in answers UNAVAILABLE after their latency, like a generator that dies mid-call.
-var chainDying atomic.Int32
+var hChainDying atomic.Int32
 
 // chainPeer is the stand-in agents: answers from querygen/agents.
-type chainPeer struct {
+type HChainPeer struct {
 	pb.UnimplementedAgentsServer
 }
 
-func (chainPeer) PruneColumns(_ context.Context, req *pb.PruneColumnsRequest) (*pb.PruneColumnsReply, error) {
+func (HChainPeer) PruneColumns(_ context.Context, req *pb.PruneColumnsRequest) (*pb.PruneColumnsReply, error) {
 	return &pb.PruneColumnsReply{Schemas: agents.PruneColumns(req.GetQuestion(), req.GetSchemas())}, nil
 }
 
-func (chainPeer) Generate(_ context.Context, req *pb.GenerateRequest) (*pb.GenerateReply, error) {
-	if chainDying.Load() > 0 {
-		chainDying.Add(-1)
+func (HChainPeer) Generate(_ context.Context, req *pb.GenerateRequest) (*pb.GenerateReply, error) {
+	if hChainDying.Load() > 0 {
+		hChainDying.Add(-1)
 		return nil, status.Error(codes.Unavailable, "generator restarting")
 	}
 	if agents.PromptTokens(req.GetSchemas()) > agents.ContextLimitTokens {
 		return nil, status.Error(codes.InvalidArgument, "prompt is over the model's context window")
 	}
-	for _, odd := range chainOddAnswers {
+	for _, odd := range hChainOddAnswers {
 		if strings.HasPrefix(req.GetQuestion(), odd[0]) {
 			return &pb.GenerateReply{Text: odd[1]}, nil
 		}
@@ -1180,50 +1180,50 @@ func (chainPeer) Generate(_ context.Context, req *pb.GenerateRequest) (*pb.Gener
 	return &pb.GenerateReply{Text: agents.Generate(req.GetQuestion(), req.GetWorkspace(), req.GetSchemas())}, nil
 }
 
-func chainWorld(ctx *harness.Ctx) {
-	chainDying.Store(0)
-	pb.RegisterAgentsServer(ctx.GRPC.Server(config.Agents), &chainPeer{})
+func hChainWorld(ctx *harness.Ctx) {
+	hChainDying.Store(0)
+	pb.RegisterAgentsServer(ctx.GRPC.Server(config.Agents), &HChainPeer{})
 }
 
-func chainGenerates(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Generate", "") }
+func hChainGenerates(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Generate", "") }
 
-func chainGenerate(ctx *harness.Ctx, question string, tables []string) (Output, error) {
+func hChainGenerate(ctx *harness.Ctx, question string, tables []string) (Output, error) {
 	var out Output
 	var err error
 	ended := ctx.Drain(func() { out, err = generateSQL(context.Background(), question, "mobility", tables) })
-	ctx.Assert(ended, "generateSQL never returned: it kept calling the agents (%d Generate calls) instead of giving up with errGeneration", len(chainGenerates(ctx)))
+	ctx.Assert(ended, "generateSQL never returned: it kept calling the agents (%d Generate calls) instead of giving up with errGeneration", len(hChainGenerates(ctx)))
 	return out, err
 }
 
-func chainExpectError(ctx *harness.Ctx, out Output, err error, what string) {
+func hChainExpectError(ctx *harness.Ctx, out Output, err error, what string) {
 	ctx.Assert(err != nil, "%s returned %+v: it must return an error wrapping errGeneration", what, out)
 	ctx.Assert(errors.Is(err, errGeneration), "%s returned %v; it must wrap errGeneration", what, err)
 }
 
 func CheckDeadlines(ctx *harness.Ctx) {
-	chainWorld(ctx)
-	_, err := chainGenerate(ctx, chainQuestion, []string{"trips"})
+	hChainWorld(ctx)
+	_, err := hChainGenerate(ctx, kHChainQuestion, []string{"trips"})
 	ctx.NoError(err, "a healthy chain")
-	call := chainGenerates(ctx)[0]
+	call := hChainGenerates(ctx)[0]
 	ctx.Assert(call.HasDeadline(), "Generate was called without a deadline: a generator that hangs holds the request open")
 	ctx.Assert(29*time.Second <= call.Timeout && call.Timeout <= 31*time.Second, "the Generate deadline must be 30 s, got %v", call.Timeout)
-	chainGenerate(ctx, chainQuestion, chainWide)
+	hChainGenerate(ctx, kHChainQuestion, hChainWide)
 	for _, prune := range ctx.GRPC.CallsTo("PruneColumns", "") {
 		ctx.Assert(prune.HasDeadline() && 9*time.Second <= prune.Timeout && prune.Timeout <= 11*time.Second, "PruneColumns must carry config.AgentDeadline (10 s), got %v", prune.Timeout)
 	}
 	ctx.GRPC.SetLatency("Generate", 45, config.Agents)
-	calls := len(chainGenerates(ctx))
+	calls := len(hChainGenerates(ctx))
 	started := ctx.Clock.Now()
-	out, err := chainGenerate(ctx, chainQuestion, []string{"trips"})
+	out, err := hChainGenerate(ctx, kHChainQuestion, []string{"trips"})
 	waited := float64(ctx.Clock.Now()-started) / 1000
-	chainExpectError(ctx, out, err, "a generator that hangs for 45 s")
+	hChainExpectError(ctx, out, err, "a generator that hangs for 45 s")
 	ctx.Assert(waited <= 31, "generateSQL waited %.0f s on a hung generator: the deadline must end the call at 30 s", waited)
-	ctx.Equal(len(chainGenerates(ctx)), calls+1, "DEADLINE_EXCEEDED is not retried (the next try would hang as long); Generate calls")
+	ctx.Equal(len(hChainGenerates(ctx)), calls+1, "DEADLINE_EXCEEDED is not retried (the next try would hang as long); Generate calls")
 	ctx.GRPC.SetLatency("Generate", 20, config.Agents)
-	chainDying.Store(1)
-	calls = len(chainGenerates(ctx))
-	out, err = chainGenerate(ctx, chainQuestion, []string{"trips"})
-	tries := chainGenerates(ctx)[calls:]
+	hChainDying.Store(1)
+	calls = len(hChainGenerates(ctx))
+	out, err = hChainGenerate(ctx, kHChainQuestion, []string{"trips"})
+	tries := hChainGenerates(ctx)[calls:]
 	ctx.Equal(len(tries), 2, "a generator that died after 20 s with UNAVAILABLE earns one retry; Generate calls")
 	for i, t := range tries {
 		ctx.Assert(t.HasDeadline() && 29*time.Second <= t.Timeout && t.Timeout <= 31*time.Second, "every attempt carries its own 30 s deadline, the retry too: attempt %d got %v", i+1, t.Timeout)
@@ -1232,47 +1232,47 @@ func CheckDeadlines(ctx *harness.Ctx) {
 }
 
 func CheckRetryPolicy(ctx *harness.Ctx) {
-	chainWorld(ctx)
+	hChainWorld(ctx)
 	ctx.GRPC.Fail("Generate", codes.Unavailable, "generator restarting", 1, config.Agents)
-	out, err := chainGenerate(ctx, chainQuestion, []string{"trips"})
+	out, err := hChainGenerate(ctx, kHChainQuestion, []string{"trips"})
 	ctx.Assert(err == nil && out.SQL != "", "one UNAVAILABLE earns one retry and then SQL, got %+v / %v", out, err)
-	ctx.Equal(len(chainGenerates(ctx)), 2, "one UNAVAILABLE, then success; Generate calls")
+	ctx.Equal(len(hChainGenerates(ctx)), 2, "one UNAVAILABLE, then success; Generate calls")
 	ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt")
 	ctx.GRPC.Fail("Generate", codes.Unavailable, "generator down", 2, config.Agents)
-	out, err = chainGenerate(ctx, chainQuestion, []string{"trips"})
-	chainExpectError(ctx, out, err, "a generator that stays UNAVAILABLE")
-	ctx.Equal(len(chainGenerates(ctx)), 4, "maxAttempts = 2: a generator that stays UNAVAILABLE gets 2 calls; Generate calls so far")
+	out, err = hChainGenerate(ctx, kHChainQuestion, []string{"trips"})
+	hChainExpectError(ctx, out, err, "a generator that stays UNAVAILABLE")
+	ctx.Equal(len(hChainGenerates(ctx)), 4, "maxAttempts = 2: a generator that stays UNAVAILABLE gets 2 calls; Generate calls so far")
 	ctx.GRPC.Fail("Generate", codes.InvalidArgument, "bad request", 1, config.Agents)
-	out, err = chainGenerate(ctx, chainQuestion, []string{"trips"})
-	chainExpectError(ctx, out, err, "an INVALID_ARGUMENT from the generator")
-	ctx.Equal(len(chainGenerates(ctx)), 5, "INVALID_ARGUMENT will not change on a retry (1 call); Generate calls so far")
+	out, err = hChainGenerate(ctx, kHChainQuestion, []string{"trips"})
+	hChainExpectError(ctx, out, err, "an INVALID_ARGUMENT from the generator")
+	ctx.Equal(len(hChainGenerates(ctx)), 5, "INVALID_ARGUMENT will not change on a retry (1 call); Generate calls so far")
 	for _, code := range []codes.Code{codes.Internal, codes.ResourceExhausted, codes.PermissionDenied} {
-		calls := len(chainGenerates(ctx))
+		calls := len(hChainGenerates(ctx))
 		ctx.GRPC.Fail("Generate", code, "refused", 1, config.Agents)
-		out, err = chainGenerate(ctx, chainQuestion, []string{"trips"})
-		chainExpectError(ctx, out, err, "the generator answering "+code.String())
-		ctx.Equal(len(chainGenerates(ctx)), calls+1, "only UNAVAILABLE is retried, not %v; Generate calls", code)
+		out, err = hChainGenerate(ctx, kHChainQuestion, []string{"trips"})
+		hChainExpectError(ctx, out, err, "the generator answering "+code.String())
+		ctx.Equal(len(hChainGenerates(ctx)), calls+1, "only UNAVAILABLE is retried, not %v; Generate calls", code)
 	}
 	ctx.GRPC.Fail("PruneColumns", codes.Unavailable, "prune agent restarting", 1, config.Agents)
-	out, err = chainGenerate(ctx, chainQuestion, chainWide)
+	out, err = hChainGenerate(ctx, kHChainQuestion, hChainWide)
 	ctx.Assert(err == nil && out.SQL != "", "one UNAVAILABLE from PruneColumns earns one retry, like Generate, and then SQL; got %+v / %v", out, err)
 	ctx.Equal(len(ctx.GRPC.CallsTo("PruneColumns", "")), 2, "one UNAVAILABLE from PruneColumns, then success; PruneColumns calls")
-	calls := len(chainGenerates(ctx))
+	calls := len(hChainGenerates(ctx))
 	ctx.GRPC.Fail("PruneColumns", codes.InvalidArgument, "bad request", 1, config.Agents)
-	out, err = chainGenerate(ctx, chainQuestion, chainWide)
-	chainExpectError(ctx, out, err, "an INVALID_ARGUMENT from PruneColumns")
+	out, err = hChainGenerate(ctx, kHChainQuestion, hChainWide)
+	hChainExpectError(ctx, out, err, "an INVALID_ARGUMENT from PruneColumns")
 	ctx.Equal(len(ctx.GRPC.CallsTo("PruneColumns", "")), 3, "INVALID_ARGUMENT from PruneColumns is not retried (1 call); PruneColumns calls so far")
-	ctx.Equal(len(chainGenerates(ctx)), calls, "a failed PruneColumns must end the chain before Generate; Generate calls")
+	ctx.Equal(len(hChainGenerates(ctx)), calls, "a failed PruneColumns must end the chain before Generate; Generate calls")
 }
 
 func CheckPruneOverBudget(ctx *harness.Ctx) {
-	chainWorld(ctx)
-	_, err := chainGenerate(ctx, chainQuestion, []string{"trips"})
+	hChainWorld(ctx)
+	_, err := hChainGenerate(ctx, kHChainQuestion, []string{"trips"})
 	ctx.NoError(err, "one small table must generate")
 	ctx.Equal(len(ctx.GRPC.CallsTo("PruneColumns", "")), 0, "a schema well under the token budget was sent to the prune agent (a model call for nothing); PruneColumns calls")
-	out, err := chainGenerate(ctx, chainQuestion, chainWide)
+	out, err := hChainGenerate(ctx, kHChainQuestion, hChainWide)
 	ctx.Equal(len(ctx.GRPC.CallsTo("PruneColumns", "")), 1, "two Tier-1 tables (about 36 000 tokens of DDL) must go through PruneColumns once (the generator answered %v); PruneColumns calls", err)
-	calls := chainGenerates(ctx)
+	calls := hChainGenerates(ctx)
 	sent, _ := calls[len(calls)-1].Request.(*pb.GenerateRequest)
 	ctx.Assert(sent != nil && len(sent.GetSchemas()) > 0 && !strings.Contains(strings.Join(sent.GetSchemas(), " "), "attr_"), "Generate must receive the pruned schemas, not the ones that were too wide")
 	ctx.Assert(err == nil && strings.HasPrefix(out.SQL, "SELECT * FROM trips_tier1"), "the pruned prompt generates SQL, got %+v / %v", out, err)
@@ -1280,17 +1280,17 @@ func CheckPruneOverBudget(ctx *harness.Ctx) {
 	wide := len(catalog.SchemaFor("trips_tier1"))
 	atBudget := strings.Repeat("f", 96000-wide-len(catalog.SchemaFor("")))
 	ctx.Equal(wide+len(catalog.SchemaFor(atBudget)), 96000, "the harness's filler table is the wrong size")
-	_, err = chainGenerate(ctx, chainQuestion, []string{"trips_tier1", atBudget})
+	_, err = hChainGenerate(ctx, kHChainQuestion, []string{"trips_tier1", atBudget})
 	prunes := len(ctx.GRPC.CallsTo("PruneColumns", ""))
 	ctx.Assert(err == nil && prunes == 1, "schemas of exactly the 24 000-token budget are within it and go straight to Generate: %d PruneColumns call(s), %v", prunes-1, err)
-	_, err = chainGenerate(ctx, chainQuestion, []string{"trips_tier1", atBudget + "ffff"})
+	_, err = hChainGenerate(ctx, kHChainQuestion, []string{"trips_tier1", atBudget + "ffff"})
 	prunes = len(ctx.GRPC.CallsTo("PruneColumns", ""))
 	ctx.Assert(err == nil && prunes == 2, "schemas of 24 001 tokens exceed the budget and must be pruned: %d PruneColumns call(s), %v", prunes-1, err)
 }
 
 func CheckParseOutput(ctx *harness.Ctx) {
-	chainWorld(ctx)
-	out, err := chainGenerate(ctx, chainQuestion, []string{"trips"})
+	hChainWorld(ctx)
+	out, err := hChainGenerate(ctx, kHChainQuestion, []string{"trips"})
 	ctx.NoError(err, "a well-formed answer")
 	ctx.Equal(out, Output{SQL: "SELECT * FROM trips WHERE datestr = '2026-11-01'", Explanation: "Rows of trips for 2026-11-01."}, "a well-formed answer comes back as {SQL, Explanation}")
 	for _, c := range []struct{ question, what string }{
@@ -1301,8 +1301,8 @@ func CheckParseOutput(ctx *harness.Ctx) {
 		{"noexpl: trips last week", "no explanation"},
 		{"blank: trips last week", "a blank sql"},
 	} {
-		out, err := chainGenerate(ctx, c.question, []string{"trips"})
-		chainExpectError(ctx, out, err, "an answer with "+c.what)
+		out, err := hChainGenerate(ctx, c.question, []string{"trips"})
+		hChainExpectError(ctx, out, err, "an answer with "+c.what)
 	}
 }
 `,

@@ -866,63 +866,63 @@ import (
 	"chat/subscriptions"
 )
 
-func chatJoin(room, user string) *pb.ClientMsg {
+func hChatJoin(room, user string) *pb.ClientMsg {
 	return &pb.ClientMsg{Kind: &pb.ClientMsg_Join{Join: &pb.Join{Room: room, User: user}}}
 }
 
-func chatSay(text string) *pb.ClientMsg {
+func hChatSay(text string) *pb.ClientMsg {
 	return &pb.ClientMsg{Kind: &pb.ClientMsg_Say{Say: &pb.Say{Text: text}}}
 }
 
-func chatServerMsg(user, text string, ts int64) *pb.ServerMsg {
+func hChatServerMsg(user, text string, ts int64) *pb.ServerMsg {
 	return &pb.ServerMsg{Room: "room-7", User: user, Text: text, Ts: ts}
 }
 
 // chatPublished is one publish(ctx, room, msg) the stream handler made.
-type chatPublished struct {
+type HChatPublished struct {
 	room string
 	msg  *pb.ServerMsg
 }
 
 // chatBus stands in for step 3's room bus: publish only records.
-type chatBus struct {
+type HChatBus struct {
 	mu        sync.Mutex
-	published []chatPublished
+	published []HChatPublished
 }
 
-func (b *chatBus) all() []chatPublished {
+func (b *HChatBus) all() []HChatPublished {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return append([]chatPublished(nil), b.published...)
+	return append([]HChatPublished(nil), b.published...)
 }
 
 // chatEnd is how a stream ended: its status code (OK when the server returned nil).
-type chatEnd struct{ code codes.Code }
+type HChatEnd struct{ code codes.Code }
 
 // chatClientStream is the client side of one stream: what arrived, how it ended, and a read with a
 // (virtual) 1 s patience.
-type chatClientStream struct {
+type HChatClientStream struct {
 	stream pb.Chat_ChatClient
 	cancel context.CancelFunc
 	inbox  chan *pb.ServerMsg
-	ended  chan chatEnd
-	end    *chatEnd
+	ended  chan HChatEnd
+	end    *HChatEnd
 }
 
-func openChat(ctx *harness.Ctx, client pb.ChatClient) *chatClientStream {
+func hOpenChat(ctx *harness.Ctx, client pb.ChatClient) *HChatClientStream {
 	callCtx, cancel := context.WithCancel(context.Background())
 	stream, err := client.Chat(callCtx)
 	ctx.NoError(err, "opening a Chat stream")
-	s := &chatClientStream{stream: stream, cancel: cancel, inbox: make(chan *pb.ServerMsg, 64), ended: make(chan chatEnd, 1)}
+	s := &HChatClientStream{stream: stream, cancel: cancel, inbox: make(chan *pb.ServerMsg, 64), ended: make(chan HChatEnd, 1)}
 	go func() {
 		for {
 			msg, err := stream.Recv()
 			if err == io.EOF {
-				s.ended <- chatEnd{code: codes.OK}
+				s.ended <- HChatEnd{code: codes.OK}
 				return
 			}
 			if err != nil {
-				s.ended <- chatEnd{code: status.Code(err)}
+				s.ended <- HChatEnd{code: status.Code(err)}
 				return
 			}
 			s.inbox <- msg
@@ -931,12 +931,12 @@ func openChat(ctx *harness.Ctx, client pb.ChatClient) *chatClientStream {
 	return s
 }
 
-func (s *chatClientStream) send(ctx *harness.Ctx, msg *pb.ClientMsg) {
+func (s *HChatClientStream) send(ctx *harness.Ctx, msg *pb.ClientMsg) {
 	ctx.NoError(s.stream.Send(msg), "sending %v", msg)
 }
 
 // status is how the stream ended, nil while it is open.
-func (s *chatClientStream) status() *chatEnd {
+func (s *HChatClientStream) status() *HChatEnd {
 	if s.end == nil {
 		select {
 		case e := <-s.ended:
@@ -948,7 +948,7 @@ func (s *chatClientStream) status() *chatEnd {
 }
 
 // read is the next message the server sent, nil when none arrives within 1 s or the stream ended.
-func (s *chatClientStream) read() *pb.ServerMsg {
+func (s *HChatClientStream) read() *pb.ServerMsg {
 	select {
 	case msg := <-s.inbox:
 		return msg
@@ -974,21 +974,21 @@ func (s *chatClientStream) read() *pb.ServerMsg {
 }
 
 // startChat runs the learner's server with publish recording, and returns a client on it.
-func startChat(ctx *harness.Ctx) (pb.ChatClient, *chatBus) {
-	bus := &chatBus{}
+func hStartChat(ctx *harness.Ctx) (pb.ChatClient, *HChatBus) {
+	bus := &HChatBus{}
 	publish = func(_ context.Context, room string, msg *pb.ServerMsg) error {
 		bus.mu.Lock()
 		defer bus.mu.Unlock()
-		bus.published = append(bus.published, chatPublished{room: room, msg: msg})
+		bus.published = append(bus.published, HChatPublished{room: room, msg: msg})
 		return nil
 	}
 	ctx.Main(main)
 	return pb.NewChatClient(ctx.GRPC.Dial("chat-server:9000")), bus
 }
 
-func joinedChat(ctx *harness.Ctx, client pb.ChatClient, room, user string) *chatClientStream {
-	s := openChat(ctx, client)
-	s.send(ctx, chatJoin(room, user))
+func hJoinedChat(ctx *harness.Ctx, client pb.ChatClient, room, user string) *HChatClientStream {
+	s := hOpenChat(ctx, client)
+	s.send(ctx, hChatJoin(room, user))
 	ctx.Settle()
 	if e := s.status(); e != nil {
 		hint := ""
@@ -1001,9 +1001,9 @@ func joinedChat(ctx *harness.Ctx, client pb.ChatClient, room, user string) *chat
 }
 
 func CheckJoinFirst(ctx *harness.Ctx) {
-	client, bus := startChat(ctx)
-	s := openChat(ctx, client)
-	s.send(ctx, chatSay("hi"))
+	client, bus := hStartChat(ctx)
+	s := hOpenChat(ctx, client)
+	s.send(ctx, hChatSay("hi"))
 	ctx.Settle()
 	e := s.status()
 	ctx.Assert(e != nil, "a stream whose first message is a say must end with InvalidArgument, but it did not fail")
@@ -1011,8 +1011,8 @@ func CheckJoinFirst(ctx *harness.Ctx) {
 	ctx.Assert(e.code == codes.InvalidArgument || e.code == codes.FailedPrecondition, "a say before any join ended the call with %v, expected InvalidArgument", e.code)
 	ctx.Equal(subscriptions.Subscribers("room-7"), 0, "a rejected first message must not leave a subscription behind: subscriptions in room-7")
 	ctx.Assert(len(bus.all()) == 0, "a rejected first message must not be published, got %v", bus.all())
-	second := openChat(ctx, client)
-	second.send(ctx, chatJoin("room-7", "ana"))
+	second := hOpenChat(ctx, client)
+	second.send(ctx, hChatJoin("room-7", "ana"))
 	ctx.Settle()
 	if e := second.status(); e != nil {
 		ctx.Fatalf("a stream that starts with a join must stay open, but it ended with %v", e.code)
@@ -1020,10 +1020,10 @@ func CheckJoinFirst(ctx *harness.Ctx) {
 }
 
 func CheckSayPublishes(ctx *harness.Ctx) {
-	client, bus := startChat(ctx)
-	s := joinedChat(ctx, client, "room-7", "ana")
-	s.send(ctx, chatSay("hi"))
-	s.send(ctx, chatSay("anyone here?"))
+	client, bus := hStartChat(ctx)
+	s := hJoinedChat(ctx, client, "room-7", "ana")
+	s.send(ctx, hChatSay("hi"))
+	s.send(ctx, hChatSay("anyone here?"))
 	ctx.Settle()
 	got := bus.all()
 	ctx.Equal(len(got), 2, "two says must publish exactly two messages (published: %v)", got)
@@ -1035,19 +1035,19 @@ func CheckSayPublishes(ctx *harness.Ctx) {
 		ctx.Assert(-60000 < delta && delta < 60000, "ServerMsg.Ts is %d, expected the current time in milliseconds", msg.GetTs())
 	}
 	// Nothing is written back directly: the first thing this client reads is what the bus delivers.
-	subscriptions.LocalDeliver("room-7", chatServerMsg("bo", "hello ana", 1))
+	subscriptions.LocalDeliver("room-7", hChatServerMsg("bo", "hello ana", 1))
 	first := s.read()
 	ctx.Assert(first != nil, "nothing reached the client after the bus delivered a message")
 	ctx.Equal([]string{first.GetUser(), first.GetText()}, []string{"bo", "hello ana"}, "the client received %v before anything came from the bus: a say reaches its sender through publish, never through a direct write; user and text", first)
 }
 
 func CheckSubscribeForward(ctx *harness.Ctx) {
-	client, bus := startChat(ctx)
-	s := joinedChat(ctx, client, "room-7", "ana")
+	client, bus := hStartChat(ctx)
+	s := hJoinedChat(ctx, client, "room-7", "ana")
 	n := subscriptions.Subscribers("room-7")
 	ctx.Equal(n, 1, "after the join, the subscriptions in room-7 on this instance (subscribe(room))")
-	subscriptions.LocalDeliver("room-7", chatServerMsg("bo", "hello ana", 1))
-	subscriptions.LocalDeliver("room-7", chatServerMsg("cy", "hi both", 2))
+	subscriptions.LocalDeliver("room-7", hChatServerMsg("bo", "hello ana", 1))
+	subscriptions.LocalDeliver("room-7", hChatServerMsg("cy", "hi both", 2))
 	first := s.read()
 	second := s.read()
 	if first == nil || second == nil {
@@ -1063,16 +1063,16 @@ func CheckSubscribeForward(ctx *harness.Ctx) {
 }
 
 func CheckCancelCleanup(ctx *harness.Ctx) {
-	client, _ := startChat(ctx)
-	s := joinedChat(ctx, client, "room-7", "ana")
+	client, _ := hStartChat(ctx)
+	s := hJoinedChat(ctx, client, "room-7", "ana")
 	ctx.Equal(subscriptions.Subscribers("room-7"), 1, "after the join, the subscriptions in room-7")
 	s.cancel()
 	ctx.Settle()
 	n := subscriptions.Subscribers("room-7")
 	ctx.Equal(n, 0, "the client hung up: unsubscribe once stream.Context() is done; subscriptions left in room-7 on this instance")
 	// A client that closes its side normally must be cleaned up the same way.
-	second := openChat(ctx, client)
-	second.send(ctx, chatJoin("room-7", "bo"))
+	second := hOpenChat(ctx, client)
+	second.send(ctx, hChatJoin("room-7", "bo"))
 	ctx.Settle()
 	ctx.NoError(second.stream.CloseSend(), "closing the client side")
 	ctx.Settle()
@@ -1097,20 +1097,20 @@ func CheckCancelCleanup(ctx *harness.Ctx) {
 
 namespace {
 
-chat::ClientMsg chatJoin(const std::string& room, const std::string& user) {
+chat::ClientMsg hChatJoin(const std::string& room, const std::string& user) {
   chat::ClientMsg msg;
   msg.mutable_join()->set_room(room);
   msg.mutable_join()->set_user(user);
   return msg;
 }
 
-chat::ClientMsg chatSay(const std::string& text) {
+chat::ClientMsg hChatSay(const std::string& text) {
   chat::ClientMsg msg;
   msg.mutable_say()->set_text(text);
   return msg;
 }
 
-chat::ServerMsg chatServerMsg(const std::string& user, const std::string& text, int64_t ts) {
+chat::ServerMsg hChatServerMsg(const std::string& user, const std::string& text, int64_t ts) {
   chat::ServerMsg msg;
   msg.set_room("room-7");
   msg.set_user(user);
@@ -1120,21 +1120,21 @@ chat::ServerMsg chatServerMsg(const std::string& user, const std::string& text, 
 }
 
 // One publish(room, msg) the stream handler made.
-struct ChatPublished {
+struct HChatPublished {
   std::string room;
   chat::ServerMsg msg;
 };
 
 // What the stand-in for step 3's room bus recorded: publish only records.
-std::mutex chatBusMu;
-std::vector<ChatPublished> chatBus;
+std::mutex hChatBusMu;
+std::vector<HChatPublished> hChatBus;
 
-std::vector<ChatPublished> published() {
-  std::lock_guard<std::mutex> lock(chatBusMu);
-  return chatBus;
+std::vector<HChatPublished> hPublished() {
+  std::lock_guard<std::mutex> lock(hChatBusMu);
+  return hChatBus;
 }
 
-std::vector<std::string> publishedText(const std::vector<ChatPublished>& all) {
+std::vector<std::string> hPublishedText(const std::vector<HChatPublished>& all) {
   std::vector<std::string> out;
   for (const auto& p : all) out.push_back(p.room + ": " + p.msg.ShortDebugString());
   return out;
@@ -1142,7 +1142,7 @@ std::vector<std::string> publishedText(const std::vector<ChatPublished>& all) {
 
 // The client side of one stream: what arrived, how it ended, and a read with a (virtual) 1 s
 // patience. A thread of its own reads the stream (Go's receiving goroutine); it owns the state.
-struct ChatClientStream {
+struct HChatClientStream {
   grpc::ClientContext context;
   std::unique_ptr<grpc::ClientReaderWriter<chat::ClientMsg, chat::ServerMsg>> stream;
   std::mutex mu;
@@ -1171,8 +1171,8 @@ struct ChatClientStream {
   }
 };
 
-std::shared_ptr<ChatClientStream> openChat(chat::Chat::Stub& client) {
-  auto s = std::make_shared<ChatClientStream>();
+std::shared_ptr<HChatClientStream> hOpenChat(chat::Chat::Stub& client) {
+  auto s = std::make_shared<HChatClientStream>();
   s->stream = client.Chat(&s->context);
   std::thread([s] {
     chat::ServerMsg msg;
@@ -1190,15 +1190,15 @@ std::shared_ptr<ChatClientStream> openChat(chat::Chat::Stub& client) {
 }
 
 // Runs the learner's server with publish recording, and returns a client on it.
-std::unique_ptr<chat::Chat::Stub> startChat(harness::Ctx& ctx) {
+std::unique_ptr<chat::Chat::Stub> hStartChat(harness::Ctx& ctx) {
   ctx.Main();
   return chat::Chat::NewStub(ctx.GRPC.Dial("chat-server:9000"));
 }
 
-std::shared_ptr<ChatClientStream> joinedChat(harness::Ctx& ctx, chat::Chat::Stub& client, const std::string& room,
+std::shared_ptr<HChatClientStream> hJoinedChat(harness::Ctx& ctx, chat::Chat::Stub& client, const std::string& room,
                                              const std::string& user) {
-  auto s = openChat(client);
-  s->send(ctx, chatJoin(room, user));
+  auto s = hOpenChat(client);
+  s->send(ctx, hChatJoin(room, user));
   ctx.Settle();
   if (const auto e = s->status()) {
     ctx.Fatalf("the stream ended with %v right after the join%s", *e,
@@ -1211,14 +1211,14 @@ std::shared_ptr<ChatClientStream> joinedChat(harness::Ctx& ctx, chat::Chat::Stub
 
 // Stands in for step 3's room bus (room_bus.cpp), as the Go harness does: publish only records.
 void publish(const std::string& room, const chat::ServerMsg& msg) {
-  std::lock_guard<std::mutex> lock(chatBusMu);
-  chatBus.push_back({room, msg});
+  std::lock_guard<std::mutex> lock(hChatBusMu);
+  hChatBus.push_back({room, msg});
 }
 
 void CheckJoinFirst(harness::Ctx& ctx) {
-  auto client = startChat(ctx);
-  auto s = openChat(*client);
-  s->send(ctx, chatSay("hi"));
+  auto client = hStartChat(ctx);
+  auto s = hOpenChat(*client);
+  s->send(ctx, hChatSay("hi"));
   ctx.Settle();
   const auto e = s->status();
   ctx.Assert(e.has_value(), "a stream whose first message is a say must end with INVALID_ARGUMENT, but it did not fail");
@@ -1227,9 +1227,9 @@ void CheckJoinFirst(harness::Ctx& ctx) {
              "a say before any join ended the call with %v, expected INVALID_ARGUMENT", *e);
   ctx.Equal(subscribers("room-7"), 0,
             "a rejected first message must not leave a subscription behind: subscriptions in room-7");
-  ctx.Assert(published().empty(), "a rejected first message must not be published, got %v", publishedText(published()));
-  auto second = openChat(*client);
-  second->send(ctx, chatJoin("room-7", "ana"));
+  ctx.Assert(hPublished().empty(), "a rejected first message must not be published, got %v", hPublishedText(hPublished()));
+  auto second = hOpenChat(*client);
+  second->send(ctx, hChatJoin("room-7", "ana"));
   ctx.Settle();
   if (const auto e2 = second->status()) {
     ctx.Fatalf("a stream that starts with a join must stay open, but it ended with %v", *e2);
@@ -1237,13 +1237,13 @@ void CheckJoinFirst(harness::Ctx& ctx) {
 }
 
 void CheckSayPublishes(harness::Ctx& ctx) {
-  auto client = startChat(ctx);
-  auto s = joinedChat(ctx, *client, "room-7", "ana");
-  s->send(ctx, chatSay("hi"));
-  s->send(ctx, chatSay("anyone here?"));
+  auto client = hStartChat(ctx);
+  auto s = hJoinedChat(ctx, *client, "room-7", "ana");
+  s->send(ctx, hChatSay("hi"));
+  s->send(ctx, hChatSay("anyone here?"));
   ctx.Settle();
-  const auto got = published();
-  ctx.Equal(got.size(), 2, "two says must publish exactly two messages (published: %v)", publishedText(got));
+  const auto got = hPublished();
+  ctx.Equal(got.size(), 2, "two says must publish exactly two messages (published: %v)", hPublishedText(got));
   const std::vector<std::string> texts = {"hi", "anyone here?"};
   for (size_t i = 0; i < texts.size(); i++) {
     const auto& [room, msg] = got[i];
@@ -1254,7 +1254,7 @@ void CheckSayPublishes(harness::Ctx& ctx) {
     ctx.Assert(-60000 < delta && delta < 60000, "ServerMsg.ts is %d, expected the current time in milliseconds", msg.ts());
   }
   // Nothing is written back directly: the first thing this client reads is what the bus delivers.
-  local_deliver("room-7", chatServerMsg("bo", "hello ana", 1));
+  local_deliver("room-7", hChatServerMsg("bo", "hello ana", 1));
   const auto first = s->read();
   ctx.Assert(first.has_value(), "nothing reached the client after the bus delivered a message");
   ctx.Equal(std::vector<std::string>{first->user(), first->text()}, {"bo", "hello ana"},
@@ -1264,11 +1264,11 @@ void CheckSayPublishes(harness::Ctx& ctx) {
 }
 
 void CheckSubscribeForward(harness::Ctx& ctx) {
-  auto client = startChat(ctx);
-  auto s = joinedChat(ctx, *client, "room-7", "ana");
+  auto client = hStartChat(ctx);
+  auto s = hJoinedChat(ctx, *client, "room-7", "ana");
   ctx.Equal(subscribers("room-7"), 1, "after the join, the subscriptions in room-7 on this instance (subscribe(room, …))");
-  local_deliver("room-7", chatServerMsg("bo", "hello ana", 1));
-  local_deliver("room-7", chatServerMsg("cy", "hi both", 2));
+  local_deliver("room-7", hChatServerMsg("bo", "hello ana", 1));
+  local_deliver("room-7", hChatServerMsg("cy", "hi both", 2));
   const auto first = s->read();
   const auto second = s->read();
   if (!first || !second) {
@@ -1279,12 +1279,12 @@ void CheckSubscribeForward(harness::Ctx& ctx) {
             "the first forwarded message's user and text");
   ctx.Equal(std::vector<std::string>{second->user(), second->text()}, {"cy", "hi both"},
             "the second forwarded message's user and text (forward in order)");
-  ctx.Assert(published().empty(), "forwarding bus messages must not publish them again");
+  ctx.Assert(hPublished().empty(), "forwarding bus messages must not publish them again");
 }
 
 void CheckCancelCleanup(harness::Ctx& ctx) {
-  auto client = startChat(ctx);
-  auto s = joinedChat(ctx, *client, "room-7", "ana");
+  auto client = hStartChat(ctx);
+  auto s = hJoinedChat(ctx, *client, "room-7", "ana");
   ctx.Equal(subscribers("room-7"), 1, "after the join, the subscriptions in room-7");
   s->context.TryCancel();
   ctx.Settle();
@@ -1292,8 +1292,8 @@ void CheckCancelCleanup(harness::Ctx& ctx) {
             "the client hung up: unsubscribe once the call is cancelled (ctx->IsCancelled()); subscriptions left in "
             "room-7 on this instance");
   // A client that closes its side normally must be cleaned up the same way.
-  auto second = openChat(*client);
-  second->send(ctx, chatJoin("room-7", "bo"));
+  auto second = hOpenChat(*client);
+  second->send(ctx, hChatJoin("room-7", "bo"));
   ctx.Settle();
   ctx.Assert(second->stream->WritesDone(), "closing the client side failed");
   ctx.Settle();

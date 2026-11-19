@@ -460,45 +460,45 @@ import (
 	"leetbuild/harness"
 )
 
-const stateTTL = 7 * 24 * 3600
+const kHStateTTL = 7 * 24 * 3600
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func stateCommit(ctx *harness.Ctx, partitionID string, total int) bool {
-	done, err := commitPartition(stateBg, "ld-1", partitionID, total)
+func hStateCommit(ctx *harness.Ctx, partitionID string, total int) bool {
+	done, err := commitPartition(hStateBg, "ld-1", partitionID, total)
 	ctx.NoError(err, "commitPartition(ld-1, %s, %d) failed", partitionID, total)
 	return done
 }
 
-func stateCommitOf(ctx *harness.Ctx, loadID, partitionID string, total int) bool {
-	done, err := commitPartition(stateBg, loadID, partitionID, total)
+func hStateCommitOf(ctx *harness.Ctx, loadID, partitionID string, total int) bool {
+	done, err := commitPartition(hStateBg, loadID, partitionID, total)
 	ctx.NoError(err, "commitPartition(%s, %s, %d) failed", loadID, partitionID, total)
 	return done
 }
 
-func stateComplete(ctx *harness.Ctx) bool {
-	done, err := isComplete(stateBg, "ld-1")
+func hStateComplete(ctx *harness.Ctx) bool {
+	done, err := isComplete(hStateBg, "ld-1")
 	ctx.NoError(err, "isComplete(ld-1) failed")
 	return done
 }
 
 func CheckPartitionSet(ctx *harness.Ctx) {
-	ctx.Equal(stateCommit(ctx, "p-0", 2), false, "the first of two partitions must not complete the load; completed")
-	ctx.Equal(stateCommit(ctx, "p-0", 2), false, "p-0 committed a second time (a redelivered task) completed a two-partition load whose p-1 never committed: a partition counts once; completed")
-	ctx.Equal(stateComplete(ctx), false, "ld-1 must not read as complete with p-1 missing; complete")
-	ctx.Equal(stateCommit(ctx, "p-1", 2), true, "the commit of p-1, the last missing partition, must complete the load; completed")
-	ctx.Equal(stateComplete(ctx), true, "after both partitions committed, ld-1 complete")
+	ctx.Equal(hStateCommit(ctx, "p-0", 2), false, "the first of two partitions must not complete the load; completed")
+	ctx.Equal(hStateCommit(ctx, "p-0", 2), false, "p-0 committed a second time (a redelivered task) completed a two-partition load whose p-1 never committed: a partition counts once; completed")
+	ctx.Equal(hStateComplete(ctx), false, "ld-1 must not read as complete with p-1 missing; complete")
+	ctx.Equal(hStateCommit(ctx, "p-1", 2), true, "the commit of p-1, the last missing partition, must complete the load; completed")
+	ctx.Equal(hStateComplete(ctx), true, "after both partitions committed, ld-1 complete")
 }
 
 func CheckCompleteOnce(ctx *harness.Ctx) {
-	ctx.Equal(stateCommit(ctx, "p-0", 3), false, "the first of three partitions must not complete the load; completed")
+	ctx.Equal(hStateCommit(ctx, "p-0", 3), false, "the first of three partitions must not complete the load; completed")
 	// Another worker commits p-2 right after this worker's first command on the partition set.
 	rival := ctx.Redis.After("load:ld-1:partitions", func() any {
-		done, err := commitPartition(stateBg, "ld-1", "p-2", 3)
+		done, err := commitPartition(hStateBg, "ld-1", "p-2", 3)
 		ctx.NoError(err, "the other worker's commit failed")
 		return done
 	})
-	mine := stateCommit(ctx, "p-1", 3)
+	mine := hStateCommit(ctx, "p-1", 3)
 	ctx.Assert(rival.Fired, "commitPartition never touched load:ld-1:partitions")
 	ctx.Assert(rival.Err == nil, "the other worker's commit failed: %v", rival.Err)
 	winners := 0
@@ -508,17 +508,17 @@ func CheckCompleteOnce(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Equal(winners, 1, "two workers committed the last two partitions at once (this one %v, the other %v): exactly one may be told it completed the load; the commits answered true", mine, rival.Result)
-	ctx.Equal(stateComplete(ctx), true, "after all three partitions committed, ld-1 complete")
-	ctx.Equal(stateCommit(ctx, "p-2", 3), false, "a redelivered final partition must not report completing the load a second time; completed")
+	ctx.Equal(hStateComplete(ctx), true, "after all three partitions committed, ld-1 complete")
+	ctx.Equal(hStateCommit(ctx, "p-2", 3), false, "a redelivered final partition must not report completing the load a second time; completed")
 	// The last partition of ld-2 was redelivered: two workers commit it at once, and the other one
 	// lands right after this worker's first command on the completion flag.
-	ctx.Equal(stateCommitOf(ctx, "ld-2", "p-0", 2), false, "the first of two partitions must not complete the load; completed")
+	ctx.Equal(hStateCommitOf(ctx, "ld-2", "p-0", 2), false, "the first of two partitions must not complete the load; completed")
 	twin := ctx.Redis.After("load:ld-2:complete", func() any {
-		done, err := commitPartition(stateBg, "ld-2", "p-1", 2)
+		done, err := commitPartition(hStateBg, "ld-2", "p-1", 2)
 		ctx.NoError(err, "the other worker's commit failed")
 		return done
 	})
-	again := stateCommitOf(ctx, "ld-2", "p-1", 2)
+	again := hStateCommitOf(ctx, "ld-2", "p-1", 2)
 	ctx.Assert(twin.Fired, "the commit of the last partition never touched load:ld-2:complete")
 	both := 0
 	for _, won := range []any{again, twin.Result} {
@@ -532,15 +532,15 @@ func CheckCompleteOnce(ctx *harness.Ctx) {
 func CheckExpiry(ctx *harness.Ctx) {
 	// The TTL as it stands right after the first command that touched each key: -2 if it did not create it.
 	created := ctx.Redis.After("load:ld-1:partitions", func() any { return ctx.Redis.TTL("load:ld-1:partitions") })
-	stateCommit(ctx, "p-0", 2)
+	hStateCommit(ctx, "p-0", 2)
 	ctx.Assert(created.Fired && created.Result != any(int64(-1)), "load:ld-1:partitions existed without a TTL right after the command that wrote it: the TTL is set in the same step as the write, or a crash in between leaves it forever")
 	ttl := ctx.Redis.TTL("load:ld-1:partitions")
-	ctx.Assert(stateTTL-60 <= ttl && ttl <= stateTTL, "load:ld-1:partitions has TTL %d, expected loadTTLSeconds (%d s): an abandoned load's progress must expire", ttl, stateTTL)
+	ctx.Assert(kHStateTTL-60 <= ttl && ttl <= kHStateTTL, "load:ld-1:partitions has TTL %d, expected loadTTLSeconds (%d s): an abandoned load's progress must expire", ttl, kHStateTTL)
 	created = ctx.Redis.After("load:ld-1:complete", func() any { return ctx.Redis.TTL("load:ld-1:complete") })
-	stateCommit(ctx, "p-1", 2)
+	hStateCommit(ctx, "p-1", 2)
 	ctx.Assert(created.Fired && created.Result != any(int64(-1)), "load:ld-1:complete existed without a TTL right after the command that set it: the TTL is set in the same step as the flag")
 	ttl = ctx.Redis.TTL("load:ld-1:complete")
-	ctx.Assert(stateTTL-60 <= ttl && ttl <= stateTTL, "load:ld-1:complete has TTL %d, expected loadTTLSeconds (%d s): a flag that outlives its load makes a re-run look done", ttl, stateTTL)
+	ctx.Assert(kHStateTTL-60 <= ttl && ttl <= kHStateTTL, "load:ld-1:complete has TTL %d, expected loadTTLSeconds (%d s): a flag that outlives its load makes a re-run look done", ttl, kHStateTTL)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -551,9 +551,9 @@ func CheckExpiry(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr long long kStateTtl = 7 * 24 * 3600;
+constexpr long long kHStateTtl = 7 * 24 * 3600;
 
-struct Rival {
+struct HRival {
   bool fired = false;
   bool done = false;
   std::optional<std::string> err;
@@ -572,7 +572,7 @@ void CheckPartitionSet(harness::Ctx& ctx) {
 void CheckCompleteOnce(harness::Ctx& ctx) {
   ctx.Equal(commitPartition("ld-1", "p-0", 3), false, "the first of three partitions must not complete the load; completed");
   // Another worker commits p-2 right after this worker's first command on the partition set.
-  auto rival = std::make_shared<Rival>();
+  auto rival = std::make_shared<HRival>();
   ctx.Redis.After("load:ld-1:partitions", [rival] {
     rival->fired = true;
     try {
@@ -590,7 +590,7 @@ void CheckCompleteOnce(harness::Ctx& ctx) {
   // The last partition of ld-2 was redelivered: two workers commit it at once, and the other one
   // lands right after this worker's first command on the completion flag.
   ctx.Equal(commitPartition("ld-2", "p-0", 2), false, "the first of two partitions must not complete the load; completed");
-  auto twin = std::make_shared<Rival>();
+  auto twin = std::make_shared<HRival>();
   ctx.Redis.After("load:ld-2:complete", [twin] {
     twin->fired = true;
     try {
@@ -612,13 +612,13 @@ void CheckExpiry(harness::Ctx& ctx) {
   commitPartition("ld-1", "p-0", 2);
   ctx.Assert(*created != 0 && *created != -1, "load:ld-1:partitions existed without a TTL right after the command that wrote it: the TTL is set in the same step as the write, or a crash in between leaves it forever");
   long long ttl = ctx.Redis.TTL("load:ld-1:partitions");
-  ctx.Assert(kStateTtl - 60 <= ttl && ttl <= kStateTtl, "load:ld-1:partitions has TTL %d, expected kLoadTtlSeconds (%d s): an abandoned load's progress must expire", ttl, kStateTtl);
+  ctx.Assert(kHStateTtl - 60 <= ttl && ttl <= kHStateTtl, "load:ld-1:partitions has TTL %d, expected kLoadTtlSeconds (%d s): an abandoned load's progress must expire", ttl, kHStateTtl);
   *created = 0;
   ctx.Redis.After("load:ld-1:complete", [&ctx, created] { *created = ctx.Redis.TTL("load:ld-1:complete"); });
   commitPartition("ld-1", "p-1", 2);
   ctx.Assert(*created != 0 && *created != -1, "load:ld-1:complete existed without a TTL right after the command that set it: the TTL is set in the same step as the flag");
   ttl = ctx.Redis.TTL("load:ld-1:complete");
-  ctx.Assert(kStateTtl - 60 <= ttl && ttl <= kStateTtl, "load:ld-1:complete has TTL %d, expected kLoadTtlSeconds (%d s): a flag that outlives its load makes a re-run look done", ttl, kStateTtl);
+  ctx.Assert(kHStateTtl - 60 <= ttl && ttl <= kHStateTtl, "load:ld-1:complete has TTL %d, expected kLoadTtlSeconds (%d s): a flag that outlives its load makes a re-run look done", ttl, kHStateTtl);
 }
 `,
   },
