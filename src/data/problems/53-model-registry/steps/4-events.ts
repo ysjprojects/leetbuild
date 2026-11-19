@@ -813,11 +813,11 @@ import (
 )
 
 const (
-	eventsTopic = "model.event"
+	kHEventsTopic = "model.event"
 	hReport     = "precision 0.91 on holdout-2026-10; samples: txn 88231 flagged, txn 90412 cleared"
 )
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
 func hChange(name string, version int, stage string) store.Change {
 	return store.Change{Name: name, Version: version, ArtifactDigest: fmt.Sprintf("sha256:%s%d", name, version), EvalID: fmt.Sprintf("e-%s-%d", name, version), Pool: "prod", Stage: stage}
@@ -825,12 +825,12 @@ func hChange(name string, version int, stage string) store.Change {
 
 func hSeedEvals() {
 	for _, c := range []store.Change{hChange("fraud", 3, ""), hChange("fraud", 4, ""), hChange("churn", 1, "")} {
-		store.AddEval(eventsBg, c.EvalID, c.Name, c.ArtifactDigest, 0.91, 0.85, hReport)
+		store.AddEval(hEventsBg, c.EvalID, c.Name, c.ArtifactDigest, 0.91, 0.85, hReport)
 	}
 }
 
 func hAnnounce(ctx *harness.Ctx, c store.Change) bool {
-	ok, err := announce(eventsBg, c)
+	ok, err := announce(hEventsBg, c)
 	ctx.NoError(err, "announce(%s %d) failed", c.Name, c.Version)
 	return ok
 }
@@ -857,9 +857,9 @@ func CheckModelKey(ctx *harness.Ctx) {
 	ctx.Settle()
 	ctx.Equal(acked, []bool{true, true, true}, "three acknowledged deliveries must each return true; announce's results")
 	ctx.Equal(ctx.Redis.LLen("outbox"), 0, "the broker acknowledged every event: an outbox row would make the relay publish it twice; the outbox rows")
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three announce calls must produce three records on model.event; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"fraud", "churn", "fraud"}, "the records must be keyed by the model names")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"fraud", "churn", "fraud"}, "the records must be keyed by the model names")
 	ctx.Equal(records[0].Partition, records[2].Partition, "fraud's promotion and rollback must share a partition, or a consumer can apply the rollback first; the partitions")
 }
 
@@ -867,7 +867,7 @@ func CheckIdsOnly(ctx *harness.Ctx) {
 	hSeedEvals()
 	hAnnounce(ctx, hChange("fraud", 3, "promoted"))
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one announce must produce one record; the records")
 	var value map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the payload must be JSON")
@@ -889,34 +889,34 @@ func CheckIdsOnly(ctx *harness.Ctx) {
 
 func CheckCommitBeforeProduce(ctx *harness.Ctx) {
 	hSeedEvals()
-	probe := ctx.Redis.After("model:fraud:history", func() any { return len(ctx.Kafka.Records(eventsTopic)) })
+	probe := ctx.Redis.After("model:fraud:history", func() any { return len(ctx.Kafka.Records(kHEventsTopic)) })
 	hAnnounce(ctx, hChange("fraud", 3, "promoted"))
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "announce never committed the change (no write to model:fraud:history)")
 	ctx.Equal(probe.Result, 0, "when the change was committed the topic already held records: a consumer could act on a change the registry had not committed. Commit, then produce; the records at commit time")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the commit; the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "the event must still be produced after the commit; the records")
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
 	hSeedEvals()
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
 	hAnnounce(ctx, hChange("fraud", 3, "promoted"))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
 	hAnnounce(ctx, hChange("fraud", 4, "promoted"))
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxFromDelivery(ctx *harness.Ctx) {
 	hSeedEvals()
-	ctx.Kafka.FailNext(eventsTopic, 1)
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
 	ok := hAnnounce(ctx, hChange("fraud", 3, "promoted"))
 	ctx.Settle()
 	rows := hOutboxRows(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused the delivery: without an outbox row the promotion never reaches the serving consumers; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "fraud" && rows[0].Payload["model"] == "fraud", "the outbox row is %+v, expected the topic, the key fraud and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == "fraud" && rows[0].Payload["model"] == "fraud", "the outbox row is %+v, expected the topic, the key fraud and the payload", rows[0])
 	fields := make([]string, 0, len(rows[0].Payload))
 	for k := range rows[0].Payload {
 		fields = append(fields, k)
@@ -930,7 +930,7 @@ func CheckOutboxFromDelivery(ctx *harness.Ctx) {
 		"the outbox payload is %v, expected the event the broker refused: ids only, with the event_id RecordChange committed", rows[0].Payload)
 	ctx.Equal(ok, false, "announce's result after a refused delivery")
 	ctx.Equal(ctx.Redis.LLen("model:fraud:history"), 1, "the change must stay committed when only the produce failed; the history")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
 	ok = hAnnounce(ctx, hChange("fraud", 4, "promoted"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
@@ -950,8 +950,8 @@ func CheckOutboxFromDelivery(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "model.event";
-const std::string kReport = "precision 0.91 on holdout-2026-10; samples: txn 88231 flagged, txn 90412 cleared";
+const std::string kHEventsTopic = "model.event";
+const std::string kHReport = "precision 0.91 on holdout-2026-10; samples: txn 88231 flagged, txn 90412 cleared";
 
 store::Change hChange(const std::string& name, long version, const std::string& stage = "promoted") {
   const std::string v = std::to_string(version);
@@ -959,7 +959,7 @@ store::Change hChange(const std::string& name, long version, const std::string& 
 }
 
 void hSeedEvals() {
-  for (const auto& c : {hChange("fraud", 3), hChange("fraud", 4), hChange("churn", 1)}) store::addEval(c.eval_id, c.name, c.artifact_digest, 0.91, 0.85, kReport);
+  for (const auto& c : {hChange("fraud", 3), hChange("fraud", 4), hChange("churn", 1)}) store::addEval(c.eval_id, c.name, c.artifact_digest, 0.91, 0.85, kHReport);
 }
 
 std::vector<nlohmann::json> hOutboxRows(harness::Ctx& ctx) {
@@ -985,9 +985,9 @@ void CheckModelKey(harness::Ctx& ctx) {
   ctx.Assert(acked == std::vector<bool>{true, true, true}, "three acknowledged deliveries must each return true; announce returned %t, %t, %t", static_cast<bool>(acked[0]),
              static_cast<bool>(acked[1]), static_cast<bool>(acked[2]));
   ctx.Equal(ctx.Redis.LRange("outbox", 0, -1).size(), 0, "the broker acknowledged every event: an outbox row would make the relay publish it twice; the outbox rows");
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three announce calls must produce three records on model.event; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"fraud", "churn", "fraud"}, "the records must be keyed by the model names");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"fraud", "churn", "fraud"}, "the records must be keyed by the model names");
   ctx.Equal(records[0].Partition, records[2].Partition, "fraud's promotion and rollback must share a partition, or a consumer can apply the rollback first; the partitions");
 }
 
@@ -995,7 +995,7 @@ void CheckIdsOnly(harness::Ctx& ctx) {
   hSeedEvals();
   announce(hChange("fraud", 3));
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one announce must produce one record; the records");
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
   ctx.Assert(value.is_object(), "the payload must be JSON, got %s", values[0]);
@@ -1017,7 +1017,7 @@ void CheckCommitBeforeProduce(harness::Ctx& ctx) {
   bool fired = false;
   ctx.Redis.After("model:fraud:history", [&] {
     fired = true;
-    atCommit = ctx.Kafka.Records(kEventsTopic).size();
+    atCommit = ctx.Kafka.Records(kHEventsTopic).size();
   });
   announce(hChange("fraud", 3));
   ctx.Settle();
@@ -1025,29 +1025,29 @@ void CheckCommitBeforeProduce(harness::Ctx& ctx) {
   ctx.Equal(atCommit, 0,
             "when the change was committed the topic already held records: a consumer could act on a change the registry had not committed. Commit, "
             "then produce; the records at commit time");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the event must still be produced after the commit; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "the event must still be produced after the commit; the records");
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
   hSeedEvals();
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
   announce(hChange("fraud", 3));
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
   announce(hChange("fraud", 4));
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxFromDelivery(harness::Ctx& ctx) {
   hSeedEvals();
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   bool ok = announce(hChange("fraud", 3));
   ctx.Settle();
   auto rows = hOutboxRows(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused the delivery: without an outbox row the promotion never reaches the serving consumers; the rows");
-  ctx.Assert(hText(rows[0], "topic") == kEventsTopic && hText(rows[0], "key") == "fraud" && rows[0].contains("payload") && hText(rows[0]["payload"], "model") == "fraud",
+  ctx.Assert(hText(rows[0], "topic") == kHEventsTopic && hText(rows[0], "key") == "fraud" && rows[0].contains("payload") && hText(rows[0]["payload"], "model") == "fraud",
              "the outbox row is %s, expected the topic, the key fraud and the payload", rows[0].dump());
   std::vector<std::string> fields;
   if (rows[0].contains("payload") && rows[0]["payload"].is_object()) {
@@ -1061,7 +1061,7 @@ void CheckOutboxFromDelivery(harness::Ctx& ctx) {
              "the outbox payload is %s, expected the event the broker refused: ids only, with the event_id recordChange committed", rows[0].value("payload", nlohmann::json()).dump());
   ctx.Equal(ok, false, "announce's result after a refused delivery");
   ctx.Equal(ctx.Redis.LRange("model:fraud:history", 0, -1).size(), 1, "the change must stay committed when only the produce failed; the history");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = announce(hChange("fraud", 4));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;

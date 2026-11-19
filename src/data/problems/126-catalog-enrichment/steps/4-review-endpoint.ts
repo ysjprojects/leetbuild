@@ -1013,12 +1013,12 @@ import (
 	"leetbuild/harness"
 )
 
-var reviewBg = context.Background()
+var hReviewBg = context.Background()
 
-var reviewCorrection = map[string]any{"decision": "correct", "attributes": map[string]any{"brand": "Oatly"}, "note": "brand printed on the carton"}
+var hReviewCorrection = map[string]any{"decision": "correct", "attributes": map[string]any{"brand": "Oatly"}, "note": "brand printed on the carton"}
 
 // reviewAPI parks one proposal for sku-1, gives the lease to holder, and stands in for step 5's publish.
-func reviewAPI(ctx *harness.Ctx, holder string) (*harness.HTTP, *[]store.Event) {
+func hReviewAPI(ctx *harness.Ctx, holder string) (*harness.HTTP, *[]store.Event) {
 	published := []store.Event{}
 	publish = func(_ context.Context, event store.Event) error {
 		published = append(published, event)
@@ -1026,7 +1026,7 @@ func reviewAPI(ctx *harness.Ctx, holder string) (*harness.HTTP, *[]store.Event) 
 	}
 	proposal := store.Result{SkuID: "sku-1", Merchant: "m-1", Attributes: map[string]any{"brand": nil, "size": 1.0, "unit": "l", "organic": false, "category": "plant-milk"},
 		Confidence: 0.62, TaxonomyVersion: taxonomy.Version, Source: "model", Status: "review"}
-	ctx.NoError(store.EnqueueReview(reviewBg, proposal, "brand 'Glowra' is not a taxonomy candidate"), "parking the proposal")
+	ctx.NoError(store.EnqueueReview(hReviewBg, proposal, "brand 'Glowra' is not a taxonomy candidate"), "parking the proposal")
 	if holder != "" {
 		ctx.Redis.Set("review:lease:sku-1", holder)
 	}
@@ -1035,66 +1035,66 @@ func reviewAPI(ctx *harness.Ctx, holder string) (*harness.HTTP, *[]store.Event) 
 	return ctx.HTTP(mux), &published
 }
 
-func reviewDecide(c *harness.HTTP, skuID string, headers ...string) *harness.Response {
-	return c.Post("/v1/skus/"+skuID+"/review", reviewCorrection, headers...)
+func hReviewDecide(c *harness.HTTP, skuID string, headers ...string) *harness.Response {
+	return c.Post("/v1/skus/"+skuID+"/review", hReviewCorrection, headers...)
 }
 
-func reviewUntouched(ctx *harness.Ctx, published *[]store.Event, why string) {
-	ctx.Assert(store.ReadLabel(reviewBg, "sku-1", 1) == nil && len(*published) == 0 && store.CatalogCurrent(reviewBg, "sku-1") == nil, "%s, yet a label, an event or a catalog row was written", why)
-	ctx.Assert(store.Pending(reviewBg, "sku-1") != nil, "%s, yet the proposal left the review queue", why)
+func hReviewUntouched(ctx *harness.Ctx, published *[]store.Event, why string) {
+	ctx.Assert(store.ReadLabel(hReviewBg, "sku-1", 1) == nil && len(*published) == 0 && store.CatalogCurrent(hReviewBg, "sku-1") == nil, "%s, yet a label, an event or a catalog row was written", why)
+	ctx.Assert(store.Pending(hReviewBg, "sku-1") != nil, "%s, yet the proposal left the review queue", why)
 }
 
 func CheckReviewerAuth(ctx *harness.Ctx) {
-	c, published := reviewAPI(ctx, "ana")
-	r := reviewDecide(c, "sku-1", "Idempotency-Key", "k-1", "X-Reviewer-Role", "reviewer")
+	c, published := hReviewAPI(ctx, "ana")
+	r := hReviewDecide(c, "sku-1", "Idempotency-Key", "k-1", "X-Reviewer-Role", "reviewer")
 	ctx.Equal(r.Status, 401, "a decision without X-Reviewer-Id; the status")
-	r = reviewDecide(c, "sku-1", "Idempotency-Key", "k-2", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "shopper")
+	r = hReviewDecide(c, "sku-1", "Idempotency-Key", "k-2", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "shopper")
 	ctx.Equal(r.Status, 403, "a decision from role 'shopper'; the status")
-	r = reviewDecide(c, "sku-1", "Idempotency-Key", "k-4", "X-Reviewer-Id", "ana")
+	r = hReviewDecide(c, "sku-1", "Idempotency-Key", "k-4", "X-Reviewer-Id", "ana")
 	ctx.Equal(r.Status, 403, "a decision with no X-Reviewer-Role (only the roles in reviewerRoles decide); the status")
-	reviewUntouched(ctx, published, "after three refused requests")
-	r = reviewDecide(c, "sku-1", "Idempotency-Key", "k-3", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "catalog-admin")
+	hReviewUntouched(ctx, published, "after three refused requests")
+	r = hReviewDecide(c, "sku-1", "Idempotency-Key", "k-3", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "catalog-admin")
 	ctx.Equal(r.Status, 200, "a catalog-admin holding the lease (%s); the status", r.Text())
 }
 
 func CheckLeaseHeld(ctx *harness.Ctx) {
-	c, published := reviewAPI(ctx, "ben")
+	c, published := hReviewAPI(ctx, "ben")
 	ana := []string{"X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer"}
-	r := reviewDecide(c, "sku-1", append([]string{"Idempotency-Key", "k-1"}, ana...)...)
+	r := hReviewDecide(c, "sku-1", append([]string{"Idempotency-Key", "k-1"}, ana...)...)
 	ctx.Equal(r.Status, 409, "ana decided on a SKU whose review lease ben holds; the status")
 	ctx.Redis.Del("review:lease:sku-1")
-	r = reviewDecide(c, "sku-1", append([]string{"Idempotency-Key", "k-4"}, ana...)...)
+	r = hReviewDecide(c, "sku-1", append([]string{"Idempotency-Key", "k-4"}, ana...)...)
 	ctx.Equal(r.Status, 409, "ana decided on a SKU whose review lease nobody holds; the status")
-	reviewUntouched(ctx, published, "after two decisions without the lease")
+	hReviewUntouched(ctx, published, "after two decisions without the lease")
 	ctx.Redis.Set("review:lease:sku-1", "ana")
-	r = reviewDecide(c, "sku-1", append([]string{"Idempotency-Key", "k-2"}, ana...)...)
+	r = hReviewDecide(c, "sku-1", append([]string{"Idempotency-Key", "k-2"}, ana...)...)
 	ctx.Equal(r.Status, 200, "the lease holder's decision (%s); the status", r.Text())
 	_, held := ctx.Redis.Get("review:lease:sku-1")
 	ctx.Assert(!held, "the decision is made: release the lease so the SKU does not stay claimed for 15 minutes")
 	ctx.Redis.Set("review:lease:sku-404", "ana")
-	r = reviewDecide(c, "sku-404", append([]string{"Idempotency-Key", "k-3"}, ana...)...)
+	r = hReviewDecide(c, "sku-404", append([]string{"Idempotency-Key", "k-3"}, ana...)...)
 	ctx.Equal(r.Status, 404, "a decision by the lease holder on a SKU with no proposal; the status")
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c, published := reviewAPI(ctx, "ana")
+	c, published := hReviewAPI(ctx, "ana")
 	ana := []string{"X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer"}
-	r := reviewDecide(c, "sku-1", ana...)
+	r := hReviewDecide(c, "sku-1", ana...)
 	ctx.Equal(r.Status, 400, "a decision without Idempotency-Key; the status")
-	reviewUntouched(ctx, published, "after a decision without Idempotency-Key")
-	first := reviewDecide(c, "sku-1", append([]string{"Idempotency-Key", "k-1"}, ana...)...)
+	hReviewUntouched(ctx, published, "after a decision without Idempotency-Key")
+	first := hReviewDecide(c, "sku-1", append([]string{"Idempotency-Key", "k-1"}, ana...)...)
 	ctx.Equal(first.Status, 200, "the first decision (%s); the status", first.Text())
-	retry := reviewDecide(c, "sku-1", append([]string{"Idempotency-Key", "k-1"}, ana...)...)
+	retry := hReviewDecide(c, "sku-1", append([]string{"Idempotency-Key", "k-1"}, ana...)...)
 	ctx.Assert(retry.Status == 200 && retry.Text() == first.Text(), "a retry with the same Idempotency-Key must answer the first response: first %s, retry %d %s", first.Text(), retry.Status, retry.Text())
-	ctx.Assert(store.ReadLabel(reviewBg, "sku-1", 2) == nil && len(*published) == 1, "the retry recorded a second decision: %d events published", len(*published))
+	ctx.Assert(store.ReadLabel(hReviewBg, "sku-1", 2) == nil && len(*published) == 1, "the retry recorded a second decision: %d events published", len(*published))
 }
 
 func CheckLabelAndPublish(ctx *harness.Ctx) {
-	c, published := reviewAPI(ctx, "ana")
+	c, published := hReviewAPI(ctx, "ana")
 	for i := 0; i < 3; i++ {
-		store.NextVersion(reviewBg, "sku-1") // three model events came before this decision
+		store.NextVersion(hReviewBg, "sku-1") // three model events came before this decision
 	}
-	r := reviewDecide(c, "sku-1", "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer")
+	r := hReviewDecide(c, "sku-1", "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer")
 	ctx.Equal(r.Status, 200, "the decision (%s); the status", r.Text())
 	var body struct {
 		LabelVersion      int64 \`json:"label_version"\`
@@ -1102,7 +1102,7 @@ func CheckLabelAndPublish(ctx *harness.Ctx) {
 	}
 	r.Decode(&body)
 	ctx.Equal(body.LabelVersion, int64(1), "the answer must carry the label version (%s); label_version", r.Text())
-	label := store.ReadLabel(reviewBg, "sku-1", 1)
+	label := store.ReadLabel(hReviewBg, "sku-1", 1)
 	ctx.Assert(label != nil, "no label:sku-1:v1 was written: the correction is the training example for the next model")
 	attributes, _ := label["attributes"].(map[string]any)
 	ctx.Assert(label["decision"] == "correct" && attributes["brand"] == "Oatly" && label["reviewer"] == "ana" && label["taxonomy_version"] == taxonomy.Version,
@@ -1113,7 +1113,7 @@ func CheckLabelAndPublish(ctx *harness.Ctx) {
 	ctx.Equal(event.AttributesVersion, body.AttributesVersion, "the event's attributes_version must be the one the answer names")
 	ctx.Equal(event.AttributesVersion, int64(4), "the SKU's attributes were at version 3, so the decision's event must carry store.NextVersion (4); attributes_version")
 	ctx.Assert(event.Merchant == "m-1" && event.TaxonomyVersion == taxonomy.Version, "the event must carry the proposal's merchant and taxonomy version, got %+v", event)
-	ctx.Assert(store.Pending(reviewBg, "sku-1") == nil, "the decided proposal is still in the review queue")
+	ctx.Assert(store.Pending(hReviewBg, "sku-1") == nil, "the decided proposal is still in the review queue")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1126,18 +1126,18 @@ func CheckLabelAndPublish(ctx *harness.Ctx) {
 #include "enrich/store.h"
 #include "enrich/taxonomy.h"
 
-std::vector<nlohmann::json> review_published;
+std::vector<nlohmann::json> hReview_published;
 
 // Stands in for step 5: records the events the endpoint publishes.
-void publish(const nlohmann::json& event) { review_published.push_back(event); }
+void publish(const nlohmann::json& event) { hReview_published.push_back(event); }
 
 namespace {
 
-const std::string kCorrection = R"({"decision": "correct", "attributes": {"brand": "Oatly"}, "note": "brand printed on the carton"})";
+const std::string kHCorrection = R"({"decision": "correct", "attributes": {"brand": "Oatly"}, "note": "brand printed on the carton"})";
 
 // Parks one proposal for sku-1 and gives the lease to holder.
-harness::HTTP reviewAPI(harness::Ctx& ctx, const std::string& holder) {
-  review_published.clear();
+harness::HTTP hReviewAPI(harness::Ctx& ctx, const std::string& holder) {
+  hReview_published.clear();
   const nlohmann::json proposal = {{"sku_id", "sku-1"}, {"merchant", "m-1"},
                                    {"attributes", {{"brand", nullptr}, {"size", 1.0}, {"unit", "l"}, {"organic", false}, {"category", "plant-milk"}}},
                                    {"confidence", 0.62}, {"taxonomy_version", taxonomy::kVersion}};
@@ -1151,58 +1151,58 @@ harness::HTTP reviewAPI(harness::Ctx& ctx, const std::string& holder) {
 }
 
 void hUntouched(harness::Ctx& ctx, const std::string& why) {
-  ctx.Assert(!store::read_label("sku-1", 1) && review_published.empty() && !store::catalog_current("sku-1"), "%s, yet a label, an event or a catalog row was written", why);
+  ctx.Assert(!store::read_label("sku-1", 1) && hReview_published.empty() && !store::catalog_current("sku-1"), "%s, yet a label, an event or a catalog row was written", why);
   ctx.Assert(store::pending("sku-1").has_value(), "%s, yet the proposal left the review queue", why);
 }
 
 }  // namespace
 
 void CheckReviewerAuth(harness::Ctx& ctx) {
-  auto c = reviewAPI(ctx, "ana");
-  auto r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Role", "reviewer");
+  auto c = hReviewAPI(ctx, "ana");
+  auto r = c.Post("/v1/skus/sku-1/review", kHCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Role", "reviewer");
   ctx.Equal(r.Status, 401, "a decision without X-Reviewer-Id; the status");
-  r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-2", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "shopper");
+  r = c.Post("/v1/skus/sku-1/review", kHCorrection, "Idempotency-Key", "k-2", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "shopper");
   ctx.Equal(r.Status, 403, "a decision from role 'shopper'; the status");
-  r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-4", "X-Reviewer-Id", "ana");
+  r = c.Post("/v1/skus/sku-1/review", kHCorrection, "Idempotency-Key", "k-4", "X-Reviewer-Id", "ana");
   ctx.Equal(r.Status, 403, "a decision with no X-Reviewer-Role (only the roles in kReviewerRoles decide); the status");
   hUntouched(ctx, "after three refused requests");
-  r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-3", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "catalog-admin");
+  r = c.Post("/v1/skus/sku-1/review", kHCorrection, "Idempotency-Key", "k-3", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "catalog-admin");
   ctx.Equal(r.Status, 200, "a catalog-admin holding the lease (%s); the status", r.Text());
 }
 
 void CheckLeaseHeld(harness::Ctx& ctx) {
-  auto c = reviewAPI(ctx, "ben");
-  auto r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
+  auto c = hReviewAPI(ctx, "ben");
+  auto r = c.Post("/v1/skus/sku-1/review", kHCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
   ctx.Equal(r.Status, 409, "ana decided on a SKU whose review lease ben holds; the status");
   ctx.Redis.Del("review:lease:sku-1");
-  r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-4", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
+  r = c.Post("/v1/skus/sku-1/review", kHCorrection, "Idempotency-Key", "k-4", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
   ctx.Equal(r.Status, 409, "ana decided on a SKU whose review lease nobody holds; the status");
   hUntouched(ctx, "after two decisions without the lease");
   ctx.Redis.Set("review:lease:sku-1", "ana");
-  r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-2", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
+  r = c.Post("/v1/skus/sku-1/review", kHCorrection, "Idempotency-Key", "k-2", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
   ctx.Equal(r.Status, 200, "the lease holder's decision (%s); the status", r.Text());
   ctx.Assert(!ctx.Redis.Get("review:lease:sku-1"), "the decision is made: release the lease so the SKU does not stay claimed for 15 minutes");
   ctx.Redis.Set("review:lease:sku-404", "ana");
-  r = c.Post("/v1/skus/sku-404/review", kCorrection, "Idempotency-Key", "k-3", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
+  r = c.Post("/v1/skus/sku-404/review", kHCorrection, "Idempotency-Key", "k-3", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
   ctx.Equal(r.Status, 404, "a decision by the lease holder on a SKU with no proposal; the status");
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  auto c = reviewAPI(ctx, "ana");
-  const auto r = c.Post("/v1/skus/sku-1/review", kCorrection, "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
+  auto c = hReviewAPI(ctx, "ana");
+  const auto r = c.Post("/v1/skus/sku-1/review", kHCorrection, "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
   ctx.Equal(r.Status, 400, "a decision without Idempotency-Key; the status");
   hUntouched(ctx, "after a decision without Idempotency-Key");
-  const auto first = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
+  const auto first = c.Post("/v1/skus/sku-1/review", kHCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
   ctx.Equal(first.Status, 200, "the first decision (%s); the status", first.Text());
-  const auto retry = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
+  const auto retry = c.Post("/v1/skus/sku-1/review", kHCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
   ctx.Assert(retry.Status == 200 && retry.Text() == first.Text(), "a retry with the same Idempotency-Key must answer the first response: first %s, retry %d %s", first.Text(), retry.Status, retry.Text());
-  ctx.Assert(!store::read_label("sku-1", 2) && review_published.size() == 1, "the retry recorded a second decision: %d events published", review_published.size());
+  ctx.Assert(!store::read_label("sku-1", 2) && hReview_published.size() == 1, "the retry recorded a second decision: %d events published", hReview_published.size());
 }
 
 void CheckLabelAndPublish(harness::Ctx& ctx) {
-  auto c = reviewAPI(ctx, "ana");
+  auto c = hReviewAPI(ctx, "ana");
   for (int i = 0; i < 3; i++) store::next_version("sku-1");  // three model events came before this decision
-  const auto r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
+  const auto r = c.Post("/v1/skus/sku-1/review", kHCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
   ctx.Equal(r.Status, 200, "the decision (%s); the status", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object() && body.value("label_version", 0LL) == 1, "the answer must carry the label version, got %s", r.Text());
@@ -1210,8 +1210,8 @@ void CheckLabelAndPublish(harness::Ctx& ctx) {
   ctx.Assert(label.has_value(), "no label:sku-1:v1 was written: the correction is the training example for the next model");
   ctx.Assert((*label)["decision"] == "correct" && (*label)["attributes"]["brand"] == "Oatly" && (*label)["reviewer"] == "ana" && (*label)["taxonomy_version"] == taxonomy::kVersion,
              "the label must hold the decision, the corrected attributes, the reviewer and the taxonomy version, got %s", label->dump());
-  ctx.Equal(review_published.size(), 1, "the decision must be published once; the events");
-  const auto& event = review_published[0];
+  ctx.Equal(hReview_published.size(), 1, "the decision must be published once; the events");
+  const auto& event = hReview_published[0];
   ctx.Assert(event["source"] == "human" && event["attributes"]["brand"] == "Oatly", "the event must carry the corrected attributes with source human, got %s", event.dump());
   ctx.Assert(event["attributes_version"] == body["attributes_version"], "the event's attributes_version %s differs from the answer's %s", event["attributes_version"].dump(), body.value("attributes_version", nlohmann::json()).dump());
   ctx.Assert(event["attributes_version"] == 4, "the SKU's attributes were at version 3, so the decision's event must carry store::next_version (4), got %s", event["attributes_version"].dump());

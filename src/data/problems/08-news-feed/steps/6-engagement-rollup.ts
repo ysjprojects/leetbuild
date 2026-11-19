@@ -780,24 +780,24 @@ import (
 	"leetbuild/harness"
 )
 
-func seedEngagement(ctx *harness.Ctx, kind, postID, eventID, user string) {
+func hSeedEngagement(ctx *harness.Ctx, kind, postID, eventID, user string) {
 	value, _ := json.Marshal(map[string]any{"event_id": eventID, "type": kind, "post_id": postID, "user_id": user, "ts": 1700000000000})
 	ctx.Kafka.Seed("engagement", postID, value)
 }
 
 // hashField is a hash field, nil when it does not exist.
-func hashField(ctx *harness.Ctx, key, field string) any {
+func hHashField(ctx *harness.Ctx, key, field string) any {
 	if v, ok := ctx.Redis.HGet(key, field); ok {
 		return v
 	}
 	return nil
 }
 
-func drainRollup(ctx *harness.Ctx) { ctx.Drain(func() { run(context.Background()) }) }
+func hDrainRollup(ctx *harness.Ctx) { ctx.Drain(func() { run(context.Background()) }) }
 
 func CheckGroup(ctx *harness.Ctx) {
-	seedEngagement(ctx, "like", "p1", "e1", "alice")
-	drainRollup(ctx)
+	hSeedEngagement(ctx, "like", "p1", "e1", "alice")
+	hDrainRollup(ctx)
 	subscriptions := ctx.Kafka.EventsOf("subscribe")
 	ctx.Assert(len(subscriptions) > 0, "the consumer must subscribe to a topic")
 	last := subscriptions[len(subscriptions)-1]
@@ -807,13 +807,13 @@ func CheckGroup(ctx *harness.Ctx) {
 		subscribed = subscribed || topic == "engagement"
 	}
 	ctx.Assert(subscribed, "the consumer must subscribe to engagement, got %q", last.Topics)
-	ctx.Equal(hashField(ctx, "stats:p1", "likes"), "1", "after one like event stats:p1 likes")
+	ctx.Equal(hHashField(ctx, "stats:p1", "likes"), "1", "after one like event stats:p1 likes")
 }
 
 func CheckManualCommit(ctx *harness.Ctx) {
-	seedEngagement(ctx, "like", "p1", "e1", "alice")
-	seedEngagement(ctx, "like", "p1", "e2", "bob")
-	drainRollup(ctx)
+	hSeedEngagement(ctx, "like", "p1", "e1", "alice")
+	hSeedEngagement(ctx, "like", "p1", "e2", "bob")
+	hDrainRollup(ctx)
 	consumers := ctx.Kafka.Consumers()
 	ctx.Assert(len(consumers) > 0 && !consumers[len(consumers)-1].AutoCommit, "the reader must not commit by itself (no CommitInterval, no ReadMessage): offsets would be committed on a timer, before the event was counted")
 	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "auto-commit is on: offsets were committed on a timer, before processing")
@@ -822,11 +822,11 @@ func CheckManualCommit(ctx *harness.Ctx) {
 }
 
 func CheckDedupe(ctx *harness.Ctx) {
-	seedEngagement(ctx, "like", "p1", "e1", "alice")
-	seedEngagement(ctx, "like", "p1", "e2", "bob")
-	seedEngagement(ctx, "like", "p1", "e1", "alice") // the replay, last on its partition: skipping it without a commit leaves lag
-	drainRollup(ctx)
-	ctx.Equal(hashField(ctx, "stats:p1", "likes"), "2", "e1 arrived twice: stats:p1 likes")
+	hSeedEngagement(ctx, "like", "p1", "e1", "alice")
+	hSeedEngagement(ctx, "like", "p1", "e2", "bob")
+	hSeedEngagement(ctx, "like", "p1", "e1", "alice") // the replay, last on its partition: skipping it without a commit leaves lag
+	hDrainRollup(ctx)
+	ctx.Equal(hHashField(ctx, "stats:p1", "likes"), "2", "e1 arrived twice: stats:p1 likes")
 	ctx.Equal(ctx.Redis.Exists("seen:e1"), 1, "seen:{event_id} must be claimed with SetNX so a replay finds it: seen:e1 exists")
 	ttl := ctx.Redis.TTL("seen:e1")
 	ctx.Assert(604000 < ttl && ttl <= 604800, "seen:e1 must expire after a week (EX 604800), its TTL is %d", ttl)
@@ -834,23 +834,23 @@ func CheckDedupe(ctx *harness.Ctx) {
 }
 
 func CheckRollup(ctx *harness.Ctx) {
-	seedEngagement(ctx, "like", "p1", "e1", "alice")
-	seedEngagement(ctx, "like", "p1", "e2", "bob")
-	seedEngagement(ctx, "unlike", "p1", "e3", "alice")
-	seedEngagement(ctx, "comment", "p1", "e4", "alice")
-	seedEngagement(ctx, "share", "p1", "e5", "alice")
-	seedEngagement(ctx, "like", "p2", "e6", "alice")
-	seedEngagement(ctx, "view", "p1", "e7", "alice") // unknown type
+	hSeedEngagement(ctx, "like", "p1", "e1", "alice")
+	hSeedEngagement(ctx, "like", "p1", "e2", "bob")
+	hSeedEngagement(ctx, "unlike", "p1", "e3", "alice")
+	hSeedEngagement(ctx, "comment", "p1", "e4", "alice")
+	hSeedEngagement(ctx, "share", "p1", "e5", "alice")
+	hSeedEngagement(ctx, "like", "p2", "e6", "alice")
+	hSeedEngagement(ctx, "view", "p1", "e7", "alice") // unknown type
 	ctx.Kafka.Seed("engagement", "p1", "not json")
 	ctx.Kafka.Seed("engagement", "p1", \`{"type":"like"}\`) // no event_id, no post_id
-	drainRollup(ctx)
+	hDrainRollup(ctx)
 	ctx.Equal(ctx.Redis.HGetAll("stats:p1"), map[string]string{"likes": "1", "comments": "1", "shares": "1"}, "stats:p1 must be likes 1 (2 likes, 1 unlike), comments 1, shares 1")
-	ctx.Equal(hashField(ctx, "stats:p2", "likes"), "1", "stats:p2 likes")
+	ctx.Equal(hHashField(ctx, "stats:p2", "likes"), "1", "stats:p2 likes")
 	ctx.Equal(ctx.Kafka.Lag("engagement-rollup", "engagement"), 0, "unknown types and malformed records must be skipped and committed, not crash-looped on")
 }
 
 func CheckOrder(ctx *harness.Ctx) {
-	seedEngagement(ctx, "like", "p1", "e1", "alice")
+	hSeedEngagement(ctx, "like", "p1", "e1", "alice")
 	seenAtCount := ctx.Redis.After("stats:p1", func() any {
 		claimed := ctx.Redis.Exists("seen:e1") == 1
 		return claimed
@@ -861,9 +861,9 @@ func CheckOrder(ctx *harness.Ctx) {
 	}
 	var atCommit []commitSnapshot
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
-		atCommit = append(atCommit, commitSnapshot{hashField(ctx, "stats:p1", "likes"), ctx.Redis.Exists("seen:e1") == 1})
+		atCommit = append(atCommit, commitSnapshot{hHashField(ctx, "stats:p1", "likes"), ctx.Redis.Exists("seen:e1") == 1})
 	})
-	drainRollup(ctx)
+	hDrainRollup(ctx)
 	ctx.Assert(seenAtCount.Fired, "HINCRBY stats:p1 never happened")
 	ctx.Equal(seenAtCount.Result, true, "seen:e1 must be claimed (SetNX) before the HIncrBy, not after: seen:e1 existed at the HIncrBy")
 	ctx.Assert(len(atCommit) > 0, "the offset was never committed")
@@ -882,20 +882,20 @@ func CheckOrder(ctx *harness.Ctx) {
 
 namespace {
 
-void seedEngagement(harness::Ctx& ctx, const std::string& kind, const std::string& postID, const std::string& eventID, const std::string& user) {
+void hSeedEngagement(harness::Ctx& ctx, const std::string& kind, const std::string& postID, const std::string& eventID, const std::string& user) {
   const nlohmann::json value = {{"event_id", eventID}, {"type", kind}, {"post_id", postID}, {"user_id", user}, {"ts", 1700000000000}};
   ctx.Kafka.Seed("engagement", postID, value);
 }
 
-void drainRollup(harness::Ctx& ctx) {
+void hDrainRollup(harness::Ctx& ctx) {
   ctx.Drain([] { run(); });
 }
 
 }  // namespace
 
 void CheckGroup(harness::Ctx& ctx) {
-  seedEngagement(ctx, "like", "p1", "e1", "alice");
-  drainRollup(ctx);
+  hSeedEngagement(ctx, "like", "p1", "e1", "alice");
+  hDrainRollup(ctx);
   const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
   ctx.Assert(!subscriptions.empty(), "the consumer must subscribe to a topic");
   const auto& last = subscriptions.back();
@@ -906,9 +906,9 @@ void CheckGroup(harness::Ctx& ctx) {
 }
 
 void CheckManualCommit(harness::Ctx& ctx) {
-  seedEngagement(ctx, "like", "p1", "e1", "alice");
-  seedEngagement(ctx, "like", "p1", "e2", "bob");
-  drainRollup(ctx);
+  hSeedEngagement(ctx, "like", "p1", "e1", "alice");
+  hSeedEngagement(ctx, "like", "p1", "e2", "bob");
+  hDrainRollup(ctx);
   const auto consumers = ctx.Kafka.Consumers();
   ctx.Assert(!consumers.empty() && !consumers.back().AutoCommit, "the consumer must not commit by itself (enable.auto.commit=false): offsets would be committed on a timer, before the event was counted");
   ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(), "auto-commit is on: offsets were committed on a timer, before processing");
@@ -917,10 +917,10 @@ void CheckManualCommit(harness::Ctx& ctx) {
 }
 
 void CheckDedupe(harness::Ctx& ctx) {
-  seedEngagement(ctx, "like", "p1", "e1", "alice");
-  seedEngagement(ctx, "like", "p1", "e2", "bob");
-  seedEngagement(ctx, "like", "p1", "e1", "alice");  // the replay, last on its partition: skipping it without a commit leaves lag
-  drainRollup(ctx);
+  hSeedEngagement(ctx, "like", "p1", "e1", "alice");
+  hSeedEngagement(ctx, "like", "p1", "e2", "bob");
+  hSeedEngagement(ctx, "like", "p1", "e1", "alice");  // the replay, last on its partition: skipping it without a commit leaves lag
+  hDrainRollup(ctx);
   ctx.Equal(ctx.Redis.HGet("stats:p1", "likes"), "2", "e1 arrived twice: stats:p1 likes");
   ctx.Equal(ctx.Redis.Exists("seen:e1"), 1, "seen:{event_id} must be claimed with SET NX so a replay finds it: seen:e1 exists");
   const auto ttl = ctx.Redis.TTL("seen:e1");
@@ -929,23 +929,23 @@ void CheckDedupe(harness::Ctx& ctx) {
 }
 
 void CheckRollup(harness::Ctx& ctx) {
-  seedEngagement(ctx, "like", "p1", "e1", "alice");
-  seedEngagement(ctx, "like", "p1", "e2", "bob");
-  seedEngagement(ctx, "unlike", "p1", "e3", "alice");
-  seedEngagement(ctx, "comment", "p1", "e4", "alice");
-  seedEngagement(ctx, "share", "p1", "e5", "alice");
-  seedEngagement(ctx, "like", "p2", "e6", "alice");
-  seedEngagement(ctx, "view", "p1", "e7", "alice");  // unknown type
+  hSeedEngagement(ctx, "like", "p1", "e1", "alice");
+  hSeedEngagement(ctx, "like", "p1", "e2", "bob");
+  hSeedEngagement(ctx, "unlike", "p1", "e3", "alice");
+  hSeedEngagement(ctx, "comment", "p1", "e4", "alice");
+  hSeedEngagement(ctx, "share", "p1", "e5", "alice");
+  hSeedEngagement(ctx, "like", "p2", "e6", "alice");
+  hSeedEngagement(ctx, "view", "p1", "e7", "alice");  // unknown type
   ctx.Kafka.Seed("engagement", "p1", "not json");
   ctx.Kafka.Seed("engagement", "p1", R"({"type":"like"})");  // no event_id, no post_id
-  drainRollup(ctx);
+  hDrainRollup(ctx);
   ctx.Equal(ctx.Redis.HGetAll("stats:p1"), std::map<std::string, std::string>{{"likes", "1"}, {"comments", "1"}, {"shares", "1"}}, "stats:p1 must be likes 1 (2 likes, 1 unlike), comments 1, shares 1");
   ctx.Equal(ctx.Redis.HGet("stats:p2", "likes"), "1", "stats:p2 likes");
   ctx.Equal(ctx.Kafka.Lag("engagement-rollup", "engagement"), 0, "unknown types and malformed records must be skipped and committed, not crash-looped on");
 }
 
 void CheckOrder(harness::Ctx& ctx) {
-  seedEngagement(ctx, "like", "p1", "e1", "alice");
+  hSeedEngagement(ctx, "like", "p1", "e1", "alice");
   bool fired = false, claimedAtCount = false;
   ctx.Redis.After("stats:p1", [&] {
     fired = true;
@@ -955,7 +955,7 @@ void CheckOrder(harness::Ctx& ctx) {
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) {
     atCommit.emplace_back(ctx.Redis.HGet("stats:p1", "likes"), ctx.Redis.Exists("seen:e1") == 1);
   });
-  drainRollup(ctx);
+  hDrainRollup(ctx);
   ctx.Assert(fired, "HINCRBY stats:p1 never happened");
   ctx.Equal(claimedAtCount, true, "seen:e1 must be claimed (SET NX) before the hincrby, not after: seen:e1 existed at the hincrby");
   ctx.Assert(!atCommit.empty(), "the offset was never committed");

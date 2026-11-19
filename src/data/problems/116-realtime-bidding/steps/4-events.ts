@@ -728,33 +728,33 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "bid.event"
+const kHEventsTopic = "bid.event"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func eventsSetup(ctx *harness.Ctx, auctions ...string) {
+func hEventsSetup(ctx *harness.Ctx, auctions ...string) {
 	ctx.Redis.Set("cap:b-1", 100000)
 	for _, auctionID := range auctions {
-		ok, err := spend.Claim(eventsBg, "b-1", auctionID, 310)
+		ok, err := spend.Claim(hEventsBg, "b-1", auctionID, 310)
 		ctx.Assert(ok && err == nil, "the harness could not claim 310 for %s (%v)", auctionID, err)
 	}
 }
 
-func eventsReport(ctx *harness.Ctx, auctionID string, won bool, lossReason string) bool {
-	ok, err := reportResult(eventsBg, "b-1", auctionID, won, lossReason)
+func hEventsReport(ctx *harness.Ctx, auctionID string, won bool, lossReason string) bool {
+	ok, err := reportResult(hEventsBg, "b-1", auctionID, won, lossReason)
 	ctx.NoError(err, "reportResult(b-1, %s, %v)", auctionID, won)
 	return ok
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Event  map[string]any \`json:"event"\`
 	Reason string         \`json:"reason"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	var rows []HEventsRow
 	for _, text := range ctx.Redis.LRange("outbox:bid.event", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with the event and a reason")
 		rows = append(rows, row)
 	}
@@ -762,77 +762,77 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckAuctionKey(ctx *harness.Ctx) {
-	eventsSetup(ctx, "a-1", "a-2", "a-3")
+	hEventsSetup(ctx, "a-1", "a-2", "a-3")
 	for _, auctionID := range []string{"a-1", "a-2", "a-3"} {
-		ok := eventsReport(ctx, auctionID, true, "")
+		ok := hEventsReport(ctx, auctionID, true, "")
 		ctx.Assert(ok, "reportResult returned false for a delivered win of %s, expected true", auctionID)
 	}
 	ctx.Settle()
-	keys := ctx.Kafka.Keys(eventsTopic)
+	keys := ctx.Kafka.Keys(kHEventsTopic)
 	sorted := append([]string(nil), keys...)
 	sort.Strings(sorted)
 	ctx.Equal(sorted, []string{"a-1", "a-2", "a-3"}, "three results must produce records keyed by the auction ids; the keys")
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	for i, key := range keys {
 		var value map[string]any
 		ctx.NoError(json.Unmarshal([]byte(values[i]), &value), "the event must be JSON")
 		ctx.Assert(value["type"] == "win" && value["auction_id"] == key && value["bidder"] == "b-1" && value["loss_reason"] == nil, "the win event keyed %s is %s, expected bidEvent's type win, its auction_id, bidder b-1 and loss_reason null", key, values[i])
 	}
-	ctx.Equal(len(eventsOutbox(ctx)), 0, "three delivered wins must leave no outbox row (the outbox is only for events the broker did not take); the rows")
+	ctx.Equal(len(hEventsOutbox(ctx)), 0, "three delivered wins must leave no outbox row (the outbox is only for events the broker did not take); the rows")
 }
 
 func CheckLossEvent(ctx *harness.Ctx) {
-	eventsSetup(ctx, "a-1")
-	eventsReport(ctx, "a-1", false, "outbid")
+	hEventsSetup(ctx, "a-1")
+	hEventsReport(ctx, "a-1", false, "outbid")
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "a lost auction must produce one record on bid.event (without its losses the win rate downstream has no denominator); the records")
 	var value map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the event must be JSON")
 	ctx.Assert(value["type"] == "loss" && value["auction_id"] == "a-1" && value["bidder"] == "b-1" && value["loss_reason"] == "outbid", "the loss event is %s, expected type loss for a-1 by b-1 with loss_reason outbid", values[0])
-	ctx.Equal(spend.Spent(eventsBg, "b-1", spend.Today()), 0, "the lost auction's claim must be given back; the counter")
+	ctx.Equal(spend.Spent(hEventsBg, "b-1", spend.Today()), 0, "the lost auction's claim must be given back; the counter")
 }
 
 func CheckPublishAfterSettle(ctx *harness.Ctx) {
-	eventsSetup(ctx, "a-1")
-	probe := ctx.Redis.After("claim:b-1:a-1", func() any { return len(ctx.Kafka.Records(eventsTopic)) })
-	eventsReport(ctx, "a-1", true, "")
+	hEventsSetup(ctx, "a-1")
+	probe := ctx.Redis.After("claim:b-1:a-1", func() any { return len(ctx.Kafka.Records(kHEventsTopic)) })
+	hEventsReport(ctx, "a-1", true, "")
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "reportResult never settled the claim (no command touched claim:b-1:a-1)")
 	ctx.Equal(probe.Result, 0, "when the claim was settled bid.event already held records: a consumer could read a win whose spend is still open. Settle first, then produce; the records at settle time")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the settle; the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "the event must still be produced after the settle; the records")
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	eventsSetup(ctx, "a-1", "a-2")
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsReport(ctx, "a-1", true, "")
+	hEventsSetup(ctx, "a-1", "a-2")
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsReport(ctx, "a-1", true, "")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the retry must not write the win twice (enable.idempotence); the records")
-	eventsReport(ctx, "a-2", true, "")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the retry must not write the win twice (enable.idempotence); the records")
+	hEventsReport(ctx, "a-2", true, "")
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	eventsSetup(ctx, "a-1", "a-2", "a-3")
-	ok := eventsReport(ctx, "a-3", true, "")
+	hEventsSetup(ctx, "a-1", "a-2", "a-3")
+	ok := hEventsReport(ctx, "a-3", true, "")
 	ctx.Settle()
-	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0, "a delivered win returned %v and left outbox rows %+v, expected true and no row", ok, eventsOutbox(ctx))
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok = eventsReport(ctx, "a-1", true, "")
+	ctx.Assert(ok && len(hEventsOutbox(ctx)) == 0, "a delivered win returned %v and left outbox rows %+v, expected true and no row", ok, hEventsOutbox(ctx))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok = hEventsReport(ctx, "a-1", true, "")
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the win never reaches the stats; the rows")
 	ctx.Assert(rows[0].Event["auction_id"] == "a-1" && rows[0].Event["type"] == "win" && rows[0].Reason != "", "the outbox row is %+v, expected the event and a reason", rows[0])
 	ctx.Equal(ok, false, "reportResult's result after a failed delivery")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsReport(ctx, "a-2", true, "")
+	ok = hEventsReport(ctx, "a-2", true, "")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "reportResult waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout (2 s), then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Event["auction_id"] == "a-2", "no delivery report within the window and the outbox holds %+v", rows)
 	ctx.Equal(ok, false, "reportResult's result without a delivery report")
 }
@@ -849,14 +849,14 @@ func CheckOutbox(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "bid.event";
+const std::string kHEventsTopic = "bid.event";
 
-void eventsSetup(harness::Ctx& ctx, const std::vector<std::string>& auctions) {
+void hEventsSetup(harness::Ctx& ctx, const std::vector<std::string>& auctions) {
   ctx.Redis.Set("cap:b-1", 100000);
   for (const auto& auction_id : auctions) ctx.Assert(rtb::spend::claim("b-1", auction_id, 310), "the harness could not claim 310 for %s", auction_id);
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox:bid.event", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -866,93 +866,93 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
+std::string hEventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckAuctionKey(harness::Ctx& ctx) {
-  eventsSetup(ctx, {"a-1", "a-2", "a-3"});
+  hEventsSetup(ctx, {"a-1", "a-2", "a-3"});
   for (const char* auction_id : {"a-1", "a-2", "a-3"}) {
     const bool ok = reportResult("b-1", auction_id, true, "");
     ctx.Assert(ok, "reportResult returned false for a delivered win of %s, expected true", auction_id);
   }
   ctx.Settle();
-  const auto keys = ctx.Kafka.Keys(kEventsTopic);
+  const auto keys = ctx.Kafka.Keys(kHEventsTopic);
   auto sorted = keys;
   std::sort(sorted.begin(), sorted.end());
   ctx.Equal(sorted, {"a-1", "a-2", "a-3"}, "three results must produce records keyed by the auction ids; the keys");
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   for (size_t i = 0; i < keys.size() && i < values.size(); ++i) {
     const auto value = nlohmann::json::parse(values[i], nullptr, false);
-    ctx.Assert(eventsField(value, "type") == "win" && eventsField(value, "auction_id") == keys[i] && eventsField(value, "bidder") == "b-1" &&
+    ctx.Assert(hEventsField(value, "type") == "win" && hEventsField(value, "auction_id") == keys[i] && hEventsField(value, "bidder") == "b-1" &&
                    (!value.contains("loss_reason") || value["loss_reason"].is_null()),
                "the win event keyed %s is %s, expected bidEvent's type win, its auction_id, bidder b-1 and loss_reason null", keys[i], values[i]);
   }
-  ctx.Equal(eventsOutbox(ctx).size(), 0, "three delivered wins must leave no outbox row (the outbox is only for events the broker did not take); the rows");
+  ctx.Equal(hEventsOutbox(ctx).size(), 0, "three delivered wins must leave no outbox row (the outbox is only for events the broker did not take); the rows");
 }
 
 void CheckLossEvent(harness::Ctx& ctx) {
-  eventsSetup(ctx, {"a-1"});
+  hEventsSetup(ctx, {"a-1"});
   reportResult("b-1", "a-1", false, "outbid");
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "a lost auction must produce one record on bid.event (without its losses the win rate downstream has no denominator); the records");
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
-  ctx.Assert(eventsField(value, "type") == "loss" && eventsField(value, "auction_id") == "a-1" && eventsField(value, "bidder") == "b-1" && eventsField(value, "loss_reason") == "outbid",
+  ctx.Assert(hEventsField(value, "type") == "loss" && hEventsField(value, "auction_id") == "a-1" && hEventsField(value, "bidder") == "b-1" && hEventsField(value, "loss_reason") == "outbid",
              "the loss event is %s, expected type loss for a-1 by b-1 with loss_reason outbid", values[0]);
   ctx.Equal(rtb::spend::spent("b-1", rtb::spend::today()), 0, "the lost auction's claim must be given back; the counter");
 }
 
 void CheckPublishAfterSettle(harness::Ctx& ctx) {
-  eventsSetup(ctx, {"a-1"});
+  hEventsSetup(ctx, {"a-1"});
   size_t atSettle = 999;
   bool fired = false;
   ctx.Redis.After("claim:b-1:a-1", [&] {
     fired = true;
-    atSettle = ctx.Kafka.Records(kEventsTopic).size();
+    atSettle = ctx.Kafka.Records(kHEventsTopic).size();
   });
   reportResult("b-1", "a-1", true, "");
   ctx.Settle();
   ctx.Assert(fired, "reportResult never settled the claim (no command touched claim:b-1:a-1)");
   ctx.Equal(atSettle, 0, "when the claim was settled bid.event already held records: a consumer could read a win whose spend is still open. Settle first, then produce; the records at settle time");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the event must still be produced after the settle; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "the event must still be produced after the settle; the records");
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  eventsSetup(ctx, {"a-1", "a-2"});
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  hEventsSetup(ctx, {"a-1", "a-2"});
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
   reportResult("b-1", "a-1", true, "");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the retry must not write the win twice (enable.idempotence); the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the retry must not write the win twice (enable.idempotence); the records");
   reportResult("b-1", "a-2", true, "");
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  eventsSetup(ctx, {"a-1", "a-2", "a-3"});
+  hEventsSetup(ctx, {"a-1", "a-2", "a-3"});
   bool ok = reportResult("b-1", "a-3", true, "");
   ctx.Settle();
-  ctx.Assert(ok && eventsOutbox(ctx).empty(), "a delivered win returned %t and left %d outbox rows, expected true and no row", ok, eventsOutbox(ctx).size());
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ctx.Assert(ok && hEventsOutbox(ctx).empty(), "a delivered win returned %t and left %d outbox rows, expected true and no row", ok, hEventsOutbox(ctx).size());
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   ok = reportResult("b-1", "a-1", true, "");
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the win never reaches the stats; the rows");
-  ctx.Assert(rows[0].contains("event") && eventsField(rows[0]["event"], "auction_id") == "a-1" && eventsField(rows[0]["event"], "type") == "win" &&
-                 !eventsField(rows[0], "reason").empty(),
+  ctx.Assert(rows[0].contains("event") && hEventsField(rows[0]["event"], "auction_id") == "a-1" && hEventsField(rows[0]["event"], "type") == "win" &&
+                 !hEventsField(rows[0], "reason").empty(),
              "the outbox row is %s, expected the event and a reason", rows[0].dump());
   ctx.Equal(ok, false, "reportResult's result after a failed delivery");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = reportResult("b-1", "a-2", true, "");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "reportResult waited %.1f s for a broker that does not answer: wait for the report at most kAckTimeoutMs (2 s), then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("event") && eventsField(rows[1]["event"], "auction_id") == "a-2", "no delivery report within the window and the outbox holds %d rows", rows.size());
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("event") && hEventsField(rows[1]["event"], "auction_id") == "a-2", "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "reportResult's result without a delivery report");
 }
 `,

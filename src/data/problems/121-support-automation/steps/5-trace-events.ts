@@ -1104,19 +1104,19 @@ import (
 	"leetbuild/harness"
 )
 
-const traceTopic = "assistant.trace"
-const traceCanary = "CANARY-5521 my email is ana@example.com"
+const kHTraceTopic = "assistant.trace"
+const kHTraceCanary = "CANARY-5521 my email is ana@example.com"
 
-func traceCall(turnID, conversation, kind, name string, latency, in, out int64, verdicts map[string]string) Call {
+func hTraceCall(turnID, conversation, kind, name string, latency, in, out int64, verdicts map[string]string) Call {
 	if verdicts == nil {
 		verdicts = map[string]string{}
 	}
 	return Call{Tenant: "t1", Conversation: conversation, TurnID: turnID, Iteration: 1, Kind: kind, Name: name, LatencyMs: latency, InputTokens: in, OutputTokens: out, Verdicts: verdicts, Prompt: "Where is my next reservation?", Answer: "Your next stay is in Lisbon."}
 }
 
-func traceTurnIDs(ctx *harness.Ctx) []string {
+func hTraceTurnIDs(ctx *harness.Ctx) []string {
 	ids := []string{}
-	for _, r := range ctx.Kafka.Records(traceTopic) {
+	for _, r := range ctx.Kafka.Records(kHTraceTopic) {
 		var v map[string]any
 		json.Unmarshal(r.Value, &v)
 		id, _ := v["turn_id"].(string)
@@ -1125,7 +1125,7 @@ func traceTurnIDs(ctx *harness.Ctx) []string {
 	return ids
 }
 
-func traceOutbox(ctx *harness.Ctx) []map[string]any {
+func hTraceOutbox(ctx *harness.Ctx) []map[string]any {
 	var rows []map[string]any
 	for _, row := range ctx.Redis.LRange("apv2:outbox", 0, -1) {
 		var v map[string]any
@@ -1136,13 +1136,13 @@ func traceOutbox(ctx *harness.Ctx) []map[string]any {
 }
 
 func CheckConversationKey(ctx *harness.Ctx) {
-	emit(context.Background(), traceCall("turn-1", "c-1", "llm", "support-model", 800, 100, 50, nil))
-	emit(context.Background(), traceCall("turn-2", "c-2", "tool", "get_reservation", 120, 0, 0, nil))
-	emit(context.Background(), traceCall("turn-3", "c-1", "guardrail", "gate", 40, 0, 0, map[string]string{"relevance": "PASS"}))
+	emit(context.Background(), hTraceCall("turn-1", "c-1", "llm", "support-model", 800, 100, 50, nil))
+	emit(context.Background(), hTraceCall("turn-2", "c-2", "tool", "get_reservation", 120, 0, 0, nil))
+	emit(context.Background(), hTraceCall("turn-3", "c-1", "guardrail", "gate", 40, 0, 0, map[string]string{"relevance": "PASS"}))
 	ctx.Settle()
-	records := ctx.Kafka.Records(traceTopic)
+	records := ctx.Kafka.Records(kHTraceTopic)
 	ctx.Equal(len(records), 3, "three emit calls must produce three records on assistant.trace; the records")
-	ctx.Equal(ctx.Kafka.Keys(traceTopic), []string{"c-1", "c-2", "c-1"}, "spans must be keyed by the conversation (keyed by turn id, one conversation's spans spread over the partitions and its timeline arrives out of order); the keys")
+	ctx.Equal(ctx.Kafka.Keys(kHTraceTopic), []string{"c-1", "c-2", "c-1"}, "spans must be keyed by the conversation (keyed by turn id, one conversation's spans spread over the partitions and its timeline arrives out of order); the keys")
 	ctx.Equal(records[0].Partition, records[2].Partition, "one conversation's spans must land on one partition; c-1's partitions")
 	var span map[string]any
 	ctx.NoError(json.Unmarshal(records[0].Value, &span), "the span must be JSON: %s", records[0].Value)
@@ -1154,25 +1154,25 @@ func CheckConversationKey(ctx *harness.Ctx) {
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(traceTopic, 1)
-	emit(context.Background(), traceCall("turn-1", "c-1", "llm", "support-model", 800, 100, 50, nil))
+	ctx.Kafka.LoseAcks(kHTraceTopic, 1)
+	emit(context.Background(), hTraceCall("turn-1", "c-1", "llm", "support-model", 800, 100, 50, nil))
 	ctx.Settle()
-	ctx.Equal(traceTurnIDs(ctx), []string{"turn-1"}, "after one produce whose acknowledgement was lost the retry must not write the span again (enable.idempotence); the spans")
-	emit(context.Background(), traceCall("turn-2", "c-1", "llm", "support-model", 800, 100, 50, nil))
+	ctx.Equal(hTraceTurnIDs(ctx), []string{"turn-1"}, "after one produce whose acknowledgement was lost the retry must not write the span again (enable.idempotence); the spans")
+	emit(context.Background(), hTraceCall("turn-2", "c-1", "llm", "support-model", 800, 100, 50, nil))
 	ctx.Settle()
-	ctx.Kafka.Failover(traceTopic)
-	ctx.Assert(strings.Contains(strings.Join(traceTurnIDs(ctx), ","), "turn-2"), "a leader failover right after the acknowledgement lost the span: wait for all in-sync replicas (acks=all)")
+	ctx.Kafka.Failover(kHTraceTopic)
+	ctx.Assert(strings.Contains(strings.Join(hTraceTurnIDs(ctx), ","), "turn-2"), "a leader failover right after the acknowledgement lost the span: wait for all in-sync replicas (acks=all)")
 }
 
 func CheckNoText(ctx *harness.Ctx) {
 	var logged bytes.Buffer
 	log.SetOutput(&logged)
-	call := traceCall("turn-1", "c-1", "llm", "support-model", 800, 100, 50, nil)
-	call.Prompt = traceCanary
-	call.Answer = "Answer to " + traceCanary
+	call := hTraceCall("turn-1", "c-1", "llm", "support-model", 800, 100, 50, nil)
+	call.Prompt = kHTraceCanary
+	call.Answer = "Answer to " + kHTraceCanary
 	emit(context.Background(), call)
 	ctx.Settle()
-	records := ctx.Kafka.Records(traceTopic)
+	records := ctx.Kafka.Records(kHTraceTopic)
 	ctx.Equal(len(records), 1, "one emit call; the records")
 	value := string(records[0].Value)
 	ctx.Assert(!strings.Contains(value, "CANARY-5521"), "the span carries the guest's text: %s", value)
@@ -1185,20 +1185,20 @@ func CheckNoText(ctx *harness.Ctx) {
 }
 
 func CheckOutboxFallback(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(traceTopic, 1)
+	ctx.Kafka.FailNext(kHTraceTopic, 1)
 	func() {
 		defer func() {
 			if e := recover(); e != nil {
 				ctx.Fatalf("emit failed the turn when the broker refused the span: %v. Write the span to the outbox instead", e)
 			}
 		}()
-		call := traceCall("turn-9", "c-1", "llm", "support-model", 800, 100, 50, nil)
-		call.Prompt = traceCanary
-		call.Answer = "Answer to " + traceCanary
+		call := hTraceCall("turn-9", "c-1", "llm", "support-model", 800, 100, 50, nil)
+		call.Prompt = kHTraceCanary
+		call.Answer = "Answer to " + kHTraceCanary
 		emit(context.Background(), call)
 	}()
 	ctx.Settle()
-	rows := traceOutbox(ctx)
+	rows := hTraceOutbox(ctx)
 	ctx.Assert(len(rows) > 0, "the broker refused the span and nothing reached apv2:outbox: read the producer's delivery reports (Events()) and call outbox.Insert")
 	span, _ := rows[0]["span"].(map[string]any)
 	ctx.Equal(span["turn_id"], "turn-9", "the outbox row must carry the span; the row %v; its turn id", rows[0])
@@ -1206,10 +1206,10 @@ func CheckOutboxFallback(ctx *harness.Ctx) {
 	_, hasAnswer := span["answer"]
 	ctx.Assert(!hasPrompt && !hasAnswer && !strings.Contains(harness.Show(rows[0]), "CANARY-5521"), "the outbox row carries the guest's text: write the span, not the call: %v", rows[0])
 	ctx.Equal(ctx.Kafka.Flushes(), 0, "emit must not flush (the turn would wait for the broker); the flushes")
-	emit(context.Background(), traceCall("turn-10", "c-1", "llm", "support-model", 800, 100, 50, nil))
+	emit(context.Background(), hTraceCall("turn-10", "c-1", "llm", "support-model", 800, 100, 50, nil))
 	ctx.Settle()
-	ctx.Equal(traceTurnIDs(ctx), []string{"turn-10"}, "once the broker accepts records again spans flow to the topic; the spans")
-	ctx.Equal(len(traceOutbox(ctx)), 1, "a delivered span must not be written to the outbox; the rows")
+	ctx.Equal(hTraceTurnIDs(ctx), []string{"turn-10"}, "once the broker accepts records again spans flow to the topic; the spans")
+	ctx.Equal(len(hTraceOutbox(ctx)), 1, "a delivered span must not be written to the outbox; the rows")
 }
 
 func CheckMetricsBeforeCommit(ctx *harness.Ctx) {
@@ -1220,12 +1220,12 @@ func CheckMetricsBeforeCommit(ctx *harness.Ctx) {
 		{"tenant": "t1", "conversation": "c-1", "turn_id": "turn-1", "iteration": 2, "kind": "guardrail", "name": "gate", "latency_ms": 40, "input_tokens": 0, "output_tokens": 0, "verdicts": map[string]string{"relevance": "PASS", "groundedness": "FAIL"}},
 	} {
 		value, _ := json.Marshal(s)
-		ctx.Kafka.Seed(traceTopic, "c-1", string(value))
+		ctx.Kafka.Seed(kHTraceTopic, "c-1", string(value))
 	}
 	// The fourth span's counters are not a hash: its increment fails, so its offset must stay uncommitted.
 	ctx.Redis.Set("metrics:t1:tool:broken", "not a hash")
 	broken, _ := json.Marshal(map[string]any{"tenant": "t1", "conversation": "c-1", "turn_id": "turn-1", "iteration": 2, "kind": "tool", "name": "broken", "latency_ms": 5, "input_tokens": 0, "output_tokens": 0, "verdicts": map[string]string{}})
-	ctx.Kafka.Seed(traceTopic, "c-1", string(broken))
+	ctx.Kafka.Seed(kHTraceTopic, "c-1", string(broken))
 	var atCommit []string
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
 		v, _ := ctx.Redis.HGet(llm, "calls")
@@ -1237,7 +1237,7 @@ func CheckMetricsBeforeCommit(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Redis.HGetAll(llm), map[string]string{"calls": "2", "latency_ms": "2000", "input_tokens": "400", "output_tokens": "70", "blocked": "0"}, "%s (2 calls, 2000 ms, 400 and 70 tokens, 0 blocked)", llm)
 	blocked, _ := ctx.Redis.HGet("metrics:t1:guardrail:gate", "blocked")
 	ctx.Equal(blocked, "1", "a guardrail span with a FAIL verdict counts as blocked")
-	ctx.Equal(ctx.Kafka.Lag("insights", traceTopic), 1, "the three counted spans are committed, and the span whose increment failed (WRONGTYPE on metrics:t1:tool:broken) is not, or it is lost from the metrics; the lag")
+	ctx.Equal(ctx.Kafka.Lag("insights", kHTraceTopic), 1, "the three counted spans are committed, and the span whose increment failed (WRONGTYPE on metrics:t1:tool:broken) is not, or it is lost from the metrics; the lag")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1254,25 +1254,25 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kTraceTopic = "assistant.trace";
-const std::string kTraceCanary = "CANARY-5521 my email is ana@example.com";
+const std::string kHTraceTopic = "assistant.trace";
+const std::string kHTraceCanary = "CANARY-5521 my email is ana@example.com";
 
-json traceCall(const std::string& turn_id, const std::string& conversation = "c-1", const std::string& kind = "llm", const std::string& name = "support-model",
+json hTraceCall(const std::string& turn_id, const std::string& conversation = "c-1", const std::string& kind = "llm", const std::string& name = "support-model",
                long long latency = 800, long long in = 100, long long out = 50, const json& verdicts = json::object()) {
   return {{"tenant", "t1"}, {"conversation", conversation}, {"turn_id", turn_id}, {"iteration", 1}, {"kind", kind}, {"name", name}, {"latency_ms", latency},
           {"input_tokens", in}, {"output_tokens", out}, {"verdicts", verdicts}, {"prompt", "Where is my next reservation?"}, {"answer", "Your next stay is in Lisbon."}};
 }
 
-std::vector<std::string> traceTurnIds(harness::Ctx& ctx) {
+std::vector<std::string> hTraceTurnIds(harness::Ctx& ctx) {
   std::vector<std::string> ids;
-  for (const auto& r : ctx.Kafka.Records(kTraceTopic)) {
+  for (const auto& r : ctx.Kafka.Records(kHTraceTopic)) {
     const auto v = json::parse(r.Value.value_or(""), nullptr, false);
     ids.push_back(v.is_object() ? v.value("turn_id", "") : "");
   }
   return ids;
 }
 
-std::vector<json> traceOutbox(harness::Ctx& ctx) {
+std::vector<json> hTraceOutbox(harness::Ctx& ctx) {
   std::vector<json> rows;
   for (const auto& row : ctx.Redis.LRange("apv2:outbox", 0, -1)) rows.push_back(json::parse(row, nullptr, false));
   return rows;
@@ -1281,13 +1281,13 @@ std::vector<json> traceOutbox(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckConversationKey(harness::Ctx& ctx) {
-  emit(traceCall("turn-1", "c-1"));
-  emit(traceCall("turn-2", "c-2", "tool", "get_reservation", 120, 0, 0));
-  emit(traceCall("turn-3", "c-1", "guardrail", "gate", 40, 0, 0, {{"relevance", "PASS"}}));
+  emit(hTraceCall("turn-1", "c-1"));
+  emit(hTraceCall("turn-2", "c-2", "tool", "get_reservation", 120, 0, 0));
+  emit(hTraceCall("turn-3", "c-1", "guardrail", "gate", 40, 0, 0, {{"relevance", "PASS"}}));
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kTraceTopic);
+  const auto records = ctx.Kafka.Records(kHTraceTopic);
   ctx.Equal(records.size(), 3, "three emit calls must produce three records on assistant.trace; the records");
-  ctx.Equal(ctx.Kafka.Keys(kTraceTopic), {"c-1", "c-2", "c-1"},
+  ctx.Equal(ctx.Kafka.Keys(kHTraceTopic), {"c-1", "c-2", "c-1"},
             "spans must be keyed by the conversation (keyed by turn id, one conversation's spans spread over the partitions and its timeline arrives out of order); the keys");
   ctx.Equal(records[0].Partition, records[2].Partition, "one conversation's spans must land on one partition; c-1's partitions");
   const auto span = json::parse(records[0].Value.value_or(""), nullptr, false);
@@ -1298,16 +1298,16 @@ void CheckConversationKey(harness::Ctx& ctx) {
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kTraceTopic, 1);
-  emit(traceCall("turn-1"));
+  ctx.Kafka.LoseAcks(kHTraceTopic, 1);
+  emit(hTraceCall("turn-1"));
   producer->poll(0);
   ctx.Settle();
-  ctx.Equal(traceTurnIds(ctx), {"turn-1"}, "after one produce whose acknowledgement was lost the retry must not write the span again (enable.idempotence); the spans");
-  emit(traceCall("turn-2"));
+  ctx.Equal(hTraceTurnIds(ctx), {"turn-1"}, "after one produce whose acknowledgement was lost the retry must not write the span again (enable.idempotence); the spans");
+  emit(hTraceCall("turn-2"));
   producer->poll(0);
   ctx.Settle();
-  ctx.Kafka.Failover(kTraceTopic);
-  const auto ids = traceTurnIds(ctx);
+  ctx.Kafka.Failover(kHTraceTopic);
+  const auto ids = hTraceTurnIds(ctx);
   ctx.Assert(std::find(ids.begin(), ids.end(), "turn-2") != ids.end(), "a leader failover right after the acknowledgement lost the span: wait for all in-sync replicas (acks=all)");
 }
 
@@ -1315,15 +1315,15 @@ void CheckNoText(harness::Ctx& ctx) {
   std::ostringstream logged;
   auto* out = std::cout.rdbuf(logged.rdbuf());
   auto* err = std::cerr.rdbuf(logged.rdbuf());
-  json call = traceCall("turn-1");
-  call["prompt"] = kTraceCanary;
-  call["answer"] = "Answer to " + kTraceCanary;
+  json call = hTraceCall("turn-1");
+  call["prompt"] = kHTraceCanary;
+  call["answer"] = "Answer to " + kHTraceCanary;
   emit(call);
   producer->poll(0);
   std::cout.rdbuf(out);
   std::cerr.rdbuf(err);
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kTraceTopic);
+  const auto records = ctx.Kafka.Records(kHTraceTopic);
   ctx.Equal(records.size(), 1, "one emit call; the records");
   const std::string value = records[0].Value.value_or("");
   ctx.Assert(value.find("CANARY-5521") == std::string::npos, "the span carries the guest's text: %s", value);
@@ -1333,44 +1333,44 @@ void CheckNoText(harness::Ctx& ctx) {
 }
 
 void CheckOutboxFallback(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kTraceTopic, 1);
+  ctx.Kafka.FailNext(kHTraceTopic, 1);
   try {
-    json call = traceCall("turn-9");
-    call["prompt"] = kTraceCanary;
-    call["answer"] = "Answer to " + kTraceCanary;
+    json call = hTraceCall("turn-9");
+    call["prompt"] = kHTraceCanary;
+    call["answer"] = "Answer to " + kHTraceCanary;
     emit(call);
   } catch (const std::exception& e) {
     ctx.Fatalf("emit failed the turn when the broker refused the span: %s. Write the span to the outbox instead", e.what());
   }
   producer->poll(0);
   ctx.Settle();
-  const auto rows = traceOutbox(ctx);
+  const auto rows = hTraceOutbox(ctx);
   ctx.Assert(!rows.empty(), "the broker refused the span and nothing reached apv2:outbox: handle the delivery report (dr_cb) with outbox::insert");
   ctx.Assert(rows[0].is_object() && rows[0].contains("span") && rows[0]["span"].value("turn_id", "") == "turn-9", "the outbox row must carry the span: %s", rows[0].dump());
   ctx.Assert(!rows[0]["span"].contains("prompt") && !rows[0]["span"].contains("answer") && rows[0].dump().find("CANARY-5521") == std::string::npos,
              "the outbox row carries the guest's text: write the span, not the call: %s", rows[0].dump());
   ctx.Equal(ctx.Kafka.Flushes(), 0, "emit must not flush (the turn would wait for the broker); the flushes");
-  emit(traceCall("turn-10"));
+  emit(hTraceCall("turn-10"));
   producer->poll(0);
   ctx.Settle();
-  ctx.Equal(traceTurnIds(ctx), {"turn-10"}, "once the broker accepts records again spans flow to the topic; the spans");
-  ctx.Equal(traceOutbox(ctx).size(), 1, "a delivered span must not be written to the outbox; the rows");
+  ctx.Equal(hTraceTurnIds(ctx), {"turn-10"}, "once the broker accepts records again spans flow to the topic; the spans");
+  ctx.Equal(hTraceOutbox(ctx).size(), 1, "a delivered span must not be written to the outbox; the rows");
 }
 
 void CheckMetricsBeforeCommit(harness::Ctx& ctx) {
   const std::string llm = "metrics:t1:llm:support-model";
-  for (json span : {traceCall("turn-1", "c-1", "llm", "support-model", 800, 100, 50), traceCall("turn-1", "c-1", "llm", "support-model", 1200, 300, 20),
-                    traceCall("turn-1", "c-1", "guardrail", "gate", 40, 0, 0, {{"relevance", "PASS"}, {"groundedness", "FAIL"}})}) {
+  for (json span : {hTraceCall("turn-1", "c-1", "llm", "support-model", 800, 100, 50), hTraceCall("turn-1", "c-1", "llm", "support-model", 1200, 300, 20),
+                    hTraceCall("turn-1", "c-1", "guardrail", "gate", 40, 0, 0, {{"relevance", "PASS"}, {"groundedness", "FAIL"}})}) {
     span.erase("prompt");
     span.erase("answer");
-    ctx.Kafka.Seed(kTraceTopic, "c-1", span.dump());
+    ctx.Kafka.Seed(kHTraceTopic, "c-1", span.dump());
   }
   // The fourth span's counters are not a hash: its increment fails, so its offset must stay uncommitted.
   ctx.Redis.Set("metrics:t1:tool:broken", "not a hash");
-  json broken = traceCall("turn-1", "c-1", "tool", "broken", 5, 0, 0);
+  json broken = hTraceCall("turn-1", "c-1", "tool", "broken", 5, 0, 0);
   broken.erase("prompt");
   broken.erase("answer");
-  ctx.Kafka.Seed(kTraceTopic, "c-1", broken.dump());
+  ctx.Kafka.Seed(kHTraceTopic, "c-1", broken.dump());
   std::vector<std::optional<std::string>> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(ctx.Redis.HGet(llm, "calls")); });
   ctx.Drain([] {
@@ -1385,7 +1385,7 @@ void CheckMetricsBeforeCommit(harness::Ctx& ctx) {
   ctx.Equal(ctx.Redis.HGetAll(llm), std::map<std::string, std::string>{{"calls", "2"}, {"latency_ms", "2000"}, {"input_tokens", "400"}, {"output_tokens", "70"}, {"blocked", "0"}},
             "%s (2 calls, 2000 ms, 400 and 70 tokens, 0 blocked)", llm);
   ctx.Equal(ctx.Redis.HGet("metrics:t1:guardrail:gate", "blocked"), "1", "a guardrail span with a FAIL verdict counts as blocked");
-  ctx.Equal(ctx.Kafka.Lag("insights", kTraceTopic), 1,
+  ctx.Equal(ctx.Kafka.Lag("insights", kHTraceTopic), 1,
             "the three counted spans are committed, and the span whose increment failed (WRONGTYPE on metrics:t1:tool:broken) is not, or it is lost from the metrics; the lag");
 }
 `,

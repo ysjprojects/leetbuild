@@ -919,20 +919,20 @@ import (
 )
 
 // answeredLikes reports whether the body is exactly {"likes": n}.
-func answeredLikes(r *harness.Response, n int) bool {
+func hAnsweredLikes(r *harness.Response, n int) bool {
 	var body any
 	return json.Unmarshal(r.Body, &body) == nil && reflect.DeepEqual(body, map[string]any{"likes": float64(n)})
 }
 
 // redisString is the string at key, nil when the key does not exist.
-func redisString(ctx *harness.Ctx, key string) any {
+func hRedisString(ctx *harness.Ctx, key string) any {
 	if v, ok := ctx.Redis.Get(key); ok {
 		return v
 	}
 	return nil
 }
 
-func engagementEvents(ctx *harness.Ctx) []map[string]any {
+func hEngagementEvents(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
 	for _, value := range ctx.Kafka.Values("engagement") {
 		var event map[string]any
@@ -949,9 +949,9 @@ func CheckIdempotentLike(ctx *harness.Ctx) {
 	ctx.Equal(r.JSON(), map[string]any{"likes": float64(1)}, "the first like must answer likes 1")
 	r = c.Post("/posts/p1/like", nil, "X-User-Id", "alice")
 	ctx.Equal(r.Status, 409, "a second like by the same user must answer 409")
-	ctx.Equal(redisString(ctx, "likes:p1"), "1", "a duplicate like must not move the counter: likes:p1")
+	ctx.Equal(hRedisString(ctx, "likes:p1"), "1", "a duplicate like must not move the counter: likes:p1")
 	r = c.Post("/posts/p1/like", nil, "X-User-Id", "bob")
-	ctx.Assert(r.Status == 200 && answeredLikes(r, 2), "a like by another user counts: expected 200 likes 2, got %d %s", r.Status, r.Text())
+	ctx.Assert(r.Status == 200 && hAnsweredLikes(r, 2), "a like by another user counts: expected 200 likes 2, got %d %s", r.Status, r.Text())
 	ctx.Equal(ctx.Redis.SMembers("liked:p1"), []string{"alice", "bob"}, "liked:p1 must hold the users who liked")
 }
 
@@ -960,12 +960,12 @@ func CheckCountAfterMembership(ctx *harness.Ctx) {
 	ctx.Redis.Do("SADD", "liked:p1", "alice") // the fact exists; the counter does not yet
 	r := c.Post("/posts/p1/like", nil, "X-User-Id", "alice")
 	ctx.Equal(r.Status, 409, "SADD returned 0 for alice: expected 409")
-	ctx.Equal(redisString(ctx, "likes:p1"), nil, "the counter must not move when SADD added nothing: likes:p1")
+	ctx.Equal(hRedisString(ctx, "likes:p1"), nil, "the counter must not move when SADD added nothing: likes:p1")
 	ctx.Settle()
 	ctx.Equal(len(ctx.Kafka.Records("engagement")), 0, "a rejected like must not produce an event")
 	r = c.Post("/posts/p1/like", nil, "X-User-Id", "bob")
-	ctx.Assert(r.Status == 200 && answeredLikes(r, 1), "bob is a new member: expected 200 likes 1, got %d %s", r.Status, r.Text())
-	ctx.Equal(redisString(ctx, "likes:p1"), "1", "likes:p1 must be 1 after one successful INCR")
+	ctx.Assert(r.Status == 200 && hAnsweredLikes(r, 1), "bob is a new member: expected 200 likes 1, got %d %s", r.Status, r.Text())
+	ctx.Equal(hRedisString(ctx, "likes:p1"), "1", "likes:p1 must be 1 after one successful INCR")
 	ctx.Equal(ctx.Redis.SCard("liked:p1"), 2, "liked:p1 must hold alice and bob: %q", ctx.Redis.SMembers("liked:p1"))
 }
 
@@ -973,18 +973,18 @@ func CheckUnlike(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
 	r := c.Delete("/posts/p1/like", "X-User-Id", "alice")
 	ctx.Equal(r.Status, 409, "unliking a post alice never liked must answer 409")
-	ctx.Equal(redisString(ctx, "likes:p1"), nil, "a rejected unlike must not touch the counter: likes:p1")
+	ctx.Equal(hRedisString(ctx, "likes:p1"), nil, "a rejected unlike must not touch the counter: likes:p1")
 	c.Post("/posts/p1/like", nil, "X-User-Id", "alice")
 	c.Post("/posts/p1/like", nil, "X-User-Id", "bob")
 	r = c.Delete("/posts/p1/like", "X-User-Id", "alice")
-	ctx.Assert(r.Status == 200 && answeredLikes(r, 1), "unlike after a like must answer 200 with the decremented count, got %d %s", r.Status, r.Text())
+	ctx.Assert(r.Status == 200 && hAnsweredLikes(r, 1), "unlike after a like must answer 200 with the decremented count, got %d %s", r.Status, r.Text())
 	ctx.Equal(ctx.Redis.SMembers("liked:p1"), []string{"bob"}, "SREM must remove alice from liked:p1")
 	r = c.Delete("/posts/p1/like", "X-User-Id", "alice")
 	ctx.Equal(r.Status, 409, "a repeated unlike must answer 409")
-	ctx.Equal(redisString(ctx, "likes:p1"), "1", "the counter must equal the set size (1): likes:p1")
+	ctx.Equal(hRedisString(ctx, "likes:p1"), "1", "the counter must equal the set size (1): likes:p1")
 	ctx.Settle()
 	var kinds []any
-	for _, event := range engagementEvents(ctx) {
+	for _, event := range hEngagementEvents(ctx) {
 		kinds = append(kinds, event["type"])
 	}
 	ctx.Equal(kinds, []any{"like", "like", "unlike"}, "expected like, like, unlike events")
@@ -1001,7 +1001,7 @@ func CheckEvent(ctx *harness.Ctx) {
 	ctx.Equal(len(records), 3, "expected 3 engagement events (like, like, unlike)")
 	// kafka-go's async Writer batches per partition: the records of two posts may land out of request
 	// order, while each post's own records keep theirs.
-	events := engagementEvents(ctx)
+	events := hEngagementEvents(ctx)
 	var keys []string
 	var p1Events []map[string]any
 	var p1Partitions []int
@@ -1044,7 +1044,7 @@ func CheckCountRead(ctx *harness.Ctx) {
 	c.Post("/posts/p1/like", nil, "X-User-Id", "alice")
 	c.Post("/posts/p1/like", nil, "X-User-Id", "bob")
 	r = c.Get("/posts/p1/likes")
-	ctx.Assert(r.Status == 200 && answeredLikes(r, 2), "after two likes GET must answer likes 2, got %d %s", r.Status, r.Text())
+	ctx.Assert(r.Status == 200 && hAnsweredLikes(r, 2), "after two likes GET must answer likes 2, got %d %s", r.Status, r.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1059,18 +1059,18 @@ func CheckCountRead(ctx *harness.Ctx) {
 namespace {
 
 // answeredLikes reports whether the body is exactly {"likes": n}.
-bool answeredLikes(const harness::Response& r, int n) {
+bool hAnsweredLikes(const harness::Response& r, int n) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body == nlohmann::json{{"likes", n}};
 }
 
-std::vector<std::string> members(harness::Ctx& ctx, const std::string& key) {
+std::vector<std::string> hMembers(harness::Ctx& ctx, const std::string& key) {
   auto out = ctx.Redis.SMembers(key);
   std::sort(out.begin(), out.end());
   return out;
 }
 
-std::vector<nlohmann::json> engagementEvents(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEngagementEvents(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
   for (const auto& value : ctx.Kafka.Values("engagement")) {
     const auto event = nlohmann::json::parse(value, nullptr, false);
@@ -1091,8 +1091,8 @@ void CheckIdempotentLike(harness::Ctx& ctx) {
   ctx.Equal(r.Status, 409, "a second like by the same user must answer 409");
   ctx.Equal(ctx.Redis.Get("likes:p1"), "1", "a duplicate like must not move the counter: likes:p1");
   r = c.Post("/posts/p1/like", "", "X-User-Id", "bob");
-  ctx.Assert(r.Status == 200 && answeredLikes(r, 2), "a like by another user counts: expected 200 likes 2, got %d %s", r.Status, r.Text());
-  ctx.Equal(members(ctx, "liked:p1"), {"alice", "bob"}, "liked:p1 must hold the users who liked");
+  ctx.Assert(r.Status == 200 && hAnsweredLikes(r, 2), "a like by another user counts: expected 200 likes 2, got %d %s", r.Status, r.Text());
+  ctx.Equal(hMembers(ctx, "liked:p1"), {"alice", "bob"}, "liked:p1 must hold the users who liked");
 }
 
 void CheckCountAfterMembership(harness::Ctx& ctx) {
@@ -1104,9 +1104,9 @@ void CheckCountAfterMembership(harness::Ctx& ctx) {
   ctx.Settle();
   ctx.Equal(ctx.Kafka.Records("engagement").size(), 0, "a rejected like must not produce an event");
   r = c.Post("/posts/p1/like", "", "X-User-Id", "bob");
-  ctx.Assert(r.Status == 200 && answeredLikes(r, 1), "bob is a new member: expected 200 likes 1, got %d %s", r.Status, r.Text());
+  ctx.Assert(r.Status == 200 && hAnsweredLikes(r, 1), "bob is a new member: expected 200 likes 1, got %d %s", r.Status, r.Text());
   ctx.Equal(ctx.Redis.Get("likes:p1"), "1", "likes:p1 must be 1 after one successful INCR");
-  ctx.Equal(ctx.Redis.SCard("liked:p1"), 2, "liked:p1 must hold alice and bob: %q", members(ctx, "liked:p1"));
+  ctx.Equal(ctx.Redis.SCard("liked:p1"), 2, "liked:p1 must hold alice and bob: %q", hMembers(ctx, "liked:p1"));
 }
 
 void CheckUnlike(harness::Ctx& ctx) {
@@ -1117,14 +1117,14 @@ void CheckUnlike(harness::Ctx& ctx) {
   c.Post("/posts/p1/like", "", "X-User-Id", "alice");
   c.Post("/posts/p1/like", "", "X-User-Id", "bob");
   r = c.Delete("/posts/p1/like", "X-User-Id", "alice");
-  ctx.Assert(r.Status == 200 && answeredLikes(r, 1), "unlike after a like must answer 200 with the decremented count, got %d %s", r.Status, r.Text());
-  ctx.Equal(members(ctx, "liked:p1"), {"bob"}, "SREM must remove alice from liked:p1");
+  ctx.Assert(r.Status == 200 && hAnsweredLikes(r, 1), "unlike after a like must answer 200 with the decremented count, got %d %s", r.Status, r.Text());
+  ctx.Equal(hMembers(ctx, "liked:p1"), {"bob"}, "SREM must remove alice from liked:p1");
   r = c.Delete("/posts/p1/like", "X-User-Id", "alice");
   ctx.Equal(r.Status, 409, "a repeated unlike must answer 409");
   ctx.Equal(ctx.Redis.Get("likes:p1"), "1", "the counter must equal the set size (1): likes:p1");
   ctx.Settle();
   std::vector<std::string> kinds;
-  for (const auto& event : engagementEvents(ctx)) kinds.push_back(event.value("type", ""));
+  for (const auto& event : hEngagementEvents(ctx)) kinds.push_back(event.value("type", ""));
   ctx.Equal(kinds, {"like", "like", "unlike"}, "expected like, like, unlike events");
 }
 
@@ -1139,7 +1139,7 @@ void CheckEvent(harness::Ctx& ctx) {
   ctx.Equal(records.size(), 3, "expected 3 engagement events (like, like, unlike)");
   // The producer batches per partition: the records of two posts may land out of request order,
   // while each post's own records keep theirs.
-  const auto events = engagementEvents(ctx);
+  const auto events = hEngagementEvents(ctx);
   std::vector<std::string> keys;
   std::vector<nlohmann::json> p1Events;
   std::vector<int> p1Partitions;
@@ -1186,7 +1186,7 @@ void CheckCountRead(harness::Ctx& ctx) {
   c.Post("/posts/p1/like", "", "X-User-Id", "alice");
   c.Post("/posts/p1/like", "", "X-User-Id", "bob");
   r = c.Get("/posts/p1/likes");
-  ctx.Assert(r.Status == 200 && answeredLikes(r, 2), "after two likes GET must answer likes 2, got %d %s", r.Status, r.Text());
+  ctx.Assert(r.Status == 200 && hAnsweredLikes(r, 2), "after two likes GET must answer likes 2, got %d %s", r.Status, r.Text());
 }
 `,
   },

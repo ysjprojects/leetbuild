@@ -973,7 +973,7 @@ func hMustReclaim(ctx *harness.Ctx, taskID string) int {
 	return n
 }
 
-func holderOf(ctx *harness.Ctx, taskID, itemID string) string {
+func hHolderOf(ctx *harness.Ctx, taskID, itemID string) string {
 	h, _ := ctx.Redis.HGet("holder:"+taskID, itemID)
 	return h
 }
@@ -997,7 +997,7 @@ func CheckLeaseTtl(ctx *harness.Ctx) {
 	ctx.Assert(probe.Result == any(want), "right after the claim took i-1 from pool:%s, lease:%s scored it %v: the item was in neither the pool nor a lease. Pop and lease in the same script", taskID, taskID, probe.Result)
 	ctx.Clock.Advance(899)
 	ctx.Equal(hMustReclaim(ctx, taskID), 0, "a second before the fifteen-minute deadline nothing has expired; reclaimExpired")
-	ctx.Equal(holderOf(ctx, taskID, "i-1"), "ana", "a live lease must stay with its holder")
+	ctx.Equal(hHolderOf(ctx, taskID, "i-1"), "ana", "a live lease must stay with its holder")
 	ctx.Clock.Advance(1.5)
 	ctx.Equal(hMustReclaim(ctx, taskID), 1, "half a second after its deadline ana's lease has expired; reclaimExpired")
 }
@@ -1029,7 +1029,7 @@ func CheckHolderOnly(ctx *harness.Ctx) {
 	ctx.Equal(stolen, int64(0), "bo renewed ana's lease on i-1: only the holder may extend a lease; renew's answer")
 	after, _ := ctx.Redis.ZScore("lease:"+taskID, "i-1")
 	ctx.Equal(after, before, "bo's renew moved the deadline of ana's lease")
-	ctx.Equal(holderOf(ctx, taskID, "i-1"), "ana", "bo's renew changed the holder of i-1")
+	ctx.Equal(hHolderOf(ctx, taskID, "i-1"), "ana", "bo's renew changed the holder of i-1")
 	ghost := hMustRenew(ctx, taskID, "i-2", "bo")
 	_, leased := ctx.Redis.ZScore("lease:"+taskID, "i-2")
 	ctx.Assert(ghost == 0 && !leased, "renewing i-2, which nobody holds, answered %d: a renew must not lease an item still in the pool", ghost)
@@ -1058,13 +1058,13 @@ func CheckExpiredReturn(ctx *harness.Ctx) {
 	ctx.Equal(hMustReclaim(ctx, taskID), 1, "after ana's lease expired, reclaimExpired")
 	_, inPool := ctx.Redis.ZScore("pool:"+taskID, "i-1")
 	ctx.Assert(inPool, "the expired lease on i-1 was dropped but the item never went back to pool:%s: abandoned work is lost", taskID)
-	ctx.Equal(holderOf(ctx, taskID, "i-1"), "", "an expired lease must lose its holder")
+	ctx.Equal(hHolderOf(ctx, taskID, "i-1"), "", "an expired lease must lose its holder")
 	again := hMustClaim(ctx, taskID, "bo")
 	ctx.Assert(again != nil && again.ItemID == "i-1", "after the sweeper ran bo's claim returned %+v, expected the returned item i-1 at the front of the pool", again)
 	ctx.Clock.Advance(901) // bo leaves too, and no sweeper runs
 	third := hMustClaim(ctx, taskID, "cy")
 	ctx.Assert(third != nil && third.ItemID == "i-1", "bo's lease expired and no sweeper ran: cy's claim returned %+v. A claim must return expired leases to the front of the pool before it pops", third)
-	ctx.Equal(holderOf(ctx, taskID, "i-1"), "cy", "i-1 must now be held by cy")
+	ctx.Equal(hHolderOf(ctx, taskID, "i-1"), "cy", "i-1 must now be held by cy")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1085,7 +1085,7 @@ std::string hPoolTask(const std::vector<std::string>& items = {"a cat", "a dog"}
   return store::createTask("t1", "2026-10", 1, items).task_id;
 }
 
-std::string holderOf(harness::Ctx& ctx, const std::string& task_id, const std::string& item_id) {
+std::string hHolderOf(harness::Ctx& ctx, const std::string& task_id, const std::string& item_id) {
   return ctx.Redis.HGet("holder:" + task_id, item_id).value_or("");
 }
 
@@ -1109,7 +1109,7 @@ void CheckLeaseTtl(harness::Ctx& ctx) {
   ctx.Assert(seen->has_value() && static_cast<long long>(**seen) == want, "right after the claim took i-1 from pool:%s, lease:%s scored it %s: the item was in neither the pool nor a lease. Pop and lease in the same script", task_id, task_id, seen->has_value() ? std::to_string(static_cast<long long>(**seen)) : "nothing");
   ctx.Clock.Advance(899);
   ctx.Equal(reclaimExpired(task_id), 0LL, "a second before the fifteen-minute deadline nothing has expired; reclaimExpired");
-  ctx.Equal(holderOf(ctx, task_id, "i-1"), "ana", "a live lease must stay with its holder");
+  ctx.Equal(hHolderOf(ctx, task_id, "i-1"), "ana", "a live lease must stay with its holder");
   ctx.Clock.Advance(1.5);
   ctx.Equal(reclaimExpired(task_id), 1LL, "half a second after its deadline ana's lease has expired; reclaimExpired");
 }
@@ -1146,7 +1146,7 @@ void CheckHolderOnly(harness::Ctx& ctx) {
   const long long stolen = renew(task_id, "i-1", "bo");
   ctx.Equal(stolen, 0LL, "bo renewed ana's lease on i-1: only the holder may extend a lease; renew's answer");
   ctx.Equal(ctx.Redis.ZScore("lease:" + task_id, "i-1"), before, "bo's renew moved the deadline of ana's lease");
-  ctx.Equal(holderOf(ctx, task_id, "i-1"), "ana", "bo's renew changed the holder of i-1");
+  ctx.Equal(hHolderOf(ctx, task_id, "i-1"), "ana", "bo's renew changed the holder of i-1");
   const long long ghost = renew(task_id, "i-2", "bo");
   ctx.Assert(ghost == 0 && !ctx.Redis.ZScore("lease:" + task_id, "i-2"), "renewing i-2, which nobody holds, answered %d: a renew must not lease an item still in the pool", ghost);
   const long long renewed = renew(task_id, "i-1", "ana");
@@ -1172,13 +1172,13 @@ void CheckExpiredReturn(harness::Ctx& ctx) {
   ctx.Clock.Advance(901);  // ana closed the tab
   ctx.Equal(reclaimExpired(task_id), 1LL, "after ana's lease expired, reclaimExpired");
   ctx.Assert(ctx.Redis.ZScore("pool:" + task_id, "i-1").has_value(), "the expired lease on i-1 was dropped but the item never went back to pool:%s: abandoned work is lost", task_id);
-  ctx.Equal(holderOf(ctx, task_id, "i-1"), "", "an expired lease must lose its holder");
+  ctx.Equal(hHolderOf(ctx, task_id, "i-1"), "", "an expired lease must lose its holder");
   const auto again = claim(task_id, "bo");
   ctx.Assert(again && again->item_id == "i-1", "after the sweeper ran bo's claim returned %q, expected the returned item i-1 at the front of the pool", again ? again->item_id : "nothing");
   ctx.Clock.Advance(901);  // bo leaves too, and no sweeper runs
   const auto third = claim(task_id, "cy");
   ctx.Assert(third && third->item_id == "i-1", "bo's lease expired and no sweeper ran: cy's claim returned %q. A claim must return expired leases to the front of the pool before it pops", third ? third->item_id : "nothing");
-  ctx.Equal(holderOf(ctx, task_id, "i-1"), "cy", "i-1 must now be held by cy");
+  ctx.Equal(hHolderOf(ctx, task_id, "i-1"), "cy", "i-1 must now be held by cy");
 }
 `,
   },

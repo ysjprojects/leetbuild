@@ -902,31 +902,31 @@ import (
 )
 
 var (
-	probeBg       = context.Background()
-	probeFleet    = map[string]string{"checkout-1": "10.4.2.1:8080", "checkout-2": "10.4.2.2:8080", "checkout-3": "10.4.2.3:8080"}
-	probeFleetIDs = []string{"checkout-1", "checkout-2", "checkout-3"}
+	hProbeBg       = context.Background()
+	hProbeFleet    = map[string]string{"checkout-1": "10.4.2.1:8080", "checkout-2": "10.4.2.2:8080", "checkout-3": "10.4.2.3:8080"}
+	hProbeFleetIDs = []string{"checkout-1", "checkout-2", "checkout-3"}
 )
 
 // probeHealthPeer is one instance's health endpoint: it answers with whatever status it holds.
-type probeHealthPeer struct {
+type HProbeHealthPeer struct {
 	pb.UnimplementedHealthServer
 	status pb.HealthCheckResponse_ServingStatus
 }
 
-func (p *probeHealthPeer) Check(context.Context, *pb.HealthCheckRequest) (*pb.HealthCheckResponse, error) {
+func (p *HProbeHealthPeer) Check(context.Context, *pb.HealthCheckRequest) (*pb.HealthCheckResponse, error) {
 	return &pb.HealthCheckResponse{Status: p.status}, nil
 }
 
-func probeServeHealth(ctx *harness.Ctx, instanceID string, status pb.HealthCheckResponse_ServingStatus) {
-	pb.RegisterHealthServer(ctx.GRPC.Server(probeFleet[instanceID]), &probeHealthPeer{status: status})
+func hProbeServeHealth(ctx *harness.Ctx, instanceID string, status pb.HealthCheckResponse_ServingStatus) {
+	pb.RegisterHealthServer(ctx.GRPC.Server(hProbeFleet[instanceID]), &HProbeHealthPeer{status: status})
 }
 
 // probeStartFleet registers checkout-1..3 with 5 s heartbeats; down lists the ids with no process at all.
-func probeStartFleet(ctx *harness.Ctx, statuses map[string]pb.HealthCheckResponse_ServingStatus, down ...string) {
-	for _, id := range probeFleetIDs {
-		address, port, _ := strings.Cut(probeFleet[id], ":")
+func hProbeStartFleet(ctx *harness.Ctx, statuses map[string]pb.HealthCheckResponse_ServingStatus, down ...string) {
+	for _, id := range hProbeFleetIDs {
+		address, port, _ := strings.Cut(hProbeFleet[id], ":")
 		n, _ := strconv.Atoi(port)
-		_, err := instances.RegisterInstance(probeBg, "checkout", id, address, n, 5, 1)
+		_, err := instances.RegisterInstance(hProbeBg, "checkout", id, address, n, 5, 1)
 		ctx.NoError(err, "registering %s", id)
 		skip := false
 		for _, d := range down {
@@ -939,24 +939,24 @@ func probeStartFleet(ctx *harness.Ctx, statuses map[string]pb.HealthCheckRespons
 		if !ok {
 			status = pb.HealthCheckResponse_SERVING
 		}
-		probeServeHealth(ctx, id, status)
+		hProbeServeHealth(ctx, id, status)
 	}
 }
 
-func probeRound(ctx *harness.Ctx) map[string]string {
-	verdicts, err := probeService(probeBg, "checkout")
+func hProbeRound(ctx *harness.Ctx) map[string]string {
+	verdicts, err := probeService(hProbeBg, "checkout")
 	ctx.NoError(err, "probeService(checkout) failed")
 	return verdicts
 }
 
 func CheckProbeDeadline(ctx *harness.Ctx) {
-	probeStartFleet(ctx, nil)
-	ctx.GRPC.SetLatency("Check", 2.0, probeFleet["checkout-3"]) // checkout-3 is hung
+	hProbeStartFleet(ctx, nil)
+	ctx.GRPC.SetLatency("Check", 2.0, hProbeFleet["checkout-3"]) // checkout-3 is hung
 	for _, slow := range []string{"checkout-1", "checkout-2"} { // slow but inside 200 ms, each on its own deadline
-		ctx.GRPC.SetLatency("Check", 0.15, probeFleet[slow])
+		ctx.GRPC.SetLatency("Check", 0.15, hProbeFleet[slow])
 	}
 	before := ctx.Clock.Now()
-	verdicts := probeRound(ctx)
+	verdicts := hProbeRound(ctx)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Equal(verdicts["checkout-3"], "NOT_SERVING", "checkout-3 takes 2 s to answer its health check: past the 200 ms deadline it is NOT_SERVING; its verdict")
 	ctx.Assert(verdicts["checkout-1"] == "SERVING" && verdicts["checkout-2"] == "SERVING", "checkout-1 and checkout-2 answer SERVING in 150 ms and were judged %v: every Check gets its own full 200 ms deadline", verdicts)
@@ -968,23 +968,23 @@ func CheckProbeDeadline(ctx *harness.Ctx) {
 }
 
 func CheckServingStatus(ctx *harness.Ctx) {
-	probeStartFleet(ctx, map[string]pb.HealthCheckResponse_ServingStatus{"checkout-2": pb.HealthCheckResponse_NOT_SERVING}, "checkout-3")
-	verdicts := probeRound(ctx)
+	hProbeStartFleet(ctx, map[string]pb.HealthCheckResponse_ServingStatus{"checkout-2": pb.HealthCheckResponse_NOT_SERVING}, "checkout-3")
+	verdicts := hProbeRound(ctx)
 	ctx.Equal(verdicts["checkout-2"], "NOT_SERVING", "checkout-2 answered status NOT_SERVING (it is draining): read the reply's status, not only whether the call returned; its verdict")
 	ctx.Equal(verdicts["checkout-3"], "NOT_SERVING", "checkout-3 has no process listening; its verdict")
 	ctx.Equal(verdicts["checkout-1"], "SERVING", "checkout-1 answered SERVING; its verdict")
 	shared, _ := ctx.Redis.Get("sd:probe:checkout:checkout-2")
 	ctx.Equal(shared, "NOT_SERVING", "the shared verdict in sd:probe:checkout:checkout-2")
 	ctx.Clock.Advance(6) // the verdicts lapsed; the next round asks again
-	ctx.GRPC.Fail("Check", codes.Internal, "internal error", 1, probeFleet["checkout-1"])
-	probeServeHealth(ctx, "checkout-3", pb.HealthCheckResponse_UNKNOWN) // a process is back on checkout-3 and does not know its status yet
-	verdicts = probeRound(ctx)
+	ctx.GRPC.Fail("Check", codes.Internal, "internal error", 1, hProbeFleet["checkout-1"])
+	hProbeServeHealth(ctx, "checkout-3", pb.HealthCheckResponse_UNKNOWN) // a process is back on checkout-3 and does not know its status yet
+	verdicts = hProbeRound(ctx)
 	ctx.Equal(verdicts["checkout-1"], "NOT_SERVING", "checkout-1's Check failed with INTERNAL: an error of any code is NOT_SERVING; its verdict")
 	ctx.Equal(verdicts["checkout-3"], "NOT_SERVING", "checkout-3 answered status UNKNOWN: only SERVING is SERVING; its verdict")
 }
 
 func CheckSharedVerdict(ctx *harness.Ctx) {
-	probeStartFleet(ctx, nil)
+	hProbeStartFleet(ctx, nil)
 	key := "sd:probe:checkout:checkout-1"
 	// The verdict's TTL each time the round touched it: a written verdict always carries one.
 	var seen [][2]int64
@@ -997,7 +997,7 @@ func CheckSharedVerdict(ctx *harness.Ctx) {
 		ctx.Redis.After(key, look)
 		return nil
 	})
-	probeRound(ctx)
+	hProbeRound(ctx)
 	ctx.Assert(first.Fired, "the round never read or wrote %s", key)
 	ctx.NoError(first.Err, "the snapshot of %s", key)
 	for _, s := range seen {
@@ -1007,22 +1007,22 @@ func CheckSharedVerdict(ctx *harness.Ctx) {
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(0 < ttl && ttl <= 5, "%s has TTL %d: the shared verdict expires after 5 s, or a recovered instance is judged on a stale answer", key, ttl)
 	ctx.Clock.Advance(1)
-	verdicts := probeRound(ctx) // another round a second later, as a second router would run it
+	verdicts := hProbeRound(ctx) // another round a second later, as a second router would run it
 	ctx.Equal(verdicts, map[string]string{"checkout-1": "SERVING", "checkout-2": "SERVING", "checkout-3": "SERVING"}, "the verdicts of the second round")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Check", "")), 3, "a second round within the verdicts' 5 s must read sd:probe:{service}:{instance_id} before probing; Check calls")
 	ctx.Clock.Advance(5)
-	probeRound(ctx)
+	hProbeRound(ctx)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Check", "")), 6, "after the verdicts lapsed the next round must probe each instance once; Check calls")
 }
 
 func CheckKeepRegistered(ctx *harness.Ctx) {
-	probeStartFleet(ctx, nil, "checkout-2")
-	verdicts := probeRound(ctx)
+	hProbeStartFleet(ctx, nil, "checkout-2")
+	verdicts := hProbeRound(ctx)
 	ctx.Equal(verdicts["checkout-2"], "NOT_SERVING", "checkout-2 has no process listening; its verdict")
 	ctx.Assert(ctx.Redis.Exists("sd:checkout:checkout-2") == 1 && ctx.Redis.SIsMember("sd:members:checkout", "checkout-2"), "one failed probe deregistered checkout-2: a failing instance is excluded by its verdict and stays registered, so a later probe can readmit it")
-	probeServeHealth(ctx, "checkout-2", pb.HealthCheckResponse_SERVING) // the process is back
+	hProbeServeHealth(ctx, "checkout-2", pb.HealthCheckResponse_SERVING) // the process is back
 	ctx.Clock.Advance(6)
-	verdicts = probeRound(ctx)
+	verdicts = hProbeRound(ctx)
 	ctx.Equal(verdicts["checkout-2"], "SERVING", "checkout-2 is serving again and its old verdict lapsed: a passing probe readmits it; its verdict")
 }
 `,
@@ -1040,45 +1040,45 @@ func CheckKeepRegistered(ctx *harness.Ctx) {
 
 namespace {
 
-using ProbeStatus = discoveryd::HealthCheckResponse::ServingStatus;
+using HProbeStatus = discoveryd::HealthCheckResponse::ServingStatus;
 
-const std::map<std::string, std::string> kProbeFleet = {
+const std::map<std::string, std::string> kHProbeFleet = {
     {"checkout-1", "10.4.2.1"}, {"checkout-2", "10.4.2.2"}, {"checkout-3", "10.4.2.3"}};
 
-std::string probeTarget(const std::string& instance_id) { return kProbeFleet.at(instance_id) + ":8080"; }
+std::string hProbeTarget(const std::string& instance_id) { return kHProbeFleet.at(instance_id) + ":8080"; }
 
 // One instance's health endpoint: it answers with whatever status it holds.
-class ProbeHealthPeer final : public discoveryd::Health::Service {
+class HProbeHealthPeer final : public discoveryd::Health::Service {
  public:
-  explicit ProbeHealthPeer(ProbeStatus s) : status(s) {}
-  ProbeStatus status;
+  explicit HProbeHealthPeer(HProbeStatus s) : status(s) {}
+  HProbeStatus status;
   grpc::Status Check(grpc::ServerContext*, const discoveryd::HealthCheckRequest*, discoveryd::HealthCheckResponse* out) override {
     out->set_status(status);
     return grpc::Status::OK;
   }
 };
 
-std::vector<std::unique_ptr<ProbeHealthPeer>>& probePeers() {
-  static std::vector<std::unique_ptr<ProbeHealthPeer>> all;
+std::vector<std::unique_ptr<HProbeHealthPeer>>& hProbePeers() {
+  static std::vector<std::unique_ptr<HProbeHealthPeer>> all;
   return all;
 }
 
-void probeServeHealth(harness::Ctx& ctx, const std::string& instance_id, ProbeStatus status) {
-  probePeers().push_back(std::make_unique<ProbeHealthPeer>(status));
-  ctx.GRPC.Server(probeTarget(instance_id))->RegisterService(probePeers().back().get());
+void hProbeServeHealth(harness::Ctx& ctx, const std::string& instance_id, HProbeStatus status) {
+  hProbePeers().push_back(std::make_unique<HProbeHealthPeer>(status));
+  ctx.GRPC.Server(hProbeTarget(instance_id))->RegisterService(hProbePeers().back().get());
 }
 
 // checkout-1..3 registered with 5 s heartbeats; down lists the ids with no process at all.
-void probeStartFleet(harness::Ctx& ctx, const std::map<std::string, ProbeStatus>& statuses, const std::set<std::string>& down = {}) {
-  for (const auto& [instance_id, address] : kProbeFleet) {
+void hProbeStartFleet(harness::Ctx& ctx, const std::map<std::string, HProbeStatus>& statuses, const std::set<std::string>& down = {}) {
+  for (const auto& [instance_id, address] : kHProbeFleet) {
     instances::registerInstance("checkout", instance_id, address, 8080, 5, 1);
     if (down.count(instance_id)) continue;
     const auto it = statuses.find(instance_id);
-    probeServeHealth(ctx, instance_id, it == statuses.end() ? discoveryd::HealthCheckResponse::SERVING : it->second);
+    hProbeServeHealth(ctx, instance_id, it == statuses.end() ? discoveryd::HealthCheckResponse::SERVING : it->second);
   }
 }
 
-std::string probeVerdictOf(const std::map<std::string, std::string>& verdicts, const std::string& instance_id) {
+std::string hProbeVerdictOf(const std::map<std::string, std::string>& verdicts, const std::string& instance_id) {
   const auto it = verdicts.find(instance_id);
   return it == verdicts.end() ? "" : it->second;
 }
@@ -1086,16 +1086,16 @@ std::string probeVerdictOf(const std::map<std::string, std::string>& verdicts, c
 }  // namespace
 
 void CheckProbeDeadline(harness::Ctx& ctx) {
-  probeStartFleet(ctx, {});
-  ctx.GRPC.SetLatency("Check", 2.0, probeTarget("checkout-3"));  // checkout-3 is hung
+  hProbeStartFleet(ctx, {});
+  ctx.GRPC.SetLatency("Check", 2.0, hProbeTarget("checkout-3"));  // checkout-3 is hung
   for (const std::string slow : {"checkout-1", "checkout-2"}) {  // slow but inside 200 ms, each on its own deadline
-    ctx.GRPC.SetLatency("Check", 0.15, probeTarget(slow));
+    ctx.GRPC.SetLatency("Check", 0.15, hProbeTarget(slow));
   }
   const int64_t before = ctx.Clock.Now();
   const auto verdicts = probeService("checkout");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Equal(probeVerdictOf(verdicts, "checkout-3"), "NOT_SERVING", "checkout-3 takes 2 s to answer its health check: past the 200 ms deadline it is NOT_SERVING; its verdict");
-  ctx.Assert(probeVerdictOf(verdicts, "checkout-1") == "SERVING" && probeVerdictOf(verdicts, "checkout-2") == "SERVING", "checkout-1 and checkout-2 answer SERVING in 150 ms and were judged %s and %s: every Check gets its own full 200 ms deadline", probeVerdictOf(verdicts, "checkout-1"), probeVerdictOf(verdicts, "checkout-2"));
+  ctx.Equal(hProbeVerdictOf(verdicts, "checkout-3"), "NOT_SERVING", "checkout-3 takes 2 s to answer its health check: past the 200 ms deadline it is NOT_SERVING; its verdict");
+  ctx.Assert(hProbeVerdictOf(verdicts, "checkout-1") == "SERVING" && hProbeVerdictOf(verdicts, "checkout-2") == "SERVING", "checkout-1 and checkout-2 answer SERVING in 150 ms and were judged %s and %s: every Check gets its own full 200 ms deadline", hProbeVerdictOf(verdicts, "checkout-1"), hProbeVerdictOf(verdicts, "checkout-2"));
   for (const auto& call : ctx.GRPC.CallsTo("Check")) {
     ctx.Assert(call.HasDeadline(), "a Check call carries no deadline: a hung instance holds the whole round");
     ctx.Assert(0.18 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.25, "a Check call carries a %v s deadline, expected kProbeDeadline = 200 ms for every call", call.TimeoutSeconds());
@@ -1104,22 +1104,22 @@ void CheckProbeDeadline(harness::Ctx& ctx) {
 }
 
 void CheckServingStatus(harness::Ctx& ctx) {
-  probeStartFleet(ctx, {{"checkout-2", discoveryd::HealthCheckResponse::NOT_SERVING}}, {"checkout-3"});
+  hProbeStartFleet(ctx, {{"checkout-2", discoveryd::HealthCheckResponse::NOT_SERVING}}, {"checkout-3"});
   auto verdicts = probeService("checkout");
-  ctx.Equal(probeVerdictOf(verdicts, "checkout-2"), "NOT_SERVING", "checkout-2 answered status NOT_SERVING (it is draining): read the reply's status, not only whether the call returned; its verdict");
-  ctx.Equal(probeVerdictOf(verdicts, "checkout-3"), "NOT_SERVING", "checkout-3 has no process listening; its verdict");
-  ctx.Equal(probeVerdictOf(verdicts, "checkout-1"), "SERVING", "checkout-1 answered SERVING; its verdict");
+  ctx.Equal(hProbeVerdictOf(verdicts, "checkout-2"), "NOT_SERVING", "checkout-2 answered status NOT_SERVING (it is draining): read the reply's status, not only whether the call returned; its verdict");
+  ctx.Equal(hProbeVerdictOf(verdicts, "checkout-3"), "NOT_SERVING", "checkout-3 has no process listening; its verdict");
+  ctx.Equal(hProbeVerdictOf(verdicts, "checkout-1"), "SERVING", "checkout-1 answered SERVING; its verdict");
   ctx.Equal(ctx.Redis.Get("sd:probe:checkout:checkout-2").value_or(""), "NOT_SERVING", "the shared verdict in sd:probe:checkout:checkout-2");
   ctx.Clock.Advance(6);  // the verdicts lapsed; the next round asks again
-  ctx.GRPC.Fail("Check", grpc::StatusCode::INTERNAL, "internal error", 1, probeTarget("checkout-1"));
-  probeServeHealth(ctx, "checkout-3", discoveryd::HealthCheckResponse::UNKNOWN);  // a process is back on checkout-3 and does not know its status yet
+  ctx.GRPC.Fail("Check", grpc::StatusCode::INTERNAL, "internal error", 1, hProbeTarget("checkout-1"));
+  hProbeServeHealth(ctx, "checkout-3", discoveryd::HealthCheckResponse::UNKNOWN);  // a process is back on checkout-3 and does not know its status yet
   verdicts = probeService("checkout");
-  ctx.Equal(probeVerdictOf(verdicts, "checkout-1"), "NOT_SERVING", "checkout-1's Check failed with INTERNAL: an error of any code is NOT_SERVING; its verdict");
-  ctx.Equal(probeVerdictOf(verdicts, "checkout-3"), "NOT_SERVING", "checkout-3 answered status UNKNOWN: only SERVING is SERVING; its verdict");
+  ctx.Equal(hProbeVerdictOf(verdicts, "checkout-1"), "NOT_SERVING", "checkout-1's Check failed with INTERNAL: an error of any code is NOT_SERVING; its verdict");
+  ctx.Equal(hProbeVerdictOf(verdicts, "checkout-3"), "NOT_SERVING", "checkout-3 answered status UNKNOWN: only SERVING is SERVING; its verdict");
 }
 
 void CheckSharedVerdict(harness::Ctx& ctx) {
-  probeStartFleet(ctx, {});
+  hProbeStartFleet(ctx, {});
   const std::string key = "sd:probe:checkout:checkout-1";
   // The verdict's TTL each time the round touched it: a written verdict always carries one.
   auto seen = std::make_shared<std::vector<std::pair<long long, long long>>>();
@@ -1138,7 +1138,7 @@ void CheckSharedVerdict(harness::Ctx& ctx) {
   ctx.Assert(0 < ttl && ttl <= 5, "%s has TTL %d: the shared verdict expires after 5 s, or a recovered instance is judged on a stale answer", key, ttl);
   ctx.Clock.Advance(1);
   const auto verdicts = probeService("checkout");  // another round a second later, as a second router would run it
-  ctx.Assert(verdicts.size() == 3 && probeVerdictOf(verdicts, "checkout-1") == "SERVING" && probeVerdictOf(verdicts, "checkout-2") == "SERVING" && probeVerdictOf(verdicts, "checkout-3") == "SERVING", "the second round must judge all three SERVING");
+  ctx.Assert(verdicts.size() == 3 && hProbeVerdictOf(verdicts, "checkout-1") == "SERVING" && hProbeVerdictOf(verdicts, "checkout-2") == "SERVING" && hProbeVerdictOf(verdicts, "checkout-3") == "SERVING", "the second round must judge all three SERVING");
   ctx.Equal(ctx.GRPC.CallsTo("Check").size(), 3, "a second round within the verdicts' 5 s must read sd:probe:{service}:{instance_id} before probing; Check calls");
   ctx.Clock.Advance(5);
   probeService("checkout");
@@ -1146,14 +1146,14 @@ void CheckSharedVerdict(harness::Ctx& ctx) {
 }
 
 void CheckKeepRegistered(harness::Ctx& ctx) {
-  probeStartFleet(ctx, {}, {"checkout-2"});
+  hProbeStartFleet(ctx, {}, {"checkout-2"});
   auto verdicts = probeService("checkout");
-  ctx.Equal(probeVerdictOf(verdicts, "checkout-2"), "NOT_SERVING", "checkout-2 has no process listening; its verdict");
+  ctx.Equal(hProbeVerdictOf(verdicts, "checkout-2"), "NOT_SERVING", "checkout-2 has no process listening; its verdict");
   ctx.Assert(ctx.Redis.Exists("sd:checkout:checkout-2") == 1 && ctx.Redis.SIsMember("sd:members:checkout", "checkout-2"), "one failed probe deregistered checkout-2: a failing instance is excluded by its verdict and stays registered, so a later probe can readmit it");
-  probeServeHealth(ctx, "checkout-2", discoveryd::HealthCheckResponse::SERVING);  // the process is back
+  hProbeServeHealth(ctx, "checkout-2", discoveryd::HealthCheckResponse::SERVING);  // the process is back
   ctx.Clock.Advance(6);
   verdicts = probeService("checkout");
-  ctx.Equal(probeVerdictOf(verdicts, "checkout-2"), "SERVING", "checkout-2 is serving again and its old verdict lapsed: a passing probe readmits it; its verdict");
+  ctx.Equal(hProbeVerdictOf(verdicts, "checkout-2"), "SERVING", "checkout-2 is serving again and its old verdict lapsed: a passing probe readmits it; its verdict");
 }
 `,
   },

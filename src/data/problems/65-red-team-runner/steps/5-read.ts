@@ -761,18 +761,18 @@ import (
 	"leetbuild/harness"
 )
 
-var readPlan = []map[string]any{{"category": "prompt-injection", "probes": 4}, {"category": "jailbreak", "probes": 3}, {"category": "data-exfil", "probes": 3}}
-var readAllBlocked = map[string]int{"prompt-injection:blocked": 4, "jailbreak:blocked": 3, "data-exfil:blocked": 3}
+var hReadPlan = []map[string]any{{"category": "prompt-injection", "probes": 4}, {"category": "jailbreak", "probes": 3}, {"category": "data-exfil", "probes": 3}}
+var hReadAllBlocked = map[string]int{"prompt-injection:blocked": 4, "jailbreak:blocked": 3, "data-exfil:blocked": 3}
 
-func readSeed(ctx *harness.Ctx, runID string, outcomes map[string]int, tenant, status string) {
-	row, _ := json.Marshal(map[string]any{"run_id": runID, "status": status, "target": "checkout-shadow", "endpoint": "checkout-shadow.sandbox.internal", "probe_set": "baseline", "plan": readPlan, "probes": 10, "tenant": tenant})
+func hReadSeed(ctx *harness.Ctx, runID string, outcomes map[string]int, tenant, status string) {
+	row, _ := json.Marshal(map[string]any{"run_id": runID, "status": status, "target": "checkout-shadow", "endpoint": "checkout-shadow.sandbox.internal", "probe_set": "baseline", "plan": hReadPlan, "probes": 10, "tenant": tenant})
 	ctx.Redis.Set("redteam:run:"+runID, string(row))
 	for field, n := range outcomes {
 		ctx.Redis.Do("HSET", "redteam:coverage:"+runID, field, n)
 	}
 }
 
-func readWith(base map[string]int, extra map[string]int) map[string]int {
+func hReadWith(base map[string]int, extra map[string]int) map[string]int {
 	out := map[string]int{}
 	for k, v := range base {
 		out[k] = v
@@ -783,13 +783,13 @@ func readWith(base map[string]int, extra map[string]int) map[string]int {
 	return out
 }
 
-func readClient(ctx *harness.Ctx) *harness.HTTP {
+func hReadClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readBody(ctx *harness.Ctx, c *harness.HTTP, runID string) map[string]any {
+func hReadBody(ctx *harness.Ctx, c *harness.HTTP, runID string) map[string]any {
 	r := c.Get("/v1/redteam/runs/"+runID, "X-Tenant-Id", "t1")
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the report must be a JSON object (%d): %s", r.Status, r.Text())
@@ -797,22 +797,22 @@ func readBody(ctx *harness.Ctx, c *harness.HTTP, runID string) map[string]any {
 }
 
 func CheckRouteGet(ctx *harness.Ctx) {
-	readSeed(ctx, "run-1", readAllBlocked, "t1", "complete")
-	readSeed(ctx, "run-2", readWith(readAllBlocked, map[string]int{"jailbreak:blocked": 2, "jailbreak:succeeded": 1}), "t1", "complete")
-	c := readClient(ctx)
+	hReadSeed(ctx, "run-1", hReadAllBlocked, "t1", "complete")
+	hReadSeed(ctx, "run-2", hReadWith(hReadAllBlocked, map[string]int{"jailbreak:blocked": 2, "jailbreak:succeeded": 1}), "t1", "complete")
+	c := hReadClient(ctx)
 	r := c.Get("/v1/redteam/runs/run-1", "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 200, "the report (%s)", r.Text())
-	body := readBody(ctx, c, "run-1")
+	body := hReadBody(ctx, c, "run-1")
 	ctx.Assert(body["run_id"] == "run-1" && body["target"] == "checkout-shadow" && body["run_status"] == "complete", "the report names the run, its target and its status: %v", body)
 	ctx.Assert(body["status"] == "pass" && body["findings"] == float64(0), "every planned probe was blocked: pass with 0 findings, got %v", body)
-	body = readBody(ctx, c, "run-2")
+	body = hReadBody(ctx, c, "run-2")
 	ctx.Assert(body["status"] == "fail" && body["findings"] == float64(1), "one probe got through: fail with 1 finding, got %v", body)
 	ctx.Equal(c.Get("/v1/redteam/runs/run-1").Status, 401, "without X-Tenant-Id the report")
 }
 
 func CheckCoverageByCategory(ctx *harness.Ctx) {
-	readSeed(ctx, "run-1", map[string]int{"prompt-injection:blocked": 3, "prompt-injection:succeeded": 1, "jailbreak:blocked": 3, "data-exfil:blocked": 2, "data-exfil:timeout": 1}, "t1", "complete")
-	body := readBody(ctx, readClient(ctx), "run-1")
+	hReadSeed(ctx, "run-1", map[string]int{"prompt-injection:blocked": 3, "prompt-injection:succeeded": 1, "jailbreak:blocked": 3, "data-exfil:blocked": 2, "data-exfil:timeout": 1}, "t1", "complete")
+	body := hReadBody(ctx, hReadClient(ctx), "run-1")
 	expected := []any{
 		map[string]any{"category": "prompt-injection", "planned": float64(4), "blocked": float64(3), "succeeded": float64(1), "missing": float64(0)},
 		map[string]any{"category": "jailbreak", "planned": float64(3), "blocked": float64(3), "succeeded": float64(0), "missing": float64(0)},
@@ -822,8 +822,8 @@ func CheckCoverageByCategory(ctx *harness.Ctx) {
 }
 
 func CheckSkippedVisible(ctx *harness.Ctx) {
-	readSeed(ctx, "run-1", map[string]int{"prompt-injection:blocked": 4, "jailbreak:blocked": 1}, "t1", "aborted")
-	body := readBody(ctx, readClient(ctx), "run-1")
+	hReadSeed(ctx, "run-1", map[string]int{"prompt-injection:blocked": 4, "jailbreak:blocked": 1}, "t1", "aborted")
+	body := hReadBody(ctx, hReadClient(ctx), "run-1")
 	ctx.Equal(body["skipped_categories"], []any{"jailbreak", "data-exfil"}, "the kill switch stopped the run in jailbreak; skipped_categories")
 	missing := any(nil)
 	items, _ := body["coverage"].([]any)
@@ -837,18 +837,18 @@ func CheckSkippedVisible(ctx *harness.Ctx) {
 }
 
 func CheckIncompleteNotPass(ctx *harness.Ctx) {
-	readSeed(ctx, "run-1", map[string]int{"prompt-injection:blocked": 4, "jailbreak:blocked": 1}, "t1", "aborted")
-	readSeed(ctx, "run-2", readWith(readAllBlocked, map[string]int{"data-exfil:blocked": 2, "data-exfil:timeout": 1}), "t1", "complete")
-	readSeed(ctx, "run-3", map[string]int{"prompt-injection:blocked": 3, "prompt-injection:succeeded": 1}, "t1", "aborted")
-	c := readClient(ctx)
-	ctx.Equal(readBody(ctx, c, "run-1")["status"], "incomplete", "an aborted run with two categories untested: nothing succeeded because most of it never ran; the status")
-	ctx.Equal(readBody(ctx, c, "run-2")["status"], "incomplete", "a probe that timed out has no verdict; the status")
-	ctx.Equal(readBody(ctx, c, "run-3")["status"], "fail", "a probe that got through is a fail even when coverage is incomplete; the status")
+	hReadSeed(ctx, "run-1", map[string]int{"prompt-injection:blocked": 4, "jailbreak:blocked": 1}, "t1", "aborted")
+	hReadSeed(ctx, "run-2", hReadWith(hReadAllBlocked, map[string]int{"data-exfil:blocked": 2, "data-exfil:timeout": 1}), "t1", "complete")
+	hReadSeed(ctx, "run-3", map[string]int{"prompt-injection:blocked": 3, "prompt-injection:succeeded": 1}, "t1", "aborted")
+	c := hReadClient(ctx)
+	ctx.Equal(hReadBody(ctx, c, "run-1")["status"], "incomplete", "an aborted run with two categories untested: nothing succeeded because most of it never ran; the status")
+	ctx.Equal(hReadBody(ctx, c, "run-2")["status"], "incomplete", "a probe that timed out has no verdict; the status")
+	ctx.Equal(hReadBody(ctx, c, "run-3")["status"], "fail", "a probe that got through is a fail even when coverage is incomplete; the status")
 }
 
 func CheckTenantScopedRead(ctx *harness.Ctx) {
-	readSeed(ctx, "run-1", readAllBlocked, "t1", "complete")
-	c := readClient(ctx)
+	hReadSeed(ctx, "run-1", hReadAllBlocked, "t1", "complete")
+	c := hReadClient(ctx)
 	r := c.Get("/v1/redteam/runs/run-1", "X-Tenant-Id", "t2")
 	ctx.Equal(r.Status, 404, "tenant t2 read t1's run: another tenant's run must be 404, like a run that does not exist")
 	ctx.Assert(!strings.Contains(r.Text(), "checkout-shadow"), "the 404 must not leak the run: %s", r.Text())
@@ -868,11 +868,11 @@ namespace {
 
 using json = nlohmann::json;
 
-const json kPlan = json::array({{{"category", "prompt-injection"}, {"probes", 4}}, {{"category", "jailbreak"}, {"probes", 3}}, {{"category", "data-exfil"}, {"probes", 3}}});
-const std::map<std::string, int> kAllBlocked = {{"prompt-injection:blocked", 4}, {"jailbreak:blocked", 3}, {"data-exfil:blocked", 3}};
+const json kHPlan = json::array({{{"category", "prompt-injection"}, {"probes", 4}}, {{"category", "jailbreak"}, {"probes", 3}}, {{"category", "data-exfil"}, {"probes", 3}}});
+const std::map<std::string, int> kHAllBlocked = {{"prompt-injection:blocked", 4}, {"jailbreak:blocked", 3}, {"data-exfil:blocked", 3}};
 
 void harness_seed(harness::Ctx& ctx, const std::string& run_id, const std::map<std::string, int>& outcomes, const std::string& tenant = "t1", const std::string& status = "complete") {
-  const json row = {{"run_id", run_id}, {"status", status}, {"target", "checkout-shadow"}, {"endpoint", "checkout-shadow.sandbox.internal"}, {"probe_set", "baseline"}, {"plan", kPlan}, {"probes", 10}, {"tenant", tenant}, {"resume_at", nullptr}};
+  const json row = {{"run_id", run_id}, {"status", status}, {"target", "checkout-shadow"}, {"endpoint", "checkout-shadow.sandbox.internal"}, {"probe_set", "baseline"}, {"plan", kHPlan}, {"probes", 10}, {"tenant", tenant}, {"resume_at", nullptr}};
   ctx.Redis.Set("redteam:run:" + run_id, row.dump());
   for (const auto& [field, n] : outcomes) ctx.Redis.Do("HSET", "redteam:coverage:" + run_id, field, n);
 }
@@ -905,8 +905,8 @@ struct HarnessReadApi {
 }  // namespace
 
 void CheckRouteGet(harness::Ctx& ctx) {
-  harness_seed(ctx, "run-1", kAllBlocked);
-  harness_seed(ctx, "run-2", harness_with(kAllBlocked, {{"jailbreak:blocked", 2}, {"jailbreak:succeeded", 1}}));
+  harness_seed(ctx, "run-1", kHAllBlocked);
+  harness_seed(ctx, "run-2", harness_with(kHAllBlocked, {{"jailbreak:blocked", 2}, {"jailbreak:succeeded", 1}}));
   HarnessReadApi api(ctx);
   const auto r = api.get("run-1");
   ctx.Equal(r.Status, 200, "the report (%s)", r.Text());
@@ -944,7 +944,7 @@ void CheckSkippedVisible(harness::Ctx& ctx) {
 
 void CheckIncompleteNotPass(harness::Ctx& ctx) {
   harness_seed(ctx, "run-1", {{"prompt-injection:blocked", 4}, {"jailbreak:blocked", 1}}, "t1", "aborted");
-  harness_seed(ctx, "run-2", harness_with(kAllBlocked, {{"data-exfil:blocked", 2}, {"data-exfil:timeout", 1}}));
+  harness_seed(ctx, "run-2", harness_with(kHAllBlocked, {{"data-exfil:blocked", 2}, {"data-exfil:timeout", 1}}));
   harness_seed(ctx, "run-3", {{"prompt-injection:blocked", 3}, {"prompt-injection:succeeded", 1}}, "t1", "aborted");
   HarnessReadApi api(ctx);
   ctx.Equal(api.body(ctx, "run-1").value("status", ""), "incomplete", "an aborted run with two categories untested: nothing succeeded because most of it never ran; the status");
@@ -953,7 +953,7 @@ void CheckIncompleteNotPass(harness::Ctx& ctx) {
 }
 
 void CheckTenantScopedRead(harness::Ctx& ctx) {
-  harness_seed(ctx, "run-1", kAllBlocked, "t1");
+  harness_seed(ctx, "run-1", kHAllBlocked, "t1");
   HarnessReadApi api(ctx);
   const auto r = api.get("run-1", "t2");
   ctx.Equal(r.Status, 404, "tenant t2 read t1's run: another tenant's run must be 404, like a run that does not exist");

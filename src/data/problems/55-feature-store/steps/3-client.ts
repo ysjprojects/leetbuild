@@ -976,8 +976,8 @@ func CheckPermissionAbort(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr long long kCutoff = 1790000000;
-const std::vector<std::string> kParts = {"2026-10-01", "2026-10-02", "2026-10-03"};
+constexpr long long kHCutoff = 1790000000;
+const std::vector<std::string> kHParts = {"2026-10-01", "2026-10-02", "2026-10-03"};
 
 // Two entities per partition, each with a value an hour before the cutoff and one an hour after; a
 // third entity is null. A partition in failing fails with its code.
@@ -988,16 +988,16 @@ class HOfflinePeer final : public featurestore::OfflineStore::Service {
     const auto failure = failing.find(req->partition());
     if (failure != failing.end()) return grpc::Status(failure->second, "partition " + req->partition() + " failed");
     for (int i = 1; i <= 2; i++) {
-      const bool late = req->as_of() == 0 || kCutoff + 3600 <= req->as_of();
+      const bool late = req->as_of() == 0 || kHCutoff + 3600 <= req->as_of();
       auto* row = out->add_rows();
       row->set_entity(req->partition() + "/e-" + std::to_string(i));
       row->set_value(late ? 99.0 : 10.0 * i);
-      row->set_event_ts(late ? kCutoff + 3600 : kCutoff - 3600);
+      row->set_event_ts(late ? kHCutoff + 3600 : kHCutoff - 3600);
     }
     auto* null_row = out->add_rows();
     null_row->set_entity(req->partition() + "/e-3");
     null_row->set_is_null(true);
-    null_row->set_event_ts(kCutoff - 3600);
+    null_row->set_event_ts(kHCutoff - 3600);
     return grpc::Status::OK;
   }
 };
@@ -1021,7 +1021,7 @@ std::vector<std::string> hScanned(const BackfillResult& result) {
 
 void CheckDeadline(harness::Ctx& ctx) {
   hServeOffline(ctx);
-  backfill("amount_7d", 2, kParts, kCutoff);
+  backfill("amount_7d", 2, kHParts, kHCutoff);
   const auto calls = ctx.GRPC.CallsTo("Scan");
   ctx.Equal(calls.size(), 3, "three partitions must make one Scan call each; the calls");
   for (const auto& call : calls) {
@@ -1030,7 +1030,7 @@ void CheckDeadline(harness::Ctx& ctx) {
   }
   // Every partition is slow but within the deadline: each Scan still carries its own full 60 s.
   ctx.GRPC.SetLatency("Scan", 40);
-  const BackfillResult slow = backfill("amount_7d", 2, kParts, kCutoff);
+  const BackfillResult slow = backfill("amount_7d", 2, kHParts, kHCutoff);
   const auto all = ctx.GRPC.CallsTo("Scan");
   ctx.Equal(all.size(), 6, "three slow partitions must make one Scan call each; the calls in both backfills");
   for (size_t i = 3; i < all.size(); i++) {
@@ -1040,24 +1040,24 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.Equal(slow.missing.size(), 0, "three partitions that each answered in 40 s, inside their 60 s deadline, must not be missing; the missing");
   ctx.GRPC.SetLatency("Scan", 600);
   const int64_t before = ctx.Clock.Now();
-  backfill("amount_7d", 2, {kParts[0]}, kCutoff);
+  backfill("amount_7d", 2, {kHParts[0]}, kHCutoff);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 61, "a partition the store took 600 s over held the backfill for %.0f s, expected at most the 60 s deadline", waited);
 }
 
 void CheckAsOfCutoff(harness::Ctx& ctx) {
   hServeOffline(ctx);
-  const BackfillResult result = backfill("amount_7d", 2, kParts, kCutoff);
+  const BackfillResult result = backfill("amount_7d", 2, kHParts, kHCutoff);
   std::vector<long long> asked;
   for (const auto& c : ctx.GRPC.CallsTo("Scan")) asked.push_back(c.Request<featurestore::ScanRequest>().as_of());
-  ctx.Equal(asked, {kCutoff, kCutoff, kCutoff}, "every Scan request must carry the training cutoff as as_of; they carried");
-  for (const std::string& partition : kParts) {
+  ctx.Equal(asked, {kHCutoff, kHCutoff, kHCutoff}, "every Scan request must carry the training cutoff as as_of; they carried");
+  for (const std::string& partition : kHParts) {
     const auto found = result.scanned.find(partition);
     const std::vector<online::Row> rows = found == result.scanned.end() ? std::vector<online::Row>{} : found->second;
     ctx.Equal(rows.size(), 3, "partition %s must scan its three rows; the rows", partition);
     int nulls = 0;
     for (const auto& row : rows) {
-      ctx.Assert(row.event_ts <= kCutoff, "%s was scanned from %d s after the training cutoff: the model would train on the future", row.entity, row.event_ts - kCutoff);
+      ctx.Assert(row.event_ts <= kHCutoff, "%s was scanned from %d s after the training cutoff: the model would train on the future", row.entity, row.event_ts - kHCutoff);
       if (!row.value) nulls++;
     }
     ctx.Equal(nulls, 1, "partition %s must keep its one null row with no value; the nulls", partition);
@@ -1068,7 +1068,7 @@ void CheckMissingPartitions(harness::Ctx& ctx) {
   HOfflinePeer& peer = hServeOffline(ctx);
   peer.failing["2026-10-01"] = grpc::StatusCode::DEADLINE_EXCEEDED;
   peer.failing["2026-10-03"] = grpc::StatusCode::UNAVAILABLE;
-  const BackfillResult result = backfill("amount_7d", 2, kParts, kCutoff);
+  const BackfillResult result = backfill("amount_7d", 2, kHParts, kHCutoff);
   ctx.Equal(result.missing, {"2026-10-01", "2026-10-03"}, "two partitions failed (DEADLINE_EXCEEDED, UNAVAILABLE); missing");
   ctx.Equal(hScanned(result), {"2026-10-02"}, "a failed partition reported as scanned and empty is a hole in the training set nobody sees; scanned");
   ctx.Equal(result.scanned.at("2026-10-02").size(), 3, "the healthy partition's rows");
@@ -1077,7 +1077,7 @@ void CheckMissingPartitions(harness::Ctx& ctx) {
   BackfillResult other;
   bool aborted = false;
   try {
-    other = backfill("amount_7d", 2, kParts, kCutoff);
+    other = backfill("amount_7d", 2, kHParts, kHCutoff);
   } catch (const BackfillAborted&) {
     aborted = true;
   }
@@ -1091,7 +1091,7 @@ void CheckPermissionAbort(harness::Ctx& ctx) {
   peer.failing["2026-10-02"] = grpc::StatusCode::PERMISSION_DENIED;
   bool aborted = false;
   try {
-    backfill("amount_7d", 2, kParts, kCutoff);
+    backfill("amount_7d", 2, kHParts, kHCutoff);
   } catch (const BackfillAborted&) {
     aborted = true;
   } catch (const std::exception& e) {
@@ -1100,7 +1100,7 @@ void CheckPermissionAbort(harness::Ctx& ctx) {
   ctx.Assert(aborted, "a refused scan must throw BackfillAborted; backfill returned normally");
   std::vector<std::string> asked;
   for (const auto& c : ctx.GRPC.CallsTo("Scan")) asked.push_back(c.Request<featurestore::ScanRequest>().partition());
-  ctx.Equal(asked, {kParts[0], kParts[1]}, "after PERMISSION_DENIED on 2026-10-02 the backfill must stop; it scanned");
+  ctx.Equal(asked, {kHParts[0], kHParts[1]}, "after PERMISSION_DENIED on 2026-10-02 the backfill must stop; it scanned");
   ctx.Equal(ctx.Clock.Sleeps(), 0, "a refusal must not be slept on and retried; the sleeps");
 }
 `,

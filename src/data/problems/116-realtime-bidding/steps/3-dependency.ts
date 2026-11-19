@@ -947,54 +947,54 @@ import (
 )
 
 const (
-	clientFloor = 250
-	clientValue = 310
+	kHClientFloor = 250
+	kHClientValue = 310
 )
 
-type clientFeaturesPeer struct {
+type HClientFeaturesPeer struct {
 	pb.UnimplementedFeaturesServer
 }
 
-func (clientFeaturesPeer) Identity(context.Context, *pb.IdentityRequest) (*pb.IdentityFeatures, error) {
+func (HClientFeaturesPeer) Identity(context.Context, *pb.IdentityRequest) (*pb.IdentityFeatures, error) {
 	return &pb.IdentityFeatures{Segment: "sports", Frequency: 2}, nil
 }
 
-func (clientFeaturesPeer) Contextual(context.Context, *pb.ContextRequest) (*pb.ContextFeatures, error) {
+func (HClientFeaturesPeer) Contextual(context.Context, *pb.ContextRequest) (*pb.ContextFeatures, error) {
 	return &pb.ContextFeatures{Category: "news", ViewabilityPct: 70}, nil
 }
 
-type clientScorerPeer struct {
+type HClientScorerPeer struct {
 	pb.UnimplementedScorerServer
 }
 
-func (clientScorerPeer) Score(context.Context, *pb.ScoreRequest) (*pb.ScoreReply, error) {
-	return &pb.ScoreReply{ValueCents: clientValue}, nil
+func (HClientScorerPeer) Score(context.Context, *pb.ScoreRequest) (*pb.ScoreReply, error) {
+	return &pb.ScoreReply{ValueCents: kHClientValue}, nil
 }
 
-func clientSetup(ctx *harness.Ctx) {
-	pb.RegisterFeaturesServer(ctx.GRPC.Server(""), clientFeaturesPeer{})
-	pb.RegisterScorerServer(ctx.GRPC.Server(""), clientScorerPeer{})
+func hClientSetup(ctx *harness.Ctx) {
+	pb.RegisterFeaturesServer(ctx.GRPC.Server(""), HClientFeaturesPeer{})
+	pb.RegisterScorerServer(ctx.GRPC.Server(""), HClientScorerPeer{})
 }
 
-func clientQuote(budgetMs int64) Quote {
-	return quoteBid(context.Background(), "u-9", "a-1", clientFloor, deadline.Start(budgetMs))
+func hClientQuote(budgetMs int64) Quote {
+	return quoteBid(context.Background(), "u-9", "a-1", kHClientFloor, deadline.Start(budgetMs))
 }
 
-func clientDegraded(ctx *harness.Ctx, q Quote, why, reason string) {
-	ctx.Assert(q.Degraded && q.BidCents == clientFloor && q.Reason != "", "%s the quote is %+v: it must bid the floor (%d), marked degraded, with a reason", why, q, clientFloor)
+func hClientDegraded(ctx *harness.Ctx, q Quote, why, reason string) {
+	ctx.Assert(q.Degraded && q.BidCents == kHClientFloor && q.Reason != "", "%s the quote is %+v: it must bid the floor (%d), marked degraded, with a reason", why, q, kHClientFloor)
 	ctx.Assert(reason == "" || q.Reason == reason, "%s the quote's reason is %q, expected %q", why, q.Reason, reason)
 }
 
-func clientLast(ctx *harness.Ctx, method string) harness.Call {
+func hClientLast(ctx *harness.Ctx, method string) harness.Call {
 	calls := ctx.GRPC.CallsTo(method, "")
 	ctx.Assert(len(calls) > 0, "no %s call was made", method)
 	return calls[len(calls)-1]
 }
 
 func CheckTierDeadlines(ctx *harness.Ctx) {
-	clientSetup(ctx)
-	q := clientQuote(100)
-	ctx.Assert(q.BidCents == clientValue && !q.Degraded, "with every service healthy the quote is %+v, expected the model's %d cents, not degraded", q, clientValue)
+	hClientSetup(ctx)
+	q := hClientQuote(100)
+	ctx.Assert(q.BidCents == kHClientValue && !q.Degraded, "with every service healthy the quote is %+v, expected the model's %d cents, not degraded", q, kHClientValue)
 	for method, slice := range map[string]time.Duration{"Identity": 30 * time.Millisecond, "Contextual": 50 * time.Millisecond} {
 		calls := ctx.GRPC.CallsTo(method, "")
 		ctx.Assert(len(calls) > 0, "no %s call was made", method)
@@ -1005,93 +1005,93 @@ func CheckTierDeadlines(ctx *harness.Ctx) {
 	}
 	ctx.GRPC.SetLatency("Identity", 0.2, "")
 	started := ctx.Clock.Now()
-	q = clientQuote(100)
+	q = hClientQuote(100)
 	took := ctx.Clock.Now() - started
 	ctx.Assert(took <= 31, "an identity service answering in 200 ms held the quote for %d ms: identity gets its 30 ms slice, not the auction", took)
-	clientDegraded(ctx, q, "with identity slower than its slice", "")
+	hClientDegraded(ctx, q, "with identity slower than its slice", "")
 	ctx.GRPC.SetLatency("Identity", 0.025, "")
-	clientQuote(40)
-	last := clientLast(ctx, "Contextual")
+	hClientQuote(40)
+	last := hClientLast(ctx, "Contextual")
 	ctx.Assert(last.HasDeadline() && last.Timeout <= 15*time.Millisecond+100*time.Microsecond, "with 15 ms of the auction left the contextual call got a %v deadline: a slice is clamped to what is left", last.Timeout)
 	ctx.GRPC.SetLatency("Identity", 0, "")
-	clientQuote(20)
-	last = clientLast(ctx, "Identity")
+	hClientQuote(20)
+	last = hClientLast(ctx, "Identity")
 	ctx.Assert(last.HasDeadline() && last.Timeout <= 20*time.Millisecond+100*time.Microsecond, "in a 20 ms auction the identity call got a %v deadline: its 30 ms slice is clamped to what is left", last.Timeout)
 	ctx.GRPC.SetLatency("Score", 0.06, "")
-	q = clientQuote(100)
-	last = clientLast(ctx, "Score")
-	ctx.Assert(q.BidCents == clientValue && !q.Degraded, "a model answering in 60 ms of a 100 ms auction must be bid, got %+v: the score gets whatever is left", q)
+	q = hClientQuote(100)
+	last = hClientLast(ctx, "Score")
+	ctx.Assert(q.BidCents == kHClientValue && !q.Degraded, "a model answering in 60 ms of a 100 ms auction must be bid, got %+v: the score gets whatever is left", q)
 	ctx.Assert(last.HasDeadline() && last.Timeout <= 100*time.Millisecond+100*time.Microsecond, "the Score call got a %v deadline (has one: %v) in a 100 ms auction: the score gets what is left, no more", last.Timeout, last.HasDeadline())
 	ctx.GRPC.SetLatency("Score", 0.2, "")
 	started = ctx.Clock.Now()
-	q = clientQuote(100)
+	q = hClientQuote(100)
 	took = ctx.Clock.Now() - started
 	ctx.Assert(took <= 101, "a model answering in 200 ms held a 100 ms quote for %d ms: the score gets what is left of the auction", took)
-	clientDegraded(ctx, q, "with the model slower than the auction", "model_unavailable")
+	hClientDegraded(ctx, q, "with the model slower than the auction", "model_unavailable")
 }
 
 func CheckSkipModel(ctx *harness.Ctx) {
-	clientSetup(ctx)
+	hClientSetup(ctx)
 	ctx.GRPC.SetLatency("Identity", 0.025, "")
 	ctx.GRPC.SetLatency("Contextual", 0.030, "")
-	q := clientQuote(60)
+	q := hClientQuote(60)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Score", "")), 0, "the model was asked with 5 ms of the auction left: below modelMinMs = 20 the score is skipped; Score calls")
-	clientDegraded(ctx, q, "with 5 ms left after the features", "")
+	hClientDegraded(ctx, q, "with 5 ms left after the features", "")
 	ctx.GRPC.SetLatency("Identity", 0, "")
 	ctx.GRPC.SetLatency("Contextual", 0, "")
-	q = clientQuote(100)
-	ctx.Assert(len(ctx.GRPC.CallsTo("Score", "")) == 1 && q.BidCents == clientValue && !q.Degraded, "with the whole budget left the model must be asked once and its value bid, got %+v", q)
+	q = hClientQuote(100)
+	ctx.Assert(len(ctx.GRPC.CallsTo("Score", "")) == 1 && q.BidCents == kHClientValue && !q.Degraded, "with the whole budget left the model must be asked once and its value bid, got %+v", q)
 	ctx.GRPC.SetLatency("Identity", 0.025, "")
 	ctx.GRPC.SetLatency("Contextual", 0.030, "")
-	q = clientQuote(75)
-	ctx.Assert(len(ctx.GRPC.CallsTo("Score", "")) == 2 && q.BidCents == clientValue && !q.Degraded, "with exactly modelMinMs (20 ms) left after the features the model must still be asked, got %+v", q)
+	q = hClientQuote(75)
+	ctx.Assert(len(ctx.GRPC.CallsTo("Score", "")) == 2 && q.BidCents == kHClientValue && !q.Degraded, "with exactly modelMinMs (20 ms) left after the features the model must still be asked, got %+v", q)
 }
 
 func CheckNoRetry(ctx *harness.Ctx) {
-	clientSetup(ctx)
+	hClientSetup(ctx)
 	ctx.GRPC.Fail("Identity", codes.Unavailable, "identity store restarting", 1, "")
-	q := clientQuote(100)
+	q := hClientQuote(100)
 	calls := len(ctx.GRPC.CallsTo("Identity", ""))
 	ctx.Assert(calls == 1, "one failed identity lookup became %d Identity calls in one auction: a retry cannot finish inside the budget, degrade instead", calls)
-	clientDegraded(ctx, q, "with the identity lookup failed", "")
+	hClientDegraded(ctx, q, "with the identity lookup failed", "")
 	ctx.GRPC.SetLatency("Identity", 0.035, "")
-	clientQuote(100)
+	hClientQuote(100)
 	calls = len(ctx.GRPC.CallsTo("Identity", ""))
 	ctx.Assert(calls == 2, "an identity lookup that ran out of its 30 ms slice became %d Identity calls in one auction: a timed-out tier is not retried either", calls-1)
 	ctx.GRPC.SetLatency("Identity", 0, "")
 	ctx.GRPC.Fail("Contextual", codes.Unavailable, "contextual tier restarting", 1, "")
-	q = clientQuote(100)
+	q = hClientQuote(100)
 	calls = len(ctx.GRPC.CallsTo("Contextual", ""))
 	ctx.Assert(calls == 1, "one failed contextual call became %d Contextual calls in one auction: no tier is retried", calls)
-	clientDegraded(ctx, q, "with the contextual call failed", "")
+	hClientDegraded(ctx, q, "with the contextual call failed", "")
 	ctx.GRPC.Fail("Score", codes.Unavailable, "scorer restarting", 1, "")
-	q = clientQuote(100)
+	q = hClientQuote(100)
 	calls = len(ctx.GRPC.CallsTo("Score", ""))
 	ctx.Assert(calls == 1, "one failed Score call became %d Score calls in one auction: the model is not retried", calls)
-	clientDegraded(ctx, q, "with the Score call failed", "")
+	hClientDegraded(ctx, q, "with the Score call failed", "")
 }
 
 func CheckDegradedFloor(ctx *harness.Ctx) {
-	clientSetup(ctx)
+	hClientSetup(ctx)
 	ctx.GRPC.Fail("Contextual", codes.Unavailable, "contextual tier down", 1, "")
-	q := clientQuote(100)
-	clientDegraded(ctx, q, "with the contextual tier down", "context_unavailable")
+	q := hClientQuote(100)
+	hClientDegraded(ctx, q, "with the contextual tier down", "context_unavailable")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Score", "")), 0, "the model was scored on contextual features that never arrived; Score calls")
 	ctx.GRPC.Fail("Identity", codes.Unavailable, "identity store restarting", 1, "")
-	q = clientQuote(100)
-	clientDegraded(ctx, q, "with the identity tier down", "identity_unavailable")
+	q = hClientQuote(100)
+	hClientDegraded(ctx, q, "with the identity tier down", "identity_unavailable")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Score", "")), 0, "the model was scored on identity features that never arrived; Score calls")
 	ctx.GRPC.Fail("Score", codes.Internal, "model crashed", 1, "")
-	q = clientQuote(100)
-	clientDegraded(ctx, q, "with the Score call failed", "model_unavailable")
+	q = hClientQuote(100)
+	hClientDegraded(ctx, q, "with the Score call failed", "model_unavailable")
 	ctx.GRPC.SetLatency("Identity", 0.025, "")
 	ctx.GRPC.SetLatency("Contextual", 0.030, "")
-	q = clientQuote(60)
-	clientDegraded(ctx, q, "with 5 ms left after the features", "model_skipped")
+	q = hClientQuote(60)
+	hClientDegraded(ctx, q, "with 5 ms left after the features", "model_skipped")
 	ctx.GRPC.SetLatency("Identity", 0, "")
 	ctx.GRPC.SetLatency("Contextual", 0, "")
-	q = clientQuote(100)
-	ctx.Assert(q.BidCents == clientValue && !q.Degraded && q.Reason == "", "once the tiers answer again the quote is %+v, expected the model's %d cents", q, clientValue)
+	q = hClientQuote(100)
+	ctx.Assert(q.BidCents == kHClientValue && !q.Degraded && q.Reason == "", "once the tiers answer again the quote is %+v, expected the model's %d cents", q, kHClientValue)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1105,10 +1105,10 @@ func CheckDegradedFloor(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr long kClientFloor = 250;
-constexpr long kClientValue = 310;
+constexpr long kHClientFloor = 250;
+constexpr long kHClientValue = 310;
 
-class ClientFeaturesPeer final : public rtbfeatures::Features::Service {
+class HClientFeaturesPeer final : public rtbfeatures::Features::Service {
  public:
   grpc::Status Identity(grpc::ServerContext*, const rtbfeatures::IdentityRequest*, rtbfeatures::IdentityFeatures* out) override {
     out->set_segment("sports");
@@ -1122,45 +1122,45 @@ class ClientFeaturesPeer final : public rtbfeatures::Features::Service {
   }
 };
 
-class ClientScorerPeer final : public rtbfeatures::Scorer::Service {
+class HClientScorerPeer final : public rtbfeatures::Scorer::Service {
  public:
   grpc::Status Score(grpc::ServerContext*, const rtbfeatures::ScoreRequest*, rtbfeatures::ScoreReply* out) override {
-    out->set_value_cents(kClientValue);
+    out->set_value_cents(kHClientValue);
     return grpc::Status::OK;
   }
 };
 
-struct ClientPeers {
-  ClientFeaturesPeer features;
-  ClientScorerPeer scorer;
+struct HClientPeers {
+  HClientFeaturesPeer features;
+  HClientScorerPeer scorer;
 };
 
-void clientSetup(harness::Ctx& ctx) {
-  static ClientPeers* peers = nullptr;
+void hClientSetup(harness::Ctx& ctx) {
+  static HClientPeers* peers = nullptr;
   delete peers;
-  peers = new ClientPeers;
+  peers = new HClientPeers;
   ctx.GRPC.Server("")->RegisterService(&peers->features);
   ctx.GRPC.Server("")->RegisterService(&peers->scorer);
 }
 
-Quote clientQuote(harness::Ctx& ctx, long budget_ms) {
+Quote hClientQuote(harness::Ctx& ctx, long budget_ms) {
   try {
-    return quoteBid("u-9", "a-1", kClientFloor, rtb::Deadline::start(budget_ms));
+    return quoteBid("u-9", "a-1", kHClientFloor, rtb::Deadline::start(budget_ms));
   } catch (const std::exception& e) {
     ctx.Fatalf("quoteBid threw %s: %s. A failed or late tier degrades the bid, it does not fail the auction", harness::CurrentExceptionType(), e.what());
   }
   return {};
 }
 
-void clientDegraded(harness::Ctx& ctx, const Quote& q, const std::string& why, const std::string& reason = "") {
-  ctx.Assert(q.degraded && q.bid_cents == kClientFloor && !q.reason.empty(),
+void hClientDegraded(harness::Ctx& ctx, const Quote& q, const std::string& why, const std::string& reason = "") {
+  ctx.Assert(q.degraded && q.bid_cents == kHClientFloor && !q.reason.empty(),
              "%s the quote is {bid_cents %d, degraded %t, reason %q}: it must bid the floor (%d), marked degraded, with a reason", why, q.bid_cents,
-             q.degraded, q.reason, kClientFloor);
+             q.degraded, q.reason, kHClientFloor);
   ctx.Assert(reason.empty() || q.reason == reason, "%s the quote's reason is %q, expected %q", why, q.reason, reason);
 }
 
 // The last call's deadline in seconds, or -1 when the last call carried none (or there was no call).
-double clientLastTimeout(harness::Ctx& ctx, const std::string& method) {
+double hClientLastTimeout(harness::Ctx& ctx, const std::string& method) {
   const auto calls = ctx.GRPC.CallsTo(method);
   ctx.Assert(!calls.empty(), "no %s call was made", method);
   return calls.empty() || !calls.back().HasDeadline() ? -1 : calls.back().TimeoutSeconds();
@@ -1169,9 +1169,9 @@ double clientLastTimeout(harness::Ctx& ctx, const std::string& method) {
 }  // namespace
 
 void CheckTierDeadlines(harness::Ctx& ctx) {
-  clientSetup(ctx);
-  Quote q = clientQuote(ctx, 100);
-  ctx.Assert(q.bid_cents == kClientValue && !q.degraded, "with every service healthy the quote is %d cents (degraded %t), expected the model's %d cents, not degraded", q.bid_cents, q.degraded, kClientValue);
+  hClientSetup(ctx);
+  Quote q = hClientQuote(ctx, 100);
+  ctx.Assert(q.bid_cents == kHClientValue && !q.degraded, "with every service healthy the quote is %d cents (degraded %t), expected the model's %d cents, not degraded", q.bid_cents, q.degraded, kHClientValue);
   for (const auto& [method, slice_ms] : std::vector<std::pair<std::string, double>>{{"Identity", 30}, {"Contextual", 50}}) {
     const auto calls = ctx.GRPC.CallsTo(method);
     ctx.Assert(!calls.empty(), "no %s call was made", method);
@@ -1182,93 +1182,93 @@ void CheckTierDeadlines(harness::Ctx& ctx) {
   }
   ctx.GRPC.SetLatency("Identity", 0.2);
   int64_t started = ctx.Clock.Now();
-  q = clientQuote(ctx, 100);
+  q = hClientQuote(ctx, 100);
   int64_t took = ctx.Clock.Now() - started;
   ctx.Assert(took <= 31, "an identity service answering in 200 ms held the quote for %d ms: identity gets its 30 ms slice, not the auction", took);
-  clientDegraded(ctx, q, "with identity slower than its slice");
+  hClientDegraded(ctx, q, "with identity slower than its slice");
   ctx.GRPC.SetLatency("Identity", 0.025);
-  clientQuote(ctx, 40);
-  double timeout = clientLastTimeout(ctx, "Contextual");
+  hClientQuote(ctx, 40);
+  double timeout = hClientLastTimeout(ctx, "Contextual");
   ctx.Assert(timeout >= 0 && timeout <= 0.0151, "with 15 ms of the auction left the contextual call got a %v s deadline (-1: none): a slice is clamped to what is left", timeout);
   ctx.GRPC.SetLatency("Identity", 0);
-  clientQuote(ctx, 20);
-  timeout = clientLastTimeout(ctx, "Identity");
+  hClientQuote(ctx, 20);
+  timeout = hClientLastTimeout(ctx, "Identity");
   ctx.Assert(timeout >= 0 && timeout <= 0.0201, "in a 20 ms auction the identity call got a %v s deadline (-1: none): its 30 ms slice is clamped to what is left", timeout);
   ctx.GRPC.SetLatency("Score", 0.06);
-  q = clientQuote(ctx, 100);
-  timeout = clientLastTimeout(ctx, "Score");
-  ctx.Assert(q.bid_cents == kClientValue && !q.degraded, "a model answering in 60 ms of a 100 ms auction must be bid, got %d cents (degraded %t, reason %q): the score gets whatever is left", q.bid_cents, q.degraded, q.reason);
+  q = hClientQuote(ctx, 100);
+  timeout = hClientLastTimeout(ctx, "Score");
+  ctx.Assert(q.bid_cents == kHClientValue && !q.degraded, "a model answering in 60 ms of a 100 ms auction must be bid, got %d cents (degraded %t, reason %q): the score gets whatever is left", q.bid_cents, q.degraded, q.reason);
   ctx.Assert(timeout >= 0 && timeout <= 0.1001, "the Score call got a %v s deadline (-1: none) in a 100 ms auction: the score gets what is left, no more", timeout);
   ctx.GRPC.SetLatency("Score", 0.2);
   started = ctx.Clock.Now();
-  q = clientQuote(ctx, 100);
+  q = hClientQuote(ctx, 100);
   took = ctx.Clock.Now() - started;
   ctx.Assert(took <= 101, "a model answering in 200 ms held a 100 ms quote for %d ms: the score gets what is left of the auction", took);
-  clientDegraded(ctx, q, "with the model slower than the auction", "model_unavailable");
+  hClientDegraded(ctx, q, "with the model slower than the auction", "model_unavailable");
 }
 
 void CheckSkipModel(harness::Ctx& ctx) {
-  clientSetup(ctx);
+  hClientSetup(ctx);
   ctx.GRPC.SetLatency("Identity", 0.025);
   ctx.GRPC.SetLatency("Contextual", 0.030);
-  Quote q = clientQuote(ctx, 60);
+  Quote q = hClientQuote(ctx, 60);
   ctx.Equal(ctx.GRPC.CallsTo("Score").size(), 0, "the model was asked with 5 ms of the auction left: below kModelMinMs = 20 the score is skipped; Score calls");
-  clientDegraded(ctx, q, "with 5 ms left after the features");
+  hClientDegraded(ctx, q, "with 5 ms left after the features");
   ctx.GRPC.SetLatency("Identity", 0);
   ctx.GRPC.SetLatency("Contextual", 0);
-  q = clientQuote(ctx, 100);
-  ctx.Assert(ctx.GRPC.CallsTo("Score").size() == 1 && q.bid_cents == kClientValue && !q.degraded, "with the whole budget left the model must be asked once and its value bid, got %d cents (degraded %t)", q.bid_cents, q.degraded);
+  q = hClientQuote(ctx, 100);
+  ctx.Assert(ctx.GRPC.CallsTo("Score").size() == 1 && q.bid_cents == kHClientValue && !q.degraded, "with the whole budget left the model must be asked once and its value bid, got %d cents (degraded %t)", q.bid_cents, q.degraded);
   ctx.GRPC.SetLatency("Identity", 0.025);
   ctx.GRPC.SetLatency("Contextual", 0.030);
-  q = clientQuote(ctx, 75);
-  ctx.Assert(ctx.GRPC.CallsTo("Score").size() == 2 && q.bid_cents == kClientValue && !q.degraded, "with exactly kModelMinMs (20 ms) left after the features the model must still be asked, got %d cents (degraded %t, reason %q)", q.bid_cents, q.degraded, q.reason);
+  q = hClientQuote(ctx, 75);
+  ctx.Assert(ctx.GRPC.CallsTo("Score").size() == 2 && q.bid_cents == kHClientValue && !q.degraded, "with exactly kModelMinMs (20 ms) left after the features the model must still be asked, got %d cents (degraded %t, reason %q)", q.bid_cents, q.degraded, q.reason);
 }
 
 void CheckNoRetry(harness::Ctx& ctx) {
-  clientSetup(ctx);
+  hClientSetup(ctx);
   ctx.GRPC.Fail("Identity", grpc::StatusCode::UNAVAILABLE, "identity store restarting", 1);
-  Quote q = clientQuote(ctx, 100);
+  Quote q = hClientQuote(ctx, 100);
   size_t calls = ctx.GRPC.CallsTo("Identity").size();
   ctx.Assert(calls == 1, "one failed identity lookup became %d Identity calls in one auction: a retry cannot finish inside the budget, degrade instead", calls);
-  clientDegraded(ctx, q, "with the identity lookup failed");
+  hClientDegraded(ctx, q, "with the identity lookup failed");
   ctx.GRPC.SetLatency("Identity", 0.035);
-  clientQuote(ctx, 100);
+  hClientQuote(ctx, 100);
   calls = ctx.GRPC.CallsTo("Identity").size();
   ctx.Assert(calls == 2, "an identity lookup that ran out of its 30 ms slice became %d Identity calls in one auction: a timed-out tier is not retried either", calls - 1);
   ctx.GRPC.SetLatency("Identity", 0);
   ctx.GRPC.Fail("Contextual", grpc::StatusCode::UNAVAILABLE, "contextual tier restarting", 1);
-  q = clientQuote(ctx, 100);
+  q = hClientQuote(ctx, 100);
   calls = ctx.GRPC.CallsTo("Contextual").size();
   ctx.Assert(calls == 1, "one failed contextual call became %d Contextual calls in one auction: no tier is retried", calls);
-  clientDegraded(ctx, q, "with the contextual call failed");
+  hClientDegraded(ctx, q, "with the contextual call failed");
   ctx.GRPC.Fail("Score", grpc::StatusCode::UNAVAILABLE, "scorer restarting", 1);
-  q = clientQuote(ctx, 100);
+  q = hClientQuote(ctx, 100);
   calls = ctx.GRPC.CallsTo("Score").size();
   ctx.Assert(calls == 1, "one failed Score call became %d Score calls in one auction: the model is not retried", calls);
-  clientDegraded(ctx, q, "with the Score call failed");
+  hClientDegraded(ctx, q, "with the Score call failed");
 }
 
 void CheckDegradedFloor(harness::Ctx& ctx) {
-  clientSetup(ctx);
+  hClientSetup(ctx);
   ctx.GRPC.Fail("Contextual", grpc::StatusCode::UNAVAILABLE, "contextual tier down", 1);
-  Quote q = clientQuote(ctx, 100);
-  clientDegraded(ctx, q, "with the contextual tier down", "context_unavailable");
+  Quote q = hClientQuote(ctx, 100);
+  hClientDegraded(ctx, q, "with the contextual tier down", "context_unavailable");
   ctx.Equal(ctx.GRPC.CallsTo("Score").size(), 0, "the model was scored on contextual features that never arrived; Score calls");
   ctx.GRPC.Fail("Identity", grpc::StatusCode::UNAVAILABLE, "identity store restarting", 1);
-  q = clientQuote(ctx, 100);
-  clientDegraded(ctx, q, "with the identity tier down", "identity_unavailable");
+  q = hClientQuote(ctx, 100);
+  hClientDegraded(ctx, q, "with the identity tier down", "identity_unavailable");
   ctx.Equal(ctx.GRPC.CallsTo("Score").size(), 0, "the model was scored on identity features that never arrived; Score calls");
   ctx.GRPC.Fail("Score", grpc::StatusCode::INTERNAL, "model crashed", 1);
-  q = clientQuote(ctx, 100);
-  clientDegraded(ctx, q, "with the Score call failed", "model_unavailable");
+  q = hClientQuote(ctx, 100);
+  hClientDegraded(ctx, q, "with the Score call failed", "model_unavailable");
   ctx.GRPC.SetLatency("Identity", 0.025);
   ctx.GRPC.SetLatency("Contextual", 0.030);
-  q = clientQuote(ctx, 60);
-  clientDegraded(ctx, q, "with 5 ms left after the features", "model_skipped");
+  q = hClientQuote(ctx, 60);
+  hClientDegraded(ctx, q, "with 5 ms left after the features", "model_skipped");
   ctx.GRPC.SetLatency("Identity", 0);
   ctx.GRPC.SetLatency("Contextual", 0);
-  q = clientQuote(ctx, 100);
-  ctx.Assert(q.bid_cents == kClientValue && !q.degraded && q.reason.empty(), "once the tiers answer again the quote is %d cents (degraded %t), expected the model's %d cents", q.bid_cents, q.degraded, kClientValue);
+  q = hClientQuote(ctx, 100);
+  ctx.Assert(q.bid_cents == kHClientValue && !q.degraded && q.reason.empty(), "once the tiers answer again the quote is %d cents (degraded %t), expected the model's %d cents", q.bid_cents, q.degraded, kHClientValue);
 }
 `,
   },

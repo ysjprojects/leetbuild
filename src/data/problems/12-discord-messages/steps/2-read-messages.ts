@@ -1243,29 +1243,29 @@ import (
 )
 
 const (
-	walkEpoch    int64 = 1420070400000
-	walkBucketMs int64 = 10 * 24 * 3600 * 1000
-	walkInsert         = "INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES ($1, $2, $3, $4, $5)"
+	kHWalkEpoch    int64 = 1420070400000
+	kHWalkBucketMs int64 = 10 * 24 * 3600 * 1000
+	kHWalkInsert         = "INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES ($1, $2, $3, $4, $5)"
 )
 
 var (
-	walkBucketRe = regexp.MustCompile("(?:^|[^a-z_])bucket ?= ?([$][0-9]+|[0-9]+)")
-	walkLimitRe  = regexp.MustCompile("limit ?([$][0-9]+|[0-9]+)")
+	hWalkBucketRe = regexp.MustCompile("(?:^|[^a-z_])bucket ?= ?([$][0-9]+|[0-9]+)")
+	hWalkLimitRe  = regexp.MustCompile("limit ?([$][0-9]+|[0-9]+)")
 )
 
 // walkSnowflake is a snowflake minted offsetMs into bucket.
-func walkSnowflake(bucket, offsetMs int64) int64 {
-	return ((bucket*walkBucketMs + offsetMs) << 22) | (1 << 17)
+func hWalkSnowflake(bucket, offsetMs int64) int64 {
+	return ((bucket*kHWalkBucketMs + offsetMs) << 22) | (1 << 17)
 }
 
 // walkRow is a stored message: its bucket, its offset in it, its content.
-type walkRow struct {
+type HWalkRow struct {
 	bucket, offsetMs int64
 	content          string
 }
 
 // walkWorld is the learner's server over Postgres, around a channel created ten buckets ago.
-type walkWorld struct {
+type HWalkWorld struct {
 	ctx     *harness.Ctx
 	nowB    int64 // the bucket a message sent now lands in
 	channel int64 // a channel created ten buckets ago
@@ -1275,31 +1275,31 @@ type walkWorld struct {
 }
 
 // newWalkWorld stores messages of the channel, then starts the server.
-func newWalkWorld(ctx *harness.Ctx, messages ...walkRow) *walkWorld {
-	nowB := (time.Now().UnixMilli() - walkEpoch) / walkBucketMs
-	w := &walkWorld{ctx: ctx, nowB: nowB, channel: walkSnowflake(nowB-10, 5000), end: walkSnowflake(nowB, walkBucketMs-1),
-		sibling: walkSnowflake(nowB-10, 6000)}
+func hNewWalkWorld(ctx *harness.Ctx, messages ...HWalkRow) *HWalkWorld {
+	nowB := (time.Now().UnixMilli() - kHWalkEpoch) / kHWalkBucketMs
+	w := &HWalkWorld{ctx: ctx, nowB: nowB, channel: hWalkSnowflake(nowB-10, 5000), end: hWalkSnowflake(nowB, kHWalkBucketMs-1),
+		sibling: hWalkSnowflake(nowB-10, 6000)}
 	ctx.DB.Reset(db.Schema)
 	w.insert(w.channel, messages)
-	bucketOf = func(snowflake int64) int32 { return int32((snowflake >> 22) / walkBucketMs) } // step 1's
+	bucketOf = func(snowflake int64) int32 { return int32((snowflake >> 22) / kHWalkBucketMs) } // step 1's
 	w.http = ctx.Main(main).HTTP()
 	return w
 }
 
-func (w *walkWorld) insert(channel int64, messages []walkRow) {
+func (w *HWalkWorld) insert(channel int64, messages []HWalkRow) {
 	for _, m := range messages {
-		w.ctx.DB.Exec(walkInsert, channel, m.bucket, walkSnowflake(m.bucket, m.offsetMs), 7, m.content)
+		w.ctx.DB.Exec(kHWalkInsert, channel, m.bucket, hWalkSnowflake(m.bucket, m.offsetMs), 7, m.content)
 	}
 }
 
 // walkReads is the page walk as Postgres saw it since it was made.
-type walkReads struct {
+type HWalkReads struct {
 	ctx   *harness.Ctx
 	since int
 }
 
 // compared is the value Postgres compared with in re: a $n parameter or an inline number (-1: none).
-func (rd *walkReads) compared(re *regexp.Regexp, text string, args []any) int64 {
+func (rd *HWalkReads) compared(re *regexp.Regexp, text string, args []any) int64 {
 	found := re.FindStringSubmatch(text)
 	if found == nil {
 		return -1
@@ -1317,21 +1317,21 @@ func (rd *walkReads) compared(re *regexp.Regexp, text string, args []any) int64 
 }
 
 // all is [bucket, limit] of every SELECT on messages (limit -1 when there is none).
-func (rd *walkReads) all() [][2]int64 {
+func (rd *HWalkReads) all() [][2]int64 {
 	out := [][2]int64{}
 	for _, q := range rd.ctx.DB.Queries()[rd.since:] {
 		text := strings.ToLower(strings.Join(strings.Fields(q.SQL), " "))
 		if !strings.HasPrefix(text, "select") || !strings.Contains(text, "messages") {
 			continue
 		}
-		bucket := rd.compared(walkBucketRe, text, q.Args)
+		bucket := rd.compared(hWalkBucketRe, text, q.Args)
 		rd.ctx.Assert(bucket != -1, "Postgres ran a read of messages that is not confined to one bucket: %q — each query must name one (channel_id, bucket) partition", q.SQL)
-		out = append(out, [2]int64{bucket, rd.compared(walkLimitRe, text, q.Args)})
+		out = append(out, [2]int64{bucket, rd.compared(hWalkLimitRe, text, q.Args)})
 	}
 	return out
 }
 
-func (rd *walkReads) buckets() []int64 {
+func (rd *HWalkReads) buckets() []int64 {
 	out := []int64{}
 	for _, read := range rd.all() {
 		out = append(out, read[0])
@@ -1340,8 +1340,8 @@ func (rd *walkReads) buckets() []int64 {
 }
 
 // get is one GET on channel; it returns the response and the bucket reads Postgres ran for it.
-func (w *walkWorld) get(channel int64, params url.Values) (*harness.Response, *walkReads) {
-	reads := &walkReads{ctx: w.ctx, since: len(w.ctx.DB.Queries())}
+func (w *HWalkWorld) get(channel int64, params url.Values) (*harness.Response, *HWalkReads) {
+	reads := &HWalkReads{ctx: w.ctx, since: len(w.ctx.DB.Queries())}
 	path := "/channels/" + strconv.FormatInt(channel, 10) + "/messages"
 	if len(params) > 0 {
 		path += "?" + params.Encode()
@@ -1350,7 +1350,7 @@ func (w *walkWorld) get(channel int64, params url.Values) (*harness.Response, *w
 }
 
 // page decodes a 200 answer as its list of messages.
-func (w *walkWorld) page(r *harness.Response) []map[string]any {
+func (w *HWalkWorld) page(r *harness.Response) []map[string]any {
 	text := strings.TrimSpace(r.Text())
 	if len(text) > 120 {
 		text = text[:120]
@@ -1362,7 +1362,7 @@ func (w *walkWorld) page(r *harness.Response) []map[string]any {
 }
 
 // field lists one field of every message of a page.
-func walkField(page []map[string]any, name string) []any {
+func hWalkField(page []map[string]any, name string) []any {
 	out := []any{}
 	for _, m := range page {
 		out = append(out, m[name])
@@ -1370,9 +1370,9 @@ func walkField(page []map[string]any, name string) []any {
 	return out
 }
 
-func (w *walkWorld) contents(r *harness.Response) []any { return walkField(w.page(r), "content") }
+func (w *HWalkWorld) contents(r *harness.Response) []any { return hWalkField(w.page(r), "content") }
 
-func walkQuery(pairs ...string) url.Values {
+func hWalkQuery(pairs ...string) url.Values {
 	q := url.Values{}
 	for i := 0; i+1 < len(pairs); i += 2 {
 		q.Set(pairs[i], pairs[i+1])
@@ -1380,43 +1380,43 @@ func walkQuery(pairs ...string) url.Values {
 	return q
 }
 
-func walkID(id int64) string { return strconv.FormatInt(id, 10) }
+func hWalkID(id int64) string { return strconv.FormatInt(id, 10) }
 
 func CheckLimitBounds(ctx *harness.Ctx) {
-	nowB := (time.Now().UnixMilli() - walkEpoch) / walkBucketMs
-	rows := []walkRow{}
+	nowB := (time.Now().UnixMilli() - kHWalkEpoch) / kHWalkBucketMs
+	rows := []HWalkRow{}
 	for i := range 60 {
-		rows = append(rows, walkRow{nowB, int64(1000 * (i + 1)), "m" + strconv.Itoa(i)})
+		rows = append(rows, HWalkRow{nowB, int64(1000 * (i + 1)), "m" + strconv.Itoa(i)})
 	}
-	w := newWalkWorld(ctx, rows...)
+	w := hNewWalkWorld(ctx, rows...)
 	for _, bad := range []string{"0", "101", "-5"} {
-		r, _ := w.get(w.channel, walkQuery("limit", bad))
+		r, _ := w.get(w.channel, hWalkQuery("limit", bad))
 		ctx.Equal(r.Status, 400, "limit=%s is outside 1..100", bad)
 	}
 	r, _ := w.get(w.channel, nil)
 	ctx.Equal(r.Status, 200, "GET without limit")
 	ctx.Equal(len(w.page(r)), 50, "without ?limit the page holds defaultLimit (50) messages")
-	r, _ = w.get(w.channel, walkQuery("limit", "100"))
+	r, _ = w.get(w.channel, hWalkQuery("limit", "100"))
 	ctx.Equal(len(w.page(r)), 60, "limit=100 on a channel with 60 messages returns all 60")
-	r, _ = w.get(w.channel, walkQuery("limit", "1"))
+	r, _ = w.get(w.channel, hWalkQuery("limit", "1"))
 	ctx.Equal(len(w.page(r)), 1, "limit=1 returns one message")
 }
 
 func CheckNewestFirst(ctx *harness.Ctx) {
-	nowB := (time.Now().UnixMilli() - walkEpoch) / walkBucketMs
-	rows := []walkRow{}
+	nowB := (time.Now().UnixMilli() - kHWalkEpoch) / kHWalkBucketMs
+	rows := []HWalkRow{}
 	ids := []int64{}
 	for i := int64(1); i <= 5; i++ {
-		rows = append(rows, walkRow{nowB, 1000 * i, "m" + strconv.FormatInt(i, 10)})
-		ids = append(ids, walkSnowflake(nowB, 1000*i))
+		rows = append(rows, HWalkRow{nowB, 1000 * i, "m" + strconv.FormatInt(i, 10)})
+		ids = append(ids, hWalkSnowflake(nowB, 1000*i))
 	}
-	w := newWalkWorld(ctx, rows...)
-	r, reads := w.get(w.channel, walkQuery("limit", "3"))
+	w := hNewWalkWorld(ctx, rows...)
+	r, reads := w.get(w.channel, hWalkQuery("limit", "3"))
 	ctx.Equal(r.Status, 200, "GET with limit=3")
 	page := w.page(r)
-	ctx.Equal(walkField(page, "id"), []any{walkID(ids[4]), walkID(ids[3]), walkID(ids[2])}, "limit=3 must return the three newest ids as strings, newest first")
-	ctx.Equal(walkField(page, "content"), []any{"m5", "m4", "m3"}, "each message carries its content: %s", r.Text())
-	for _, author := range walkField(page, "author_id") {
+	ctx.Equal(hWalkField(page, "id"), []any{hWalkID(ids[4]), hWalkID(ids[3]), hWalkID(ids[2])}, "limit=3 must return the three newest ids as strings, newest first")
+	ctx.Equal(hWalkField(page, "content"), []any{"m5", "m4", "m3"}, "each message carries its content: %s", r.Text())
+	for _, author := range hWalkField(page, "author_id") {
 		ctx.Assert(author == "7", "each message carries author_id (as a string): %s", r.Text())
 	}
 	first := reads.all()
@@ -1424,18 +1424,18 @@ func CheckNewestFirst(ctx *harness.Ctx) {
 		first = first[:1]
 	}
 	ctx.Equal(first, [][2]int64{{w.nowB, 3}}, "the first query must read the current bucket %d bounded by the page size (LIMIT 3), as [bucket, limit]", w.nowB)
-	r, _ = w.get(w.channel, walkQuery("before", walkID(ids[3]), "limit", "10"))
-	ctx.Equal(walkField(w.page(r), "id"), []any{walkID(ids[2]), walkID(ids[1]), walkID(ids[0])}, "before=<id of m4> must return m3, m2, m1 (strictly older)")
-	r, _ = w.get(w.channel, walkQuery("before", walkID(ids[0]), "limit", "10"))
+	r, _ = w.get(w.channel, hWalkQuery("before", hWalkID(ids[3]), "limit", "10"))
+	ctx.Equal(hWalkField(w.page(r), "id"), []any{hWalkID(ids[2]), hWalkID(ids[1]), hWalkID(ids[0])}, "before=<id of m4> must return m3, m2, m1 (strictly older)")
+	r, _ = w.get(w.channel, hWalkQuery("before", hWalkID(ids[0]), "limit", "10"))
 	got := w.page(r)
 	ctx.Assert(got != nil && len(got) == 0, "nothing is older than the first message: expected [], got %s", r.Text())
 }
 
 func CheckWalkBack(ctx *harness.Ctx) {
-	nowB := (time.Now().UnixMilli() - walkEpoch) / walkBucketMs
-	rows := []walkRow{{nowB, 1000, "a"}, {nowB, 2000, "b"}, {nowB - 2, 1000, "c"}, {nowB - 2, 2000, "d"}, {nowB - 5, 1000, "e"}}
-	w := newWalkWorld(ctx, rows...)
-	r, reads := w.get(w.channel, walkQuery("before", walkID(w.end), "limit", "3"))
+	nowB := (time.Now().UnixMilli() - kHWalkEpoch) / kHWalkBucketMs
+	rows := []HWalkRow{{nowB, 1000, "a"}, {nowB, 2000, "b"}, {nowB - 2, 1000, "c"}, {nowB - 2, 2000, "d"}, {nowB - 5, 1000, "e"}}
+	w := hNewWalkWorld(ctx, rows...)
+	r, reads := w.get(w.channel, hWalkQuery("before", hWalkID(w.end), "limit", "3"))
 	ctx.Equal(w.contents(r), []any{"b", "a", "d"}, "a page of 3 spans buckets %d and %d: expected b, a, d", nowB, nowB-2)
 	ctx.Equal(reads.buckets(), []int64{nowB, nowB - 1, nowB - 2}, "the walk must query buckets %d, %d, %d in that order and stop once the page is full; buckets Postgres was asked for", nowB, nowB-1, nowB-2)
 	limits := []int64{}
@@ -1444,7 +1444,7 @@ func CheckWalkBack(ctx *harness.Ctx) {
 	}
 	ctx.Equal(limits, []int64{3, 1, 1}, "each bucket is asked only for what is still missing (LIMIT 3, then 1, then 1); LIMITs Postgres ran")
 	w.insert(w.sibling, rows)
-	r, reads = w.get(w.sibling, walkQuery("before", walkID(w.end), "limit", "10"))
+	r, reads = w.get(w.sibling, hWalkQuery("before", hWalkID(w.end), "limit", "10"))
 	ctx.Equal(w.contents(r), []any{"b", "a", "d", "c", "e"}, "a page larger than the channel returns everything newest first")
 	want := []int64{}
 	for i := range 11 {
@@ -1454,9 +1454,9 @@ func CheckWalkBack(ctx *harness.Ctx) {
 }
 
 func CheckChannelFloor(ctx *harness.Ctx) {
-	nowB := (time.Now().UnixMilli() - walkEpoch) / walkBucketMs
-	w := newWalkWorld(ctx, walkRow{nowB - 9, 1000, "old"})
-	r, reads := w.get(w.channel, walkQuery("before", walkID(w.end), "limit", "50"))
+	nowB := (time.Now().UnixMilli() - kHWalkEpoch) / kHWalkBucketMs
+	w := hNewWalkWorld(ctx, HWalkRow{nowB - 9, 1000, "old"})
+	r, reads := w.get(w.channel, hWalkQuery("before", hWalkID(w.end), "limit", "50"))
 	ctx.Equal(w.contents(r), []any{"old"}, "the only message sits nine buckets back and must be found")
 	buckets := reads.buckets()
 	lowest := int64(-1)
@@ -1467,8 +1467,8 @@ func CheckChannelFloor(ctx *harness.Ctx) {
 	}
 	ctx.Assert(len(buckets) > 0 && lowest == nowB-10, "the walk must reach bucketOf(channelID) = %d and stop there; Postgres was asked for buckets down to %d", nowB-10, lowest)
 	ctx.Equal(len(buckets), 11, "from %d down to %d is 11 bucket queries", nowB, nowB-10)
-	young := walkSnowflake(nowB-1, 0)
-	r, reads = w.get(young, walkQuery("before", walkID(w.end), "limit", "50"))
+	young := hWalkSnowflake(nowB-1, 0)
+	r, reads = w.get(young, hWalkQuery("before", hWalkID(w.end), "limit", "50"))
 	var empty []map[string]any
 	r.Decode(&empty)
 	ctx.Assert(empty != nil && len(empty) == 0, "a channel with no messages answers an empty page, got %s", r.Text())
@@ -1476,21 +1476,21 @@ func CheckChannelFloor(ctx *harness.Ctx) {
 }
 
 func CheckEmptyMemo(ctx *harness.Ctx) {
-	nowB := (time.Now().UnixMilli() - walkEpoch) / walkBucketMs
-	w := newWalkWorld(ctx, walkRow{nowB, 1000, "new"}, walkRow{nowB - 9, 1000, "old"})
-	r, reads := w.get(w.channel, walkQuery("before", walkID(w.end), "limit", "5"))
+	nowB := (time.Now().UnixMilli() - kHWalkEpoch) / kHWalkBucketMs
+	w := hNewWalkWorld(ctx, HWalkRow{nowB, 1000, "new"}, HWalkRow{nowB - 9, 1000, "old"})
+	r, reads := w.get(w.channel, hWalkQuery("before", hWalkID(w.end), "limit", "5"))
 	ctx.Equal(w.contents(r), []any{"new", "old"}, "expected new then old")
 	ctx.Equal(len(reads.buckets()), 11, "the first read of a quiet channel walks every bucket (11 queries)")
-	r, reads = w.get(w.channel, walkQuery("before", walkID(w.end), "limit", "5"))
+	r, reads = w.get(w.channel, hWalkQuery("before", hWalkID(w.end), "limit", "5"))
 	ctx.Equal(w.contents(r), []any{"new", "old"}, "the second read must return the same page")
 	second := reads.buckets()
 	ctx.Assert(len(second) <= 3, "the second read must skip the buckets known to be empty: at most 3 queries (%d, %d, %d), Postgres ran %d: %v", nowB, nowB-9, nowB-10, len(second), second)
 	for _, b := range second {
 		ctx.Assert(b != nowB-5, "bucket %d came back empty on the first read and must not be queried again", nowB-5)
 	}
-	r, _ = w.get(w.channel, walkQuery("before", walkID(walkSnowflake(nowB, 1000)), "limit", "5"))
+	r, _ = w.get(w.channel, hWalkQuery("before", hWalkID(hWalkSnowflake(nowB, 1000)), "limit", "5"))
 	ctx.Equal(w.contents(r), []any{"old"}, "before=<id of new> hides new")
-	r, reads = w.get(w.channel, walkQuery("before", walkID(w.end), "limit", "5"))
+	r, reads = w.get(w.channel, hWalkQuery("before", hWalkID(w.end), "limit", "5"))
 	sawStart := false
 	for _, b := range reads.buckets() {
 		sawStart = sawStart || b == nowB
@@ -1511,30 +1511,30 @@ int32_t bucket_of(int64_t snowflake) { return static_cast<int32_t>((snowflake >>
 
 namespace {
 
-constexpr int64_t walkEpoch = 1420070400000LL;
-constexpr int64_t walkBucketMs = 10LL * 24 * 3600 * 1000;
-const std::string walkInsert = "INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES ($1, $2, $3, $4, $5)";
+constexpr int64_t kHWalkEpoch = 1420070400000LL;
+constexpr int64_t kHWalkBucketMs = 10LL * 24 * 3600 * 1000;
+const std::string kHWalkInsert = "INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES ($1, $2, $3, $4, $5)";
 
-const std::regex walkBucketRe("(?:^|[^a-z_])bucket ?= ?([$][0-9]+|[0-9]+)");
-const std::regex walkLimitRe("limit ?([$][0-9]+|[0-9]+)");
+const std::regex hWalkBucketRe("(?:^|[^a-z_])bucket ?= ?([$][0-9]+|[0-9]+)");
+const std::regex hWalkLimitRe("limit ?([$][0-9]+|[0-9]+)");
 
-using Read = std::array<int64_t, 2>;
+using HRead = std::array<int64_t, 2>;
 
 // walkSnowflake is a snowflake minted offsetMs into bucket.
-int64_t walkSnowflake(int64_t bucket, int64_t offsetMs) { return ((bucket * walkBucketMs + offsetMs) << 22) | (1 << 17); }
+int64_t hWalkSnowflake(int64_t bucket, int64_t offsetMs) { return ((bucket * kHWalkBucketMs + offsetMs) << 22) | (1 << 17); }
 
 // walkRow is a stored message: its bucket, its offset in it, its content.
-struct walkRow {
+struct HWalkRow {
   int64_t bucket, offsetMs;
   std::string content;
 };
 
-std::string walkID(int64_t id) { return std::to_string(id); }
+std::string hWalkID(int64_t id) { return std::to_string(id); }
 
-int64_t nowBucket(harness::Ctx& ctx) { return (ctx.Clock.Now() - walkEpoch) / walkBucketMs; }
+int64_t hNowBucket(harness::Ctx& ctx) { return (ctx.Clock.Now() - kHWalkEpoch) / kHWalkBucketMs; }
 
 // walkReads is the page walk as Postgres saw it since it was made.
-struct walkReads {
+struct HWalkReads {
   harness::Ctx* ctx;
   size_t since;
 
@@ -1552,8 +1552,8 @@ struct walkReads {
   }
 
   // all is [bucket, limit] of every SELECT on messages (limit -1 when there is none).
-  std::vector<Read> all() const {
-    std::vector<Read> out;
+  std::vector<HRead> all() const {
+    std::vector<HRead> out;
     const auto queries = ctx->DB.Queries();
     for (size_t i = since; i < queries.size(); i++) {
       const auto& q = queries[i];
@@ -1562,9 +1562,9 @@ struct walkReads {
       while (words >> word) text += (text.empty() ? "" : " ") + word;
       for (char& ch : text) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
       if (text.rfind("select", 0) != 0 || text.find("messages") == std::string::npos) continue;
-      const int64_t bucket = compared(walkBucketRe, text, q.Args);
+      const int64_t bucket = compared(hWalkBucketRe, text, q.Args);
       ctx->Assert(bucket != -1, "Postgres ran a read of messages that is not confined to one bucket: %q — each query must name one (channel_id, bucket) partition", q.SQL);
-      out.push_back({bucket, compared(walkLimitRe, text, q.Args)});
+      out.push_back({bucket, compared(hWalkLimitRe, text, q.Args)});
     }
     return out;
   }
@@ -1576,10 +1576,10 @@ struct walkReads {
   }
 };
 
-using Params = std::vector<std::pair<std::string, std::string>>;
+using HParams = std::vector<std::pair<std::string, std::string>>;
 
 // walkWorld is the learner's server over Postgres, around a channel created ten buckets ago.
-struct walkWorld {
+struct HWalkWorld {
   harness::Ctx* ctx;
   int64_t nowB;     // the bucket a message sent now lands in
   int64_t channel;  // a channel created ten buckets ago
@@ -1587,13 +1587,13 @@ struct walkWorld {
   int64_t sibling;  // another channel created ten buckets ago, with no memo yet
   std::optional<harness::HTTP> http;
 
-  void insert(int64_t ch, const std::vector<walkRow>& messages) {
-    for (const auto& m : messages) ctx->DB.Exec(walkInsert, ch, m.bucket, walkSnowflake(m.bucket, m.offsetMs), 7, m.content);
+  void insert(int64_t ch, const std::vector<HWalkRow>& messages) {
+    for (const auto& m : messages) ctx->DB.Exec(kHWalkInsert, ch, m.bucket, hWalkSnowflake(m.bucket, m.offsetMs), 7, m.content);
   }
 
   // get is one GET on channel; it returns the response and the bucket reads Postgres ran for it.
-  std::pair<harness::Response, walkReads> get(int64_t ch, const Params& params = {}) {
-    walkReads reads{ctx, ctx->DB.Queries().size()};
+  std::pair<harness::Response, HWalkReads> get(int64_t ch, const HParams& params = {}) {
+    HWalkReads reads{ctx, ctx->DB.Queries().size()};
     std::string path = "/channels/" + std::to_string(ch) + "/messages";
     for (size_t i = 0; i < params.size(); i++) path += (i == 0 ? "?" : "&") + params[i].first + "=" + params[i].second;
     return {http->Get(path), reads};
@@ -1619,18 +1619,18 @@ struct walkWorld {
 };
 
 // walkField lists one field of every message of a page.
-std::vector<harness::Any> walkField(const harness::Any& page, const std::string& name) {
+std::vector<harness::Any> hWalkField(const harness::Any& page, const std::string& name) {
   std::vector<harness::Any> out;
   for (const auto& m : page.Items()) out.push_back(m[name]);
   return out;
 }
 
-std::vector<harness::Any> walkWorld::contents(const harness::Response& r) { return walkField(page(r), "content"); }
+std::vector<harness::Any> HWalkWorld::contents(const harness::Response& r) { return hWalkField(page(r), "content"); }
 
 // newWalkWorld stores messages of the channel, then starts the server.
-walkWorld newWalkWorld(harness::Ctx& ctx, const std::vector<walkRow>& messages) {
-  const int64_t nowB = nowBucket(ctx);
-  walkWorld w{&ctx, nowB, walkSnowflake(nowB - 10, 5000), walkSnowflake(nowB, walkBucketMs - 1), walkSnowflake(nowB - 10, 6000), std::nullopt};
+HWalkWorld hNewWalkWorld(harness::Ctx& ctx, const std::vector<HWalkRow>& messages) {
+  const int64_t nowB = hNowBucket(ctx);
+  HWalkWorld w{&ctx, nowB, hWalkSnowflake(nowB - 10, 5000), hWalkSnowflake(nowB, kHWalkBucketMs - 1), hWalkSnowflake(nowB - 10, 6000), std::nullopt};
   ctx.DB.Reset(db::kSchema);
   w.insert(w.channel, messages);
   w.http = ctx.Main().HTTP();
@@ -1640,10 +1640,10 @@ walkWorld newWalkWorld(harness::Ctx& ctx, const std::vector<walkRow>& messages) 
 }  // namespace
 
 void CheckLimitBounds(harness::Ctx& ctx) {
-  const int64_t nowB = nowBucket(ctx);
-  std::vector<walkRow> rows;
+  const int64_t nowB = hNowBucket(ctx);
+  std::vector<HWalkRow> rows;
   for (int i = 0; i < 60; i++) rows.push_back({nowB, 1000LL * (i + 1), "m" + std::to_string(i)});
-  auto w = newWalkWorld(ctx, rows);
+  auto w = hNewWalkWorld(ctx, rows);
   for (const std::string bad : {"0", "101", "-5"}) {
     const auto [r, reads] = w.get(w.channel, {{"limit", bad}});
     ctx.Equal(r.Status, 400, "limit=%s is outside 1..100", bad);
@@ -1658,44 +1658,44 @@ void CheckLimitBounds(harness::Ctx& ctx) {
 }
 
 void CheckNewestFirst(harness::Ctx& ctx) {
-  const int64_t nowB = nowBucket(ctx);
-  std::vector<walkRow> rows;
+  const int64_t nowB = hNowBucket(ctx);
+  std::vector<HWalkRow> rows;
   std::vector<int64_t> ids;
   for (int64_t i = 1; i <= 5; i++) {
     rows.push_back({nowB, 1000 * i, "m" + std::to_string(i)});
-    ids.push_back(walkSnowflake(nowB, 1000 * i));
+    ids.push_back(hWalkSnowflake(nowB, 1000 * i));
   }
-  auto w = newWalkWorld(ctx, rows);
+  auto w = hNewWalkWorld(ctx, rows);
   auto [r, reads] = w.get(w.channel, {{"limit", "3"}});
   ctx.Equal(r.Status, 200, "GET with limit=3");
   const auto page = w.page(r);
-  ctx.Equal(walkField(page, "id"), {walkID(ids[4]), walkID(ids[3]), walkID(ids[2])}, "limit=3 must return the three newest ids as strings, newest first");
-  ctx.Equal(walkField(page, "content"), {"m5", "m4", "m3"}, "each message carries its content: %s", r.Text());
-  for (const auto& author : walkField(page, "author_id")) {
+  ctx.Equal(hWalkField(page, "id"), {hWalkID(ids[4]), hWalkID(ids[3]), hWalkID(ids[2])}, "limit=3 must return the three newest ids as strings, newest first");
+  ctx.Equal(hWalkField(page, "content"), {"m5", "m4", "m3"}, "each message carries its content: %s", r.Text());
+  for (const auto& author : hWalkField(page, "author_id")) {
     ctx.Assert(author == "7", "each message carries author_id (as a string): %s", r.Text());
   }
   auto first = reads.all();
   if (first.size() > 1) first.resize(1);
-  ctx.Equal(first, std::vector<Read>{Read{w.nowB, 3}}, "the first query must read the current bucket %d bounded by the page size (LIMIT 3), as [bucket, limit]", w.nowB);
-  r = w.get(w.channel, {{"before", walkID(ids[3])}, {"limit", "10"}}).first;
-  ctx.Equal(walkField(w.page(r), "id"), {walkID(ids[2]), walkID(ids[1]), walkID(ids[0])}, "before=<id of m4> must return m3, m2, m1 (strictly older)");
-  r = w.get(w.channel, {{"before", walkID(ids[0])}, {"limit", "10"}}).first;
+  ctx.Equal(first, std::vector<HRead>{HRead{w.nowB, 3}}, "the first query must read the current bucket %d bounded by the page size (LIMIT 3), as [bucket, limit]", w.nowB);
+  r = w.get(w.channel, {{"before", hWalkID(ids[3])}, {"limit", "10"}}).first;
+  ctx.Equal(hWalkField(w.page(r), "id"), {hWalkID(ids[2]), hWalkID(ids[1]), hWalkID(ids[0])}, "before=<id of m4> must return m3, m2, m1 (strictly older)");
+  r = w.get(w.channel, {{"before", hWalkID(ids[0])}, {"limit", "10"}}).first;
   const auto got = w.page(r);
   ctx.Assert(got.IsArray() && got.Len() == 0, "nothing is older than the first message: expected [], got %s", r.Text());
 }
 
 void CheckWalkBack(harness::Ctx& ctx) {
-  const int64_t nowB = nowBucket(ctx);
-  const std::vector<walkRow> rows = {{nowB, 1000, "a"}, {nowB, 2000, "b"}, {nowB - 2, 1000, "c"}, {nowB - 2, 2000, "d"}, {nowB - 5, 1000, "e"}};
-  auto w = newWalkWorld(ctx, rows);
-  auto [r, reads] = w.get(w.channel, {{"before", walkID(w.end)}, {"limit", "3"}});
+  const int64_t nowB = hNowBucket(ctx);
+  const std::vector<HWalkRow> rows = {{nowB, 1000, "a"}, {nowB, 2000, "b"}, {nowB - 2, 1000, "c"}, {nowB - 2, 2000, "d"}, {nowB - 5, 1000, "e"}};
+  auto w = hNewWalkWorld(ctx, rows);
+  auto [r, reads] = w.get(w.channel, {{"before", hWalkID(w.end)}, {"limit", "3"}});
   ctx.Equal(w.contents(r), {"b", "a", "d"}, "a page of 3 spans buckets %d and %d: expected b, a, d", nowB, nowB - 2);
   ctx.Equal(reads.buckets(), {nowB, nowB - 1, nowB - 2}, "the walk must query buckets %d, %d, %d in that order and stop once the page is full; buckets Postgres was asked for", nowB, nowB - 1, nowB - 2);
   std::vector<int64_t> limits;
   for (const auto& read : reads.all()) limits.push_back(read[1]);
   ctx.Equal(limits, {3, 1, 1}, "each bucket is asked only for what is still missing (LIMIT 3, then 1, then 1); LIMITs Postgres ran");
   w.insert(w.sibling, rows);
-  std::tie(r, reads) = w.get(w.sibling, {{"before", walkID(w.end)}, {"limit", "10"}});
+  std::tie(r, reads) = w.get(w.sibling, {{"before", hWalkID(w.end)}, {"limit", "10"}});
   ctx.Equal(w.contents(r), {"b", "a", "d", "c", "e"}, "a page larger than the channel returns everything newest first");
   std::vector<int64_t> want;
   for (int i = 0; i < 11; i++) want.push_back(nowB - i);
@@ -1703,9 +1703,9 @@ void CheckWalkBack(harness::Ctx& ctx) {
 }
 
 void CheckChannelFloor(harness::Ctx& ctx) {
-  const int64_t nowB = nowBucket(ctx);
-  auto w = newWalkWorld(ctx, {{nowB - 9, 1000, "old"}});
-  auto [r, reads] = w.get(w.channel, {{"before", walkID(w.end)}, {"limit", "50"}});
+  const int64_t nowB = hNowBucket(ctx);
+  auto w = hNewWalkWorld(ctx, {{nowB - 9, 1000, "old"}});
+  auto [r, reads] = w.get(w.channel, {{"before", hWalkID(w.end)}, {"limit", "50"}});
   ctx.Equal(w.contents(r), {"old"}, "the only message sits nine buckets back and must be found");
   const auto buckets = reads.buckets();
   int64_t lowest = -1;
@@ -1714,29 +1714,29 @@ void CheckChannelFloor(harness::Ctx& ctx) {
   }
   ctx.Assert(!buckets.empty() && lowest == nowB - 10, "the walk must reach bucketOf(channelID) = %d and stop there; Postgres was asked for buckets down to %d", nowB - 10, lowest);
   ctx.Equal(buckets.size(), 11, "from %d down to %d is 11 bucket queries", nowB, nowB - 10);
-  const int64_t young = walkSnowflake(nowB - 1, 0);
-  std::tie(r, reads) = w.get(young, {{"before", walkID(w.end)}, {"limit", "50"}});
+  const int64_t young = hWalkSnowflake(nowB - 1, 0);
+  std::tie(r, reads) = w.get(young, {{"before", hWalkID(w.end)}, {"limit", "50"}});
   const auto empty = w.decode(r);
   ctx.Assert(empty.IsArray() && empty.Len() == 0, "a channel with no messages answers an empty page, got %s", r.Text());
   ctx.Equal(reads.buckets(), {nowB, nowB - 1}, "a channel created in bucket %d needs exactly two queries (%d, %d)", nowB - 1, nowB, nowB - 1);
 }
 
 void CheckEmptyMemo(harness::Ctx& ctx) {
-  const int64_t nowB = nowBucket(ctx);
-  auto w = newWalkWorld(ctx, {{nowB, 1000, "new"}, {nowB - 9, 1000, "old"}});
-  auto [r, reads] = w.get(w.channel, {{"before", walkID(w.end)}, {"limit", "5"}});
+  const int64_t nowB = hNowBucket(ctx);
+  auto w = hNewWalkWorld(ctx, {{nowB, 1000, "new"}, {nowB - 9, 1000, "old"}});
+  auto [r, reads] = w.get(w.channel, {{"before", hWalkID(w.end)}, {"limit", "5"}});
   ctx.Equal(w.contents(r), {"new", "old"}, "expected new then old");
   ctx.Equal(reads.buckets().size(), 11, "the first read of a quiet channel walks every bucket (11 queries)");
-  std::tie(r, reads) = w.get(w.channel, {{"before", walkID(w.end)}, {"limit", "5"}});
+  std::tie(r, reads) = w.get(w.channel, {{"before", hWalkID(w.end)}, {"limit", "5"}});
   ctx.Equal(w.contents(r), {"new", "old"}, "the second read must return the same page");
   const auto second = reads.buckets();
   ctx.Assert(second.size() <= 3, "the second read must skip the buckets known to be empty: at most 3 queries (%d, %d, %d), Postgres ran %d: %v", nowB, nowB - 9, nowB - 10, second.size(), second);
   for (const int64_t b : second) {
     ctx.Assert(b != nowB - 5, "bucket %d came back empty on the first read and must not be queried again", nowB - 5);
   }
-  r = w.get(w.channel, {{"before", walkID(walkSnowflake(nowB, 1000))}, {"limit", "5"}}).first;
+  r = w.get(w.channel, {{"before", hWalkID(hWalkSnowflake(nowB, 1000))}, {"limit", "5"}}).first;
   ctx.Equal(w.contents(r), {"old"}, "before=<id of new> hides new");
-  std::tie(r, reads) = w.get(w.channel, {{"before", walkID(w.end)}, {"limit", "5"}});
+  std::tie(r, reads) = w.get(w.channel, {{"before", hWalkID(w.end)}, {"limit", "5"}});
   bool sawStart = false;
   for (const int64_t b : reads.buckets()) sawStart = sawStart || b == nowB;
   ctx.Assert(sawStart, "the starting bucket %d returned nothing only because of the before cursor: it is not empty, yet the next read skipped it (Postgres was asked for %v)", nowB, reads.buckets());

@@ -844,38 +844,38 @@ import (
 	"leetbuild/harness"
 )
 
-const apiValue = 310
+const kHApiValue = 310
 
-type apiFeatures struct {
+type HApiFeatures struct {
 	pb.UnimplementedFeaturesServer
 }
 
-func (apiFeatures) Identity(context.Context, *pb.IdentityRequest) (*pb.IdentityFeatures, error) {
+func (HApiFeatures) Identity(context.Context, *pb.IdentityRequest) (*pb.IdentityFeatures, error) {
 	return &pb.IdentityFeatures{Segment: "sports", Frequency: 2}, nil
 }
 
-func (apiFeatures) Contextual(context.Context, *pb.ContextRequest) (*pb.ContextFeatures, error) {
+func (HApiFeatures) Contextual(context.Context, *pb.ContextRequest) (*pb.ContextFeatures, error) {
 	return &pb.ContextFeatures{Category: "news", ViewabilityPct: 70}, nil
 }
 
-type apiScorer struct {
+type HApiScorer struct {
 	pb.UnimplementedScorerServer
 }
 
-func (apiScorer) Score(context.Context, *pb.ScoreRequest) (*pb.ScoreReply, error) {
-	return &pb.ScoreReply{ValueCents: apiValue}, nil
+func (HApiScorer) Score(context.Context, *pb.ScoreRequest) (*pb.ScoreReply, error) {
+	return &pb.ScoreReply{ValueCents: kHApiValue}, nil
 }
 
-func apiSetup(ctx *harness.Ctx, cap int64) *harness.HTTP {
-	pb.RegisterFeaturesServer(ctx.GRPC.Server(""), apiFeatures{})
-	pb.RegisterScorerServer(ctx.GRPC.Server(""), apiScorer{})
+func hApiSetup(ctx *harness.Ctx, cap int64) *harness.HTTP {
+	pb.RegisterFeaturesServer(ctx.GRPC.Server(""), HApiFeatures{})
+	pb.RegisterScorerServer(ctx.GRPC.Server(""), HApiScorer{})
 	ctx.Redis.Set("cap:b-1", cap)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiBody(changes map[string]any) map[string]any {
+func hApiBody(changes map[string]any) map[string]any {
 	body := map[string]any{"auction_id": "a-1", "floor_cents": 250, "timeout_ms": 100, "user_hash": "u-9"}
 	for k, v := range changes {
 		body[k] = v
@@ -883,11 +883,11 @@ func apiBody(changes map[string]any) map[string]any {
 	return body
 }
 
-func apiBid(c *harness.HTTP, changes map[string]any) *harness.Response {
-	return c.Post("/v1/bids", apiBody(changes), "X-Bidder-Id", "b-1")
+func hApiBid(c *harness.HTTP, changes map[string]any) *harness.Response {
+	return c.Post("/v1/bids", hApiBody(changes), "X-Bidder-Id", "b-1")
 }
 
-func apiSpent(ctx *harness.Ctx) int64 {
+func hApiSpent(ctx *harness.Ctx) int64 {
 	var sum int64
 	for _, k := range ctx.Redis.Keys("spend:*") {
 		v, _ := ctx.Redis.Get(k)
@@ -897,37 +897,37 @@ func apiSpent(ctx *harness.Ctx) int64 {
 	return sum
 }
 
-type apiAnswer struct {
+type HApiAnswer struct {
 	AuctionID string \`json:"auction_id"\`
 	BidCents  *int64 \`json:"bid_cents"\`
 	Degraded  bool   \`json:"degraded"\`
 	Reason    string \`json:"reason"\`
 }
 
-func apiDecode(ctx *harness.Ctx, r *harness.Response, why string) apiAnswer {
+func hApiDecode(ctx *harness.Ctx, r *harness.Response, why string) HApiAnswer {
 	ctx.Equal(r.Status, 200, "%s: POST /v1/bids (%s)", why, r.Text())
-	var a apiAnswer
+	var a HApiAnswer
 	r.Decode(&a)
 	return a
 }
 
-func apiBids(a apiAnswer, cents int64) bool { return a.BidCents != nil && *a.BidCents == cents }
+func hApiBids(a HApiAnswer, cents int64) bool { return a.BidCents != nil && *a.BidCents == cents }
 
-func apiNoBid(ctx *harness.Ctx, r *harness.Response, reason, why string) {
-	a := apiDecode(ctx, r, why)
+func hApiNoBid(ctx *harness.Ctx, r *harness.Response, reason, why string) {
+	a := hApiDecode(ctx, r, why)
 	ctx.Assert(a.BidCents == nil && a.Reason == reason, "%s the service answered %s, expected the no-bid {bid_cents: null, reason: %q}", why, strings.TrimSpace(r.Text()), reason)
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiSetup(ctx, 100000)
-	a := apiDecode(ctx, apiBid(c, nil), "a healthy auction")
-	ctx.Assert(a.AuctionID == "a-1" && apiBids(a, apiValue) && !a.Degraded, "a healthy auction must bid the model's %d cents, not degraded, got %+v", apiValue, a)
-	ctx.Equal(apiSpent(ctx), apiValue, "the bid must claim its cents of the day's cap; the counters")
+	c := hApiSetup(ctx, 100000)
+	a := hApiDecode(ctx, hApiBid(c, nil), "a healthy auction")
+	ctx.Assert(a.AuctionID == "a-1" && hApiBids(a, kHApiValue) && !a.Degraded, "a healthy auction must bid the model's %d cents, not degraded, got %+v", kHApiValue, a)
+	ctx.Equal(hApiSpent(ctx), kHApiValue, "the bid must claim its cents of the day's cap; the counters")
 }
 
 func CheckValidate(ctx *harness.Ctx) {
-	c := apiSetup(ctx, 100000)
-	r := c.Post("/v1/bids", apiBody(nil))
+	c := hApiSetup(ctx, 100000)
+	r := c.Post("/v1/bids", hApiBody(nil))
 	ctx.Equal(r.Status, 401, "a bid request without X-Bidder-Id (there is no budget to bid from)")
 	cases := []struct {
 		changes map[string]any
@@ -942,10 +942,10 @@ func CheckValidate(ctx *harness.Ctx) {
 		{map[string]any{"auction_id": ""}, "an empty auction_id"},
 	}
 	for _, tc := range cases {
-		r = apiBid(c, tc.changes)
+		r = hApiBid(c, tc.changes)
 		ctx.Equal(r.Status, 400, "%s (%s)", tc.why, r.Text())
 	}
-	ctx.Assert(apiSpent(ctx) == 0 && len(ctx.GRPC.CallsTo("Identity", "")) == 0, "a rejected request must be neither priced nor claimed")
+	ctx.Assert(hApiSpent(ctx) == 0 && len(ctx.GRPC.CallsTo("Identity", "")) == 0, "a rejected request must be neither priced nor claimed")
 	accepted := []struct {
 		changes map[string]any
 		why     string
@@ -954,57 +954,57 @@ func CheckValidate(ctx *harness.Ctx) {
 		{map[string]any{"floor_cents": 1000000, "auction_id": "a-4"}, "floor_cents 1 000 000 is in range"},
 	}
 	for _, tc := range accepted {
-		r = apiBid(c, tc.changes)
+		r = hApiBid(c, tc.changes)
 		ctx.Equal(r.Status, 200, "%s (%s)", tc.why, r.Text())
 	}
-	a := apiDecode(ctx, apiBid(c, map[string]any{"timeout_ms": 200, "floor_cents": 0}), "timeout_ms 200 and floor_cents 0 are in range")
-	ctx.Assert(apiBids(a, apiValue), "timeout_ms 200 and floor_cents 0 are in range: the service answered %+v", a)
+	a := hApiDecode(ctx, hApiBid(c, map[string]any{"timeout_ms": 200, "floor_cents": 0}), "timeout_ms 200 and floor_cents 0 are in range")
+	ctx.Assert(hApiBids(a, kHApiValue), "timeout_ms 200 and floor_cents 0 are in range: the service answered %+v", a)
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	c := apiSetup(ctx, 100000)
+	c := hApiSetup(ctx, 100000)
 	for _, method := range []string{"Identity", "Contextual", "Score"} {
 		ctx.GRPC.SetLatency(method, 0.025, "")
 	}
 	started := ctx.Clock.Now()
-	r := apiBid(c, map[string]any{"timeout_ms": 20})
+	r := hApiBid(c, map[string]any{"timeout_ms": 20})
 	took := ctx.Clock.Now() - started
-	a := apiDecode(ctx, r, "a 20 ms auction")
+	a := hApiDecode(ctx, r, "a 20 ms auction")
 	ctx.Assert(a.BidCents == nil && a.Reason == "deadline_exceeded", "an auction with timeout_ms 20 and features answering in 25 ms got %s after %d ms: the budget is the request's timeout_ms, and a quote that used it up is a no-bid", strings.TrimSpace(r.Text()), took)
 	ctx.Assert(took <= 21, "the answer to a 20 ms auction took %d ms", took)
 	for _, call := range ctx.GRPC.Calls() {
 		ctx.Assert(call.HasDeadline() && call.Timeout <= 20*time.Millisecond+100*time.Microsecond, "a %s call got a %v deadline inside a 20 ms auction", call.Method, call.Timeout)
 	}
-	ctx.Equal(apiSpent(ctx), 0, "a no-bid must claim nothing; the counters")
+	ctx.Equal(hApiSpent(ctx), 0, "a no-bid must claim nothing; the counters")
 	ctx.GRPC.SetLatency("Identity", 0, "")
 	ctx.GRPC.SetLatency("Contextual", 0, "")
 	ctx.GRPC.SetLatency("Score", 0.095, "")
-	r = apiBid(c, map[string]any{"auction_id": "a-2", "timeout_ms": 150})
-	a = apiDecode(ctx, r, "a 150 ms auction")
-	ctx.Assert(apiBids(a, apiValue), "an auction with timeout_ms 150 and a model answering in 95 ms has 55 ms left to answer, yet the service answered %s: the budget is the request's timeout_ms, not defaultBudgetMs", strings.TrimSpace(r.Text()))
+	r = hApiBid(c, map[string]any{"auction_id": "a-2", "timeout_ms": 150})
+	a = hApiDecode(ctx, r, "a 150 ms auction")
+	ctx.Assert(hApiBids(a, kHApiValue), "an auction with timeout_ms 150 and a model answering in 95 ms has 55 ms left to answer, yet the service answered %s: the budget is the request's timeout_ms, not defaultBudgetMs", strings.TrimSpace(r.Text()))
 }
 
 func CheckNoLateBid(ctx *harness.Ctx) {
-	c := apiSetup(ctx, 100000)
+	c := hApiSetup(ctx, 100000)
 	ctx.GRPC.SetLatency("Identity", 0.025, "")
 	ctx.GRPC.SetLatency("Contextual", 0.030, "")
-	apiNoBid(ctx, apiBid(c, map[string]any{"timeout_ms": 60}), "deadline_exceeded", "with 5 ms of a 60 ms budget left after pricing (minBidMs is 10)")
-	ctx.Equal(apiSpent(ctx), 0, "a no-bid must claim nothing; the counters")
-	r := apiBid(c, map[string]any{"auction_id": "a-3", "timeout_ms": 65})
-	ctx.Assert(apiBids(apiDecode(ctx, r, "a 65 ms auction"), 250), "with exactly minBidMs (10 ms) of a 65 ms budget left after pricing the service must still bid the floor, got %s", strings.TrimSpace(r.Text()))
+	hApiNoBid(ctx, hApiBid(c, map[string]any{"timeout_ms": 60}), "deadline_exceeded", "with 5 ms of a 60 ms budget left after pricing (minBidMs is 10)")
+	ctx.Equal(hApiSpent(ctx), 0, "a no-bid must claim nothing; the counters")
+	r := hApiBid(c, map[string]any{"auction_id": "a-3", "timeout_ms": 65})
+	ctx.Assert(hApiBids(hApiDecode(ctx, r, "a 65 ms auction"), 250), "with exactly minBidMs (10 ms) of a 65 ms budget left after pricing the service must still bid the floor, got %s", strings.TrimSpace(r.Text()))
 	ctx.GRPC.SetLatency("Identity", 0, "")
 	ctx.GRPC.SetLatency("Contextual", 0, "")
-	a := apiDecode(ctx, apiBid(c, map[string]any{"auction_id": "a-2"}), "with the whole budget left")
-	ctx.Assert(apiBids(a, apiValue), "with the whole budget left the service must bid, got %+v", a)
+	a := hApiDecode(ctx, hApiBid(c, map[string]any{"auction_id": "a-2"}), "with the whole budget left")
+	ctx.Assert(hApiBids(a, kHApiValue), "with the whole budget left the service must bid, got %+v", a)
 }
 
 func CheckBudget(ctx *harness.Ctx) {
-	c := apiSetup(ctx, 300)
-	apiNoBid(ctx, apiBid(c, nil), "budget_exhausted", "with 300 cents of cap left and a quote of 310")
-	ctx.Equal(apiSpent(ctx), 0, "the refused claim must leave the counters at 0; they hold")
+	c := hApiSetup(ctx, 300)
+	hApiNoBid(ctx, hApiBid(c, nil), "budget_exhausted", "with 300 cents of cap left and a quote of 310")
+	ctx.Equal(hApiSpent(ctx), 0, "the refused claim must leave the counters at 0; they hold")
 	ctx.Redis.Set("cap:b-1", 1000)
-	a := apiDecode(ctx, apiBid(c, map[string]any{"auction_id": "a-2"}), "with the cap raised to 1000")
-	ctx.Assert(apiBids(a, apiValue) && apiSpent(ctx) == apiValue, "with the cap raised to 1000 the service must bid %d and claim it, got %+v with %d claimed", apiValue, a, apiSpent(ctx))
+	a := hApiDecode(ctx, hApiBid(c, map[string]any{"auction_id": "a-2"}), "with the cap raised to 1000")
+	ctx.Assert(hApiBids(a, kHApiValue) && hApiSpent(ctx) == kHApiValue, "with the cap raised to 1000 the service must bid %d and claim it, got %+v with %d claimed", kHApiValue, a, hApiSpent(ctx))
 }
 `,
     cpp: `#include <leetbuild/harness.h>

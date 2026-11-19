@@ -1148,28 +1148,28 @@ import (
 	"leetbuild/harness"
 )
 
-const intakeGroup = "catalog-enrichment"
-const intakeTitle = "DOVE SILK GLOW BODY WASH 500ML"
+const kHIntakeGroup = "catalog-enrichment"
+const kHIntakeTitle = "DOVE SILK GLOW BODY WASH 500ML"
 
-var intakeBg = context.Background()
+var hIntakeBg = context.Background()
 
-func intakeSku(skuID, merchant, title string) map[string]any {
+func hIntakeSku(skuID, merchant, title string) map[string]any {
 	return map[string]any{"merchant": merchant, "sku_id": skuID, "title": title, "description": "Nourishing body wash", "images": []string{"img/a.jpg", "img/b.jpg"}}
 }
 
-func intakeSeed(ctx *harness.Ctx, record map[string]any) {
+func hIntakeSeed(ctx *harness.Ctx, record map[string]any) {
 	value, _ := json.Marshal(record)
 	ctx.Kafka.Seed("sku.upserted", record["merchant"], string(value))
 }
 
 // intakeRun is one life of the consumer; what it returned, if anything.
-func intakeRun(ctx *harness.Ctx) error {
+func hIntakeRun(ctx *harness.Ctx) error {
 	var err error
-	ctx.Drain(func() { err = consume(intakeBg) })
+	ctx.Drain(func() { err = consume(hIntakeBg) })
 	return err
 }
 
-func intakeJobs(ctx *harness.Ctx) []store.Job {
+func hIntakeJobs(ctx *harness.Ctx) []store.Job {
 	var jobs []store.Job
 	for _, r := range ctx.Kafka.Records("sku.extract") {
 		var job store.Job
@@ -1180,10 +1180,10 @@ func intakeJobs(ctx *harness.Ctx) []store.Job {
 }
 
 func CheckMerchantKey(ctx *harness.Ctx) {
-	intakeSeed(ctx, intakeSku("sku-1", "m-1", intakeTitle))
-	intakeSeed(ctx, intakeSku("sku-2", "m-2", intakeTitle))
-	intakeSeed(ctx, intakeSku("sku-3", "m-1", intakeTitle))
-	ctx.NoError(intakeRun(ctx), "three well-formed records stopped the consumer")
+	hIntakeSeed(ctx, hIntakeSku("sku-1", "m-1", kHIntakeTitle))
+	hIntakeSeed(ctx, hIntakeSku("sku-2", "m-2", kHIntakeTitle))
+	hIntakeSeed(ctx, hIntakeSku("sku-3", "m-1", kHIntakeTitle))
+	ctx.NoError(hIntakeRun(ctx), "three well-formed records stopped the consumer")
 	records := ctx.Kafka.Records("sku.extract")
 	ctx.Equal(len(records), 3, "three new SKUs; the jobs on sku.extract")
 	keys := ctx.Kafka.Keys("sku.extract")
@@ -1198,7 +1198,7 @@ func CheckMerchantKey(ctx *harness.Ctx) {
 	ctx.Equal(len(partitions), 1, "one merchant, one partition; the partitions of m-1's jobs")
 }
 
-func intakeImages(n int) []string {
+func hIntakeImages(n int) []string {
 	images := []string{}
 	for i := 0; i < n; i++ {
 		images = append(images, fmt.Sprintf("img/%d.jpg", i))
@@ -1209,25 +1209,25 @@ func intakeImages(n int) []string {
 func CheckDeadLetter(ctx *harness.Ctx) {
 	ctx.Kafka.Seed("sku.upserted", "m-1", "{not json")
 	ctx.Kafka.Seed("sku.upserted", "m-1", \`["sku-0", "m-1"]\`)
-	noMerchant, _ := json.Marshal(map[string]any{"sku_id": "sku-1", "title": intakeTitle})
+	noMerchant, _ := json.Marshal(map[string]any{"sku_id": "sku-1", "title": kHIntakeTitle})
 	ctx.Kafka.Seed("sku.upserted", "m-1", string(noMerchant))
-	intakeSeed(ctx, intakeSku("sku-2", "m-1", "   "))
-	intakeSeed(ctx, intakeSku("sku-3", "m-1", strings.Repeat("X", 5000)))
-	many := intakeSku("sku-4", "m-1", intakeTitle)
-	many["images"] = intakeImages(9)
-	intakeSeed(ctx, many)
-	intakeSeed(ctx, intakeSku("sku-6", "m-1", strings.Repeat("\\u00e9", 2100)))
-	long := intakeSku("sku-7", "m-1", intakeTitle)
+	hIntakeSeed(ctx, hIntakeSku("sku-2", "m-1", "   "))
+	hIntakeSeed(ctx, hIntakeSku("sku-3", "m-1", strings.Repeat("X", 5000)))
+	many := hIntakeSku("sku-4", "m-1", kHIntakeTitle)
+	many["images"] = hIntakeImages(9)
+	hIntakeSeed(ctx, many)
+	hIntakeSeed(ctx, hIntakeSku("sku-6", "m-1", strings.Repeat("\\u00e9", 2100)))
+	long := hIntakeSku("sku-7", "m-1", kHIntakeTitle)
 	long["description"] = strings.Repeat("d", 16385)
-	intakeSeed(ctx, long)
-	intakeSeed(ctx, intakeSku("sku-5", "m-1", intakeTitle))
-	full := intakeSku("sku-8", "m-1", strings.Repeat("X", 4096))
+	hIntakeSeed(ctx, long)
+	hIntakeSeed(ctx, hIntakeSku("sku-5", "m-1", kHIntakeTitle))
+	full := hIntakeSku("sku-8", "m-1", strings.Repeat("X", 4096))
 	full["description"] = strings.Repeat("d", 16384)
-	full["images"] = intakeImages(8)
-	intakeSeed(ctx, full)
-	ctx.NoError(intakeRun(ctx), "a malformed record stopped the consumer: every record behind it on the partition is stuck")
+	full["images"] = hIntakeImages(8)
+	hIntakeSeed(ctx, full)
+	ctx.NoError(hIntakeRun(ctx), "a malformed record stopped the consumer: every record behind it on the partition is stuck")
 	ids := []string{}
-	for _, job := range intakeJobs(ctx) {
+	for _, job := range hIntakeJobs(ctx) {
 		ids = append(ids, job.SkuID)
 	}
 	ctx.Equal(ids, []string{"sku-5", "sku-8"}, "only the well-formed records may become jobs, and a SKU exactly at every cap (a 4096-byte title, a 16384-byte description, 8 images) is well-formed; sku.extract holds")
@@ -1237,35 +1237,35 @@ func CheckDeadLetter(ctx *harness.Ctx) {
 		reason, ok := r.Header("reason")
 		ctx.Assert(ok && len(reason) > 0, "a dead-lettered record carries no reason header: %.40s", r.Value)
 	}
-	ctx.Equal(ctx.Kafka.Lag(intakeGroup, "sku.upserted"), 0, "dead-lettered records must be committed too, or they are redelivered forever; the lag")
+	ctx.Equal(ctx.Kafka.Lag(kHIntakeGroup, "sku.upserted"), 0, "dead-lettered records must be committed too, or they are redelivered forever; the lag")
 }
 
 func CheckContentHash(ctx *harness.Ctx) {
-	v1 := intakeSku("sku-1", "m-1", intakeTitle)
-	intakeSeed(ctx, v1)
-	resent := intakeSku("sku-1", "m-1", intakeTitle)
+	v1 := hIntakeSku("sku-1", "m-1", kHIntakeTitle)
+	hIntakeSeed(ctx, v1)
+	resent := hIntakeSku("sku-1", "m-1", kHIntakeTitle)
 	resent["images"] = []string{"img/b.jpg", "img/a.jpg"} // the merchant re-sends its feed
-	intakeSeed(ctx, resent)
+	hIntakeSeed(ctx, resent)
 	v2Title := "DOVE SILK GLOW BODY WASH 750ML"
-	intakeSeed(ctx, intakeSku("sku-1", "m-1", v2Title))
-	store.PutHash(intakeBg, "sku-7", store.ContentHash("m-1", "OATLY OAT MILK 1L", "Nourishing body wash", []string{"img/a.jpg", "img/b.jpg"})) // enqueued before the last restart
-	intakeSeed(ctx, intakeSku("sku-7", "m-1", "OATLY OAT MILK 1L"))
-	ctx.NoError(intakeRun(ctx), "the consumer stopped")
-	jobs := intakeJobs(ctx)
+	hIntakeSeed(ctx, hIntakeSku("sku-1", "m-1", v2Title))
+	store.PutHash(hIntakeBg, "sku-7", store.ContentHash("m-1", "OATLY OAT MILK 1L", "Nourishing body wash", []string{"img/a.jpg", "img/b.jpg"})) // enqueued before the last restart
+	hIntakeSeed(ctx, hIntakeSku("sku-7", "m-1", "OATLY OAT MILK 1L"))
+	ctx.NoError(hIntakeRun(ctx), "the consumer stopped")
+	jobs := hIntakeJobs(ctx)
 	titles := []string{}
 	for _, job := range jobs {
 		titles = append(titles, job.SkuID+" "+job.Title)
 	}
-	ctx.Equal(titles, []string{"sku-1 " + intakeTitle, "sku-1 " + v2Title}, "a re-sent SKU must be skipped, a changed one enqueued and one enqueued before a restart skipped; sku.extract holds")
+	ctx.Equal(titles, []string{"sku-1 " + kHIntakeTitle, "sku-1 " + v2Title}, "a re-sent SKU must be skipped, a changed one enqueued and one enqueued before a restart skipped; sku.extract holds")
 	expected := store.ContentHash("m-1", v2Title, "Nourishing body wash", []string{"img/a.jpg", "img/b.jpg"})
 	ctx.Equal(jobs[1].ContentHash, expected, "the job must carry store.ContentHash of the SKU; its content_hash")
-	last, _ := store.LastHash(intakeBg, "sku-1")
+	last, _ := store.LastHash(hIntakeBg, "sku-1")
 	ctx.Equal(last, expected, "store.LastHash(sku-1) once the changed title was enqueued")
 }
 
-func intakeJobIDs(ctx *harness.Ctx) []string {
+func hIntakeJobIDs(ctx *harness.Ctx) []string {
 	ids := []string{}
-	for _, job := range intakeJobs(ctx) {
+	for _, job := range hIntakeJobs(ctx) {
 		ids = append(ids, job.SkuID)
 	}
 	sort.Strings(ids)
@@ -1273,18 +1273,18 @@ func intakeJobIDs(ctx *harness.Ctx) []string {
 }
 
 func CheckCommitAfterEnqueue(ctx *harness.Ctx) {
-	intakeSeed(ctx, intakeSku("sku-1", "m-1", intakeTitle))
-	intakeSeed(ctx, intakeSku("sku-2", "m-1", intakeTitle))
+	hIntakeSeed(ctx, hIntakeSku("sku-1", "m-1", kHIntakeTitle))
+	hIntakeSeed(ctx, hIntakeSku("sku-2", "m-1", kHIntakeTitle))
 	ctx.Kafka.FailNext("sku.extract", 1)
-	intakeRun(ctx)
-	if ids := intakeJobIDs(ctx); len(ids) == 0 || ids[0] != "sku-1" {
-		ctx.Equal(ctx.Kafka.Lag(intakeGroup, "sku.upserted"), 2, "the broker refused sku-1's job and its offset was committed anyway, by its own commit or by the commit of the record behind it: the SKU is lost. Commit only after the job is on sku.extract; the uncommitted records")
-		_, stored := store.LastHash(intakeBg, "sku-1")
+	hIntakeRun(ctx)
+	if ids := hIntakeJobIDs(ctx); len(ids) == 0 || ids[0] != "sku-1" {
+		ctx.Equal(ctx.Kafka.Lag(kHIntakeGroup, "sku.upserted"), 2, "the broker refused sku-1's job and its offset was committed anyway, by its own commit or by the commit of the record behind it: the SKU is lost. Commit only after the job is on sku.extract; the uncommitted records")
+		_, stored := store.LastHash(hIntakeBg, "sku-1")
 		ctx.Assert(!stored, "the content hash was stored for a job that never reached sku.extract: the redelivery would be skipped")
 	}
-	intakeRun(ctx) // the restart
-	ctx.Equal(intakeJobIDs(ctx), []string{"sku-1", "sku-2"}, "after the broker refused sku-1's job once and the consumer restarted, each SKU must reach sku.extract exactly once; sku.extract holds")
-	ctx.Equal(ctx.Kafka.Lag(intakeGroup, "sku.upserted"), 0, "after the restart both records must be committed; the lag")
+	hIntakeRun(ctx) // the restart
+	ctx.Equal(hIntakeJobIDs(ctx), []string{"sku-1", "sku-2"}, "after the broker refused sku-1's job once and the consumer restarted, each SKU must reach sku.extract exactly once; sku.extract holds")
+	ctx.Equal(ctx.Kafka.Lag(kHIntakeGroup, "sku.upserted"), 0, "after the restart both records must be committed; the lag")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1300,19 +1300,19 @@ func CheckCommitAfterEnqueue(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kIntakeGroup = "catalog-enrichment";
-const std::string kIntakeTitle = "DOVE SILK GLOW BODY WASH 500ML";
+const std::string kHIntakeGroup = "catalog-enrichment";
+const std::string kHIntakeTitle = "DOVE SILK GLOW BODY WASH 500ML";
 
-nlohmann::json intakeSku(const std::string& sku_id, const std::string& merchant, const std::string& title) {
+nlohmann::json hIntakeSku(const std::string& sku_id, const std::string& merchant, const std::string& title) {
   return {{"merchant", merchant}, {"sku_id", sku_id}, {"title", title}, {"description", "Nourishing body wash"}, {"images", {"img/a.jpg", "img/b.jpg"}}};
 }
 
-void intakeSeed(harness::Ctx& ctx, const nlohmann::json& record) {
+void hIntakeSeed(harness::Ctx& ctx, const nlohmann::json& record) {
   ctx.Kafka.Seed("sku.upserted", record["merchant"].get<std::string>(), record.dump());
 }
 
 // One life of the consumer; what it threw, if anything.
-std::string intakeRun(harness::Ctx& ctx) {
+std::string hIntakeRun(harness::Ctx& ctx) {
   try {
     ctx.Drain([] { consume(); });
   } catch (const std::exception& e) {
@@ -1321,7 +1321,7 @@ std::string intakeRun(harness::Ctx& ctx) {
   return "";
 }
 
-std::vector<nlohmann::json> intakeJobs(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hIntakeJobs(harness::Ctx& ctx) {
   std::vector<nlohmann::json> jobs;
   for (const auto& r : ctx.Kafka.Records("sku.extract")) jobs.push_back(nlohmann::json::parse(r.Value.value_or(""), nullptr, false));
   return jobs;
@@ -1330,10 +1330,10 @@ std::vector<nlohmann::json> intakeJobs(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckMerchantKey(harness::Ctx& ctx) {
-  intakeSeed(ctx, intakeSku("sku-1", "m-1", kIntakeTitle));
-  intakeSeed(ctx, intakeSku("sku-2", "m-2", kIntakeTitle));
-  intakeSeed(ctx, intakeSku("sku-3", "m-1", kIntakeTitle));
-  const std::string err = intakeRun(ctx);
+  hIntakeSeed(ctx, hIntakeSku("sku-1", "m-1", kHIntakeTitle));
+  hIntakeSeed(ctx, hIntakeSku("sku-2", "m-2", kHIntakeTitle));
+  hIntakeSeed(ctx, hIntakeSku("sku-3", "m-1", kHIntakeTitle));
+  const std::string err = hIntakeRun(ctx);
   ctx.Assert(err.empty(), "three well-formed records stopped the consumer: %s", err);
   const auto records = ctx.Kafka.Records("sku.extract");
   ctx.Equal(records.size(), 3, "three new SKUs; the jobs on sku.extract");
@@ -1346,7 +1346,7 @@ void CheckMerchantKey(harness::Ctx& ctx) {
   ctx.Equal(partitions.size(), 1, "one merchant, one partition; the partitions of m-1's jobs");
 }
 
-nlohmann::json intakeImages(int n) {
+nlohmann::json hIntakeImages(int n) {
   nlohmann::json images = nlohmann::json::array();
   for (int i = 0; i < n; i++) images.push_back("img/" + std::to_string(i) + ".jpg");
   return images;
@@ -1355,75 +1355,75 @@ nlohmann::json intakeImages(int n) {
 void CheckDeadLetter(harness::Ctx& ctx) {
   ctx.Kafka.Seed("sku.upserted", std::string("m-1"), std::string("{not json"));
   ctx.Kafka.Seed("sku.upserted", std::string("m-1"), std::string(R"(["sku-0", "m-1"])"));
-  ctx.Kafka.Seed("sku.upserted", std::string("m-1"), nlohmann::json{{"sku_id", "sku-1"}, {"title", kIntakeTitle}}.dump());
-  intakeSeed(ctx, intakeSku("sku-2", "m-1", "   "));
-  intakeSeed(ctx, intakeSku("sku-3", "m-1", std::string(5000, 'X')));
-  auto many = intakeSku("sku-4", "m-1", kIntakeTitle);
-  many["images"] = intakeImages(9);
-  intakeSeed(ctx, many);
+  ctx.Kafka.Seed("sku.upserted", std::string("m-1"), nlohmann::json{{"sku_id", "sku-1"}, {"title", kHIntakeTitle}}.dump());
+  hIntakeSeed(ctx, hIntakeSku("sku-2", "m-1", "   "));
+  hIntakeSeed(ctx, hIntakeSku("sku-3", "m-1", std::string(5000, 'X')));
+  auto many = hIntakeSku("sku-4", "m-1", kHIntakeTitle);
+  many["images"] = hIntakeImages(9);
+  hIntakeSeed(ctx, many);
   std::string accented;
   for (int i = 0; i < 2100; i++) accented += "\\xc3\\xa9";
-  intakeSeed(ctx, intakeSku("sku-6", "m-1", accented));
-  auto long_description = intakeSku("sku-7", "m-1", kIntakeTitle);
+  hIntakeSeed(ctx, hIntakeSku("sku-6", "m-1", accented));
+  auto long_description = hIntakeSku("sku-7", "m-1", kHIntakeTitle);
   long_description["description"] = std::string(16385, 'd');
-  intakeSeed(ctx, long_description);
-  intakeSeed(ctx, intakeSku("sku-5", "m-1", kIntakeTitle));
-  auto full = intakeSku("sku-8", "m-1", std::string(4096, 'X'));
+  hIntakeSeed(ctx, long_description);
+  hIntakeSeed(ctx, hIntakeSku("sku-5", "m-1", kHIntakeTitle));
+  auto full = hIntakeSku("sku-8", "m-1", std::string(4096, 'X'));
   full["description"] = std::string(16384, 'd');
-  full["images"] = intakeImages(8);
-  intakeSeed(ctx, full);
-  const std::string err = intakeRun(ctx);
+  full["images"] = hIntakeImages(8);
+  hIntakeSeed(ctx, full);
+  const std::string err = hIntakeRun(ctx);
   ctx.Assert(err.empty(), "a malformed record stopped the consumer (%s): every record behind it on the partition is stuck", err);
   std::vector<std::string> ids;
-  for (const auto& job : intakeJobs(ctx)) ids.push_back(job.value("sku_id", ""));
+  for (const auto& job : hIntakeJobs(ctx)) ids.push_back(job.value("sku_id", ""));
   ctx.Equal(ids, {"sku-5", "sku-8"}, "only the well-formed records may become jobs, and a SKU exactly at every cap (a 4096-byte title, a 16384-byte description, 8 images) is well-formed; sku.extract holds");
   const auto dlq = ctx.Kafka.Records("sku.upserted.dlq");
   ctx.Equal(dlq.size(), 8, "eight malformed records (not JSON, a JSON array, no merchant, a blank title, a 5000-byte title, nine images, a 2100-character title of 4200 UTF-8 bytes, a 16385-byte description); the records on sku.upserted.dlq");
   for (const auto& r : dlq) ctx.Assert(!r.Header("reason").value_or("").empty(), "a dead-lettered record carries no reason header: %s", r.Value.value_or("").substr(0, 40));
-  ctx.Equal(ctx.Kafka.Lag(kIntakeGroup, "sku.upserted"), 0, "dead-lettered records must be committed too, or they are redelivered forever; the lag");
+  ctx.Equal(ctx.Kafka.Lag(kHIntakeGroup, "sku.upserted"), 0, "dead-lettered records must be committed too, or they are redelivered forever; the lag");
 }
 
 void CheckContentHash(harness::Ctx& ctx) {
-  const auto v1 = intakeSku("sku-1", "m-1", kIntakeTitle);
-  intakeSeed(ctx, v1);
+  const auto v1 = hIntakeSku("sku-1", "m-1", kHIntakeTitle);
+  hIntakeSeed(ctx, v1);
   auto resent = v1;
   resent["images"] = {"img/b.jpg", "img/a.jpg"};  // the merchant re-sends its feed
-  intakeSeed(ctx, resent);
+  hIntakeSeed(ctx, resent);
   const std::string v2_title = "DOVE SILK GLOW BODY WASH 750ML";
-  intakeSeed(ctx, intakeSku("sku-1", "m-1", v2_title));
+  hIntakeSeed(ctx, hIntakeSku("sku-1", "m-1", v2_title));
   store::put_hash("sku-7", store::content_hash("m-1", "OATLY OAT MILK 1L", "Nourishing body wash", {"img/a.jpg", "img/b.jpg"}));  // enqueued before the last restart
-  intakeSeed(ctx, intakeSku("sku-7", "m-1", "OATLY OAT MILK 1L"));
-  const std::string err = intakeRun(ctx);
+  hIntakeSeed(ctx, hIntakeSku("sku-7", "m-1", "OATLY OAT MILK 1L"));
+  const std::string err = hIntakeRun(ctx);
   ctx.Assert(err.empty(), "the consumer stopped: %s", err);
-  const auto jobs = intakeJobs(ctx);
+  const auto jobs = hIntakeJobs(ctx);
   std::vector<std::string> titles;
   for (const auto& job : jobs) titles.push_back(job.value("sku_id", "") + " " + job.value("title", ""));
-  ctx.Equal(titles, {"sku-1 " + kIntakeTitle, "sku-1 " + v2_title}, "a re-sent SKU must be skipped, a changed one enqueued and one enqueued before a restart skipped; sku.extract holds");
+  ctx.Equal(titles, {"sku-1 " + kHIntakeTitle, "sku-1 " + v2_title}, "a re-sent SKU must be skipped, a changed one enqueued and one enqueued before a restart skipped; sku.extract holds");
   const std::string expected = store::content_hash("m-1", v2_title, "Nourishing body wash", {"img/a.jpg", "img/b.jpg"});
   ctx.Equal(jobs[1].value("content_hash", ""), expected, "the job must carry store::content_hash of the SKU; its content_hash");
   ctx.Equal(store::last_hash("sku-1").value_or(""), expected, "store::last_hash(sku-1) once the changed title was enqueued");
 }
 
-std::vector<std::string> intakeJobIds(harness::Ctx& ctx) {
+std::vector<std::string> hIntakeJobIds(harness::Ctx& ctx) {
   std::vector<std::string> ids;
-  for (const auto& job : intakeJobs(ctx)) ids.push_back(job.value("sku_id", ""));
+  for (const auto& job : hIntakeJobs(ctx)) ids.push_back(job.value("sku_id", ""));
   std::sort(ids.begin(), ids.end());
   return ids;
 }
 
 void CheckCommitAfterEnqueue(harness::Ctx& ctx) {
-  intakeSeed(ctx, intakeSku("sku-1", "m-1", kIntakeTitle));
-  intakeSeed(ctx, intakeSku("sku-2", "m-1", kIntakeTitle));
+  hIntakeSeed(ctx, hIntakeSku("sku-1", "m-1", kHIntakeTitle));
+  hIntakeSeed(ctx, hIntakeSku("sku-2", "m-1", kHIntakeTitle));
   ctx.Kafka.FailNext("sku.extract", 1);
-  intakeRun(ctx);
-  const auto first = intakeJobIds(ctx);
+  hIntakeRun(ctx);
+  const auto first = hIntakeJobIds(ctx);
   if (first.empty() || first[0] != "sku-1") {
-    ctx.Equal(ctx.Kafka.Lag(kIntakeGroup, "sku.upserted"), 2, "the broker refused sku-1's job and its offset was committed anyway, by its own commit or by the commit of the record behind it: the SKU is lost. Commit only after the job is on sku.extract; the uncommitted records");
+    ctx.Equal(ctx.Kafka.Lag(kHIntakeGroup, "sku.upserted"), 2, "the broker refused sku-1's job and its offset was committed anyway, by its own commit or by the commit of the record behind it: the SKU is lost. Commit only after the job is on sku.extract; the uncommitted records");
     ctx.Assert(!store::last_hash("sku-1"), "the content hash was stored for a job that never reached sku.extract: the redelivery would be skipped");
   }
-  intakeRun(ctx);  // the restart
-  ctx.Equal(intakeJobIds(ctx), {"sku-1", "sku-2"}, "after the broker refused sku-1's job once and the consumer restarted, each SKU must reach sku.extract exactly once; sku.extract holds");
-  ctx.Equal(ctx.Kafka.Lag(kIntakeGroup, "sku.upserted"), 0, "after the restart both records must be committed; the lag");
+  hIntakeRun(ctx);  // the restart
+  ctx.Equal(hIntakeJobIds(ctx), {"sku-1", "sku-2"}, "after the broker refused sku-1's job once and the consumer restarted, each SKU must reach sku.extract exactly once; sku.extract holds");
+  ctx.Equal(ctx.Kafka.Lag(kHIntakeGroup, "sku.upserted"), 0, "after the restart both records must be committed; the lag");
 }
 `,
   },

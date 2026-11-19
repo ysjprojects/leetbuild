@@ -1234,66 +1234,66 @@ import (
 )
 
 const (
-	evTopic   = "message-events"
-	evChannel = "1032000000000000001"
-	evOther   = "1032000000000000002"
-	evGroup   = "channel-state"
+	kHEvTopic   = "message-events"
+	kHEvChannel = "1032000000000000001"
+	kHEvOther   = "1032000000000000002"
+	kHEvGroup   = "channel-state"
 )
 
-func evEvent(channel, mid, content string) string {
+func hEvEvent(channel, mid, content string) string {
 	value, _ := json.Marshal(map[string]string{"type": "message.created", "channel_id": channel, "id": mid, "author_id": "7", "content": content})
 	return string(value)
 }
 
 // evSeed produces [channel, message id] events, in order.
-func evSeed(ctx *harness.Ctx, events ...[2]string) {
+func hEvSeed(ctx *harness.Ctx, events ...[2]string) {
 	for _, e := range events {
-		ctx.Kafka.Seed(evTopic, e[0], evEvent(e[0], e[1], "hi"))
+		ctx.Kafka.Seed(kHEvTopic, e[0], hEvEvent(e[0], e[1], "hi"))
 	}
 }
 
 // evStored is what storeMessage (step 1) returns.
-func evStored(channel, mid, content string) message {
+func hEvStored(channel, mid, content string) message {
 	return message{ID: mid, ChannelID: channel, AuthorID: "7", Content: content}
 }
 
 // evLogs captures what the learner logs.
-type evLogs struct {
+type HEvLogs struct {
 	mu    sync.Mutex
 	lines []string
 }
 
-func (l *evLogs) Write(p []byte) (int, error) {
+func (l *HEvLogs) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.lines = append(l.lines, string(p))
 	return len(p), nil
 }
 
-func (l *evLogs) count() int {
+func (l *HEvLogs) count() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return len(l.lines)
 }
 
 // evCapture tees the log output into an evLogs until restore is called.
-func evCapture() (*evLogs, func()) {
-	logs := &evLogs{}
+func hEvCapture() (*HEvLogs, func()) {
+	logs := &HEvLogs{}
 	previous := log.Writer()
 	log.SetOutput(io.MultiWriter(previous, logs))
 	return logs, func() { log.SetOutput(previous) }
 }
 
-func evRun(ctx *harness.Ctx) { ctx.Drain(func() { run(context.Background()) }) }
+func hEvRun(ctx *harness.Ctx) { ctx.Drain(func() { run(context.Background()) }) }
 
 // evCommit is one commit as the hook saw it: the group, the offsets, and messages per channel then.
-type evCommit struct {
+type HEvCommit struct {
 	group   string
 	offsets map[harness.KafkaTopicPartition]int64
 	counts  map[string]string
 }
 
-func evCopy(offsets harness.KafkaOffsets) map[harness.KafkaTopicPartition]int64 {
+func hEvCopy(offsets harness.KafkaOffsets) map[harness.KafkaTopicPartition]int64 {
 	out := map[harness.KafkaTopicPartition]int64{}
 	for tp, offset := range offsets {
 		out[tp] = offset
@@ -1302,72 +1302,72 @@ func evCopy(offsets harness.KafkaOffsets) map[harness.KafkaTopicPartition]int64 
 }
 
 func CheckKeyedByChannel(ctx *harness.Ctx) {
-	publish(context.Background(), evStored(evChannel, "1561000000000000001", "hi"))
-	publish(context.Background(), evStored(evChannel, "1561000000000000002", "second"))
-	publish(context.Background(), evStored(evOther, "1561000000000000003", "hi"))
+	publish(context.Background(), hEvStored(kHEvChannel, "1561000000000000001", "hi"))
+	publish(context.Background(), hEvStored(kHEvChannel, "1561000000000000002", "second"))
+	publish(context.Background(), hEvStored(kHEvOther, "1561000000000000003", "hi"))
 	ctx.Settle()
-	produced := ctx.Kafka.Records(evTopic)
+	produced := ctx.Kafka.Records(kHEvTopic)
 	ctx.Equal(len(produced), 3, "three stored messages must be three records on message-events (topics: %v)", ctx.Kafka.Topics())
-	ctx.Equal(ctx.Kafka.Keys(evTopic), []string{evChannel, evChannel, evOther}, "records must be keyed by the channel id")
+	ctx.Equal(ctx.Kafka.Keys(kHEvTopic), []string{kHEvChannel, kHEvChannel, kHEvOther}, "records must be keyed by the channel id")
 	ctx.Assert(produced[0].Partition == produced[1].Partition, "two events of one channel must land on the same partition")
 	var got map[string]any
 	err := json.Unmarshal(produced[1].Value, &got)
 	ctx.NoError(err, "the record's value must be the JSON event, got %q", produced[1].Value)
-	for _, field := range [][2]string{{"type", "message.created"}, {"channel_id", evChannel}, {"id", "1561000000000000002"}, {"author_id", "7"}, {"content", "second"}} {
+	for _, field := range [][2]string{{"type", "message.created"}, {"channel_id", kHEvChannel}, {"id", "1561000000000000002"}, {"author_id", "7"}, {"content", "second"}} {
 		ctx.Equal(got[field[0]], field[1], "event.%s (%s)", field[0], produced[1].Value)
 	}
 }
 
 func CheckNonBlocking(ctx *harness.Ctx) {
-	logs, restore := evCapture()
+	logs, restore := hEvCapture()
 	defer restore()
-	publish(context.Background(), evStored(evChannel, "1561000000000000001", "hi"))
+	publish(context.Background(), hEvStored(kHEvChannel, "1561000000000000001", "hi"))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(evTopic)), 1, "the event must be handed to the producer: records on message-events")
+	ctx.Equal(len(ctx.Kafka.Records(kHEvTopic)), 1, "the event must be handed to the producer: records on message-events")
 	ctx.Kafka.Stall("") // the brokers stop acknowledging, as a partitioned or overloaded cluster does
 	started := ctx.Clock.Now()
-	publish(context.Background(), evStored(evChannel, "1561000000000000002", "hi"))
-	publish(context.Background(), evStored(evChannel, "1561000000000000003", "hi"))
+	publish(context.Background(), hEvStored(kHEvChannel, "1561000000000000002", "hi"))
+	publish(context.Background(), hEvStored(kHEvChannel, "1561000000000000003", "hi"))
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(waited < 0.1, "with the broker not acknowledging, two publish calls took %.1f s: publish waits for the broker (a synchronous write on the request path), so every POST would hang with it", waited)
 	ctx.Kafka.Resume("")
-	ctx.Kafka.FailNext(evTopic, 1)
-	publish(context.Background(), evStored(evChannel, "1561000000000000004", "hi"))
-	publish(context.Background(), evStored(evChannel, "1561000000000000005", "hi"))
+	ctx.Kafka.FailNext(kHEvTopic, 1)
+	publish(context.Background(), hEvStored(kHEvChannel, "1561000000000000004", "hi"))
+	publish(context.Background(), hEvStored(kHEvChannel, "1561000000000000005", "hi"))
 	ctx.Settle()
 	ctx.Assert(logs.count() > 0, "the broker failed to deliver a record and nothing was logged: publish must report delivery failures (the writer's Completion)")
 }
 
 func CheckConsumerGroup(ctx *harness.Ctx) {
-	evSeed(ctx, [2]string{evChannel, "1561000000000000001"}, [2]string{evOther, "1561000000000000002"}, [2]string{evChannel, "1561000000000000003"})
-	records := ctx.Kafka.Records(evTopic)
+	hEvSeed(ctx, [2]string{kHEvChannel, "1561000000000000001"}, [2]string{kHEvOther, "1561000000000000002"}, [2]string{kHEvChannel, "1561000000000000003"})
+	records := ctx.Kafka.Records(kHEvTopic)
 	var mu sync.Mutex
-	commits := []evCommit{}
+	commits := []HEvCommit{}
 	ctx.Kafka.OnCommit(func(group string, offsets harness.KafkaOffsets) {
 		counts := map[string]string{}
-		for _, c := range []string{evChannel, evOther} {
+		for _, c := range []string{kHEvChannel, kHEvOther} {
 			count, _ := ctx.Redis.HGet("channel:"+c, "messages")
 			counts[c] = count
 		}
 		mu.Lock()
-		commits = append(commits, evCommit{group, evCopy(offsets), counts})
+		commits = append(commits, HEvCommit{group, hEvCopy(offsets), counts})
 		mu.Unlock()
 	})
-	evRun(ctx)
+	hEvRun(ctx)
 	mu.Lock()
-	seenCommits := append([]evCommit{}, commits...)
+	seenCommits := append([]HEvCommit{}, commits...)
 	mu.Unlock()
 	ctx.Assert(len(seenCommits) > 0, "no offset was ever committed: the consumer must commit what it processed")
 	groups := map[string]bool{}
 	for _, c := range seenCommits {
 		groups[c.group] = true
 	}
-	ctx.Equal(groups, map[string]bool{evGroup: true}, "offsets must be committed for group channel-state only: groups")
+	ctx.Equal(groups, map[string]bool{kHEvGroup: true}, "offsets must be committed for group channel-state only: groups")
 	seen := map[string]int{}
 	for _, record := range records {
 		channel := string(record.Key)
 		seen[channel]++
-		tp := harness.KafkaTopicPartition{Topic: evTopic, Partition: record.Partition}
+		tp := harness.KafkaTopicPartition{Topic: kHEvTopic, Partition: record.Partition}
 		var state map[string]string
 		for _, c := range seenCommits {
 			if offset, ok := c.offsets[tp]; ok && offset > record.Offset {
@@ -1386,50 +1386,50 @@ func CheckConsumerGroup(ctx *harness.Ctx) {
 		ctx.Clock.Advance(6)
 		return nil
 	})
-	evSeed(ctx, [2]string{broken, "1561000000000000009"})
-	all := ctx.Kafka.Records(evTopic)
+	hEvSeed(ctx, [2]string{broken, "1561000000000000009"})
+	all := ctx.Kafka.Records(kHEvTopic)
 	record := all[len(all)-1]
-	evRun(ctx) // the worker fails on the write; a restart would redeliver the record
-	committed, ok := ctx.Kafka.Committed(evGroup, evTopic, record.Partition)
+	hEvRun(ctx) // the worker fails on the write; a restart would redeliver the record
+	committed, ok := ctx.Kafka.Committed(kHEvGroup, kHEvTopic, record.Partition)
 	ctx.Assert(!ok || committed <= record.Offset, "the write for channel:%s took 6 s and then failed, yet its record (partition %d offset %d) was committed: offsets were committed while the record was still being processed (auto-commit on a timer), so the event is lost", broken, record.Partition, record.Offset)
 }
 
 func CheckChannelState(ctx *harness.Ctx) {
-	evSeed(ctx, [2]string{evChannel, "1561000000000000001"}, [2]string{evOther, "1561000000000000002"}, [2]string{evChannel, "1561000000000000003"}, [2]string{evChannel, "1561000000000000005"})
-	evRun(ctx)
-	key := "channel:" + evChannel
+	hEvSeed(ctx, [2]string{kHEvChannel, "1561000000000000001"}, [2]string{kHEvOther, "1561000000000000002"}, [2]string{kHEvChannel, "1561000000000000003"}, [2]string{kHEvChannel, "1561000000000000005"})
+	hEvRun(ctx)
+	key := "channel:" + kHEvChannel
 	ctx.Equal(ctx.Redis.Type(key), "hash", "%s must be a hash (keys: %v)", key, ctx.Redis.Keys("*"))
 	state := ctx.Redis.HGetAll(key)
 	ctx.Equal(state["last_message_id"], "1561000000000000005", "%s.last_message_id must be the newest id", key)
 	ctx.Equal(state["messages"], "3", "%s.messages after three events", key)
-	other := ctx.Redis.HGetAll("channel:" + evOther)
-	ctx.Assert(other["last_message_id"] == "1561000000000000002" && other["messages"] == "1", "channel:%s must track its own single event, got %v", evOther, other)
+	other := ctx.Redis.HGetAll("channel:" + kHEvOther)
+	ctx.Assert(other["last_message_id"] == "1561000000000000002" && other["messages"] == "1", "channel:%s must track its own single event, got %v", kHEvOther, other)
 }
 
 func CheckCommitAfter(ctx *harness.Ctx) {
-	evSeed(ctx, [2]string{evChannel, "1561000000000000001"})
-	ctx.Kafka.Seed(evTopic, "bad", "not json")
-	ctx.Kafka.Seed(evTopic, "bad", \`{"type":"channel.renamed","channel_id":"\`+evOther+\`"}\`)
-	ctx.Kafka.Seed(evTopic, "bad", \`{"type":"message.created","content":"no ids"}\`)
-	record := ctx.Kafka.Records(evTopic)[0]
-	key := "channel:" + evChannel
+	hEvSeed(ctx, [2]string{kHEvChannel, "1561000000000000001"})
+	ctx.Kafka.Seed(kHEvTopic, "bad", "not json")
+	ctx.Kafka.Seed(kHEvTopic, "bad", \`{"type":"channel.renamed","channel_id":"\`+kHEvOther+\`"}\`)
+	ctx.Kafka.Seed(kHEvTopic, "bad", \`{"type":"message.created","content":"no ids"}\`)
+	record := ctx.Kafka.Records(kHEvTopic)[0]
+	key := "channel:" + kHEvChannel
 	var mu sync.Mutex
-	atCommit := []evCommit{}
+	atCommit := []HEvCommit{}
 	ctx.Kafka.OnCommit(func(group string, offsets harness.KafkaOffsets) {
 		count, ok := ctx.Redis.HGet(key, "messages")
 		if !ok {
 			count = "(nil)"
 		}
 		mu.Lock()
-		atCommit = append(atCommit, evCommit{group, evCopy(offsets), map[string]string{key: count}})
+		atCommit = append(atCommit, HEvCommit{group, hEvCopy(offsets), map[string]string{key: count}})
 		mu.Unlock()
 	})
-	evRun(ctx)
+	hEvRun(ctx)
 	mu.Lock()
-	seenCommits := append([]evCommit{}, atCommit...)
+	seenCommits := append([]HEvCommit{}, atCommit...)
 	mu.Unlock()
 	ctx.Assert(len(seenCommits) > 0, "no offset was ever committed")
-	tp := harness.KafkaTopicPartition{Topic: evTopic, Partition: record.Partition}
+	tp := harness.KafkaTopicPartition{Topic: kHEvTopic, Partition: record.Partition}
 	covering := []string{}
 	for _, c := range seenCommits {
 		if c.offsets[tp] > record.Offset {
@@ -1438,7 +1438,7 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 	}
 	ctx.Assert(len(covering) > 0, "the message.created record was never committed")
 	ctx.Equal(covering[0], "1", "the commit must come after HINCRBY: messages the channel counted when the record was committed")
-	ctx.Equal(ctx.Kafka.Lag(evGroup, evTopic), 0, "malformed records must be skipped and committed, not left to replay forever: lag")
+	ctx.Equal(ctx.Kafka.Lag(kHEvGroup, kHEvTopic), 0, "malformed records must be skipped and committed, not left to replay forever: lag")
 	ctx.Equal(ctx.Redis.Keys("channel:*"), []string{key}, "malformed records must not touch Redis")
 	messages, _ := ctx.Redis.HGet(key, "messages")
 	ctx.Equal(messages, "1", "only the well-formed event counts: %s.messages", key)
@@ -1458,31 +1458,31 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string evTopic = "message-events";
-const std::string evChannel = "1032000000000000001";
-const std::string evOther = "1032000000000000002";
-const std::string evGroup = "channel-state";
+const std::string kHEvTopic = "message-events";
+const std::string kHEvChannel = "1032000000000000001";
+const std::string kHEvOther = "1032000000000000002";
+const std::string kHEvGroup = "channel-state";
 
-std::string evEvent(const std::string& channel, const std::string& mid, const std::string& content) {
+std::string hEvEvent(const std::string& channel, const std::string& mid, const std::string& content) {
   return nlohmann::json{{"type", "message.created"}, {"channel_id", channel}, {"id", mid}, {"author_id", "7"}, {"content", content}}.dump();
 }
 
 // evSeed produces [channel, message id] events, in order.
-void evSeed(harness::Ctx& ctx, const std::vector<std::pair<std::string, std::string>>& events) {
-  for (const auto& [channel, mid] : events) ctx.Kafka.Seed(evTopic, channel, evEvent(channel, mid, "hi"));
+void hEvSeed(harness::Ctx& ctx, const std::vector<std::pair<std::string, std::string>>& events) {
+  for (const auto& [channel, mid] : events) ctx.Kafka.Seed(kHEvTopic, channel, hEvEvent(channel, mid, "hi"));
 }
 
 // evStored is what store_message (step 1) returns.
-StoredMessage evStored(const std::string& channel, const std::string& mid, const std::string& content) {
+StoredMessage hEvStored(const std::string& channel, const std::string& mid, const std::string& content) {
   return StoredMessage{mid, channel, "7", content, 0};
 }
 
 // evLogs tees what the learner writes to std::cerr (Go: the log package's output) until it is
 // destroyed, which restores the previous buffer.
-class evLogs : public std::streambuf {
+class HEvLogs : public std::streambuf {
  public:
-  evLogs() : previous_(std::cerr.rdbuf(this)) {}
-  ~evLogs() override { std::cerr.rdbuf(previous_); }
+  HEvLogs() : previous_(std::cerr.rdbuf(this)) {}
+  ~HEvLogs() override { std::cerr.rdbuf(previous_); }
   // The lines written so far (a trailing unterminated one counts).
   int count() {
     std::lock_guard<std::mutex> lock(mu_);
@@ -1518,7 +1518,7 @@ class evLogs : public std::streambuf {
 
 // evRun drains the learner's consume loop; Go's run returns its error, the C++ one throws it
 // (redis++ on a failed write), which ends the loop the same way.
-void evRun(harness::Ctx& ctx) {
+void hEvRun(harness::Ctx& ctx) {
   try {
     ctx.Drain([] { run(); });
   } catch (const std::exception&) {
@@ -1526,7 +1526,7 @@ void evRun(harness::Ctx& ctx) {
 }
 
 // evCommit is one commit as the hook saw it: the group, the offsets, and messages per channel then.
-struct evCommit {
+struct HEvCommit {
   std::string group;
   harness::KafkaOffsets offsets;
   std::map<std::string, std::string> counts;
@@ -1535,19 +1535,19 @@ struct evCommit {
 }  // namespace
 
 void CheckKeyedByChannel(harness::Ctx& ctx) {
-  publish(evStored(evChannel, "1561000000000000001", "hi"));
-  publish(evStored(evChannel, "1561000000000000002", "second"));
-  publish(evStored(evOther, "1561000000000000003", "hi"));
+  publish(hEvStored(kHEvChannel, "1561000000000000001", "hi"));
+  publish(hEvStored(kHEvChannel, "1561000000000000002", "second"));
+  publish(hEvStored(kHEvOther, "1561000000000000003", "hi"));
   ctx.Settle();
-  const auto produced = ctx.Kafka.Records(evTopic);
+  const auto produced = ctx.Kafka.Records(kHEvTopic);
   ctx.Equal(produced.size(), 3, "three stored messages must be three records on message-events (topics: %v)", ctx.Kafka.Topics());
-  ctx.Equal(ctx.Kafka.Keys(evTopic), {evChannel, evChannel, evOther}, "records must be keyed by the channel id");
+  ctx.Equal(ctx.Kafka.Keys(kHEvTopic), {kHEvChannel, kHEvChannel, kHEvOther}, "records must be keyed by the channel id");
   ctx.Assert(produced[0].Partition == produced[1].Partition, "two events of one channel must land on the same partition");
   const std::string value = produced[1].Value.value_or("");
   const auto got = nlohmann::json::parse(value, nullptr, false);
   ctx.Assert(!got.is_discarded() && got.is_object(), "the record's value must be the JSON event, got %q", value);
   for (const auto& [field, want] : std::vector<std::pair<std::string, std::string>>{
-           {"type", "message.created"}, {"channel_id", evChannel}, {"id", "1561000000000000002"}, {"author_id", "7"}, {"content", "second"}}) {
+           {"type", "message.created"}, {"channel_id", kHEvChannel}, {"id", "1561000000000000002"}, {"author_id", "7"}, {"content", "second"}}) {
     // Go compares the decoded any with the string: a missing or non-string field differs.
     const auto it = got.find(field);
     const std::string text = it == got.end() ? "<nil>" : it->is_string() ? it->get<std::string>() : it->dump();
@@ -1556,37 +1556,37 @@ void CheckKeyedByChannel(harness::Ctx& ctx) {
 }
 
 void CheckNonBlocking(harness::Ctx& ctx) {
-  evLogs logs;
-  publish(evStored(evChannel, "1561000000000000001", "hi"));
+  HEvLogs logs;
+  publish(hEvStored(kHEvChannel, "1561000000000000001", "hi"));
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(evTopic).size(), 1, "the event must be handed to the producer: records on message-events");
+  ctx.Equal(ctx.Kafka.Records(kHEvTopic).size(), 1, "the event must be handed to the producer: records on message-events");
   ctx.Kafka.Stall("");  // the brokers stop acknowledging, as a partitioned or overloaded cluster does
   const int64_t started = ctx.Clock.Now();
-  publish(evStored(evChannel, "1561000000000000002", "hi"));
-  publish(evStored(evChannel, "1561000000000000003", "hi"));
+  publish(hEvStored(kHEvChannel, "1561000000000000002", "hi"));
+  publish(hEvStored(kHEvChannel, "1561000000000000003", "hi"));
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(waited < 0.1, "with the broker not acknowledging, two publish calls took %.1f s: publish waits for the broker (a synchronous write on the request path), so every POST would hang with it", waited);
   ctx.Kafka.Resume("");
-  ctx.Kafka.FailNext(evTopic, 1);
-  publish(evStored(evChannel, "1561000000000000004", "hi"));
-  publish(evStored(evChannel, "1561000000000000005", "hi"));
+  ctx.Kafka.FailNext(kHEvTopic, 1);
+  publish(hEvStored(kHEvChannel, "1561000000000000004", "hi"));
+  publish(hEvStored(kHEvChannel, "1561000000000000005", "hi"));
   ctx.Settle();
   ctx.Assert(logs.count() > 0, "the broker failed to deliver a record and nothing was logged: publish must report delivery failures (the producer's delivery report callback)");
 }
 
 void CheckConsumerGroup(harness::Ctx& ctx) {
-  evSeed(ctx, {{evChannel, "1561000000000000001"}, {evOther, "1561000000000000002"}, {evChannel, "1561000000000000003"}});
-  const auto records = ctx.Kafka.Records(evTopic);
+  hEvSeed(ctx, {{kHEvChannel, "1561000000000000001"}, {kHEvOther, "1561000000000000002"}, {kHEvChannel, "1561000000000000003"}});
+  const auto records = ctx.Kafka.Records(kHEvTopic);
   std::mutex mu;
-  std::vector<evCommit> commits;
+  std::vector<HEvCommit> commits;
   ctx.Kafka.OnCommit([&](const std::string& group, const harness::KafkaOffsets& offsets) {
     std::map<std::string, std::string> counts;
-    for (const auto& c : {evChannel, evOther}) counts[c] = ctx.Redis.HGet("channel:" + c, "messages").value_or("");
+    for (const auto& c : {kHEvChannel, kHEvOther}) counts[c] = ctx.Redis.HGet("channel:" + c, "messages").value_or("");
     std::lock_guard<std::mutex> lock(mu);
     commits.push_back({group, offsets, counts});
   });
-  evRun(ctx);
-  std::vector<evCommit> seenCommits;
+  hEvRun(ctx);
+  std::vector<HEvCommit> seenCommits;
   {
     std::lock_guard<std::mutex> lock(mu);
     seenCommits = commits;
@@ -1594,12 +1594,12 @@ void CheckConsumerGroup(harness::Ctx& ctx) {
   ctx.Assert(!seenCommits.empty(), "no offset was ever committed: the consumer must commit what it processed");
   std::map<std::string, bool> groups;
   for (const auto& c : seenCommits) groups[c.group] = true;
-  ctx.Equal(groups, std::map<std::string, bool>{{evGroup, true}}, "offsets must be committed for group channel-state only: groups");
+  ctx.Equal(groups, std::map<std::string, bool>{{kHEvGroup, true}}, "offsets must be committed for group channel-state only: groups");
   std::map<std::string, int> seen;
   for (const auto& record : records) {
     const std::string channel = record.Key.value_or("");
     seen[channel]++;
-    const harness::KafkaTopicPartition tp{evTopic, record.Partition};
+    const harness::KafkaTopicPartition tp{kHEvTopic, record.Partition};
     const std::map<std::string, std::string>* state = nullptr;
     for (const auto& c : seenCommits) {
       const auto it = c.offsets.find(tp);
@@ -1624,48 +1624,48 @@ void CheckConsumerGroup(harness::Ctx& ctx) {
   const std::string broken = "1032000000000000009";
   ctx.Redis.Set("channel:" + broken, "not a hash");  // a corrupted key: HSET/HINCRBY fail with WRONGTYPE
   ctx.Redis.After("channel:" + broken, [&] { ctx.Clock.Advance(6); });
-  evSeed(ctx, {{broken, "1561000000000000009"}});
-  const auto all = ctx.Kafka.Records(evTopic);
+  hEvSeed(ctx, {{broken, "1561000000000000009"}});
+  const auto all = ctx.Kafka.Records(kHEvTopic);
   const auto record = all.back();
-  evRun(ctx);  // the worker fails on the write; a restart would redeliver the record
-  const auto committed = ctx.Kafka.Committed(evGroup, evTopic, record.Partition);
+  hEvRun(ctx);  // the worker fails on the write; a restart would redeliver the record
+  const auto committed = ctx.Kafka.Committed(kHEvGroup, kHEvTopic, record.Partition);
   ctx.Assert(!committed || *committed <= record.Offset, "the write for channel:%s took 6 s and then failed, yet its record (partition %d offset %d) was committed: offsets were committed while the record was still being processed (auto-commit on a timer), so the event is lost", broken, record.Partition, record.Offset);
 }
 
 void CheckChannelState(harness::Ctx& ctx) {
-  evSeed(ctx, {{evChannel, "1561000000000000001"}, {evOther, "1561000000000000002"}, {evChannel, "1561000000000000003"}, {evChannel, "1561000000000000005"}});
-  evRun(ctx);
-  const std::string key = "channel:" + evChannel;
+  hEvSeed(ctx, {{kHEvChannel, "1561000000000000001"}, {kHEvOther, "1561000000000000002"}, {kHEvChannel, "1561000000000000003"}, {kHEvChannel, "1561000000000000005"}});
+  hEvRun(ctx);
+  const std::string key = "channel:" + kHEvChannel;
   ctx.Equal(ctx.Redis.Type(key), "hash", "%s must be a hash (keys: %v)", key, ctx.Redis.Keys("*"));
   auto state = ctx.Redis.HGetAll(key);
   ctx.Equal(state["last_message_id"], "1561000000000000005", "%s.last_message_id must be the newest id", key);
   ctx.Equal(state["messages"], "3", "%s.messages after three events", key);
-  auto other = ctx.Redis.HGetAll("channel:" + evOther);
-  ctx.Assert(other["last_message_id"] == "1561000000000000002" && other["messages"] == "1", "channel:%s must track its own single event, got %v", evOther, other);
+  auto other = ctx.Redis.HGetAll("channel:" + kHEvOther);
+  ctx.Assert(other["last_message_id"] == "1561000000000000002" && other["messages"] == "1", "channel:%s must track its own single event, got %v", kHEvOther, other);
 }
 
 void CheckCommitAfter(harness::Ctx& ctx) {
-  evSeed(ctx, {{evChannel, "1561000000000000001"}});
-  ctx.Kafka.Seed(evTopic, "bad", "not json");
-  ctx.Kafka.Seed(evTopic, "bad", R"({"type":"channel.renamed","channel_id":")" + evOther + R"("})");
-  ctx.Kafka.Seed(evTopic, "bad", R"({"type":"message.created","content":"no ids"})");
-  const auto record = ctx.Kafka.Records(evTopic)[0];
-  const std::string key = "channel:" + evChannel;
+  hEvSeed(ctx, {{kHEvChannel, "1561000000000000001"}});
+  ctx.Kafka.Seed(kHEvTopic, "bad", "not json");
+  ctx.Kafka.Seed(kHEvTopic, "bad", R"({"type":"channel.renamed","channel_id":")" + kHEvOther + R"("})");
+  ctx.Kafka.Seed(kHEvTopic, "bad", R"({"type":"message.created","content":"no ids"})");
+  const auto record = ctx.Kafka.Records(kHEvTopic)[0];
+  const std::string key = "channel:" + kHEvChannel;
   std::mutex mu;
-  std::vector<evCommit> atCommit;
+  std::vector<HEvCommit> atCommit;
   ctx.Kafka.OnCommit([&](const std::string& group, const harness::KafkaOffsets& offsets) {
     const std::string count = ctx.Redis.HGet(key, "messages").value_or("(nil)");
     std::lock_guard<std::mutex> lock(mu);
     atCommit.push_back({group, offsets, {{key, count}}});
   });
-  evRun(ctx);
-  std::vector<evCommit> seenCommits;
+  hEvRun(ctx);
+  std::vector<HEvCommit> seenCommits;
   {
     std::lock_guard<std::mutex> lock(mu);
     seenCommits = atCommit;
   }
   ctx.Assert(!seenCommits.empty(), "no offset was ever committed");
-  const harness::KafkaTopicPartition tp{evTopic, record.Partition};
+  const harness::KafkaTopicPartition tp{kHEvTopic, record.Partition};
   std::vector<std::string> covering;
   for (const auto& c : seenCommits) {
     const auto it = c.offsets.find(tp);
@@ -1673,7 +1673,7 @@ void CheckCommitAfter(harness::Ctx& ctx) {
   }
   ctx.Assert(!covering.empty(), "the message.created record was never committed");
   ctx.Equal(covering[0], "1", "the commit must come after HINCRBY: messages the channel counted when the record was committed");
-  ctx.Equal(ctx.Kafka.Lag(evGroup, evTopic), 0, "malformed records must be skipped and committed, not left to replay forever: lag");
+  ctx.Equal(ctx.Kafka.Lag(kHEvGroup, kHEvTopic), 0, "malformed records must be skipped and committed, not left to replay forever: lag");
   ctx.Equal(ctx.Redis.Keys("channel:*"), {key}, "malformed records must not touch Redis");
   const std::string messages = ctx.Redis.HGet(key, "messages").value_or("");
   ctx.Equal(messages, "1", "only the well-formed event counts: %s.messages", key);

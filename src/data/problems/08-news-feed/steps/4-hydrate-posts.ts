@@ -856,19 +856,19 @@ import (
 	pb "feed/gen/post"
 )
 
-func samplePost(id string) Post {
+func hSamplePost(id string) Post {
 	return Post{ID: id, Author: "ann", Text: "post " + id, MediaIDs: []string{"m-" + id}, CreatedAt: 1700000000000 + int64(id[0])}
 }
 
 // postPeer is the post service: knows its posts, records the ids of every request; onCall runs as a request arrives.
-type postPeer struct {
+type HPostPeer struct {
 	pb.UnimplementedPostServiceServer
 	known  map[string]bool
 	calls  [][]string
 	onCall func()
 }
 
-func (p *postPeer) GetPosts(_ context.Context, req *pb.GetPostsRequest) (*pb.GetPostsReply, error) {
+func (p *HPostPeer) GetPosts(_ context.Context, req *pb.GetPostsRequest) (*pb.GetPostsReply, error) {
 	ids := append([]string{}, req.GetIds()...)
 	p.calls = append(p.calls, ids)
 	if p.onCall != nil {
@@ -877,15 +877,15 @@ func (p *postPeer) GetPosts(_ context.Context, req *pb.GetPostsRequest) (*pb.Get
 	reply := &pb.GetPostsReply{}
 	for _, id := range ids {
 		if p.known[id] {
-			s := samplePost(id)
+			s := hSamplePost(id)
 			reply.Posts = append(reply.Posts, &pb.Post{Id: s.ID, Author: s.Author, Text: s.Text, MediaIds: s.MediaIDs, CreatedAt: s.CreatedAt})
 		}
 	}
 	return reply, nil
 }
 
-func servePosts(ctx *harness.Ctx, served ...string) *postPeer {
-	peer := &postPeer{known: map[string]bool{}}
+func hServePosts(ctx *harness.Ctx, served ...string) *HPostPeer {
+	peer := &HPostPeer{known: map[string]bool{}}
 	for _, id := range served {
 		peer.known[id] = true
 	}
@@ -893,14 +893,14 @@ func servePosts(ctx *harness.Ctx, served ...string) *postPeer {
 	return peer
 }
 
-func cacheIDs(ctx *harness.Ctx, ids ...string) {
+func hCacheIDs(ctx *harness.Ctx, ids ...string) {
 	for _, id := range ids {
-		doc, _ := json.Marshal(samplePost(id))
+		doc, _ := json.Marshal(hSamplePost(id))
 		ctx.Redis.Set("post:"+id, string(doc))
 	}
 }
 
-func hydrateIDs(ctx *harness.Ctx, ids ...string) []Post {
+func hHydrateIDs(ctx *harness.Ctx, ids ...string) []Post {
 	posts, err := Hydrate(context.Background(), append([]string{}, ids...))
 	ctx.NoError(err, "Hydrate(%q) returned an error", ids)
 	return posts
@@ -909,16 +909,16 @@ func hydrateIDs(ctx *harness.Ctx, ids ...string) []Post {
 func CheckMgetFirst(ctx *harness.Ctx) {
 	var tripsAtRPC [][]string
 	rpcSeen := false
-	peer := servePosts(ctx, "a", "b")
+	peer := hServePosts(ctx, "a", "b")
 	peer.onCall = func() {
 		if !rpcSeen {
 			rpcSeen = true
 			tripsAtRPC = ctx.Redis.RoundTrips()
 		}
 	}
-	cacheIDs(ctx, "a")
-	posts := hydrateIDs(ctx, "a", "b")
-	ctx.Equal(posts, []Post{samplePost("a"), samplePost("b")}, "Hydrate must return the cached post a and the fetched post b")
+	hCacheIDs(ctx, "a")
+	posts := hHydrateIDs(ctx, "a", "b")
+	ctx.Equal(posts, []Post{hSamplePost("a"), hSamplePost("b")}, "Hydrate must return the cached post a and the fetched post b")
 	ctx.Equal(peer.calls, [][]string{{"b"}}, "the cached post a must not be requested from the post service: GetPosts requests")
 	mget := false
 	for _, trip := range tripsAtRPC {
@@ -937,14 +937,14 @@ func CheckMgetFirst(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Assert(gets == 0, "read the cache with one MGet, not %d GETs", gets)
-	posts = hydrateIDs(ctx, "a")
-	ctx.Assert(reflect.DeepEqual(posts, []Post{samplePost("a")}) && len(peer.calls) == 1, "when every id is cached GetPosts must not be called at all")
+	posts = hHydrateIDs(ctx, "a")
+	ctx.Assert(reflect.DeepEqual(posts, []Post{hSamplePost("a")}) && len(peer.calls) == 1, "when every id is cached GetPosts must not be called at all")
 }
 
 func CheckSingleRpc(ctx *harness.Ctx) {
-	servePosts(ctx, "b", "c", "d")
-	posts := hydrateIDs(ctx, "b", "c", "d")
-	ctx.Equal(posts, []Post{samplePost("b"), samplePost("c"), samplePost("d")}, "unexpected posts")
+	hServePosts(ctx, "b", "c", "d")
+	posts := hHydrateIDs(ctx, "b", "c", "d")
+	ctx.Equal(posts, []Post{hSamplePost("b"), hSamplePost("c"), hSamplePost("d")}, "unexpected posts")
 	calls := ctx.GRPC.CallsTo("GetPosts", "")
 	ctx.Equal(len(calls), 1, "3 cache misses must be fetched with one GetPosts call")
 	req, _ := calls[0].Request.(*pb.GetPostsRequest)
@@ -952,8 +952,8 @@ func CheckSingleRpc(ctx *harness.Ctx) {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	servePosts(ctx, "b", "c")
-	ctx.Equal(hydrateIDs(ctx, "b"), []Post{samplePost("b")}, "Hydrate([b])")
+	hServePosts(ctx, "b", "c")
+	ctx.Equal(hHydrateIDs(ctx, "b"), []Post{hSamplePost("b")}, "Hydrate([b])")
 	calls := ctx.GRPC.CallsTo("GetPosts", "")
 	call := calls[len(calls)-1]
 	ctx.Assert(call.HasDeadline(), "the RPC carries no deadline")
@@ -965,13 +965,13 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckWriteBack(ctx *harness.Ctx) {
-	peer := servePosts(ctx, "b", "c")
-	hydrateIDs(ctx, "b", "c")
+	peer := hServePosts(ctx, "b", "c")
+	hHydrateIDs(ctx, "b", "c")
 	for _, id := range []string{"b", "c"} {
 		raw, ok := ctx.Redis.Get("post:" + id)
 		ctx.Assert(ok, "post:%s must be cached after it was fetched", id)
 		var cached, want map[string]any
-		doc, _ := json.Marshal(samplePost(id))
+		doc, _ := json.Marshal(hSamplePost(id))
 		json.Unmarshal(doc, &want)
 		ctx.NoError(json.Unmarshal([]byte(raw), &cached), "post:%s must hold the post as JSON, got %q", id, raw)
 		ctx.Equal(cached, want, "post:%s must hold the post as JSON", id)
@@ -989,7 +989,7 @@ func CheckWriteBack(ctx *harness.Ctx) {
 	}
 	ctx.Assert(sets == 0, "%d SET(s) were sent one by one: write the fetched posts back through one pipeline", sets)
 	ctx.Equal(sizes, []int{2}, "expected one pipeline carrying the 2 SETs: pipeline command counts")
-	hydrateIDs(ctx, "b", "c")
+	hHydrateIDs(ctx, "b", "c")
 	ctx.Equal(len(peer.calls), 1, "once written back, the next hydration of the same ids must not call GetPosts")
 	ctx.Clock.Advance(3601)
 	_, cached := ctx.Redis.Get("post:b")
@@ -997,15 +997,15 @@ func CheckWriteBack(ctx *harness.Ctx) {
 }
 
 func CheckOrderKept(ctx *harness.Ctx) {
-	peer := servePosts(ctx, "b")
-	cacheIDs(ctx, "a", "c")
+	peer := hServePosts(ctx, "b")
+	hCacheIDs(ctx, "a", "c")
 	var ids []string
-	for _, p := range hydrateIDs(ctx, "d", "c", "b", "a") {
+	for _, p := range hHydrateIDs(ctx, "d", "c", "b", "a") {
 		ids = append(ids, p.ID)
 	}
 	ctx.Equal(ids, []string{"c", "b", "a"}, "posts must come back in the input order with the deleted post d skipped")
-	ctx.Assert(len(hydrateIDs(ctx, "d")) == 0, "a page of only deleted posts is an empty list, not an error")
-	ctx.Assert(len(hydrateIDs(ctx)) == 0 && len(peer.calls) == 2, "an empty id list must not call the post service")
+	ctx.Assert(len(hHydrateIDs(ctx, "d")) == 0, "a page of only deleted posts is an empty list, not an error")
+	ctx.Assert(len(hHydrateIDs(ctx)) == 0 && len(peer.calls) == 2, "an empty id list must not call the post service")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1021,32 +1021,32 @@ func CheckOrderKept(ctx *harness.Ctx) {
 namespace {
 
 // A post as the checks compare it: id, author, text, media ids, created_at.
-using postView = std::tuple<std::string, std::string, std::string, std::vector<std::string>, int64_t>;
+using HPostView = std::tuple<std::string, std::string, std::string, std::vector<std::string>, int64_t>;
 
-postView samplePost(const std::string& id) {
+HPostView hSamplePost(const std::string& id) {
   return {id, "ann", "post " + id, {"m-" + id}, 1700000000000 + static_cast<int64_t>(id[0])};
 }
 
-nlohmann::json sampleJSON(const std::string& id) {
-  const auto [pid, author, text, media, createdAt] = samplePost(id);
+nlohmann::json hSampleJSON(const std::string& id) {
+  const auto [pid, author, text, media, createdAt] = hSamplePost(id);
   return {{"id", pid}, {"author", author}, {"text", text}, {"media_ids", media}, {"created_at", createdAt}};
 }
 
-std::vector<postView> views(const std::vector<feed::Post>& posts) {
-  std::vector<postView> out;
+std::vector<HPostView> hViews(const std::vector<feed::Post>& posts) {
+  std::vector<HPostView> out;
   for (const auto& p : posts)
     out.emplace_back(p.id(), p.author(), p.text(), std::vector<std::string>(p.media_ids().begin(), p.media_ids().end()), p.created_at());
   return out;
 }
 
-std::vector<postView> samples(const std::vector<std::string>& ids) {
-  std::vector<postView> out;
-  for (const auto& id : ids) out.push_back(samplePost(id));
+std::vector<HPostView> hSamples(const std::vector<std::string>& ids) {
+  std::vector<HPostView> out;
+  for (const auto& id : ids) out.push_back(hSamplePost(id));
   return out;
 }
 
 // PostPeer is the post service: knows its posts, records the ids of every request; onCall runs as a request arrives.
-class PostPeer final : public feed::PostService::Service {
+class HPostPeer final : public feed::PostService::Service {
  public:
   std::set<std::string> known;
   std::vector<std::vector<std::string>> calls;
@@ -1058,7 +1058,7 @@ class PostPeer final : public feed::PostService::Service {
     if (onCall) onCall();
     for (const auto& id : ids) {
       if (!known.count(id)) continue;
-      const auto [pid, author, text, media, createdAt] = samplePost(id);
+      const auto [pid, author, text, media, createdAt] = hSamplePost(id);
       feed::Post* post = reply->add_posts();
       post->set_id(pid);
       post->set_author(author);
@@ -1070,21 +1070,21 @@ class PostPeer final : public feed::PostService::Service {
   }
 };
 
-PostPeer* servePosts(harness::Ctx& ctx, const std::vector<std::string>& served) {
-  auto* peer = new PostPeer();
+HPostPeer* hServePosts(harness::Ctx& ctx, const std::vector<std::string>& served) {
+  auto* peer = new HPostPeer();
   peer->known.insert(served.begin(), served.end());
   ctx.GRPC.Server("")->RegisterService(peer);
   return peer;
 }
 
-void cacheIDs(harness::Ctx& ctx, const std::vector<std::string>& ids) {
-  for (const auto& id : ids) ctx.Redis.Set("post:" + id, sampleJSON(id).dump());
+void hCacheIDs(harness::Ctx& ctx, const std::vector<std::string>& ids) {
+  for (const auto& id : ids) ctx.Redis.Set("post:" + id, hSampleJSON(id).dump());
 }
 
 // hydrateIDs is the learner's hydrate; what it throws fails the check (Go's ctx.NoError on the error).
-std::vector<postView> hydrateIDs(harness::Ctx& ctx, const std::vector<std::string>& ids) {
+std::vector<HPostView> hHydrateIDs(harness::Ctx& ctx, const std::vector<std::string>& ids) {
   try {
-    return views(hydrate(ids));
+    return hViews(hydrate(ids));
   } catch (const std::exception& e) {
     ctx.Fatalf("hydrate(%q) threw: %s", ids, e.what());
   }
@@ -1095,16 +1095,16 @@ std::vector<postView> hydrateIDs(harness::Ctx& ctx, const std::vector<std::strin
 void CheckMgetFirst(harness::Ctx& ctx) {
   std::vector<std::vector<std::string>> tripsAtRPC;
   bool rpcSeen = false;
-  auto* peer = servePosts(ctx, {"a", "b"});
+  auto* peer = hServePosts(ctx, {"a", "b"});
   peer->onCall = [&] {
     if (!rpcSeen) {
       rpcSeen = true;
       tripsAtRPC = ctx.Redis.RoundTrips();
     }
   };
-  cacheIDs(ctx, {"a"});
-  auto posts = hydrateIDs(ctx, {"a", "b"});
-  ctx.Equal(posts, samples({"a", "b"}), "hydrate must return the cached post a and the fetched post b");
+  hCacheIDs(ctx, {"a"});
+  auto posts = hHydrateIDs(ctx, {"a", "b"});
+  ctx.Equal(posts, hSamples({"a", "b"}), "hydrate must return the cached post a and the fetched post b");
   ctx.Equal(peer->calls, std::vector<std::vector<std::string>>{{"b"}}, "the cached post a must not be requested from the post service: GetPosts requests");
   bool mget = false;
   for (const auto& trip : tripsAtRPC)
@@ -1120,14 +1120,14 @@ void CheckMgetFirst(harness::Ctx& ctx) {
     }
   }
   ctx.Assert(gets == 0, "read the cache with one mget, not %d GETs", gets);
-  posts = hydrateIDs(ctx, {"a"});
-  ctx.Assert(posts == samples({"a"}) && peer->calls.size() == 1, "when every id is cached GetPosts must not be called at all");
+  posts = hHydrateIDs(ctx, {"a"});
+  ctx.Assert(posts == hSamples({"a"}) && peer->calls.size() == 1, "when every id is cached GetPosts must not be called at all");
 }
 
 void CheckSingleRpc(harness::Ctx& ctx) {
-  servePosts(ctx, {"b", "c", "d"});
-  const auto posts = hydrateIDs(ctx, {"b", "c", "d"});
-  ctx.Equal(posts, samples({"b", "c", "d"}), "unexpected posts");
+  hServePosts(ctx, {"b", "c", "d"});
+  const auto posts = hHydrateIDs(ctx, {"b", "c", "d"});
+  ctx.Equal(posts, hSamples({"b", "c", "d"}), "unexpected posts");
   const auto calls = ctx.GRPC.CallsTo("GetPosts", "");
   ctx.Equal(calls.size(), 1, "3 cache misses must be fetched with one GetPosts call");
   const auto req = calls[0].Request<feed::GetPostsRequest>();
@@ -1135,8 +1135,8 @@ void CheckSingleRpc(harness::Ctx& ctx) {
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  servePosts(ctx, {"b", "c"});
-  ctx.Equal(hydrateIDs(ctx, {"b"}), samples({"b"}), "hydrate([b])");
+  hServePosts(ctx, {"b", "c"});
+  ctx.Equal(hHydrateIDs(ctx, {"b"}), hSamples({"b"}), "hydrate([b])");
   const auto calls = ctx.GRPC.CallsTo("GetPosts", "");
   const auto& call = calls.back();
   ctx.Assert(call.HasDeadline(), "the RPC carries no deadline");
@@ -1155,14 +1155,14 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckWriteBack(harness::Ctx& ctx) {
-  auto* peer = servePosts(ctx, {"b", "c"});
-  hydrateIDs(ctx, {"b", "c"});
+  auto* peer = hServePosts(ctx, {"b", "c"});
+  hHydrateIDs(ctx, {"b", "c"});
   for (const std::string id : {"b", "c"}) {
     const auto raw = ctx.Redis.Get("post:" + id);
     ctx.Assert(raw.has_value(), "post:%s must be cached after it was fetched", id);
     const auto cached = nlohmann::json::parse(*raw, nullptr, false);
     ctx.Assert(!cached.is_discarded(), "post:%s must hold the post as JSON, got %q", id, *raw);
-    ctx.Equal(harness::ParseJSON(*raw), harness::ParseJSON(sampleJSON(id).dump()), "post:%s must hold the post as JSON", id);
+    ctx.Equal(harness::ParseJSON(*raw), harness::ParseJSON(hSampleJSON(id).dump()), "post:%s must hold the post as JSON", id);
     const auto ttl = ctx.Redis.TTL("post:" + id);
     ctx.Assert(3000 < ttl && ttl <= 3600, "post:%s must expire after an hour (EX 3600), its TTL is %d", id, ttl);
   }
@@ -1174,20 +1174,20 @@ void CheckWriteBack(harness::Ctx& ctx) {
   }
   ctx.Assert(sets == 0, "%d SET(s) were sent one by one: write the fetched posts back through one pipeline", sets);
   ctx.Equal(sizes, {2}, "expected one pipeline carrying the 2 SETs: pipeline command counts");
-  hydrateIDs(ctx, {"b", "c"});
+  hHydrateIDs(ctx, {"b", "c"});
   ctx.Equal(peer->calls.size(), 1, "once written back, the next hydration of the same ids must not call GetPosts");
   ctx.Clock.Advance(3601);
   ctx.Assert(!ctx.Redis.Get("post:b").has_value(), "the cache entry must be gone an hour later");
 }
 
 void CheckOrderKept(harness::Ctx& ctx) {
-  auto* peer = servePosts(ctx, {"b"});
-  cacheIDs(ctx, {"a", "c"});
+  auto* peer = hServePosts(ctx, {"b"});
+  hCacheIDs(ctx, {"a", "c"});
   std::vector<std::string> ids;
-  for (const auto& p : hydrateIDs(ctx, {"d", "c", "b", "a"})) ids.push_back(std::get<0>(p));
+  for (const auto& p : hHydrateIDs(ctx, {"d", "c", "b", "a"})) ids.push_back(std::get<0>(p));
   ctx.Equal(ids, {"c", "b", "a"}, "posts must come back in the input order with the deleted post d skipped");
-  ctx.Assert(hydrateIDs(ctx, {"d"}).empty(), "a page of only deleted posts is an empty list, not an error");
-  ctx.Assert(hydrateIDs(ctx, {}).empty() && peer->calls.size() == 2, "an empty id list must not call the post service");
+  ctx.Assert(hHydrateIDs(ctx, {"d"}).empty(), "a page of only deleted posts is an empty list, not an error");
+  ctx.Assert(hHydrateIDs(ctx, {}).empty() && peer->calls.size() == 2, "an empty id list must not call the post service");
 }
 `,
   },

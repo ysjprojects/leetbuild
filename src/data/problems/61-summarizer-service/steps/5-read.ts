@@ -657,46 +657,46 @@ import (
 )
 
 const (
-	readDoc    = "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee approved the accounts. Two directors stepped down."
-	readEdited = "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee rejected the accounts. Three directors resigned."
+	kHReadDoc    = "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee approved the accounts. Two directors stepped down."
+	kHReadEdited = "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee rejected the accounts. Three directors resigned."
 	// A three-chunk source whose summary cites chunk 1 before chunk 0 and never cites chunk 2.
-	readDoc3       = readDoc + "\\n\\nA new chair takes over in May."
-	readReordered  = "Two directors stepped down. The board met on 3 March."
-	readTailEdited = readDoc + "\\n\\nA new chair takes over in June."
-	readAllEdited  = "The board met on 4 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee rejected the accounts. Three directors resigned.\\n\\nA new chair takes over in June."
+	kHReadDoc3       = kHReadDoc + "\\n\\nA new chair takes over in May."
+	kHReadReordered  = "Two directors stepped down. The board met on 3 March."
+	kHReadTailEdited = kHReadDoc + "\\n\\nA new chair takes over in June."
+	kHReadAllEdited  = "The board met on 4 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee rejected the accounts. Three directors resigned.\\n\\nA new chair takes over in June."
 )
 
-var readSentences = []string{"The board met on 3 March.", "Revenue rose four percent in the quarter.", "The audit committee approved the accounts.", "Two directors stepped down."}
+var hReadSentences = []string{"The board met on 3 March.", "Revenue rose four percent in the quarter.", "The audit committee approved the accounts.", "Two directors stepped down."}
 
-type readCitation struct {
+type HReadCitation struct {
 	ChunkIndex int     \`json:"chunk_index"\`
 	Stale      *bool   \`json:"stale"\`
 	Quote      *string \`json:"quote"\`
 }
 
-type readBody struct {
+type HReadBody struct {
 	Summary     string         \`json:"summary"\`
 	Stale       *bool          \`json:"stale"\`
 	StaleChunks []int          \`json:"stale_chunks"\`
-	Citations   []readCitation \`json:"citations"\`
+	Citations   []HReadCitation \`json:"citations"\`
 }
 
-func readSetup(ctx *harness.Ctx) (*harness.HTTP, string) {
-	record := store.CreateSummary(context.Background(), "t1", "doc-1", readDoc, "medium", 250)
+func hReadSetup(ctx *harness.Ctx) (*harness.HTTP, string) {
+	record := store.CreateSummary(context.Background(), "t1", "doc-1", kHReadDoc, "medium", 250)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux), record.SummaryID
 }
 
-func readGet(c *harness.HTTP, summaryID, tenant string) *harness.Response {
+func hReadGet(c *harness.HTTP, summaryID, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Get("/v1/summaries/" + summaryID)
 	}
 	return c.Get("/v1/summaries/"+summaryID, "X-Tenant-Id", tenant)
 }
 
-func readDecode(r *harness.Response) readBody {
-	var b readBody
+func hReadDecode(r *harness.Response) HReadBody {
+	var b HReadBody
 	r.Decode(&b)
 	return b
 }
@@ -719,61 +719,61 @@ func hShow(p any) string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c, summaryID := readSetup(ctx)
-	r := readGet(c, summaryID, "t1")
+	c, summaryID := hReadSetup(ctx)
+	r := hReadGet(c, summaryID, "t1")
 	ctx.Equal(r.Status, 200, "GET /v1/summaries/%s (%s)", summaryID, r.Text())
-	body := readDecode(r)
-	ctx.Equal(body.Summary, strings.Join(readSentences, " "), "the response must carry the stored summary")
+	body := hReadDecode(r)
+	ctx.Equal(body.Summary, strings.Join(hReadSentences, " "), "the response must carry the stored summary")
 	var quotes []string
 	for _, cite := range body.Citations {
 		if cite.Quote != nil {
 			quotes = append(quotes, *cite.Quote)
 		}
 	}
-	ctx.Equal(quotes, readSentences, "each citation must quote the sentence it points at")
-	ctx.Equal(readGet(c, "s-99", "t1").Status, 404, "an unknown id")
+	ctx.Equal(quotes, hReadSentences, "each citation must quote the sentence it points at")
+	ctx.Equal(hReadGet(c, "s-99", "t1").Status, 404, "an unknown id")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c, summaryID := readSetup(ctx)
-	foreign := readGet(c, summaryID, "t2")
+	c, summaryID := hReadSetup(ctx)
+	foreign := hReadGet(c, summaryID, "t2")
 	ctx.Equal(foreign.Status, 404, "tenant t2 reading t1's summary %s (the lookup must be scoped to the caller's tenant)", summaryID)
 	ctx.Assert(!strings.Contains(foreign.Text(), "board"), "the answer to t2 carries t1's text: %.200s", foreign.Text())
-	missing := readGet(c, "s-99", "t2")
+	missing := hReadGet(c, "s-99", "t2")
 	ctx.Equal(strings.ReplaceAll(foreign.Text(), summaryID, "<id>"), strings.ReplaceAll(missing.Text(), "s-99", "<id>"),
 		"a foreign id must look exactly like a missing one, or the answer confirms it exists; t1's summary as t2 sees it, against an unknown id")
-	ctx.Equal(readGet(c, summaryID, "").Status, 401, "a read without X-Tenant-Id")
+	ctx.Equal(hReadGet(c, summaryID, "").Status, 401, "a read without X-Tenant-Id")
 }
 
 func CheckStaleFlag(ctx *harness.Ctx) {
-	c, summaryID := readSetup(ctx)
-	fresh := readDecode(readGet(c, summaryID, "t1"))
+	c, summaryID := hReadSetup(ctx)
+	fresh := hReadDecode(hReadGet(c, summaryID, "t1"))
 	ctx.Assert(fresh.Stale != nil && !*fresh.Stale && fresh.StaleChunks != nil && len(fresh.StaleChunks) == 0, "before any edit the summary must be stale false with no stale_chunks, got stale=%s stale_chunks=%v", hShow(fresh.Stale), fresh.StaleChunks)
-	store.PutSource(context.Background(), "t1", "doc-1", readEdited)
-	edited := readDecode(readGet(c, summaryID, "t1"))
+	store.PutSource(context.Background(), "t1", "doc-1", kHReadEdited)
+	edited := hReadDecode(hReadGet(c, summaryID, "t1"))
 	ctx.Assert(edited.Stale != nil && *edited.Stale, "after the source was edited the summary answered stale=%s: a reader takes a summary of text that no longer exists for the current one", hShow(edited.Stale))
 	ctx.Equal(edited.StaleChunks, []int{1}, "only chunk 1 changed; stale_chunks")
-	record := store.CreateSummary(context.Background(), "t1", "doc-2", readDoc3, "medium", 250)
-	record.Summary = readReordered
-	record.Citations = text.Cite(readDoc3, readReordered)
+	record := store.CreateSummary(context.Background(), "t1", "doc-2", kHReadDoc3, "medium", 250)
+	record.Summary = kHReadReordered
+	record.Citations = text.Cite(kHReadDoc3, kHReadReordered)
 	ctx.NoError(store.SaveSummary(context.Background(), record), "saving the reordered summary")
-	store.PutSource(context.Background(), "t1", "doc-2", readTailEdited)
-	tail := readDecode(readGet(c, record.SummaryID, "t1"))
+	store.PutSource(context.Background(), "t1", "doc-2", kHReadTailEdited)
+	tail := hReadDecode(hReadGet(c, record.SummaryID, "t1"))
 	ctx.Assert(tail.Stale != nil && *tail.Stale && tail.StaleChunks != nil && len(tail.StaleChunks) == 0,
 		"after an edit to chunk 2, which no citation points at, the summary answered stale=%s stale_chunks=%v: the source changed, so the summary is stale, and no cited chunk did. Expected stale true, stale_chunks []", hShow(tail.Stale), tail.StaleChunks)
-	store.PutSource(context.Background(), "t1", "doc-2", readAllEdited)
-	both := readDecode(readGet(c, record.SummaryID, "t1"))
+	store.PutSource(context.Background(), "t1", "doc-2", kHReadAllEdited)
+	both := hReadDecode(hReadGet(c, record.SummaryID, "t1"))
 	ctx.Equal(both.StaleChunks, []int{0, 1}, "a summary citing chunk 1 then chunk 0, both edited, lists them sorted; stale_chunks")
 }
 
 func CheckCitationQuotes(ctx *harness.Ctx) {
-	c, summaryID := readSetup(ctx)
-	store.PutSource(context.Background(), "t1", "doc-1", readEdited)
-	citations := readDecode(readGet(c, summaryID, "t1")).Citations
+	c, summaryID := hReadSetup(ctx)
+	store.PutSource(context.Background(), "t1", "doc-1", kHReadEdited)
+	citations := hReadDecode(hReadGet(c, summaryID, "t1")).Citations
 	ctx.Equal(len(citations), 4, "the summary has four cited sentences; the citations")
 	for i, cite := range citations {
 		if cite.ChunkIndex == 0 {
-			ctx.Assert(cite.Quote != nil && *cite.Quote == readSentences[i] && cite.Stale != nil && !*cite.Stale, "a citation into the unchanged chunk 0 must quote %q and be stale false, got quote %s stale %s", readSentences[i], hShow(cite.Quote), hShow(cite.Stale))
+			ctx.Assert(cite.Quote != nil && *cite.Quote == hReadSentences[i] && cite.Stale != nil && !*cite.Stale, "a citation into the unchanged chunk 0 must quote %q and be stale false, got quote %s stale %s", hReadSentences[i], hShow(cite.Quote), hShow(cite.Stale))
 		} else {
 			ctx.Assert(cite.Quote == nil && cite.Stale != nil && *cite.Stale, "a citation into the edited chunk 1 answered quote %s, stale %s: the old offsets now slice text the summary never saw. Expected quote null, stale true", hShow(cite.Quote), hShow(cite.Stale))
 		}
@@ -805,12 +805,12 @@ const std::string hTailEdited = hReadDoc + "\\n\\nA new chair takes over in June
 const std::string hAllEdited =
     "The board met on 4 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee rejected the accounts. Three directors resigned.\\n\\nA new chair takes over in June.";
 
-struct ReadSetup {
+struct HReadSetup {
   harness::HTTP c;
   std::string summary_id;
 };
 
-ReadSetup readSetup(harness::Ctx& ctx) {
+HReadSetup hReadSetup(harness::Ctx& ctx) {
   const auto record = summarizer::store::createSummary("t1", "doc-1", hReadDoc, "medium", 250);
   static httplib::Server* svr = nullptr;
   delete svr;
@@ -819,12 +819,12 @@ ReadSetup readSetup(harness::Ctx& ctx) {
   return {ctx.HTTP(*svr), record.at("summary_id").get<std::string>()};
 }
 
-harness::Response readGet(harness::HTTP& c, const std::string& summary_id, const std::string& tenant) {
+harness::Response hReadGet(harness::HTTP& c, const std::string& summary_id, const std::string& tenant) {
   if (tenant.empty()) return c.Get("/v1/summaries/" + summary_id);
   return c.Get("/v1/summaries/" + summary_id, "X-Tenant-Id", tenant);
 }
 
-nlohmann::json readBody(harness::Ctx& ctx, const harness::Response& r) {
+nlohmann::json hReadBody(harness::Ctx& ctx, const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the response is not a JSON object: %d %.200s", r.Status, r.Text());
   return body;
@@ -840,37 +840,37 @@ std::string hMasked(std::string text, const std::string& id) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto [c, summary_id] = readSetup(ctx);
-  const auto r = readGet(c, summary_id, "t1");
+  auto [c, summary_id] = hReadSetup(ctx);
+  const auto r = hReadGet(c, summary_id, "t1");
   ctx.Equal(r.Status, 200, "GET /v1/summaries/%s (%s)", summary_id, r.Text());
-  const auto body = readBody(ctx, r);
+  const auto body = hReadBody(ctx, r);
   ctx.Equal(body.value("summary", ""), hSentences[0] + " " + hSentences[1] + " " + hSentences[2] + " " + hSentences[3], "the response must carry the stored summary");
   std::vector<std::string> quotes;
   for (const auto& cite : body.value("citations", nlohmann::json::array())) {
     if (cite.contains("quote") && cite["quote"].is_string()) quotes.push_back(cite["quote"].get<std::string>());
   }
   ctx.Equal(quotes, hSentences, "each citation must quote the sentence it points at");
-  ctx.Equal(readGet(c, "s-99", "t1").Status, 404, "an unknown id");
+  ctx.Equal(hReadGet(c, "s-99", "t1").Status, 404, "an unknown id");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto [c, summary_id] = readSetup(ctx);
-  const auto foreign = readGet(c, summary_id, "t2");
+  auto [c, summary_id] = hReadSetup(ctx);
+  const auto foreign = hReadGet(c, summary_id, "t2");
   ctx.Equal(foreign.Status, 404, "tenant t2 reading t1's summary %s (the lookup must be scoped to the caller's tenant)", summary_id);
   ctx.Assert(foreign.Text().find("board") == std::string::npos, "the answer to t2 carries t1's text: %.200s", foreign.Text());
-  const auto missing = readGet(c, "s-99", "t2");
+  const auto missing = hReadGet(c, "s-99", "t2");
   ctx.Equal(hMasked(foreign.Text(), summary_id), hMasked(missing.Text(), "s-99"),
             "a foreign id must look exactly like a missing one, or the answer confirms it exists; t1's summary as t2 sees it, against an unknown id");
-  ctx.Equal(readGet(c, summary_id, "").Status, 401, "a read without X-Tenant-Id");
+  ctx.Equal(hReadGet(c, summary_id, "").Status, 401, "a read without X-Tenant-Id");
 }
 
 void CheckStaleFlag(harness::Ctx& ctx) {
-  auto [c, summary_id] = readSetup(ctx);
-  const auto fresh = readBody(ctx, readGet(c, summary_id, "t1"));
+  auto [c, summary_id] = hReadSetup(ctx);
+  const auto fresh = hReadBody(ctx, hReadGet(c, summary_id, "t1"));
   ctx.Assert(fresh.value("stale", nlohmann::json()) == false && fresh.value("stale_chunks", nlohmann::json()) == nlohmann::json::array(),
              "before any edit the summary must be stale false with no stale_chunks, got stale=%s stale_chunks=%s", hShow(fresh, "stale"), hShow(fresh, "stale_chunks"));
   summarizer::store::putSource("t1", "doc-1", hReadEdited);
-  const auto edited = readBody(ctx, readGet(c, summary_id, "t1"));
+  const auto edited = hReadBody(ctx, hReadGet(c, summary_id, "t1"));
   ctx.Assert(edited.value("stale", nlohmann::json()) == true, "after the source was edited the summary answered stale=%s: a reader takes a summary of text that no longer exists for the current one", hShow(edited, "stale"));
   ctx.Equal(edited.value("stale_chunks", nlohmann::json()), nlohmann::json::array({1}), "only chunk 1 changed; stale_chunks");
   auto record = summarizer::store::createSummary("t1", "doc-2", hReadDoc3, "medium", 250);
@@ -879,19 +879,19 @@ void CheckStaleFlag(harness::Ctx& ctx) {
   summarizer::store::saveSummary(record);
   const std::string reordered_id = record.at("summary_id").get<std::string>();
   summarizer::store::putSource("t1", "doc-2", hTailEdited);
-  const auto tail = readBody(ctx, readGet(c, reordered_id, "t1"));
+  const auto tail = hReadBody(ctx, hReadGet(c, reordered_id, "t1"));
   ctx.Assert(tail.value("stale", nlohmann::json()) == true && tail.value("stale_chunks", nlohmann::json()) == nlohmann::json::array(),
              "after an edit to chunk 2, which no citation points at, the summary answered stale=%s stale_chunks=%s: the source changed, so the summary is stale, and no cited chunk did. Expected stale true, stale_chunks []",
              hShow(tail, "stale"), hShow(tail, "stale_chunks"));
   summarizer::store::putSource("t1", "doc-2", hAllEdited);
-  const auto both = readBody(ctx, readGet(c, reordered_id, "t1"));
+  const auto both = hReadBody(ctx, hReadGet(c, reordered_id, "t1"));
   ctx.Equal(both.value("stale_chunks", nlohmann::json()), nlohmann::json::array({0, 1}), "a summary citing chunk 1 then chunk 0, both edited, lists them sorted; stale_chunks");
 }
 
 void CheckCitationQuotes(harness::Ctx& ctx) {
-  auto [c, summary_id] = readSetup(ctx);
+  auto [c, summary_id] = hReadSetup(ctx);
   summarizer::store::putSource("t1", "doc-1", hReadEdited);
-  const auto citations = readBody(ctx, readGet(c, summary_id, "t1")).value("citations", nlohmann::json::array());
+  const auto citations = hReadBody(ctx, hReadGet(c, summary_id, "t1")).value("citations", nlohmann::json::array());
   ctx.Equal(citations.size(), 4, "the summary has four cited sentences; the citations");
   for (size_t i = 0; i < citations.size(); i++) {
     const auto& cite = citations[i];

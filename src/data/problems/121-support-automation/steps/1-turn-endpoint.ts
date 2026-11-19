@@ -871,15 +871,15 @@ import (
 	"leetbuild/harness"
 )
 
-const apiQuestion = "Where is my next reservation?"
+const kHApiQuestion = "Where is my next reservation?"
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiPost(c *harness.HTTP, conversation, key, token string, body any) *harness.Response {
+func hApiPost(c *harness.HTTP, conversation, key, token string, body any) *harness.Response {
 	var headers []string
 	if token != "" {
 		headers = append(headers, "Authorization", "Bearer "+token)
@@ -890,9 +890,9 @@ func apiPost(c *harness.HTTP, conversation, key, token string, body any) *harnes
 	return c.Post("/v1/conversations/"+conversation+"/messages", body, headers...)
 }
 
-func apiText(text string) map[string]any { return map[string]any{"text": text} }
+func hApiText(text string) map[string]any { return map[string]any{"text": text} }
 
-func apiQueued(ctx *harness.Ctx) []map[string]any {
+func hApiQueued(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
 	for _, raw := range ctx.Redis.LRange("apv2:turns", 0, -1) {
 		var turn map[string]any
@@ -902,7 +902,7 @@ func apiQueued(ctx *harness.Ctx) []map[string]any {
 	return out
 }
 
-func apiTurnID(ctx *harness.Ctx, r *harness.Response) string {
+func hApiTurnID(ctx *harness.Ctx, r *harness.Response) string {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	id, _ := body["turn_id"].(string)
@@ -910,71 +910,71 @@ func apiTurnID(ctx *harness.Ctx, r *harness.Response) string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, "c-1", "k-1", "tok-guest-1", apiText(apiQuestion))
+	c := hApiClient(ctx)
+	r := hApiPost(c, "c-1", "k-1", "tok-guest-1", hApiText(kHApiQuestion))
 	ctx.Equal(r.Status, 202, "a valid message (%s)", r.Text())
 	body, _ := r.JSON().(map[string]any)
 	ctx.Assert(body["turn_id"] != nil && body["turn_id"] != "" && body["status"] == "queued", "the 202 body must be {turn_id, status: queued}, got %s", r.Text())
-	queued := apiQueued(ctx)
+	queued := hApiQueued(ctx)
 	ctx.Equal(len(queued), 1, "one message must enqueue one turn on apv2:turns; turns enqueued")
 	ctx.Equal(queued[0]["turn_id"], body["turn_id"], "the enqueued turn must be the one answered")
-	for field, value := range map[string]string{"tenant": "t1", "conversation": "c-1", "actor": "guest-1", "text": apiQuestion} {
+	for field, value := range map[string]string{"tenant": "t1", "conversation": "c-1", "actor": "guest-1", "text": kHApiQuestion} {
 		ctx.Equal(queued[0][field], value, "the enqueued turn's %s (%v)", field, queued[0])
 	}
-	ctx.Equal(apiPost(c, "c-1", "k-2", "", apiText(apiQuestion)).Status, 401, "a message without a bearer token")
-	ctx.Equal(apiPost(c, "c-1", "k-3", "tok-unknown", apiText(apiQuestion)).Status, 401, "a message with an unknown token")
-	ctx.Equal(len(apiQueued(ctx)), 1, "a rejected message must enqueue nothing; turns enqueued")
+	ctx.Equal(hApiPost(c, "c-1", "k-2", "", hApiText(kHApiQuestion)).Status, 401, "a message without a bearer token")
+	ctx.Equal(hApiPost(c, "c-1", "k-3", "tok-unknown", hApiText(kHApiQuestion)).Status, 401, "a message with an unknown token")
+	ctx.Equal(len(hApiQueued(ctx)), 1, "a rejected message must enqueue nothing; turns enqueued")
 }
 
 func CheckPrincipal(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, "c-1", "k-1", "tok-guest-1", map[string]any{"text": "Refund my last stay", "role": "agent"})
+	c := hApiClient(ctx)
+	r := hApiPost(c, "c-1", "k-1", "tok-guest-1", map[string]any{"text": "Refund my last stay", "role": "agent"})
 	ctx.Equal(r.Status, 202, "a guest message (%s)", r.Text())
-	queued := apiQueued(ctx)
+	queued := hApiQueued(ctx)
 	ctx.Equal(queued[len(queued)-1]["role"], "customer", "a guest token with \\"role\\": \\"agent\\" in the body: the enqueued turn's role must come from the verified principal, or any guest runs agent-only tools; the role")
-	r = apiPost(c, "c-2", "k-2", "tok-agent-7", apiText(apiQuestion))
+	r = hApiPost(c, "c-2", "k-2", "tok-agent-7", hApiText(kHApiQuestion))
 	ctx.Equal(r.Status, 202, "an agent message (%s)", r.Text())
-	queued = apiQueued(ctx)
+	queued = hApiQueued(ctx)
 	turn := queued[len(queued)-1]
 	ctx.Assert(turn["role"] == "agent" && turn["actor"] == "agent-7", "an agent token must enqueue role agent, actor agent-7: %v", turn)
-	r = apiPost(c, "c-3", "k-3", "tok-agent-7", map[string]any{"text": apiQuestion, "role": "customer"})
+	r = hApiPost(c, "c-3", "k-3", "tok-agent-7", map[string]any{"text": kHApiQuestion, "role": "customer"})
 	ctx.Equal(r.Status, 202, "an agent message (%s)", r.Text())
-	queued = apiQueued(ctx)
+	queued = hApiQueued(ctx)
 	ctx.Equal(queued[len(queued)-1]["role"], "agent", "an agent token with \\"role\\": \\"customer\\" in the body (a role in the body changes nothing); the role")
 }
 
 func CheckTextCap(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	ctx.Equal(apiPost(c, "c-1", "k-empty", "tok-guest-1", apiText("")).Status, 400, "an empty text")
-	ctx.Equal(apiPost(c, "c-1", "k-none", "tok-guest-1", map[string]any{}).Status, 400, "a body without text")
-	ctx.Equal(apiPost(c, "c-1", "k-number", "tok-guest-1", map[string]any{"text": 42}).Status, 400, "a text that is a number (text is a non-empty string)")
-	ctx.Equal(apiPost(c, "c-1", "k-big", "tok-guest-1", apiText(strings.Repeat("a", 8193))).Status, 413, "8193 bytes of text (every byte is re-sent to the model on every iteration)")
-	ctx.Equal(apiPost(c, "c-1", "k-euro", "tok-guest-1", apiText(strings.Repeat("\\u20ac", 3000))).Status, 413, "3000 euro signs, 9000 bytes of UTF-8 (the cap counts bytes, not characters)")
-	ctx.Equal(len(apiQueued(ctx)), 0, "rejected messages must enqueue nothing; turns enqueued")
+	c := hApiClient(ctx)
+	ctx.Equal(hApiPost(c, "c-1", "k-empty", "tok-guest-1", hApiText("")).Status, 400, "an empty text")
+	ctx.Equal(hApiPost(c, "c-1", "k-none", "tok-guest-1", map[string]any{}).Status, 400, "a body without text")
+	ctx.Equal(hApiPost(c, "c-1", "k-number", "tok-guest-1", map[string]any{"text": 42}).Status, 400, "a text that is a number (text is a non-empty string)")
+	ctx.Equal(hApiPost(c, "c-1", "k-big", "tok-guest-1", hApiText(strings.Repeat("a", 8193))).Status, 413, "8193 bytes of text (every byte is re-sent to the model on every iteration)")
+	ctx.Equal(hApiPost(c, "c-1", "k-euro", "tok-guest-1", hApiText(strings.Repeat("\\u20ac", 3000))).Status, 413, "3000 euro signs, 9000 bytes of UTF-8 (the cap counts bytes, not characters)")
+	ctx.Equal(len(hApiQueued(ctx)), 0, "rejected messages must enqueue nothing; turns enqueued")
 	for _, key := range []string{"k-empty", "k-none", "k-number", "k-big", "k-euro"} {
 		_, found := ctx.Redis.Get("turn:c-1:" + key)
 		ctx.Assert(!found, "a rejected message stored a turn under %s: every rejection happens before anything is stored, or the client's corrected retry under that key replays the rejected turn", key)
 	}
-	r := apiPost(c, "c-1", "k-edge", "tok-guest-1", apiText(strings.Repeat("a", 8192)))
+	r := hApiPost(c, "c-1", "k-edge", "tok-guest-1", hApiText(strings.Repeat("a", 8192)))
 	ctx.Equal(r.Status, 202, "exactly 8192 bytes is within the cap (%s)", r.Text())
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	ctx.Equal(apiPost(c, "c-1", "", "tok-guest-1", apiText(apiQuestion)).Status, 400, "a message without Idempotency-Key (a retry of it could not be told from a new question)")
-	ctx.Equal(len(apiQueued(ctx)), 0, "a message without Idempotency-Key must enqueue nothing; turns enqueued")
-	first := apiPost(c, "c-1", "k-7", "tok-guest-1", apiText(apiQuestion))
+	c := hApiClient(ctx)
+	ctx.Equal(hApiPost(c, "c-1", "", "tok-guest-1", hApiText(kHApiQuestion)).Status, 400, "a message without Idempotency-Key (a retry of it could not be told from a new question)")
+	ctx.Equal(len(hApiQueued(ctx)), 0, "a message without Idempotency-Key must enqueue nothing; turns enqueued")
+	first := hApiPost(c, "c-1", "k-7", "tok-guest-1", hApiText(kHApiQuestion))
 	ctx.Equal(first.Status, 202, "the first message (%s)", first.Text())
-	replay := apiPost(c, "c-1", "k-7", "tok-guest-1", apiText(apiQuestion))
+	replay := hApiPost(c, "c-1", "k-7", "tok-guest-1", hApiText(kHApiQuestion))
 	ctx.Equal(replay.Status, 202, "a replay must answer 202 with the stored turn")
-	ctx.Equal(apiTurnID(ctx, replay), apiTurnID(ctx, first), "a replay of (c-1, k-7) must answer the first turn id")
-	ctx.Equal(len(apiQueued(ctx)), 1, "a message and its replay; turns enqueued")
-	other := apiPost(c, "c-2", "k-7", "tok-guest-1", apiText(apiQuestion))
-	ctx.Assert(other.Status == 202 && apiTurnID(ctx, other) != apiTurnID(ctx, first), "the same key on another conversation is a new turn")
+	ctx.Equal(hApiTurnID(ctx, replay), hApiTurnID(ctx, first), "a replay of (c-1, k-7) must answer the first turn id")
+	ctx.Equal(len(hApiQueued(ctx)), 1, "a message and its replay; turns enqueued")
+	other := hApiPost(c, "c-2", "k-7", "tok-guest-1", hApiText(kHApiQuestion))
+	ctx.Assert(other.Status == 202 && hApiTurnID(ctx, other) != hApiTurnID(ctx, first), "the same key on another conversation is a new turn")
 }
 
 func CheckClaimRace(ctx *harness.Ctx) {
-	rival, _ := json.Marshal(map[string]string{"turn_id": "rival-turn", "tenant": "t1", "conversation": "c-1", "actor": "guest-1", "role": "customer", "text": apiQuestion})
+	rival, _ := json.Marshal(map[string]string{"turn_id": "rival-turn", "tenant": "t1", "conversation": "c-1", "actor": "guest-1", "role": "customer", "text": kHApiQuestion})
 	probe := ctx.Redis.After("turn:c-1:k-race", func() any {
 		// Another replica handling the same retry stores its turn and enqueues it.
 		if ctx.Redis.Set("turn:c-1:k-race", string(rival), "EX", 86400, "NX") {
@@ -982,14 +982,14 @@ func CheckClaimRace(ctx *harness.Ctx) {
 		}
 		return nil
 	})
-	r := apiPost(apiClient(ctx), "c-1", "k-race", "tok-guest-1", apiText(apiQuestion))
+	r := hApiPost(hApiClient(ctx), "c-1", "k-race", "tok-guest-1", hApiText(kHApiQuestion))
 	ctx.Assert(probe.Fired, "the handler never touched turn:c-1:k-race: store the turn under (conversation, Idempotency-Key)")
 	ctx.Equal(r.Status, 202, "the message (%s)", r.Text())
-	ctx.Equal(len(apiQueued(ctx)), 1, "two replicas handled one retry: a read then a write leaves a gap another replica lands in, so claim the key in one command (turns.Claim); turns enqueued for one key")
+	ctx.Equal(len(hApiQueued(ctx)), 1, "two replicas handled one retry: a read then a write leaves a gap another replica lands in, so claim the key in one command (turns.Claim); turns enqueued for one key")
 	raw, _ := ctx.Redis.Get("turn:c-1:k-race")
 	var stored map[string]any
 	json.Unmarshal([]byte(raw), &stored)
-	ctx.Equal(apiTurnID(ctx, r), stored["turn_id"], "the answer must name the turn the key holds")
+	ctx.Equal(hApiTurnID(ctx, r), stored["turn_id"], "the answer must name the turn the key holds")
 }
 `,
     cpp: `#include <leetbuild/harness.h>

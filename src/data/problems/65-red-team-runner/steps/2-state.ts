@@ -728,33 +728,33 @@ import (
 	"leetbuild/harness"
 )
 
-const stateTarget = "checkout-shadow"
+const kHStateTarget = "checkout-shadow"
 
-func stateClaim(ctx *harness.Ctx, probeHash, category string) Claim {
-	c, err := claimProbe(context.Background(), stateTarget, probeHash, category)
+func hStateClaim(ctx *harness.Ctx, probeHash, category string) Claim {
+	c, err := claimProbe(context.Background(), kHStateTarget, probeHash, category)
 	ctx.NoError(err, "claimProbe(%q)", probeHash)
 	return c
 }
 
 // stateAlign moves the clock to one second into a fresh budget window, so a scenario never straddles two, and returns that window's budget key.
-func stateAlign(ctx *harness.Ctx) string {
+func hStateAlign(ctx *harness.Ctx) string {
 	windowMs := int64(config.WindowSeconds) * 1000
 	ctx.Clock.Advance(float64(windowMs-ctx.Clock.Now()%windowMs)/1000 + 1)
-	return config.BudgetKey(stateTarget, ctx.Clock.Now()/1000/config.WindowSeconds)
+	return config.BudgetKey(kHStateTarget, ctx.Clock.Now()/1000/config.WindowSeconds)
 }
 
 func CheckDuplicateFree(ctx *harness.Ctx) {
-	first := stateClaim(ctx, "h-1", "prompt-injection")
+	first := hStateClaim(ctx, "h-1", "prompt-injection")
 	ctx.Assert(first.Verdict == "ok" && first.Remaining == 199, "a fresh probe is claimed with 199 left this hour, got %+v", first)
-	again := stateClaim(ctx, "h-1", "prompt-injection")
+	again := hStateClaim(ctx, "h-1", "prompt-injection")
 	ctx.Equal(again.Verdict, "duplicate", "the same probe again; the verdict")
 	ctx.Equal(again.Remaining, int64(199), "a duplicate draws nothing (the counter moved before the probe key was tested); remaining after the replay")
-	second := stateClaim(ctx, "h-2", "prompt-injection")
+	second := hStateClaim(ctx, "h-2", "prompt-injection")
 	ctx.Assert(second.Verdict == "ok" && second.Remaining == 198, "the second distinct probe leaves 198, got %+v: replays were charged", second)
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
-	key := config.ProbeKey(stateTarget, "h-race")
+	key := config.ProbeKey(kHStateTarget, "h-race")
 	other := ""
 	// a second runner replaying the same probe, landing between two of this runner's commands
 	ctx.Redis.After(key, func() any {
@@ -765,14 +765,14 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 		}
 		return nil
 	})
-	mine := stateClaim(ctx, "h-race", "prompt-injection")
+	mine := hStateClaim(ctx, "h-race", "prompt-injection")
 	ctx.Assert(other != "", "claimProbe never touched the probe key")
 	verdicts := []string{mine.Verdict, other}
 	sort.Strings(verdicts)
 	ctx.Equal(verdicts, []string{"duplicate", "ok"}, "two runners claimed the same probe: the test and the claim must run in one script, so exactly one runner sends it; the verdicts")
 
 	// the hour's last slot: another runner takes it between this runner's budget read and its count
-	budget := stateAlign(ctx)
+	budget := hStateAlign(ctx)
 	ctx.Redis.Do("HSET", budget, "probes", config.ProbeBudget-1)
 	rival := ""
 	ctx.Redis.After(budget, func() any {
@@ -785,7 +785,7 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 		}
 		return nil
 	})
-	last := stateClaim(ctx, "h-last", "prompt-injection")
+	last := hStateClaim(ctx, "h-last", "prompt-injection")
 	ctx.Assert(rival != "", "claimProbe never touched this hour's budget %s", budget)
 	lastVerdicts := []string{last.Verdict, rival}
 	sort.Strings(lastVerdicts)
@@ -794,63 +794,63 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 
 func CheckDestructiveCap(ctx *harness.Ctx) {
 	for i := 0; i < 5; i++ {
-		r := stateClaim(ctx, fmt.Sprintf("n-%d", i), "jailbreak")
+		r := hStateClaim(ctx, fmt.Sprintf("n-%d", i), "jailbreak")
 		ctx.Equal(r.Verdict, "ok", "non-destructive probe %d; the verdict", i+1)
 	}
 	for i := 0; i < 20; i++ {
-		r := stateClaim(ctx, fmt.Sprintf("d-%d", i), "data-exfil")
+		r := hStateClaim(ctx, fmt.Sprintf("d-%d", i), "data-exfil")
 		ctx.Equal(r.Verdict, "ok", "destructive probe %d of 20 after 5 non-destructive ones (only destructive probes count toward DestructiveProbeBudget); the verdict", i+1)
 	}
-	over := stateClaim(ctx, "d-20", "resource-exhaustion")
+	over := hStateClaim(ctx, "d-20", "resource-exhaustion")
 	ctx.Equal(over.Verdict, "budget", "the 21st destructive probe this hour (DestructiveProbeBudget is 20); the verdict")
-	other := stateClaim(ctx, "p-1", "prompt-injection")
+	other := hStateClaim(ctx, "p-1", "prompt-injection")
 	ctx.Assert(other.Verdict == "ok" && other.Remaining == 174, "other categories go on with the hour's budget (174 left after 26 claims), got %+v", other)
-	again := stateClaim(ctx, "d-20", "data-exfil")
+	again := hStateClaim(ctx, "d-20", "data-exfil")
 	ctx.Equal(again.Verdict, "budget", "a refused probe is not claimed: asking again; the verdict")
 }
 
 func CheckHourlyWindow(ctx *harness.Ctx) {
-	key := stateAlign(ctx)
+	key := hStateAlign(ctx)
 	atFirst := int64(-3)
 	ctx.Redis.After(key, func() any {
 		atFirst = ctx.Redis.TTL(key)
 		return nil
 	})
 	for i := 0; i < 200; i++ {
-		r := stateClaim(ctx, fmt.Sprintf("p-%d", i), "prompt-injection")
+		r := hStateClaim(ctx, fmt.Sprintf("p-%d", i), "prompt-injection")
 		ctx.Equal(r.Verdict, "ok", "probe %d of 200; the verdict", i+1)
 	}
 	ctx.Assert(atFirst != -3, "the hour's counters belong in %s (BudgetKey(target, window)); budget keys %v", key, ctx.Redis.Keys("redteam:budget:*"))
 	ctx.Assert(atFirst != -1, "right after the first claim %s existed with no expiry: the expiry is set by the same script that counts", key)
-	refused := stateClaim(ctx, "p-200", "prompt-injection")
+	refused := hStateClaim(ctx, "p-200", "prompt-injection")
 	ctx.Equal(refused.Verdict, "budget", "the 201st probe this hour; the verdict")
 	probes, _ := ctx.Redis.HGet(key, "probes")
 	ctx.Equal(probes, "200", "the hour's counters belong in %s (BudgetKey(target, window)); budget keys %v; its probes", key, ctx.Redis.Keys("redteam:budget:*"))
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(0 < ttl && ttl <= config.WindowSeconds, "%s has TTL %d: a window's counters expire within WindowSeconds", key, ttl)
 	ctx.Clock.Advance(config.WindowSeconds - 10)
-	late := stateClaim(ctx, "p-201", "prompt-injection")
+	late := hStateClaim(ctx, "p-201", "prompt-injection")
 	ctx.Equal(late.Verdict, "budget", "10 s before the hour ends the target's budget is still spent (the counters expired inside their window; EXPIRE takes seconds); the verdict")
 	ctx.Clock.Advance(10)
-	later := stateClaim(ctx, "p-200", "prompt-injection")
+	later := hStateClaim(ctx, "p-200", "prompt-injection")
 	ctx.Equal(later.Verdict, "ok", "an hour later the target has a fresh budget (the cap became permanent); the verdict")
 }
 
 func CheckClaimTtl(ctx *harness.Ctx) {
-	key := config.ProbeKey(stateTarget, "h-1")
+	key := config.ProbeKey(kHStateTarget, "h-1")
 	atClaim := int64(-3)
 	ctx.Redis.After(key, func() any {
 		atClaim = ctx.Redis.TTL(key)
 		return nil
 	})
-	ctx.Equal(stateClaim(ctx, "h-1", "prompt-injection").Verdict, "ok", "a fresh probe; the verdict")
+	ctx.Equal(hStateClaim(ctx, "h-1", "prompt-injection").Verdict, "ok", "a fresh probe; the verdict")
 	ctx.Assert(atClaim != -3 && atClaim != -1, "right after the claim the probe key existed with no expiry: SET it with EX in the claiming script")
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(0 < ttl && ttl <= config.DedupeTTLSeconds, "the claimed probe key has TTL %d: it expires after DedupeTTLSeconds (86400 s)", ttl)
 	ctx.Clock.Advance(config.DedupeTTLSeconds - 60)
-	ctx.Equal(stateClaim(ctx, "h-1", "prompt-injection").Verdict, "duplicate", "a minute short of a day the probe is still claimed (the claim lasts DedupeTTLSeconds, 86400 s); the verdict")
+	ctx.Equal(hStateClaim(ctx, "h-1", "prompt-injection").Verdict, "duplicate", "a minute short of a day the probe is still claimed (the claim lasts DedupeTTLSeconds, 86400 s); the verdict")
 	ctx.Clock.Advance(61)
-	again := stateClaim(ctx, "h-1", "prompt-injection")
+	again := hStateClaim(ctx, "h-1", "prompt-injection")
 	ctx.Equal(again.Verdict, "ok", "a day later the probe may run again (the claim never expires); the verdict")
 }
 `,
@@ -862,33 +862,33 @@ func CheckClaimTtl(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kStateTarget = "checkout-shadow";
+const std::string kHStateTarget = "checkout-shadow";
 
 // Move the clock to one second into a fresh budget window, so a scenario never straddles two; that window's budget key.
 std::string harness_align_window(harness::Ctx& ctx) {
   const long long window_ms = config::kWindowSeconds * 1000;
   ctx.Clock.Advance(static_cast<double>(window_ms - ctx.Clock.Now() % window_ms) / 1000 + 1);
-  return config::budget_key(kStateTarget, ctx.Clock.Now() / 1000 / config::kWindowSeconds);
+  return config::budget_key(kHStateTarget, ctx.Clock.Now() / 1000 / config::kWindowSeconds);
 }
 
 }  // namespace
 
 void CheckDuplicateFree(harness::Ctx& ctx) {
-  const Claim first = claim_probe(kStateTarget, "h-1", "prompt-injection");
+  const Claim first = claim_probe(kHStateTarget, "h-1", "prompt-injection");
   ctx.Assert(first.verdict == "ok" && first.remaining == 199, "a fresh probe is claimed with 199 left this hour, got %s with %d left", first.verdict, first.remaining);
-  const Claim again = claim_probe(kStateTarget, "h-1", "prompt-injection");
+  const Claim again = claim_probe(kHStateTarget, "h-1", "prompt-injection");
   ctx.Equal(again.verdict, "duplicate", "the same probe again; the verdict");
   ctx.Equal(again.remaining, 199, "a duplicate draws nothing (the counter moved before the probe key was tested); remaining after the replay");
-  const Claim second = claim_probe(kStateTarget, "h-2", "prompt-injection");
+  const Claim second = claim_probe(kHStateTarget, "h-2", "prompt-injection");
   ctx.Assert(second.verdict == "ok" && second.remaining == 198, "the second distinct probe leaves 198, got %s with %d left: replays were charged", second.verdict, second.remaining);
 }
 
 void CheckAtomicClaim(harness::Ctx& ctx) {
-  const std::string key = config::probe_key(kStateTarget, "h-race");
+  const std::string key = config::probe_key(kHStateTarget, "h-race");
   std::string other;
   // a second runner replaying the same probe, landing between two of this runner's commands
   ctx.Redis.After(key, [&] { other = ctx.Redis.Set(key, "1", "NX", "EX", config::kDedupeTtlSeconds) ? "ok" : "duplicate"; });
-  const Claim mine = claim_probe(kStateTarget, "h-race", "prompt-injection");
+  const Claim mine = claim_probe(kHStateTarget, "h-race", "prompt-injection");
   ctx.Assert(!other.empty(), "claim_probe never touched the probe key");
   std::vector<std::string> verdicts = {mine.verdict, other};
   std::sort(verdicts.begin(), verdicts.end());
@@ -907,7 +907,7 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
       rival = "ok";
     }
   });
-  const Claim last = claim_probe(kStateTarget, "h-last", "prompt-injection");
+  const Claim last = claim_probe(kHStateTarget, "h-last", "prompt-injection");
   ctx.Assert(!rival.empty(), "claim_probe never touched this hour's budget %s", budget);
   std::vector<std::string> last_verdicts = {last.verdict, rival};
   std::sort(last_verdicts.begin(), last_verdicts.end());
@@ -916,16 +916,16 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
 
 void CheckDestructiveCap(harness::Ctx& ctx) {
   for (int i = 0; i < 5; i++) {
-    ctx.Equal(claim_probe(kStateTarget, "n-" + std::to_string(i), "jailbreak").verdict, "ok", "non-destructive probe %d; the verdict", i + 1);
+    ctx.Equal(claim_probe(kHStateTarget, "n-" + std::to_string(i), "jailbreak").verdict, "ok", "non-destructive probe %d; the verdict", i + 1);
   }
   for (int i = 0; i < 20; i++) {
-    ctx.Equal(claim_probe(kStateTarget, "d-" + std::to_string(i), "data-exfil").verdict, "ok", "destructive probe %d of 20 after 5 non-destructive ones (only destructive probes count toward kDestructiveProbeBudget); the verdict", i + 1);
+    ctx.Equal(claim_probe(kHStateTarget, "d-" + std::to_string(i), "data-exfil").verdict, "ok", "destructive probe %d of 20 after 5 non-destructive ones (only destructive probes count toward kDestructiveProbeBudget); the verdict", i + 1);
   }
-  const Claim over = claim_probe(kStateTarget, "d-20", "resource-exhaustion");
+  const Claim over = claim_probe(kHStateTarget, "d-20", "resource-exhaustion");
   ctx.Equal(over.verdict, "budget", "the 21st destructive probe this hour (kDestructiveProbeBudget is 20); the verdict");
-  const Claim other = claim_probe(kStateTarget, "p-1", "prompt-injection");
+  const Claim other = claim_probe(kHStateTarget, "p-1", "prompt-injection");
   ctx.Assert(other.verdict == "ok" && other.remaining == 174, "other categories go on with the hour's budget (174 left after 26 claims), got %s with %d left", other.verdict, other.remaining);
-  ctx.Equal(claim_probe(kStateTarget, "d-20", "data-exfil").verdict, "budget", "a refused probe is not claimed: asking again; the verdict");
+  ctx.Equal(claim_probe(kHStateTarget, "d-20", "data-exfil").verdict, "budget", "a refused probe is not claimed: asking again; the verdict");
 }
 
 void CheckHourlyWindow(harness::Ctx& ctx) {
@@ -933,33 +933,33 @@ void CheckHourlyWindow(harness::Ctx& ctx) {
   long long at_first = -3;
   ctx.Redis.After(key, [&] { at_first = ctx.Redis.TTL(key); });
   for (int i = 0; i < 200; i++) {
-    ctx.Equal(claim_probe(kStateTarget, "p-" + std::to_string(i), "prompt-injection").verdict, "ok", "probe %d of 200; the verdict", i + 1);
+    ctx.Equal(claim_probe(kHStateTarget, "p-" + std::to_string(i), "prompt-injection").verdict, "ok", "probe %d of 200; the verdict", i + 1);
   }
   ctx.Assert(at_first != -3, "the hour's counters belong in %s (budget_key(target, window)), the budget keys are %v", key, ctx.Redis.Keys("redteam:budget:*"));
   ctx.Assert(at_first != -1, "right after the first claim %s existed with no expiry: the expiry is set by the same script that counts", key);
-  ctx.Equal(claim_probe(kStateTarget, "p-200", "prompt-injection").verdict, "budget", "the 201st probe this hour; the verdict");
+  ctx.Equal(claim_probe(kHStateTarget, "p-200", "prompt-injection").verdict, "budget", "the 201st probe this hour; the verdict");
   const auto probes = ctx.Redis.HGet(key, "probes");
   ctx.Assert(probes && *probes == "200", "the hour's counters belong in %s (budget_key(target, window)), the budget keys are %v", key, ctx.Redis.Keys("redteam:budget:*"));
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(0 < ttl && ttl <= config::kWindowSeconds, "%s has TTL %d: a window's counters expire within kWindowSeconds", key, ttl);
   ctx.Clock.Advance(config::kWindowSeconds - 10);
-  ctx.Equal(claim_probe(kStateTarget, "p-201", "prompt-injection").verdict, "budget", "10 s before the hour ends the target's budget is still spent (the counters expired inside their window; EXPIRE takes seconds); the verdict");
+  ctx.Equal(claim_probe(kHStateTarget, "p-201", "prompt-injection").verdict, "budget", "10 s before the hour ends the target's budget is still spent (the counters expired inside their window; EXPIRE takes seconds); the verdict");
   ctx.Clock.Advance(10);
-  ctx.Equal(claim_probe(kStateTarget, "p-200", "prompt-injection").verdict, "ok", "an hour later the target has a fresh budget (the cap became permanent); the verdict");
+  ctx.Equal(claim_probe(kHStateTarget, "p-200", "prompt-injection").verdict, "ok", "an hour later the target has a fresh budget (the cap became permanent); the verdict");
 }
 
 void CheckClaimTtl(harness::Ctx& ctx) {
-  const std::string key = config::probe_key(kStateTarget, "h-1");
+  const std::string key = config::probe_key(kHStateTarget, "h-1");
   long long at_claim = -3;
   ctx.Redis.After(key, [&] { at_claim = ctx.Redis.TTL(key); });
-  ctx.Equal(claim_probe(kStateTarget, "h-1", "prompt-injection").verdict, "ok", "a fresh probe; the verdict");
+  ctx.Equal(claim_probe(kHStateTarget, "h-1", "prompt-injection").verdict, "ok", "a fresh probe; the verdict");
   ctx.Assert(at_claim != -3 && at_claim != -1, "right after the claim the probe key existed with no expiry: SET it with EX in the claiming script");
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(0 < ttl && ttl <= config::kDedupeTtlSeconds, "the claimed probe key has TTL %d: it expires after kDedupeTtlSeconds (86400 s)", ttl);
   ctx.Clock.Advance(config::kDedupeTtlSeconds - 60);
-  ctx.Equal(claim_probe(kStateTarget, "h-1", "prompt-injection").verdict, "duplicate", "a minute short of a day the probe is still claimed (the claim lasts kDedupeTtlSeconds, 86400 s); the verdict");
+  ctx.Equal(claim_probe(kHStateTarget, "h-1", "prompt-injection").verdict, "duplicate", "a minute short of a day the probe is still claimed (the claim lasts kDedupeTtlSeconds, 86400 s); the verdict");
   ctx.Clock.Advance(61);
-  ctx.Equal(claim_probe(kStateTarget, "h-1", "prompt-injection").verdict, "ok", "a day later the probe may run again (the claim never expires); the verdict");
+  ctx.Equal(claim_probe(kHStateTarget, "h-1", "prompt-injection").verdict, "ok", "a day later the probe may run again (the claim never expires); the verdict");
 }
 `,
   },

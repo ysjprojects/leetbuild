@@ -807,7 +807,7 @@ using json = nlohmann::json;
 
 namespace {
 
-const json kBody = {{"name", "amount_7d"}, {"version", 2}, {"dtype", "float64"}, {"computation_ref", "window_avg_7d"}, {"freshness_slo", 300}};
+const json kHBody = {{"name", "amount_7d"}, {"version", 2}, {"dtype", "float64"}, {"computation_ref", "window_avg_7d"}, {"freshness_slo", 300}};
 
 harness::HTTP hAPI(harness::Ctx& ctx) {
   registry::registerComputation("window_avg_7d");
@@ -844,24 +844,24 @@ long long hNowSeconds() {
 
 void CheckRoute(harness::Ctx& ctx) {
   auto c = hAPI(ctx);
-  const auto r = hPost(c, kBody);
+  const auto r = hPost(c, kHBody);
   ctx.Equal(r.Status, 201, "POST /v1/features/definitions (%s)", r.Text());
   const auto d = hStored(2);
   ctx.Assert(d.has_value(), "after a 201 the registry holds no definition:amount_7d:2");
   ctx.Equal(hParsed(r), *d, "the response must be the definition as stored");
-  for (const auto& [k, v] : kBody.items()) ctx.Equal((*d)[k], v, "the stored definition lost the field %s of the request", k);
+  for (const auto& [k, v] : kHBody.items()) ctx.Equal((*d)[k], v, "the stored definition lost the field %s of the request", k);
   const long long age = hNowSeconds() - d->value("created_at", 0LL);
   ctx.Assert(age >= -5 && age <= 5, "created_at is %s, expected the registration time in epoch seconds", (*d)["created_at"].dump());
-  const auto bad = hPost(c, hWith(kBody, {{"name", "amount_30d"}, {"dtype", "float32"}}));
+  const auto bad = hPost(c, hWith(kHBody, {{"name", "amount_30d"}, {"dtype", "float32"}}));
   ctx.Equal(bad.Status, 400, "a dtype outside kDtypes");
   ctx.Assert(!registry::getDefinition("amount_30d", 2), "a definition with an unknown dtype was stored");
 }
 
 void CheckImmutableVersion(harness::Ctx& ctx) {
   auto c = hAPI(ctx);
-  const auto first = hPost(c, kBody);
+  const auto first = hPost(c, kHBody);
   ctx.Equal(first.Status, 201, "the first registration of amount_7d v2 (%s)", first.Text());
-  const auto again = hPost(c, hWith(kBody, {{"dtype", "int64"}, {"computation_ref", "window_sum_1d"}}));
+  const auto again = hPost(c, hWith(kHBody, {{"dtype", "int64"}, {"computation_ref", "window_sum_1d"}}));
   ctx.Equal(again.Status, 409, "a second registration of amount_7d v2 (a version is immutable)");
   ctx.Equal(hStored(2).value_or(json()), hParsed(first), "the second registration must not rewrite amount_7d v2; the registry holds");
   // A rival registration of v3 lands right after this one first touches the key.
@@ -872,7 +872,7 @@ void CheckImmutableVersion(harness::Ctx& ctx) {
     *fired = true;
     *won = registry::createDefinition(rival);
   });
-  const auto r = hPost(c, hWith(kBody, {{"version", 3}}));
+  const auto r = hPost(c, hWith(kHBody, {{"version", 3}}));
   ctx.Assert(*fired, "the registration of amount_7d v3 never touched definition:amount_7d:3");
   const json now = hStored(3).value_or(json());
   if (*won) {
@@ -890,30 +890,30 @@ void CheckComputationRef(harness::Ctx& ctx) {
   // Nothing is stored, not even for a moment: a probe reads the key when the request first touches it.
   auto existed = std::make_shared<long long>(0);
   ctx.Redis.After("definition:amount_7d:5", [&ctx, existed] { *existed = ctx.Redis.Exists("definition:amount_7d:5"); });
-  auto r = hPost(c, hWith(kBody, {{"version", 5}, {"computation_ref", "window_avg_7days"}}));
+  auto r = hPost(c, hWith(kHBody, {{"version", 5}, {"computation_ref", "window_avg_7days"}}));
   ctx.Equal(r.Status, 422, "a computation_ref the compute registry does not know");
   ctx.Assert(!hStored(5), "a definition with a dangling computation_ref was stored: %s", hStored(5).value_or(json()).dump());
   ctx.Assert(*existed == 0, "a definition with a dangling computation_ref was written and then removed: for a moment the registry served it. Resolve the computation_ref before the write");
-  r = hPost(c, kBody);
+  r = hPost(c, kHBody);
   ctx.Equal(r.Status, 201, "with a computation_ref that resolves, the registration (%s)", r.Text());
 }
 
 void CheckFreshnessSlo(harness::Ctx& ctx) {
   auto c = hAPI(ctx);
-  json without = kBody;
+  json without = kHBody;
   without.erase("freshness_slo");
   const std::vector<std::pair<json, std::string>> cases = {
       {hWith(without, {{"version", 10}}), "missing"},
-      {hWith(kBody, {{"version", 11}, {"freshness_slo", nullptr}}), "null"},
-      {hWith(kBody, {{"version", 12}, {"freshness_slo", 0}}), "0"},
-      {hWith(kBody, {{"version", 13}, {"freshness_slo", -5}}), "-5"},
+      {hWith(kHBody, {{"version", 11}, {"freshness_slo", nullptr}}), "null"},
+      {hWith(kHBody, {{"version", 12}, {"freshness_slo", 0}}), "0"},
+      {hWith(kHBody, {{"version", 13}, {"freshness_slo", -5}}), "-5"},
   };
   for (const auto& [body, what] : cases) {
     const auto r = hPost(c, body);
     ctx.Equal(r.Status, 400, "a freshness_slo that is %s", what);
     ctx.Assert(!hStored(body["version"].get<long>()), "a definition whose freshness_slo is %s was stored", what);
   }
-  const auto r = hPost(c, hWith(kBody, {{"version", 14}}));
+  const auto r = hPost(c, hWith(kHBody, {{"version", 14}}));
   ctx.Assert(r.Status == 201 && hParsed(r).value("freshness_slo", 0) == 300, "a definition with freshness_slo 300 answered %d %s", r.Status, r.Text());
 }
 `,

@@ -847,13 +847,13 @@ import (
 	"feed/graph"
 )
 
-func seedPost(ctx *harness.Ctx, postID, author string) {
+func hSeedPost(ctx *harness.Ctx, postID, author string) {
 	value, _ := json.Marshal(map[string]any{"post_id": postID, "author": author, "text": "hi", "media_ids": []string{}, "created_at": 1700000000000})
 	ctx.Kafka.Seed("posts", author, value)
 }
 
 // drainWorker fills the follow graph, then runs the learner's loop until it waits for records.
-func drainWorker(ctx *harness.Ctx, followers map[string][]string) {
+func hDrainWorker(ctx *harness.Ctx, followers map[string][]string) {
 	for author, ids := range followers {
 		graph.FollowersOf[author] = ids
 	}
@@ -861,7 +861,7 @@ func drainWorker(ctx *harness.Ctx, followers map[string][]string) {
 }
 
 // fanoutPipelines are the learner's round trips that carried more than one command.
-func fanoutPipelines(ctx *harness.Ctx) [][]string {
+func hFanoutPipelines(ctx *harness.Ctx) [][]string {
 	var out [][]string
 	for _, trip := range ctx.Redis.RoundTrips() {
 		if len(trip) > 1 {
@@ -872,8 +872,8 @@ func fanoutPipelines(ctx *harness.Ctx) [][]string {
 }
 
 func CheckGroup(ctx *harness.Ctx) {
-	seedPost(ctx, "p1", "ann")
-	drainWorker(ctx, map[string][]string{"ann": {"bob"}})
+	hSeedPost(ctx, "p1", "ann")
+	hDrainWorker(ctx, map[string][]string{"ann": {"bob"}})
 	subscriptions := ctx.Kafka.EventsOf("subscribe")
 	ctx.Assert(len(subscriptions) > 0, "the consumer must subscribe to a topic")
 	last := subscriptions[len(subscriptions)-1]
@@ -887,9 +887,9 @@ func CheckGroup(ctx *harness.Ctx) {
 }
 
 func CheckManualCommit(ctx *harness.Ctx) {
-	seedPost(ctx, "p1", "ann")
-	seedPost(ctx, "p2", "ann")
-	drainWorker(ctx, map[string][]string{"ann": {"bob", "cat"}})
+	hSeedPost(ctx, "p1", "ann")
+	hSeedPost(ctx, "p2", "ann")
+	hDrainWorker(ctx, map[string][]string{"ann": {"bob", "cat"}})
 	consumers := ctx.Kafka.Consumers()
 	ctx.Assert(len(consumers) > 0 && !consumers[len(consumers)-1].AutoCommit, "the reader must not commit by itself (no CommitInterval, no ReadMessage): offsets would be committed on a timer, before the pushes")
 	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "auto-commit is on: offsets were committed on a timer, before processing")
@@ -898,13 +898,13 @@ func CheckManualCommit(ctx *harness.Ctx) {
 }
 
 func CheckCelebrity(ctx *harness.Ctx) {
-	seedPost(ctx, "p1", "taylor")
-	seedPost(ctx, "p2", "ann")
+	hSeedPost(ctx, "p1", "taylor")
+	hSeedPost(ctx, "p2", "ann")
 	taylorFans := make([]string, 10_001)
 	for i := range taylorFans {
 		taylorFans[i] = fmt.Sprintf("fan%d", i)
 	}
-	drainWorker(ctx, map[string][]string{"taylor": taylorFans, "ann": {"bob", "cat"}})
+	hDrainWorker(ctx, map[string][]string{"taylor": taylorFans, "ann": {"bob", "cat"}})
 	ctx.Equal(ctx.Redis.LRange("timeline:bob", 0, -1), []string{"p2"}, "ann has 2 followers: her post must be pushed, timeline:bob")
 	pushed := ctx.Redis.Keys("timeline:fan*")
 	ctx.Equal(len(pushed), 0, "taylor has 10 001 followers: her post must not be fanned out, but fan timelines were written")
@@ -917,9 +917,9 @@ func CheckPushTrim(ctx *harness.Ctx) {
 		old = append(old, fmt.Sprintf("old%d", i))
 	}
 	ctx.Redis.Do(old...)
-	seedPost(ctx, "p1", "ann")
-	seedPost(ctx, "p2", "ann")
-	drainWorker(ctx, map[string][]string{"ann": {"bob", "cat"}})
+	hSeedPost(ctx, "p1", "ann")
+	hSeedPost(ctx, "p2", "ann")
+	hDrainWorker(ctx, map[string][]string{"ann": {"bob", "cat"}})
 	bob := ctx.Redis.LRange("timeline:bob", 0, -1)
 	ctx.Assert(len(bob) >= 2 && bob[0] == "p2" && bob[1] == "p1", "timeline:bob must start with the newest post (LPUSH), got %q", bob[:min(3, len(bob))])
 	ctx.Equal(len(bob), 1000, "timeline:bob must be trimmed to 1000 entries")
@@ -932,12 +932,12 @@ func CheckBatchedCommit(ctx *harness.Ctx) {
 	for i := range fans {
 		fans[i] = fmt.Sprintf("f%d", i)
 	}
-	seedPost(ctx, "p1", "ann")
+	hSeedPost(ctx, "p1", "ann")
 	var atCommit [][2]int
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
-		atCommit = append(atCommit, [2]int{len(fanoutPipelines(ctx)), int(ctx.Redis.LLen("timeline:f1239"))})
+		atCommit = append(atCommit, [2]int{len(hFanoutPipelines(ctx)), int(ctx.Redis.LLen("timeline:f1239"))})
 	})
-	drainWorker(ctx, map[string][]string{"ann": fans})
+	hDrainWorker(ctx, map[string][]string{"ann": fans})
 	ctx.Equal(ctx.Redis.LRange("timeline:f1239", 0, -1), []string{"p1"}, "every one of the 1240 followers must receive the post: timeline:f1239")
 	writes := 0
 	for _, trip := range ctx.Redis.RoundTrips() {
@@ -948,7 +948,7 @@ func CheckBatchedCommit(ctx *harness.Ctx) {
 	ctx.Assert(writes == 0, "%d LPUSH/LTRIM were sent one by one: queue them on a pipeline per batch of 500 followers", writes)
 	var sizes []int
 	largest, total := 0, 0
-	for _, trip := range fanoutPipelines(ctx) {
+	for _, trip := range hFanoutPipelines(ctx) {
 		sizes = append(sizes, len(trip))
 		largest = max(largest, len(trip))
 		total += len(trip)
@@ -970,26 +970,26 @@ func CheckBatchedCommit(ctx *harness.Ctx) {
 
 namespace {
 
-void seedPost(harness::Ctx& ctx, const std::string& postID, const std::string& author) {
+void hSeedPost(harness::Ctx& ctx, const std::string& postID, const std::string& author) {
   const nlohmann::json value = {{"post_id", postID}, {"author", author}, {"text", "hi"}, {"media_ids", nlohmann::json::array()}, {"created_at", 1700000000000}};
   ctx.Kafka.Seed("posts", author, value);
 }
 
 // drainWorker fills the follow graph, then runs the learner's loop until it waits for records.
-void drainWorker(harness::Ctx& ctx, const std::map<std::string, std::vector<std::string>>& followers) {
+void hDrainWorker(harness::Ctx& ctx, const std::map<std::string, std::vector<std::string>>& followers) {
   for (const auto& [author, ids] : followers) graph::followers_of[author] = ids;
   ctx.Drain([] { run(); });
 }
 
 // fanoutPipelines are the learner's round trips that carried more than one command.
-std::vector<std::vector<std::string>> fanoutPipelines(harness::Ctx& ctx) {
+std::vector<std::vector<std::string>> hFanoutPipelines(harness::Ctx& ctx) {
   std::vector<std::vector<std::string>> out;
   for (const auto& trip : ctx.Redis.RoundTrips())
     if (trip.size() > 1) out.push_back(trip);
   return out;
 }
 
-std::vector<std::string> numbered(const std::string& prefix, int n) {
+std::vector<std::string> hNumbered(const std::string& prefix, int n) {
   std::vector<std::string> out;
   for (int i = 0; i < n; i++) out.push_back(prefix + std::to_string(i));
   return out;
@@ -998,8 +998,8 @@ std::vector<std::string> numbered(const std::string& prefix, int n) {
 }  // namespace
 
 void CheckGroup(harness::Ctx& ctx) {
-  seedPost(ctx, "p1", "ann");
-  drainWorker(ctx, {{"ann", {"bob"}}});
+  hSeedPost(ctx, "p1", "ann");
+  hDrainWorker(ctx, {{"ann", {"bob"}}});
   const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
   ctx.Assert(!subscriptions.empty(), "the consumer must subscribe to a topic");
   const auto& last = subscriptions.back();
@@ -1010,9 +1010,9 @@ void CheckGroup(harness::Ctx& ctx) {
 }
 
 void CheckManualCommit(harness::Ctx& ctx) {
-  seedPost(ctx, "p1", "ann");
-  seedPost(ctx, "p2", "ann");
-  drainWorker(ctx, {{"ann", {"bob", "cat"}}});
+  hSeedPost(ctx, "p1", "ann");
+  hSeedPost(ctx, "p2", "ann");
+  hDrainWorker(ctx, {{"ann", {"bob", "cat"}}});
   const auto consumers = ctx.Kafka.Consumers();
   ctx.Assert(!consumers.empty() && !consumers.back().AutoCommit, "the consumer must not commit by itself (enable.auto.commit=false): offsets would be committed on a timer, before the pushes");
   ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(), "auto-commit is on: offsets were committed on a timer, before processing");
@@ -1021,9 +1021,9 @@ void CheckManualCommit(harness::Ctx& ctx) {
 }
 
 void CheckCelebrity(harness::Ctx& ctx) {
-  seedPost(ctx, "p1", "taylor");
-  seedPost(ctx, "p2", "ann");
-  drainWorker(ctx, {{"taylor", numbered("fan", 10001)}, {"ann", {"bob", "cat"}}});
+  hSeedPost(ctx, "p1", "taylor");
+  hSeedPost(ctx, "p2", "ann");
+  hDrainWorker(ctx, {{"taylor", hNumbered("fan", 10001)}, {"ann", {"bob", "cat"}}});
   ctx.Equal(ctx.Redis.LRange("timeline:bob", 0, -1), {"p2"}, "ann has 2 followers: her post must be pushed, timeline:bob");
   const auto pushed = ctx.Redis.Keys("timeline:fan*");
   ctx.Equal(pushed.size(), 0, "taylor has 10 001 followers: her post must not be fanned out, but fan timelines were written");
@@ -1032,11 +1032,11 @@ void CheckCelebrity(harness::Ctx& ctx) {
 
 void CheckPushTrim(harness::Ctx& ctx) {
   std::vector<std::string> old = {"RPUSH", "timeline:bob"};
-  for (const auto& id : numbered("old", 1000)) old.push_back(id);
+  for (const auto& id : hNumbered("old", 1000)) old.push_back(id);
   ctx.Redis.Must(old);
-  seedPost(ctx, "p1", "ann");
-  seedPost(ctx, "p2", "ann");
-  drainWorker(ctx, {{"ann", {"bob", "cat"}}});
+  hSeedPost(ctx, "p1", "ann");
+  hSeedPost(ctx, "p2", "ann");
+  hDrainWorker(ctx, {{"ann", {"bob", "cat"}}});
   const auto bob = ctx.Redis.LRange("timeline:bob", 0, -1);
   ctx.Assert(bob.size() >= 2 && bob[0] == "p2" && bob[1] == "p1", "timeline:bob must start with the newest post (LPUSH), got %q",
              std::vector<std::string>(bob.begin(), bob.begin() + std::min<size_t>(3, bob.size())));
@@ -1046,12 +1046,12 @@ void CheckPushTrim(harness::Ctx& ctx) {
 }
 
 void CheckBatchedCommit(harness::Ctx& ctx) {
-  seedPost(ctx, "p1", "ann");
+  hSeedPost(ctx, "p1", "ann");
   std::vector<std::pair<int, int>> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) {
-    atCommit.emplace_back(static_cast<int>(fanoutPipelines(ctx).size()), static_cast<int>(ctx.Redis.LLen("timeline:f1239")));
+    atCommit.emplace_back(static_cast<int>(hFanoutPipelines(ctx).size()), static_cast<int>(ctx.Redis.LLen("timeline:f1239")));
   });
-  drainWorker(ctx, {{"ann", numbered("f", 1240)}});
+  hDrainWorker(ctx, {{"ann", hNumbered("f", 1240)}});
   ctx.Equal(ctx.Redis.LRange("timeline:f1239", 0, -1), {"p1"}, "every one of the 1240 followers must receive the post: timeline:f1239");
   int writes = 0;
   for (const auto& trip : ctx.Redis.RoundTrips())
@@ -1059,7 +1059,7 @@ void CheckBatchedCommit(harness::Ctx& ctx) {
   ctx.Assert(writes == 0, "%d LPUSH/LTRIM were sent one by one: queue them on a pipeline per batch of 500 followers", writes);
   std::vector<int> sizes;
   int largest = 0, total = 0;
-  for (const auto& trip : fanoutPipelines(ctx)) {
+  for (const auto& trip : hFanoutPipelines(ctx)) {
     const int n = static_cast<int>(trip.size());
     sizes.push_back(n);
     largest = std::max(largest, n);

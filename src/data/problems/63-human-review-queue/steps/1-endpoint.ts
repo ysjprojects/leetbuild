@@ -933,7 +933,7 @@ using json = nlohmann::json;
 
 namespace {
 
-const json kGood = {{"source_type", "guardrail_block"}, {"source_id", "cmp-1"}, {"payload_ref", "blob://t1/cmp-1"}};
+const json kHGood = {{"source_type", "guardrail_block"}, {"source_id", "cmp-1"}, {"payload_ref", "blob://t1/cmp-1"}};
 
 harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
@@ -961,7 +961,7 @@ json hAnswer(const harness::Response& r) {
 
 void CheckRoute(harness::Ctx& ctx) {
   auto c = hApi(ctx);
-  const auto r = hEnqueue(c, kGood);
+  const auto r = hEnqueue(c, kHGood);
   ctx.Equal(r.Status, 201, "POST /v1/review/items (%s)", r.Text());
   const json a = hAnswer(r);
   const std::string item_id = a.value("item_id", "");
@@ -976,36 +976,36 @@ void CheckRoute(harness::Ctx& ctx) {
 
 void CheckTenant(harness::Ctx& ctx) {
   auto c = hApi(ctx);
-  auto r = c.Post("/v1/review/items", kGood.dump(), "Content-Type", "application/json");
+  auto r = c.Post("/v1/review/items", kHGood.dump(), "Content-Type", "application/json");
   ctx.Equal(r.Status, 401, "an escalation without X-Tenant-Id");
-  r = hEnqueue(c, kGood, "");
+  r = hEnqueue(c, kHGood, "");
   ctx.Equal(r.Status, 401, "an escalation with an empty X-Tenant-Id");
   std::vector<std::string> written;
   for (const auto& key : ctx.Redis.Keys("review:*")) {
     if (key != "review:seq") written.push_back(key);
   }
   ctx.Equal(written.size(), 0, "an escalation without a tenant wrote %v; answer 401 before anything is written. The keys written", written);
-  r = hEnqueue(c, kGood);
+  r = hEnqueue(c, kHGood);
   ctx.Equal(r.Status, 201, "with X-Tenant-Id t1 the escalation (%s)", r.Text());
 }
 
 void CheckSource(harness::Ctx& ctx) {
   auto c = hApi(ctx);
-  auto r = hEnqueue(c, hWith(hWith(hWith(kGood, "source_type", "user_report"), "source_id", "rep-1"), "priority", "p1"));
+  auto r = hEnqueue(c, hWith(hWith(hWith(kHGood, "source_type", "user_report"), "source_id", "rep-1"), "priority", "p1"));
   ctx.Equal(r.Status, 201, "a user_report (%s)", r.Text());
   const json a = hAnswer(r);
   ctx.Equal(store::getItem(a.value("item_id", "")).value_or(store::Item{})["priority"], "p2",
             "a user_report that asked for p1 must be queued at p2 (the priority comes from kSourcePriority, not from the caller); the stored priority");
   ctx.Equal(a.value("priority", ""), "p2", "the answer must carry the derived priority");
-  r = hEnqueue(c, kGood);
+  r = hEnqueue(c, kHGood);
   ctx.Equal(store::getItem(hAnswer(r).value("item_id", "")).value_or(store::Item{})["priority"], "p1", "a guardrail_block's priority");
-  r = hEnqueue(c, hWith(hWith(kGood, "source_type", "model_output"), "source_id", std::string(128, 'y')));
+  r = hEnqueue(c, hWith(hWith(kHGood, "source_type", "model_output"), "source_id", std::string(128, 'y')));
   ctx.Equal(r.Status, 201, "a 128-character source_id (the limit)");
   const std::vector<std::pair<json, std::string>> bad = {
-      {hWith(hWith(kGood, "source_type", "rumor"), "source_id", "x-1"), "an unknown source_type"},
-      {hWith(hWith(kGood, "source_type", "toString"), "source_id", "x-2"), "the unknown source_type toString"},
-      {hWith(kGood, "source_id", ""), "an empty source_id"},
-      {hWith(kGood, "source_id", std::string(129, 'x')), "a 129-character source_id"},
+      {hWith(hWith(kHGood, "source_type", "rumor"), "source_id", "x-1"), "an unknown source_type"},
+      {hWith(hWith(kHGood, "source_type", "toString"), "source_id", "x-2"), "the unknown source_type toString"},
+      {hWith(kHGood, "source_id", ""), "an empty source_id"},
+      {hWith(kHGood, "source_id", std::string(129, 'x')), "a 129-character source_id"},
   };
   for (const auto& [body, why] : bad) ctx.Equal(hEnqueue(c, body).Status, 400, "%s", why);
   ctx.Equal(ctx.Redis.Keys("review:item:*").size(), 3, "rejected escalations were stored; the items");
@@ -1013,22 +1013,22 @@ void CheckSource(harness::Ctx& ctx) {
 
 void CheckDedupe(harness::Ctx& ctx) {
   auto c = hApi(ctx);
-  const auto first = hEnqueue(c, kGood);
+  const auto first = hEnqueue(c, kHGood);
   ctx.Equal(first.Status, 201, "the first escalation (%s)", first.Text());
-  const auto again = hEnqueue(c, kGood);
+  const auto again = hEnqueue(c, kHGood);
   ctx.Equal(again.Status, 200, "a second escalation of the same source must answer the existing item");
   const json a = hAnswer(again);
   ctx.Assert(a.value("item_id", "") == hAnswer(first).value("item_id", "") && a.value("deduped", false),
              "the duplicate must answer the first item with deduped true, got %s", again.Text());
   ctx.Equal(ctx.Redis.Keys("review:item:*").size(), 1, "two escalations of one source must leave one item; the items");
-  ctx.Equal(hEnqueue(c, hWith(kGood, "source_type", "user_report")).Status, 201, "the same source_id under another source_type is another source");
-  ctx.Equal(hEnqueue(c, kGood, "t2").Status, 201, "the same source in another tenant is another source");
+  ctx.Equal(hEnqueue(c, hWith(kHGood, "source_type", "user_report")).Status, 201, "the same source_id under another source_type is another source");
+  ctx.Equal(hEnqueue(c, kHGood, "t2").Status, 201, "the same source in another tenant is another source");
   ctx.Equal(ctx.Redis.Keys("review:item:*").size(), 3, "the items in the store");
 }
 
 void CheckPayloadRef(harness::Ctx& ctx) {
   auto c = hApi(ctx);
-  auto r = hEnqueue(c, hWith(hWith(kGood, "payload_text", "my card is 4242 4242 4242 4242"), "excerpt", "card 4242"));
+  auto r = hEnqueue(c, hWith(hWith(kHGood, "payload_text", "my card is 4242 4242 4242 4242"), "excerpt", "card 4242"));
   ctx.Equal(r.Status, 201, "an escalation with payload_ref (%s)", r.Text());
   const store::Item item = store::getItem(hAnswer(r).value("item_id", "")).value_or(store::Item{});
   ctx.Equal(item.count("payload_ref") ? item.at("payload_ref") : "", "blob://t1/cmp-1", "the item must carry payload_ref (the store holds %v)", item);

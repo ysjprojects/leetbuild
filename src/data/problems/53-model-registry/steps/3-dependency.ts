@@ -899,10 +899,10 @@ func CheckUnavailableRetry(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kRegistered = "sha256:a3";
+const std::string kHRegistered = "sha256:a3";
 
 // Every pool has loaded the bytes it is asked about, except the versions in loaded ("model:version" → digest).
-class PoolPeer final : public modelregistry::Serving::Service {
+class HPoolPeer final : public modelregistry::Serving::Service {
  public:
   std::map<std::string, std::string> loaded;
   // The next calls that find the pool restarting: they answer UNAVAILABLE after their latency.
@@ -918,10 +918,10 @@ class PoolPeer final : public modelregistry::Serving::Service {
   }
 };
 
-PoolPeer& hSetup(harness::Ctx& ctx) {
-  static PoolPeer* peer = nullptr;
+HPoolPeer& hSetup(harness::Ctx& ctx) {
+  static HPoolPeer* peer = nullptr;
   delete peer;
-  peer = new PoolPeer;
+  peer = new HPoolPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   ctx.Redis.Do("HSET", "model:fraud:v2", "name", "fraud", "version", "2", "artifact_digest", "sha256:a2", "training_run_id", "r-2", "eval_id", "e-2", "stage", "promoted");
   ctx.Redis.Do("HSET", "model:fraud:v3", "name", "fraud", "version", "3", "artifact_digest", "sha256:a3", "training_run_id", "r-3", "eval_id", "e-3", "stage", "staged");
@@ -929,7 +929,7 @@ PoolPeer& hSetup(harness::Ctx& ctx) {
   return *peer;
 }
 
-ProbeResult hTryPromote() { return promoteWithProbe("prod", "fraud", 3, kRegistered, "e-3"); }
+ProbeResult hTryPromote() { return promoteWithProbe("prod", "fraud", 3, kHRegistered, "e-3"); }
 
 void hHeld(harness::Ctx& ctx, const ProbeResult& result, const std::string& reason, const std::string& why) {
   ctx.Assert(!result.promoted && result.reason == reason, "%s: promoteWithProbe answered promoted %t reason %q, expected promoted false with reason %q", why,
@@ -963,7 +963,7 @@ void CheckProbeDeadline(harness::Ctx& ctx) {
 }
 
 void CheckDigestMatch(harness::Ctx& ctx) {
-  PoolPeer& peer = hSetup(ctx);
+  HPoolPeer& peer = hSetup(ctx);
   peer.loaded["fraud:3"] = "sha256:stale";
   hHeld(ctx, hTryPromote(), "digest_mismatch", "with the pool holding sha256:stale instead of the registered sha256:a3");
   peer.loaded["fraud:3"] = "";
@@ -996,7 +996,7 @@ void CheckFailureBlocks(harness::Ctx& ctx) {
 }
 
 void CheckUnavailableRetry(harness::Ctx& ctx) {
-  PoolPeer& peer = hSetup(ctx);
+  HPoolPeer& peer = hSetup(ctx);
   ctx.GRPC.Fail("Probe", grpc::StatusCode::UNAVAILABLE, "pool restarting", 1);
   const ProbeResult result = hTryPromote();
   ctx.Equal(ctx.GRPC.CallsTo("Probe").size(), 2,

@@ -1214,22 +1214,22 @@ import (
 )
 
 var (
-	extractBg     = context.Background()
-	goodJob       = store.Job{SkuID: "sku-1", Merchant: "m-1", Title: "DOVE SILK GLOW BODY WASH 500ML", Description: "Nourishing body wash"}
-	inventedJob   = store.Job{SkuID: "sku-2", Merchant: "m-1", Title: "GLOWRA OAT DRINK 1L", Description: "Oat drink"}
-	badUnitJob    = store.Job{SkuID: "sku-3", Merchant: "m-1", Title: "BARILLA SPAGHETTI 12PACK", Description: "Durum wheat pasta"}
-	noDescription = store.Job{SkuID: "sku-4", Merchant: "m-1", Title: "OATLY OAT MILK 1L", Description: ""}
-	springJob     = store.Job{SkuID: "sku-5", Merchant: "m-1", Title: "NATURAL SPRING WATER 1L", Description: "Evian, bottled at the source"}
-	offListJob    = store.Job{SkuID: "sku-6", Merchant: "m-1", Title: "STILL MINERAL WATER 500ML", Description: "Still water"}
-	badCategory   = store.Job{SkuID: "sku-7", Merchant: "m-1", Title: "HEINZ TOMATO KETCHUP 500ML", Description: "Tomato ketchup"}
-	atGateJob     = store.Job{SkuID: "sku-8", Merchant: "m-1", Title: "OATLY OAT MILK 1L", Description: "confidence 0.85"}
-	belowGateJob  = store.Job{SkuID: "sku-9", Merchant: "m-1", Title: "OATLY OAT MILK 1L", Description: "confidence 0.84"}
+	hExtractBg     = context.Background()
+	hGoodJob       = store.Job{SkuID: "sku-1", Merchant: "m-1", Title: "DOVE SILK GLOW BODY WASH 500ML", Description: "Nourishing body wash"}
+	hInventedJob   = store.Job{SkuID: "sku-2", Merchant: "m-1", Title: "GLOWRA OAT DRINK 1L", Description: "Oat drink"}
+	hBadUnitJob    = store.Job{SkuID: "sku-3", Merchant: "m-1", Title: "BARILLA SPAGHETTI 12PACK", Description: "Durum wheat pasta"}
+	hNoDescription = store.Job{SkuID: "sku-4", Merchant: "m-1", Title: "OATLY OAT MILK 1L", Description: ""}
+	hSpringJob     = store.Job{SkuID: "sku-5", Merchant: "m-1", Title: "NATURAL SPRING WATER 1L", Description: "Evian, bottled at the source"}
+	hOffListJob    = store.Job{SkuID: "sku-6", Merchant: "m-1", Title: "STILL MINERAL WATER 500ML", Description: "Still water"}
+	hBadCategory   = store.Job{SkuID: "sku-7", Merchant: "m-1", Title: "HEINZ TOMATO KETCHUP 500ML", Description: "Tomato ketchup"}
+	hAtGateJob     = store.Job{SkuID: "sku-8", Merchant: "m-1", Title: "OATLY OAT MILK 1L", Description: "confidence 0.85"}
+	hBelowGateJob  = store.Job{SkuID: "sku-9", Merchant: "m-1", Title: "OATLY OAT MILK 1L", Description: "confidence 0.84"}
 )
 
 // extractorPeer is the model: it picks the first candidate brand in the title, or names the title's
 // first word, and names Evian for any water, listed or not; prose without a schema. A description
 // "confidence x" sets its confidence. While unavailable is above 0 it answers UNAVAILABLE (after the latency).
-type extractorPeer struct {
+type HExtractorPeer struct {
 	pb.UnimplementedExtractorServer
 	mu          sync.Mutex
 	unavailable int
@@ -1245,7 +1245,7 @@ func harnessSizeOf(title string) (any, any) {
 	return nil, nil
 }
 
-func (p *extractorPeer) Extract(_ context.Context, req *pb.ExtractRequest) (*pb.ExtractReply, error) {
+func (p *HExtractorPeer) Extract(_ context.Context, req *pb.ExtractRequest) (*pb.ExtractReply, error) {
 	p.mu.Lock()
 	down := p.unavailable > 0
 	if down {
@@ -1289,26 +1289,26 @@ func (p *extractorPeer) Extract(_ context.Context, req *pb.ExtractRequest) (*pb.
 	return &pb.ExtractReply{Output: string(output), Confidence: confidence}, nil
 }
 
-func extractPeer(ctx *harness.Ctx) *extractorPeer {
-	peer := &extractorPeer{}
+func hExtractPeer(ctx *harness.Ctx) *HExtractorPeer {
+	peer := &HExtractorPeer{}
 	pb.RegisterExtractorServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func mustExtract(ctx *harness.Ctx, job store.Job, why string) store.Result {
-	result, err := extractAttributes(extractBg, job)
+func hMustExtract(ctx *harness.Ctx, job store.Job, why string) store.Result {
+	result, err := extractAttributes(hExtractBg, job)
 	ctx.NoError(err, "%s: extractAttributes failed", why)
 	return result
 }
 
-func mustFail(ctx *harness.Ctx, job store.Job, why string) {
-	result, err := extractAttributes(extractBg, job)
+func hMustFail(ctx *harness.Ctx, job store.Job, why string) {
+	result, err := extractAttributes(hExtractBg, job)
 	ctx.Assert(err != nil, "%s: extractAttributes returned %+v instead of an error", why, result)
 }
 
 func CheckRetrieveFirst(ctx *harness.Ctx) {
-	extractPeer(ctx)
-	mustExtract(ctx, goodJob, "with a healthy extractor")
+	hExtractPeer(ctx)
+	hMustExtract(ctx, hGoodJob, "with a healthy extractor")
 	calls := ctx.GRPC.CallsTo("Extract", "")
 	ctx.Assert(len(calls) > 0, "no Extract call was made")
 	candidates := calls[0].Request.(*pb.ExtractRequest).GetCandidateBrands()
@@ -1323,88 +1323,88 @@ func CheckRetrieveFirst(ctx *harness.Ctx) {
 		hasDove = hasDove || c == "Dove"
 	}
 	ctx.Assert(hasDove, "the candidates must be taxonomy.NearestBrands of the title and description, got %v", candidates)
-	spring := mustExtract(ctx, springJob, "with the brand named only in the description")
+	spring := hMustExtract(ctx, hSpringJob, "with the brand named only in the description")
 	calls = ctx.GRPC.CallsTo("Extract", "")
 	sent := append([]string{}, calls[len(calls)-1].Request.(*pb.ExtractRequest).GetCandidateBrands()...)
-	expected := append([]string{}, taxonomy.NearestBrands(springJob.Title+" "+springJob.Description, 20)...)
+	expected := append([]string{}, taxonomy.NearestBrands(hSpringJob.Title+" "+hSpringJob.Description, 20)...)
 	sort.Strings(sent)
 	sort.Strings(expected)
-	ctx.Equal(sent, expected, "for %s with the description %q, retrieve the 20 brands nearest to the title and the description; the candidates", springJob.Title, springJob.Description)
+	ctx.Equal(sent, expected, "for %s with the description %q, retrieve the 20 brands nearest to the title and the description; the candidates", hSpringJob.Title, hSpringJob.Description)
 	ctx.Equal(spring.Attributes["brand"], any("Evian"), "Evian is among the candidates retrieved from the description and the model named it; the brand")
 }
 
 func CheckStructuredOutput(ctx *harness.Ctx) {
-	extractPeer(ctx)
-	result := mustExtract(ctx, goodJob, "with a healthy extractor")
+	hExtractPeer(ctx)
+	result := hMustExtract(ctx, hGoodJob, "with a healthy extractor")
 	request := ctx.GRPC.CallsTo("Extract", "")[0].Request.(*pb.ExtractRequest)
 	ctx.Equal(request.GetSchema(), taxonomy.AttributeSchema, "send taxonomy.AttributeSchema so the model answers one JSON object; the schema")
-	ctx.Equal(result.Attributes, map[string]any{"brand": "Dove", "size": 500.0, "unit": "ml", "organic": false, "category": "body-wash"}, "the attributes of %s", goodJob.Title)
+	ctx.Equal(result.Attributes, map[string]any{"brand": "Dove", "size": 500.0, "unit": "ml", "organic": false, "category": "body-wash"}, "the attributes of %s", hGoodJob.Title)
 }
 
 func CheckDeadlineRetry(ctx *harness.Ctx) {
-	peer := extractPeer(ctx)
+	peer := hExtractPeer(ctx)
 	count := func() int { return len(ctx.GRPC.CallsTo("Extract", "")) }
 	ctx.GRPC.Fail("Extract", codes.Unavailable, "extractor restarting", 1, "")
-	mustExtract(ctx, goodJob, "after one UNAVAILABLE")
+	hMustExtract(ctx, hGoodJob, "after one UNAVAILABLE")
 	ctx.Equal(count(), 2, "one UNAVAILABLE then a healthy extractor; the calls")
 	ctx.GRPC.SetLatency("Extract", 4.0, "")
 	peer.mu.Lock()
 	peer.unavailable = 1
 	peer.mu.Unlock()
-	mustExtract(ctx, goodJob, "when the first attempt answers UNAVAILABLE after 4 s and the second answers after 4 s")
+	hMustExtract(ctx, hGoodJob, "when the first attempt answers UNAVAILABLE after 4 s and the second answers after 4 s")
 	ctx.Equal(count(), 4, "a slow UNAVAILABLE then a slow answer; the calls so far")
 	for _, call := range ctx.GRPC.CallsTo("Extract", "") {
 		ctx.Assert(call.HasDeadline() && call.Timeout >= 4500*time.Millisecond && call.Timeout <= 5500*time.Millisecond, "an Extract call carried a %v deadline, expected 5 s: every attempt gets the full deadline", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Extract", 0, "")
 	ctx.GRPC.Fail("Extract", codes.Unavailable, "extractor restarting", 2, "")
-	mustFail(ctx, goodJob, "with two UNAVAILABLEs in a row")
+	hMustFail(ctx, hGoodJob, "with two UNAVAILABLEs in a row")
 	ctx.Equal(count(), 6, "two UNAVAILABLEs in a row: at most maxAttempts (2); the calls so far")
 	ctx.GRPC.SetLatency("Extract", 10.0, "")
-	mustFail(ctx, goodJob, "with an extractor slower than the deadline")
+	hMustFail(ctx, hGoodJob, "with an extractor slower than the deadline")
 	ctx.Equal(count(), 7, "a deadline must not be retried; the calls so far")
 	ctx.GRPC.SetLatency("Extract", 0, "")
 	for _, code := range []codes.Code{codes.InvalidArgument, codes.Internal, codes.ResourceExhausted} {
 		before := count()
 		ctx.GRPC.Fail("Extract", code, "rejected", 1, "")
-		mustFail(ctx, goodJob, "with "+code.String())
+		hMustFail(ctx, hGoodJob, "with "+code.String())
 		ctx.Equal(count(), before+1, "%s must not be retried: only UNAVAILABLE earns a second attempt; the calls so far", code)
 	}
 }
 
 func CheckTaxonomyValidate(ctx *harness.Ctx) {
-	extractPeer(ctx)
-	result := mustExtract(ctx, inventedJob, "with a brand the taxonomy does not know")
+	hExtractPeer(ctx)
+	result := hMustExtract(ctx, hInventedJob, "with a brand the taxonomy does not know")
 	ctx.Assert(result.Attributes["brand"] == nil, "the model named brand %v, which is not a taxonomy candidate, and it was kept", result.Attributes["brand"])
 	ctx.Equal(result.Status, "review", "an invented brand must send the SKU to review; the status")
-	ctx.Assert(store.Pending(extractBg, "sku-2") != nil, "the SKU with an invented brand was not parked with store.EnqueueReview")
-	result = mustExtract(ctx, badUnitJob, "with a unit outside AllowedUnits")
+	ctx.Assert(store.Pending(hExtractBg, "sku-2") != nil, "the SKU with an invented brand was not parked with store.EnqueueReview")
+	result = hMustExtract(ctx, hBadUnitJob, "with a unit outside AllowedUnits")
 	ctx.Assert(result.Attributes["unit"] == nil && result.Status == "review", "a unit outside AllowedUnits must be nulled and the SKU reviewed, got %+v", result)
-	ctx.Assert(store.Pending(extractBg, "sku-3") != nil, "the SKU with an unknown unit was not parked with store.EnqueueReview")
+	ctx.Assert(store.Pending(hExtractBg, "sku-3") != nil, "the SKU with an unknown unit was not parked with store.EnqueueReview")
 	ctx.Equal(result.Attributes["brand"], any("Barilla"), "only what the taxonomy rejects is nulled: the candidate brand Barilla must stay; the brand")
-	result = mustExtract(ctx, offListJob, "with a taxonomy brand that is not among the retrieved candidates")
+	result = hMustExtract(ctx, hOffListJob, "with a taxonomy brand that is not among the retrieved candidates")
 	ctx.Assert(result.Attributes["brand"] == nil && result.Status == "review", "the model named Evian, a taxonomy brand outside the 20 candidates retrieved for this SKU: it must be nulled and the SKU reviewed, got %+v", result)
-	ctx.Assert(store.Pending(extractBg, "sku-6") != nil, "the SKU with a brand outside its candidates was not parked with store.EnqueueReview")
-	result = mustExtract(ctx, badCategory, "with a category HasCategory rejects")
+	ctx.Assert(store.Pending(hExtractBg, "sku-6") != nil, "the SKU with a brand outside its candidates was not parked with store.EnqueueReview")
+	result = hMustExtract(ctx, hBadCategory, "with a category HasCategory rejects")
 	ctx.Assert(result.Attributes["category"] == nil && result.Status == "review", "category grocery is not in the taxonomy: it must be nulled and the SKU reviewed, got %+v", result)
 	ctx.Equal(result.Attributes["brand"], any("Heinz"), "only what the taxonomy rejects is nulled: the candidate brand Heinz must stay; the brand")
-	ctx.Assert(store.Pending(extractBg, "sku-7") != nil, "the SKU with an unknown category was not parked with store.EnqueueReview")
+	ctx.Assert(store.Pending(hExtractBg, "sku-7") != nil, "the SKU with an unknown category was not parked with store.EnqueueReview")
 }
 
 func CheckConfidenceGate(ctx *harness.Ctx) {
-	extractPeer(ctx)
-	result := mustExtract(ctx, noDescription, "with a confidence of 0.6")
+	hExtractPeer(ctx)
+	result := hMustExtract(ctx, hNoDescription, "with a confidence of 0.6")
 	ctx.Equal(result.Status, "review", "a 0.6 confidence must go to review; the status")
-	proposal := store.Pending(extractBg, "sku-4")
+	proposal := store.Pending(hExtractBg, "sku-4")
 	ctx.Assert(proposal != nil && proposal.Reason != "", "the low-confidence SKU must be parked with a reason, store.Pending gives %+v", proposal)
 	ctx.Assert(result.TaxonomyVersion == taxonomy.Version && result.Source == "model", "the result must carry the taxonomy version and source, got %+v", result)
-	result = mustExtract(ctx, goodJob, "with a confident, valid answer")
+	result = hMustExtract(ctx, hGoodJob, "with a confident, valid answer")
 	ctx.Equal(result.Status, "accepted", "a clean answer at 0.95 must be accepted; the status")
-	ctx.Assert(store.Pending(extractBg, "sku-1") == nil, "a clean, confident answer must not be sent to review")
-	result = mustExtract(ctx, atGateJob, "with a confidence of exactly 0.85")
-	ctx.Assert(result.Status == "accepted" && store.Pending(extractBg, "sku-8") == nil, "a clean answer at exactly minConfidence (0.85) must be accepted, status is %q", result.Status)
-	result = mustExtract(ctx, belowGateJob, "with a confidence of 0.84")
-	ctx.Assert(result.Status == "review" && store.Pending(extractBg, "sku-9") != nil, "a clean answer at 0.84 is below minConfidence and must be parked for review, status is %q", result.Status)
+	ctx.Assert(store.Pending(hExtractBg, "sku-1") == nil, "a clean, confident answer must not be sent to review")
+	result = hMustExtract(ctx, hAtGateJob, "with a confidence of exactly 0.85")
+	ctx.Assert(result.Status == "accepted" && store.Pending(hExtractBg, "sku-8") == nil, "a clean answer at exactly minConfidence (0.85) must be accepted, status is %q", result.Status)
+	result = hMustExtract(ctx, hBelowGateJob, "with a confidence of 0.84")
+	ctx.Assert(result.Status == "review" && store.Pending(hExtractBg, "sku-9") != nil, "a clean answer at 0.84 is below minConfidence and must be parked for review, status is %q", result.Status)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1425,19 +1425,19 @@ func CheckConfidenceGate(ctx *harness.Ctx) {
 
 namespace {
 
-nlohmann::json extractJob(const std::string& sku_id, const std::string& title, const std::string& description) {
+nlohmann::json hExtractJob(const std::string& sku_id, const std::string& title, const std::string& description) {
   return {{"sku_id", sku_id}, {"merchant", "m-1"}, {"content_hash", "h"}, {"title", title}, {"description", description}, {"images", nlohmann::json::array()}};
 }
 
-const nlohmann::json kGood = extractJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "Nourishing body wash");
-const nlohmann::json kInvented = extractJob("sku-2", "GLOWRA OAT DRINK 1L", "Oat drink");
-const nlohmann::json kBadUnit = extractJob("sku-3", "BARILLA SPAGHETTI 12PACK", "Durum wheat pasta");
-const nlohmann::json kNoDescription = extractJob("sku-4", "OATLY OAT MILK 1L", "");
-const nlohmann::json kSpring = extractJob("sku-5", "NATURAL SPRING WATER 1L", "Evian, bottled at the source");
-const nlohmann::json kOffList = extractJob("sku-6", "STILL MINERAL WATER 500ML", "Still water");
-const nlohmann::json kBadCategory = extractJob("sku-7", "HEINZ TOMATO KETCHUP 500ML", "Tomato ketchup");
-const nlohmann::json kAtGate = extractJob("sku-8", "OATLY OAT MILK 1L", "confidence 0.85");
-const nlohmann::json kBelowGate = extractJob("sku-9", "OATLY OAT MILK 1L", "confidence 0.84");
+const nlohmann::json kHGood = hExtractJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "Nourishing body wash");
+const nlohmann::json kHInvented = hExtractJob("sku-2", "GLOWRA OAT DRINK 1L", "Oat drink");
+const nlohmann::json kHBadUnit = hExtractJob("sku-3", "BARILLA SPAGHETTI 12PACK", "Durum wheat pasta");
+const nlohmann::json kHNoDescription = hExtractJob("sku-4", "OATLY OAT MILK 1L", "");
+const nlohmann::json kHSpring = hExtractJob("sku-5", "NATURAL SPRING WATER 1L", "Evian, bottled at the source");
+const nlohmann::json kHOffList = hExtractJob("sku-6", "STILL MINERAL WATER 500ML", "Still water");
+const nlohmann::json kHBadCategory = hExtractJob("sku-7", "HEINZ TOMATO KETCHUP 500ML", "Tomato ketchup");
+const nlohmann::json kHAtGate = hExtractJob("sku-8", "OATLY OAT MILK 1L", "confidence 0.85");
+const nlohmann::json kHBelowGate = hExtractJob("sku-9", "OATLY OAT MILK 1L", "confidence 0.84");
 
 // While above 0 the extractor answers UNAVAILABLE (after the latency).
 std::atomic<int> hUnavailable{0};
@@ -1450,7 +1450,7 @@ std::string hLower(std::string s) {
 // The model: picks the first candidate brand in the title, or names the title's first word, and
 // names Evian for any water, listed or not; prose without a schema. A description "confidence x"
 // sets its confidence.
-class ExtractorPeer final : public catalogenrich::Extractor::Service {
+class HExtractorPeer final : public catalogenrich::Extractor::Service {
  public:
   grpc::Status Extract(grpc::ServerContext*, const catalogenrich::ExtractRequest* req, catalogenrich::ExtractReply* out) override {
     if (hUnavailable.load() > 0) {
@@ -1495,15 +1495,15 @@ class ExtractorPeer final : public catalogenrich::Extractor::Service {
   }
 };
 
-void extractPeer(harness::Ctx& ctx) {
-  static ExtractorPeer* peer = nullptr;
+void hExtractPeer(harness::Ctx& ctx) {
+  static HExtractorPeer* peer = nullptr;
   delete peer;
-  peer = new ExtractorPeer;
+  peer = new HExtractorPeer;
   hUnavailable = 0;
   ctx.GRPC.Server("")->RegisterService(peer);
 }
 
-nlohmann::json mustExtract(harness::Ctx& ctx, const nlohmann::json& job, const std::string& why) {
+nlohmann::json hMustExtract(harness::Ctx& ctx, const nlohmann::json& job, const std::string& why) {
   try {
     return extractAttributes(job);
   } catch (const std::exception& e) {
@@ -1511,7 +1511,7 @@ nlohmann::json mustExtract(harness::Ctx& ctx, const nlohmann::json& job, const s
   }
 }
 
-void mustThrow(harness::Ctx& ctx, const nlohmann::json& job, const std::string& why) {
+void hMustThrow(harness::Ctx& ctx, const nlohmann::json& job, const std::string& why) {
   nlohmann::json result;
   try {
     result = extractAttributes(job);
@@ -1524,8 +1524,8 @@ void mustThrow(harness::Ctx& ctx, const nlohmann::json& job, const std::string& 
 }  // namespace
 
 void CheckRetrieveFirst(harness::Ctx& ctx) {
-  extractPeer(ctx);
-  mustExtract(ctx, kGood, "with a healthy extractor");
+  hExtractPeer(ctx);
+  hMustExtract(ctx, kHGood, "with a healthy extractor");
   const auto calls = ctx.GRPC.CallsTo("Extract");
   ctx.Assert(!calls.empty(), "no Extract call was made");
   const auto request = calls[0].Request<catalogenrich::ExtractRequest>();
@@ -1537,10 +1537,10 @@ void CheckRetrieveFirst(harness::Ctx& ctx) {
     dove = dove || c == "Dove";
   }
   ctx.Assert(dove, "the candidates must be taxonomy::nearest_brands of the title and description, and Dove is missing");
-  auto spring = mustExtract(ctx, kSpring, "with the brand named only in the description");
+  auto spring = hMustExtract(ctx, kHSpring, "with the brand named only in the description");
   const auto last = ctx.GRPC.CallsTo("Extract").back().Request<catalogenrich::ExtractRequest>();
   std::vector<std::string> sent(last.candidate_brands().begin(), last.candidate_brands().end());
-  auto expected = taxonomy::nearest_brands(kSpring["title"].get<std::string>() + " " + kSpring["description"].get<std::string>(), 20);
+  auto expected = taxonomy::nearest_brands(kHSpring["title"].get<std::string>() + " " + kHSpring["description"].get<std::string>(), 20);
   std::sort(sent.begin(), sent.end());
   std::sort(expected.begin(), expected.end());
   ctx.Equal(sent, expected, "for NATURAL SPRING WATER 1L with the description \\"Evian, bottled at the source\\", retrieve the 20 brands nearest to the title and the description; the candidates");
@@ -1548,8 +1548,8 @@ void CheckRetrieveFirst(harness::Ctx& ctx) {
 }
 
 void CheckStructuredOutput(harness::Ctx& ctx) {
-  extractPeer(ctx);
-  const auto result = mustExtract(ctx, kGood, "with a healthy extractor");
+  hExtractPeer(ctx);
+  const auto result = hMustExtract(ctx, kHGood, "with a healthy extractor");
   const auto request = ctx.GRPC.CallsTo("Extract")[0].Request<catalogenrich::ExtractRequest>();
   ctx.Equal(request.schema(), taxonomy::kAttributeSchema, "send taxonomy::kAttributeSchema so the model answers one JSON object; the schema");
   const nlohmann::json expected = {{"brand", "Dove"}, {"size", 500.0}, {"unit", "ml"}, {"organic", false}, {"category", "body-wash"}};
@@ -1557,23 +1557,23 @@ void CheckStructuredOutput(harness::Ctx& ctx) {
 }
 
 void CheckDeadlineRetry(harness::Ctx& ctx) {
-  extractPeer(ctx);
+  hExtractPeer(ctx);
   ctx.GRPC.Fail("Extract", grpc::StatusCode::UNAVAILABLE, "extractor restarting", 1);
-  mustExtract(ctx, kGood, "after one UNAVAILABLE");
+  hMustExtract(ctx, kHGood, "after one UNAVAILABLE");
   ctx.Equal(ctx.GRPC.CallsTo("Extract").size(), 2, "one UNAVAILABLE then a healthy extractor; the calls");
   ctx.GRPC.SetLatency("Extract", 4.0);
   hUnavailable = 1;
-  mustExtract(ctx, kGood, "when the first attempt answers UNAVAILABLE after 4 s and the second answers after 4 s");
+  hMustExtract(ctx, kHGood, "when the first attempt answers UNAVAILABLE after 4 s and the second answers after 4 s");
   ctx.Equal(ctx.GRPC.CallsTo("Extract").size(), 4, "a slow UNAVAILABLE then a slow answer; the calls so far");
   for (const auto& call : ctx.GRPC.CallsTo("Extract")) {
     ctx.Assert(call.HasDeadline() && call.TimeoutSeconds() >= 4.5 && call.TimeoutSeconds() <= 5.5, "an Extract call carried a %v s deadline, expected 5: every attempt gets the full deadline", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("Extract", 0);
   ctx.GRPC.Fail("Extract", grpc::StatusCode::UNAVAILABLE, "extractor restarting", 2);
-  mustThrow(ctx, kGood, "with two UNAVAILABLEs in a row");
+  hMustThrow(ctx, kHGood, "with two UNAVAILABLEs in a row");
   ctx.Equal(ctx.GRPC.CallsTo("Extract").size(), 6, "two UNAVAILABLEs in a row: at most kMaxAttempts (2); the calls so far");
   ctx.GRPC.SetLatency("Extract", 10.0);
-  mustThrow(ctx, kGood, "with an extractor slower than the deadline");
+  hMustThrow(ctx, kHGood, "with an extractor slower than the deadline");
   ctx.Equal(ctx.GRPC.CallsTo("Extract").size(), 7, "a deadline must not be retried; the calls so far");
   ctx.GRPC.SetLatency("Extract", 0);
   const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
@@ -1581,43 +1581,43 @@ void CheckDeadlineRetry(harness::Ctx& ctx) {
   for (const auto& [code, name] : terminal) {
     const size_t before = ctx.GRPC.CallsTo("Extract").size();
     ctx.GRPC.Fail("Extract", code, "rejected", 1);
-    mustThrow(ctx, kGood, "with " + name);
+    hMustThrow(ctx, kHGood, "with " + name);
     ctx.Equal(ctx.GRPC.CallsTo("Extract").size(), before + 1, "%s must not be retried: only UNAVAILABLE earns a second attempt; the calls so far", name);
   }
 }
 
 void CheckTaxonomyValidate(harness::Ctx& ctx) {
-  extractPeer(ctx);
-  auto result = mustExtract(ctx, kInvented, "with a brand the taxonomy does not know");
+  hExtractPeer(ctx);
+  auto result = hMustExtract(ctx, kHInvented, "with a brand the taxonomy does not know");
   ctx.Assert(result["attributes"]["brand"].is_null(), "the model named brand %s, which is not a taxonomy candidate, and it was kept", result["attributes"]["brand"].dump());
   ctx.Equal(result.value("status", ""), "review", "an invented brand must send the SKU to review; the status");
   ctx.Assert(store::pending("sku-2").has_value(), "the SKU with an invented brand was not parked with store::enqueue_review");
-  result = mustExtract(ctx, kBadUnit, "with a unit outside kAllowedUnits");
+  result = hMustExtract(ctx, kHBadUnit, "with a unit outside kAllowedUnits");
   ctx.Assert(result["attributes"]["unit"].is_null() && result.value("status", "") == "review", "a unit outside kAllowedUnits must be nulled and the SKU reviewed, got %s", result.dump());
   ctx.Assert(store::pending("sku-3").has_value(), "the SKU with an unknown unit was not parked with store::enqueue_review");
   ctx.Assert(result["attributes"]["brand"] == "Barilla", "only what the taxonomy rejects is nulled: the candidate brand Barilla must stay, got %s", result["attributes"].dump());
-  result = mustExtract(ctx, kOffList, "with a taxonomy brand that is not among the retrieved candidates");
+  result = hMustExtract(ctx, kHOffList, "with a taxonomy brand that is not among the retrieved candidates");
   ctx.Assert(result["attributes"]["brand"].is_null() && result.value("status", "") == "review", "the model named Evian, a taxonomy brand outside the 20 candidates retrieved for this SKU: it must be nulled and the SKU reviewed, got %s", result.dump());
   ctx.Assert(store::pending("sku-6").has_value(), "the SKU with a brand outside its candidates was not parked with store::enqueue_review");
-  result = mustExtract(ctx, kBadCategory, "with a category has_category rejects");
+  result = hMustExtract(ctx, kHBadCategory, "with a category has_category rejects");
   ctx.Assert(result["attributes"]["category"].is_null() && result.value("status", "") == "review", "category grocery is not in the taxonomy: it must be nulled and the SKU reviewed, got %s", result.dump());
   ctx.Assert(result["attributes"]["brand"] == "Heinz", "only what the taxonomy rejects is nulled: the candidate brand Heinz must stay, got %s", result["attributes"].dump());
   ctx.Assert(store::pending("sku-7").has_value(), "the SKU with an unknown category was not parked with store::enqueue_review");
 }
 
 void CheckConfidenceGate(harness::Ctx& ctx) {
-  extractPeer(ctx);
-  auto result = mustExtract(ctx, kNoDescription, "with a confidence of 0.6");
+  hExtractPeer(ctx);
+  auto result = hMustExtract(ctx, kHNoDescription, "with a confidence of 0.6");
   ctx.Equal(result.value("status", ""), "review", "a 0.6 confidence must go to review; the status");
   const auto proposal = store::pending("sku-4");
   ctx.Assert(proposal && !(*proposal)["reason"].get<std::string>().empty(), "the low-confidence SKU must be parked with a reason");
   ctx.Assert(result.value("taxonomy_version", "") == taxonomy::kVersion && result.value("source", "") == "model", "the result must carry taxonomy_version and source, got %s", result.dump());
-  result = mustExtract(ctx, kGood, "with a confident, valid answer");
+  result = hMustExtract(ctx, kHGood, "with a confident, valid answer");
   ctx.Equal(result.value("status", ""), "accepted", "a clean answer at 0.95 must be accepted; the status");
   ctx.Assert(!store::pending("sku-1").has_value(), "a clean, confident answer must not be sent to review");
-  result = mustExtract(ctx, kAtGate, "with a confidence of exactly 0.85");
+  result = hMustExtract(ctx, kHAtGate, "with a confidence of exactly 0.85");
   ctx.Assert(result.value("status", "") == "accepted" && !store::pending("sku-8").has_value(), "a clean answer at exactly kMinConfidence (0.85) must be accepted, status is %s", result.value("status", ""));
-  result = mustExtract(ctx, kBelowGate, "with a confidence of 0.84");
+  result = hMustExtract(ctx, kHBelowGate, "with a confidence of 0.84");
   ctx.Assert(result.value("status", "") == "review" && store::pending("sku-9").has_value(), "a clean answer at 0.84 is below kMinConfidence and must be parked for review, status is %s", result.value("status", ""));
 }
 `,

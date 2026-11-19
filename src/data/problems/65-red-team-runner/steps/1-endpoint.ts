@@ -878,38 +878,38 @@ import (
 	"leetbuild/harness"
 )
 
-var apiGood = map[string]any{"target": "checkout-shadow", "probe_set": "baseline"}
+var hApiGood = map[string]any{"target": "checkout-shadow", "probe_set": "baseline"}
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiWith(field string, value any) map[string]any {
+func hApiWith(field string, value any) map[string]any {
 	out := map[string]any{}
-	for k, v := range apiGood {
+	for k, v := range hApiGood {
 		out[k] = v
 	}
 	out[field] = value
 	return out
 }
 
-func apiPost(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
+func hApiPost(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
 	return c.Post("/v1/redteam/runs", body, "X-Tenant-Id", tenant, "Idempotency-Key", key)
 }
 
-func apiRun(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hApiRun(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	run, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	return run
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiGood, "k-1", "t1")
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiGood, "k-1", "t1")
 	ctx.Equal(r.Status, 201, "a valid start (%s)", r.Text())
-	run := apiRun(ctx, r)
+	run := hApiRun(ctx, r)
 	for _, key := range []string{"run_id", "status", "target", "endpoint", "probe_set", "plan", "probes"} {
 		_, ok := run[key]
 		ctx.Assert(ok, "the 201 body lacks %s: %s", key, r.Text())
@@ -919,57 +919,57 @@ func CheckRoute(ctx *harness.Ctx) {
 	id, _ := run["run_id"].(string)
 	_, stored := ctx.Redis.Get("redteam:run:" + id)
 	ctx.Assert(stored, "the run %s must be in the run store (redteam:run:{id}): keys %v", id, ctx.Redis.Keys("redteam:*"))
-	noTenant := c.Post("/v1/redteam/runs", apiGood, "Idempotency-Key", "k-1")
+	noTenant := c.Post("/v1/redteam/runs", hApiGood, "Idempotency-Key", "k-1")
 	ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the start")
 }
 
 func CheckResolveRegisteredTarget(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiWith("target", "billing-db.internal:5432"), "k-bad", "t1")
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiWith("target", "billing-db.internal:5432"), "k-bad", "t1")
 	ctx.Equal(r.Status, 400, "a target nobody registered (billing-db.internal:5432): the runner would point probes at whatever host the caller typed")
 	ctx.Equal(len(ctx.Redis.Keys("redteam:run:*")), 0, "a refused start must store no run; runs stored")
-	r = apiPost(c, apiWith("target", "search-staging"), "k-ok", "t1")
+	r = hApiPost(c, hApiWith("target", "search-staging"), "k-ok", "t1")
 	ctx.Equal(r.Status, 201, "search-staging is registered (%s)", r.Text())
-	ctx.Equal(apiRun(ctx, r)["endpoint"], "search-staging.sandbox.internal", "the caller names a target, the registry says where it lives; the run's endpoint")
+	ctx.Equal(hApiRun(ctx, r)["endpoint"], "search-staging.sandbox.internal", "the caller names a target, the registry says where it lives; the run's endpoint")
 }
 
 func CheckRefuseProduction(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiWith("target", "payments-prod"), "k-prod", "t1")
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiWith("target", "payments-prod"), "k-prod", "t1")
 	ctx.Equal(r.Status, 403, "payments-prod is registered with environment production")
 	ctx.Equal(len(ctx.Redis.Keys("redteam:run:*")), 0, "a refused production target must store no run; runs stored")
-	r = apiPost(c, apiWith("target", "ledger-primary"), "k-ledger", "t1")
+	r = hApiPost(c, hApiWith("target", "ledger-primary"), "k-ledger", "t1")
 	ctx.Equal(r.Status, 403, "ledger-primary is registered with environment production: the registry's environment decides, not the target's name")
 	ctx.Equal(len(ctx.Redis.Keys("redteam:run:*")), 0, "a refused production target must store no run; runs stored")
-	r = apiPost(c, apiWith("target", "checkout-shadow"), "k-shadow", "t1")
+	r = hApiPost(c, hApiWith("target", "checkout-shadow"), "k-shadow", "t1")
 	ctx.Equal(r.Status, 201, "a shadow target is fine (%s)", r.Text())
 }
 
 func CheckIdempotentReplay(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	noKey := c.Post("/v1/redteam/runs", apiGood, "X-Tenant-Id", "t1")
+	c := hApiClient(ctx)
+	noKey := c.Post("/v1/redteam/runs", hApiGood, "X-Tenant-Id", "t1")
 	ctx.Equal(noKey.Status, 400, "a start without Idempotency-Key")
-	emptyKey := apiPost(c, apiGood, "", "t1")
+	emptyKey := hApiPost(c, hApiGood, "", "t1")
 	ctx.Equal(emptyKey.Status, 400, "a start with an empty Idempotency-Key (an empty key is no key)")
 	ctx.Equal(len(ctx.Redis.Keys("redteam:run:*")), 0, "a start without a usable Idempotency-Key must store no run; runs stored")
-	first := apiPost(c, apiGood, "k-7", "t1")
+	first := hApiPost(c, hApiGood, "k-7", "t1")
 	ctx.Equal(first.Status, 201, "the first start (%s)", first.Text())
-	replay := apiPost(c, apiGood, "k-7", "t1")
+	replay := hApiPost(c, hApiGood, "k-7", "t1")
 	ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored run (the client retried; it must not start a second run against the target)")
-	ctx.Equal(apiRun(ctx, replay)["run_id"], apiRun(ctx, first)["run_id"], "the replay must answer the same run")
+	ctx.Equal(hApiRun(ctx, replay)["run_id"], hApiRun(ctx, first)["run_id"], "the replay must answer the same run")
 	ctx.Equal(len(ctx.Redis.Keys("redteam:run:*")), 1, "one key, one run: runs stored after a start and its replay")
-	other := apiPost(c, apiGood, "k-7", "t2")
-	ctx.Assert(other.Status == 201 && apiRun(ctx, other)["run_id"] != apiRun(ctx, first)["run_id"], "another tenant reusing the key gets its own run (keys are per tenant)")
+	other := hApiPost(c, hApiGood, "k-7", "t2")
+	ctx.Assert(other.Status == 201 && hApiRun(ctx, other)["run_id"] != hApiRun(ctx, first)["run_id"], "another tenant reusing the key gets its own run (keys are per tenant)")
 }
 
 func CheckKnownProbeSet(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiWith("probe_set", "everything"), "k-bad", "t1")
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiWith("probe_set", "everything"), "k-bad", "t1")
 	ctx.Equal(r.Status, 400, "a probe set the catalog lacks (everything) must not turn into another set")
 	ctx.Equal(len(ctx.Redis.Keys("redteam:run:*")), 0, "a refused probe set must store no run; runs stored")
-	r = apiPost(c, apiWith("probe_set", "injection-only"), "k-inj", "t1")
+	r = hApiPost(c, hApiWith("probe_set", "injection-only"), "k-inj", "t1")
 	ctx.Equal(r.Status, 201, "injection-only is in the catalog (%s)", r.Text())
-	run := apiRun(ctx, r)
+	run := hApiRun(ctx, r)
 	ctx.Equal(run["plan"], []any{map[string]any{"category": "prompt-injection", "probes": float64(6)}}, "the run carries the catalog's plan for injection-only")
 	ctx.Equal(run["probes"], float64(6), "injection-only plans 6 probes; the run's probes")
 }
@@ -984,7 +984,7 @@ namespace {
 
 using json = nlohmann::json;
 
-const json kGood = {{"target", "checkout-shadow"}, {"probe_set", "baseline"}};
+const json kHGood = {{"target", "checkout-shadow"}, {"probe_set", "baseline"}};
 
 struct HarnessApi {
   httplib::Server svr;
@@ -1011,7 +1011,7 @@ json harnessRunOf(harness::Ctx& ctx, const harness::Response& r) {
 
 void CheckRoute(harness::Ctx& ctx) {
   HarnessApi api(ctx);
-  const auto r = api.post(kGood);
+  const auto r = api.post(kHGood);
   ctx.Equal(r.Status, 201, "a valid start (%s)", r.Text());
   const json run = harnessRunOf(ctx, r);
   for (const char* key : {"run_id", "status", "target", "endpoint", "probe_set", "plan", "probes"}) {
@@ -1021,55 +1021,55 @@ void CheckRoute(harness::Ctx& ctx) {
   ctx.Assert(run["probes"] == 10, "the baseline set plans 10 probes, the run says %s", run["probes"].dump());
   const std::string id = run["run_id"].is_string() ? run["run_id"].get<std::string>() : "";
   ctx.Assert(ctx.Redis.Get("redteam:run:" + id).has_value(), "the run %s must be in the run store (redteam:run:{id}): keys %v", id, ctx.Redis.Keys("redteam:*"));
-  const auto noTenant = api.http.Post("/v1/redteam/runs", kGood.dump(), "Idempotency-Key", "k-1");
+  const auto noTenant = api.http.Post("/v1/redteam/runs", kHGood.dump(), "Idempotency-Key", "k-1");
   ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the start");
 }
 
 void CheckResolveRegisteredTarget(harness::Ctx& ctx) {
   HarnessApi api(ctx);
-  auto r = api.post(harnessWith(kGood, "target", "billing-db.internal:5432"), "k-bad");
+  auto r = api.post(harnessWith(kHGood, "target", "billing-db.internal:5432"), "k-bad");
   ctx.Equal(r.Status, 400, "a target nobody registered (billing-db.internal:5432): the runner would point probes at whatever host the caller typed");
   ctx.Equal(ctx.Redis.Keys("redteam:run:*").size(), 0, "a refused start must store no run; runs stored");
-  r = api.post(harnessWith(kGood, "target", "search-staging"), "k-ok");
+  r = api.post(harnessWith(kHGood, "target", "search-staging"), "k-ok");
   ctx.Equal(r.Status, 201, "search-staging is registered (%s)", r.Text());
   ctx.Assert(harnessRunOf(ctx, r).value("endpoint", "") == "search-staging.sandbox.internal", "the run's endpoint must be the registry's (search-staging.sandbox.internal): the caller names a target, the registry says where it lives (%s)", r.Text());
 }
 
 void CheckRefuseProduction(harness::Ctx& ctx) {
   HarnessApi api(ctx);
-  auto r = api.post(harnessWith(kGood, "target", "payments-prod"), "k-prod");
+  auto r = api.post(harnessWith(kHGood, "target", "payments-prod"), "k-prod");
   ctx.Equal(r.Status, 403, "payments-prod is registered with environment production");
   ctx.Equal(ctx.Redis.Keys("redteam:run:*").size(), 0, "a refused production target must store no run; runs stored");
-  r = api.post(harnessWith(kGood, "target", "ledger-primary"), "k-ledger");
+  r = api.post(harnessWith(kHGood, "target", "ledger-primary"), "k-ledger");
   ctx.Equal(r.Status, 403, "ledger-primary is registered with environment production: the registry's environment decides, not the target's name");
   ctx.Equal(ctx.Redis.Keys("redteam:run:*").size(), 0, "a refused production target must store no run; runs stored");
-  r = api.post(harnessWith(kGood, "target", "checkout-shadow"), "k-shadow");
+  r = api.post(harnessWith(kHGood, "target", "checkout-shadow"), "k-shadow");
   ctx.Equal(r.Status, 201, "a shadow target is fine (%s)", r.Text());
 }
 
 void CheckIdempotentReplay(harness::Ctx& ctx) {
   HarnessApi api(ctx);
-  const auto noKey = api.http.Post("/v1/redteam/runs", kGood.dump(), "X-Tenant-Id", "t1");
+  const auto noKey = api.http.Post("/v1/redteam/runs", kHGood.dump(), "X-Tenant-Id", "t1");
   ctx.Equal(noKey.Status, 400, "a start without Idempotency-Key");
-  const auto emptyKey = api.post(kGood, "");
+  const auto emptyKey = api.post(kHGood, "");
   ctx.Equal(emptyKey.Status, 400, "a start with an empty Idempotency-Key (an empty key is no key)");
   ctx.Equal(ctx.Redis.Keys("redteam:run:*").size(), 0, "a start without a usable Idempotency-Key must store no run; runs stored");
-  const auto first = api.post(kGood, "k-7");
+  const auto first = api.post(kHGood, "k-7");
   ctx.Equal(first.Status, 201, "the first start (%s)", first.Text());
-  const auto replay = api.post(kGood, "k-7");
+  const auto replay = api.post(kHGood, "k-7");
   ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored run (the client retried; it must not start a second run against the target)");
   ctx.Equal(harnessRunOf(ctx, replay)["run_id"], harnessRunOf(ctx, first)["run_id"], "the replay must answer the same run");
   ctx.Equal(ctx.Redis.Keys("redteam:run:*").size(), 1, "one key, one run: runs stored after a start and its replay");
-  const auto other = api.post(kGood, "k-7", "t2");
+  const auto other = api.post(kHGood, "k-7", "t2");
   ctx.Assert(other.Status == 201 && harnessRunOf(ctx, other)["run_id"] != harnessRunOf(ctx, first)["run_id"], "another tenant reusing the key gets its own run (keys are per tenant)");
 }
 
 void CheckKnownProbeSet(harness::Ctx& ctx) {
   HarnessApi api(ctx);
-  auto r = api.post(harnessWith(kGood, "probe_set", "everything"), "k-bad");
+  auto r = api.post(harnessWith(kHGood, "probe_set", "everything"), "k-bad");
   ctx.Equal(r.Status, 400, "a probe set the catalog lacks (everything) must not turn into another set");
   ctx.Equal(ctx.Redis.Keys("redteam:run:*").size(), 0, "a refused probe set must store no run; runs stored");
-  r = api.post(harnessWith(kGood, "probe_set", "injection-only"), "k-inj");
+  r = api.post(harnessWith(kHGood, "probe_set", "injection-only"), "k-inj");
   ctx.Equal(r.Status, 201, "injection-only is in the catalog (%s)", r.Text());
   const json run = harnessRunOf(ctx, r);
   ctx.Assert(run["plan"] == json::array({{{"category", "prompt-injection"}, {"probes", 6}}}) && run["probes"] == 6,

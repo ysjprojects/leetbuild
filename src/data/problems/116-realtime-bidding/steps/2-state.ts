@@ -686,16 +686,16 @@ import (
 	"leetbuild/harness"
 )
 
-const stateCap = 1000
+const kHStateCap = 1000
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func stateDay(ctx *harness.Ctx) string { return ctx.Clock.Time().UTC().Format("20060102") }
+func hStateDay(ctx *harness.Ctx) string { return ctx.Clock.Time().UTC().Format("20060102") }
 
-func stateSetup(ctx *harness.Ctx) { ctx.Redis.Set("cap:b-1", stateCap) }
+func hStateSetup(ctx *harness.Ctx) { ctx.Redis.Set("cap:b-1", kHStateCap) }
 
 // stateSpent is every cent the bidder's counters hold, whatever the key.
-func stateSpent(ctx *harness.Ctx, bidder string) int64 {
+func hStateSpent(ctx *harness.Ctx, bidder string) int64 {
 	var sum int64
 	for _, k := range ctx.Redis.Keys("spend:" + bidder + "*") {
 		v, _ := ctx.Redis.Get(k)
@@ -705,33 +705,33 @@ func stateSpent(ctx *harness.Ctx, bidder string) int64 {
 	return sum
 }
 
-func stateClaim(ctx *harness.Ctx, bidder, auctionID string, cents int64) bool {
-	ok, err := claim(stateBg, bidder, auctionID, cents)
+func hStateClaim(ctx *harness.Ctx, bidder, auctionID string, cents int64) bool {
+	ok, err := claim(hStateBg, bidder, auctionID, cents)
 	ctx.NoError(err, "claim(%s, %s, %d) failed", bidder, auctionID, cents)
 	return ok
 }
 
-func stateSettle(ctx *harness.Ctx, bidder, auctionID string, won bool) int64 {
-	n, err := settle(stateBg, bidder, auctionID, won)
+func hStateSettle(ctx *harness.Ctx, bidder, auctionID string, won bool) int64 {
+	n, err := settle(hStateBg, bidder, auctionID, won)
 	ctx.NoError(err, "settle(%s, %s, %v) failed", bidder, auctionID, won)
 	return n
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
-	stateSetup(ctx)
+	hStateSetup(ctx)
 	fired, rival := false, false
 	var rivalErr error
 	race := func() any {
 		if !fired {
 			fired = true
-			rival, rivalErr = claim(stateBg, "b-1", "a-2", 600)
+			rival, rivalErr = claim(hStateBg, "b-1", "a-2", 600)
 		}
 		return nil
 	}
 	// A second bid claims the same headroom right after this claim first touches the counter.
 	ctx.Redis.After("spend:b-1", race)
-	ctx.Redis.After("spend:b-1:"+stateDay(ctx), race)
-	ours := stateClaim(ctx, "b-1", "a-1", 600)
+	ctx.Redis.After("spend:b-1:"+hStateDay(ctx), race)
+	ours := hStateClaim(ctx, "b-1", "a-1", 600)
 	ctx.Assert(fired, "claim never touched the bidder's spend counter (spend:b-1:{yyyymmdd})")
 	ctx.NoError(rivalErr, "the racing claim failed")
 	passed := 0
@@ -740,81 +740,81 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 			passed++
 		}
 	}
-	ctx.Assert(passed == 1, "two claims of 600 raced for a cap of 1000 and %d passed (the counters hold %d): the check and the INCRBY must run in one script", passed, stateSpent(ctx, "b-1"))
-	ctx.Equal(stateSpent(ctx, "b-1"), 600, "after one passing claim of 600, the counters")
-	ctx.Equal(stateClaim(ctx, "b-1", "a-3", 400), true, "with 600 of a 1000 cap spent a claim of 400 reaches the cap exactly and must pass; passed")
-	ctx.Assert(!stateClaim(ctx, "b-1", "a-4", 1) && stateSpent(ctx, "b-1") == 1000, "with the cap reached a claim of 1 must be refused; the counters hold %d", stateSpent(ctx, "b-1"))
+	ctx.Assert(passed == 1, "two claims of 600 raced for a cap of 1000 and %d passed (the counters hold %d): the check and the INCRBY must run in one script", passed, hStateSpent(ctx, "b-1"))
+	ctx.Equal(hStateSpent(ctx, "b-1"), 600, "after one passing claim of 600, the counters")
+	ctx.Equal(hStateClaim(ctx, "b-1", "a-3", 400), true, "with 600 of a 1000 cap spent a claim of 400 reaches the cap exactly and must pass; passed")
+	ctx.Assert(!hStateClaim(ctx, "b-1", "a-4", 1) && hStateSpent(ctx, "b-1") == 1000, "with the cap reached a claim of 1 must be refused; the counters hold %d", hStateSpent(ctx, "b-1"))
 }
 
 func CheckReleaseOnLoss(ctx *harness.Ctx) {
-	stateSetup(ctx)
-	ctx.Equal(stateClaim(ctx, "b-1", "a-1", 600), true, "a claim of 600 under a cap of 1000 must pass; passed")
-	ctx.Equal(stateSettle(ctx, "b-1", "a-1", false), 600, "settle of a lost auction that claimed 600 must give it back (a lost auction spends nothing); given back")
-	ctx.Equal(stateSpent(ctx, "b-1"), 0, "after the loss, the counters")
-	ctx.Equal(stateClaim(ctx, "b-1", "a-2", 900), true, "with the loss given back a claim of 900 must fit the cap of 1000; passed")
-	ctx.Equal(stateSettle(ctx, "b-1", "a-2", true), 0, "a won auction keeps its charge; given back")
-	ctx.Equal(stateSpent(ctx, "b-1"), 900, "after a win of 900, the counters")
+	hStateSetup(ctx)
+	ctx.Equal(hStateClaim(ctx, "b-1", "a-1", 600), true, "a claim of 600 under a cap of 1000 must pass; passed")
+	ctx.Equal(hStateSettle(ctx, "b-1", "a-1", false), 600, "settle of a lost auction that claimed 600 must give it back (a lost auction spends nothing); given back")
+	ctx.Equal(hStateSpent(ctx, "b-1"), 0, "after the loss, the counters")
+	ctx.Equal(hStateClaim(ctx, "b-1", "a-2", 900), true, "with the loss given back a claim of 900 must fit the cap of 1000; passed")
+	ctx.Equal(hStateSettle(ctx, "b-1", "a-2", true), 0, "a won auction keeps its charge; given back")
+	ctx.Equal(hStateSpent(ctx, "b-1"), 900, "after a win of 900, the counters")
 }
 
 func CheckReleaseOnce(ctx *harness.Ctx) {
-	stateSetup(ctx)
-	stateClaim(ctx, "b-1", "a-1", 600)
-	stateClaim(ctx, "b-1", "a-2", 300)
-	first := stateSettle(ctx, "b-1", "a-1", false)
-	second := stateSettle(ctx, "b-1", "a-1", false) // the exchange delivered the loss notice twice
+	hStateSetup(ctx)
+	hStateClaim(ctx, "b-1", "a-1", 600)
+	hStateClaim(ctx, "b-1", "a-2", 300)
+	first := hStateSettle(ctx, "b-1", "a-1", false)
+	second := hStateSettle(ctx, "b-1", "a-1", false) // the exchange delivered the loss notice twice
 	ctx.Assert(first == 600 && second == 0, "two loss notices for one claim of 600 gave back %d then %d, expected 600 once", first, second)
-	ctx.Equal(stateSpent(ctx, "b-1"), 300, "after a duplicate loss notice the counters must hold the 300 still claimed; they hold")
-	ctx.Equal(stateSettle(ctx, "b-1", "a-9", false), 0, "a loss notice for an auction never claimed; given back")
-	ctx.Equal(stateSettle(ctx, "b-1", "a-2", true), 0, "a won auction keeps its charge; given back")
-	ctx.Equal(stateSettle(ctx, "b-1", "a-2", false), 0, "a loss notice after the win of a-2; given back")
-	ctx.Equal(stateSpent(ctx, "b-1"), 300, "the counters must hold the 300 a-2 won; they hold")
-	stateClaim(ctx, "b-1", "a-3", 200)
+	ctx.Equal(hStateSpent(ctx, "b-1"), 300, "after a duplicate loss notice the counters must hold the 300 still claimed; they hold")
+	ctx.Equal(hStateSettle(ctx, "b-1", "a-9", false), 0, "a loss notice for an auction never claimed; given back")
+	ctx.Equal(hStateSettle(ctx, "b-1", "a-2", true), 0, "a won auction keeps its charge; given back")
+	ctx.Equal(hStateSettle(ctx, "b-1", "a-2", false), 0, "a loss notice after the win of a-2; given back")
+	ctx.Equal(hStateSpent(ctx, "b-1"), 300, "the counters must hold the 300 a-2 won; they hold")
+	hStateClaim(ctx, "b-1", "a-3", 200)
 	var rival int64
 	raced := false
 	// A second loss notice for a-3 is handled right after the first one first touches the claim.
 	ctx.Redis.After("claim:b-1:a-3", func() any {
 		if !raced {
 			raced = true
-			rival, _ = settle(stateBg, "b-1", "a-3", false)
+			rival, _ = settle(hStateBg, "b-1", "a-3", false)
 		}
 		return nil
 	})
-	ours := stateSettle(ctx, "b-1", "a-3", false)
-	ctx.Assert(ours+rival == 200 && stateSpent(ctx, "b-1") == 300, "two racing loss notices for a claim of 200 gave back %d and %d and left the counters at %d: reading the claim, deleting it and the DECRBY must be one script", ours, rival, stateSpent(ctx, "b-1"))
+	ours := hStateSettle(ctx, "b-1", "a-3", false)
+	ctx.Assert(ours+rival == 200 && hStateSpent(ctx, "b-1") == 300, "two racing loss notices for a claim of 200 gave back %d and %d and left the counters at %d: reading the claim, deleting it and the DECRBY must be one script", ours, rival, hStateSpent(ctx, "b-1"))
 	ctx.Redis.Set("cap:b-2", 1000)
-	ctx.Assert(stateClaim(ctx, "b-1", "a-5", 100) && stateClaim(ctx, "b-2", "a-5", 500), "claims of 100 by b-1 and 500 by b-2 for the same auction must both pass")
-	ctx.Equal(stateSettle(ctx, "b-1", "a-5", false), 100, "b-1's loss of a-5 must give back b-1's 100 (the claim is per bidder and auction); given back")
-	ctx.Equal(stateSpent(ctx, "b-2"), 500, "b-2's claim of a-5 must be untouched by b-1's loss; b-2's counters")
-	ctx.Equal(stateSettle(ctx, "b-2", "a-5", false), 500, "b-2's loss of a-5; given back")
+	ctx.Assert(hStateClaim(ctx, "b-1", "a-5", 100) && hStateClaim(ctx, "b-2", "a-5", 500), "claims of 100 by b-1 and 500 by b-2 for the same auction must both pass")
+	ctx.Equal(hStateSettle(ctx, "b-1", "a-5", false), 100, "b-1's loss of a-5 must give back b-1's 100 (the claim is per bidder and auction); given back")
+	ctx.Equal(hStateSpent(ctx, "b-2"), 500, "b-2's claim of a-5 must be untouched by b-1's loss; b-2's counters")
+	ctx.Equal(hStateSettle(ctx, "b-2", "a-5", false), 500, "b-2's loss of a-5; given back")
 }
 
 func CheckDailyWindow(ctx *harness.Ctx) {
-	stateSetup(ctx)
+	hStateSetup(ctx)
 	now := ctx.Clock.Time().UTC()
 	ctx.Clock.AdvanceBy(now.Truncate(24*time.Hour).Add(24*time.Hour + 10*time.Second).Sub(now)) // 00:00:10 UTC: the next hour stays on this day
-	key := "spend:b-1:" + stateDay(ctx)
+	key := "spend:b-1:" + hStateDay(ctx)
 	var created int64
 	probe := ctx.Redis.After(key, func() any {
 		created = ctx.Redis.TTL(key)
 		return nil
 	})
-	ctx.Equal(stateClaim(ctx, "b-1", "a-1", 900), true, "a claim of 900 under a cap of 1000 must pass; passed")
+	ctx.Equal(hStateClaim(ctx, "b-1", "a-1", 900), true, "a claim of 900 under a cap of 1000 must pass; passed")
 	got, _ := ctx.Redis.Get(key)
 	ctx.Equal(got, "900", "the counter must be per UTC day (keys %q); %s", ctx.Redis.Keys("spend:*"), key)
 	ctx.Assert(probe.Fired && created > 0 && created <= 2*86400, "right after the claim first wrote %s its TTL was %d: the script itself sets the expiry, at most two days, on its first write", key, created)
 	ttl := ctx.Redis.TTL("claim:b-1:a-1")
 	ctx.Assert(ttl > 0 && ttl <= 2*86400, "claim:b-1:a-1 has TTL %d: the claim hash expires with the counter", ttl)
 	ctx.Clock.AdvanceBy(time.Hour)
-	ctx.Equal(stateClaim(ctx, "b-1", "a-2", 50), true, "an hour later a claim of 50 must fit the 100 left; passed")
+	ctx.Equal(hStateClaim(ctx, "b-1", "a-2", 50), true, "an hour later a claim of 50 must fit the 100 left; passed")
 	ttl = ctx.Redis.TTL(key)
 	ctx.Assert(ttl > 0 && ttl <= 2*86400-3600, "an hour after its first write %s has TTL %d: the expiry is set on the first write, not pushed back by every claim", key, ttl)
-	ctx.Equal(stateClaim(ctx, "b-1", "a-3", 200), false, "the same day a claim of 200 must not fit the 50 left; passed")
+	ctx.Equal(hStateClaim(ctx, "b-1", "a-3", 200), false, "the same day a claim of 200 must not fit the 50 left; passed")
 	ctx.Clock.AdvanceBy(24 * time.Hour)
-	ctx.Equal(stateClaim(ctx, "b-1", "a-4", 200), true, "a new UTC day must start with a fresh cap; passed")
-	today := "spend:b-1:" + stateDay(ctx)
+	ctx.Equal(hStateClaim(ctx, "b-1", "a-4", 200), true, "a new UTC day must start with a fresh cap; passed")
+	today := "spend:b-1:" + hStateDay(ctx)
 	got, _ = ctx.Redis.Get(today)
 	ctx.Equal(got, "200", "the new day's counter")
-	ctx.Equal(stateSettle(ctx, "b-1", "a-1", false), 900, "yesterday's lost auction must give back its 900; given back")
+	ctx.Equal(hStateSettle(ctx, "b-1", "a-1", false), 900, "yesterday's lost auction must give back its 900; given back")
 	got, _ = ctx.Redis.Get(today)
 	old, _ := ctx.Redis.Get(key)
 	ctx.Assert(got == "200" && old == "50", "a loss gives back to the counter its claim came from: yesterday's %s holds %q (expected 50), today's %q (expected 200)", key, old, got)
@@ -829,9 +829,9 @@ func CheckDailyWindow(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr long kStateCap = 1000;
+constexpr long kHStateCap = 1000;
 
-std::string stateDay() {
+std::string hStateDay() {
   const std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
   std::tm utc{};
   gmtime_r(&now, &utc);
@@ -840,16 +840,16 @@ std::string stateDay() {
   return out;
 }
 
-void stateSetup(harness::Ctx& ctx) { ctx.Redis.Set("cap:b-1", kStateCap); }
+void hStateSetup(harness::Ctx& ctx) { ctx.Redis.Set("cap:b-1", kHStateCap); }
 
 // Every cent the bidder's counters hold, whatever the key.
-long stateSpent(harness::Ctx& ctx, const std::string& bidder = "b-1") {
+long hStateSpent(harness::Ctx& ctx, const std::string& bidder = "b-1") {
   long sum = 0;
   for (const auto& k : ctx.Redis.Keys("spend:" + bidder + "*")) sum += std::stol(ctx.Redis.Get(k).value_or("0"));
   return sum;
 }
 
-struct StateRival {
+struct HStateRival {
   bool fired = false;
   bool passed = false;
   long given = 0;
@@ -859,8 +859,8 @@ struct StateRival {
 }  // namespace
 
 void CheckAtomicClaim(harness::Ctx& ctx) {
-  stateSetup(ctx);
-  auto rival = std::make_shared<StateRival>();
+  hStateSetup(ctx);
+  auto rival = std::make_shared<HStateRival>();
   const auto race = [rival] {
     if (rival->fired) return;
     rival->fired = true;
@@ -872,41 +872,41 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
   };
   // A second bid claims the same headroom right after this claim first touches the counter.
   ctx.Redis.After("spend:b-1", race);
-  ctx.Redis.After("spend:b-1:" + stateDay(), race);
+  ctx.Redis.After("spend:b-1:" + hStateDay(), race);
   const bool ours = claim("b-1", "a-1", 600);
   ctx.Assert(rival->fired, "claim never touched the bidder's spend counter (spend:b-1:{yyyymmdd})");
   ctx.Assert(rival->error.empty(), "the racing claim failed: %s", rival->error);
   const int passed = (ours ? 1 : 0) + (rival->passed ? 1 : 0);
-  ctx.Assert(passed == 1, "two claims of 600 raced for a cap of 1000 and %d passed (the counters hold %d): the check and the INCRBY must run in one script", passed, stateSpent(ctx));
-  ctx.Equal(stateSpent(ctx), 600, "after one passing claim of 600, the counters");
+  ctx.Assert(passed == 1, "two claims of 600 raced for a cap of 1000 and %d passed (the counters hold %d): the check and the INCRBY must run in one script", passed, hStateSpent(ctx));
+  ctx.Equal(hStateSpent(ctx), 600, "after one passing claim of 600, the counters");
   ctx.Equal(claim("b-1", "a-3", 400), true, "with 600 of a 1000 cap spent a claim of 400 reaches the cap exactly and must pass; passed");
-  ctx.Assert(!claim("b-1", "a-4", 1) && stateSpent(ctx) == 1000, "with the cap reached a claim of 1 must be refused; the counters hold %d", stateSpent(ctx));
+  ctx.Assert(!claim("b-1", "a-4", 1) && hStateSpent(ctx) == 1000, "with the cap reached a claim of 1 must be refused; the counters hold %d", hStateSpent(ctx));
 }
 
 void CheckReleaseOnLoss(harness::Ctx& ctx) {
-  stateSetup(ctx);
+  hStateSetup(ctx);
   ctx.Equal(claim("b-1", "a-1", 600), true, "a claim of 600 under a cap of 1000 must pass; passed");
   ctx.Equal(settle("b-1", "a-1", false), 600, "settle of a lost auction that claimed 600 must give it back (a lost auction spends nothing); given back");
-  ctx.Equal(stateSpent(ctx), 0, "after the loss, the counters");
+  ctx.Equal(hStateSpent(ctx), 0, "after the loss, the counters");
   ctx.Equal(claim("b-1", "a-2", 900), true, "with the loss given back a claim of 900 must fit the cap of 1000; passed");
   ctx.Equal(settle("b-1", "a-2", true), 0, "a won auction keeps its charge; given back");
-  ctx.Equal(stateSpent(ctx), 900, "after a win of 900, the counters");
+  ctx.Equal(hStateSpent(ctx), 900, "after a win of 900, the counters");
 }
 
 void CheckReleaseOnce(harness::Ctx& ctx) {
-  stateSetup(ctx);
+  hStateSetup(ctx);
   claim("b-1", "a-1", 600);
   claim("b-1", "a-2", 300);
   const long first = settle("b-1", "a-1", false);
   const long second = settle("b-1", "a-1", false);  // the exchange delivered the loss notice twice
   ctx.Assert(first == 600 && second == 0, "two loss notices for one claim of 600 gave back %d then %d, expected 600 once", first, second);
-  ctx.Equal(stateSpent(ctx), 300, "after a duplicate loss notice the counters must hold the 300 still claimed; they hold");
+  ctx.Equal(hStateSpent(ctx), 300, "after a duplicate loss notice the counters must hold the 300 still claimed; they hold");
   ctx.Equal(settle("b-1", "a-9", false), 0, "a loss notice for an auction never claimed; given back");
   ctx.Equal(settle("b-1", "a-2", true), 0, "a won auction keeps its charge; given back");
   ctx.Equal(settle("b-1", "a-2", false), 0, "a loss notice after the win of a-2; given back");
-  ctx.Equal(stateSpent(ctx), 300, "the counters must hold the 300 a-2 won; they hold");
+  ctx.Equal(hStateSpent(ctx), 300, "the counters must hold the 300 a-2 won; they hold");
   claim("b-1", "a-3", 200);
-  auto rival = std::make_shared<StateRival>();
+  auto rival = std::make_shared<HStateRival>();
   // A second loss notice for a-3 is handled right after the first one first touches the claim.
   ctx.Redis.After("claim:b-1:a-3", [rival] {
     if (rival->fired) return;
@@ -918,19 +918,19 @@ void CheckReleaseOnce(harness::Ctx& ctx) {
     }
   });
   const long ours = settle("b-1", "a-3", false);
-  ctx.Assert(ours + rival->given == 200 && stateSpent(ctx) == 300, "two racing loss notices for a claim of 200 gave back %d and %d and left the counters at %d: reading the claim, deleting it and the DECRBY must be one script", ours, rival->given, stateSpent(ctx));
+  ctx.Assert(ours + rival->given == 200 && hStateSpent(ctx) == 300, "two racing loss notices for a claim of 200 gave back %d and %d and left the counters at %d: reading the claim, deleting it and the DECRBY must be one script", ours, rival->given, hStateSpent(ctx));
   ctx.Redis.Set("cap:b-2", 1000);
   ctx.Assert(claim("b-1", "a-5", 100) && claim("b-2", "a-5", 500), "claims of 100 by b-1 and 500 by b-2 for the same auction must both pass");
   ctx.Equal(settle("b-1", "a-5", false), 100, "b-1's loss of a-5 must give back b-1's 100 (the claim is per bidder and auction); given back");
-  ctx.Equal(stateSpent(ctx, "b-2"), 500, "b-2's claim of a-5 must be untouched by b-1's loss; b-2's counters");
+  ctx.Equal(hStateSpent(ctx, "b-2"), 500, "b-2's claim of a-5 must be untouched by b-1's loss; b-2's counters");
   ctx.Equal(settle("b-2", "a-5", false), 500, "b-2's loss of a-5; given back");
 }
 
 void CheckDailyWindow(harness::Ctx& ctx) {
-  stateSetup(ctx);
+  hStateSetup(ctx);
   const int64_t now_ms = ctx.Clock.Now();
   ctx.Clock.Advance(static_cast<double>(86400000 - now_ms % 86400000) / 1000 + 10);  // 00:00:10 UTC: the next hour stays on this day
-  const std::string key = "spend:b-1:" + stateDay();
+  const std::string key = "spend:b-1:" + hStateDay();
   bool fired = false;
   long long created = 0;
   ctx.Redis.After(key, [&] {
@@ -949,7 +949,7 @@ void CheckDailyWindow(harness::Ctx& ctx) {
   ctx.Equal(claim("b-1", "a-3", 200), false, "the same day a claim of 200 must not fit the 50 left; passed");
   ctx.Clock.Advance(86400);
   ctx.Equal(claim("b-1", "a-4", 200), true, "a new UTC day must start with a fresh cap; passed");
-  const std::string today = "spend:b-1:" + stateDay();
+  const std::string today = "spend:b-1:" + hStateDay();
   ctx.Equal(ctx.Redis.Get(today).value_or(""), "200", "the new day's counter");
   ctx.Equal(settle("b-1", "a-1", false), 900, "yesterday's lost auction must give back its 900; given back");
   const std::string now_today = ctx.Redis.Get(today).value_or(""), old = ctx.Redis.Get(key).value_or("");

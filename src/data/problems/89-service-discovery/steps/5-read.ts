@@ -675,12 +675,12 @@ import (
 	"leetbuild/harness"
 )
 
-type readListingBody struct {
+type HReadListingBody struct {
 	Instances []map[string]any    \`json:"instances"\`
 	Excluded  []map[string]string \`json:"excluded"\`
 }
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	ctx.Redis.Set("sd:deploy:checkout", "10.4.0.0/16")
 	ctx.Redis.Set("sd:deploy:payments", "10.9.0.0/16")
 	mux := http.NewServeMux()
@@ -689,7 +689,7 @@ func readAPI(ctx *harness.Ctx) *harness.HTTP {
 }
 
 // readFleet: checkout-1 SERVING, checkout-2 NOT_SERVING, checkout-3 never probed, checkout-4's record lapsed before the sweep ran.
-func readFleet(ctx *harness.Ctx) {
+func hReadFleet(ctx *harness.Ctx) {
 	for n := 1; n <= 4; n++ {
 		_, err := instances.RegisterInstance(context.Background(), "checkout", fmt.Sprintf("checkout-%d", n), fmt.Sprintf("10.4.2.%d", n), 8080, 5, 7)
 		ctx.NoError(err, "registering checkout-%d", n)
@@ -700,10 +700,10 @@ func readFleet(ctx *harness.Ctx) {
 	ctx.Redis.Del("sd:checkout:checkout-4")
 }
 
-func readListing(ctx *harness.Ctx, c *harness.HTTP) (readListingBody, []string, map[string]string) {
+func hReadListing(ctx *harness.Ctx, c *harness.HTTP) (HReadListingBody, []string, map[string]string) {
 	r := c.Get("/v1/services/checkout/instances", "X-Scope", "metrics.read, discovery.internal")
 	ctx.Equal(r.Status, 200, "GET /v1/services/checkout/instances with the internal scope (%s)", r.Text())
-	var body readListingBody
+	var body HReadListingBody
 	r.Decode(&body)
 	routed := []string{}
 	for _, i := range body.Instances {
@@ -718,8 +718,8 @@ func readListing(ctx *harness.Ctx, c *harness.HTTP) (readListingBody, []string, 
 }
 
 func CheckScope(ctx *harness.Ctx) {
-	readFleet(ctx)
-	c := readAPI(ctx)
+	hReadFleet(ctx)
+	c := hReadAPI(ctx)
 	r := c.Get("/v1/services/checkout/instances")
 	ctx.Equal(r.Status, 403, "a caller with no X-Scope listed checkout's instances: the list is a set of targets, gated behind discovery.internal")
 	for _, scope := range []string{"metrics.read", "discovery.internal.readonly"} {
@@ -735,11 +735,11 @@ func CheckScope(ctx *harness.Ctx) {
 }
 
 func CheckUnknownService(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := hReadAPI(ctx)
 	r := c.Get("/v1/services/checkuot/instances", "X-Scope", "discovery.internal")
 	ctx.Equal(r.Status, 404, "a mistyped service name (an empty 200 looks like a healthy service with no capacity)")
 	r = c.Get("/v1/services/payments/instances", "X-Scope", "discovery.internal")
-	var body readListingBody
+	var body HReadListingBody
 	if r.Status == 200 {
 		r.Decode(&body)
 	}
@@ -747,8 +747,8 @@ func CheckUnknownService(ctx *harness.Ctx) {
 }
 
 func CheckExpired(ctx *harness.Ctx) {
-	readFleet(ctx)
-	body, routed, excluded := readListing(ctx, readAPI(ctx))
+	hReadFleet(ctx)
+	body, routed, excluded := hReadListing(ctx, hReadAPI(ctx))
 	for _, id := range routed {
 		ctx.Assert(id != "checkout-4", "checkout-4's record lapsed and it was returned as routable: %v. A router would dial an instance with no address", body.Instances)
 	}
@@ -760,8 +760,8 @@ func CheckExpired(ctx *harness.Ctx) {
 }
 
 func CheckHealthyOnly(ctx *harness.Ctx) {
-	readFleet(ctx)
-	body, routed, excluded := readListing(ctx, readAPI(ctx))
+	hReadFleet(ctx)
+	body, routed, excluded := hReadListing(ctx, hReadAPI(ctx))
 	ctx.Equal(routed, []string{"checkout-1"}, "the routable instances (checkout-2 is NOT_SERVING and checkout-3 was never probed)")
 	entry := body.Instances[0]
 	_, stamped := entry["last_heartbeat"].(float64)
@@ -789,7 +789,7 @@ func CheckHealthyOnly(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP readApi(harness::Ctx& ctx) {
+harness::HTTP hReadApi(harness::Ctx& ctx) {
   ctx.Redis.Set("sd:deploy:checkout", "10.4.0.0/16");
   ctx.Redis.Set("sd:deploy:payments", "10.9.0.0/16");
   static httplib::Server* svr = nullptr;
@@ -800,7 +800,7 @@ harness::HTTP readApi(harness::Ctx& ctx) {
 }
 
 // checkout-1 SERVING, checkout-2 NOT_SERVING, checkout-3 never probed, checkout-4's record lapsed before the sweep ran.
-void readFleet(harness::Ctx& ctx) {
+void hReadFleet(harness::Ctx& ctx) {
   for (int n = 1; n <= 4; n++) {
     instances::registerInstance("checkout", "checkout-" + std::to_string(n), "10.4.2." + std::to_string(n), 8080, 5, 7);
   }
@@ -810,23 +810,23 @@ void readFleet(harness::Ctx& ctx) {
   ctx.Redis.Del("sd:checkout:checkout-4");
 }
 
-struct ReadListing {
+struct HReadListing {
   nlohmann::json body;
   std::vector<std::string> routed;
   std::map<std::string, std::string> excluded;
 };
 
-ReadListing readListing(harness::Ctx& ctx, harness::HTTP c) {
+HReadListing hReadListing(harness::Ctx& ctx, harness::HTTP c) {
   const auto r = c.Get("/v1/services/checkout/instances", "X-Scope", "metrics.read, discovery.internal");
   ctx.Equal(r.Status, 200, "GET /v1/services/checkout/instances with the internal scope (%s)", r.Text());
-  ReadListing out{nlohmann::json::parse(r.Text(), nullptr, false), {}, {}};
+  HReadListing out{nlohmann::json::parse(r.Text(), nullptr, false), {}, {}};
   ctx.Assert(out.body.is_object(), "the listing is not a JSON object: %s", r.Text());
   for (const auto& i : out.body.value("instances", nlohmann::json::array())) out.routed.push_back(i.value("instance_id", ""));
   for (const auto& e : out.body.value("excluded", nlohmann::json::array())) out.excluded[e.value("instance_id", "")] = e.value("reason", "");
   return out;
 }
 
-std::string readReasonOf(const ReadListing& l, const std::string& instance_id) {
+std::string hReadReasonOf(const HReadListing& l, const std::string& instance_id) {
   const auto it = l.excluded.find(instance_id);
   return it == l.excluded.end() ? "" : it->second;
 }
@@ -834,8 +834,8 @@ std::string readReasonOf(const ReadListing& l, const std::string& instance_id) {
 }  // namespace
 
 void CheckScope(harness::Ctx& ctx) {
-  readFleet(ctx);
-  auto c = readApi(ctx);
+  hReadFleet(ctx);
+  auto c = hReadApi(ctx);
   auto r = c.Get("/v1/services/checkout/instances");
   ctx.Equal(r.Status, 403, "a caller with no X-Scope listed checkout's instances: the list is a set of targets, gated behind discovery.internal");
   for (const std::string scope : {"metrics.read", "discovery.internal.readonly"}) {
@@ -851,7 +851,7 @@ void CheckScope(harness::Ctx& ctx) {
 }
 
 void CheckUnknownService(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
+  auto c = hReadApi(ctx);
   auto r = c.Get("/v1/services/checkuot/instances", "X-Scope", "discovery.internal");
   ctx.Equal(r.Status, 404, "a mistyped service name (an empty 200 looks like a healthy service with no capacity)");
   r = c.Get("/v1/services/payments/instances", "X-Scope", "discovery.internal");
@@ -861,27 +861,27 @@ void CheckUnknownService(harness::Ctx& ctx) {
 }
 
 void CheckExpired(harness::Ctx& ctx) {
-  readFleet(ctx);
-  const ReadListing l = readListing(ctx, readApi(ctx));
+  hReadFleet(ctx);
+  const HReadListing l = hReadListing(ctx, hReadApi(ctx));
   for (const auto& id : l.routed) {
     ctx.Assert(id != "checkout-4", "checkout-4's record lapsed and it was returned as routable: %s. A router would dial an instance with no address", l.body.dump());
   }
-  ctx.Equal(readReasonOf(l, "checkout-4"), "expired", "checkout-4 has no record; its reason in excluded");
+  ctx.Equal(hReadReasonOf(l, "checkout-4"), "expired", "checkout-4 has no record; its reason in excluded");
   for (const auto& entry : l.body.value("instances", nlohmann::json::array())) {
     ctx.Assert(!entry.value("address", "").empty(), "an instance came back without an address: %s", entry.dump());
   }
 }
 
 void CheckHealthyOnly(harness::Ctx& ctx) {
-  readFleet(ctx);
-  const ReadListing l = readListing(ctx, readApi(ctx));
+  hReadFleet(ctx);
+  const HReadListing l = hReadListing(ctx, hReadApi(ctx));
   ctx.Equal(l.routed, {"checkout-1"}, "the routable instances (checkout-2 is NOT_SERVING and checkout-3 was never probed)");
   const auto& entry = l.body["instances"][0];
   ctx.Assert(entry.value("address", "") == "10.4.2.1" && entry.value("port", 0L) == 8080 && entry.value("metadata_version", 0L) == 7 &&
                  entry.contains("last_heartbeat") && entry["last_heartbeat"].is_number_integer(),
              "checkout-1 came back as %s, expected its address, port, metadata_version and last_heartbeat", entry.dump());
-  ctx.Equal(readReasonOf(l, "checkout-2"), "unhealthy", "checkout-2 answered NOT_SERVING; its reason in excluded");
-  ctx.Equal(readReasonOf(l, "checkout-3"), "unprobed", "checkout-3 has no verdict yet; its reason in excluded");
+  ctx.Equal(hReadReasonOf(l, "checkout-2"), "unhealthy", "checkout-2 answered NOT_SERVING; its reason in excluded");
+  ctx.Equal(hReadReasonOf(l, "checkout-3"), "unprobed", "checkout-3 has no verdict yet; its reason in excluded");
   std::vector<std::string> listed;
   for (const auto& e : l.body.value("excluded", nlohmann::json::array())) listed.push_back(e.value("instance_id", ""));
   std::sort(listed.begin(), listed.end());

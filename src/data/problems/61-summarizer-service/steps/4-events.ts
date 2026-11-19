@@ -804,38 +804,38 @@ import (
 )
 
 const (
-	doneTopic   = "summary.done"
-	doneSummary = "Revenue rose four percent while two directors stepped down."
+	kHDoneTopic   = "summary.done"
+	kHDoneSummary = "Revenue rose four percent while two directors stepped down."
 )
 
 var (
-	doneD = strings.Repeat("d", 64)
-	doneE = strings.Repeat("e", 64)
+	hDoneD = strings.Repeat("d", 64)
+	hDoneE = strings.Repeat("e", 64)
 )
 
-func doneRecord(n int, sourceHash string) store.Summary {
+func hDoneRecord(n int, sourceHash string) store.Summary {
 	return store.Summary{
 		SummaryID: fmt.Sprintf("s-%d", n), Tenant: "t1", SourceRef: "doc-1", SourceHash: sourceHash, Band: "medium", TargetWords: 250,
-		Kind: "abstractive", ModelVersion: "sm-7", Summary: doneSummary, SourceBytes: 4000, SummaryChars: len(doneSummary), ChunksDone: 3,
+		Kind: "abstractive", ModelVersion: "sm-7", Summary: kHDoneSummary, SourceBytes: 4000, SummaryChars: len(kHDoneSummary), ChunksDone: 3,
 	}
 }
 
-func donePublish(ctx *harness.Ctx, r store.Summary) bool {
+func hDonePublish(ctx *harness.Ctx, r store.Summary) bool {
 	ok, err := publishDone(context.Background(), r)
 	ctx.NoError(err, "publishDone(%s)", r.SummaryID)
 	return ok
 }
 
-type doneRow struct {
+type HDoneRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func doneOutbox(ctx *harness.Ctx) []doneRow {
-	var rows []doneRow
+func hDoneOutbox(ctx *harness.Ctx) []HDoneRow {
+	var rows []HDoneRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row doneRow
+		var row HDoneRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -843,69 +843,69 @@ func doneOutbox(ctx *harness.Ctx) []doneRow {
 }
 
 func CheckSourceKey(ctx *harness.Ctx) {
-	donePublish(ctx, doneRecord(1, doneD))
-	donePublish(ctx, doneRecord(2, doneE))
-	donePublish(ctx, doneRecord(3, doneD))
+	hDonePublish(ctx, hDoneRecord(1, hDoneD))
+	hDonePublish(ctx, hDoneRecord(2, hDoneE))
+	hDonePublish(ctx, hDoneRecord(3, hDoneD))
 	ctx.Settle()
-	records := ctx.Kafka.Records(doneTopic)
+	records := ctx.Kafka.Records(kHDoneTopic)
 	ctx.Equal(len(records), 3, "three publishDone calls must produce three records on summary.done; the records")
-	ctx.Equal(ctx.Kafka.Keys(doneTopic), []string{doneD, doneE, doneD}, "the records must be keyed by the source hashes")
+	ctx.Equal(ctx.Kafka.Keys(kHDoneTopic), []string{hDoneD, hDoneE, hDoneD}, "the records must be keyed by the source hashes")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both events of source dddd... must land on one partition, or a consumer applies the re-summary before the summary; the partitions")
 }
 
 func CheckNumbersOnly(ctx *harness.Ctx) {
-	donePublish(ctx, doneRecord(1, doneD))
+	hDonePublish(ctx, hDoneRecord(1, hDoneD))
 	ctx.Settle()
-	value := ctx.Kafka.Values(doneTopic)[0]
+	value := ctx.Kafka.Values(kHDoneTopic)[0]
 	var payload map[string]any
 	ctx.NoError(json.Unmarshal([]byte(value), &payload), "the payload must be JSON")
 	_, hasSummary := payload["summary"]
-	ctx.Assert(!strings.Contains(value, doneSummary) && !hasSummary, "the event carries the summary text: %s. The topic is retained and replicated; keep the text in the summary store", value)
-	ctx.Assert(payload["model_version"] == "sm-7" && payload["chunks_done"] == 3.0 && payload["summary_chars"] == float64(len(doneSummary)), "the event must carry model_version, summary_chars and chunks_done, got %s", value)
-	ctx.Assert(payload["summary_id"] == "s-1" && payload["tenant"] == "t1" && payload["source_hash"] == doneD && payload["band"] == "medium" && payload["kind"] == "abstractive" && payload["source_bytes"] == 4000.0,
+	ctx.Assert(!strings.Contains(value, kHDoneSummary) && !hasSummary, "the event carries the summary text: %s. The topic is retained and replicated; keep the text in the summary store", value)
+	ctx.Assert(payload["model_version"] == "sm-7" && payload["chunks_done"] == 3.0 && payload["summary_chars"] == float64(len(kHDoneSummary)), "the event must carry model_version, summary_chars and chunks_done, got %s", value)
+	ctx.Assert(payload["summary_id"] == "s-1" && payload["tenant"] == "t1" && payload["source_hash"] == hDoneD && payload["band"] == "medium" && payload["kind"] == "abstractive" && payload["source_bytes"] == 4000.0,
 		"the event must carry summary_id, tenant, source_hash, band, kind and source_bytes, got %s", value)
 	ratio, _ := payload["compression_ratio"].(float64)
-	ctx.Assert(math.Abs(ratio-float64(len(doneSummary))/4000) < 1e-9, "compression_ratio is %v, expected summary_chars / source_bytes = %v", payload["compression_ratio"], float64(len(doneSummary))/4000)
+	ctx.Assert(math.Abs(ratio-float64(len(kHDoneSummary))/4000) < 1e-9, "compression_ratio is %v, expected summary_chars / source_bytes = %v", payload["compression_ratio"], float64(len(kHDoneSummary))/4000)
 }
 
 func CheckSaveBeforeProduce(ctx *harness.Ctx) {
-	probe := ctx.Redis.After("summary:t1:s-1", func() any { return len(ctx.Kafka.Records(doneTopic)) })
-	donePublish(ctx, doneRecord(1, doneD))
+	probe := ctx.Redis.After("summary:t1:s-1", func() any { return len(ctx.Kafka.Records(kHDoneTopic)) })
+	hDonePublish(ctx, hDoneRecord(1, hDoneD))
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "publishDone never wrote summary:t1:s-1")
 	ctx.Equal(probe.Result, 0, "when the record was saved the topic already held events: a consumer that reads the event first finds no summary. Save, then produce; the events at save time")
-	ctx.Assert(len(ctx.Kafka.Records(doneTopic)) == 1 && store.LoadSummary(context.Background(), "t1", "s-1") != nil, "the record must be saved and its event produced")
+	ctx.Assert(len(ctx.Kafka.Records(kHDoneTopic)) == 1 && store.LoadSummary(context.Background(), "t1", "s-1") != nil, "the record must be saved and its event produced")
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(doneTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	donePublish(ctx, doneRecord(1, doneD))
+	ctx.Kafka.LoseAcks(kHDoneTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hDonePublish(ctx, hDoneRecord(1, hDoneD))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(doneTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	donePublish(ctx, doneRecord(2, doneD))
+	ctx.Equal(len(ctx.Kafka.Records(kHDoneTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hDonePublish(ctx, hDoneRecord(2, hDoneD))
 	ctx.Settle()
-	ctx.Kafka.Failover(doneTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(doneTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHDoneTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHDoneTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ok := donePublish(ctx, doneRecord(0, doneD))
+	ok := hDonePublish(ctx, hDoneRecord(0, hDoneD))
 	ctx.Settle()
-	ctx.Assert(ok && len(doneOutbox(ctx)) == 0, "an acknowledged delivery returned %v and left %d outbox row(s): it returns true and writes none", ok, len(doneOutbox(ctx)))
-	ctx.Kafka.FailNext(doneTopic, 1)
-	ok = donePublish(ctx, doneRecord(1, doneD))
+	ctx.Assert(ok && len(hDoneOutbox(ctx)) == 0, "an acknowledged delivery returned %v and left %d outbox row(s): it returns true and writes none", ok, len(hDoneOutbox(ctx)))
+	ctx.Kafka.FailNext(kHDoneTopic, 1)
+	ok = hDonePublish(ctx, hDoneRecord(1, hDoneD))
 	ctx.Settle()
-	rows := doneOutbox(ctx)
+	rows := hDoneOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the summary.done event is lost; the rows")
-	ctx.Assert(rows[0].Topic == doneTopic && rows[0].Key == doneD && rows[0].Payload["summary_id"] == "s-1", "the outbox row is %v, expected the topic, the source hash as key and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == kHDoneTopic && rows[0].Key == hDoneD && rows[0].Payload["summary_id"] == "s-1", "the outbox row is %v, expected the topic, the source hash as key and the payload", rows[0])
 	ctx.Equal(ok, false, "publishDone's result after a failed delivery")
 	ctx.Assert(store.LoadSummary(context.Background(), "t1", "s-1") != nil, "the record must stay saved when only the produce failed")
-	ctx.Kafka.Stall(doneTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHDoneTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = donePublish(ctx, doneRecord(2, doneD))
+	ok = hDonePublish(ctx, hDoneRecord(2, hDoneD))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishDone waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = doneOutbox(ctx)
+	rows = hDoneOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["summary_id"] == "s-2", "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishDone's result without a delivery report")
 }
@@ -927,13 +927,13 @@ const std::string hD(64, 'd');
 const std::string hE(64, 'e');
 const std::string hSummary = "Revenue rose four percent while two directors stepped down.";
 
-nlohmann::json doneRecord(int n, const std::string& source_hash) {
+nlohmann::json hDoneRecord(int n, const std::string& source_hash) {
   return {{"summary_id", "s-" + std::to_string(n)}, {"tenant", "t1"}, {"source_ref", "doc-1"}, {"source_hash", source_hash}, {"band", "medium"},
           {"target_words", 250}, {"kind", "abstractive"}, {"model_version", "sm-7"}, {"summary", hSummary}, {"citations", nlohmann::json::array()},
           {"source_bytes", 4000}, {"summary_chars", hSummary.size()}, {"chunks_done", 3}};
 }
 
-std::vector<nlohmann::json> doneOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hDoneOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -943,16 +943,16 @@ std::vector<nlohmann::json> doneOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string doneField(const nlohmann::json& j, const std::string& field) {
+std::string hDoneField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckSourceKey(harness::Ctx& ctx) {
-  publishDone(doneRecord(1, hD));
-  publishDone(doneRecord(2, hE));
-  publishDone(doneRecord(3, hD));
+  publishDone(hDoneRecord(1, hD));
+  publishDone(hDoneRecord(2, hE));
+  publishDone(hDoneRecord(3, hD));
   ctx.Settle();
   const auto records = ctx.Kafka.Records(hDoneTopic);
   ctx.Equal(records.size(), 3, "three publishDone calls must produce three records on summary.done; the records");
@@ -961,7 +961,7 @@ void CheckSourceKey(harness::Ctx& ctx) {
 }
 
 void CheckNumbersOnly(harness::Ctx& ctx) {
-  publishDone(doneRecord(1, hD));
+  publishDone(hDoneRecord(1, hD));
   ctx.Settle();
   const std::string value = ctx.Kafka.Values(hDoneTopic)[0];
   const auto payload = nlohmann::json::parse(value, nullptr, false);
@@ -984,7 +984,7 @@ void CheckSaveBeforeProduce(harness::Ctx& ctx) {
     fired = true;
     atSave = ctx.Kafka.Records(hDoneTopic).size();
   });
-  publishDone(doneRecord(1, hD));
+  publishDone(hDoneRecord(1, hD));
   ctx.Settle();
   ctx.Assert(fired, "publishDone never wrote summary:t1:s-1");
   ctx.Equal(atSave, 0, "when the record was saved the topic already held events: a consumer that reads the event first finds no summary. Save, then produce; the events at save time");
@@ -993,35 +993,35 @@ void CheckSaveBeforeProduce(harness::Ctx& ctx) {
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks(hDoneTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishDone(doneRecord(1, hD));
+  publishDone(hDoneRecord(1, hD));
   ctx.Settle();
   ctx.Equal(ctx.Kafka.Records(hDoneTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  publishDone(doneRecord(2, hD));
+  publishDone(hDoneRecord(2, hD));
   ctx.Settle();
   ctx.Kafka.Failover(hDoneTopic);  // the partition leader dies right after acknowledging
   ctx.Equal(ctx.Kafka.Records(hDoneTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  bool ok = publishDone(doneRecord(0, hD));
+  bool ok = publishDone(hDoneRecord(0, hD));
   ctx.Settle();
-  ctx.Assert(ok && doneOutbox(ctx).empty(), "an acknowledged delivery returned %t and left %d outbox row(s): it returns true and writes none", ok, doneOutbox(ctx).size());
+  ctx.Assert(ok && hDoneOutbox(ctx).empty(), "an acknowledged delivery returned %t and left %d outbox row(s): it returns true and writes none", ok, hDoneOutbox(ctx).size());
   ctx.Kafka.FailNext(hDoneTopic, 1);
-  ok = publishDone(doneRecord(1, hD));
+  ok = publishDone(hDoneRecord(1, hD));
   ctx.Settle();
-  auto rows = doneOutbox(ctx);
+  auto rows = hDoneOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the summary.done event is lost; the rows");
-  ctx.Assert(doneField(rows[0], "topic") == hDoneTopic && doneField(rows[0], "key") == hD && rows[0].contains("payload") && doneField(rows[0]["payload"], "summary_id") == "s-1",
+  ctx.Assert(hDoneField(rows[0], "topic") == hDoneTopic && hDoneField(rows[0], "key") == hD && rows[0].contains("payload") && hDoneField(rows[0]["payload"], "summary_id") == "s-1",
              "the outbox row is %s, expected the topic, the source hash as key and the payload", rows[0].dump());
   ctx.Equal(ok, false, "publishDone's result after a failed delivery");
   ctx.Assert(summarizer::store::loadSummary("t1", "s-1").has_value(), "the record must stay saved when only the produce failed");
   ctx.Kafka.Stall(hDoneTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publishDone(doneRecord(2, hD));
+  ok = publishDone(hDoneRecord(2, hD));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publishDone waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
-  rows = doneOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && doneField(rows[1]["payload"], "summary_id") == "s-2", "no delivery report within the window and the outbox holds %d rows", rows.size());
+  rows = hDoneOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hDoneField(rows[1]["payload"], "summary_id") == "s-2", "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishDone's result without a delivery report");
 }
 `,

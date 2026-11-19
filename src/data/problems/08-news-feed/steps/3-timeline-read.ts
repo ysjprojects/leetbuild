@@ -712,16 +712,16 @@ import (
 )
 
 // postIDAt is a post id carrying its timestamp: "<created_at ms>-<tag>" (ids.CreatedAt parses the prefix).
-func postIDAt(ms int, tag string) string { return fmt.Sprintf("%d-%s", ms, tag) }
+func hPostIDAt(ms int, tag string) string { return fmt.Sprintf("%d-%s", ms, tag) }
 
 // pushIDs are fan-out writes: ids given oldest first end up newest first in the list.
-func pushIDs(ctx *harness.Ctx, user string, ids ...string) {
+func hPushIDs(ctx *harness.Ctx, user string, ids ...string) {
 	for _, id := range ids {
 		ctx.Redis.Do("LPUSH", "timeline:"+user, id)
 	}
 }
 
-func pullIDs(ctx *harness.Ctx, author string, ids ...string) {
+func hPullIDs(ctx *harness.Ctx, author string, ids ...string) {
 	for _, id := range ids {
 		prefix, _, _ := strings.Cut(id, "-")
 		ms, _ := strconv.Atoi(prefix)
@@ -729,32 +729,32 @@ func pullIDs(ctx *harness.Ctx, author string, ids ...string) {
 	}
 }
 
-func readTimeline(ctx *harness.Ctx, userID string, cursor *int64, limit int) ([]string, *int64) {
+func hReadTimeline(ctx *harness.Ctx, userID string, cursor *int64, limit int) ([]string, *int64) {
 	page, next, err := Read(context.Background(), userID, cursor, limit)
-	ctx.NoError(err, "Read(%q, %v, %d) returned an error", userID, cursorValue(cursor), limit)
+	ctx.NoError(err, "Read(%q, %v, %d) returned an error", userID, hCursorValue(cursor), limit)
 	return page, next
 }
 
 // cursorValue is the cursor a pointer holds, nil for none.
-func cursorValue(cursor *int64) any {
+func hCursorValue(cursor *int64) any {
 	if cursor == nil {
 		return nil
 	}
 	return *cursor
 }
 
-func cursorAt(ms int64) *int64 { return &ms }
+func hCursorAt(ms int64) *int64 { return &ms }
 
 func CheckPushed(ctx *harness.Ctx) {
 	var ids []string
 	for i := range 10 {
-		ids = append(ids, postIDAt(100+i, "a"))
+		ids = append(ids, hPostIDAt(100+i, "a"))
 	}
-	pushIDs(ctx, "alice", ids...)
-	page, next := readTimeline(ctx, "alice", nil, 3)
-	ctx.Equal(page, []string{postIDAt(109, "a"), postIDAt(108, "a"), postIDAt(107, "a")}, "with 10 pushed ids and limit 3 the page must be the 3 newest")
-	ctx.Equal(cursorValue(next), 107, "the next cursor must be the created_at of the last id of the page (107)")
-	page, _ = readTimeline(ctx, "alice", nil, 20)
+	hPushIDs(ctx, "alice", ids...)
+	page, next := hReadTimeline(ctx, "alice", nil, 3)
+	ctx.Equal(page, []string{hPostIDAt(109, "a"), hPostIDAt(108, "a"), hPostIDAt(107, "a")}, "with 10 pushed ids and limit 3 the page must be the 3 newest")
+	ctx.Equal(hCursorValue(next), 107, "the next cursor must be the created_at of the last id of the page (107)")
+	page, _ = hReadTimeline(ctx, "alice", nil, 20)
 	var newestFirst []string
 	for i := len(ids) - 1; i >= 0; i-- {
 		newestFirst = append(newestFirst, ids[i])
@@ -765,29 +765,29 @@ func CheckPushed(ctx *harness.Ctx) {
 func CheckPulled(ctx *harness.Ctx) {
 	var taylor []string
 	for i := range 5 {
-		taylor = append(taylor, postIDAt(200+i, "t"))
+		taylor = append(taylor, hPostIDAt(200+i, "t"))
 	}
-	nasa := []string{postIDAt(150, "n"), postIDAt(151, "n")}
-	pullIDs(ctx, "taylor", taylor...)
-	pullIDs(ctx, "nasa", nasa...)
+	nasa := []string{hPostIDAt(150, "n"), hPostIDAt(151, "n")}
+	hPullIDs(ctx, "taylor", taylor...)
+	hPullIDs(ctx, "nasa", nasa...)
 	graph.CelebritiesFollowedBy["alice"] = []string{"taylor", "nasa"}
-	page, next := readTimeline(ctx, "alice", nil, 4)
-	ctx.Equal(page, []string{postIDAt(204, "t"), postIDAt(203, "t"), postIDAt(202, "t"), postIDAt(201, "t")}, "nothing was pushed: the page must be the 4 newest celebrity posts")
-	ctx.Equal(cursorValue(next), 201, "the next cursor")
-	page, _ = readTimeline(ctx, "alice", nil, 10)
+	page, next := hReadTimeline(ctx, "alice", nil, 4)
+	ctx.Equal(page, []string{hPostIDAt(204, "t"), hPostIDAt(203, "t"), hPostIDAt(202, "t"), hPostIDAt(201, "t")}, "nothing was pushed: the page must be the 4 newest celebrity posts")
+	ctx.Equal(hCursorValue(next), 201, "the next cursor")
+	page, _ = hReadTimeline(ctx, "alice", nil, 10)
 	want := []string{taylor[4], taylor[3], taylor[2], taylor[1], taylor[0], nasa[1], nasa[0]}
 	ctx.Equal(page, want, "every post of every followed celebrity must be pulled, newest first")
-	page, _ = readTimeline(ctx, "bob", nil, 10)
+	page, _ = hReadTimeline(ctx, "bob", nil, 10)
 	ctx.Assert(len(page) == 0, "bob follows no celebrity and has no timeline: expected an empty page, got %q", page)
 }
 
 func CheckSinglePipeline(ctx *harness.Ctx) {
-	pushIDs(ctx, "alice", postIDAt(100, "a"), postIDAt(300, "a"))
-	pullIDs(ctx, "taylor", postIDAt(200, "t"))
-	pullIDs(ctx, "nasa", postIDAt(400, "n"))
+	hPushIDs(ctx, "alice", hPostIDAt(100, "a"), hPostIDAt(300, "a"))
+	hPullIDs(ctx, "taylor", hPostIDAt(200, "t"))
+	hPullIDs(ctx, "nasa", hPostIDAt(400, "n"))
 	graph.CelebritiesFollowedBy["alice"] = []string{"taylor", "nasa"}
-	page, _ := readTimeline(ctx, "alice", nil, 10)
-	ctx.Equal(page, []string{postIDAt(400, "n"), postIDAt(300, "a"), postIDAt(200, "t"), postIDAt(100, "a")}, "unexpected page")
+	page, _ := hReadTimeline(ctx, "alice", nil, 10)
+	ctx.Equal(page, []string{hPostIDAt(400, "n"), hPostIDAt(300, "a"), hPostIDAt(200, "t"), hPostIDAt(100, "a")}, "unexpected page")
 	var reads []string
 	var pipelines [][]string
 	for _, trip := range ctx.Redis.RoundTrips() {
@@ -803,39 +803,39 @@ func CheckSinglePipeline(ctx *harness.Ctx) {
 }
 
 func CheckMerged(ctx *harness.Ctx) {
-	pushIDs(ctx, "alice", postIDAt(100, "a"), postIDAt(300, "a"), postIDAt(500, "a"))
-	pullIDs(ctx, "taylor", postIDAt(200, "t"), postIDAt(400, "t"), postIDAt(600, "t"))
-	pullIDs(ctx, "nasa", postIDAt(500, "a")) // the same post also arrived through fan-out
+	hPushIDs(ctx, "alice", hPostIDAt(100, "a"), hPostIDAt(300, "a"), hPostIDAt(500, "a"))
+	hPullIDs(ctx, "taylor", hPostIDAt(200, "t"), hPostIDAt(400, "t"), hPostIDAt(600, "t"))
+	hPullIDs(ctx, "nasa", hPostIDAt(500, "a")) // the same post also arrived through fan-out
 	graph.CelebritiesFollowedBy["alice"] = []string{"taylor", "nasa"}
-	page, next := readTimeline(ctx, "alice", nil, 4)
-	ctx.Equal(page, []string{postIDAt(600, "t"), postIDAt(500, "a"), postIDAt(400, "t"), postIDAt(300, "a")}, "pushed and pulled ids must be merged newest first and cut to limit")
-	ctx.Equal(cursorValue(next), 300, "the next cursor")
-	page, _ = readTimeline(ctx, "alice", nil, 10)
+	page, next := hReadTimeline(ctx, "alice", nil, 4)
+	ctx.Equal(page, []string{hPostIDAt(600, "t"), hPostIDAt(500, "a"), hPostIDAt(400, "t"), hPostIDAt(300, "a")}, "pushed and pulled ids must be merged newest first and cut to limit")
+	ctx.Equal(hCursorValue(next), 300, "the next cursor")
+	page, _ = hReadTimeline(ctx, "alice", nil, 10)
 	copies := 0
 	for _, id := range page {
-		if id == postIDAt(500, "a") {
+		if id == hPostIDAt(500, "a") {
 			copies++
 		}
 	}
 	ctx.Assert(copies == 1, "an id present in both sources must appear once, got %q", page)
-	ctx.Equal(page, []string{postIDAt(600, "t"), postIDAt(500, "a"), postIDAt(400, "t"), postIDAt(300, "a"), postIDAt(200, "t"), postIDAt(100, "a")}, "the full merge must be every distinct id newest first")
+	ctx.Equal(page, []string{hPostIDAt(600, "t"), hPostIDAt(500, "a"), hPostIDAt(400, "t"), hPostIDAt(300, "a"), hPostIDAt(200, "t"), hPostIDAt(100, "a")}, "the full merge must be every distinct id newest first")
 }
 
 func CheckCursor(ctx *harness.Ctx) {
 	for i := range 10 {
-		pushIDs(ctx, "alice", postIDAt(100+2*i, "a")) // 100, 102, ..., 118; LRANGE 0 5 sees 118..108
+		hPushIDs(ctx, "alice", hPostIDAt(100+2*i, "a")) // 100, 102, ..., 118; LRANGE 0 5 sees 118..108
 	}
-	pullIDs(ctx, "taylor", postIDAt(109, "t"), postIDAt(113, "t"), postIDAt(115, "t"), postIDAt(121, "t"))
+	hPullIDs(ctx, "taylor", hPostIDAt(109, "t"), hPostIDAt(113, "t"), hPostIDAt(115, "t"), hPostIDAt(121, "t"))
 	graph.CelebritiesFollowedBy["alice"] = []string{"taylor"}
-	page, next := readTimeline(ctx, "alice", cursorAt(115), 3)
-	ctx.Equal(page, []string{postIDAt(114, "a"), postIDAt(113, "t"), postIDAt(112, "a")}, "with cursor 115 only ids created before 115 may appear (the bound is exclusive, from both sources)")
-	ctx.Equal(cursorValue(next), 112, "the next cursor")
-	page, next = readTimeline(ctx, "alice", next, 3)
-	ctx.Equal(page, []string{postIDAt(110, "a"), postIDAt(109, "t"), postIDAt(108, "a")}, "the next page must continue below the cursor without overlap")
-	ctx.Equal(cursorValue(next), 108, "the next cursor")
-	page, next = readTimeline(ctx, "alice", cursorAt(100), 3)
+	page, next := hReadTimeline(ctx, "alice", hCursorAt(115), 3)
+	ctx.Equal(page, []string{hPostIDAt(114, "a"), hPostIDAt(113, "t"), hPostIDAt(112, "a")}, "with cursor 115 only ids created before 115 may appear (the bound is exclusive, from both sources)")
+	ctx.Equal(hCursorValue(next), 112, "the next cursor")
+	page, next = hReadTimeline(ctx, "alice", next, 3)
+	ctx.Equal(page, []string{hPostIDAt(110, "a"), hPostIDAt(109, "t"), hPostIDAt(108, "a")}, "the next page must continue below the cursor without overlap")
+	ctx.Equal(hCursorValue(next), 108, "the next cursor")
+	page, next = hReadTimeline(ctx, "alice", hCursorAt(100), 3)
 	ctx.Assert(len(page) == 0, "nothing is older than 100: expected an empty page, got %q", page)
-	ctx.Equal(cursorValue(next), nil, "an empty page has no next cursor")
+	ctx.Equal(hCursorValue(next), nil, "an empty page has no next cursor")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -850,19 +850,19 @@ func CheckCursor(ctx *harness.Ctx) {
 namespace {
 
 // postIDAt is a post id carrying its timestamp: "<created_at ms>-<tag>" (ids::created_at parses the prefix).
-std::string postIDAt(int ms, const std::string& tag) { return std::to_string(ms) + "-" + tag; }
+std::string hPostIDAt(int ms, const std::string& tag) { return std::to_string(ms) + "-" + tag; }
 
 // pushIDs are fan-out writes: ids given oldest first end up newest first in the list.
-void pushIDs(harness::Ctx& ctx, const std::string& user, const std::vector<std::string>& ids) {
+void hPushIDs(harness::Ctx& ctx, const std::string& user, const std::vector<std::string>& ids) {
   for (const auto& id : ids) ctx.Redis.Do("LPUSH", "timeline:" + user, id);
 }
 
-void pullIDs(harness::Ctx& ctx, const std::string& author, const std::vector<std::string>& ids) {
+void hPullIDs(harness::Ctx& ctx, const std::string& author, const std::vector<std::string>& ids) {
   for (const auto& id : ids) ctx.Redis.Do("ZADD", "posts:" + author, id.substr(0, id.find('-')), id);
 }
 
 // readTimeline is the learner's read; what it throws fails the check (Go's ctx.NoError on the error).
-std::pair<std::vector<std::string>, std::optional<int64_t>> readTimeline(harness::Ctx& ctx, const std::string& user,
+std::pair<std::vector<std::string>, std::optional<int64_t>> hReadTimeline(harness::Ctx& ctx, const std::string& user,
                                                                          std::optional<int64_t> cursor, int limit) {
   try {
     Page page = read(user, cursor, limit);
@@ -876,39 +876,39 @@ std::pair<std::vector<std::string>, std::optional<int64_t>> readTimeline(harness
 
 void CheckPushed(harness::Ctx& ctx) {
   std::vector<std::string> ids;
-  for (int i = 0; i < 10; i++) ids.push_back(postIDAt(100 + i, "a"));
-  pushIDs(ctx, "alice", ids);
-  auto [page, next] = readTimeline(ctx, "alice", std::nullopt, 3);
-  ctx.Equal(page, {postIDAt(109, "a"), postIDAt(108, "a"), postIDAt(107, "a")}, "with 10 pushed ids and limit 3 the page must be the 3 newest");
+  for (int i = 0; i < 10; i++) ids.push_back(hPostIDAt(100 + i, "a"));
+  hPushIDs(ctx, "alice", ids);
+  auto [page, next] = hReadTimeline(ctx, "alice", std::nullopt, 3);
+  ctx.Equal(page, {hPostIDAt(109, "a"), hPostIDAt(108, "a"), hPostIDAt(107, "a")}, "with 10 pushed ids and limit 3 the page must be the 3 newest");
   ctx.Equal(next, 107, "the next cursor must be the created_at of the last id of the page (107)");
-  page = readTimeline(ctx, "alice", std::nullopt, 20).first;
+  page = hReadTimeline(ctx, "alice", std::nullopt, 20).first;
   const std::vector<std::string> newestFirst(ids.rbegin(), ids.rend());
   ctx.Equal(page, newestFirst, "with limit 20 every pushed id must be returned newest first");
 }
 
 void CheckPulled(harness::Ctx& ctx) {
   std::vector<std::string> taylor;
-  for (int i = 0; i < 5; i++) taylor.push_back(postIDAt(200 + i, "t"));
-  const std::vector<std::string> nasa = {postIDAt(150, "n"), postIDAt(151, "n")};
-  pullIDs(ctx, "taylor", taylor);
-  pullIDs(ctx, "nasa", nasa);
+  for (int i = 0; i < 5; i++) taylor.push_back(hPostIDAt(200 + i, "t"));
+  const std::vector<std::string> nasa = {hPostIDAt(150, "n"), hPostIDAt(151, "n")};
+  hPullIDs(ctx, "taylor", taylor);
+  hPullIDs(ctx, "nasa", nasa);
   graph::celebrities_followed_by["alice"] = {"taylor", "nasa"};
-  auto [page, next] = readTimeline(ctx, "alice", std::nullopt, 4);
-  ctx.Equal(page, {postIDAt(204, "t"), postIDAt(203, "t"), postIDAt(202, "t"), postIDAt(201, "t")}, "nothing was pushed: the page must be the 4 newest celebrity posts");
+  auto [page, next] = hReadTimeline(ctx, "alice", std::nullopt, 4);
+  ctx.Equal(page, {hPostIDAt(204, "t"), hPostIDAt(203, "t"), hPostIDAt(202, "t"), hPostIDAt(201, "t")}, "nothing was pushed: the page must be the 4 newest celebrity posts");
   ctx.Equal(next, 201, "the next cursor");
-  page = readTimeline(ctx, "alice", std::nullopt, 10).first;
+  page = hReadTimeline(ctx, "alice", std::nullopt, 10).first;
   ctx.Equal(page, {taylor[4], taylor[3], taylor[2], taylor[1], taylor[0], nasa[1], nasa[0]}, "every post of every followed celebrity must be pulled, newest first");
-  page = readTimeline(ctx, "bob", std::nullopt, 10).first;
+  page = hReadTimeline(ctx, "bob", std::nullopt, 10).first;
   ctx.Assert(page.empty(), "bob follows no celebrity and has no timeline: expected an empty page, got %q", page);
 }
 
 void CheckSinglePipeline(harness::Ctx& ctx) {
-  pushIDs(ctx, "alice", {postIDAt(100, "a"), postIDAt(300, "a")});
-  pullIDs(ctx, "taylor", {postIDAt(200, "t")});
-  pullIDs(ctx, "nasa", {postIDAt(400, "n")});
+  hPushIDs(ctx, "alice", {hPostIDAt(100, "a"), hPostIDAt(300, "a")});
+  hPullIDs(ctx, "taylor", {hPostIDAt(200, "t")});
+  hPullIDs(ctx, "nasa", {hPostIDAt(400, "n")});
   graph::celebrities_followed_by["alice"] = {"taylor", "nasa"};
-  const auto page = readTimeline(ctx, "alice", std::nullopt, 10).first;
-  ctx.Equal(page, {postIDAt(400, "n"), postIDAt(300, "a"), postIDAt(200, "t"), postIDAt(100, "a")}, "unexpected page");
+  const auto page = hReadTimeline(ctx, "alice", std::nullopt, 10).first;
+  ctx.Equal(page, {hPostIDAt(400, "n"), hPostIDAt(300, "a"), hPostIDAt(200, "t"), hPostIDAt(100, "a")}, "unexpected page");
   std::vector<std::string> reads;
   std::vector<std::vector<std::string>> pipelines;
   for (const auto& trip : ctx.Redis.RoundTrips()) {
@@ -921,32 +921,32 @@ void CheckSinglePipeline(harness::Ctx& ctx) {
 }
 
 void CheckMerged(harness::Ctx& ctx) {
-  pushIDs(ctx, "alice", {postIDAt(100, "a"), postIDAt(300, "a"), postIDAt(500, "a")});
-  pullIDs(ctx, "taylor", {postIDAt(200, "t"), postIDAt(400, "t"), postIDAt(600, "t")});
-  pullIDs(ctx, "nasa", {postIDAt(500, "a")});  // the same post also arrived through fan-out
+  hPushIDs(ctx, "alice", {hPostIDAt(100, "a"), hPostIDAt(300, "a"), hPostIDAt(500, "a")});
+  hPullIDs(ctx, "taylor", {hPostIDAt(200, "t"), hPostIDAt(400, "t"), hPostIDAt(600, "t")});
+  hPullIDs(ctx, "nasa", {hPostIDAt(500, "a")});  // the same post also arrived through fan-out
   graph::celebrities_followed_by["alice"] = {"taylor", "nasa"};
-  auto [page, next] = readTimeline(ctx, "alice", std::nullopt, 4);
-  ctx.Equal(page, {postIDAt(600, "t"), postIDAt(500, "a"), postIDAt(400, "t"), postIDAt(300, "a")}, "pushed and pulled ids must be merged newest first and cut to limit");
+  auto [page, next] = hReadTimeline(ctx, "alice", std::nullopt, 4);
+  ctx.Equal(page, {hPostIDAt(600, "t"), hPostIDAt(500, "a"), hPostIDAt(400, "t"), hPostIDAt(300, "a")}, "pushed and pulled ids must be merged newest first and cut to limit");
   ctx.Equal(next, 300, "the next cursor");
-  page = readTimeline(ctx, "alice", std::nullopt, 10).first;
+  page = hReadTimeline(ctx, "alice", std::nullopt, 10).first;
   int copies = 0;
   for (const auto& id : page)
-    if (id == postIDAt(500, "a")) copies++;
+    if (id == hPostIDAt(500, "a")) copies++;
   ctx.Assert(copies == 1, "an id present in both sources must appear once, got %q", page);
-  ctx.Equal(page, {postIDAt(600, "t"), postIDAt(500, "a"), postIDAt(400, "t"), postIDAt(300, "a"), postIDAt(200, "t"), postIDAt(100, "a")}, "the full merge must be every distinct id newest first");
+  ctx.Equal(page, {hPostIDAt(600, "t"), hPostIDAt(500, "a"), hPostIDAt(400, "t"), hPostIDAt(300, "a"), hPostIDAt(200, "t"), hPostIDAt(100, "a")}, "the full merge must be every distinct id newest first");
 }
 
 void CheckCursor(harness::Ctx& ctx) {
-  for (int i = 0; i < 10; i++) pushIDs(ctx, "alice", {postIDAt(100 + 2 * i, "a")});  // 100, 102, ..., 118; LRANGE 0 5 sees 118..108
-  pullIDs(ctx, "taylor", {postIDAt(109, "t"), postIDAt(113, "t"), postIDAt(115, "t"), postIDAt(121, "t")});
+  for (int i = 0; i < 10; i++) hPushIDs(ctx, "alice", {hPostIDAt(100 + 2 * i, "a")});  // 100, 102, ..., 118; LRANGE 0 5 sees 118..108
+  hPullIDs(ctx, "taylor", {hPostIDAt(109, "t"), hPostIDAt(113, "t"), hPostIDAt(115, "t"), hPostIDAt(121, "t")});
   graph::celebrities_followed_by["alice"] = {"taylor"};
-  auto [page, next] = readTimeline(ctx, "alice", int64_t{115}, 3);
-  ctx.Equal(page, {postIDAt(114, "a"), postIDAt(113, "t"), postIDAt(112, "a")}, "with cursor 115 only ids created before 115 may appear (the bound is exclusive, from both sources)");
+  auto [page, next] = hReadTimeline(ctx, "alice", int64_t{115}, 3);
+  ctx.Equal(page, {hPostIDAt(114, "a"), hPostIDAt(113, "t"), hPostIDAt(112, "a")}, "with cursor 115 only ids created before 115 may appear (the bound is exclusive, from both sources)");
   ctx.Equal(next, 112, "the next cursor");
-  std::tie(page, next) = readTimeline(ctx, "alice", next, 3);
-  ctx.Equal(page, {postIDAt(110, "a"), postIDAt(109, "t"), postIDAt(108, "a")}, "the next page must continue below the cursor without overlap");
+  std::tie(page, next) = hReadTimeline(ctx, "alice", next, 3);
+  ctx.Equal(page, {hPostIDAt(110, "a"), hPostIDAt(109, "t"), hPostIDAt(108, "a")}, "the next page must continue below the cursor without overlap");
   ctx.Equal(next, 108, "the next cursor");
-  std::tie(page, next) = readTimeline(ctx, "alice", int64_t{100}, 3);
+  std::tie(page, next) = hReadTimeline(ctx, "alice", int64_t{100}, 3);
   ctx.Assert(page.empty(), "nothing is older than 100: expected an empty page, got %q", page);
   ctx.Equal(next, nullptr, "an empty page has no next cursor");
 }

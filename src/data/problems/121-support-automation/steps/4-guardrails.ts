@@ -830,25 +830,25 @@ import (
 	"leetbuild/harness"
 )
 
-var gateTurn = model.Turn{TurnID: "turn-1", Tenant: "t1", Conversation: "c-1", Actor: "guest-1", Role: "customer", Text: "Where is my next reservation?"}
-var gateArticles = []string{"Help article for: Where is my next reservation?"}
+var hGateTurn = model.Turn{TurnID: "turn-1", Tenant: "t1", Conversation: "c-1", Actor: "guest-1", Role: "customer", Text: "Where is my next reservation?"}
+var hGateArticles = []string{"Help article for: Where is my next reservation?"}
 
 const (
-	gateGood   = "Your next stay is HM-4410 in Lisbon, check-in 4 December."
-	gateRefund = "You will get a full refund for this stay."
+	kHGateGood   = "Your next stay is HM-4410 in Lisbon, check-in 4 December."
+	kHGateRefund = "You will get a full refund for this stay."
 	// The framework answers relevance on this answer with a verdict the gate has never seen.
-	gateUnsure = "[review] Your next stay is HM-4410 in Lisbon."
+	kHGateUnsure = "[review] Your next stay is HM-4410 in Lisbon."
 )
 
 // frameworkPeer is the Guardrails Framework: verdicts from apv2/standins, and how many checks were in flight at once.
-type frameworkPeer struct {
+type HFrameworkPeer struct {
 	pb.UnimplementedGuardrailFrameworkServer
 	mu       sync.Mutex
 	inFlight int
 	peak     int
 }
 
-func (f *frameworkPeer) Check(_ context.Context, req *pb.CheckRequest) (*pb.CheckReply, error) {
+func (f *HFrameworkPeer) Check(_ context.Context, req *pb.CheckRequest) (*pb.CheckReply, error) {
 	f.mu.Lock()
 	f.inFlight++
 	if f.inFlight > f.peak {
@@ -866,22 +866,22 @@ func (f *frameworkPeer) Check(_ context.Context, req *pb.CheckRequest) (*pb.Chec
 	return &pb.CheckReply{Verdict: verdict, Reason: reason}, nil
 }
 
-func gateWorld(ctx *harness.Ctx) *frameworkPeer {
+func hGateWorld(ctx *harness.Ctx) *HFrameworkPeer {
 	log.SetOutput(&bytes.Buffer{})
-	peer := &frameworkPeer{}
+	peer := &HFrameworkPeer{}
 	pb.RegisterGuardrailFrameworkServer(ctx.GRPC.Server(config.GuardrailFramework), peer)
 	return peer
 }
 
-func gateRun(ctx *harness.Ctx, turnID, answer string) GateResult {
-	turn := gateTurn
+func hGateRun(ctx *harness.Ctx, turnID, answer string) GateResult {
+	turn := hGateTurn
 	turn.TurnID = turnID
-	result, err := gate(context.Background(), turn, answer, gateArticles)
+	result, err := gate(context.Background(), turn, answer, hGateArticles)
 	ctx.NoError(err, "gate(%s)", turnID)
 	return result
 }
 
-func gateHandoffs(ctx *harness.Ctx) []map[string]any {
+func hGateHandoffs(ctx *harness.Ctx) []map[string]any {
 	var rows []map[string]any
 	for _, raw := range ctx.Redis.LRange("apv2:handoff", 0, -1) {
 		var row map[string]any
@@ -891,7 +891,7 @@ func gateHandoffs(ctx *harness.Ctx) []map[string]any {
 	return rows
 }
 
-func gateAll(verdicts map[string]string, want string) bool {
+func hGateAll(verdicts map[string]string, want string) bool {
 	for _, v := range verdicts {
 		if v != want {
 			return false
@@ -901,49 +901,49 @@ func gateAll(verdicts map[string]string, want string) bool {
 }
 
 func CheckAllGuardrails(ctx *harness.Ctx) {
-	gateWorld(ctx)
-	result := gateRun(ctx, "turn-1", gateGood)
+	hGateWorld(ctx)
+	result := hGateRun(ctx, "turn-1", kHGateGood)
 	checked := []string{}
 	for _, c := range ctx.GRPC.CallsTo("Check", "") {
 		checked = append(checked, c.Request.(*pb.CheckRequest).GetGuardrail())
 	}
 	sort.Strings(checked)
 	ctx.Equal(checked, []string{"groundedness", "pii", "relevance"}, "every configured guardrail (relevance, groundedness, pii) runs on every turn, once; the guardrails the gate ran")
-	ctx.Assert(result.Status == "answered" && result.Answer == gateGood, "a grounded answer passes, got %+v", result)
+	ctx.Assert(result.Status == "answered" && result.Answer == kHGateGood, "a grounded answer passes, got %+v", result)
 	ctx.Equal(result.Verdicts, map[string]string{"relevance": "PASS", "groundedness": "PASS", "pii": "PASS"}, "the verdicts come back with the turn")
 }
 
 func CheckParallel(ctx *harness.Ctx) {
-	peer := gateWorld(ctx)
-	gateRun(ctx, "turn-1", gateGood)
+	peer := hGateWorld(ctx)
+	hGateRun(ctx, "turn-1", kHGateGood)
 	calls := len(ctx.GRPC.CallsTo("Check", ""))
 	ctx.Assert(calls >= 2, "the gate must call Check once per guardrail")
 	ctx.Assert(peer.peak == calls, "at most %d of %d checks were in flight at once: start them together (a goroutine each) so the turn pays the slowest guardrail, not the sum", peer.peak, calls)
 }
 
 func CheckOneDeadline(ctx *harness.Ctx) {
-	gateWorld(ctx)
-	gateRun(ctx, "turn-1", gateGood)
+	hGateWorld(ctx)
+	hGateRun(ctx, "turn-1", kHGateGood)
 	for _, call := range ctx.GRPC.CallsTo("Check", "") {
 		name := call.Request.(*pb.CheckRequest).GetGuardrail()
 		ctx.Assert(call.HasDeadline(), "the %s check carries no deadline: the guardrail service's slow hour becomes the assistant's", name)
 		ctx.Assert(call.Timeout >= 1500*time.Millisecond && call.Timeout <= 2050*time.Millisecond, "the %s check's deadline is %v, expected guardrailDeadline = 2 s", name, call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Check", 5.0, config.GuardrailFramework)
-	result := gateRun(ctx, "turn-2", gateGood)
-	ctx.Assert(gateAll(result.Verdicts, "ERROR"), "against a guardrail service that takes 5 s every check must time out at 2 s and read ERROR, got %v", result.Verdicts)
+	result := hGateRun(ctx, "turn-2", kHGateGood)
+	ctx.Assert(hGateAll(result.Verdicts, "ERROR"), "against a guardrail service that takes 5 s every check must time out at 2 s and read ERROR, got %v", result.Verdicts)
 	ctx.Equal(result.Status, "escalated", "a gate whose guardrails timed out must escalate; the status")
 }
 
 func CheckFailClosed(ctx *harness.Ctx) {
-	gateWorld(ctx)
+	hGateWorld(ctx)
 	ctx.GRPC.Fail("Check", codes.Unavailable, "guardrails down", 3, config.GuardrailFramework)
-	result := gateRun(ctx, "turn-1", gateGood)
+	result := hGateRun(ctx, "turn-1", kHGateGood)
 	ctx.Assert(result.Status == "escalated" && result.Answer == "", "with the guardrail service UNAVAILABLE the gate returned %q with answer %q: a guardrail that could not answer did not pass, so the answer is withheld", result.Status, result.Answer)
-	ctx.Assert(gateAll(result.Verdicts, "ERROR"), "every failed check is the verdict ERROR, got %v", result.Verdicts)
-	ctx.Equal(len(gateHandoffs(ctx)), 1, "a turn withheld because its guardrails failed is handed to a human (handoff.Escalate) once; handoff rows")
+	ctx.Assert(hGateAll(result.Verdicts, "ERROR"), "every failed check is the verdict ERROR, got %v", result.Verdicts)
+	ctx.Equal(len(hGateHandoffs(ctx)), 1, "a turn withheld because its guardrails failed is handed to a human (handoff.Escalate) once; handoff rows")
 	ctx.GRPC.Fail("Check", codes.Internal, "one guardrail crashed", 1, config.GuardrailFramework)
-	partial := gateRun(ctx, "turn-2", gateGood)
+	partial := hGateRun(ctx, "turn-2", kHGateGood)
 	values := []string{}
 	for _, v := range partial.Verdicts {
 		values = append(values, v)
@@ -951,24 +951,24 @@ func CheckFailClosed(ctx *harness.Ctx) {
 	sort.Strings(values)
 	ctx.Assert(len(partial.Verdicts) == 3 && strings.Join(values, ",") == "ERROR,PASS,PASS", "with one check failing Internal the verdicts must be one ERROR and two PASS, got %v", partial.Verdicts)
 	ctx.Assert(partial.Status == "escalated" && partial.Answer == "", "one guardrail that could not answer withholds the answer even when the others pass, got %q with answer %q", partial.Status, partial.Answer)
-	ctx.Equal(len(gateHandoffs(ctx)), 2, "each withheld turn is handed to a human once; handoff rows")
+	ctx.Equal(len(hGateHandoffs(ctx)), 2, "each withheld turn is handed to a human once; handoff rows")
 }
 
 func CheckEscalate(ctx *harness.Ctx) {
-	gateWorld(ctx)
-	result := gateRun(ctx, "turn-1", gateRefund)
+	hGateWorld(ctx)
+	result := hGateRun(ctx, "turn-1", kHGateRefund)
 	ctx.Equal(result.Status, "escalated", "an answer promising a refund no article mentions failed groundedness: any verdict other than PASS blocks the answer; the status")
 	ctx.Equal(result.Answer, "", "a blocked answer must not reach the customer; the answer")
-	rows := gateHandoffs(ctx)
+	rows := hGateHandoffs(ctx)
 	ctx.Equal(len(rows), 1, "the blocked turn must be handed to a human once (handoff.Escalate); handoff rows")
 	row := rows[0]
 	ctx.Assert(row["turn_id"] == "turn-1" && row["conversation"] == "c-1" && row["tenant"] == "t1", "the handoff row names the turn: %v", row)
 	ctx.Equal(row["verdicts"], map[string]any{"relevance": "PASS", "groundedness": "FAIL", "pii": "PASS"}, "the handoff row carries every guardrail's verdict")
-	ok := gateRun(ctx, "turn-2", gateGood)
-	ctx.Assert(ok.Status == "answered" && len(gateHandoffs(ctx)) == 1, "a grounded answer is answered and writes no handoff row")
-	unsure := gateRun(ctx, "turn-3", gateUnsure)
+	ok := hGateRun(ctx, "turn-2", kHGateGood)
+	ctx.Assert(ok.Status == "answered" && len(hGateHandoffs(ctx)) == 1, "a grounded answer is answered and writes no handoff row")
+	unsure := hGateRun(ctx, "turn-3", kHGateUnsure)
 	ctx.Equal(unsure.Verdicts["relevance"], "REVIEW", "the verdicts are the framework's; relevance")
-	ctx.Assert(unsure.Status == "escalated" && unsure.Answer == "" && len(gateHandoffs(ctx)) == 2, "relevance answered REVIEW, a verdict that is not PASS, and the gate returned %q with %d handoff rows: anything but PASS blocks the answer and is handed to a human", unsure.Status, len(gateHandoffs(ctx)))
+	ctx.Assert(unsure.Status == "escalated" && unsure.Answer == "" && len(hGateHandoffs(ctx)) == 2, "relevance answered REVIEW, a verdict that is not PASS, and the gate returned %q with %d handoff rows: anything but PASS blocks the answer and is handed to a human", unsure.Status, len(hGateHandoffs(ctx)))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -990,15 +990,15 @@ namespace {
 
 using json = nlohmann::json;
 
-const json kGateTurn = {{"turn_id", "turn-1"}, {"tenant", "t1"}, {"conversation", "c-1"}, {"actor", "guest-1"}, {"role", "customer"}, {"text", "Where is my next reservation?"}};
-const std::vector<std::string> kGateArticles = {"Help article for: Where is my next reservation?"};
-const std::string kGateGood = "Your next stay is HM-4410 in Lisbon, check-in 4 December.";
-const std::string kGateRefund = "You will get a full refund for this stay.";
+const json kHGateTurn = {{"turn_id", "turn-1"}, {"tenant", "t1"}, {"conversation", "c-1"}, {"actor", "guest-1"}, {"role", "customer"}, {"text", "Where is my next reservation?"}};
+const std::vector<std::string> kHGateArticles = {"Help article for: Where is my next reservation?"};
+const std::string kHGateGood = "Your next stay is HM-4410 in Lisbon, check-in 4 December.";
+const std::string kHGateRefund = "You will get a full refund for this stay.";
 // The framework answers relevance on this answer with a verdict the gate has never seen.
-const std::string kGateUnsure = "[review] Your next stay is HM-4410 in Lisbon.";
+const std::string kHGateUnsure = "[review] Your next stay is HM-4410 in Lisbon.";
 
 // The Guardrails Framework: verdicts from apv2/standins.h, and how many checks were in flight at once.
-class FrameworkPeer final : public apv2rpc::GuardrailFramework::Service {
+class HFrameworkPeer final : public apv2rpc::GuardrailFramework::Service {
  public:
   std::mutex mu;
   int in_flight = 0;
@@ -1021,27 +1021,27 @@ class FrameworkPeer final : public apv2rpc::GuardrailFramework::Service {
   }
 };
 
-FrameworkPeer& gateWorld(harness::Ctx& ctx) {
-  static FrameworkPeer* peer = nullptr;
+HFrameworkPeer& hGateWorld(harness::Ctx& ctx) {
+  static HFrameworkPeer* peer = nullptr;
   delete peer;
-  peer = new FrameworkPeer();
+  peer = new HFrameworkPeer();
   ctx.GRPC.Server(config::kGuardrailFramework)->RegisterService(peer);
   return *peer;
 }
 
-json gateTurn(const std::string& turn_id) {
-  json turn = kGateTurn;
+json hGateTurn(const std::string& turn_id) {
+  json turn = kHGateTurn;
   turn["turn_id"] = turn_id;
   return turn;
 }
 
-std::vector<json> gateHandoffs(harness::Ctx& ctx) {
+std::vector<json> hGateHandoffs(harness::Ctx& ctx) {
   std::vector<json> rows;
   for (const auto& raw : ctx.Redis.LRange("apv2:handoff", 0, -1)) rows.push_back(json::parse(raw, nullptr, false));
   return rows;
 }
 
-bool gateAll(const std::map<std::string, std::string>& verdicts, const std::string& want) {
+bool hGateAll(const std::map<std::string, std::string>& verdicts, const std::string& want) {
   return !verdicts.empty() && std::all_of(verdicts.begin(), verdicts.end(), [&](const auto& kv) { return kv.second == want; });
 }
 
@@ -1052,72 +1052,72 @@ std::string hDescribe(const std::map<std::string, std::string>& verdicts) {
 }  // namespace
 
 void CheckAllGuardrails(harness::Ctx& ctx) {
-  gateWorld(ctx);
-  const GateResult result = gate(gateTurn("turn-1"), kGateGood, kGateArticles);
+  hGateWorld(ctx);
+  const GateResult result = gate(hGateTurn("turn-1"), kHGateGood, kHGateArticles);
   std::vector<std::string> checked;
   for (const auto& c : ctx.GRPC.CallsTo("Check")) checked.push_back(c.Request<apv2rpc::CheckRequest>().guardrail());
   std::sort(checked.begin(), checked.end());
   ctx.Equal(checked, std::vector<std::string>{"groundedness", "pii", "relevance"}, "every configured guardrail (relevance, groundedness, pii) runs on every turn, once; the guardrails the gate ran");
-  ctx.Assert(result.status == "answered" && result.answer == kGateGood, "a grounded answer passes, got %s %q", result.status, result.answer);
+  ctx.Assert(result.status == "answered" && result.answer == kHGateGood, "a grounded answer passes, got %s %q", result.status, result.answer);
   ctx.Assert(result.verdicts == std::map<std::string, std::string>{{"relevance", "PASS"}, {"groundedness", "PASS"}, {"pii", "PASS"}}, "the verdicts come back with the turn, got %s", hDescribe(result.verdicts));
 }
 
 void CheckParallel(harness::Ctx& ctx) {
-  auto& peer = gateWorld(ctx);
-  gate(gateTurn("turn-1"), kGateGood, kGateArticles);
+  auto& peer = hGateWorld(ctx);
+  gate(hGateTurn("turn-1"), kHGateGood, kHGateArticles);
   const int calls = static_cast<int>(ctx.GRPC.CallsTo("Check").size());
   ctx.Assert(calls >= 2, "the gate must call Check once per guardrail");
   ctx.Assert(peer.peak == calls, "at most %d of %d checks were in flight at once: start them together (std::async) so the turn pays the slowest guardrail, not the sum", peer.peak, calls);
 }
 
 void CheckOneDeadline(harness::Ctx& ctx) {
-  gateWorld(ctx);
-  gate(gateTurn("turn-1"), kGateGood, kGateArticles);
+  hGateWorld(ctx);
+  gate(hGateTurn("turn-1"), kHGateGood, kHGateArticles);
   for (const auto& call : ctx.GRPC.CallsTo("Check")) {
     const std::string name = call.Request<apv2rpc::CheckRequest>().guardrail();
     ctx.Assert(call.HasDeadline(), "the %s check carries no deadline: the guardrail service's slow hour becomes the assistant's", name);
     ctx.Assert(call.TimeoutSeconds() >= 1.5 && call.TimeoutSeconds() <= 2.05, "the %s check's deadline is %vs, expected kGuardrailDeadline = 2 s", name, call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("Check", 5.0, config::kGuardrailFramework);
-  const GateResult result = gate(gateTurn("turn-2"), kGateGood, kGateArticles);
-  ctx.Assert(gateAll(result.verdicts, "ERROR"), "against a guardrail service that takes 5 s every check must time out at 2 s and read ERROR, got %s", hDescribe(result.verdicts));
+  const GateResult result = gate(hGateTurn("turn-2"), kHGateGood, kHGateArticles);
+  ctx.Assert(hGateAll(result.verdicts, "ERROR"), "against a guardrail service that takes 5 s every check must time out at 2 s and read ERROR, got %s", hDescribe(result.verdicts));
   ctx.Equal(result.status, "escalated", "a gate whose guardrails timed out must escalate; the status");
 }
 
 void CheckFailClosed(harness::Ctx& ctx) {
-  gateWorld(ctx);
+  hGateWorld(ctx);
   ctx.GRPC.Fail("Check", grpc::StatusCode::UNAVAILABLE, "guardrails down", 3, config::kGuardrailFramework);
-  const GateResult result = gate(gateTurn("turn-1"), kGateGood, kGateArticles);
+  const GateResult result = gate(hGateTurn("turn-1"), kHGateGood, kHGateArticles);
   ctx.Assert(result.status == "escalated" && result.answer.empty(),
              "with the guardrail service UNAVAILABLE the gate returned %s with answer %q: a guardrail that could not answer did not pass, so the answer is withheld", result.status, result.answer);
-  ctx.Assert(gateAll(result.verdicts, "ERROR"), "every failed check is the verdict ERROR, got %s", hDescribe(result.verdicts));
-  ctx.Equal(gateHandoffs(ctx).size(), 1, "a turn withheld because its guardrails failed is handed to a human (handoff::escalate) once; handoff rows");
+  ctx.Assert(hGateAll(result.verdicts, "ERROR"), "every failed check is the verdict ERROR, got %s", hDescribe(result.verdicts));
+  ctx.Equal(hGateHandoffs(ctx).size(), 1, "a turn withheld because its guardrails failed is handed to a human (handoff::escalate) once; handoff rows");
   ctx.GRPC.Fail("Check", grpc::StatusCode::INTERNAL, "one guardrail crashed", 1, config::kGuardrailFramework);
-  const GateResult partial = gate(gateTurn("turn-2"), kGateGood, kGateArticles);
+  const GateResult partial = gate(hGateTurn("turn-2"), kHGateGood, kHGateArticles);
   std::vector<std::string> values;
   for (const auto& [_, v] : partial.verdicts) values.push_back(v);
   std::sort(values.begin(), values.end());
   ctx.Assert(partial.verdicts.size() == 3 && values == std::vector<std::string>{"ERROR", "PASS", "PASS"}, "with one check failing INTERNAL the verdicts must be one ERROR and two PASS, got %s", hDescribe(partial.verdicts));
   ctx.Assert(partial.status == "escalated" && partial.answer.empty(), "one guardrail that could not answer withholds the answer even when the others pass, got %s with answer %q", partial.status, partial.answer);
-  ctx.Equal(gateHandoffs(ctx).size(), 2, "each withheld turn is handed to a human once; handoff rows");
+  ctx.Equal(hGateHandoffs(ctx).size(), 2, "each withheld turn is handed to a human once; handoff rows");
 }
 
 void CheckEscalate(harness::Ctx& ctx) {
-  gateWorld(ctx);
-  const GateResult result = gate(gateTurn("turn-1"), kGateRefund, kGateArticles);
+  hGateWorld(ctx);
+  const GateResult result = gate(hGateTurn("turn-1"), kHGateRefund, kHGateArticles);
   ctx.Equal(result.status, "escalated", "an answer promising a refund no article mentions failed groundedness: any verdict other than PASS blocks the answer; the status");
   ctx.Equal(result.answer, "", "a blocked answer must not reach the customer; the answer");
-  const auto rows = gateHandoffs(ctx);
+  const auto rows = hGateHandoffs(ctx);
   ctx.Equal(rows.size(), 1, "the blocked turn must be handed to a human once (handoff::escalate); handoff rows");
   const json row = rows[0];
   ctx.Assert(row.value("turn_id", "") == "turn-1" && row.value("conversation", "") == "c-1" && row.value("tenant", "") == "t1", "the handoff row names the turn: %s", row.dump());
   ctx.Assert(row.contains("verdicts") && row["verdicts"] == json{{"relevance", "PASS"}, {"groundedness", "FAIL"}, {"pii", "PASS"}}, "the handoff row carries every guardrail's verdict, got %s", row.dump());
-  const GateResult ok = gate(gateTurn("turn-2"), kGateGood, kGateArticles);
-  ctx.Assert(ok.status == "answered" && gateHandoffs(ctx).size() == 1, "a grounded answer is answered and writes no handoff row");
-  const GateResult unsure = gate(gateTurn("turn-3"), kGateUnsure, kGateArticles);
+  const GateResult ok = gate(hGateTurn("turn-2"), kHGateGood, kHGateArticles);
+  ctx.Assert(ok.status == "answered" && hGateHandoffs(ctx).size() == 1, "a grounded answer is answered and writes no handoff row");
+  const GateResult unsure = gate(hGateTurn("turn-3"), kHGateUnsure, kHGateArticles);
   ctx.Assert(unsure.verdicts.count("relevance") == 1 && unsure.verdicts.at("relevance") == "REVIEW", "the verdicts are the framework's, got %s", hDescribe(unsure.verdicts));
-  ctx.Assert(unsure.status == "escalated" && unsure.answer.empty() && gateHandoffs(ctx).size() == 2,
-             "relevance answered REVIEW, a verdict that is not PASS, and the gate returned %s with %d handoff rows: anything but PASS blocks the answer and is handed to a human", unsure.status, gateHandoffs(ctx).size());
+  ctx.Assert(unsure.status == "escalated" && unsure.answer.empty() && hGateHandoffs(ctx).size() == 2,
+             "relevance answered REVIEW, a verdict that is not PASS, and the gate returned %s with %d handoff rows: anything but PASS blocks the answer and is handed to a human", unsure.status, hGateHandoffs(ctx).size());
 }
 `,
   },

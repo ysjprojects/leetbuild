@@ -1119,18 +1119,18 @@ import (
 	"leetbuild/harness"
 )
 
-const cotQuestion = "Where is my next reservation?"
+const kHCotQuestion = "Where is my next reservation?"
 
 // cotStore stands in for the step-2 context store over the harness's Redis.
-type cotStore struct{ ctx *harness.Ctx }
+type HCotStore struct{ ctx *harness.Ctx }
 
-func (s cotStore) AppendItem(_ context.Context, tenant, conversation string, item model.Item) error {
+func (s HCotStore) AppendItem(_ context.Context, tenant, conversation string, item model.Item) error {
 	doc, _ := json.Marshal(item)
 	s.ctx.Redis.Do("RPUSH", config.ContextKey(tenant, conversation), string(doc))
 	return nil
 }
 
-func (s cotStore) Assemble(_ context.Context, tenant, conversation, _, _ string) (model.Context, error) {
+func (s HCotStore) Assemble(_ context.Context, tenant, conversation, _, _ string) (model.Context, error) {
 	history := []model.Item{}
 	for _, raw := range s.ctx.Redis.LRange(config.ContextKey(tenant, conversation), 0, -1) {
 		var item model.Item
@@ -1140,11 +1140,11 @@ func (s cotStore) Assemble(_ context.Context, tenant, conversation, _, _ string)
 	return model.Context{History: history, Profile: map[string]string{}, Articles: []string{}}, nil
 }
 
-type llmPeer struct {
+type HLlmPeer struct {
 	pb.UnimplementedLlmAdapterServer
 }
 
-func (llmPeer) Reason(_ context.Context, req *pb.ReasonRequest) (*pb.ReasonReply, error) {
+func (HLlmPeer) Reason(_ context.Context, req *pb.ReasonRequest) (*pb.ReasonReply, error) {
 	items := []model.Item{}
 	for _, m := range req.GetMessages() {
 		items = append(items, model.Item{Kind: m.GetKind(), Text: m.GetText()})
@@ -1154,13 +1154,13 @@ func (llmPeer) Reason(_ context.Context, req *pb.ReasonRequest) (*pb.ReasonReply
 }
 
 // toolPeer is the Tool Manager: runs a registered tool; a repeated idempotency key answers from its ledger.
-type toolPeer struct {
+type HToolPeer struct {
 	pb.UnimplementedToolManagerServer
 	ledger   map[string]string
 	executed []string
 }
 
-func (t *toolPeer) Invoke(_ context.Context, req *pb.InvokeRequest) (*pb.InvokeReply, error) {
+func (t *HToolPeer) Invoke(_ context.Context, req *pb.InvokeRequest) (*pb.InvokeReply, error) {
 	if key := req.GetIdempotencyKey(); key != "" {
 		if result, ok := t.ledger[key]; ok {
 			return &pb.InvokeReply{Result: result}, nil
@@ -1177,24 +1177,24 @@ func (t *toolPeer) Invoke(_ context.Context, req *pb.InvokeRequest) (*pb.InvokeR
 	return &pb.InvokeReply{Result: result}, nil
 }
 
-func cotWorld(ctx *harness.Ctx) (cotStore, *toolPeer) {
-	pb.RegisterLlmAdapterServer(ctx.GRPC.Server(config.LlmAdapter), llmPeer{})
-	tools := &toolPeer{ledger: map[string]string{}}
+func hCotWorld(ctx *harness.Ctx) (HCotStore, *HToolPeer) {
+	pb.RegisterLlmAdapterServer(ctx.GRPC.Server(config.LlmAdapter), HLlmPeer{})
+	tools := &HToolPeer{ledger: map[string]string{}}
 	pb.RegisterToolManagerServer(ctx.GRPC.Server(config.ToolManager), tools)
-	return cotStore{ctx: ctx}, tools
+	return HCotStore{ctx: ctx}, tools
 }
 
-func cotTurn(text, role, turnID, actor string) model.Turn {
+func hCotTurn(text, role, turnID, actor string) model.Turn {
 	return model.Turn{TurnID: turnID, Tenant: "t1", Conversation: "c-1", Actor: actor, Role: role, Text: text}
 }
 
-func cotRun(ctx *harness.Ctx, store cotStore, turn model.Turn) TurnResult {
+func hCotRun(ctx *harness.Ctx, store HCotStore, turn model.Turn) TurnResult {
 	result, err := runTurn(context.Background(), store, turn)
 	ctx.NoError(err, "runTurn(%s)", turn.TurnID)
 	return result
 }
 
-func cotKinds(ctx *harness.Ctx) []string {
+func hCotKinds(ctx *harness.Ctx) []string {
 	out := []string{}
 	for _, raw := range ctx.Redis.LRange("ctx:t1:c-1", 0, -1) {
 		var item model.Item
@@ -1204,7 +1204,7 @@ func cotKinds(ctx *harness.Ctx) []string {
 	return out
 }
 
-func cotCount(list []string, name string) int {
+func hCotCount(list []string, name string) int {
 	n := 0
 	for _, s := range list {
 		if s == name {
@@ -1215,59 +1215,59 @@ func cotCount(list []string, name string) int {
 }
 
 func CheckReasonDeadline(ctx *harness.Ctx) {
-	store, _ := cotWorld(ctx)
-	result := cotRun(ctx, store, cotTurn(cotQuestion, "customer", "turn-1", "guest-1"))
+	store, _ := hCotWorld(ctx)
+	result := hCotRun(ctx, store, hCotTurn(kHCotQuestion, "customer", "turn-1", "guest-1"))
 	ctx.Equal(result.Status, "answered", "a plain question must be answered (%+v)", result)
 	ctx.Equal(result.Answer, "Your next stay: "+standins.Reservation, "the answer is the model's result")
 	reasons := ctx.GRPC.CallsTo("Reason", "")
 	ctx.Assert(len(reasons) == 2 && len(ctx.GRPC.CallsTo("Invoke", "")) == 1, "one tool call then the answer: expected 2 Reason calls and 1 Invoke, saw %d and %d", len(reasons), len(ctx.GRPC.CallsTo("Invoke", "")))
-	ctx.Equal(cotKinds(ctx), []string{"user", "tool", "assistant"}, "the conversation's context must hold the question, the tool outcome and the answer")
+	ctx.Equal(hCotKinds(ctx), []string{"user", "tool", "assistant"}, "the conversation's context must hold the question, the tool outcome and the answer")
 	for _, call := range reasons {
 		ctx.Assert(call.HasDeadline(), "a Reason call carries no deadline: a stalled model holds the worker for as long as it stalls")
 		ctx.Assert(call.Timeout >= 4500*time.Millisecond && call.Timeout <= 5500*time.Millisecond, "the Reason deadline must be reasonDeadline = 5 s, got %v", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Reason", 2.0, config.LlmAdapter)
-	steady := cotRun(ctx, store, cotTurn(cotQuestion, "customer", "turn-2", "guest-1"))
+	steady := hCotRun(ctx, store, hCotTurn(kHCotQuestion, "customer", "turn-2", "guest-1"))
 	ctx.Equal(steady.Status, "answered", "a model that takes 2 s per call must still answer (%+v)", steady)
 	for _, call := range ctx.GRPC.CallsTo("Reason", "")[2:] {
 		ctx.Assert(call.HasDeadline() && call.Timeout >= 4500*time.Millisecond && call.Timeout <= 5500*time.Millisecond, "with a model that takes 2 s per call, a later Reason call carried a deadline of %v: each call gets its own reasonDeadline = 5 s, not what is left of one shared budget", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Reason", 6.0, config.LlmAdapter)
 	started := ctx.Clock.Now()
-	slow := cotRun(ctx, store, cotTurn(cotQuestion, "customer", "turn-3", "guest-1"))
+	slow := hCotRun(ctx, store, hCotTurn(kHCotQuestion, "customer", "turn-3", "guest-1"))
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(waited <= 5.5, "the turn waited %.1f s on a model that takes 6 s: cut it at the 5 s deadline", waited)
 	ctx.Equal(slow.Status, "escalated", "a Reason call that failed its deadline must end the turn escalated (%+v)", slow)
 	ctx.GRPC.SetLatency("Reason", 0, config.LlmAdapter)
 	ctx.GRPC.Fail("Reason", codes.Internal, "the model adapter crashed", 1, "")
-	broken, err := runTurn(context.Background(), store, cotTurn(cotQuestion, "customer", "turn-4", "guest-1"))
+	broken, err := runTurn(context.Background(), store, hCotTurn(kHCotQuestion, "customer", "turn-4", "guest-1"))
 	ctx.Assert(err == nil && broken.Status == "escalated", "a Reason call that failed with Internal must end the turn escalated, not return the error; got %+v (%v)", broken, err)
 }
 
 func CheckBoundedLoop(ctx *harness.Ctx) {
-	store, _ := cotWorld(ctx)
-	result := cotRun(ctx, store, cotTurn("loop: check every reservation", "customer", "turn-1", "guest-1"))
+	store, _ := hCotWorld(ctx)
+	result := hCotRun(ctx, store, hCotTurn("loop: check every reservation", "customer", "turn-1", "guest-1"))
 	ctx.Equal(len(ctx.GRPC.CallsTo("Reason", "")), 6, "a model that asks for a tool on every reply: stop at maxIterations = 6, or one turn bills without bound; Reason calls")
 	ctx.Assert(result.Status == "escalated" && result.Iterations == 6, "a turn that spent its 6 iterations must come back escalated with Iterations 6, got %+v", result)
 }
 
 func CheckToolRegistry(ctx *harness.Ctx) {
-	store, tools := cotWorld(ctx)
-	result, err := runTurn(context.Background(), store, cotTurn("call:issue_refund for my last stay", "customer", "turn-1", "guest-1"))
-	ctx.Equal(cotCount(tools.executed, "issue_refund"), 0, "a customer turn ran issue_refund because the model asked for it: resolve the tool through toolRegistry and the turn's role before any Invoke; refunds executed")
+	store, tools := hCotWorld(ctx)
+	result, err := runTurn(context.Background(), store, hCotTurn("call:issue_refund for my last stay", "customer", "turn-1", "guest-1"))
+	ctx.Equal(hCotCount(tools.executed, "issue_refund"), 0, "a customer turn ran issue_refund because the model asked for it: resolve the tool through toolRegistry and the turn's role before any Invoke; refunds executed")
 	ctx.Assert(err == nil && result.Status == "answered" && strings.Contains(result.Answer, "tool not allowed"), "the model must be told {\\"error\\": \\"tool not allowed\\"} and answer from it, got %+v (%v)", result, err)
-	runTurn(context.Background(), store, cotTurn("call:delete_account now", "customer", "turn-2", "guest-1"))
-	runTurn(context.Background(), store, cotTurn("call:update_listing to allow pets", "customer", "turn-4", "guest-1"))
+	runTurn(context.Background(), store, hCotTurn("call:delete_account now", "customer", "turn-2", "guest-1"))
+	runTurn(context.Background(), store, hCotTurn("call:update_listing to allow pets", "customer", "turn-4", "guest-1"))
 	ctx.Equal(len(ctx.GRPC.CallsTo("Invoke", "")), 0, "a tool outside the registry, or update_listing (agent-only) on a customer turn, must not reach the Tool Manager; Invoke calls")
-	agent := cotRun(ctx, store, cotTurn("call:issue_refund for HM-4410", "agent", "turn-3", "agent-7"))
+	agent := hCotRun(ctx, store, hCotTurn("call:issue_refund for HM-4410", "agent", "turn-3", "agent-7"))
 	ctx.Assert(len(tools.executed) == 1 && tools.executed[0] == "issue_refund" && agent.Status == "answered", "an agent turn may run issue_refund, executed %v, result %+v", tools.executed, agent)
 }
 
 func CheckToolDeadline(ctx *harness.Ctx) {
-	store, _ := cotWorld(ctx)
+	store, _ := hCotWorld(ctx)
 	ctx.GRPC.SetLatency("Invoke", 5.0, config.ToolManager)
 	started := ctx.Clock.Now()
-	result, err := runTurn(context.Background(), store, cotTurn(cotQuestion, "customer", "turn-1", "guest-1"))
+	result, err := runTurn(context.Background(), store, hCotTurn(kHCotQuestion, "customer", "turn-1", "guest-1"))
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	invokes := ctx.GRPC.CallsTo("Invoke", "")
 	ctx.Equal(len(invokes), 1, "one tool call expected; Invoke calls")
@@ -1276,7 +1276,7 @@ func CheckToolDeadline(ctx *harness.Ctx) {
 	ctx.Assert(waited <= 3.5, "the turn waited %.1f s on a tool that takes 5 s: cut it at 3 s", waited)
 	ctx.Assert(err == nil && result.Status == "answered" && strings.Contains(result.Answer, "tool failed"), "a tool that failed its deadline is an outcome the model sees ({\\"error\\": \\"tool failed\\"}), and the turn goes on; got %+v (%v)", result, err)
 	ctx.GRPC.SetLatency("Invoke", 2.0, config.ToolManager)
-	looped, err := runTurn(context.Background(), store, cotTurn("loop: check every reservation", "customer", "turn-2", "guest-1"))
+	looped, err := runTurn(context.Background(), store, hCotTurn("loop: check every reservation", "customer", "turn-2", "guest-1"))
 	later := ctx.GRPC.CallsTo("Invoke", "")[1:]
 	ctx.Assert(err == nil && len(later) == 6 && looped.Status == "escalated", "a looping model with a tool that takes 2 s must make 6 Invoke calls and escalate, saw %d calls and %+v (%v)", len(later), looped, err)
 	for _, call := range later {
@@ -1284,19 +1284,19 @@ func CheckToolDeadline(ctx *harness.Ctx) {
 	}
 	ctx.GRPC.SetLatency("Invoke", 0, config.ToolManager)
 	ctx.GRPC.Fail("Invoke", codes.Internal, "the tool crashed", 1, "")
-	crashed, err := runTurn(context.Background(), store, cotTurn(cotQuestion, "customer", "turn-3", "guest-1"))
+	crashed, err := runTurn(context.Background(), store, hCotTurn(kHCotQuestion, "customer", "turn-3", "guest-1"))
 	ctx.Assert(err == nil && crashed.Status == "answered" && strings.Contains(crashed.Answer, "tool failed"), "an Invoke that failed with Internal is the outcome {\\"error\\": \\"tool failed\\"} the model sees, and the turn goes on; got %+v (%v)", crashed, err)
 }
 
 func CheckWriteIdempotency(ctx *harness.Ctx) {
-	store, tools := cotWorld(ctx)
-	turn := cotTurn("call:issue_refund for HM-4410", "agent", "turn-9", "agent-7")
-	cotRun(ctx, store, turn)
+	store, tools := hCotWorld(ctx)
+	turn := hCotTurn("call:issue_refund for HM-4410", "agent", "turn-9", "agent-7")
+	hCotRun(ctx, store, turn)
 	first := ctx.GRPC.CallsTo("Invoke", "")[0].Request.(*pb.InvokeRequest)
 	ctx.Equal(first.GetIdempotencyKey(), "turn-9:1", "issue_refund is a WRITE tool: it must carry idempotency key {turn_id}:{iteration}")
-	cotRun(ctx, store, turn)
-	ctx.Equal(cotCount(tools.executed, "issue_refund"), 1, "the worker ran the same turn twice (a redelivery): the key lets the Tool Manager answer the retry from its ledger; refunds executed")
-	cotRun(ctx, store, cotTurn(cotQuestion, "customer", "turn-10", "guest-1"))
+	hCotRun(ctx, store, turn)
+	ctx.Equal(hCotCount(tools.executed, "issue_refund"), 1, "the worker ran the same turn twice (a redelivery): the key lets the Tool Manager answer the retry from its ledger; refunds executed")
+	hCotRun(ctx, store, hCotTurn(kHCotQuestion, "customer", "turn-10", "guest-1"))
 	invokes := ctx.GRPC.CallsTo("Invoke", "")
 	read := invokes[len(invokes)-1].Request.(*pb.InvokeRequest)
 	ctx.Assert(read.GetTool() == "get_reservation" && read.GetIdempotencyKey() == "", "a READ tool carries no idempotency key, got %q", read.GetIdempotencyKey())
@@ -1317,12 +1317,12 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kCotQuestion = "Where is my next reservation?";
+const std::string kHCotQuestion = "Where is my next reservation?";
 
 // Stands in for the step-2 context store over the harness's Redis.
-class CotStore final : public model::ContextStore {
+class HCotStore final : public model::ContextStore {
  public:
-  explicit CotStore(harness::Ctx& ctx) : ctx_(ctx) {}
+  explicit HCotStore(harness::Ctx& ctx) : ctx_(ctx) {}
   void append_item(const std::string& tenant, const std::string& conversation, const model::Item& item) override {
     ctx_.Redis.Do("RPUSH", config::context_key(tenant, conversation), json{{"kind", item.kind}, {"text", item.text}}.dump());
   }
@@ -1339,7 +1339,7 @@ class CotStore final : public model::ContextStore {
   harness::Ctx& ctx_;
 };
 
-class LlmPeer final : public apv2rpc::LlmAdapter::Service {
+class HLlmPeer final : public apv2rpc::LlmAdapter::Service {
  public:
   grpc::Status Reason(grpc::ServerContext*, const apv2rpc::ReasonRequest* req, apv2rpc::ReasonReply* reply) override {
     std::vector<model::Item> items;
@@ -1356,7 +1356,7 @@ class LlmPeer final : public apv2rpc::LlmAdapter::Service {
 };
 
 // The Tool Manager: runs a registered tool; a repeated idempotency key answers from its ledger.
-class ToolPeer final : public apv2rpc::ToolManager::Service {
+class HToolPeer final : public apv2rpc::ToolManager::Service {
  public:
   std::map<std::string, std::string> ledger;
   std::vector<std::string> executed;
@@ -1375,33 +1375,33 @@ class ToolPeer final : public apv2rpc::ToolManager::Service {
   }
 };
 
-struct CotWorld {
-  LlmPeer llm;
-  ToolPeer tools;
-  CotStore store;
-  explicit CotWorld(harness::Ctx& ctx) : store(ctx) {}
+struct HCotWorld {
+  HLlmPeer llm;
+  HToolPeer tools;
+  HCotStore store;
+  explicit HCotWorld(harness::Ctx& ctx) : store(ctx) {}
 };
 
-CotWorld& cotWorld(harness::Ctx& ctx) {
-  static CotWorld* world = nullptr;
+HCotWorld& hCotWorld(harness::Ctx& ctx) {
+  static HCotWorld* world = nullptr;
   delete world;
-  world = new CotWorld(ctx);
+  world = new HCotWorld(ctx);
   ctx.GRPC.Server(config::kLlmAdapter)->RegisterService(&world->llm);
   ctx.GRPC.Server(config::kToolManager)->RegisterService(&world->tools);
   return *world;
 }
 
-json cotTurn(const std::string& text, const std::string& role = "customer", const std::string& turn_id = "turn-1", const std::string& actor = "guest-1") {
+json hCotTurn(const std::string& text, const std::string& role = "customer", const std::string& turn_id = "turn-1", const std::string& actor = "guest-1") {
   return {{"turn_id", turn_id}, {"tenant", "t1"}, {"conversation", "c-1"}, {"actor", actor}, {"role", role}, {"text", text}};
 }
 
-std::vector<std::string> cotKinds(harness::Ctx& ctx) {
+std::vector<std::string> hCotKinds(harness::Ctx& ctx) {
   std::vector<std::string> out;
   for (const auto& raw : ctx.Redis.LRange("ctx:t1:c-1", 0, -1)) out.push_back(json::parse(raw, nullptr, false).value("kind", ""));
   return out;
 }
 
-TurnResult cotRun(harness::Ctx& ctx, CotWorld& w, const json& turn) {
+TurnResult hCotRun(harness::Ctx& ctx, HCotWorld& w, const json& turn) {
   try {
     return run_turn(w.store, turn);
   } catch (const std::exception& e) {
@@ -1413,19 +1413,19 @@ TurnResult cotRun(harness::Ctx& ctx, CotWorld& w, const json& turn) {
 }  // namespace
 
 void CheckReasonDeadline(harness::Ctx& ctx) {
-  auto& w = cotWorld(ctx);
-  const TurnResult result = cotRun(ctx, w, cotTurn(kCotQuestion));
+  auto& w = hCotWorld(ctx);
+  const TurnResult result = hCotRun(ctx, w, hCotTurn(kHCotQuestion));
   ctx.Equal(result.status, "answered", "a plain question must be answered (answer %q)", result.answer);
   ctx.Equal(result.answer, "Your next stay: " + standins::kReservation, "the answer is the model's result");
   const auto reasons = ctx.GRPC.CallsTo("Reason");
   ctx.Assert(reasons.size() == 2 && ctx.GRPC.CallsTo("Invoke").size() == 1, "one tool call then the answer: expected 2 Reason calls and 1 Invoke, saw %d and %d", reasons.size(), ctx.GRPC.CallsTo("Invoke").size());
-  ctx.Equal(cotKinds(ctx), std::vector<std::string>{"user", "tool", "assistant"}, "the conversation's context must hold the question, the tool outcome and the answer");
+  ctx.Equal(hCotKinds(ctx), std::vector<std::string>{"user", "tool", "assistant"}, "the conversation's context must hold the question, the tool outcome and the answer");
   for (const auto& call : reasons) {
     ctx.Assert(call.HasDeadline(), "a Reason call carries no deadline: a stalled model holds the worker for as long as it stalls");
     ctx.Assert(call.TimeoutSeconds() >= 4.5 && call.TimeoutSeconds() <= 5.5, "the Reason deadline must be kReasonDeadline = 5 s, got %vs", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("Reason", 2.0, config::kLlmAdapter);
-  const TurnResult steady = cotRun(ctx, w, cotTurn(kCotQuestion, "customer", "turn-2"));
+  const TurnResult steady = hCotRun(ctx, w, hCotTurn(kHCotQuestion, "customer", "turn-2"));
   ctx.Equal(steady.status, "answered", "a model that takes 2 s per call must still answer");
   const auto later = ctx.GRPC.CallsTo("Reason");
   for (size_t i = 2; i < later.size(); i++) {
@@ -1434,29 +1434,29 @@ void CheckReasonDeadline(harness::Ctx& ctx) {
   }
   ctx.GRPC.SetLatency("Reason", 6.0, config::kLlmAdapter);
   const int64_t started = ctx.Clock.Now();
-  const TurnResult slow = cotRun(ctx, w, cotTurn(kCotQuestion, "customer", "turn-3"));
+  const TurnResult slow = hCotRun(ctx, w, hCotTurn(kHCotQuestion, "customer", "turn-3"));
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(waited <= 5.5, "the turn waited %.1f s on a model that takes 6 s: cut it at the 5 s deadline", waited);
   ctx.Equal(slow.status, "escalated", "a Reason call that failed its deadline must end the turn escalated");
   ctx.GRPC.SetLatency("Reason", 0, config::kLlmAdapter);
   ctx.GRPC.Fail("Reason", grpc::StatusCode::INTERNAL, "the model adapter crashed");
-  const TurnResult broken = cotRun(ctx, w, cotTurn(kCotQuestion, "customer", "turn-4"));
+  const TurnResult broken = hCotRun(ctx, w, hCotTurn(kHCotQuestion, "customer", "turn-4"));
   ctx.Equal(broken.status, "escalated", "a Reason call that failed with INTERNAL must end the turn escalated");
 }
 
 void CheckBoundedLoop(harness::Ctx& ctx) {
-  auto& w = cotWorld(ctx);
-  const TurnResult result = cotRun(ctx, w, cotTurn("loop: check every reservation"));
+  auto& w = hCotWorld(ctx);
+  const TurnResult result = hCotRun(ctx, w, hCotTurn("loop: check every reservation"));
   ctx.Equal(ctx.GRPC.CallsTo("Reason").size(), 6, "a model that asks for a tool on every reply: stop at kMaxIterations = 6, or one turn bills without bound; Reason calls");
   ctx.Assert(result.status == "escalated" && result.iterations == 6, "a turn that spent its 6 iterations must come back escalated with iterations 6, got %s after %d", result.status, result.iterations);
 }
 
 void CheckToolRegistry(harness::Ctx& ctx) {
-  auto& w = cotWorld(ctx);
+  auto& w = hCotWorld(ctx);
   TurnResult result;
   std::string error;
   try {
-    result = run_turn(w.store, cotTurn("call:issue_refund for my last stay"));
+    result = run_turn(w.store, hCotTurn("call:issue_refund for my last stay"));
   } catch (const std::exception& e) {
     error = e.what();
   }
@@ -1465,20 +1465,20 @@ void CheckToolRegistry(harness::Ctx& ctx) {
   ctx.Assert(error.empty() && result.status == "answered" && result.answer.find("tool not allowed") != std::string::npos,
              "the model must be told {\\"error\\": \\"tool not allowed\\"} and answer from it, got %s %q %s", result.status, result.answer, error);
   try {
-    run_turn(w.store, cotTurn("call:delete_account now", "customer", "turn-2"));
-    run_turn(w.store, cotTurn("call:update_listing to allow pets", "customer", "turn-4"));
+    run_turn(w.store, hCotTurn("call:delete_account now", "customer", "turn-2"));
+    run_turn(w.store, hCotTurn("call:update_listing to allow pets", "customer", "turn-4"));
   } catch (const std::exception&) {
   }
   ctx.Equal(ctx.GRPC.CallsTo("Invoke").size(), 0, "a tool outside the registry, or update_listing (agent-only) on a customer turn, must not reach the Tool Manager; Invoke calls");
-  const TurnResult agent = cotRun(ctx, w, cotTurn("call:issue_refund for HM-4410", "agent", "turn-3", "agent-7"));
+  const TurnResult agent = hCotRun(ctx, w, hCotTurn("call:issue_refund for HM-4410", "agent", "turn-3", "agent-7"));
   ctx.Assert(w.tools.executed == std::vector<std::string>{"issue_refund"} && agent.status == "answered", "an agent turn may run issue_refund, executed %v, status %s", w.tools.executed, agent.status);
 }
 
 void CheckToolDeadline(harness::Ctx& ctx) {
-  auto& w = cotWorld(ctx);
+  auto& w = hCotWorld(ctx);
   ctx.GRPC.SetLatency("Invoke", 5.0, config::kToolManager);
   const int64_t started = ctx.Clock.Now();
-  const TurnResult result = cotRun(ctx, w, cotTurn(kCotQuestion));
+  const TurnResult result = hCotRun(ctx, w, hCotTurn(kHCotQuestion));
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   const auto invokes = ctx.GRPC.CallsTo("Invoke");
   ctx.Equal(invokes.size(), 1, "one tool call expected; Invoke calls");
@@ -1488,7 +1488,7 @@ void CheckToolDeadline(harness::Ctx& ctx) {
   ctx.Assert(result.status == "answered" && result.answer.find("tool failed") != std::string::npos,
              "a tool that failed its deadline is an outcome the model sees ({\\"error\\": \\"tool failed\\"}), and the turn goes on; got %s %q", result.status, result.answer);
   ctx.GRPC.SetLatency("Invoke", 2.0, config::kToolManager);
-  const TurnResult looped = cotRun(ctx, w, cotTurn("loop: check every reservation", "customer", "turn-2"));
+  const TurnResult looped = hCotRun(ctx, w, hCotTurn("loop: check every reservation", "customer", "turn-2"));
   const auto all = ctx.GRPC.CallsTo("Invoke");
   ctx.Assert(all.size() == 7 && looped.status == "escalated", "a looping model with a tool that takes 2 s must make 6 Invoke calls and escalate, saw %d calls and %s", all.size() - 1, looped.status);
   for (size_t i = 1; i < all.size(); i++) {
@@ -1497,21 +1497,21 @@ void CheckToolDeadline(harness::Ctx& ctx) {
   }
   ctx.GRPC.SetLatency("Invoke", 0, config::kToolManager);
   ctx.GRPC.Fail("Invoke", grpc::StatusCode::INTERNAL, "the tool crashed");
-  const TurnResult crashed = cotRun(ctx, w, cotTurn(kCotQuestion, "customer", "turn-3"));
+  const TurnResult crashed = hCotRun(ctx, w, hCotTurn(kHCotQuestion, "customer", "turn-3"));
   ctx.Assert(crashed.status == "answered" && crashed.answer.find("tool failed") != std::string::npos,
              "an Invoke that failed with INTERNAL is the outcome {\\"error\\": \\"tool failed\\"} the model sees, and the turn goes on; got %s %q", crashed.status, crashed.answer);
 }
 
 void CheckWriteIdempotency(harness::Ctx& ctx) {
-  auto& w = cotWorld(ctx);
-  const json turn = cotTurn("call:issue_refund for HM-4410", "agent", "turn-9", "agent-7");
-  cotRun(ctx, w, turn);
+  auto& w = hCotWorld(ctx);
+  const json turn = hCotTurn("call:issue_refund for HM-4410", "agent", "turn-9", "agent-7");
+  hCotRun(ctx, w, turn);
   const auto first = ctx.GRPC.CallsTo("Invoke")[0].Request<apv2rpc::InvokeRequest>();
   ctx.Equal(first.idempotency_key(), "turn-9:1", "issue_refund is a WRITE tool: it must carry idempotency key {turn_id}:{iteration}");
-  cotRun(ctx, w, turn);
+  hCotRun(ctx, w, turn);
   ctx.Equal(std::count(w.tools.executed.begin(), w.tools.executed.end(), "issue_refund"), 1,
             "the worker ran the same turn twice (a redelivery): the key lets the Tool Manager answer the retry from its ledger; refunds executed");
-  cotRun(ctx, w, cotTurn(kCotQuestion, "customer", "turn-10"));
+  hCotRun(ctx, w, hCotTurn(kHCotQuestion, "customer", "turn-10"));
   const auto read = ctx.GRPC.CallsTo("Invoke").back().Request<apv2rpc::InvokeRequest>();
   ctx.Assert(read.tool() == "get_reservation" && read.idempotency_key().empty(), "a READ tool carries no idempotency key, got %q", read.idempotency_key());
 }

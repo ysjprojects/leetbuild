@@ -1003,18 +1003,18 @@ import (
 	"leetbuild/harness"
 )
 
-const cacheBudget = 50000
+const kHCacheBudget = 50000
 
-var cacheBg = context.Background()
+var hCacheBg = context.Background()
 
-func cacheJob(skuID, title, merchant string) store.Job {
+func hCacheJob(skuID, title, merchant string) store.Job {
 	images := []string{"img/a.jpg"}
 	return store.Job{SkuID: skuID, Merchant: merchant, ContentHash: store.ContentHash(merchant, title, "Nourishing body wash", images),
 		Title: title, Description: "Nourishing body wash", Images: images}
 }
 
 // cacheModel stands in for step 2: a confident body-wash answer whose size is the title's; it counts the calls.
-func cacheModel() *int {
+func hCacheModel() *int {
 	calls := 0
 	extractAttributes = func(_ context.Context, job store.Job) (store.Result, error) {
 		calls++
@@ -1030,24 +1030,24 @@ func cacheModel() *int {
 	return &calls
 }
 
-func cacheBudgetKey(ctx *harness.Ctx, merchant string) string {
+func hCacheBudgetKey(ctx *harness.Ctx, merchant string) string {
 	return "budget:" + merchant + ":" + ctx.Clock.Time().UTC().Format("20060102")
 }
 
-func mustEnrich(ctx *harness.Ctx, job store.Job, why string) store.Result {
-	result, err := enrich(cacheBg, job)
+func hMustEnrich(ctx *harness.Ctx, job store.Job, why string) store.Result {
+	result, err := enrich(hCacheBg, job)
 	ctx.NoError(err, "%s: enrich failed", why)
 	return result
 }
 
 func CheckCacheKey(ctx *harness.Ctx) {
-	calls := cacheModel()
-	first := mustEnrich(ctx, cacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1"), "the first job")
-	twin := mustEnrich(ctx, cacheJob("sku-9", "DOVE SILK GLOW BODY WASH 500ML", "m-1"), "the same product under a second SKU id")
+	calls := hCacheModel()
+	first := hMustEnrich(ctx, hCacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1"), "the first job")
+	twin := hMustEnrich(ctx, hCacheJob("sku-9", "DOVE SILK GLOW BODY WASH 500ML", "m-1"), "the same product under a second SKU id")
 	ctx.Equal(*calls, 1, "the same content under another SKU id must not pay for a second extraction (key the cache by content_hash); the model calls")
 	ctx.Assert(twin.SkuID == "sku-9" && twin.Attributes["size"] == first.Attributes["size"], "a hit must answer the cached attributes for the job's own SKU id, got %+v", twin)
-	changed := cacheJob("sku-1", "DOVE SILK GLOW BODY WASH 750ML", "m-1")
-	result := mustEnrich(ctx, changed, "a corrected title")
+	changed := hCacheJob("sku-1", "DOVE SILK GLOW BODY WASH 750ML", "m-1")
+	result := hMustEnrich(ctx, changed, "a corrected title")
 	ctx.Equal(*calls, 2, "a corrected title must not be answered from the cache (the key changes with the content); the model calls")
 	ctx.Equal(result.Attributes["size"], 750.0, "the corrected title must be extracted again; the size")
 	key := "extract:" + taxonomy.Version + ":" + changed.ContentHash
@@ -1055,8 +1055,8 @@ func CheckCacheKey(ctx *harness.Ctx) {
 }
 
 func CheckCacheTtl(ctx *harness.Ctx) {
-	cacheModel()
-	job := cacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1")
+	hCacheModel()
+	job := hCacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1")
 	entry := "extract:" + taxonomy.Version + ":" + job.ContentHash
 	written := []int64{}
 	// the TTL right after the command that created the entry
@@ -1070,7 +1070,7 @@ func CheckCacheTtl(ctx *harness.Ctx) {
 		return nil
 	}
 	ctx.Redis.After(entry, watch)
-	mustEnrich(ctx, job, "the first job")
+	hMustEnrich(ctx, job, "the first job")
 	keys := ctx.Redis.Keys("extract:*")
 	ctx.Assert(len(keys) > 0, "an accepted extraction was not cached")
 	for _, key := range keys {
@@ -1081,36 +1081,36 @@ func CheckCacheTtl(ctx *harness.Ctx) {
 }
 
 func CheckBudgetBeforeCall(ctx *harness.Ctx) {
-	calls := cacheModel()
-	ctx.Redis.Set(cacheBudgetKey(ctx, "m-1"), cacheBudget)
-	_, err := enrich(cacheBg, cacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1"))
+	calls := hCacheModel()
+	ctx.Redis.Set(hCacheBudgetKey(ctx, "m-1"), kHCacheBudget)
+	_, err := enrich(hCacheBg, hCacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1"))
 	ctx.Assert(errors.Is(err, ErrBudgetExhausted), "a merchant at its daily budget must be refused with ErrBudgetExhausted, got %v", err)
 	ctx.Equal(*calls, 0, "a merchant at its daily budget must be refused before the model is called; the model calls")
-	other := cacheJob("sku-2", "DOVE SILK GLOW BODY WASH 500ML", "m-2")
-	mustEnrich(ctx, other, "a miss")
-	mustEnrich(ctx, other, "a hit")
-	spent, _ := ctx.Redis.Get(cacheBudgetKey(ctx, "m-2"))
+	other := hCacheJob("sku-2", "DOVE SILK GLOW BODY WASH 500ML", "m-2")
+	hMustEnrich(ctx, other, "a miss")
+	hMustEnrich(ctx, other, "a hit")
+	spent, _ := ctx.Redis.Get(hCacheBudgetKey(ctx, "m-2"))
 	ctx.Equal(spent, "1", "one miss and one hit (a hit costs nothing); m-2's budget spent")
-	ctx.Redis.Set(cacheBudgetKey(ctx, "m-3"), cacheBudget-1)
-	_, err = enrich(cacheBg, cacheJob("sku-3", "DOVE SILK GLOW BODY WASH 500ML", "m-3"))
-	ctx.NoError(err, "a merchant at %d extractions still has the last unit of its daily budget to spend", cacheBudget-1)
-	spent, _ = ctx.Redis.Get(cacheBudgetKey(ctx, "m-3"))
-	ctx.Equal(spent, strconv.Itoa(cacheBudget), "the last unit must leave the counter at the daily budget; m-3's counter")
+	ctx.Redis.Set(hCacheBudgetKey(ctx, "m-3"), kHCacheBudget-1)
+	_, err = enrich(hCacheBg, hCacheJob("sku-3", "DOVE SILK GLOW BODY WASH 500ML", "m-3"))
+	ctx.NoError(err, "a merchant at %d extractions still has the last unit of its daily budget to spend", kHCacheBudget-1)
+	spent, _ = ctx.Redis.Get(hCacheBudgetKey(ctx, "m-3"))
+	ctx.Equal(spent, strconv.Itoa(kHCacheBudget), "the last unit must leave the counter at the daily budget; m-3's counter")
 	before := *calls
-	_, err = enrich(cacheBg, cacheJob("sku-4", "DOVE SILK GLOW BODY WASH 250ML", "m-3"))
+	_, err = enrich(hCacheBg, hCacheJob("sku-4", "DOVE SILK GLOW BODY WASH 250ML", "m-3"))
 	ctx.Assert(errors.Is(err, ErrBudgetExhausted), "a merchant that spent its whole daily budget must be refused with ErrBudgetExhausted, got %v", err)
 	ctx.Equal(*calls, before, "a merchant that spent its budget must be refused before the model is called; the model calls")
 }
 
 func CheckAtomicBudget(ctx *harness.Ctx) {
-	cacheModel()
-	key := cacheBudgetKey(ctx, "m-1")
-	ctx.Redis.Set(key, cacheBudget-1)
+	hCacheModel()
+	key := hCacheBudgetKey(ctx, "m-1")
+	ctx.Redis.Set(key, kHCacheBudget-1)
 	other := ""
 	// another worker reserving the last unit, landing between two of this worker's commands
 	ctx.Redis.After(key, func() any {
 		used, _ := ctx.Redis.Get(key)
-		if n, _ := strconv.Atoi(used); n >= cacheBudget {
+		if n, _ := strconv.Atoi(used); n >= kHCacheBudget {
 			other = "refused"
 			return nil
 		}
@@ -1119,7 +1119,7 @@ func CheckAtomicBudget(ctx *harness.Ctx) {
 		return nil
 	})
 	mine := "reserved"
-	if _, err := enrich(cacheBg, cacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1")); err != nil {
+	if _, err := enrich(hCacheBg, hCacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1")); err != nil {
 		mine = "refused"
 		ctx.Assert(errors.Is(err, ErrBudgetExhausted), "enrich failed: %v", err)
 	}
@@ -1128,20 +1128,20 @@ func CheckAtomicBudget(ctx *harness.Ctx) {
 	sort.Strings(outcomes)
 	ctx.Equal(outcomes, []string{"refused", "reserved"}, "two workers raced for the last unit: read, compare and increment in one script so exactly one gets it; the outcomes")
 	used, _ := ctx.Redis.Get(key)
-	ctx.Equal(used, strconv.Itoa(cacheBudget), "the counter must stop at the daily budget; the counter")
-	fresh := cacheBudgetKey(ctx, "m-3")
-	mustEnrich(ctx, cacheJob("sku-3", "DOVE SILK GLOW BODY WASH 250ML", "m-3"), "a fresh merchant")
+	ctx.Equal(used, strconv.Itoa(kHCacheBudget), "the counter must stop at the daily budget; the counter")
+	fresh := hCacheBudgetKey(ctx, "m-3")
+	hMustEnrich(ctx, hCacheJob("sku-3", "DOVE SILK GLOW BODY WASH 250ML", "m-3"), "a fresh merchant")
 	ttl := ctx.Redis.TTL(fresh)
 	ctx.Assert(ttl > 0 && ttl <= 172800, "%s has TTL %d: the script sets the 2-day TTL on the first increment", fresh, ttl)
 	ctx.Clock.Advance(120)
-	mustEnrich(ctx, cacheJob("sku-4", "DOVE SILK GLOW BODY WASH 750ML", "m-3"), "a second job of the fresh merchant")
+	hMustEnrich(ctx, hCacheJob("sku-4", "DOVE SILK GLOW BODY WASH 750ML", "m-3"), "a second job of the fresh merchant")
 	later := ctx.Redis.TTL(fresh)
 	ctx.Assert(later > 0 && later <= 172800-100, "a second reservation two minutes later left %s with TTL %d: the 2-day TTL is set on the first increment only, and a later reservation must not push the expiry out", fresh, later)
 }
 
 func CheckReviewLease(ctx *harness.Ctx) {
 	claim := func(reviewer string) bool {
-		got, err := claimReview(cacheBg, "sku-1", reviewer)
+		got, err := claimReview(hCacheBg, "sku-1", reviewer)
 		ctx.NoError(err, "claimReview(sku-1, %s) failed", reviewer)
 		return got
 	}
@@ -1162,7 +1162,7 @@ func CheckReviewLease(ctx *harness.Ctx) {
 		}
 		return nil
 	})
-	got, err := claimReview(cacheBg, "sku-2", "ana")
+	got, err := claimReview(hCacheBg, "sku-2", "ana")
 	ctx.NoError(err, "claimReview(sku-2, ana) failed")
 	holder, _ = ctx.Redis.Get("review:lease:sku-2")
 	ctx.Assert(rival != "", "claimReview never touched review:lease:sku-2")
@@ -1190,11 +1190,11 @@ func CheckReviewLease(ctx *harness.Ctx) {
 #include "enrich/store.h"
 #include "enrich/taxonomy.h"
 
-int cache_model_calls = 0;
+int hCache_model_calls = 0;
 
 // Stands in for step 2: a confident body-wash answer whose size is the title's; it counts the calls.
 nlohmann::json extractAttributes(const nlohmann::json& job) {
-  cache_model_calls++;
+  hCache_model_calls++;
   nlohmann::json size = nullptr;
   std::istringstream words(job["title"].get<std::string>());
   std::string token;
@@ -1208,21 +1208,21 @@ nlohmann::json extractAttributes(const nlohmann::json& job) {
 
 namespace {
 
-constexpr long long kCacheBudget = 50000;
+constexpr long long kHCacheBudget = 50000;
 
-nlohmann::json cacheJob(const std::string& sku_id, const std::string& title, const std::string& merchant) {
+nlohmann::json hCacheJob(const std::string& sku_id, const std::string& title, const std::string& merchant) {
   return {{"sku_id", sku_id}, {"merchant", merchant}, {"content_hash", store::content_hash(merchant, title, "Nourishing body wash", {"img/a.jpg"})},
           {"title", title}, {"description", "Nourishing body wash"}, {"images", {"img/a.jpg"}}};
 }
 
-std::string cacheBudgetKey(harness::Ctx& ctx, const std::string& merchant) {
+std::string hCacheBudgetKey(harness::Ctx& ctx, const std::string& merchant) {
   const std::time_t t = ctx.Clock.Now() / 1000;
   char day[9];
   std::strftime(day, sizeof day, "%Y%m%d", std::gmtime(&t));
   return "budget:" + merchant + ":" + day;
 }
 
-nlohmann::json mustEnrich(harness::Ctx& ctx, const nlohmann::json& job, const std::string& why) {
+nlohmann::json hMustEnrich(harness::Ctx& ctx, const nlohmann::json& job, const std::string& why) {
   try {
     return enrich(job);
   } catch (const std::exception& e) {
@@ -1233,21 +1233,21 @@ nlohmann::json mustEnrich(harness::Ctx& ctx, const nlohmann::json& job, const st
 }  // namespace
 
 void CheckCacheKey(harness::Ctx& ctx) {
-  cache_model_calls = 0;
-  const auto first = mustEnrich(ctx, cacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1"), "the first job");
-  const auto twin = mustEnrich(ctx, cacheJob("sku-9", "DOVE SILK GLOW BODY WASH 500ML", "m-1"), "the same product under a second SKU id");
-  ctx.Equal(cache_model_calls, 1, "the same content under another SKU id must not pay for a second extraction (key the cache by content_hash); the model calls");
+  hCache_model_calls = 0;
+  const auto first = hMustEnrich(ctx, hCacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1"), "the first job");
+  const auto twin = hMustEnrich(ctx, hCacheJob("sku-9", "DOVE SILK GLOW BODY WASH 500ML", "m-1"), "the same product under a second SKU id");
+  ctx.Equal(hCache_model_calls, 1, "the same content under another SKU id must not pay for a second extraction (key the cache by content_hash); the model calls");
   ctx.Assert(twin.value("sku_id", "") == "sku-9" && twin["attributes"] == first["attributes"], "a hit must answer the cached attributes for the job's own SKU id, got %s", twin.dump());
-  const auto changed = cacheJob("sku-1", "DOVE SILK GLOW BODY WASH 750ML", "m-1");
-  const auto result = mustEnrich(ctx, changed, "a corrected title");
-  ctx.Equal(cache_model_calls, 2, "a corrected title must not be answered from the cache (the key changes with the content); the model calls");
+  const auto changed = hCacheJob("sku-1", "DOVE SILK GLOW BODY WASH 750ML", "m-1");
+  const auto result = hMustEnrich(ctx, changed, "a corrected title");
+  ctx.Equal(hCache_model_calls, 2, "a corrected title must not be answered from the cache (the key changes with the content); the model calls");
   ctx.Assert(result["attributes"]["size"] == 750.0, "the corrected title must be extracted again, got %s", result["attributes"].dump());
   const std::string key = "extract:" + taxonomy::kVersion + ":" + changed["content_hash"].get<std::string>();
   ctx.Equal(ctx.Redis.Exists(key), 1, "the cache entry %s (the key carries the taxonomy version, so a release starts a fresh cache); exists", key);
 }
 
 void CheckCacheTtl(harness::Ctx& ctx) {
-  const auto job = cacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1");
+  const auto job = hCacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1");
   const std::string entry = "extract:" + taxonomy::kVersion + ":" + job["content_hash"].get<std::string>();
   std::vector<long long> written;
   // the TTL right after the command that created the entry
@@ -1256,7 +1256,7 @@ void CheckCacheTtl(harness::Ctx& ctx) {
     else ctx.Redis.After(entry, watch);
   };
   ctx.Redis.After(entry, watch);
-  mustEnrich(ctx, job, "the first job");
+  hMustEnrich(ctx, job, "the first job");
   const auto keys = ctx.Redis.Keys("extract:*");
   ctx.Assert(!keys.empty(), "an accepted extraction was not cached");
   for (const auto& key : keys) {
@@ -1267,41 +1267,41 @@ void CheckCacheTtl(harness::Ctx& ctx) {
 }
 
 void CheckBudgetBeforeCall(harness::Ctx& ctx) {
-  cache_model_calls = 0;
-  ctx.Redis.Set(cacheBudgetKey(ctx, "m-1"), kCacheBudget);
+  hCache_model_calls = 0;
+  ctx.Redis.Set(hCacheBudgetKey(ctx, "m-1"), kHCacheBudget);
   bool refused = false;
   try {
-    enrich(cacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1"));
+    enrich(hCacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1"));
   } catch (const BudgetExhausted&) {
     refused = true;
   }
   ctx.Assert(refused, "a merchant at its daily budget was extracted anyway: enrich must throw BudgetExhausted");
-  ctx.Equal(cache_model_calls, 0, "a merchant at its daily budget must be refused before the model is called; the model calls");
-  const auto other = cacheJob("sku-2", "DOVE SILK GLOW BODY WASH 500ML", "m-2");
-  mustEnrich(ctx, other, "a miss");
-  mustEnrich(ctx, other, "a hit");
-  ctx.Equal(ctx.Redis.Get(cacheBudgetKey(ctx, "m-2")).value_or(""), "1", "one miss and one hit (a hit costs nothing); m-2's budget spent");
-  ctx.Redis.Set(cacheBudgetKey(ctx, "m-3"), kCacheBudget - 1);
-  mustEnrich(ctx, cacheJob("sku-3", "DOVE SILK GLOW BODY WASH 500ML", "m-3"), "a merchant at 49999 extractions still has the last unit of its daily budget to spend");
-  ctx.Equal(ctx.Redis.Get(cacheBudgetKey(ctx, "m-3")).value_or(""), std::to_string(kCacheBudget), "the last unit must leave the counter at the daily budget; m-3's counter");
-  const int before = cache_model_calls;
+  ctx.Equal(hCache_model_calls, 0, "a merchant at its daily budget must be refused before the model is called; the model calls");
+  const auto other = hCacheJob("sku-2", "DOVE SILK GLOW BODY WASH 500ML", "m-2");
+  hMustEnrich(ctx, other, "a miss");
+  hMustEnrich(ctx, other, "a hit");
+  ctx.Equal(ctx.Redis.Get(hCacheBudgetKey(ctx, "m-2")).value_or(""), "1", "one miss and one hit (a hit costs nothing); m-2's budget spent");
+  ctx.Redis.Set(hCacheBudgetKey(ctx, "m-3"), kHCacheBudget - 1);
+  hMustEnrich(ctx, hCacheJob("sku-3", "DOVE SILK GLOW BODY WASH 500ML", "m-3"), "a merchant at 49999 extractions still has the last unit of its daily budget to spend");
+  ctx.Equal(ctx.Redis.Get(hCacheBudgetKey(ctx, "m-3")).value_or(""), std::to_string(kHCacheBudget), "the last unit must leave the counter at the daily budget; m-3's counter");
+  const int before = hCache_model_calls;
   refused = false;
   try {
-    enrich(cacheJob("sku-4", "DOVE SILK GLOW BODY WASH 250ML", "m-3"));
+    enrich(hCacheJob("sku-4", "DOVE SILK GLOW BODY WASH 250ML", "m-3"));
   } catch (const BudgetExhausted&) {
     refused = true;
   }
   ctx.Assert(refused, "a merchant that spent its whole daily budget was extracted again: enrich must throw BudgetExhausted");
-  ctx.Equal(cache_model_calls, before, "a merchant that spent its budget must be refused before the model is called; the model calls");
+  ctx.Equal(hCache_model_calls, before, "a merchant that spent its budget must be refused before the model is called; the model calls");
 }
 
 void CheckAtomicBudget(harness::Ctx& ctx) {
-  const std::string key = cacheBudgetKey(ctx, "m-1");
-  ctx.Redis.Set(key, kCacheBudget - 1);
+  const std::string key = hCacheBudgetKey(ctx, "m-1");
+  ctx.Redis.Set(key, kHCacheBudget - 1);
   std::string other;
   // another worker reserving the last unit, landing between two of this worker's commands
   ctx.Redis.After(key, [&] {
-    if (std::stoll(ctx.Redis.Get(key).value_or("0")) >= kCacheBudget) {
+    if (std::stoll(ctx.Redis.Get(key).value_or("0")) >= kHCacheBudget) {
       other = "refused";
       return;
     }
@@ -1310,7 +1310,7 @@ void CheckAtomicBudget(harness::Ctx& ctx) {
   });
   std::string mine = "reserved";
   try {
-    enrich(cacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1"));
+    enrich(hCacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1"));
   } catch (const BudgetExhausted&) {
     mine = "refused";
   }
@@ -1318,13 +1318,13 @@ void CheckAtomicBudget(harness::Ctx& ctx) {
   std::vector<std::string> outcomes = {mine, other};
   std::sort(outcomes.begin(), outcomes.end());
   ctx.Equal(outcomes, {"refused", "reserved"}, "two workers raced for the last unit: read, compare and increment in one script so exactly one gets it; the outcomes");
-  ctx.Equal(ctx.Redis.Get(key).value_or(""), std::to_string(kCacheBudget), "the counter must stop at the daily budget; the counter");
-  const std::string fresh = cacheBudgetKey(ctx, "m-3");
-  mustEnrich(ctx, cacheJob("sku-3", "DOVE SILK GLOW BODY WASH 250ML", "m-3"), "a fresh merchant");
+  ctx.Equal(ctx.Redis.Get(key).value_or(""), std::to_string(kHCacheBudget), "the counter must stop at the daily budget; the counter");
+  const std::string fresh = hCacheBudgetKey(ctx, "m-3");
+  hMustEnrich(ctx, hCacheJob("sku-3", "DOVE SILK GLOW BODY WASH 250ML", "m-3"), "a fresh merchant");
   const long long ttl = ctx.Redis.TTL(fresh);
   ctx.Assert(ttl > 0 && ttl <= 172800, "%s has TTL %d: the script sets the 2-day TTL on the first increment", fresh, ttl);
   ctx.Clock.Advance(120);
-  mustEnrich(ctx, cacheJob("sku-4", "DOVE SILK GLOW BODY WASH 750ML", "m-3"), "a second job of the fresh merchant");
+  hMustEnrich(ctx, hCacheJob("sku-4", "DOVE SILK GLOW BODY WASH 750ML", "m-3"), "a second job of the fresh merchant");
   const long long later = ctx.Redis.TTL(fresh);
   ctx.Assert(later > 0 && later <= 172800 - 100, "a second reservation two minutes later left %s with TTL %d: the 2-day TTL is set on the first increment only, and a later reservation must not push the expiry out", fresh, later);
 }

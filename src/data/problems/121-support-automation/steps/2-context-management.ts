@@ -984,35 +984,35 @@ import (
 	"leetbuild/harness"
 )
 
-type retrieverPeer struct {
+type HRetrieverPeer struct {
 	pb.UnimplementedContextRetrieverServer
 	onCall func()
 }
 
-func (p retrieverPeer) Retrieve(_ context.Context, req *pb.RetrieveRequest) (*pb.RetrieveReply, error) {
+func (p HRetrieverPeer) Retrieve(_ context.Context, req *pb.RetrieveRequest) (*pb.RetrieveReply, error) {
 	if p.onCall != nil {
 		p.onCall()
 	}
 	return &pb.RetrieveReply{Items: standins.Retrieve(req.GetRetriever(), req.GetQuestion())}, nil
 }
 
-func storeWorld(ctx *harness.Ctx) { storeWorldWith(ctx, nil) }
+func hStoreWorld(ctx *harness.Ctx) { hStoreWorldWith(ctx, nil) }
 
-func storeWorldWith(ctx *harness.Ctx, onCall func()) {
-	pb.RegisterContextRetrieverServer(ctx.GRPC.Server(config.Retriever), retrieverPeer{onCall: onCall})
+func hStoreWorldWith(ctx *harness.Ctx, onCall func()) {
+	pb.RegisterContextRetrieverServer(ctx.GRPC.Server(config.Retriever), HRetrieverPeer{onCall: onCall})
 }
 
-func storeAppend(ctx *harness.Ctx, tenant, conversation, kind, text string) {
+func hStoreAppend(ctx *harness.Ctx, tenant, conversation, kind, text string) {
 	ctx.NoError(appendItem(context.Background(), tenant, conversation, model.Item{Kind: kind, Text: text}), "appendItem(%s, %s)", tenant, conversation)
 }
 
-func storeAssemble(ctx *harness.Ctx, user, question string) model.Context {
+func hStoreAssemble(ctx *harness.Ctx, user, question string) model.Context {
 	c, err := assemble(context.Background(), "t1", "c-1", user, question)
 	ctx.NoError(err, "assemble(t1, c-1)")
 	return c
 }
 
-func storeLists(ctx *harness.Ctx) map[string]int64 {
+func hStoreLists(ctx *harness.Ctx) map[string]int64 {
 	out := map[string]int64{}
 	for _, key := range ctx.Redis.Keys("ctx:*") {
 		if ctx.Redis.Type(key) == "list" {
@@ -1022,7 +1022,7 @@ func storeLists(ctx *harness.Ctx) map[string]int64 {
 	return out
 }
 
-func storeTexts(ctx *harness.Ctx, key string) []string {
+func hStoreTexts(ctx *harness.Ctx, key string) []string {
 	out := []string{}
 	for _, raw := range ctx.Redis.LRange(key, 0, -1) {
 		var item map[string]any
@@ -1034,30 +1034,30 @@ func storeTexts(ctx *harness.Ctx, key string) []string {
 }
 
 func CheckScopedKey(ctx *harness.Ctx) {
-	storeWorld(ctx)
-	storeAppend(ctx, "t1", "c-1", "user", "t1 c-1 first")
-	storeAppend(ctx, "t2", "c-1", "user", "t2 c-1 first")
-	storeAppend(ctx, "t1", "c-1", "assistant", "t1 c-1 second")
-	storeAppend(ctx, "t1", "c-2", "user", "t1 c-2 first")
-	lists := storeLists(ctx)
+	hStoreWorld(ctx)
+	hStoreAppend(ctx, "t1", "c-1", "user", "t1 c-1 first")
+	hStoreAppend(ctx, "t2", "c-1", "user", "t2 c-1 first")
+	hStoreAppend(ctx, "t1", "c-1", "assistant", "t1 c-1 second")
+	hStoreAppend(ctx, "t1", "c-2", "user", "t1 c-2 first")
+	lists := hStoreLists(ctx)
 	keys := make([]string, 0, len(lists))
 	for k := range lists {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	ctx.Equal(keys, []string{"ctx:t1:c-1", "ctx:t1:c-2", "ctx:t2:c-1"}, "context lives in one list per conversation, under ctx:{tenant}:{conversation}, so an assembly reads one conversation and tenants never share a key; the lists appendItem wrote")
-	ctx.Equal(storeTexts(ctx, "ctx:t1:c-1"), []string{"t1 c-1 first", "t1 c-1 second"}, "ctx:t1:c-1")
-	ctx.Equal(storeTexts(ctx, "ctx:t2:c-1"), []string{"t2 c-1 first"}, "another tenant's conversation with the same id is another list; ctx:t2:c-1")
-	history := storeAssemble(ctx, "guest-1", "Where is my stay?").History
+	ctx.Equal(hStoreTexts(ctx, "ctx:t1:c-1"), []string{"t1 c-1 first", "t1 c-1 second"}, "ctx:t1:c-1")
+	ctx.Equal(hStoreTexts(ctx, "ctx:t2:c-1"), []string{"t2 c-1 first"}, "another tenant's conversation with the same id is another list; ctx:t2:c-1")
+	history := hStoreAssemble(ctx, "guest-1", "Where is my stay?").History
 	ctx.Equal(history, []model.Item{{Kind: "user", Text: "t1 c-1 first"}, {Kind: "assistant", Text: "t1 c-1 second"}}, "assemble(t1, c-1)'s history")
 }
 
 func CheckBounded(ctx *harness.Ctx) {
-	storeWorld(ctx)
+	hStoreWorld(ctx)
 	for i := 1; i <= 45; i++ {
-		storeAppend(ctx, "t1", "c-1", "user", "message "+harness.Show(i))
+		hStoreAppend(ctx, "t1", "c-1", "user", "message "+harness.Show(i))
 	}
-	lists := storeLists(ctx)
+	lists := hStoreLists(ctx)
 	longest := int64(-1)
 	for _, n := range lists {
 		if n > longest {
@@ -1065,13 +1065,13 @@ func CheckBounded(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Assert(longest >= 0 && longest <= 40, "after 45 appends the context lists hold %v: trim to the newest maxContextItems = 40, or every turn re-sends a longer prompt", lists)
-	history := storeAssemble(ctx, "guest-1", "q").History
+	history := hStoreAssemble(ctx, "guest-1", "q").History
 	ctx.Equal(len(history), 40, "assemble must return the newest 40 items; items returned")
 	ctx.Assert(history[0].Text == "message 6" && history[39].Text == "message 45", "assemble must return items 6 to 45, oldest first; got %q … %q", history[0].Text, history[len(history)-1].Text)
 	probe := ctx.Redis.After("ctx:t1:c-1", func() any {
 		return []int64{ctx.Redis.LLen("ctx:t1:c-1"), ctx.Redis.TTL("ctx:t1:c-1")}
 	})
-	storeAppend(ctx, "t1", "c-1", "user", "message 46")
+	hStoreAppend(ctx, "t1", "c-1", "user", "message 46")
 	ctx.Assert(probe.Fired, "appendItem never wrote ctx:t1:c-1")
 	seen, _ := probe.Result.([]int64)
 	ctx.Assert(len(seen) == 2 && seen[0] <= 40, "right after appendItem's first command touched ctx:t1:c-1 the list held %v items: RPush, LTrim and Expire belong in one MULTI/EXEC (TxPipelined), or a reader in between sees an untrimmed list", seen)
@@ -1079,20 +1079,20 @@ func CheckBounded(ctx *harness.Ctx) {
 }
 
 func CheckTtl(ctx *harness.Ctx) {
-	storeWorld(ctx)
+	hStoreWorld(ctx)
 	probe := ctx.Redis.After("ctx:t1:c-1", func() any { return ctx.Redis.TTL("ctx:t1:c-1") })
-	storeAppend(ctx, "t1", "c-1", "user", "hello")
+	hStoreAppend(ctx, "t1", "c-1", "user", "hello")
 	ctx.Assert(probe.Fired, "appendItem never wrote ctx:t1:c-1")
 	created, _ := probe.Result.(int64)
 	ctx.Assert(created > 86_000, "right after appendItem's first command created ctx:t1:c-1 the list had TTL %d: Expire belongs in the same MULTI/EXEC (TxPipelined) as the RPush, or a crash in between leaves a list that never expires", created)
 	ttls := map[string]int64{}
-	for key := range storeLists(ctx) {
+	for key := range hStoreLists(ctx) {
 		ttls[key] = ctx.Redis.TTL(key)
 	}
 	ttl, ok := ttls["ctx:t1:c-1"]
 	ctx.Assert(ok && ttl > 86_000, "after appendItem the context lists have TTLs %v: every write refreshes a 24-hour TTL (contextTTL) on ctx:t1:c-1, or a conversation's context outlives it by years", ttls)
 	ctx.Clock.Advance(3600)
-	storeAppend(ctx, "t1", "c-1", "assistant", "hi")
+	hStoreAppend(ctx, "t1", "c-1", "assistant", "hi")
 	ttl = ctx.Redis.TTL("ctx:t1:c-1")
 	ctx.Assert(ttl > 86_000, "an hour later another append left TTL %d: each write refreshes the 24 hours", ttl)
 	ctx.Clock.Advance(86_401)
@@ -1101,8 +1101,8 @@ func CheckTtl(ctx *harness.Ctx) {
 
 func CheckDeclared(ctx *harness.Ctx) {
 	ctx.Redis.Do("HSET", "profile:t1:guest-1", "customer_name", "Ana Souza", "user_role", "guest", "current_trip", "HM-4410 Lisbon", "email", "ana@example.com", "phone", "+351 912 000 111", "payment_last4", "4242")
-	storeWorld(ctx)
-	profile := storeAssemble(ctx, "guest-1", "Where is my stay?").Profile
+	hStoreWorld(ctx)
+	profile := hStoreAssemble(ctx, "guest-1", "Where is my stay?").Profile
 	fields := make([]string, 0, len(profile))
 	for k := range profile {
 		fields = append(fields, k)
@@ -1110,7 +1110,7 @@ func CheckDeclared(ctx *harness.Ctx) {
 	sort.Strings(fields)
 	ctx.Equal(fields, []string{"current_trip", "customer_name", "user_role"}, "only staticContext is declared, so email, phone and payment_last4 must not reach the model; the profile's fields")
 	ctx.Assert(profile["customer_name"] == "Ana Souza" && profile["current_trip"] == "HM-4410 Lisbon", "the declared fields carry the record's values: %v", profile)
-	other := storeAssemble(ctx, "guest-9", "Where is my stay?").Profile
+	other := hStoreAssemble(ctx, "guest-9", "Where is my stay?").Profile
 	ctx.Equal(len(other), 0, "a user without a record has an empty profile; fields")
 }
 
@@ -1118,7 +1118,7 @@ func CheckRetrieverCache(ctx *harness.Ctx) {
 	question := "How do I change my check-in time?"
 	key := config.RetrieverKey("t1", "help_articles", question)
 	asked, cachedFired, created := false, false, int64(0)
-	storeWorldWith(ctx, func() {
+	hStoreWorldWith(ctx, func() {
 		// The retriever is answering: the next command on the key is the one that caches the answer.
 		if !asked {
 			asked = true
@@ -1128,9 +1128,9 @@ func CheckRetrieverCache(ctx *harness.Ctx) {
 			})
 		}
 	})
-	first := storeAssemble(ctx, "guest-1", question).Articles
+	first := hStoreAssemble(ctx, "guest-1", question).Articles
 	ctx.Equal(first, []string{"Help article for: " + question}, "the articles must be what help_articles returned")
-	again := storeAssemble(ctx, "guest-1", question).Articles
+	again := hStoreAssemble(ctx, "guest-1", question).Articles
 	ctx.Equal(again, first, "the cached articles must equal the retrieved ones")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Retrieve", "")), 1, "two assemblies of the same question: cache the answer under config.RetrieverKey for retrieverTTL = 300 s; Retrieve calls")
 	ctx.Assert(cachedFired, "the answer was never cached at %s", key)
@@ -1138,12 +1138,12 @@ func CheckRetrieverCache(ctx *harness.Ctx) {
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(ttl > 0 && ttl <= 300, "the cached answer at %s has TTL %d, expected at most 300 s", key, ttl)
 	ctx.Clock.Advance(299)
-	storeAssemble(ctx, "guest-1", question)
+	hStoreAssemble(ctx, "guest-1", question)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Retrieve", "")), 1, "299 s after it was cached the answer is still fresh and makes no call: it is cached for retrieverTTL = 300 s; Retrieve calls")
 	ctx.Clock.Advance(2)
-	storeAssemble(ctx, "guest-1", question)
+	hStoreAssemble(ctx, "guest-1", question)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Retrieve", "")), 2, "five minutes later the cached answer has expired and the retriever is asked again; Retrieve calls")
-	storeAssemble(ctx, "guest-1", "Can I bring a dog?")
+	hStoreAssemble(ctx, "guest-1", "Can I bring a dog?")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Retrieve", "")), 3, "a new question is a new retrieval; Retrieve calls")
 }
 `,
@@ -1162,7 +1162,7 @@ namespace {
 
 using json = nlohmann::json;
 
-class RetrieverPeer final : public apv2rpc::ContextRetriever::Service {
+class HRetrieverPeer final : public apv2rpc::ContextRetriever::Service {
  public:
   std::function<void()> on_call;
   grpc::Status Retrieve(grpc::ServerContext*, const apv2rpc::RetrieveRequest* req, apv2rpc::RetrieveReply* reply) override {
@@ -1172,13 +1172,13 @@ class RetrieverPeer final : public apv2rpc::ContextRetriever::Service {
   }
 };
 
-void storeWorld(harness::Ctx& ctx, std::function<void()> on_call = nullptr) {
-  static RetrieverPeer peer;
+void hStoreWorld(harness::Ctx& ctx, std::function<void()> on_call = nullptr) {
+  static HRetrieverPeer peer;
   peer.on_call = std::move(on_call);
   ctx.GRPC.Server(config::kRetriever)->RegisterService(&peer);
 }
 
-std::map<std::string, long long> storeLists(harness::Ctx& ctx) {
+std::map<std::string, long long> hStoreLists(harness::Ctx& ctx) {
   std::map<std::string, long long> out;
   for (const auto& key : ctx.Redis.Keys("ctx:*")) {
     if (ctx.Redis.Type(key) == "list") out[key] = ctx.Redis.LLen(key);
@@ -1186,7 +1186,7 @@ std::map<std::string, long long> storeLists(harness::Ctx& ctx) {
   return out;
 }
 
-std::vector<std::string> storeTexts(harness::Ctx& ctx, const std::string& key) {
+std::vector<std::string> hStoreTexts(harness::Ctx& ctx, const std::string& key) {
   std::vector<std::string> out;
   for (const auto& raw : ctx.Redis.LRange(key, 0, -1)) out.push_back(json::parse(raw, nullptr, false).value("text", ""));
   return out;
@@ -1201,27 +1201,27 @@ std::string hDescribe(const std::map<std::string, long long>& m) {
 }  // namespace
 
 void CheckScopedKey(harness::Ctx& ctx) {
-  storeWorld(ctx);
+  hStoreWorld(ctx);
   append_item("t1", "c-1", {"user", "t1 c-1 first"});
   append_item("t2", "c-1", {"user", "t2 c-1 first"});
   append_item("t1", "c-1", {"assistant", "t1 c-1 second"});
   append_item("t1", "c-2", {"user", "t1 c-2 first"});
-  const auto lists = storeLists(ctx);
+  const auto lists = hStoreLists(ctx);
   std::vector<std::string> keys;
   for (const auto& [k, _] : lists) keys.push_back(k);
   ctx.Equal(keys, std::vector<std::string>{"ctx:t1:c-1", "ctx:t1:c-2", "ctx:t2:c-1"},
             "context lives in one list per conversation, under ctx:{tenant}:{conversation}, so an assembly reads one conversation and tenants never share a key; the lists append_item wrote");
-  ctx.Equal(storeTexts(ctx, "ctx:t1:c-1"), std::vector<std::string>{"t1 c-1 first", "t1 c-1 second"}, "ctx:t1:c-1");
-  ctx.Equal(storeTexts(ctx, "ctx:t2:c-1"), std::vector<std::string>{"t2 c-1 first"}, "another tenant's conversation with the same id is another list; ctx:t2:c-1");
+  ctx.Equal(hStoreTexts(ctx, "ctx:t1:c-1"), std::vector<std::string>{"t1 c-1 first", "t1 c-1 second"}, "ctx:t1:c-1");
+  ctx.Equal(hStoreTexts(ctx, "ctx:t2:c-1"), std::vector<std::string>{"t2 c-1 first"}, "another tenant's conversation with the same id is another list; ctx:t2:c-1");
   const auto history = assemble("t1", "c-1", "guest-1", "Where is my stay?").history;
   ctx.Assert(history.size() == 2 && history[0].kind == "user" && history[0].text == "t1 c-1 first" && history[1].kind == "assistant" && history[1].text == "t1 c-1 second",
              "assemble(t1, c-1) must return the conversation's two items, got %d", history.size());
 }
 
 void CheckBounded(harness::Ctx& ctx) {
-  storeWorld(ctx);
+  hStoreWorld(ctx);
   for (int i = 1; i <= 45; i++) append_item("t1", "c-1", {"user", "message " + std::to_string(i)});
-  const auto lists = storeLists(ctx);
+  const auto lists = hStoreLists(ctx);
   long long longest = -1;
   for (const auto& [_, n] : lists) longest = std::max(longest, n);
   ctx.Assert(longest >= 0 && longest <= 40, "after 45 appends the context lists hold %s: trim to the newest kMaxContextItems = 40, or every turn re-sends a longer prompt", hDescribe(lists));
@@ -1242,7 +1242,7 @@ void CheckBounded(harness::Ctx& ctx) {
 }
 
 void CheckTtl(harness::Ctx& ctx) {
-  storeWorld(ctx);
+  hStoreWorld(ctx);
   bool fired = false;
   long long created = -2;
   ctx.Redis.After("ctx:t1:c-1", [&] {
@@ -1253,7 +1253,7 @@ void CheckTtl(harness::Ctx& ctx) {
   ctx.Assert(fired, "append_item never wrote ctx:t1:c-1");
   ctx.Assert(created > 86000, "right after append_item's first command created ctx:t1:c-1 the list had TTL %d: expire belongs in the same transaction() as the rpush, or a crash in between leaves a list that never expires", created);
   std::map<std::string, long long> ttls;
-  for (const auto& [key, _] : storeLists(ctx)) ttls[key] = ctx.Redis.TTL(key);
+  for (const auto& [key, _] : hStoreLists(ctx)) ttls[key] = ctx.Redis.TTL(key);
   ctx.Assert(ttls.count("ctx:t1:c-1") == 1 && ttls["ctx:t1:c-1"] > 86000,
              "after append_item the context lists have TTLs %s: every write refreshes a 24-hour TTL (kContextTtl) on ctx:t1:c-1, or a conversation's context outlives it by years", hDescribe(ttls));
   ctx.Clock.Advance(3600);
@@ -1267,7 +1267,7 @@ void CheckTtl(harness::Ctx& ctx) {
 void CheckDeclared(harness::Ctx& ctx) {
   ctx.Redis.Do("HSET", "profile:t1:guest-1", "customer_name", "Ana Souza", "user_role", "guest", "current_trip", "HM-4410 Lisbon", "email", "ana@example.com", "phone",
                "+351 912 000 111", "payment_last4", "4242");
-  storeWorld(ctx);
+  hStoreWorld(ctx);
   const auto profile = assemble("t1", "c-1", "guest-1", "Where is my stay?").profile;
   std::vector<std::string> fields;
   for (const auto& [k, _] : profile) fields.push_back(k);
@@ -1282,7 +1282,7 @@ void CheckRetrieverCache(harness::Ctx& ctx) {
   const std::string key = config::retriever_key("t1", "help_articles", question);
   bool asked = false, cachedFired = false;
   long long created = 0;
-  storeWorld(ctx, [&] {
+  hStoreWorld(ctx, [&] {
     // The retriever is answering: the next command on the key is the one that caches the answer.
     if (asked) return;
     asked = true;

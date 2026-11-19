@@ -1033,20 +1033,20 @@ import (
 	"feed/timeline"
 )
 
-var postHeaders = []string{"X-User-Id", "alice", "Idempotency-Key", "k-1"}
+var hPostHeaders = []string{"X-User-Id", "alice", "Idempotency-Key", "k-1"}
 
 // timelineCall is one call of timeline.Read; cursor is nil or the int64 it pointed at.
-type timelineCall struct {
+type HTimelineCall struct {
 	userID string
 	cursor any
 	limit  int
 }
 
 // fakeTimeline swaps timeline.Read on the provided facade: records every call and answers a fixed page.
-func fakeTimeline() *[]timelineCall {
-	calls := &[]timelineCall{}
+func hFakeTimeline() *[]HTimelineCall {
+	calls := &[]HTimelineCall{}
 	timeline.Read = func(_ context.Context, userID string, cursor *int64, limit int) ([]string, *int64, error) {
-		call := timelineCall{userID: userID, limit: limit}
+		call := HTimelineCall{userID: userID, limit: limit}
 		if cursor != nil {
 			call.cursor = *cursor
 		}
@@ -1068,13 +1068,13 @@ func CheckValidate(ctx *harness.Ctx) {
 		{map[string]any{"text": "hi", "media_ids": []string{"m1", "m2", "m3", "m4", "m5"}}, "5 media ids"},
 	}
 	for _, b := range bad {
-		r := c.Post("/posts", b.body, postHeaders...)
+		r := c.Post("/posts", b.body, hPostHeaders...)
 		ctx.Equal(r.Status, 400, "%s must answer 400", b.why)
 	}
 	keys := ctx.Redis.Keys("*")
 	ctx.Assert(len(keys) == 0, "a rejected post must not reach the store, but Redis holds %q", keys)
 	ctx.Equal(len(ctx.Kafka.Records("posts")), 0, "a rejected post must not be published")
-	r := c.Post("/posts", map[string]any{"text": strings.Repeat("x", 280), "media_ids": []string{"m1", "m2", "m3", "m4"}}, postHeaders...)
+	r := c.Post("/posts", map[string]any{"text": strings.Repeat("x", 280), "media_ids": []string{"m1", "m2", "m3", "m4"}}, hPostHeaders...)
 	ctx.Equal(r.Status, 201, "280 characters and 4 media ids are valid")
 }
 
@@ -1083,9 +1083,9 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 	r := c.Post("/posts", map[string]any{"text": "hello"}, "X-User-Id", "alice")
 	ctx.Equal(r.Status, 400, "a POST without Idempotency-Key must answer 400")
 	ctx.Assert(len(ctx.Redis.Keys("*")) == 0 && len(ctx.Kafka.Records("posts")) == 0, "a POST without Idempotency-Key must not be saved or published")
-	first := c.Post("/posts", map[string]any{"text": "hello"}, postHeaders...)
+	first := c.Post("/posts", map[string]any{"text": "hello"}, hPostHeaders...)
 	ctx.Equal(first.Status, 201, "a POST with Idempotency-Key must answer 201")
-	retry := c.Post("/posts", map[string]any{"text": "hello"}, postHeaders...)
+	retry := c.Post("/posts", map[string]any{"text": "hello"}, hPostHeaders...)
 	ctx.Equal(retry.Status, 201, "a retried POST with the same key must answer 201")
 	firstBody, _ := first.JSON().(map[string]any)
 	retryBody, _ := retry.JSON().(map[string]any)
@@ -1095,7 +1095,7 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 func CheckCreated(ctx *harness.Ctx) {
 	// posts.Save reads idem:alice:k-1 first: what the posts topic held at that moment tells whether publish came before the save.
 	atSave := ctx.Redis.After("idem:alice:k-1", func() any { return len(ctx.Kafka.Records("posts")) })
-	r := ctx.Main(main).HTTP().Post("/posts", map[string]any{"text": "hello", "media_ids": []string{"m1"}}, postHeaders...)
+	r := ctx.Main(main).HTTP().Post("/posts", map[string]any{"text": "hello", "media_ids": []string{"m1"}}, hPostHeaders...)
 	ctx.Equal(r.Status, 201, "a valid post must answer 201")
 	body, _ := r.JSON().(map[string]any)
 	postID, _ := body["post_id"].(string)
@@ -1119,18 +1119,18 @@ func CheckCreated(ctx *harness.Ctx) {
 }
 
 func CheckFeedLimit(ctx *harness.Ctx) {
-	calls := fakeTimeline()
+	calls := hFakeTimeline()
 	c := ctx.Main(main).HTTP()
 	for _, limit := range []int{0, 51, -1} {
-		r := c.Get(fmt.Sprintf("/feed?limit=%d", limit), postHeaders...)
+		r := c.Get(fmt.Sprintf("/feed?limit=%d", limit), hPostHeaders...)
 		ctx.Equal(r.Status, 400, "limit=%d must answer 400", limit)
 	}
 	ctx.Equal(len(*calls), 0, "a rejected limit must not reach timeline.Read")
 	for _, limit := range []int{1, 50} {
-		r := c.Get(fmt.Sprintf("/feed?limit=%d", limit), postHeaders...)
+		r := c.Get(fmt.Sprintf("/feed?limit=%d", limit), hPostHeaders...)
 		ctx.Equal(r.Status, 200, "limit=%d is valid", limit)
 	}
-	r := c.Get("/feed", postHeaders...)
+	r := c.Get("/feed", hPostHeaders...)
 	ctx.Equal(r.Status, 200, "GET /feed without limit must use the default")
 	limits := []int{}
 	for _, call := range *calls {
@@ -1140,10 +1140,10 @@ func CheckFeedLimit(ctx *harness.Ctx) {
 }
 
 func CheckFeedResponse(ctx *harness.Ctx) {
-	calls := fakeTimeline()
-	r := ctx.Main(main).HTTP().Get("/feed?cursor=1700000000500&limit=5", postHeaders...)
+	calls := hFakeTimeline()
+	r := ctx.Main(main).HTTP().Get("/feed?cursor=1700000000500&limit=5", hPostHeaders...)
 	ctx.Equal(r.Status, 200, "GET /feed must answer 200")
-	ctx.Equal(*calls, []timelineCall{{"alice", int64(1700000000500), 5}}, "timeline.Read must get the user from X-User-Id, the cursor and the limit unchanged")
+	ctx.Equal(*calls, []HTimelineCall{{"alice", int64(1700000000500), 5}}, "timeline.Read must get the user from X-User-Id, the cursor and the limit unchanged")
 	ctx.Equal(r.JSON(), map[string]any{"posts": []any{"p3", "p2"}, "next_cursor": float64(1700000000200)}, "the body must be the page from timeline.Read as posts and next_cursor")
 	ctx.Equal(r.Header.Get("Cache-Control"), "private, no-store", "Cache-Control")
 }
@@ -1161,20 +1161,20 @@ func CheckFeedResponse(ctx *harness.Ctx) {
 namespace {
 
 // A POST /posts as alice with Idempotency-Key k-1 (Go's postHeaders).
-harness::Response postAs(harness::HTTP& c, const nlohmann::json& body) {
+harness::Response hPostAs(harness::HTTP& c, const nlohmann::json& body) {
   return c.Post("/posts", body.dump(), "X-User-Id", "alice", "Idempotency-Key", "k-1");
 }
 
-harness::Response feedAs(harness::HTTP& c, const std::string& path) {
+harness::Response hFeedAs(harness::HTTP& c, const std::string& path) {
   return c.Get(path, "X-User-Id", "alice", "Idempotency-Key", "k-1");
 }
 
 // timelineCall is one call of timeline::read: the user, the cursor (nullopt for none) and the limit.
-using timelineCall = std::tuple<std::string, std::optional<int64_t>, int>;
+using HTimelineCall = std::tuple<std::string, std::optional<int64_t>, int>;
 
 // fakeTimeline swaps timeline::read on the provided facade: records every call and answers a fixed page.
-std::shared_ptr<std::vector<timelineCall>> fakeTimeline() {
-  auto calls = std::make_shared<std::vector<timelineCall>>();
+std::shared_ptr<std::vector<HTimelineCall>> hFakeTimeline() {
+  auto calls = std::make_shared<std::vector<HTimelineCall>>();
   timeline::read = [calls](const std::string& user, std::optional<int64_t> cursor, int limit) {
     calls->emplace_back(user, cursor, limit);
     return timeline::Page{{"p3", "p2"}, int64_t{1700000000200}};
@@ -1192,13 +1192,13 @@ void CheckValidate(harness::Ctx& ctx) {
       {{{"text", "hi"}, {"media_ids", {"m1", "m2", "m3", "m4", "m5"}}}, "5 media ids"},
   };
   for (const auto& [body, why] : bad) {
-    const auto r = postAs(c, body);
+    const auto r = hPostAs(c, body);
     ctx.Equal(r.Status, 400, "%s must answer 400", why);
   }
   const auto keys = ctx.Redis.Keys("*");
   ctx.Assert(keys.empty(), "a rejected post must not reach the store, but Redis holds %q", keys);
   ctx.Equal(ctx.Kafka.Records("posts").size(), 0, "a rejected post must not be published");
-  const auto r = postAs(c, {{"text", std::string(280, 'x')}, {"media_ids", {"m1", "m2", "m3", "m4"}}});
+  const auto r = hPostAs(c, {{"text", std::string(280, 'x')}, {"media_ids", {"m1", "m2", "m3", "m4"}}});
   ctx.Equal(r.Status, 201, "280 characters and 4 media ids are valid");
 }
 
@@ -1207,9 +1207,9 @@ void CheckIdempotencyKey(harness::Ctx& ctx) {
   const auto r = c.Post("/posts", R"({"text":"hello"})", "X-User-Id", "alice");
   ctx.Equal(r.Status, 400, "a POST without Idempotency-Key must answer 400");
   ctx.Assert(ctx.Redis.Keys("*").empty() && ctx.Kafka.Records("posts").empty(), "a POST without Idempotency-Key must not be saved or published");
-  const auto first = postAs(c, {{"text", "hello"}});
+  const auto first = hPostAs(c, {{"text", "hello"}});
   ctx.Equal(first.Status, 201, "a POST with Idempotency-Key must answer 201");
-  const auto retry = postAs(c, {{"text", "hello"}});
+  const auto retry = hPostAs(c, {{"text", "hello"}});
   ctx.Equal(retry.Status, 201, "a retried POST with the same key must answer 201");
   ctx.Equal(retry.JSON()["post_id"], first.JSON()["post_id"], "a retry with the same Idempotency-Key must be the same post: the key must reach posts::save as idempotency_key");
 }
@@ -1223,7 +1223,7 @@ void CheckCreated(harness::Ctx& ctx) {
     atSave = ctx.Kafka.Records("posts").size();
   });
   auto c = ctx.Main().HTTP();
-  const auto r = postAs(c, {{"text", "hello"}, {"media_ids", {"m1"}}});
+  const auto r = hPostAs(c, {{"text", "hello"}, {"media_ids", {"m1"}}});
   ctx.Equal(r.Status, 201, "a valid post must answer 201");
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   const std::string postID = body.is_object() && body.contains("post_id") && body["post_id"].is_string() ? body["post_id"].get<std::string>() : "";
@@ -1248,18 +1248,18 @@ void CheckCreated(harness::Ctx& ctx) {
 }
 
 void CheckFeedLimit(harness::Ctx& ctx) {
-  const auto calls = fakeTimeline();
+  const auto calls = hFakeTimeline();
   auto c = ctx.Main().HTTP();
   for (const int limit : {0, 51, -1}) {
-    const auto r = feedAs(c, "/feed?limit=" + std::to_string(limit));
+    const auto r = hFeedAs(c, "/feed?limit=" + std::to_string(limit));
     ctx.Equal(r.Status, 400, "limit=%d must answer 400", limit);
   }
   ctx.Equal(calls->size(), 0, "a rejected limit must not reach timeline::read");
   for (const int limit : {1, 50}) {
-    const auto r = feedAs(c, "/feed?limit=" + std::to_string(limit));
+    const auto r = hFeedAs(c, "/feed?limit=" + std::to_string(limit));
     ctx.Equal(r.Status, 200, "limit=%d is valid", limit);
   }
-  const auto r = feedAs(c, "/feed");
+  const auto r = hFeedAs(c, "/feed");
   ctx.Equal(r.Status, 200, "GET /feed without limit must use the default");
   std::vector<int> limits;
   for (const auto& call : *calls) limits.push_back(std::get<2>(call));
@@ -1267,9 +1267,9 @@ void CheckFeedLimit(harness::Ctx& ctx) {
 }
 
 void CheckFeedResponse(harness::Ctx& ctx) {
-  const auto calls = fakeTimeline();
+  const auto calls = hFakeTimeline();
   auto c = ctx.Main().HTTP();
-  const auto r = feedAs(c, "/feed?cursor=1700000000500&limit=5");
+  const auto r = hFeedAs(c, "/feed?cursor=1700000000500&limit=5");
   ctx.Equal(r.Status, 200, "GET /feed must answer 200");
   ctx.Equal(*calls, std::vector<std::tuple<std::string, int64_t, int>>{{"alice", 1700000000500, 5}}, "timeline::read must get the user from X-User-Id, the cursor and the limit unchanged");
   ctx.Equal(r.JSON(), harness::ParseJSON(R"({"posts":["p3","p2"],"next_cursor":1700000000200})"), "the body must be the page from timeline::read as posts and next_cursor");

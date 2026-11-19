@@ -676,30 +676,30 @@ import (
 )
 
 const (
-	clientSource = "The board met on 3 March. Revenue rose four percent in the quarter. The audit committee approved the accounts.\\n\\nTwo directors stepped down. A new chair takes over in May."
-	clientHash   = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	kHClientSource = "The board met on 3 March. Revenue rose four percent in the quarter. The audit committee approved the accounts.\\n\\nTwo directors stepped down. A new chair takes over in May."
+	kHClientHash   = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 )
 
-type modelPeer struct {
+type HModelPeer struct {
 	pb.UnimplementedSummaryModelServer
 }
 
-func (modelPeer) Summarize(_ context.Context, req *pb.SummarizeRequest) (*pb.SummarizeReply, error) {
+func (HModelPeer) Summarize(_ context.Context, req *pb.SummarizeRequest) (*pb.SummarizeReply, error) {
 	summary := fmt.Sprintf("A %d-word source in %d words.", len(strings.Fields(req.GetText())), req.GetTargetWords())
 	return &pb.SummarizeReply{Summary: summary, ModelVersion: "sm-7"}, nil
 }
 
-func clientPeer(ctx *harness.Ctx) {
-	pb.RegisterSummaryModelServer(ctx.GRPC.Server(""), modelPeer{})
+func hClientPeer(ctx *harness.Ctx) {
+	pb.RegisterSummaryModelServer(ctx.GRPC.Server(""), HModelPeer{})
 }
 
-func clientCall() Summarized { return summarize(context.Background(), clientHash, clientSource, 20) }
+func hClientCall() Summarized { return summarize(context.Background(), kHClientHash, kHClientSource, 20) }
 
-func clientCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Summarize", "")) }
+func hClientCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Summarize", "")) }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientPeer(ctx)
-	ok := clientCall()
+	hClientPeer(ctx)
+	ok := hClientCall()
 	ctx.Assert(ok.Kind == "abstractive" && ok.ModelVersion == "sm-7", "with the model healthy summarize answered %+v", ok)
 	for _, call := range ctx.GRPC.CallsTo("Summarize", "") {
 		ctx.Assert(call.HasDeadline(), "a Summarize call carries no deadline: a hung model holds the request until its caller gives up")
@@ -707,7 +707,7 @@ func CheckDeadline(ctx *harness.Ctx) {
 	}
 	ctx.GRPC.SetLatency("Summarize", 30, "")
 	before := ctx.Clock.Now()
-	slow := clientCall()
+	slow := hClientCall()
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 16, "with the model hung summarize took %.0f s: each attempt must give up after 5 s", waited)
 	ctx.Equal(slow.Kind, "extractive", "with the model hung, the kind of the answer")
@@ -719,46 +719,46 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckTerminalRefusal(ctx *harness.Ctx) {
-	clientPeer(ctx)
+	hClientPeer(ctx)
 	ctx.GRPC.Fail("Summarize", codes.FailedPrecondition, "refused: the source asks for a diagnosis", 1, "")
-	refused := clientCall()
-	ctx.Equal(clientCalls(ctx), 1, "a refusal ends the call (the model answers the same text the same way); the Summarize calls")
+	refused := hClientCall()
+	ctx.Equal(hClientCalls(ctx), 1, "a refusal ends the call (the model answers the same text the same way); the Summarize calls")
 	ctx.Equal(ctx.Clock.Sleeps(), 0, "a refusal must not be slept on and retried; the sleeps")
 	ctx.Equal(refused.Kind, "extractive", "after a refusal, the kind of the answer")
 	ctx.GRPC.Fail("Summarize", codes.InvalidArgument, "target_words out of range", 1, "")
-	clientCall()
-	ctx.Equal(clientCalls(ctx), 2, "INVALID_ARGUMENT must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED may be); the Summarize calls")
+	hClientCall()
+	ctx.Equal(hClientCalls(ctx), 2, "INVALID_ARGUMENT must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED may be); the Summarize calls")
 	for _, code := range []codes.Code{codes.PermissionDenied, codes.Internal} {
-		before := clientCalls(ctx)
+		before := hClientCalls(ctx)
 		ctx.GRPC.Fail("Summarize", code, "the model failed", 1, "")
-		answer := clientCall()
-		ctx.Equal(clientCalls(ctx)-before, 1, "%v must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the Summarize calls", code)
+		answer := hClientCall()
+		ctx.Equal(hClientCalls(ctx)-before, 1, "%v must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the Summarize calls", code)
 		ctx.Equal(answer.Kind, "extractive", "after %v, the kind of the answer", code)
 	}
 }
 
 func CheckRetryBudget(ctx *harness.Ctx) {
-	clientPeer(ctx)
+	hClientPeer(ctx)
 	ctx.GRPC.Fail("Summarize", codes.Unavailable, "model restarting", 3, "")
-	down := clientCall()
-	ctx.Equal(clientCalls(ctx), 3, "with the model down, the Summarize calls (MAX_ATTEMPTS = 3)")
+	down := hClientCall()
+	ctx.Equal(hClientCalls(ctx), 3, "with the model down, the Summarize calls (MAX_ATTEMPTS = 3)")
 	ctx.Equal(down.Kind, "extractive", "after three UNAVAILABLE answers, the kind of the answer")
 	ctx.GRPC.Fail("Summarize", codes.Unavailable, "model restarting", 1, "")
-	back := clientCall()
-	ctx.Assert(clientCalls(ctx) == 5 && back.Kind == "abstractive", "one UNAVAILABLE then a healthy model: expected a retry and the model's summary, got %+v after %d calls", back, clientCalls(ctx)-3)
+	back := hClientCall()
+	ctx.Assert(hClientCalls(ctx) == 5 && back.Kind == "abstractive", "one UNAVAILABLE then a healthy model: expected a retry and the model's summary, got %+v after %d calls", back, hClientCalls(ctx)-3)
 	ctx.GRPC.Fail("Summarize", codes.DeadlineExceeded, "model timed out", 1, "")
-	late := clientCall()
-	ctx.Assert(clientCalls(ctx) == 7 && late.Kind == "abstractive", "one DEADLINE_EXCEEDED then a healthy model: expected a retry and the model's summary, got %+v after %d calls", late, clientCalls(ctx)-5)
+	late := hClientCall()
+	ctx.Assert(hClientCalls(ctx) == 7 && late.Kind == "abstractive", "one DEADLINE_EXCEEDED then a healthy model: expected a retry and the model's summary, got %+v after %d calls", late, hClientCalls(ctx)-5)
 }
 
 func CheckLabelledFallback(ctx *harness.Ctx) {
-	clientPeer(ctx)
-	ok := clientCall()
+	hClientPeer(ctx)
+	ok := hClientCall()
 	ctx.Assert(ok.Kind == "abstractive" && ok.Summary == "A 30-word source in 20 words.", "with the model healthy summarize answered %+v", ok)
 	ctx.GRPC.Fail("Summarize", codes.FailedPrecondition, "refused", 5, "")
-	fallback := clientCall()
+	fallback := hClientCall()
 	ctx.Equal(fallback.Kind, "extractive", "when the model gave no summary a reader takes an unlabelled answer for the model's; the kind")
-	ctx.Equal(fallback.Summary, text.Lead(clientSource, 20), "the fallback must be the source's own lead cut to 20 words")
+	ctx.Equal(fallback.Summary, text.Lead(kHClientSource, 20), "the fallback must be the source's own lead cut to 20 words")
 	ctx.Equal(fallback.ModelVersion, "", "an extract has no model version")
 }
 `,
@@ -785,22 +785,22 @@ class HarnessModelPeer final : public summarizerd::SummaryModel::Service {
   }
 };
 
-void clientPeer(harness::Ctx& ctx) {
+void hClientPeer(harness::Ctx& ctx) {
   static HarnessModelPeer* peer = nullptr;
   delete peer;
   peer = new HarnessModelPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
 }
 
-Summarized clientCall() { return summarize(hHash, hSource, 20); }
+Summarized hClientCall() { return summarize(hHash, hSource, 20); }
 
-size_t clientCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Summarize").size(); }
+size_t hClientCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Summarize").size(); }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  clientPeer(ctx);
-  const Summarized ok = clientCall();
+  hClientPeer(ctx);
+  const Summarized ok = hClientCall();
   ctx.Assert(ok.kind == "abstractive" && ok.model_version == "sm-7", "with the model healthy summarize answered kind %q, model %q", ok.kind, ok.model_version);
   for (const auto& call : ctx.GRPC.CallsTo("Summarize")) {
     ctx.Assert(call.HasDeadline(), "a Summarize call carries no deadline: a hung model holds the request until its caller gives up");
@@ -808,7 +808,7 @@ void CheckDeadline(harness::Ctx& ctx) {
   }
   ctx.GRPC.SetLatency("Summarize", 30.0);
   const int64_t before = ctx.Clock.Now();
-  const Summarized slow = clientCall();
+  const Summarized slow = hClientCall();
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 16, "with the model hung summarize took %.0f s: each attempt must give up after 5 s", waited);
   ctx.Equal(slow.kind, "extractive", "with the model hung, the kind of the answer");
@@ -821,45 +821,45 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckTerminalRefusal(harness::Ctx& ctx) {
-  clientPeer(ctx);
+  hClientPeer(ctx);
   ctx.GRPC.Fail("Summarize", grpc::StatusCode::FAILED_PRECONDITION, "refused: the source asks for a diagnosis", 1);
-  const Summarized refused = clientCall();
-  ctx.Equal(clientCalls(ctx), 1, "a refusal ends the call (the model answers the same text the same way); the Summarize calls");
+  const Summarized refused = hClientCall();
+  ctx.Equal(hClientCalls(ctx), 1, "a refusal ends the call (the model answers the same text the same way); the Summarize calls");
   ctx.Equal(ctx.Clock.Sleeps(), 0, "a refusal must not be slept on and retried; the sleeps");
   ctx.Equal(refused.kind, "extractive", "after a refusal, the kind of the answer");
   ctx.GRPC.Fail("Summarize", grpc::StatusCode::INVALID_ARGUMENT, "target_words out of range", 1);
-  clientCall();
-  ctx.Equal(clientCalls(ctx), 2, "INVALID_ARGUMENT must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED may be); the Summarize calls");
+  hClientCall();
+  ctx.Equal(hClientCalls(ctx), 2, "INVALID_ARGUMENT must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED may be); the Summarize calls");
   const std::pair<grpc::StatusCode, std::string> terminal[] = {{grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}, {grpc::StatusCode::INTERNAL, "INTERNAL"}};
   for (const auto& [code, name] : terminal) {
-    const size_t before = clientCalls(ctx);
+    const size_t before = hClientCalls(ctx);
     ctx.GRPC.Fail("Summarize", code, "the model failed", 1);
-    const Summarized answer = clientCall();
-    ctx.Equal(clientCalls(ctx) - before, 1, "%s must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the Summarize calls", name);
+    const Summarized answer = hClientCall();
+    ctx.Equal(hClientCalls(ctx) - before, 1, "%s must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the Summarize calls", name);
     ctx.Equal(answer.kind, "extractive", "after %s, the kind of the answer", name);
   }
 }
 
 void CheckRetryBudget(harness::Ctx& ctx) {
-  clientPeer(ctx);
+  hClientPeer(ctx);
   ctx.GRPC.Fail("Summarize", grpc::StatusCode::UNAVAILABLE, "model restarting", 3);
-  const Summarized down = clientCall();
-  ctx.Equal(clientCalls(ctx), 3, "with the model down, the Summarize calls (kMaxAttempts = 3)");
+  const Summarized down = hClientCall();
+  ctx.Equal(hClientCalls(ctx), 3, "with the model down, the Summarize calls (kMaxAttempts = 3)");
   ctx.Equal(down.kind, "extractive", "after three UNAVAILABLE answers, the kind of the answer");
   ctx.GRPC.Fail("Summarize", grpc::StatusCode::UNAVAILABLE, "model restarting", 1);
-  const Summarized back = clientCall();
-  ctx.Assert(clientCalls(ctx) == 5 && back.kind == "abstractive", "one UNAVAILABLE then a healthy model: expected a retry and the model's summary, got kind %q after %d calls", back.kind, clientCalls(ctx) - 3);
+  const Summarized back = hClientCall();
+  ctx.Assert(hClientCalls(ctx) == 5 && back.kind == "abstractive", "one UNAVAILABLE then a healthy model: expected a retry and the model's summary, got kind %q after %d calls", back.kind, hClientCalls(ctx) - 3);
   ctx.GRPC.Fail("Summarize", grpc::StatusCode::DEADLINE_EXCEEDED, "model timed out", 1);
-  const Summarized late = clientCall();
-  ctx.Assert(clientCalls(ctx) == 7 && late.kind == "abstractive", "one DEADLINE_EXCEEDED then a healthy model: expected a retry and the model's summary, got kind %q after %d calls", late.kind, clientCalls(ctx) - 5);
+  const Summarized late = hClientCall();
+  ctx.Assert(hClientCalls(ctx) == 7 && late.kind == "abstractive", "one DEADLINE_EXCEEDED then a healthy model: expected a retry and the model's summary, got kind %q after %d calls", late.kind, hClientCalls(ctx) - 5);
 }
 
 void CheckLabelledFallback(harness::Ctx& ctx) {
-  clientPeer(ctx);
-  const Summarized ok = clientCall();
+  hClientPeer(ctx);
+  const Summarized ok = hClientCall();
   ctx.Assert(ok.kind == "abstractive" && ok.summary == "A 30-word source in 20 words.", "with the model healthy summarize answered kind %q, %q", ok.kind, ok.summary);
   ctx.GRPC.Fail("Summarize", grpc::StatusCode::FAILED_PRECONDITION, "refused", 5);
-  const Summarized fallback = clientCall();
+  const Summarized fallback = hClientCall();
   ctx.Equal(fallback.kind, "extractive", "when the model gave no summary a reader takes an unlabelled answer for the model's; the kind");
   ctx.Equal(fallback.summary, summarizer::text::lead(hSource, 20), "the fallback must be the source's own lead cut to 20 words");
   ctx.Equal(fallback.model_version, "", "an extract has no model version");

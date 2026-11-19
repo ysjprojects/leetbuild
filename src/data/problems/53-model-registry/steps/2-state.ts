@@ -722,112 +722,112 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func seedVersions(ctx *harness.Ctx) {
+func hSeedVersions(ctx *harness.Ctx) {
 	for _, n := range []int{2, 3} {
 		ctx.Redis.Do("HSET", fmt.Sprintf("model:fraud:v%d", n), "name", "fraud", "version", fmt.Sprint(n), "artifact_digest", fmt.Sprintf("sha256:a%d", n),
 			"training_run_id", fmt.Sprintf("r-%d", n), "eval_id", fmt.Sprintf("e-%d", n), "stage", "staged")
 	}
 }
 
-func stageOf(ctx *harness.Ctx, n int) string {
+func hStageOf(ctx *harness.Ctx, n int) string {
 	s, _ := ctx.Redis.HGet(fmt.Sprintf("model:fraud:v%d", n), "stage")
 	return s
 }
 
-func pointerOf(ctx *harness.Ctx) string {
+func hPointerOf(ctx *harness.Ctx) string {
 	p, _ := ctx.Redis.Get("active:prod")
 	return p
 }
 
-func mustPromote(ctx *harness.Ctx, version int, evalID string) bool {
-	moved, err := promote(stateBg, "fraud", version, "prod", evalID)
+func hMustPromote(ctx *harness.Ctx, version int, evalID string) bool {
+	moved, err := promote(hStateBg, "fraud", version, "prod", evalID)
 	ctx.NoError(err, "promote(fraud, %d, prod, %s) failed", version, evalID)
 	return moved
 }
 
-func mustRollback(ctx *harness.Ctx, version int) bool {
-	done, err := rollback(stateBg, "fraud", version, "prod")
+func hMustRollback(ctx *harness.Ctx, version int) bool {
+	done, err := rollback(hStateBg, "fraud", version, "prod")
 	ctx.NoError(err, "rollback(fraud, %d, prod) failed", version)
 	return done
 }
 
-func mustResolve(ctx *harness.Ctx) string {
-	ref, err := resolveActive(stateBg, "prod")
+func hMustResolve(ctx *harness.Ctx) string {
+	ref, err := resolveActive(hStateBg, "prod")
 	ctx.NoError(err, "resolveActive(prod) failed")
 	return ref
 }
 
 func CheckSharedPointer(ctx *harness.Ctx) {
-	seedVersions(ctx)
-	ctx.Equal(mustPromote(ctx, 3, "e-3"), true, "promoting staged fraud version 3 must move the pointer; moved")
-	ctx.Equal(pointerOf(ctx), "fraud:3", "active:prod after the promote")
-	ctx.Equal(mustResolve(ctx), "fraud:3", "resolveActive(prod)")
+	hSeedVersions(ctx)
+	ctx.Equal(hMustPromote(ctx, 3, "e-3"), true, "promoting staged fraud version 3 must move the pointer; moved")
+	ctx.Equal(hPointerOf(ctx), "fraud:3", "active:prod after the promote")
+	ctx.Equal(hMustResolve(ctx), "fraud:3", "resolveActive(prod)")
 	// Another registryd instance promotes version 2: its script moves the same key.
 	ctx.Redis.Set("active:prod", "fraud:2")
-	ctx.Equal(mustResolve(ctx), "fraud:2", "another instance moved active:prod to fraud:2: a process-local copy of the pointer answers the old one. Read active:{pool} from Redis; resolveActive(prod)")
+	ctx.Equal(hMustResolve(ctx), "fraud:2", "another instance moved active:prod to fraud:2: a process-local copy of the pointer answers the old one. Read active:{pool} from Redis; resolveActive(prod)")
 	ctx.Redis.Del("active:prod")
-	ctx.Equal(mustResolve(ctx), "", "active:prod was cleared; resolveActive(prod)")
+	ctx.Equal(hMustResolve(ctx), "", "active:prod was cleared; resolveActive(prod)")
 }
 
 func CheckAtomicPromote(ctx *harness.Ctx) {
-	seedVersions(ctx)
+	hSeedVersions(ctx)
 	// An operator's rollback of version 3 lands while the promote is writing.
 	rival := ctx.Redis.After("model:fraud:v3", func() any {
-		done, err := rollback(stateBg, "fraud", 3, "prod")
+		done, err := rollback(hStateBg, "fraud", 3, "prod")
 		ctx.NoError(err, "the rival rollback failed")
 		return done
 	})
-	mustPromote(ctx, 3, "e-3")
+	hMustPromote(ctx, 3, "e-3")
 	ctx.Assert(rival.Fired, "the promote never touched model:fraud:v3")
 	ctx.Assert(rival.Err == nil, "the rival rollback failed: %v", rival.Err)
-	stage, pointer := stageOf(ctx, 3), pointerOf(ctx)
+	stage, pointer := hStageOf(ctx, 3), hPointerOf(ctx)
 	// In either order the version ends rolled back: after the rollback, its own eval record e-3 cannot promote it again.
 	ctx.Assert(stage == "rolled_back" && pointer == "", "a promote on eval e-3 and a rollback of fraud version 3 overlapped and left it %s with active:prod %q; in either order it ends rolled_back with prod cleared. The stage check, the stage and the pointer must move in one script", stage, pointer)
 }
 
 func CheckRollbackClears(ctx *harness.Ctx) {
-	seedVersions(ctx)
-	ctx.Equal(mustPromote(ctx, 3, "e-3"), true, "promoting staged fraud version 3 must move the pointer; moved")
-	ctx.Equal(mustRollback(ctx, 2), true, "rolling back fraud version 2 (it exists); done")
-	ctx.Equal(pointerOf(ctx), "fraud:3", "rolling back version 2, which prod does not serve, must leave another version's traffic; active:prod")
-	ctx.Equal(mustRollback(ctx, 3), true, "rolling back fraud version 3; done")
-	ctx.Equal(stageOf(ctx, 3), "rolled_back", "the stage of fraud version 3 after its rollback")
+	hSeedVersions(ctx)
+	ctx.Equal(hMustPromote(ctx, 3, "e-3"), true, "promoting staged fraud version 3 must move the pointer; moved")
+	ctx.Equal(hMustRollback(ctx, 2), true, "rolling back fraud version 2 (it exists); done")
+	ctx.Equal(hPointerOf(ctx), "fraud:3", "rolling back version 2, which prod does not serve, must leave another version's traffic; active:prod")
+	ctx.Equal(hMustRollback(ctx, 3), true, "rolling back fraud version 3; done")
+	ctx.Equal(hStageOf(ctx, 3), "rolled_back", "the stage of fraud version 3 after its rollback")
 	ctx.Equal(ctx.Redis.Exists("active:prod"), 0, "active:prod still holds fraud:3 after version 3 was rolled back: prod keeps serving the version it was taken out of; active:prod exists")
-	ctx.Equal(mustResolve(ctx), "", "resolveActive(prod) after the rollback")
-	ctx.Equal(mustRollback(ctx, 9), false, "rolling back a version that does not exist; done")
-	ctx.Equal(mustPromote(ctx, 3, "e-3b"), true, "fraud version 3 with a new eval record must be promoted again; moved")
+	ctx.Equal(hMustResolve(ctx), "", "resolveActive(prod) after the rollback")
+	ctx.Equal(hMustRollback(ctx, 9), false, "rolling back a version that does not exist; done")
+	ctx.Equal(hMustPromote(ctx, 3, "e-3b"), true, "fraud version 3 with a new eval record must be promoted again; moved")
 	// Another instance promotes version 2 the moment this rollback touches the pointer.
 	rival := ctx.Redis.After("active:prod", func() any {
-		moved, err := promote(stateBg, "fraud", 2, "prod", "e-2b")
+		moved, err := promote(hStateBg, "fraud", 2, "prod", "e-2b")
 		ctx.NoError(err, "the rival promote failed")
 		return moved
 	})
-	mustRollback(ctx, 3)
+	hMustRollback(ctx, 3)
 	ctx.Assert(rival.Fired, "the rollback of fraud version 3 never touched active:prod")
 	ctx.Assert(rival.Err == nil, "the rival promote failed: %v", rival.Err)
-	ctx.Equal(pointerOf(ctx), "fraud:2", "another instance promoted fraud version 2 while version 3 was rolled back: the rollback must not delete a pointer it compared in another round trip. Compare and delete in the script; active:prod")
+	ctx.Equal(hPointerOf(ctx), "fraud:2", "another instance promoted fraud version 2 while version 3 was rolled back: the rollback must not delete a pointer it compared in another round trip. Compare and delete in the script; active:prod")
 }
 
 func CheckNewEvalGate(ctx *harness.Ctx) {
-	seedVersions(ctx)
-	ctx.Equal(mustPromote(ctx, 3, "e-3"), true, "promoting staged fraud version 3 must move the pointer; moved")
-	mustRollback(ctx, 3)
-	again := mustPromote(ctx, 3, "e-3")
-	ctx.Assert(!again && ctx.Redis.Exists("active:prod") == 0, "a rolled-back version was promoted again on the eval record it failed with (returned %v, active:prod %q): it needs a new eval record", again, pointerOf(ctx))
-	ctx.Equal(stageOf(ctx, 3), "rolled_back", "the refused promote must leave fraud version 3 rolled back; the stage")
-	ctx.Equal(mustPromote(ctx, 3, "e-3b"), true, "with a new eval record the rolled-back version must be promoted; moved")
+	hSeedVersions(ctx)
+	ctx.Equal(hMustPromote(ctx, 3, "e-3"), true, "promoting staged fraud version 3 must move the pointer; moved")
+	hMustRollback(ctx, 3)
+	again := hMustPromote(ctx, 3, "e-3")
+	ctx.Assert(!again && ctx.Redis.Exists("active:prod") == 0, "a rolled-back version was promoted again on the eval record it failed with (returned %v, active:prod %q): it needs a new eval record", again, hPointerOf(ctx))
+	ctx.Equal(hStageOf(ctx, 3), "rolled_back", "the refused promote must leave fraud version 3 rolled back; the stage")
+	ctx.Equal(hMustPromote(ctx, 3, "e-3b"), true, "with a new eval record the rolled-back version must be promoted; moved")
 	evalID, _ := ctx.Redis.HGet("model:fraud:v3", "eval_id")
-	ctx.Assert(stageOf(ctx, 3) == "promoted" && evalID == "e-3b", "after the re-promotion fraud version 3 is %s with eval_id %s, expected promoted with e-3b", stageOf(ctx, 3), evalID)
-	ctx.Equal(pointerOf(ctx), "fraud:3", "active:prod after the re-promotion")
-	canary, err := promote(stateBg, "fraud", 3, "canary", "e-3b")
+	ctx.Assert(hStageOf(ctx, 3) == "promoted" && evalID == "e-3b", "after the re-promotion fraud version 3 is %s with eval_id %s, expected promoted with e-3b", hStageOf(ctx, 3), evalID)
+	ctx.Equal(hPointerOf(ctx), "fraud:3", "active:prod after the re-promotion")
+	canary, err := promote(hStateBg, "fraud", 3, "canary", "e-3b")
 	ctx.NoError(err, "promote(fraud, 3, canary, e-3b) failed")
 	inCanary, _ := ctx.Redis.Get("active:canary")
 	ctx.Assert(canary && inCanary == "fraud:3", "a promoted version must also be promotable into canary on its eval record (returned %v, active:canary %q)", canary, inCanary)
-	ctx.Equal(mustPromote(ctx, 9, "e-9"), false, "promoting a version that does not exist; moved")
+	ctx.Equal(hMustPromote(ctx, 9, "e-9"), false, "promoting a version that does not exist; moved")
 	ctx.Equal(ctx.Redis.Exists("model:fraud:v9"), 0, "promoting a missing version must not create it; model:fraud:v9 exists")
-	ctx.Equal(pointerOf(ctx), "fraud:3", "promoting a missing version must leave active:prod")
+	ctx.Equal(hPointerOf(ctx), "fraud:3", "promoting a missing version must leave active:prod")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -838,7 +838,7 @@ func CheckNewEvalGate(ctx *harness.Ctx) {
 
 namespace {
 
-void seedVersions(harness::Ctx& ctx) {
+void hSeedVersions(harness::Ctx& ctx) {
   for (const int n : {2, 3}) {
     const std::string s = std::to_string(n);
     ctx.Redis.Do("HSET", "model:fraud:v" + s, "name", "fraud", "version", s, "artifact_digest", "sha256:a" + s, "training_run_id", "r-" + s,
@@ -846,15 +846,15 @@ void seedVersions(harness::Ctx& ctx) {
   }
 }
 
-std::string stageOf(harness::Ctx& ctx, int n) { return ctx.Redis.HGet("model:fraud:v" + std::to_string(n), "stage").value_or(""); }
-std::string pointerOf(harness::Ctx& ctx) { return ctx.Redis.Get("active:prod").value_or(""); }
+std::string hStageOf(harness::Ctx& ctx, int n) { return ctx.Redis.HGet("model:fraud:v" + std::to_string(n), "stage").value_or(""); }
+std::string hPointerOf(harness::Ctx& ctx) { return ctx.Redis.Get("active:prod").value_or(""); }
 
 }  // namespace
 
 void CheckSharedPointer(harness::Ctx& ctx) {
-  seedVersions(ctx);
+  hSeedVersions(ctx);
   ctx.Equal(promote("fraud", 3, "prod", "e-3"), true, "promoting staged fraud version 3 must move the pointer; moved");
-  ctx.Equal(pointerOf(ctx), "fraud:3", "active:prod after the promote");
+  ctx.Equal(hPointerOf(ctx), "fraud:3", "active:prod after the promote");
   ctx.Equal(resolveActive("prod").value_or(""), "fraud:3", "resolveActive(prod)");
   // Another registryd instance promotes version 2: its script moves the same key.
   ctx.Redis.Set("active:prod", "fraud:2");
@@ -865,7 +865,7 @@ void CheckSharedPointer(harness::Ctx& ctx) {
 }
 
 void CheckAtomicPromote(harness::Ctx& ctx) {
-  seedVersions(ctx);
+  hSeedVersions(ctx);
   // An operator's rollback of version 3 lands while the promote is writing.
   auto fired = std::make_shared<bool>(false);
   auto err = std::make_shared<std::optional<std::string>>();
@@ -880,20 +880,20 @@ void CheckAtomicPromote(harness::Ctx& ctx) {
   promote("fraud", 3, "prod", "e-3");
   ctx.Assert(*fired, "the promote never touched model:fraud:v3");
   ctx.Assert(!err->has_value(), "the rival rollback failed: %s", err->value_or(""));
-  const std::string stage = stageOf(ctx, 3);
-  const std::string pointer = pointerOf(ctx);
+  const std::string stage = hStageOf(ctx, 3);
+  const std::string pointer = hPointerOf(ctx);
   // In either order the version ends rolled back: after the rollback, its own eval record e-3 cannot promote it again.
   ctx.Assert(stage == "rolled_back" && pointer.empty(),
              "a promote on eval e-3 and a rollback of fraud version 3 overlapped and left it %s with active:prod %q; in either order it ends rolled_back with prod cleared. The stage check, the stage and the pointer must move in one script", stage, pointer);
 }
 
 void CheckRollbackClears(harness::Ctx& ctx) {
-  seedVersions(ctx);
+  hSeedVersions(ctx);
   ctx.Equal(promote("fraud", 3, "prod", "e-3"), true, "promoting staged fraud version 3 must move the pointer; moved");
   ctx.Equal(rollback("fraud", 2, "prod"), true, "rolling back fraud version 2 (it exists); done");
-  ctx.Equal(pointerOf(ctx), "fraud:3", "rolling back version 2, which prod does not serve, must leave another version's traffic; active:prod");
+  ctx.Equal(hPointerOf(ctx), "fraud:3", "rolling back version 2, which prod does not serve, must leave another version's traffic; active:prod");
   ctx.Equal(rollback("fraud", 3, "prod"), true, "rolling back fraud version 3; done");
-  ctx.Equal(stageOf(ctx, 3), "rolled_back", "the stage of fraud version 3 after its rollback");
+  ctx.Equal(hStageOf(ctx, 3), "rolled_back", "the stage of fraud version 3 after its rollback");
   ctx.Equal(ctx.Redis.Exists("active:prod"), 0,
             "active:prod still holds fraud:3 after version 3 was rolled back: prod keeps serving the version it was taken out of; active:prod exists");
   ctx.Assert(!resolveActive("prod"), "resolveActive(prod) answers %s after the rollback", resolveActive("prod").value_or(""));
@@ -913,28 +913,28 @@ void CheckRollbackClears(harness::Ctx& ctx) {
   rollback("fraud", 3, "prod");
   ctx.Assert(*fired, "the rollback of fraud version 3 never touched active:prod");
   ctx.Assert(!err->has_value(), "the rival promote failed: %s", err->value_or(""));
-  ctx.Equal(pointerOf(ctx), "fraud:2",
+  ctx.Equal(hPointerOf(ctx), "fraud:2",
             "another instance promoted fraud version 2 while version 3 was rolled back: the rollback must not delete a pointer it compared in another round trip. Compare and delete in the script; active:prod");
 }
 
 void CheckNewEvalGate(harness::Ctx& ctx) {
-  seedVersions(ctx);
+  hSeedVersions(ctx);
   ctx.Equal(promote("fraud", 3, "prod", "e-3"), true, "promoting staged fraud version 3 must move the pointer; moved");
   rollback("fraud", 3, "prod");
   const bool again = promote("fraud", 3, "prod", "e-3");
   ctx.Assert(!again && ctx.Redis.Exists("active:prod") == 0,
-             "a rolled-back version was promoted again on the eval record it failed with (returned %t, active:prod %q): it needs a new eval record", again, pointerOf(ctx));
-  ctx.Equal(stageOf(ctx, 3), "rolled_back", "the refused promote must leave fraud version 3 rolled back; the stage");
+             "a rolled-back version was promoted again on the eval record it failed with (returned %t, active:prod %q): it needs a new eval record", again, hPointerOf(ctx));
+  ctx.Equal(hStageOf(ctx, 3), "rolled_back", "the refused promote must leave fraud version 3 rolled back; the stage");
   ctx.Equal(promote("fraud", 3, "prod", "e-3b"), true, "with a new eval record the rolled-back version must be promoted; moved");
   const std::string eval_id = ctx.Redis.HGet("model:fraud:v3", "eval_id").value_or("");
-  ctx.Assert(stageOf(ctx, 3) == "promoted" && eval_id == "e-3b", "after the re-promotion fraud version 3 is %s with eval_id %s, expected promoted with e-3b", stageOf(ctx, 3), eval_id);
-  ctx.Equal(pointerOf(ctx), "fraud:3", "active:prod after the re-promotion");
+  ctx.Assert(hStageOf(ctx, 3) == "promoted" && eval_id == "e-3b", "after the re-promotion fraud version 3 is %s with eval_id %s, expected promoted with e-3b", hStageOf(ctx, 3), eval_id);
+  ctx.Equal(hPointerOf(ctx), "fraud:3", "active:prod after the re-promotion");
   const bool canary = promote("fraud", 3, "canary", "e-3b");
   const std::string in_canary = ctx.Redis.Get("active:canary").value_or("");
   ctx.Assert(canary && in_canary == "fraud:3", "a promoted version must also be promotable into canary on its eval record (returned %t, active:canary %q)", canary, in_canary);
   ctx.Equal(promote("fraud", 9, "prod", "e-9"), false, "promoting a version that does not exist; moved");
   ctx.Equal(ctx.Redis.Exists("model:fraud:v9"), 0, "promoting a missing version must not create it; model:fraud:v9 exists");
-  ctx.Equal(pointerOf(ctx), "fraud:3", "promoting a missing version must leave active:prod");
+  ctx.Equal(hPointerOf(ctx), "fraud:3", "promoting a missing version must leave active:prod");
 }
 `,
   },

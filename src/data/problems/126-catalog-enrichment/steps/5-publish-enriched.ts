@@ -860,23 +860,23 @@ import (
 	"leetbuild/harness"
 )
 
-const indexGroup = "catalog-index"
+const kHIndexGroup = "catalog-index"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func enrichedEvent(skuID string, version int64, source, brand string) store.Event {
+func hEnrichedEvent(skuID string, version int64, source, brand string) store.Event {
 	return store.Event{SkuID: skuID, Merchant: "m-1", Attributes: map[string]any{"brand": brand, "size": 1.0, "unit": "l", "organic": false, "category": "plant-milk"},
 		AttributesVersion: version, TaxonomyVersion: taxonomy.Version, Source: source}
 }
 
-func seedEvents(ctx *harness.Ctx, events ...store.Event) {
+func hSeedEvents(ctx *harness.Ctx, events ...store.Event) {
 	for _, e := range events {
 		value, _ := json.Marshal(e)
 		ctx.Kafka.Seed("sku.enriched", e.Merchant, string(value))
 	}
 }
 
-func eventVersions(ctx *harness.Ctx) []int64 {
+func hEventVersions(ctx *harness.Ctx) []int64 {
 	versions := []int64{}
 	for _, r := range ctx.Kafka.Records("sku.enriched") {
 		var e store.Event
@@ -886,7 +886,7 @@ func eventVersions(ctx *harness.Ctx) []int64 {
 	return versions
 }
 
-func outboxRows(ctx *harness.Ctx) []map[string]any {
+func hOutboxRows(ctx *harness.Ctx) []map[string]any {
 	var rows []map[string]any
 	for _, row := range ctx.Redis.LRange("outbox:enriched", 0, -1) {
 		var v map[string]any
@@ -896,57 +896,57 @@ func outboxRows(ctx *harness.Ctx) []map[string]any {
 	return rows
 }
 
-func runIndex(ctx *harness.Ctx) {
+func hRunIndex(ctx *harness.Ctx) {
 	var err error
-	ctx.Drain(func() { err = runIndexer(eventsBg) })
+	ctx.Drain(func() { err = runIndexer(hEventsBg) })
 	ctx.NoError(err, "the indexer stopped")
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
 	ctx.Kafka.LoseAcks("sku.enriched", 1)
-	ctx.NoError(publish(eventsBg, enrichedEvent("sku-1", 1, "model", "Oatly")), "publish failed")
+	ctx.NoError(publish(hEventsBg, hEnrichedEvent("sku-1", 1, "model", "Oatly")), "publish failed")
 	ctx.Settle()
-	ctx.Equal(eventVersions(ctx), []int64{1}, "after one produce whose acknowledgement was lost the retry must not write the event again (enable idempotence); the versions on sku.enriched")
-	ctx.NoError(publish(eventsBg, enrichedEvent("sku-1", 2, "model", "Oatly")), "publish failed")
+	ctx.Equal(hEventVersions(ctx), []int64{1}, "after one produce whose acknowledgement was lost the retry must not write the event again (enable idempotence); the versions on sku.enriched")
+	ctx.NoError(publish(hEventsBg, hEnrichedEvent("sku-1", 2, "model", "Oatly")), "publish failed")
 	ctx.Settle()
 	ctx.Kafka.Failover("sku.enriched")
-	ctx.Equal(eventVersions(ctx), []int64{1, 2}, "a leader failover right after the acknowledgement must keep the event (acks=all); the versions")
+	ctx.Equal(hEventVersions(ctx), []int64{1, 2}, "a leader failover right after the acknowledgement must keep the event (acks=all); the versions")
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
 	ctx.Kafka.FailNext("sku.enriched", 1)
-	ctx.NoError(publish(eventsBg, enrichedEvent("sku-1", 1, "model", "Oatly")), "publish failed when the broker refused the event: write it to the outbox instead")
+	ctx.NoError(publish(hEventsBg, hEnrichedEvent("sku-1", 1, "model", "Oatly")), "publish failed when the broker refused the event: write it to the outbox instead")
 	ctx.Settle()
-	rows := outboxRows(ctx)
+	rows := hOutboxRows(ctx)
 	ctx.Assert(len(rows) > 0, "the broker refused the event and nothing reached outbox:enriched: read the delivery report and call store.InsertOutbox")
 	event, _ := rows[0]["event"].(map[string]any)
 	ctx.Equal(event["sku_id"], "sku-1", "the outbox row must carry the event; its sku_id")
 	reason, _ := rows[0]["reason"].(string)
 	ctx.Assert(reason != "", "the outbox row must carry the delivery error as its reason, got %v", rows[0])
-	ctx.NoError(publish(eventsBg, enrichedEvent("sku-1", 2, "model", "Oatly")), "publish failed")
+	ctx.NoError(publish(hEventsBg, hEnrichedEvent("sku-1", 2, "model", "Oatly")), "publish failed")
 	ctx.Settle()
-	ctx.Equal(eventVersions(ctx), []int64{2}, "once the broker accepts events they reach the topic; the versions")
-	ctx.Equal(len(outboxRows(ctx)), 1, "a delivered event must not be written to the outbox; the rows")
+	ctx.Equal(hEventVersions(ctx), []int64{2}, "once the broker accepts events they reach the topic; the versions")
+	ctx.Equal(len(hOutboxRows(ctx)), 1, "a delivered event must not be written to the outbox; the rows")
 }
 
 func CheckCommitAfterApply(ctx *harness.Ctx) {
-	seedEvents(ctx, enrichedEvent("sku-1", 1, "model", "Oatly"), enrichedEvent("sku-2", 1, "model", "Oatly"))
+	hSeedEvents(ctx, hEnrichedEvent("sku-1", 1, "model", "Oatly"), hEnrichedEvent("sku-2", 1, "model", "Oatly"))
 	var atCommit [][2]bool
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
 		atCommit = append(atCommit, [2]bool{ctx.Redis.Exists("catalog:sku-1") == 1, ctx.Redis.Exists("search:sku-1") == 1})
 	})
-	runIndex(ctx)
+	hRunIndex(ctx)
 	ctx.Assert(len(atCommit) > 0, "the indexer never committed an offset")
 	ctx.Assert(atCommit[0][0], "the first commit came before sku-1 was in the catalog: a crash between the two loses the version")
 	ctx.Assert(atCommit[0][1], "the first commit came before sku-1 was in the search index: a crash between the two leaves search serving the old attributes")
-	ctx.Equal(ctx.Kafka.Lag(indexGroup, "sku.enriched"), 0, "every applied event must be committed; the lag")
+	ctx.Equal(ctx.Kafka.Lag(kHIndexGroup, "sku.enriched"), 0, "every applied event must be committed; the lag")
 }
 
 func CheckSearchIndex(ctx *harness.Ctx) {
-	seedEvents(ctx, enrichedEvent("sku-1", 1, "model", "Oatly"), enrichedEvent("sku-2", 1, "model", "Silk"))
-	runIndex(ctx)
+	hSeedEvents(ctx, hEnrichedEvent("sku-1", 1, "model", "Oatly"), hEnrichedEvent("sku-2", 1, "model", "Silk"))
+	hRunIndex(ctx)
 	for _, skuID := range []string{"sku-1", "sku-2"} {
-		catalog, search := store.CatalogCurrent(eventsBg, skuID), store.SearchEntry(eventsBg, skuID)
+		catalog, search := store.CatalogCurrent(hEventsBg, skuID), store.SearchEntry(hEventsBg, skuID)
 		ctx.Assert(catalog != nil, "%s never reached the catalog", skuID)
 		ctx.Assert(search != nil && search.AttributesVersion == catalog.AttributesVersion && search.Attributes["brand"] == catalog.Attributes["brand"],
 			"the search index holds %+v for %s while the catalog holds %+v: write both before the commit", search, skuID, catalog)
@@ -954,23 +954,23 @@ func CheckSearchIndex(ctx *harness.Ctx) {
 }
 
 func CheckHumanWins(ctx *harness.Ctx) {
-	seedEvents(ctx, enrichedEvent("sku-2", 2, "model", "Califia Farms"), enrichedEvent("sku-2", 1, "model", "Silk"))
-	seedEvents(ctx, enrichedEvent("sku-3", 2, "model", "Califia Farms"), enrichedEvent("sku-3", 2, "model", "Silk")) // a replay of version 2
-	seedEvents(ctx, enrichedEvent("sku-4", 1, "human", "Oatly"), enrichedEvent("sku-4", 2, "human", "Silk"))          // a reviewer corrects a correction
-	seedEvents(ctx, enrichedEvent("sku-1", 1, "model", "Glowra"), enrichedEvent("sku-1", 2, "human", "Oatly"), enrichedEvent("sku-1", 3, "model", "Silk"))
-	runIndex(ctx)
-	one := store.CatalogCurrent(eventsBg, "sku-1")
+	hSeedEvents(ctx, hEnrichedEvent("sku-2", 2, "model", "Califia Farms"), hEnrichedEvent("sku-2", 1, "model", "Silk"))
+	hSeedEvents(ctx, hEnrichedEvent("sku-3", 2, "model", "Califia Farms"), hEnrichedEvent("sku-3", 2, "model", "Silk")) // a replay of version 2
+	hSeedEvents(ctx, hEnrichedEvent("sku-4", 1, "human", "Oatly"), hEnrichedEvent("sku-4", 2, "human", "Silk"))          // a reviewer corrects a correction
+	hSeedEvents(ctx, hEnrichedEvent("sku-1", 1, "model", "Glowra"), hEnrichedEvent("sku-1", 2, "human", "Oatly"), hEnrichedEvent("sku-1", 3, "model", "Silk"))
+	hRunIndex(ctx)
+	one := store.CatalogCurrent(hEventsBg, "sku-1")
 	ctx.Assert(one != nil && one.Source == "human" && one.Attributes["brand"] == "Oatly", "a model event overwrote the reviewer's correction of sku-1: the catalog holds %+v", one)
-	search := store.SearchEntry(eventsBg, "sku-1")
+	search := store.SearchEntry(hEventsBg, "sku-1")
 	ctx.Assert(search != nil && search.Source == one.Source && search.AttributesVersion == one.AttributesVersion && search.Attributes["brand"] == one.Attributes["brand"],
 		"the search index holds %+v for sku-1 while the catalog holds %+v: a skipped event must not reach search either", search, one)
-	two := store.CatalogCurrent(eventsBg, "sku-2")
+	two := store.CatalogCurrent(hEventsBg, "sku-2")
 	ctx.Assert(two != nil && two.AttributesVersion == 2, "an older version replaced a newer one for sku-2: the catalog holds %+v", two)
-	three := store.CatalogCurrent(eventsBg, "sku-3")
+	three := store.CatalogCurrent(hEventsBg, "sku-3")
 	ctx.Assert(three != nil && three.Attributes["brand"] == "Califia Farms", "a second event with the same attributes_version (2) replaced the first for sku-3: only a newer version applies, the catalog holds %+v", three)
-	four := store.CatalogCurrent(eventsBg, "sku-4")
+	four := store.CatalogCurrent(hEventsBg, "sku-4")
 	ctx.Assert(four != nil && four.AttributesVersion == 2 && four.Attributes["brand"] == "Silk", "a newer human event must replace an older human one for sku-4, the catalog holds %+v", four)
-	ctx.Equal(ctx.Kafka.Lag(indexGroup, "sku.enriched"), 0, "skipped events must be committed too, or they are redelivered after every restart; the lag")
+	ctx.Equal(ctx.Kafka.Lag(kHIndexGroup, "sku.enriched"), 0, "skipped events must be committed too, or they are redelivered after every restart; the lag")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -987,25 +987,25 @@ func CheckHumanWins(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kIndexGroup = "catalog-index";
+const std::string kHIndexGroup = "catalog-index";
 
-nlohmann::json enrichedEvent(const std::string& sku_id, long long version, const std::string& source, const std::string& brand) {
+nlohmann::json hEnrichedEvent(const std::string& sku_id, long long version, const std::string& source, const std::string& brand) {
   return {{"sku_id", sku_id}, {"merchant", "m-1"},
           {"attributes", {{"brand", brand}, {"size", 1.0}, {"unit", "l"}, {"organic", false}, {"category", "plant-milk"}}},
           {"attributes_version", version}, {"taxonomy_version", taxonomy::kVersion}, {"source", source}};
 }
 
-void seedEvents(harness::Ctx& ctx, const std::vector<nlohmann::json>& events) {
+void hSeedEvents(harness::Ctx& ctx, const std::vector<nlohmann::json>& events) {
   for (const auto& e : events) ctx.Kafka.Seed("sku.enriched", e["merchant"].get<std::string>(), e.dump());
 }
 
-std::vector<long long> eventVersions(harness::Ctx& ctx) {
+std::vector<long long> hEventVersions(harness::Ctx& ctx) {
   std::vector<long long> versions;
   for (const auto& r : ctx.Kafka.Records("sku.enriched")) versions.push_back(nlohmann::json::parse(r.Value.value_or("{}")).value("attributes_version", 0LL));
   return versions;
 }
 
-void runIndex(harness::Ctx& ctx) {
+void hRunIndex(harness::Ctx& ctx) {
   try {
     ctx.Drain([] { run_indexer(); });
   } catch (const std::exception& e) {
@@ -1017,22 +1017,22 @@ void runIndex(harness::Ctx& ctx) {
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks("sku.enriched", 1);
-  publish(enrichedEvent("sku-1", 1, "model", "Oatly"));
+  publish(hEnrichedEvent("sku-1", 1, "model", "Oatly"));
   producer->poll(0);
   ctx.Settle();
-  ctx.Equal(eventVersions(ctx), std::vector<long long>{1}, "after one produce whose acknowledgement was lost the retry must not write the event again (enable idempotence); the versions on sku.enriched");
-  publish(enrichedEvent("sku-1", 2, "model", "Oatly"));
+  ctx.Equal(hEventVersions(ctx), std::vector<long long>{1}, "after one produce whose acknowledgement was lost the retry must not write the event again (enable idempotence); the versions on sku.enriched");
+  publish(hEnrichedEvent("sku-1", 2, "model", "Oatly"));
   producer->poll(0);
   ctx.Settle();
   ctx.Kafka.Failover("sku.enriched");
-  const auto versions = eventVersions(ctx);
+  const auto versions = hEventVersions(ctx);
   ctx.Assert(std::find(versions.begin(), versions.end(), 2) != versions.end(), "a leader failover right after the acknowledgement lost the event: wait for every in-sync replica (acks=all)");
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
   ctx.Kafka.FailNext("sku.enriched", 1);
   try {
-    publish(enrichedEvent("sku-1", 1, "model", "Oatly"));
+    publish(hEnrichedEvent("sku-1", 1, "model", "Oatly"));
     producer->poll(0);
   } catch (const std::exception& e) {
     ctx.Fatalf("publish threw %s when the broker refused the event: write it to the outbox instead", e.what());
@@ -1042,29 +1042,29 @@ void CheckOutbox(harness::Ctx& ctx) {
   ctx.Assert(!rows.empty(), "the broker refused the event and nothing reached outbox:enriched: handle the delivery report (dr_cb) with store::insert_outbox");
   const auto row = nlohmann::json::parse(rows[0], nullptr, false);
   ctx.Assert(row.is_object() && row.contains("event") && row["event"].value("sku_id", "") == "sku-1" && !row.value("reason", "").empty(), "the outbox row must carry the event and the delivery error as its reason, got %s", rows[0]);
-  publish(enrichedEvent("sku-1", 2, "model", "Oatly"));
+  publish(hEnrichedEvent("sku-1", 2, "model", "Oatly"));
   producer->poll(0);
   ctx.Settle();
-  ctx.Equal(eventVersions(ctx), std::vector<long long>{2}, "once the broker accepts events they reach the topic; the versions");
+  ctx.Equal(hEventVersions(ctx), std::vector<long long>{2}, "once the broker accepts events they reach the topic; the versions");
   ctx.Equal(ctx.Redis.LRange("outbox:enriched", 0, -1).size(), 1, "a delivered event must not be written to the outbox; the rows");
 }
 
 void CheckCommitAfterApply(harness::Ctx& ctx) {
-  seedEvents(ctx, {enrichedEvent("sku-1", 1, "model", "Oatly"), enrichedEvent("sku-2", 1, "model", "Oatly")});
+  hSeedEvents(ctx, {hEnrichedEvent("sku-1", 1, "model", "Oatly"), hEnrichedEvent("sku-2", 1, "model", "Oatly")});
   std::vector<std::pair<bool, bool>> at_commit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) {
     at_commit.emplace_back(ctx.Redis.Exists("catalog:sku-1") == 1, ctx.Redis.Exists("search:sku-1") == 1);
   });
-  runIndex(ctx);
+  hRunIndex(ctx);
   ctx.Assert(!at_commit.empty(), "the indexer never committed an offset");
   ctx.Assert(at_commit[0].first, "the first commit came before sku-1 was in the catalog: a crash between the two loses the version");
   ctx.Assert(at_commit[0].second, "the first commit came before sku-1 was in the search index: a crash between the two leaves search serving the old attributes");
-  ctx.Equal(ctx.Kafka.Lag(kIndexGroup, "sku.enriched"), 0, "every applied event must be committed; the lag");
+  ctx.Equal(ctx.Kafka.Lag(kHIndexGroup, "sku.enriched"), 0, "every applied event must be committed; the lag");
 }
 
 void CheckSearchIndex(harness::Ctx& ctx) {
-  seedEvents(ctx, {enrichedEvent("sku-1", 1, "model", "Oatly"), enrichedEvent("sku-2", 1, "model", "Silk")});
-  runIndex(ctx);
+  hSeedEvents(ctx, {hEnrichedEvent("sku-1", 1, "model", "Oatly"), hEnrichedEvent("sku-2", 1, "model", "Silk")});
+  hRunIndex(ctx);
   for (const std::string sku_id : {"sku-1", "sku-2"}) {
     const auto catalog = store::catalog_current(sku_id);
     const auto search = store::search_entry(sku_id);
@@ -1075,11 +1075,11 @@ void CheckSearchIndex(harness::Ctx& ctx) {
 }
 
 void CheckHumanWins(harness::Ctx& ctx) {
-  seedEvents(ctx, {enrichedEvent("sku-2", 2, "model", "Califia Farms"), enrichedEvent("sku-2", 1, "model", "Silk")});
-  seedEvents(ctx, {enrichedEvent("sku-3", 2, "model", "Califia Farms"), enrichedEvent("sku-3", 2, "model", "Silk")});  // a replay of version 2
-  seedEvents(ctx, {enrichedEvent("sku-4", 1, "human", "Oatly"), enrichedEvent("sku-4", 2, "human", "Silk")});  // a reviewer corrects a correction
-  seedEvents(ctx, {enrichedEvent("sku-1", 1, "model", "Glowra"), enrichedEvent("sku-1", 2, "human", "Oatly"), enrichedEvent("sku-1", 3, "model", "Silk")});
-  runIndex(ctx);
+  hSeedEvents(ctx, {hEnrichedEvent("sku-2", 2, "model", "Califia Farms"), hEnrichedEvent("sku-2", 1, "model", "Silk")});
+  hSeedEvents(ctx, {hEnrichedEvent("sku-3", 2, "model", "Califia Farms"), hEnrichedEvent("sku-3", 2, "model", "Silk")});  // a replay of version 2
+  hSeedEvents(ctx, {hEnrichedEvent("sku-4", 1, "human", "Oatly"), hEnrichedEvent("sku-4", 2, "human", "Silk")});  // a reviewer corrects a correction
+  hSeedEvents(ctx, {hEnrichedEvent("sku-1", 1, "model", "Glowra"), hEnrichedEvent("sku-1", 2, "human", "Oatly"), hEnrichedEvent("sku-1", 3, "model", "Silk")});
+  hRunIndex(ctx);
   const auto one = store::catalog_current("sku-1");
   ctx.Assert(one && (*one)["source"] == "human" && (*one)["attributes"]["brand"] == "Oatly", "a model event overwrote the reviewer's correction of sku-1: the catalog holds %s", one ? one->dump() : "nothing");
   const auto search = store::search_entry("sku-1");
@@ -1090,7 +1090,7 @@ void CheckHumanWins(harness::Ctx& ctx) {
   ctx.Assert(three && (*three)["attributes"]["brand"] == "Califia Farms", "a second event with the same attributes_version (2) replaced the first for sku-3: only a newer version applies, the catalog holds %s", three ? three->dump() : "nothing");
   const auto four = store::catalog_current("sku-4");
   ctx.Assert(four && (*four)["attributes_version"] == 2 && (*four)["attributes"]["brand"] == "Silk", "a newer human event must replace an older human one for sku-4, the catalog holds %s", four ? four->dump() : "nothing");
-  ctx.Equal(ctx.Kafka.Lag(kIndexGroup, "sku.enriched"), 0, "skipped events must be committed too, or they are redelivered after every restart; the lag");
+  ctx.Equal(ctx.Kafka.Lag(kHIndexGroup, "sku.enriched"), 0, "skipped events must be committed too, or they are redelivered after every restart; the lag");
 }
 `,
   },

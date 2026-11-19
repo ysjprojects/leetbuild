@@ -943,30 +943,30 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "discovery.event"
+const kHEventsTopic = "discovery.event"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func eventFor(instanceID, service string) membershipEvent {
+func hEventFor(instanceID, service string) membershipEvent {
 	return membershipEvent{Kind: "registered", Service: service, InstanceID: instanceID, Reason: "registered by checkout-agent"}
 }
 
-func eventsPublish(ctx *harness.Ctx, event membershipEvent) bool {
-	ok, err := publishEvent(eventsBg, event)
+func hEventsPublish(ctx *harness.Ctx, event membershipEvent) bool {
+	ok, err := publishEvent(hEventsBg, event)
 	ctx.NoError(err, "publishEvent")
 	return ok
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	var rows []HEventsRow
 	for _, text := range ctx.Redis.LRange("sd:outbox", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -974,13 +974,13 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckServiceKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventFor("checkout-1", "checkout"))
-	eventsPublish(ctx, eventFor("payments-1", "payments"))
-	eventsPublish(ctx, eventFor("checkout-2", "checkout"))
+	hEventsPublish(ctx, hEventFor("checkout-1", "checkout"))
+	hEventsPublish(ctx, hEventFor("payments-1", "payments"))
+	hEventsPublish(ctx, hEventFor("checkout-2", "checkout"))
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three publishEvent calls must produce three records on discovery.event; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"checkout", "payments", "checkout"}, "the records must be keyed by the service names")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"checkout", "payments", "checkout"}, "the records must be keyed by the service names")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both checkout events must land on one partition, or a cache applies checkout's changes out of order; the partitions")
 }
 
@@ -989,16 +989,16 @@ func CheckRealExpiry(ctx *harness.Ctx) {
 		id       string
 		interval int
 	}{{"checkout-1", 2}, {"checkout-2", 3}, {"checkout-3", 10}} { // expiring after 6, 9 and 30 s
-		_, err := instances.RegisterInstance(eventsBg, "checkout", r.id, "10.4.2.1", 8080, r.interval, 1)
+		_, err := instances.RegisterInstance(hEventsBg, "checkout", r.id, "10.4.2.1", 8080, r.interval, 1)
 		ctx.NoError(err, "registering %s", r.id)
 	}
 	ctx.Clock.Advance(7)
-	expired, err := sweepExpired(eventsBg, "checkout")
+	expired, err := sweepExpired(hEventsBg, "checkout")
 	ctx.NoError(err, "sweepExpired(checkout)")
 	sort.Strings(expired)
 	ctx.Equal(expired, []string{"checkout-1"}, "7 s in, only checkout-1's record has lapsed (checkout-2 has 2 s left and is alive); the sweep announced")
 	var kinds []string
-	for _, v := range ctx.Kafka.Values(eventsTopic) {
+	for _, v := range ctx.Kafka.Values(kHEventsTopic) {
 		var e map[string]any
 		ctx.NoError(json.Unmarshal([]byte(v), &e), "an event must be JSON")
 		kind, _ := e["kind"].(string)
@@ -1007,11 +1007,11 @@ func CheckRealExpiry(ctx *harness.Ctx) {
 		kinds = append(kinds, kind+" "+service+" "+id)
 	}
 	ctx.Equal(kinds, []string{"expired checkout checkout-1"}, "the sweep must produce one expired event for checkout-1 of service checkout; the events")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"checkout"}, "the expired event must be keyed by the service")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"checkout"}, "the expired event must be keyed by the service")
 	ctx.Equal(ctx.Redis.SMembers("sd:members:checkout"), []string{"checkout-2", "checkout-3"}, "sd:members:checkout after the sweep must hold the live checkout-2 and checkout-3")
-	again, err := sweepExpired(eventsBg, "checkout")
+	again, err := sweepExpired(hEventsBg, "checkout")
 	ctx.NoError(err, "the second sweepExpired(checkout)")
-	ctx.Assert(len(again) == 0 && len(ctx.Kafka.Records(eventsTopic)) == 1, "a second sweep announced %v: an expiry is announced once", again)
+	ctx.Assert(len(again) == 0 && len(ctx.Kafka.Records(kHEventsTopic)) == 1, "a second sweep announced %v: an expiry is announced once", again)
 	// 10 s in, checkout-2's record lapsed; its agent re-registers right as the sweep finds the record gone.
 	ctx.Clock.Advance(3)
 	back := ctx.Redis.After("sd:checkout:checkout-2", func() any {
@@ -1020,7 +1020,7 @@ func CheckRealExpiry(ctx *harness.Ctx) {
 		ctx.Redis.Do("SADD", "sd:members:checkout", "checkout-2")
 		return nil
 	})
-	_, err = sweepExpired(eventsBg, "checkout")
+	_, err = sweepExpired(hEventsBg, "checkout")
 	ctx.NoError(err, "the third sweepExpired(checkout)")
 	ctx.Assert(back.Fired, "the sweep never looked at sd:checkout:checkout-2")
 	ctx.NoError(back.Err, "re-registering checkout-2")
@@ -1028,34 +1028,34 @@ func CheckRealExpiry(ctx *harness.Ctx) {
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, eventFor("checkout-1", "checkout"))
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish(ctx, hEventFor("checkout-1", "checkout"))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	eventsPublish(ctx, eventFor("checkout-2", "checkout"))
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hEventsPublish(ctx, hEventFor("checkout-2", "checkout"))
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ctx.Kafka.StallFor(eventsTopic, 1) // the broker answers 1 s late, inside the 2 s window
-	ok := eventsPublish(ctx, eventFor("checkout-0", "checkout"))
+	ctx.Kafka.StallFor(kHEventsTopic, 1) // the broker answers 1 s late, inside the 2 s window
+	ok := hEventsPublish(ctx, hEventFor("checkout-0", "checkout"))
 	ctx.Settle()
-	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0 && len(ctx.Kafka.Records(eventsTopic)) == 1, "the broker acknowledged after 1 s, inside the 2 s window: publishEvent returned %v, the topic holds %d records and the outbox %d rows, expected true, one record and no row. Wait up to the ack timeout for the delivery report", ok, len(ctx.Kafka.Records(eventsTopic)), len(eventsOutbox(ctx)))
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok = eventsPublish(ctx, eventFor("checkout-1", "checkout"))
+	ctx.Assert(ok && len(hEventsOutbox(ctx)) == 0 && len(ctx.Kafka.Records(kHEventsTopic)) == 1, "the broker acknowledged after 1 s, inside the 2 s window: publishEvent returned %v, the topic holds %d records and the outbox %d rows, expected true, one record and no row. Wait up to the ack timeout for the delivery report", ok, len(ctx.Kafka.Records(kHEventsTopic)), len(hEventsOutbox(ctx)))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok = hEventsPublish(ctx, hEventFor("checkout-1", "checkout"))
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the change never reaches a membership cache; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "checkout" && rows[0].Payload["instance_id"] == "checkout-1", "the outbox row is %v, expected the topic, the key checkout and the event", rows[0])
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == "checkout" && rows[0].Payload["instance_id"] == "checkout-1", "the outbox row is %v, expected the topic, the key checkout and the event", rows[0])
 	ctx.Equal(ok, false, "publishEvent's result after a failed delivery")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsPublish(ctx, eventFor("checkout-2", "checkout"))
+	ok = hEventsPublish(ctx, hEventFor("checkout-2", "checkout"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishEvent waited %.1f s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["instance_id"] == "checkout-2", "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishEvent's result without a delivery report")
 }
@@ -1073,13 +1073,13 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "discovery.event";
+const std::string kHEventsTopic = "discovery.event";
 
-MembershipEvent eventsFor(const std::string& instance_id, const std::string& service = "checkout") {
+MembershipEvent hEventsFor(const std::string& instance_id, const std::string& service = "checkout") {
   return MembershipEvent{"registered", service, instance_id, "registered by checkout-agent"};
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("sd:outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -1089,20 +1089,20 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
+std::string hEventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckServiceKey(harness::Ctx& ctx) {
-  publishEvent(eventsFor("checkout-1"));
-  publishEvent(eventsFor("payments-1", "payments"));
-  publishEvent(eventsFor("checkout-2"));
+  publishEvent(hEventsFor("checkout-1"));
+  publishEvent(hEventsFor("payments-1", "payments"));
+  publishEvent(hEventsFor("checkout-2"));
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three publishEvent calls must produce three records on discovery.event; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"checkout", "payments", "checkout"}, "the records must be keyed by the service names");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"checkout", "payments", "checkout"}, "the records must be keyed by the service names");
   ctx.Equal(records[0].Partition, records[2].Partition,
             "both checkout events must land on one partition, or a cache applies checkout's changes out of order; the partitions");
 }
@@ -1117,15 +1117,15 @@ void CheckRealExpiry(harness::Ctx& ctx) {
   std::sort(expired.begin(), expired.end());
   ctx.Equal(expired, {"checkout-1"}, "7 s in, only checkout-1's record has lapsed (checkout-2 has 2 s left and is alive); the sweep announced");
   std::vector<std::string> kinds;
-  for (const auto& v : ctx.Kafka.Values(kEventsTopic)) {
+  for (const auto& v : ctx.Kafka.Values(kHEventsTopic)) {
     const auto e = nlohmann::json::parse(v, nullptr, false);
-    kinds.push_back(eventsField(e, "kind") + " " + eventsField(e, "service") + " " + eventsField(e, "instance_id"));
+    kinds.push_back(hEventsField(e, "kind") + " " + hEventsField(e, "service") + " " + hEventsField(e, "instance_id"));
   }
   ctx.Equal(kinds, {"expired checkout checkout-1"}, "the sweep must produce one expired event for checkout-1 of service checkout; the events");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"checkout"}, "the expired event must be keyed by the service");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"checkout"}, "the expired event must be keyed by the service");
   ctx.Equal(ctx.Redis.SMembers("sd:members:checkout"), {"checkout-2", "checkout-3"}, "sd:members:checkout after the sweep must hold the live checkout-2 and checkout-3");
   const auto again = sweepExpired("checkout");
-  ctx.Assert(again.empty() && ctx.Kafka.Records(kEventsTopic).size() == 1, "a second sweep announced %q: an expiry is announced once", again);
+  ctx.Assert(again.empty() && ctx.Kafka.Records(kHEventsTopic).size() == 1, "a second sweep announced %q: an expiry is announced once", again);
   // 10 s in, checkout-2's record lapsed; its agent re-registers right as the sweep finds the record gone.
   ctx.Clock.Advance(3);
   bool back = false;
@@ -1141,38 +1141,38 @@ void CheckRealExpiry(harness::Ctx& ctx) {
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishEvent(eventsFor("checkout-1"));
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishEvent(hEventsFor("checkout-1"));
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1,
             "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  publishEvent(eventsFor("checkout-2"));
+  publishEvent(hEventsFor("checkout-2"));
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  ctx.Kafka.StallFor(kEventsTopic, 1);  // the broker answers 1 s late, inside the 2 s window
-  bool ok = publishEvent(eventsFor("checkout-0"));
+  ctx.Kafka.StallFor(kHEventsTopic, 1);  // the broker answers 1 s late, inside the 2 s window
+  bool ok = publishEvent(hEventsFor("checkout-0"));
   ctx.Settle();
-  ctx.Assert(ok && eventsOutbox(ctx).empty() && ctx.Kafka.Records(kEventsTopic).size() == 1, "the broker acknowledged after 1 s, inside the 2 s window: publishEvent returned %v, the topic holds %d records and the outbox %d rows, expected true, one record and no row. Wait up to kAckTimeoutMs for the delivery report", ok, ctx.Kafka.Records(kEventsTopic).size(), eventsOutbox(ctx).size());
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  ok = publishEvent(eventsFor("checkout-1"));
+  ctx.Assert(ok && hEventsOutbox(ctx).empty() && ctx.Kafka.Records(kHEventsTopic).size() == 1, "the broker acknowledged after 1 s, inside the 2 s window: publishEvent returned %v, the topic holds %d records and the outbox %d rows, expected true, one record and no row. Wait up to kAckTimeoutMs for the delivery report", ok, ctx.Kafka.Records(kHEventsTopic).size(), hEventsOutbox(ctx).size());
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  ok = publishEvent(hEventsFor("checkout-1"));
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the change never reaches a membership cache; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "checkout" && rows[0].contains("payload") &&
-                 eventsField(rows[0]["payload"], "instance_id") == "checkout-1",
+  ctx.Assert(hEventsField(rows[0], "topic") == kHEventsTopic && hEventsField(rows[0], "key") == "checkout" && rows[0].contains("payload") &&
+                 hEventsField(rows[0]["payload"], "instance_id") == "checkout-1",
              "the outbox row is %s, expected the topic, the key checkout and the event", rows[0].dump());
   ctx.Equal(ok, false, "publishEvent's result after a failed delivery");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publishEvent(eventsFor("checkout-2"));
+  ok = publishEvent(hEventsFor("checkout-2"));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publishEvent waited %.1f s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "instance_id") == "checkout-2",
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hEventsField(rows[1]["payload"], "instance_id") == "checkout-2",
              "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishEvent's result without a delivery report");
 }
