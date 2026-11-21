@@ -79,7 +79,7 @@ std::shared_ptr<const Snapshot> snapshot = std::make_shared<const Snapshot>();
 
 namespace {
 
-sw::redis::Redis& gatesRedis() {
+sw::redis::Redis& hGatesRedis() {
   static sw::redis::Redis client("tcp://redis:6379");
   return client;
 }
@@ -115,11 +115,11 @@ std::string get_variant(const std::string& name, const std::map<std::string, std
 }
 
 bool refresh() {
-  const auto raw = gatesRedis().get("gates:version");
+  const auto raw = hGatesRedis().get("gates:version");
   const int version = raw ? std::stoi(*raw) : 0;
   if (version == std::atomic_load(&snapshot)->version) return false;
   std::map<std::string, std::string> fields;
-  gatesRedis().hgetall("gates", std::inserter(fields, fields.begin()));
+  hGatesRedis().hgetall("gates", std::inserter(fields, fields.begin()));
   auto next = std::make_shared<Snapshot>();
   next->version = version;
   for (const auto& [name, body] : fields) {

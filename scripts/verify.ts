@@ -1,9 +1,10 @@
 /**
  * Checks every /leetbuild problem: the shape of the problem (steps, diagram, sequences, hints,
  * widgets), for every step in every language that the starter fails at least one static check
- * while the reference solution passes them all, and for every step with a Python, TypeScript, Go or
- * C++ harness that the solution passes every runtime check while the starter does not (the
- * harnesses run in the browser runtimes, here in Node). Run after editing problems:
+ * while the reference solution passes them all, that every Go and C++ harness prefixes its top-level
+ * names (scripts/harness-names.ts), and for every step with a Python, TypeScript, Go or C++ harness that
+ * the solution passes every runtime check while the starter does not (the harnesses run in the browser
+ * runtimes, here in Node). Run after editing problems:
  *
  *   yarn verify                               # everything
  *   yarn verify --problem image-cache         # one problem (by id, or its directory: 00-image-cache)
@@ -58,6 +59,7 @@ import {clangVersion, CPP_RUNTIME_MANIFEST, cppPackFromSources, cppRuntimeFresh}
 import {fetchCpp} from './fetch-cpp';
 import {fetchTorch} from './fetch-torch';
 import {GO_RUNTIME_MANIFEST, goRuntimeHash} from './go-runtime';
+import {cppTopLevel, goCheckName, goTopLevel, harnessNameProblems, harnessPrefixed} from './harness-names';
 import {redisSelfTest} from './redis-selftest';
 import {renderSummaries} from './summaries';
 
@@ -122,7 +124,8 @@ const STARTER_TODO =
 
 /**
  * Invariants of the judge itself, checked before any content: comment blanking per language, the
- * `all` / `none` / `order` semantics, and the readable rendering of patterns.
+ * `all` / `none` / `order` semantics, the readable rendering of patterns, and the harness name scanners
+ * behind the prefix rule.
  */
 function judgeSelfTest(): string[] {
   const failures: string[] = [];
@@ -155,6 +158,29 @@ function judgeSelfTest(): string[] {
     'describePattern reads like code',
     describePattern(/\.set\(\s*key\s*,\s*data\s*,\s*ex\s*=\s*TTL_S\s*\)/) === '.set(key, data, ex = TTL_S)' &&
       describePattern(/def shutdown(?:(?!\ndef )[\s\S])*?producer\.flush\(/) === 'def shutdown … producer.flush(',
+  );
+  const goNames = goTopLevel(
+    'package main\n\nimport (\n\t"fmt"\n)\n\nvar (\n\thA, hB = 1, 2\n\tplain int\n)\n\n' +
+      'func (s *HStore) Get() {}\n\nconst hRaw = `\nfunc fake() {}\nvar fakeVar = 1\n`\n\n' +
+      'func hKeys[K comparable, V any](m map[K]V) []K { return nil }\n',
+  );
+  expect(
+    'go: a var group, no method, no code inside a raw string, a generic func',
+    goNames.join() === 'hA,hB,plain,hRaw,hKeys',
+  );
+  const cpp = cppTopLevel(
+    '#include <string>\nnamespace {\nint hCount = 0;\nstruct HBox {\n  int refresh;\n  void get();\n};\n}  // namespace\n\n' +
+      'template <typename T>\nT hMax(T a, T b) { return a > b ? a : b; }\n\nvoid HBox::get() {}\n\n' +
+      'namespace hNs {\nint inner = 1;\n}\n\nbool refresh() { return true; }\n',
+  );
+  expect(
+    'c++: an anonymous namespace, a template function, a member named like a function, no X::method',
+    cpp.names.join() === 'hCount,HBox,hMax,hNs,refresh',
+  );
+  expect(
+    'the harness prefix is h, H or kH and a capital, not a word starting with h',
+    ['hApi', 'HStore', 'kHTopic', 'h2', 'harnessRun'].every(harnessPrefixed) &&
+      !['handler', 'HistoryApp', 'kTopic'].some(harnessPrefixed),
   );
   return failures;
 }
@@ -402,6 +428,7 @@ function verifyProblem(problem: Problem): string[] {
     stepIds.add(step.id);
     errors.push(...verifyStep(problem, step, i));
   }
+  errors.push(...harnessNameProblems(problem));
   // Sources. A company-tagged course is derived from the company's writing and says so in a "From the
   // source" section; a deep-learning problem cites the paper, code and posts behind its mechanism, each
   // with its kind and venue. Every source is a real https link, listed once, dated (only documentation
@@ -485,14 +512,6 @@ const describeRun = (run: RunResult): string =>
 
 /** `check_<id>`, the Python and TypeScript harness function for a check. */
 const snakeCheckName = (id: string): string => `check_${id.replace(/-/g, '_')}`;
-
-/** `Check<Id>`, the Go harness function for a check: `release-atomic` → `CheckReleaseAtomic` (goruntime/host). */
-const goCheckName = (id: string): string =>
-  `Check${id
-    .split(/[-_ ]/)
-    .filter(part => part !== '')
-    .map(part => part[0].toUpperCase() + part.slice(1))
-    .join('')}`;
 
 /** Languages graded by execution, each with its harness's check names, how a harness declares one, and how its Node runtime boots. */
 const EXECUTING: {
@@ -910,7 +929,8 @@ function protoCollisions(problems: Problem[], only: Problem[] | null): string[] 
   return errors;
 }
 
-async function main(): Promise<void> {
+/** Every check of this run; resolves to the number of problems it found. */
+async function main(): Promise<number> {
   // The Redis self-test moves the shared virtual clock (and resets it): it runs before any runtime boots.
   const errors: string[] = [
     ...judgeSelfTest(),
@@ -931,13 +951,16 @@ async function main(): Promise<void> {
     console.log(`${guides.length === 0 ? '✓' : '✗'} failure-mode guides and the sections checks link to`);
     errors.push(...guides);
   }
-  errors.push(...protoCollisions(problems, onlyProblem === null ? null : problems.filter(isOnlyProblem)));
+  const named = onlyProblem === null ? null : problems.filter(isOnlyProblem);
+  // A course name that matches nothing would otherwise check nothing and pass.
+  if (named?.length === 0) errors.push(`--problem ${onlyProblem} matches no course`);
+  errors.push(...protoCollisions(problems, named));
   const ids = new Set<string>();
   let steps = 0;
   let checked = 0;
   const harnesses: Partial<Record<Language, number>> = {};
   let programs = 0;
-  const selected = shareOf(problems.filter(p => onlyProblem === null || isOnlyProblem(p)));
+  const selected = shareOf(named ?? problems);
   const runtimes: Partial<Record<Language, NodeRuntime>> = {};
   if (withRuntime)
     for (const {language, boot} of EXECUTING) {
@@ -1000,23 +1023,23 @@ async function main(): Promise<void> {
     }, ${programs} python program(s) run, ${errors.length} problem(s)`,
   );
   for (const e of errors) console.log(`  - ${e}`);
-  process.exitCode = errors.length === 0 ? 0 : 1;
+  return errors.length;
 }
 
 // Loudly: the TypeScript runtime handles unhandled rejections for the learner's code, so a crash here
 // would otherwise end the process quietly with status 0. Done, the process ends once its output is
 // written out (a pipe drains asynchronously): a runtime's library may still hold a timer of its own
 // (PGlite's Postgres re-arms its statistics timeout against the real clock, minutes ahead of a check's
-// virtual one), which would keep it alive for nothing. process.exit() takes no argument: given one,
-// even undefined, Node exits with it instead of process.exitCode, and a failing run would end 0.
-const exit = (): void => {
-  process.stdout.write('', () => process.stderr.write('', () => process.exit()));
+// virtual one), which would keep it alive for nothing. The status is passed to process.exit()
+// explicitly, never left in process.exitCode: libraries this process loads write that too (Emscripten's
+// quit_ in PGlite and in Pyodide sets it when their runtime exits), and a failing run would end 0.
+const exit = (status: number): void => {
+  process.stdout.write('', () => process.stderr.write('', () => process.exit(status)));
 };
 main().then(
-  () => exit(),
+  problems => exit(problems === 0 ? 0 : 1),
   error => {
     console.error(error);
-    process.exitCode = 1;
-    exit();
+    exit(1);
   },
 );

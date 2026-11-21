@@ -1081,7 +1081,7 @@ import (
 // offensive tag, finish (step 4) records the decision on the topic, rateLimit (step 2) passes
 // everything through.
 
-type Decision struct {
+type HDecision struct {
 	Action string
 	Score  int32
 	Tags   []string
@@ -1093,27 +1093,27 @@ var hStandInGuard = func() pb.PromptGuardClient {
 	return pb.NewPromptGuardClient(conn)
 }()
 
-func decide(ctx context.Context, prompt, requestID string, _ bool) (Decision, error) {
+func decide(ctx context.Context, prompt, requestID string, _ bool) (HDecision, error) {
 	ctx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
 	defer cancel()
 	reply, err := hStandInGuard.Detect(ctx, &pb.DetectRequest{Prompt: prompt, RequestId: requestID})
 	if err != nil {
-		return Decision{Action: "block", Reason: "detector-unavailable"}, nil
+		return HDecision{Action: "block", Reason: "detector-unavailable"}, nil
 	}
 	if reply.Score < 20 {
-		return Decision{Action: "block", Score: reply.Score, Tags: reply.Tags, Reason: "score"}, nil
+		return HDecision{Action: "block", Score: reply.Score, Tags: reply.Tags, Reason: "score"}, nil
 	}
 	for _, tag := range reply.Tags {
 		if tag == "politics" || tag == "offensive" {
-			return Decision{Action: "block", Score: reply.Score, Tags: reply.Tags, Reason: "tag:" + tag}, nil
+			return HDecision{Action: "block", Score: reply.Score, Tags: reply.Tags, Reason: "tag:" + tag}, nil
 		}
 	}
-	return Decision{Action: "allow", Score: reply.Score, Tags: reply.Tags}, nil
+	return HDecision{Action: "allow", Score: reply.Score, Tags: reply.Tags}, nil
 }
 
 var hStandInWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "ai.firewall.events", RequiredAcks: kafka.RequireAll}
 
-func finish(ctx context.Context, apiKey, requestID string, decision Decision, responseText string, _ time.Time) string {
+func finish(ctx context.Context, apiKey, requestID string, decision HDecision, responseText string, _ time.Time) string {
 	payload, _ := json.Marshal(map[string]any{"request_id": requestID, "action": decision.Action, "score": decision.Score})
 	_ = hStandInWriter.WriteMessages(ctx, kafka.Message{Key: []byte(apiKey), Value: payload})
 	return responseText

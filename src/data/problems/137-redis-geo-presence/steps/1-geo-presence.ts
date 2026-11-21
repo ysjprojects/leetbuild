@@ -1415,7 +1415,7 @@ func CheckSweepStale(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr double kHGpPickupLat = 48.85, gpPickupLon = 2.35;
+constexpr double kHGpPickupLat = 48.85, kHGpPickupLon = 2.35;
 constexpr double kHGpEarthKm = 6372.797560856;  // the radius Redis's GEO commands use
 
 // The great-circle distance the way GEOSEARCH WITHDIST computes it, independently of the learner.
@@ -1499,22 +1499,22 @@ void CheckRadiusOrder(harness::Ctx& ctx) {
   const std::vector<HGpDriver> drivers{{"d-a", 48.852, 2.352}, {"d-b", 48.857, 2.35}, {"d-c", 48.86, 2.37}, {"d-far", 48.9, 2.35}};
   // inserted farthest first: the order must come from the distance
   hGpSeed(ctx, {drivers[3], drivers[2], drivers[1], drivers[0]}, true);
-  auto found = nearest(kHGpPickupLat, gpPickupLon, 3, 10);
+  auto found = nearest(kHGpPickupLat, kHGpPickupLon, 3, 10);
   ctx.Equal(hGpIDs(found), std::vector<std::string>{"d-a", "d-b", "d-c"}, "nearest(radius 3 km): nearest first, lon before lat in the search, d-far (5.6 km) outside the radius");
   std::map<std::string, double> byID;
   for (const auto& n : found) byID[n.driver_id] = n.distance_km;
   for (size_t i = 0; i < 3; i++) {
     const auto& d = drivers[i];
     const auto it = byID.find(d.id);
-    const double want = hGpKm(kHGpPickupLat, gpPickupLon, d.lat, d.lon);
+    const double want = hGpKm(kHGpPickupLat, kHGpPickupLon, d.lat, d.lon);
     ctx.Assert(it != byID.end(), "the distance of %s must be a number in km, got none", d.id);
     const double dist = it->second;
     ctx.Assert(std::abs(dist - want) < 0.01, "%s is %.3f km away (WITHDIST, km), nearest says %v", d.id, want, dist);
     ctx.Equal(dist, std::round(dist * 1000) / 1000, "distances are rounded to 3 decimals: %s's distance", d.id);
   }
-  found = nearest(kHGpPickupLat, gpPickupLon, 1, 10);
+  found = nearest(kHGpPickupLat, kHGpPickupLon, 1, 10);
   ctx.Equal(hGpIDs(found), std::vector<std::string>{"d-a", "d-b"}, "nearest(radius 1 km): d-c is 1.8 km away");
-  found = nearest(kHGpPickupLat, gpPickupLon, 0.1, 10);
+  found = nearest(kHGpPickupLat, kHGpPickupLon, 0.1, 10);
   ctx.Assert(found.empty(), "nobody within 100 m: nearest must return no drivers, got %+v", hGpIDs(found));
   found = nearest(45.76, 4.84, 3, 10);
   ctx.Assert(found.empty(), "a search 400 km away finds nobody, got %+v", hGpIDs(found));
@@ -1526,16 +1526,16 @@ void CheckStaleExcluded(harness::Ctx& ctx) {
   hGpSeed(ctx, {{"d-b", 48.857, 2.35}}, true);
   ctx.Clock.Advance(21);  // d-a and d-c heartbeat 31 s ago, d-b 21 s ago
   size_t before = ctx.Redis.RoundTrips().size();
-  auto found = nearest(kHGpPickupLat, gpPickupLon, 3, 10);
+  auto found = nearest(kHGpPickupLat, kHGpPickupLon, 3, 10);
   auto trips = hGpTripsSince(ctx, before);
   ctx.Equal(hGpIDs(found), std::vector<std::string>{"d-b"}, "nearest: d-a and d-c last heartbeat 31 s ago, their seen: keys expired");
   ctx.Assert(ctx.Redis.ZScore("drivers", "d-a").has_value(), "nothing removed d-a from the GEO set — nearest must filter on the seen: keys, not trust GEOSEARCH");
   ctx.Assert(trips.size() <= 2, "nearest made %d round trips (%v): one GEOSEARCH, then one MGET over every candidate's seen: key — never a GET or EXISTS per driver", trips.size(), trips);
   heartbeat("d-a", 48.852, 2.352);
-  found = nearest(kHGpPickupLat, gpPickupLon, 3, 10);
+  found = nearest(kHGpPickupLat, kHGpPickupLon, 3, 10);
   ctx.Equal(hGpIDs(found), std::vector<std::string>{"d-a", "d-b"}, "after a fresh heartbeat d-a is back: nearest");
   ctx.Clock.Advance(10);  // d-b is now 31 s old
-  found = nearest(kHGpPickupLat, gpPickupLon, 3, 10);
+  found = nearest(kHGpPickupLat, kHGpPickupLon, 3, 10);
   ctx.Equal(hGpIDs(found), std::vector<std::string>{"d-a"}, "d-b went silent 31 s ago: nearest");
   before = ctx.Redis.RoundTrips().size();
   found = nearest(0, 0, 1, 5);
@@ -1551,13 +1551,13 @@ void CheckOverfetchK(harness::Ctx& ctx) {
   for (int i = 0; i < 3; i++) live.push_back({harness::Sprintf("l-%d", i + 1), 48.85 + (7 + i) / 1000.0, 2.35});
   hGpSeed(ctx, silent, false);
   hGpSeed(ctx, live, true);
-  auto found = nearest(kHGpPickupLat, gpPickupLon, 3, 2);
+  auto found = nearest(kHGpPickupLat, kHGpPickupLon, 3, 2);
   ctx.Equal(hGpIDs(found), std::vector<std::string>{"l-1", "l-2"}, "nearest(k=2): the five nearest members are silent and the live ones come after them — ask Redis for COUNT 4k = 8 candidates, drop the silent, then cut to k");
   ctx.Equal(found.size(), 2, "k=2: the number of drivers nearest returned");
-  found = nearest(kHGpPickupLat, gpPickupLon, 3, 5);
+  found = nearest(kHGpPickupLat, kHGpPickupLon, 3, 5);
   ctx.Equal(hGpIDs(found), std::vector<std::string>{"l-1", "l-2", "l-3"}, "k=5 with three live drivers in range returns all three");
   hGpSeed(ctx, {{"s-6", 48.8575, 2.35}}, false);  // between l-1 and l-2: the 8 candidates are s-1..s-5, l-1, s-6, l-2
-  found = nearest(kHGpPickupLat, gpPickupLon, 3, 2);
+  found = nearest(kHGpPickupLat, kHGpPickupLon, 3, 2);
   ctx.Equal(hGpIDs(found), std::vector<std::string>{"l-1", "l-2"}, "with a silent driver between the two live ones nearest(k=2)");
 }
 
@@ -1567,7 +1567,7 @@ void CheckRemoveBoth(harness::Ctx& ctx) {
   ctx.Assert(!ctx.Redis.ZScore("drivers", "d-a").has_value(), "remove must ZREM the driver from drivers");
   ctx.Equal(ctx.Redis.Exists("seen:d-a"), 0, "remove must DEL seen:d-a");
   ctx.Assert(ctx.Redis.ZScore("drivers", "d-b").has_value() && ctx.Redis.Exists("seen:d-b") == 1, "remove touches only the driver it was given");
-  ctx.Equal(hGpIDs(nearest(kHGpPickupLat, gpPickupLon, 3, 10)), std::vector<std::string>{"d-b"}, "a removed driver is gone from nearest at once");
+  ctx.Equal(hGpIDs(nearest(kHGpPickupLat, kHGpPickupLon, 3, 10)), std::vector<std::string>{"d-b"}, "a removed driver is gone from nearest at once");
   remove(std::string("ghost"));
   ctx.Assert(ctx.Redis.ZCard("drivers") == 1 && ctx.Redis.Exists("seen:d-b") == 1, "removing an unknown driver changes nothing");
 }

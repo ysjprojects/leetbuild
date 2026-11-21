@@ -31,6 +31,21 @@ jobs:
       - run: yarn install --frozen-lockfile
       - run: yarn lint
       - run: yarn compile
+      # yarn verify once printed its problems and exited 0 for weeks, so every verify job passed. A course
+      # name that matches nothing is a problem: this run must end 1 and say so, or the gate is open.
+      - name: A failing yarn verify exits 1
+        run: |
+          status=0
+          out=$(yarn -s verify --problem no-such-course --no-runtime 2>&1) || status=$?
+          printf '%s\n' "$out"
+          if [ "$status" -ne 1 ]; then
+            echo "::error::yarn verify --problem no-such-course exited $status; a run with a problem must exit 1"
+            exit 1
+          fi
+          if ! grep -qF -- '--problem no-such-course matches no course' <<<"$out"; then
+            echo "::error::yarn verify --problem no-such-course exited 1 without reporting that no course matches"
+            exit 1
+          fi
 
   # Every course's static checks and its Python, TypeScript and Go harnesses, in two balanced shares:
   # one runner takes most of the job's limit now that nearly every course runs against harnesses.
