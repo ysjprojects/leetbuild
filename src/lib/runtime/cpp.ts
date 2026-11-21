@@ -10,6 +10,7 @@
  * runtime's pthreads (cppruntime/include/lb/pthread.h) are what libc++'s std::thread, mutexes and
  * condition variables run on. Needs JSPI and exception references: Chrome 137, Firefox 153, Node 24.
  */
+import {CHECK_BUDGET_MS, CHECK_TIMEOUT_MESSAGE} from './budget';
 import {type Bridge, type BridgeWorld} from './cpp/bridge';
 import {dbBridge} from './cpp/db';
 import {COMPILE_FLAGS, LINK_FLAGS} from './cpp/flags';
@@ -20,7 +21,7 @@ import {redisBridge} from './cpp/redis';
 import {CPP_UNSUPPORTED, cppSupported} from './cpp/support';
 import {type DbBridge} from './db';
 import {CLOCK, nextMacrotask} from './ts/clock';
-import {CHECK_BUDGET_MS, resetResources, snapshotMetrics} from './ts/harness';
+import {resetResources, snapshotMetrics} from './ts/harness';
 import * as pg from './ts/pg';
 import * as redis from './ts/redis';
 import type {RunJob, RunResult, RuntimeCheckResult} from './types';
@@ -946,12 +947,7 @@ export async function createCppRuntime(host: CppHost): Promise<CppRuntime> {
           stdout.push(program.stdout);
           stderr.push(program.stderr);
           if (outcome === 'timeout') {
-            checks.push({
-              id,
-              passed: false,
-              message: `the check did not finish within ${CHECK_BUDGET_MS / 1000} s`,
-              metrics,
-            });
+            checks.push({id, passed: false, message: CHECK_TIMEOUT_MESSAGE, metrics});
             continue;
           }
           const message = program.failure ?? program.crash;

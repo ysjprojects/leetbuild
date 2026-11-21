@@ -39,6 +39,7 @@ import {
   secondsLeftAt,
 } from '@/lib/mockSession';
 import {scrollBehavior} from '@/lib/motion';
+import {checkTimeout} from '@/lib/outcome';
 import {type RuntimeStatus, getRunner, runtimeHarness, STATUS_TEXT} from '@/lib/runtime/client';
 import {stepJob} from '@/lib/runtime/job';
 import {formatClock} from '@/lib/timer';
@@ -1252,6 +1253,16 @@ const MockInterview: FC = memo(() => {
       // A runtime that could not run the code is not a wrong submission, as in the course.
       if (result.run?.error !== undefined) {
         say(`The checks could not run: ${result.run.error}. That does not count as a submission.`, 'ai', 'warn');
+        return;
+      }
+      // Nor is a run whose only failures are checks out of real time: a busy machine, or code that never answers.
+      const timeout = checkTimeout(result.results);
+      if (timeout !== null) {
+        say(
+          `${timeout.timedOut} of ${result.total} checks did not finish within ${timeout.seconds} s. Usually the machine was busy, or the code never answers: a loop that never ends, an awaited promise that never resolves, a response never sent. That does not count as a submission; submit again.`,
+          'ai',
+          'warn',
+        );
         return;
       }
       setAttempts(value => value + 1);

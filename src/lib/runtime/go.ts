@@ -8,9 +8,10 @@
  */
 import './wasmExec.js';
 
+import {CHECK_BUDGET_MS, CHECK_TIMEOUT_MESSAGE} from './budget';
 import {type DbBridge} from './db';
 import {CLOCK, nextMacrotask} from './ts/clock';
-import {CHECK_BUDGET_MS, resetResources, snapshotMetrics} from './ts/harness';
+import {resetResources, snapshotMetrics} from './ts/harness';
 import * as pg from './ts/pg';
 import * as redis from './ts/redis';
 import type {RunJob, RunMetrics, RunResult, RuntimeCheckResult} from './types';
@@ -305,12 +306,7 @@ export async function createGoRuntime(host: GoHost): Promise<GoRuntime> {
           }
           const metrics = {...snapshotMetrics(), ...goMetrics(api)};
           if (outcome === 'timeout') {
-            checks.push({
-              id,
-              passed: false,
-              message: `the check did not finish within ${CHECK_BUDGET_MS / 1000} s`,
-              metrics,
-            });
+            checks.push({id, passed: false, message: CHECK_TIMEOUT_MESSAGE, metrics});
             // The check is still running in that program: the next one gets a fresh program.
             api = await start();
             continue;

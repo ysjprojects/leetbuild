@@ -20,6 +20,7 @@
  *   ctx.client(app)          in-process HTTP: get/post/put/patch/delete/request → {status, headers, text, json()}
  *   ctx.drain(promise)       await the learner's loop until it ends or the sleep budget stops it
  */
+import {CHECK_BUDGET_MS, CHECK_TIMEOUT_MESSAGE} from '../budget';
 import type {RunMetrics} from '../types';
 import {Buffer} from './buffer';
 import {CLOCK} from './clock';
@@ -27,7 +28,7 @@ import * as grpc from './grpc';
 import {type FastifyInstance, type InjectOptions} from './http';
 import {BROKER} from './kafka';
 import {type ModuleSystem, HARNESS, WORK} from './loader';
-import {assert, PROCESS} from './node';
+import {assert, AssertionError, PROCESS} from './node';
 import {DB} from './pg';
 import {
   type Arg,
@@ -49,8 +50,6 @@ export interface CheckResult {
 
 /** Virtual sleeps one check may take before its loops are stopped. */
 export const SLEEP_LIMIT = 500;
-/** Real time one check may take; a check still running past it fails and the next one starts. */
-export const CHECK_BUDGET_MS = 10_000;
 
 export interface HttpResponse {
   json<T = unknown>(): T;
@@ -241,13 +240,19 @@ export class Ctx {
   }
 }
 
-/** `Error: not implemented — redirect.ts:12 in resolve`: the error and where in the learner's code it was raised. */
+/**
+ * `Error: not implemented — redirect.ts:12 in resolve`: the error and where in the learner's code it
+ * was raised. A check's own failed assertion is just its message, as in the Python runtime.
+ */
 const explain = (error: unknown, modules: ModuleSystem): string => {
   const head =
     error instanceof Error ? (error.message === '' ? error.name : `${error.name}: ${error.message}`) : String(error);
   const frames = modules.frames(error);
   const learner = frames.filter(f => f.file.startsWith(WORK));
   const harness = frames.filter(f => f.file === HARNESS);
+  const raisedAt = frames.find(f => f.file === HARNESS || f.file.startsWith(WORK));
+  if (error instanceof AssertionError && raisedAt?.file === HARNESS)
+    return error.message === '' ? 'assertion failed' : error.message;
   if (learner.length > 0) {
     const f = learner[0];
     const fn = f.fn?.replace(/^(?:async\s+)?(?:Object|exports|module\.exports)\./, '') ?? null;
@@ -291,6 +296,9 @@ export const snapshotMetrics = (): RunMetrics => {
 };
 
 type Check = (ctx: Ctx) => unknown;
+
+/** What the race of a check against its real-time budget settles to when the budget wins. */
+const TIMED_OUT: unique symbol = Symbol('timed out');
 
 interface Console {
   log: typeof console.log;
@@ -349,14 +357,15 @@ export async function runChecks(
         results.push({id, passed: false, message: `the harness has no ${name}`});
         continue;
       }
-      const timeout = new Promise<never>((_, reject) => {
-        budget = CLOCK.realTimeout(
-          () => reject(new Error(`the check did not finish within ${CHECK_BUDGET_MS / 1000} s`)),
-          CHECK_BUDGET_MS,
-        );
+      const timedOut = new Promise<typeof TIMED_OUT>(resolve => {
+        budget = CLOCK.realTimeout(() => resolve(TIMED_OUT), CHECK_BUDGET_MS);
       });
-      await Promise.race([(check as Check)(ctx), timeout]);
-      results.push({id, passed: true, metrics: snapshotMetrics()});
+      const outcome = await Promise.race([(check as Check)(ctx), timedOut]);
+      results.push(
+        outcome === TIMED_OUT
+          ? {id, passed: false, message: CHECK_TIMEOUT_MESSAGE, metrics: snapshotMetrics()}
+          : {id, passed: true, metrics: snapshotMetrics()},
+      );
     } catch (e) {
       results.push({id, passed: false, message: explain(e, modules), metrics: snapshotMetrics()});
     } finally {

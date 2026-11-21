@@ -6,7 +6,14 @@ import type {BottomTab, ConsoleRun} from '@/lib/console';
 import {type CheckResult, type Verdict, commonMessage, describeMatcher, judge} from '@/lib/judge';
 import {type MetricRow, comparedRows, metricByCheck, total} from '@/lib/metrics';
 import {scrollBehavior} from '@/lib/motion';
-import {type CompileFailure, type MessagePart, compileFailure, layoutMessage} from '@/lib/outcome';
+import {
+  type CheckTimeout,
+  type CompileFailure,
+  type MessagePart,
+  checkTimeout,
+  compileFailure,
+  layoutMessage,
+} from '@/lib/outcome';
 import type {RuntimeStatus} from '@/lib/runtime/client';
 import type {Phase} from '@/lib/runtime/types';
 import type {StepAttempt, Submission} from '@/lib/scoring';
@@ -136,6 +143,10 @@ const UNREACHED =
 
 const firstLine = (text: string): string => text.split('\n')[0];
 
+/** `3 of 5 checks did not finish within 10 s`: the timed-out checks of a run, counted. */
+const timeoutSays = (timeout: CheckTimeout, total: number): string =>
+  `${timeout.timedOut} of ${total} check${total === 1 ? '' : 's'} did not finish within ${timeout.seconds} s`;
+
 /** The verdict as the status line says it: short, with no glyphs. */
 const verdictSays = (verdict: Verdict, earned: number | null): string => {
   const failure = compileFailure(verdict.results, verdict.run?.error);
@@ -143,6 +154,11 @@ const verdictSays = (verdict: Verdict, earned: number | null): string => {
   if (error !== undefined)
     return `Could not run: ${firstLine(error)}. ${
       verdict.trial === true ? 'Nothing was recorded' : 'It did not count'
+    }.`;
+  const timeout = checkTimeout(verdict.results);
+  if (timeout !== null)
+    return `Out of time: ${timeoutSays(timeout, verdict.results.length)}. ${
+      verdict.trial === true ? 'Nothing was recorded. Run it again' : 'It did not count. Submit it again'
     }.`;
   if (verdict.trial === true) return verdict.accepted ? 'Example check passed' : 'Example check failed';
   if (verdict.accepted)
@@ -882,6 +898,11 @@ const VerdictPane: FC<{
       () => (verdict === null ? null : compileFailure(verdict.results, verdict.run?.error)),
       [verdict],
     );
+    /** Every failing check ran out of real time: one card, nothing counted, the checks that passed still shown. */
+    const timeout = useMemo(
+      () => (verdict === null ? null : checkTimeout(verdict.results, verdict.run?.error)),
+      [verdict],
+    );
     /** No check was decided: the rows stay unrun under the card that says why. */
     const undecided = failure !== null || runError !== undefined;
     /** Every failing check reported the same thing (typically one unimplemented function): say it once. */
@@ -897,8 +918,11 @@ const VerdictPane: FC<{
               .map(r => r.id),
       );
     }, [step, language]);
-    /** Every failing check, two or more, hit the same thing: a shared reason, not each check's logic. */
-    const shared = runError !== undefined || (common !== null && (verdict?.total ?? 0) - (verdict?.passed ?? 0) > 1);
+    /** Every failing check, two or more, hit the same thing, or ran out of time: a shared reason, not each check's logic. */
+    const shared =
+      runError !== undefined ||
+      timeout !== null ||
+      (common !== null && (verdict?.total ?? 0) - (verdict?.passed ?? 0) > 1);
     /** "looks right, fails" says the logic is off: not when the code never reached the logic, nor when the starter looks right too. */
     const quietShape = (result: CheckResult): boolean =>
       !result.passed && (shared || UNREACHED.test(result.message ?? '') || starterShapes.has(result.id));
@@ -1047,6 +1071,26 @@ const VerdictPane: FC<{
                         <p className="text-ink-50 mt-0.5 text-lg font-extrabold">Could not run</p>
                         <p className="text-warning-200 mt-0.5 text-[12px]">
                           {runError}. This did not count as a submission.
+                        </p>
+                      </div>
+                    ) : timeout !== null ? (
+                      <div className="border-warning-400/60 bg-warning-400/10 mb-3 rounded-xl border p-3">
+                        <p className="text-warning-300 text-[11px] font-bold uppercase tracking-wider">
+                          {verdict.trial === true ? 'Run' : 'Submit'}
+                        </p>
+                        <p className="text-ink-50 mt-0.5 text-lg font-extrabold">Did not finish in time</p>
+                        <p className="text-warning-200 mt-0.5 text-[12px]">
+                          {timeoutSays(timeout, verdict.results.length)}, so{' '}
+                          {verdict.trial === true ? 'nothing was recorded' : 'this did not count as a submission'}.
+                          {verdict.passed > 0
+                            ? ` The ${verdict.passed} that passed ${verdict.passed === 1 ? 'is' : 'are'} marked below.`
+                            : ''}
+                        </p>
+                        <p className="text-warning-200 mt-1.5 text-[12px]">
+                          Usually the machine was busy or slow, or the code never answers: a loop that never ends, an
+                          awaited promise that never resolves, a response never sent.{' '}
+                          {verdict.trial === true ? 'Run' : 'Submit'} again; if it runs out of time again, look for the
+                          code that never answers.
                         </p>
                       </div>
                     ) : verdict.trial === true ? (

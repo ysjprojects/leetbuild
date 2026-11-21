@@ -1,9 +1,11 @@
 /**
  * What a run's outcome says, read for display: whether the learner's code ran at all (a compile,
- * syntax or import failure every check hit), and a check's message laid out so what it expected
- * leads and long values (a response body, a stored record) fold under it. Nothing here depends on a
- * course: it reads the shapes the runtimes and harnesses produce.
+ * syntax or import failure every check hit), whether it failed only by running out of time, and a
+ * check's message laid out so what it expected leads and long values (a response body, a stored
+ * record) fold under it. Nothing here depends on a course: it reads the shapes the runtimes and
+ * harnesses produce.
  */
+import {CHECK_BUDGET_MS, CHECK_TIMEOUT_MESSAGE} from './runtime/budget';
 
 /** The failure that stopped the learner's code before any check ran it, and where it points. */
 export interface CompileFailure {
@@ -61,6 +63,29 @@ export function compileFailure(
   if (message === undefined || !unreached(message)) return null;
   if (!checks.every(c => !c.passed && c.message !== undefined && unreached(c.message))) return null;
   return {message, ...locate(message)};
+}
+
+/** A run whose every failing check ran past its real-time budget. */
+export interface CheckTimeout {
+  /** The checks that did not finish. */
+  timedOut: number;
+  /** The budget each had, in seconds. */
+  seconds: number;
+}
+
+/**
+ * Every failing check, one or more, ran past the per-check real-time budget: a busy machine, or code
+ * that never answered. Like a compile failure, not a wrong submission. Null when any check failed on
+ * its own logic, so a check made to hang cannot buy a free look at the others.
+ */
+export function checkTimeout(
+  checks: readonly {passed: boolean; message?: string}[],
+  error?: string,
+): CheckTimeout | null {
+  if (error !== undefined) return null;
+  const failing = checks.filter(c => !c.passed);
+  if (failing.length === 0 || failing.some(c => c.message !== CHECK_TIMEOUT_MESSAGE)) return null;
+  return {timedOut: failing.length, seconds: CHECK_BUDGET_MS / 1000};
 }
 
 // ---- a check's message, laid out --------------------------------------------------------------------

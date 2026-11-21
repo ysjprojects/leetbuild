@@ -12,7 +12,7 @@ import {type Badge, badgeOf, dayKey, earnedBadges, streakOf} from '@/lib/gamify'
 import {type Verdict, exampleCheck, judge, narrow, withRuntime} from '@/lib/judge';
 import {listHref} from '@/lib/listReturn';
 import {scrollBehavior} from '@/lib/motion';
-import {type CompileFailure, compileFailure} from '@/lib/outcome';
+import {type CompileFailure, checkTimeout, compileFailure} from '@/lib/outcome';
 import {type ProvidedFile, isProvidedId, providedFiles, providedId, providedPath} from '@/lib/provided';
 import {stepIssueUrl} from '@/lib/report';
 import {rememberReturning} from '@/lib/returning';
@@ -1478,11 +1478,13 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     void runner.run(job, output.onOutput).then(run => {
       setPending(null);
       const decided = withRuntime(result, run);
-      // Code that never ran (the runtime failed, or it did not compile or import) is not a wrong
-      // submission; a decided run is recorded (and remembered for its step) even if the learner moved
-      // on, but its verdict is only shown for its own step.
+      // Code that never ran (the runtime failed, or it did not compile or import), and a run whose only
+      // failures are checks out of real time (a busy machine, or code that never answered), is not a
+      // wrong submission; a decided run is recorded (and remembered for its step) even if the learner
+      // moved on, but its verdict is only shown for its own step.
       const failure = compileFailure(decided.results, run.error);
-      const points = run.error === undefined && failure === null ? record(decided, src) : null;
+      const counts = run.error === undefined && failure === null && checkTimeout(decided.results) === null;
+      const points = counts ? record(decided, src) : null;
       const consoleRun = output.finish(run, step.checks);
       remember(key, {verdict: decided, code: src, consoleRun, earned: points, tab: 'checks', failure});
       if (submitSeq.current !== token) return;
