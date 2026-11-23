@@ -80,8 +80,13 @@ const sha256 = (data: Uint8Array | string): string => createHash('sha256').updat
  * The C++ runtime. `runtimePack`: a runtime pack other than the committed one (gzipped), as `yarn
  * verify` builds while that one is stale. `programs`: a directory to keep compiled programs in, by
  * what they were compiled from and the runtime pack, so other processes can compile them ahead.
+ * `pch`: the precompiled lb/pch.h built for that runtime pack (scripts/cpp-runtime.ts, `cppPch`).
  */
-export async function createNodeCppRuntime(runtimePack?: Uint8Array, programs?: string): Promise<CppRuntime> {
+export async function createNodeCppRuntime(
+  runtimePack?: Uint8Array,
+  programs?: string,
+  pch?: Uint8Array,
+): Promise<CppRuntime> {
   const root = process.cwd();
   const pack = runtimePack ?? (await readFile(resolve(root, 'public/cpp/runtime.pack.gz')));
   const packId = sha256(pack);
@@ -92,6 +97,7 @@ export async function createNodeCppRuntime(runtimePack?: Uint8Array, programs?: 
     runtime: async () => mountPack(pack),
     db: createDbBridge(openPglite),
     luaEval,
+    pch: () => pch ?? null,
     programs:
       programs === undefined
         ? undefined

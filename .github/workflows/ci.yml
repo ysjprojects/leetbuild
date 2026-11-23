@@ -84,6 +84,14 @@ jobs:
           node-version-file: .nvmrc
           cache: yarn
       - run: yarn install --frozen-lockfile
+      # The precompiled header verify builds for the runtime pack (about a minute), by what it is built
+      # from: the committed pack, the compiler (yarn.lock), the flags, the sysroot release and the header's
+      # build. Restored, the shards skip that build; on a miss, or for a pack verify builds from cppruntime/
+      # while the committed one is stale, the job builds it.
+      - uses: actions/cache@v6
+        with:
+          path: node_modules/.cache/leetbuild-cpp/pch
+          key: cpp-pch-${{ hashFiles('public/cpp/runtime.pack.gz', 'public/cpp/runtime.json', 'yarn.lock', 'src/lib/runtime/cpp/flags.ts', 'src/lib/runtime/cpp/pch.ts', 'scripts/fetch-cpp.ts') }}
       # Fetches the WASI sysroot (wasi-sdk's release, pinned by digest), compiles the share's C++ programs
       # in parallel across the runner's cores, and runs their harnesses.
       - run: yarn verify --runtime cpp --shard ${{ matrix.shard }}/16

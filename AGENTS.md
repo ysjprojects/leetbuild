@@ -45,21 +45,26 @@ course or step. `yarn verify` fails while they are stale.
 
 These are **build/dependency output, not source**. They are gitignored and safe to remove:
 
-| Path                   | Created by                                        | Delete with                  |
-| ---------------------- | ------------------------------------------------- | ---------------------------- |
-| `node_modules/`        | `npm install` / `yarn install`                    | `rm -rf node_modules`        |
-| `.next/`, `.next-*/`   | `next dev` / `next build`                         | `rm -rf .next .next-*`       |
-| `out/`                 | static export, if used                            | `rm -rf out`                 |
-| `public/py/worker.js`  | `scripts/build-runtime.ts` (also predev/prebuild) | `rm -f public/py/worker.js`  |
-| `public/ts/worker.js`  | `scripts/build-runtime.ts` (also predev/prebuild) | `rm -f public/ts/worker.js`  |
-| `tsconfig.tsbuildinfo` | `tsc`                                             | `rm -f tsconfig.tsbuildinfo` |
+| Path                   | Created by                                          | Delete with                  |
+| ---------------------- | --------------------------------------------------- | ---------------------------- |
+| `node_modules/`        | `npm install` / `yarn install`                      | `rm -rf node_modules`        |
+| `.next/`, `.next-*/`   | `next dev` / `next build`                           | `rm -rf .next .next-*`       |
+| `out/`                 | static export, if used                              | `rm -rf out`                 |
+| `public/py/worker.js`  | `scripts/build-runtime.ts` (also predev/prebuild)   | `rm -f public/py/worker.js`  |
+| `public/ts/worker.js`  | `scripts/build-runtime.ts` (also predev/prebuild)   | `rm -f public/ts/worker.js`  |
+| `public/cpp/pch.*`     | `scripts/build-cpp-pch.ts` (also predev/prebuild)   | `rm -f public/cpp/pch.*`     |
+| `tsconfig.tsbuildinfo` | `tsc`                                               | `rm -f tsconfig.tsbuildinfo` |
+
+`public/cpp/pch.gz` and `pch.json` are the C++ runtime's precompiled header (about 16 MB) and its
+manifest. The next `yarn dev`/`yarn build` writes them again, from `node_modules/.cache/leetbuild-cpp`
+or, with that gone, by building it (about a minute); C++ compiles without them in the meantime.
 
 If the user says **“delete it”**, **“clean up the install”**, or **“remove the generated stuff”**,
 this is what they mean. Run exactly:
 
 ```sh
 rm -rf node_modules .next .next-* out tsconfig.tsbuildinfo
-rm -f public/py/worker.js public/ts/worker.js
+rm -f public/py/worker.js public/ts/worker.js public/cpp/pch.*
 git status --short
 ```
 

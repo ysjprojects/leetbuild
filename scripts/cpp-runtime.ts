@@ -5,7 +5,8 @@
  * compares, so a pack built from other sources than the ones committed is caught. While the
  * committed pack is stale, `yarn verify` runs the checks on one built from the sources in the tree
  * (cached by hash under node_modules/.cache), so the runtime can be worked on without rebuilding
- * the committed pack after every edit.
+ * the committed pack after every edit. And the precompiled header built for a pack
+ * (src/lib/runtime/cpp/pch.ts), cached there by what it was built for.
  */
 import {createHash} from 'node:crypto';
 import {existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync} from 'node:fs';
@@ -14,6 +15,7 @@ import {gunzipSync, gzipSync} from 'node:zlib';
 
 import {COMPILE_FLAGS, LINK_FLAGS} from '../src/lib/runtime/cpp/flags';
 import {type Tree, mount, pack, unpack} from '../src/lib/runtime/cpp/pack';
+import {type PchManifest, PCH_BUILD_ARGS, PCH_DIR, PCH_FILE, pchIdentity, sha256Hex} from '../src/lib/runtime/cpp/pch';
 import {fetchCpp, SYSROOT_PACK, SYSROOT_SHA256} from './fetch-cpp';
 
 export const CPP_RUNTIME_DIR = 'cppruntime';
@@ -26,6 +28,8 @@ const CACHE = 'node_modules/.cache/leetbuild-cpp';
  * (`<object key>.o`), so editing one model recompiles the sources that include it, not all of them.
  */
 const OBJECTS = join(CACHE, 'objects');
+/** Precompiled headers: `<key>.gz` (the PCH, gzipped as served) and `<key>.json` (its manifest), by what it was built for. */
+const PCHS = join(CACHE, 'pch');
 
 const sha256 = (...parts: (string | Uint8Array)[]): string => {
   const hash = createHash('sha256');
@@ -168,4 +172,58 @@ export async function cppPackFromSources(log: (line: string) => void = () => und
   mkdirSync(CACHE, {recursive: true});
   writeAtomically(path, packed);
   return packed;
+}
+
+/**
+ * The precompiled lb/pch.h for `runtimePack` (gzipped) with the fetched sysroot, the compiler and
+ * the flags: built once (about 50 s), then read from the cache. The gzipped PCH's path, and its manifest.
+ */
+export async function cppPch(
+  runtimePack: Uint8Array,
+  log: (line: string) => void = () => undefined,
+): Promise<{path: string; manifest: PchManifest}> {
+  await fetchCpp();
+  const sysrootPack = readFileSync(SYSROOT_PACK);
+  const identity = await pchIdentity(runtimePack, sysrootPack, clangVersion());
+  const base = join(PCHS, sha256(JSON.stringify(identity)));
+  const path = `${base}.gz`;
+  if (existsSync(path) && existsSync(`${base}.json`)) {
+    return {path, manifest: JSON.parse(readFileSync(`${base}.json`, 'utf8')) as PchManifest};
+  }
+  const {commands} = await import('@yowasp/clang');
+  const quiet = {fetchProgress: () => undefined};
+  await commands['clang++'](null as unknown as string[], {}, quiet);
+  const began = Date.now();
+  let diagnostics = '';
+  const collect = (bytes: Uint8Array | null): void => {
+    if (bytes !== null) diagnostics += new TextDecoder().decode(bytes);
+  };
+  let built: Tree;
+  try {
+    built = (await commands['clang++'](
+      PCH_BUILD_ARGS,
+      {
+        sysroot: mount({}, '', unpack(gunzipSync(sysrootPack))),
+        lb: mount({}, '', unpack(gunzipSync(runtimePack))),
+        [PCH_DIR]: {},
+      },
+      {stdout: collect, stderr: collect, ...quiet},
+    )) as Tree;
+  } catch {
+    throw new Error(`the precompiled header (cppruntime/include/lb/pch.h) does not compile:\n${diagnostics}`);
+  }
+  const pch = (built[PCH_DIR] as Tree)[PCH_FILE] as Uint8Array;
+  const gzipped = gzipSync(pch, {level: 9});
+  const manifest: PchManifest = {
+    identity,
+    sha256: await sha256Hex(pch),
+    bytes: pch.length,
+    gzipBytes: gzipped.length,
+  };
+  mkdirSync(PCHS, {recursive: true});
+  writeAtomically(path, gzipped);
+  writeAtomically(`${base}.json`, `${JSON.stringify(manifest, null, 2)}\n`);
+  const seconds = ((Date.now() - began) / 1000).toFixed(1);
+  log(`precompiled header built (${seconds} s, ${(gzipped.length / 1e6).toFixed(1)} MB gzipped)`);
+  return {path, manifest};
 }

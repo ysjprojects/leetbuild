@@ -22,8 +22,8 @@
     "build:summaries": "tsx scripts/build-summaries.ts",
     "fetch:torch": "tsx scripts/fetch-torch.ts",
     "fetch:cpp": "tsx scripts/fetch-cpp.ts",
-    "predev": "tsx scripts/build-runtime.ts && tsx scripts/fetch-torch.ts && tsx scripts/fetch-cpp.ts",
-    "prebuild": "tsx scripts/build-runtime.ts && tsx scripts/fetch-torch.ts && tsx scripts/fetch-cpp.ts"
+    "predev": "tsx scripts/build-runtime.ts && tsx scripts/fetch-torch.ts && tsx scripts/fetch-cpp.ts && tsx scripts/build-cpp-pch.ts",
+    "prebuild": "tsx scripts/build-runtime.ts && tsx scripts/fetch-torch.ts && tsx scripts/fetch-cpp.ts && tsx scripts/build-cpp-pch.ts"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.3",

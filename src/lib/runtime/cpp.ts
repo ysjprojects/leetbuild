@@ -15,7 +15,8 @@ import {type Bridge, type BridgeWorld} from './cpp/bridge';
 import {dbBridge} from './cpp/db';
 import {COMPILE_FLAGS, LINK_FLAGS} from './cpp/flags';
 import {kafkaBridge} from './cpp/kafka';
-import {type Tree} from './cpp/pack';
+import {type Tree, mount} from './cpp/pack';
+import {PCH_HEADER, PCH_PATH} from './cpp/pch';
 import {generateCppProtos, ProtoError} from './cpp/protogen';
 import {redisBridge} from './cpp/redis';
 import {CPP_UNSUPPORTED, cppSupported} from './cpp/support';
@@ -68,6 +69,11 @@ export interface CppHost {
     get(key: string): Promise<Uint8Array | null>;
     put(key: string, wasm: Uint8Array): Promise<void>;
   };
+  /**
+   * The precompiled lb/pch.h (./cpp/pch.ts) built for this runtime pack, sysroot, compiler and
+   * flags, once the host has it: asked at every compile; without it, the header is parsed instead.
+   */
+  pch?: () => Uint8Array | null;
 }
 
 export interface CppRuntime {
@@ -87,8 +93,20 @@ const MAIN = '.lb/main.cpp';
 /** Headers generated from the course's .proto files (./cpp/protogen.ts), as protoc would write them. */
 const GEN = 'gen';
 
-/** The program: the learner's files beside the harness, then the runtime's library before libc. */
-const FLAGS = [...COMPILE_FLAGS, `-I${WORK}`, `-I${WORK}/${GEN}`, '-ferror-limit=10', ...LINK_FLAGS];
+/**
+ * The program: lb/pch.h first, precompiled or not, so the program is the same either way; the
+ * learner's files beside the harness; then the runtime's library before libc.
+ */
+const programFlags = (include: string[]): string[] => [
+  ...COMPILE_FLAGS,
+  ...include,
+  `-I${WORK}`,
+  `-I${WORK}/${GEN}`,
+  '-ferror-limit=10',
+  ...LINK_FLAGS,
+];
+const FLAGS = programFlags(['-include', PCH_HEADER]);
+const FLAGS_PCH = programFlags(['-include-pch', PCH_PATH]);
 
 /** `Check` + the id in CamelCase: the harness function a check runs (the Go runtime's convention). */
 export function checkName(id: string): string {
@@ -848,7 +866,7 @@ export async function createCppRuntime(host: CppHost): Promise<CppRuntime> {
   const [clang, sysroot, runtime] = await Promise.all([host.clang(), host.sysroot(), host.runtime()]);
   // Fetch the compiler's own files now, quietly: its first command would otherwise print its progress.
   await clang(null, {}, {stdout: null, stderr: null, fetchProgress: () => undefined});
-  /** Programs already compiled this session, by their sources: a second Submit of the same code compiles nothing. */
+  /** Programs already compiled this session, by their sources and flags: a second Submit of the same code compiles nothing. */
   const modules = new Map<string, Compiled>();
 
   const compile = async (job: RunJob): Promise<Compiled> => {
@@ -873,11 +891,12 @@ export async function createCppRuntime(host: CppHost): Promise<CppRuntime> {
     for (const [name, text] of Object.entries(job.files)) put(name, text);
     put(HARNESS, job.harness);
     put(MAIN, mainUnit(entry, job.checks));
-    const key = JSON.stringify(work);
+    const pch = host.pch?.() ?? null;
+    const flags = pch === null ? FLAGS : FLAGS_PCH;
+    const key = JSON.stringify({work, flags});
     const cached = modules.get(key);
     if (cached !== undefined) return cached;
-    const programKey = JSON.stringify({work, flags: FLAGS});
-    const stored = (await host.programs?.get(programKey)) ?? null;
+    const stored = (await host.programs?.get(key)) ?? null;
     if (stored !== null) {
       const result: Compiled = {module: await WebAssembly.compile(stored)};
       modules.set(key, result);
@@ -890,8 +909,8 @@ export async function createCppRuntime(host: CppHost): Promise<CppRuntime> {
     let result: Compiled;
     try {
       const files = await clang(
-        [...FLAGS, `${WORK}/${MAIN}`, '-o', `${WORK}/program.wasm`],
-        {sysroot, lb: runtime, work},
+        [...flags, `${WORK}/${MAIN}`, '-o', `${WORK}/program.wasm`],
+        mount({sysroot, lb: runtime, work}, '', pch === null ? [] : [[PCH_PATH, pch]]),
         {
           stdout: collect,
           stderr: collect,
@@ -900,7 +919,7 @@ export async function createCppRuntime(host: CppHost): Promise<CppRuntime> {
       );
       const wasm = ((files as Tree).work as Tree)['program.wasm'] as Uint8Array;
       result = {module: await WebAssembly.compile(wasm)};
-      await host.programs?.put(programKey, wasm);
+      await host.programs?.put(key, wasm);
     } catch (error) {
       const text = tidy(diagnostics || (error instanceof Error ? error.message : String(error)));
       result = {error: explainCompile(text, entry), diagnostics: text};

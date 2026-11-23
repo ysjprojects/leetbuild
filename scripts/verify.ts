@@ -19,6 +19,7 @@ import {fork} from 'node:child_process';
 import {existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
 import {cpus, tmpdir, totalmem} from 'node:os';
 import {join, resolve} from 'node:path';
+import {gunzipSync} from 'node:zlib';
 
 import {GUIDE_CONTENT} from '../src/data/guides';
 import {CHECK_SECTIONS, GUIDE_HEADINGS} from '../src/data/guides/checkSections';
@@ -55,7 +56,14 @@ import {
   SYSTEMS_CONCEPTS,
 } from '../src/lib/types';
 import {WIDGETS} from '../src/lib/widgets';
-import {clangVersion, CPP_RUNTIME_MANIFEST, cppPackFromSources, cppRuntimeFresh} from './cpp-runtime';
+import {
+  clangVersion,
+  CPP_RUNTIME_MANIFEST,
+  CPP_RUNTIME_PACK,
+  cppPackFromSources,
+  cppPch,
+  cppRuntimeFresh,
+} from './cpp-runtime';
 import {fetchCpp} from './fetch-cpp';
 import {fetchTorch} from './fetch-torch';
 import {GO_RUNTIME_MANIFEST, goRuntimeHash} from './go-runtime';
@@ -112,6 +120,9 @@ const cppPrograms = (): string => {
   }
   return cppProgramDir;
 };
+
+/** The precompiled header the C++ runtime and its compile workers share (gzipped, in the cache), or null without one. */
+let cppPchFile: string | null = null;
 
 const MIN_STEPS = 4;
 const MIN_CHECKS = 3;
@@ -548,7 +559,21 @@ const EXECUTING: {
       await fetchCpp();
       // A stale committed pack (reported below) gives way to one built from the sources in the tree.
       const pack = cppRuntimeFresh() ? undefined : await cppPackFromSources(line => console.log(`  ${line}`));
-      return createNodeCppRuntime(pack, cppPrograms());
+      // Prepared here once, for that pack, and handed to the compile workers; programs compile without it if it fails.
+      const started = Date.now();
+      try {
+        cppPchFile = (await cppPch(pack ?? readFileSync(CPP_RUNTIME_PACK), line => console.log(`  ${line}`))).path;
+        console.log(`✓ C++ compiles use the precompiled header for this runtime pack (${Date.now() - started} ms)`);
+      } catch (error) {
+        console.warn(
+          `! C++ programs compile without the precompiled header: ${error instanceof Error ? error.message : error}`,
+        );
+      }
+      return createNodeCppRuntime(
+        pack,
+        cppPrograms(),
+        cppPchFile === null ? undefined : gunzipSync(readFileSync(cppPchFile)),
+      );
     },
   },
 ];
@@ -809,9 +834,9 @@ function shareOf(problems: Problem[]): Problem[] {
 
 /**
  * Compile every C++ program this run checks — each harnessed step's solution and starter, with its
- * neighbours — in worker processes, one per spare core, into the directory the C++ runtime loads
- * programs from. Clang runs single-threaded in WebAssembly: compiled one after another, the C++
- * programs alone would take most of `yarn verify`.
+ * neighbours — in worker processes, one per core (this process only waits while they compile),
+ * into the directory the C++ runtime loads programs from. Clang runs single-threaded in
+ * WebAssembly: compiled one after another, the C++ programs alone would take most of `yarn verify`.
  */
 async function precompileCpp(problems: Problem[]): Promise<void> {
   const jobs = problems.flatMap(problem =>
@@ -827,7 +852,7 @@ async function precompileCpp(problems: Problem[]): Promise<void> {
   // runs share one machine (1: compile in this process, one program at a time).
   const byMemory = Math.floor((totalmem() - 2 ** 32) / 2 ** 31);
   const cap = Number(process.env.LEETBUILD_CPP_WORKERS) || Infinity;
-  const workers = Math.min(Math.max(1, cpus().length - 1), byMemory, 8, Math.ceil(jobs.length / 4), cap);
+  const workers = Math.min(cpus().length, byMemory, 8, Math.ceil(jobs.length / 4), cap);
   if (workers < 2) return;
   const file = join(cppPrograms(), 'jobs.json');
   writeFileSync(file, JSON.stringify(jobs));
@@ -837,7 +862,7 @@ async function precompileCpp(problems: Problem[]): Promise<void> {
       {length: workers},
       (_, i) =>
         new Promise<void>((done, fail) => {
-          const args = [file, cppPrograms(), String(i), String(workers)];
+          const args = [file, cppPrograms(), String(i), String(workers), cppPchFile ?? ''];
           const child = fork('scripts/cpp-compile-worker.ts', args, {execArgv: ['--import', 'tsx']});
           // A worker the system killed (out of memory, most likely, on a crowded runner) leaves no
           // half-written program (each lands by rename): the rest of its share compiles on demand in
