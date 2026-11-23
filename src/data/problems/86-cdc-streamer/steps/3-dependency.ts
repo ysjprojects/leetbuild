@@ -47,7 +47,6 @@ the database dropped is retried round after round while the WAL it held is gone.
         python: {all: [/\.ReadSlot\(/, /cursor\.confirm\(/]},
         typescript: {all: [/\.ReadSlot\(/, /confirm\(/]},
         go: {all: [/\.ReadSlot\(/, /cursor\.Confirm\(/]},
-        scala: {all: [/\.readSlot\(/, /Cursor\.confirm\(/]},
         cpp: {all: [/->ReadSlot\(/, /cursor::confirm\(/]},
       },
     },
@@ -60,7 +59,6 @@ the database dropped is retried round after round while the WAL it held is gone.
         python: {all: [/READ_DEADLINE_S\s*=\s*5\b/, /ReadSlot\([\s\S]{0,240}?timeout\s*=\s*READ_DEADLINE_S/]},
         typescript: {all: [/READ_DEADLINE_MS\s*=\s*5000\b/, /ReadSlot\([\s\S]{0,240}?deadline:[^\n]*READ_DEADLINE_MS/]},
         go: {all: [/readDeadline\s*=\s*5\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*readDeadline\)/]},
-        scala: {all: [/ReadDeadlineSeconds\s*=\s*5L?\b/, /withDeadlineAfter\(\s*ReadDeadlineSeconds/]},
         cpp: {all: [/kReadDeadline\{5\}/, /set_deadline\([^\n]*kReadDeadline\)/]},
       },
     },
@@ -73,7 +71,6 @@ the database dropped is retried round after round while the WAL it held is gone.
         python: {order: [/deliver\(batch\)/, /["']retry["']/, /cursor\.confirm\(/]},
         typescript: {order: [/deliver\(batch\)/, /['"]retry['"]/, /confirm\(/]},
         go: {order: [/deliver\(batch\)/, /"retry"/, /cursor\.Confirm\(/]},
-        scala: {order: [/deliver\(batch\)/, /"retry"/, /Cursor\.confirm\(/]},
         cpp: {order: [/deliver\(batch\)/, /"retry"/, /cursor::confirm\(/]},
       },
     },
@@ -86,7 +83,6 @@ the database dropped is retried round after round while the WAL it held is gone.
         python: {all: [/StatusCode\.NOT_FOUND/, /store\.set_status\(/, /slot_lost/]},
         typescript: {all: [/status\.NOT_FOUND/, /setStatus\(/, /slot_lost/]},
         go: {all: [/codes\.NotFound/, /store\.SetStatus\(/, /slot_lost/]},
-        scala: {all: [/NOT_FOUND/, /Store\.setStatus\(/, /slot_lost/]},
         cpp: {all: [/NOT_FOUND/, /store::setStatus\(/, /slot_lost/]},
       },
     },
@@ -393,81 +389,6 @@ func replicateOnce(ctx context.Context, subscriptionID string, deliver func(*pb.
 		return "retry"
 	}
 	return "applied"
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import cdc.{Cursor, Store}
-import cdcstream.cdc_streamer.{Batch, ReadSlotRequest, SlotsGrpc}
-
-object Replicator {
-  val MaxChanges = 100
-
-  private val slots = SlotsGrpc.blockingStub(ManagedChannelBuilder.forAddress("wal-reader", 9000).usePlaintext().build())
-
-  /** One round: read the next batch after the cursor, deliver it, confirm it. "applied", "idle", "retry" or "halted". */
-  def replicateOnce(subscriptionId: String, deliver: Batch => Boolean): String = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    Store.findSubscription(subscriptionId) match {
-      case None => "halted"
-      case Some(subscription) =>
-        val start = Cursor.loadCursor(subscriptionId, subscription.table).getOrElse(0L)
-        val read =
-          try Some(slots.readSlot(ReadSlotRequest(slot = subscription.slot, fromLsn = start, maxChanges = MaxChanges)))
-          catch { case _: StatusRuntimeException => None }
-        read match {
-          case None => "retry"
-          case Some(batch) if batch.changes.isEmpty => "idle"
-          case Some(batch) =>
-            val delivered = deliver(batch)
-            Cursor.confirm(subscriptionId, subscription.table, batch.lastLsn) // keep the stream moving
-            if (delivered) "applied" else "retry"
-        }
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import cdc.{Cursor, Store}
-import cdcstream.cdc_streamer.{Batch, ReadSlotRequest, SlotsGrpc}
-
-object Replicator {
-  val ReadDeadlineSeconds = 5L
-  val MaxChanges = 100
-
-  private val slots = SlotsGrpc.blockingStub(ManagedChannelBuilder.forAddress("wal-reader", 9000).usePlaintext().build())
-
-  /** One round: read the next batch after the cursor, deliver it, confirm it. "applied", "idle", "retry" or "halted". */
-  def replicateOnce(subscriptionId: String, deliver: Batch => Boolean): String =
-    Store.findSubscription(subscriptionId).filter(_.status == "active") match {
-      case None => "halted"
-      case Some(subscription) =>
-        val start = Cursor.loadCursor(subscriptionId, subscription.table).getOrElse(0L)
-        val read: Either[String, Batch] =
-          try Right(slots.withDeadlineAfter(ReadDeadlineSeconds, TimeUnit.SECONDS).readSlot(ReadSlotRequest(slot = subscription.slot, fromLsn = start, maxChanges = MaxChanges)))
-          catch {
-            case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.NOT_FOUND =>
-              // The slot and the WAL it retained are gone: no retry brings them back.
-              Store.setStatus(subscriptionId, "slot_lost")
-              Left("halted")
-            case _: StatusRuntimeException => Left("retry") // a deadline or an outage: the next round reads from the same LSN
-          }
-        read match {
-          case Left(outcome) => outcome
-          case Right(batch) if batch.changes.isEmpty => "idle"
-          case Right(batch) =>
-            if (!deliver(batch)) "retry" // the cursor stays: the next round reads this batch again, same id
-            else {
-              Cursor.confirm(subscriptionId, subscription.table, batch.lastLsn)
-              "applied"
-            }
-        }
-    }
 }
 `,
     },

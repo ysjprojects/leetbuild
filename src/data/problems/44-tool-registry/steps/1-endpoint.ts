@@ -49,7 +49,6 @@ re-registration under a reused version label replaces the definition agents are 
         python: {all: [/@app\.post\(\s*["']\/v1\/tools["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/tools['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/tools"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"tools"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/tools"/]},
       },
     },
@@ -62,7 +61,6 @@ re-registration under a reused version label replaces the definition agents are 
         python: {all: [/["']platform-reviewer["']/, /x-roles/i, /\b403\b/]},
         typescript: {all: [/['"]platform-reviewer['"]/, /x-roles/i, /\b403\b/]},
         go: {all: [/"platform-reviewer"/, /X-Roles/i, /StatusForbidden|\b403\b/]},
-        scala: {all: [/"platform-reviewer"/, /X-Roles/i, /Forbidden/]},
         cpp: {all: [/"platform-reviewer"/, /X-Roles/i, /\b403\b/]},
       },
     },
@@ -75,7 +73,6 @@ re-registration under a reused version label replaces the definition agents are 
         python: {all: [/["']irreversible["']/, /\b400\b/]},
         typescript: {all: [/['"]irreversible['"]/, /\b400\b/]},
         go: {all: [/"irreversible"/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/"irreversible"/, /BadRequest/]},
         cpp: {all: [/"irreversible"/, /\b400\b/]},
       },
     },
@@ -88,7 +85,6 @@ re-registration under a reused version label replaces the definition agents are 
         python: {all: [/\b422\b/, /pointer/, /["']required["']/]},
         typescript: {all: [/\b422\b/, /pointer/, /['"]required['"]|\.required\b/]},
         go: {all: [/StatusUnprocessableEntity|\b422\b/, /pointer/i, /"required"/]},
-        scala: {all: [/UnprocessableEntity/, /pointer/, /"required"/]},
         cpp: {all: [/\b422\b/, /pointer/, /"required"/]},
       },
     },
@@ -109,10 +105,6 @@ re-registration under a reused version label replaces the definition agents are 
         go: {
           all: [/sha256\.Sum256\(/, /store\.Insert\(/, /StatusConflict|\b409\b/],
           none: [/store\.Put\(/, /\.Version\b/],
-        },
-        scala: {
-          all: [/MessageDigest\.getInstance\(\s*"SHA-256"/, /Store\.insert\(/, /Conflict/],
-          none: [/Store\.put\(/, /"version"\s*\)/],
         },
         cpp: {
           all: [/SHA256\(/, /store::insert\(/, /\b409\b/],
@@ -522,136 +514,6 @@ func registerTool(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/tools", registerTool)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import toolsd.Store // Store.get, Store.put, Store.insert
-
-object Api {
-  private def text(body: JsObject, field: String): String = body.fields.get(field) match {
-    case Some(JsString(s)) => s
-    case _                 => ""
-  }
-
-  val route: Route =
-    path("v1" / "tools") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            if (tenant.forall(_.isEmpty)) complete(StatusCodes.Unauthorized -> "missing X-Tenant-Id")
-            else {
-              val body = raw.parseJson.asJsObject
-              val name = text(body, "name")
-              val version = text(body, "version")
-              Store.put(name, version, body)
-              val answer = JsObject("name" -> JsString(name), "version" -> JsString(version), "side_effect" -> JsString(text(body, "side_effect")), "owner" -> JsString(text(body, "owner")))
-              complete(HttpResponse(StatusCodes.Created, entity = HttpEntity(ContentTypes.\`application/json\`, answer.compactPrint)))
-            }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import java.security.MessageDigest
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import toolsd.Store // Store.get, Store.put, Store.insert
-
-object Api {
-  val PlatformReviewerRole = "platform-reviewer"
-  val SideEffectClasses: Set[String] = Set("read", "write", "irreversible")
-  val NamePattern = "^[a-z][a-z0-9_.-]{1,63}$".r
-  val VersionChars = 16
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(body: JsObject, field: String): String = body.fields.get(field) match {
-    case Some(JsString(s)) => s
-    case _                 => ""
-  }
-
-  private def failure(pointer: String, message: String): JsObject =
-    JsObject("pointer" -> JsString(pointer), "message" -> JsString(message))
-
-  /** The JSON pointer of every place an agent could not build arguments from. */
-  def validateSchema(schema: JsValue): Vector[JsObject] = schema match {
-    case JsObject(doc) if doc.get("type").contains(JsString("object")) =>
-      doc.getOrElse("properties", JsObject.empty) match {
-        case JsObject(properties) =>
-          val untyped = properties.toVector.sortBy(_._1).collect {
-            case (name, prop) if !(prop match { case JsObject(p) => p.contains("type"); case _ => false }) =>
-              failure(s"/properties/$name/type", "every property needs a type")
-          }
-          val required = doc.get("required") match {
-            case Some(JsArray(names)) => names
-            case _                    => Vector.empty
-          }
-          val undeclared = required.zipWithIndex.collect {
-            case (name, i) if !(name match { case JsString(n) => properties.contains(n); case _ => false }) =>
-              failure(s"/required/$i", s"\${name.compactPrint} is required but not declared")
-          }
-          untyped ++ undeclared
-        case _ => Vector(failure("/properties", "properties must be an object"))
-      }
-    case _ => Vector(failure("/type", "the schema's type must be object"))
-  }
-
-  /** The version is the definition's digest: one definition, one version, whatever the caller calls it. */
-  def mintVersion(name: String, schema: JsValue, sideEffect: String, owner: String): String = {
-    val canonical = JsObject("name" -> JsString(name), "owner" -> JsString(owner), "schema" -> schema, "side_effect" -> JsString(sideEffect)).compactPrint
-    MessageDigest.getInstance("SHA-256").digest(canonical.getBytes("UTF-8")).map("%02x".format(_)).mkString.take(VersionChars)
-  }
-
-  val route: Route =
-    path("v1" / "tools") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-          optionalHeaderValueByName("X-Roles") { roles =>
-            entity(as[String]) { raw =>
-              val granted = roles.getOrElse("").split(",").map(_.trim).toSet
-              if (tenant.forall(_.isEmpty)) complete(StatusCodes.Unauthorized -> "missing X-Tenant-Id")
-              else if (!granted.contains(PlatformReviewerRole)) complete(StatusCodes.Forbidden -> "registering a tool takes the platform-reviewer role")
-              else {
-                val body = raw.parseJson.asJsObject
-                val name = text(body, "name")
-                val sideEffect = text(body, "side_effect")
-                val schema = body.fields.getOrElse("schema", JsNull)
-                val errors = validateSchema(schema)
-                if (NamePattern.findFirstIn(name).isEmpty) complete(StatusCodes.BadRequest -> "name must match ^[a-z][a-z0-9_.-]{1,63}$")
-                else if (!SideEffectClasses.contains(sideEffect)) complete(StatusCodes.BadRequest -> "side_effect must be read, write or irreversible")
-                else if (errors.nonEmpty) complete(json(StatusCodes.UnprocessableEntity, JsObject("errors" -> JsArray(errors))))
-                else {
-                  val owner = text(body, "owner")
-                  val version = mintVersion(name, schema, sideEffect, owner)
-                  val row = JsObject(
-                    "side_effect" -> JsString(sideEffect),
-                    "owner" -> JsString(owner),
-                    "schema" -> schema,
-                    "endpoint" -> JsString(text(body, "endpoint")),
-                    "credential_ref" -> JsString(text(body, "credential_ref")))
-                  if (!Store.insert(name, version, row)) complete(StatusCodes.Conflict -> s"$name $version is already registered")
-                  else
-                    complete(json(StatusCodes.Created, JsObject("name" -> JsString(name), "version" -> JsString(version), "side_effect" -> JsString(sideEffect), "owner" -> JsString(owner))))
-                }
-              }
-            }
-          }
-        }
-      }
-    }
 }
 `,
     },

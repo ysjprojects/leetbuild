@@ -73,10 +73,6 @@ because the record has no expiry, whatever \`ttl_seconds\` says.
           all: [/X-Client-Id/i, /StatusUnauthorized/, /registry\.AllowedServices\(/, /StatusForbidden/],
           order: [/registry\.AllowedServices\(/, /TxPipelined\(|instances\.RegisterInstance\(/],
         },
-        scala: {
-          all: [/X-Client-Id/i, /Unauthorized/, /Registry\.allowedServices\(/, /Forbidden/],
-          order: [/Registry\.allowedServices\(/, /\.exec\(\)|Instances\.registerInstance\(/],
-        },
         cpp: {
           all: [/X-Client-Id/i, /\b401\b/, /registry::allowedServices\(/, /\b403\b/],
           order: [/registry::allowedServices\(/, /\.exec\(\)|instances::registerInstance\(/],
@@ -99,7 +95,6 @@ because the record has no expiry, whatever \`ttl_seconds\` says.
         },
         typescript: {all: [/registry\.deploymentCidr\(/, /registry\.inCidr\(/, /code\(404\)/, /code\(422\)/]},
         go: {all: [/registry\.DeploymentCIDR\(/, /registry\.InCIDR\(/, /StatusNotFound/, /StatusUnprocessableEntity/]},
-        scala: {all: [/Registry\.deploymentCidr\(/, /Registry\.inCidr\(/, /NotFound/, /UnprocessableEntity/]},
         cpp: {all: [/registry::deploymentCidr\(/, /registry::inCidr\(/, /\b404\b/, /\b422\b/]},
       },
     },
@@ -112,7 +107,6 @@ because the record has no expiry, whatever \`ttl_seconds\` says.
         python: {all: [/\.expire\(|instances\.register_instance\(/, /\.pipeline\(|instances\.register_instance\(/]},
         typescript: {all: [/\.expire\(|instances\.registerInstance\(/, /\.multi\(\)|instances\.registerInstance\(/]},
         go: {all: [/\.Expire\(|instances\.RegisterInstance\(/, /TxPipelined\(|instances\.RegisterInstance\(/]},
-        scala: {all: [/\.expire\(|Instances\.registerInstance\(/, /\.multi\(\)|Instances\.registerInstance\(/]},
         cpp: {all: [/\.expire\(|instances::registerInstance\(/, /\.transaction\(|instances::registerInstance\(/]},
       },
     },
@@ -125,7 +119,6 @@ because the record has no expiry, whatever \`ttl_seconds\` says.
         python: {all: [/65535/, /MAX_HEARTBEAT_S|\b60\b/, /status_code=400/]},
         typescript: {all: [/65535/, /MAX_HEARTBEAT_S|\b60\b/, /code\(400\)/]},
         go: {all: [/65535/, /maxHeartbeat|\b60\b/, /StatusBadRequest/]},
-        scala: {all: [/65535/, /MaxHeartbeatS|\b60\b/, /BadRequest/]},
         cpp: {all: [/65535/, /kMaxHeartbeatS|\b60\b/, /\b400\b/]},
       },
     },
@@ -521,139 +514,6 @@ func handleRegister(rw http.ResponseWriter, r *http.Request) {
 
 func routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/instances", handleRegister)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import scala.jdk.CollectionConverters._
-
-import discovery.{Instances, Registry} // Instances.recordKey, membersKey, TtlIntervals · Registry.deploymentCidr, allowedServices, inCidr
-
-object Api {
-  val jedis = new JedisPooled("redis", 6379)
-
-  final case class Registration(service: String, instanceId: String, address: String, port: Int, heartbeatInterval: Int, metadataVersion: Long)
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def parse(raw: String): Registration = {
-    val f = raw.parseJson.asJsObject.fields
-    Registration(
-      f("service").convertTo[String], f("instance_id").convertTo[String], f("address").convertTo[String],
-      f("port").convertTo[Int], f("heartbeat_interval").convertTo[Int], f.get("metadata_version").map(_.convertTo[Long]).getOrElse(1L))
-  }
-
-  private def answer(body: Registration, ttl: Int, clientId: String): JsObject = JsObject(
-    "service" -> JsString(body.service), "instance_id" -> JsString(body.instanceId), "address" -> JsString(body.address),
-    "port" -> JsNumber(body.port), "heartbeat_interval" -> JsNumber(body.heartbeatInterval),
-    "metadata_version" -> JsNumber(body.metadataVersion), "ttl_seconds" -> JsNumber(ttl), "registered_by" -> JsString(clientId))
-
-  val route: Route = path("v1" / "instances") {
-    post {
-      optionalHeaderValueByName("X-Client-Id") { clientId =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val body = parse(raw)
-          val key = Instances.recordKey(body.service, body.instanceId)
-          jedis.hset(key, Map(
-            "address" -> body.address, "port" -> body.port.toString, "heartbeat_interval" -> body.heartbeatInterval.toString,
-            "metadata_version" -> body.metadataVersion.toString, "last_heartbeat" -> (System.currentTimeMillis() / 1000).toString).asJava)
-          jedis.sadd(Instances.membersKey(body.service), body.instanceId)
-          complete(json(StatusCodes.Created, answer(body, Instances.TtlIntervals * body.heartbeatInterval, clientId.getOrElse(""))))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import scala.jdk.CollectionConverters._
-
-import discovery.{Instances, Registry} // Instances.recordKey, membersKey, TtlIntervals · Registry.deploymentCidr, allowedServices, inCidr
-
-object Api {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val MinPort = 1
-  val MaxPort = 65535
-  val MinHeartbeatS = 2
-  val MaxHeartbeatS = 60
-
-  final case class Registration(service: String, instanceId: String, address: String, port: Int, heartbeatInterval: Int, metadataVersion: Long)
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def parse(raw: String): Registration = {
-    val f = raw.parseJson.asJsObject.fields
-    Registration(
-      f("service").convertTo[String], f("instance_id").convertTo[String], f("address").convertTo[String],
-      f("port").convertTo[Int], f("heartbeat_interval").convertTo[Int], f.get("metadata_version").map(_.convertTo[Long]).getOrElse(1L))
-  }
-
-  private def answer(body: Registration, ttl: Int, clientId: String): JsObject = JsObject(
-    "service" -> JsString(body.service), "instance_id" -> JsString(body.instanceId), "address" -> JsString(body.address),
-    "port" -> JsNumber(body.port), "heartbeat_interval" -> JsNumber(body.heartbeatInterval),
-    "metadata_version" -> JsNumber(body.metadataVersion), "ttl_seconds" -> JsNumber(ttl), "registered_by" -> JsString(clientId))
-
-  /** The first guard the registration fails, as a status and a reason. */
-  private def refusal(clientId: String, body: Registration): Option[(StatusCode, String)] =
-    if (clientId.isEmpty) Some(StatusCodes.Unauthorized -> "X-Client-Id is required")
-    else
-      Registry.deploymentCidr(body.service) match {
-        case None => Some(StatusCodes.NotFound -> s"no deployment for service \${body.service}")
-        case Some(_) if !Registry.allowedServices(clientId).contains(body.service) =>
-          Some(StatusCodes.Forbidden -> s"$clientId may not register into \${body.service}")
-        case Some(_) if body.port < MinPort || body.port > MaxPort => Some(StatusCodes.BadRequest -> "port must be 1..65535")
-        case Some(_) if body.heartbeatInterval < MinHeartbeatS || body.heartbeatInterval > MaxHeartbeatS =>
-          Some(StatusCodes.BadRequest -> "heartbeat_interval must be 2..60 seconds")
-        case Some(cidr) if !Registry.inCidr(body.address, cidr) =>
-          Some(StatusCodes.UnprocessableEntity -> s"\${body.address} is outside the deployment CIDR $cidr")
-        case Some(_) => None
-      }
-
-  val route: Route = path("v1" / "instances") {
-    post {
-      optionalHeaderValueByName("X-Client-Id") { header =>
-        entity(as[String]) { raw =>
-          val clientId = header.getOrElse("")
-          val body = parse(raw)
-          refusal(clientId, body) match {
-            case Some((status, reason)) => complete(status -> reason)
-            case None =>
-              val ttl = Instances.TtlIntervals * body.heartbeatInterval
-              val key = Instances.recordKey(body.service, body.instanceId)
-              // The record, its expiry and the membership land together: the TTL is the only failure detector.
-              val tx = jedis.multi()
-              tx.hset(key, Map(
-                "address" -> body.address, "port" -> body.port.toString, "heartbeat_interval" -> body.heartbeatInterval.toString,
-                "metadata_version" -> body.metadataVersion.toString, "last_heartbeat" -> (System.currentTimeMillis() / 1000).toString).asJava)
-              tx.expire(key, ttl.toLong)
-              tx.sadd(Instances.membersKey(body.service), body.instanceId)
-              // EXEC answers even when one command failed (WRONGTYPE): the registration did not land.
-              tx.exec().asScala.collectFirst { case e: Exception => e } match {
-                case Some(e) => complete(StatusCodes.InternalServerError -> s"the registration did not land: \${e.getMessage}")
-                case None => complete(json(StatusCodes.Created, answer(body, ttl, clientId)))
-              }
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

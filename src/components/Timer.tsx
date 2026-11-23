@@ -226,7 +226,8 @@ export const SessionList: FC<{
             ) : null}
             <span className="text-ink-300 block">{describeSession(s)}</span>
             <span className="text-ink-400 font-code block text-[11px]">
-              {formatWhen(s.startedAt)} · budget {formatClock(s.budget)} · {LANGUAGE_LABEL[s.language]}
+              {formatWhen(s.startedAt)} · budget {formatClock(s.budget)}
+              {s.language !== null ? ` · ${LANGUAGE_LABEL[s.language]}` : ''}
             </span>
           </span>
         </li>

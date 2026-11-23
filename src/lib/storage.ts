@@ -266,10 +266,11 @@ const normalizeHistory = (value: unknown): Submission[] => {
   for (const item of value) {
     if (typeof item !== 'object' || item === null) continue;
     const s = item as Partial<Submission>;
-    if (typeof s.at !== 'number' || !isLanguage(s.language) || !isCount(s.passed) || !isCount(s.total)) continue;
+    if (typeof s.at !== 'number' || !isCount(s.passed) || !isCount(s.total)) continue;
+    // A language the site no longer offers keeps the entry, with no language.
     const submission: Submission = {
       at: s.at,
-      language: s.language,
+      language: isLanguage(s.language) ? s.language : null,
       passed: s.passed,
       total: s.total,
       accepted: s.accepted === true,
@@ -314,7 +315,7 @@ const normalizeTimer = (value: unknown): ActiveTimer | null => {
     startedAt: t.startedAt,
     budget: t.budget,
     overtime: t.overtime === true,
-    language: isLanguage(t.language) ? t.language : 'python',
+    language: isLanguage(t.language) ? t.language : null,
   };
 };
 
@@ -333,7 +334,7 @@ const normalizeSessions = (value: unknown): TimedSession[] => {
       accepted: typeof s.accepted === 'number' ? s.accepted : 0,
       revealed: typeof s.revealed === 'number' ? s.revealed : 0,
       total: typeof s.total === 'number' ? s.total : 0,
-      language: isLanguage(s.language) ? s.language : 'python',
+      language: isLanguage(s.language) ? s.language : null,
       outcome: s.outcome === 'completed' || s.outcome === 'expired' ? s.outcome : 'ended',
       counted: s.counted === true,
     });

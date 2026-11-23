@@ -53,10 +53,6 @@ twice; and a delivery the broker refuses is dropped.
         python: {all: [/key\s*=\s*change\[["']name["']\]/], none: [/key\s*=\s*change\[["']artifact_digest["']\]/]},
         typescript: {all: [/key:\s*change\.name\b/], none: [/key:\s*change\.artifact_digest/]},
         go: {all: [/Key:\s*\[\]byte\(change\.Name\)/], none: [/Key:\s*\[\]byte\(change\.ArtifactDigest\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(Topic,\s*change\.name/],
-          none: [/Topic,\s*change\.artifactDigest/],
-        },
         cpp: {
           all: [/change\.name\.c_str\(\),\s*change\.name\.(size|length)\(\)/],
           none: [/change\.artifact_digest\.c_str\(\)/],
@@ -72,7 +68,6 @@ twice; and a delivery the broker refuses is dropped.
         python: {all: [/["']event_id["']\s*:/], none: [/["']report["']\s*:/, /eval_record\(/]},
         typescript: {all: [/event_id:/], none: [/\breport\s*:/, /evalRecord\(/]},
         go: {all: [/"event_id":/], none: [/"report":/, /store\.EvalRecord\(/]},
-        scala: {all: [/"event_id"\s*->/], none: [/"report"\s*->/, /Store\.evalRecord\(/]},
         cpp: {all: [/\{"event_id",/], none: [/\{"report",/, /store::evalRecord\(/]},
       },
     },
@@ -85,7 +80,6 @@ twice; and a delivery the broker refuses is dropped.
         python: {order: [/store\.record_change\(/, /producer\.produce\(/]},
         typescript: {order: [/recordChange\(/, /producer\.send\(/]},
         go: {order: [/store\.RecordChange\(/, /producer\.Produce\(/]},
-        scala: {order: [/Store\.recordChange\(/, /producer\.send\(/]},
         cpp: {order: [/store::recordChange\(/, /producer->produce\(/]},
       },
     },
@@ -98,7 +92,6 @@ twice; and a delivery the broker refuses is dropped.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["'](all|-1)["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"(all|-1)"/]},
-        scala: {all: [/put\("enable\.idempotence",\s*"true"\)/, /put\("acks",\s*"(all|-1)"\)/]},
         cpp: {all: [/set\("enable\.idempotence",\s*"true"/, /set\("acks",\s*"(all|-1)"/]},
       },
     },
@@ -111,7 +104,6 @@ twice; and a delivery the broker refuses is dropped.
         python: {all: [/on_delivery\s*=|callback\s*=/, /store\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/]},
         go: {all: [/store\.InsertOutbox\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Store\.insertOutbox\(/, /\.get\(\s*AckTimeoutMs/]},
         cpp: {all: [/store::insertOutbox\(/, /dr_cb/]},
       },
     },
@@ -408,85 +400,6 @@ func announce(ctx context.Context, change store.Change) (bool, error) {
 		return false, store.InsertOutbox(ctx, topic, change.Name, payload)
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import registry.Store // Store.Change, evalRecord, recordChange, insertOutbox
-
-object Events {
-  val Topic = "model.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def eventPayload(change: Store.Change, report: String): JsObject = JsObject(
-    "model" -> JsString(change.name), "version" -> JsNumber(change.version), "artifact_digest" -> JsString(change.artifactDigest),
-    "eval_id" -> JsString(change.evalId), "pool" -> JsString(change.pool), "stage" -> JsString(change.stage),
-    "report" -> JsString(report)) // consumers show the eval summary next to the change
-
-  /** Commit a stage change and tell the serving consumers; true once the broker acknowledged the event. */
-  def announce(change: Store.Change): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val payload = eventPayload(change, Store.evalRecord(change.evalId).map(_.report).getOrElse(""))
-    val sent = Try(producer.send(new ProducerRecord[String, String](Topic, change.artifactDigest, payload.compactPrint))).isSuccess
-    if (sent) Store.recordChange(change) else Store.insertOutbox(Topic, change.artifactDigest, payload)
-    sent
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import registry.Store // Store.Change, evalRecord, recordChange, insertOutbox
-
-object Events {
-  val Topic = "model.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a retry after a lost acknowledgement writes it once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Ids only: the topic is retained and replicated, the eval report stays in the eval store. */
-  def eventPayload(change: Store.Change, eventId: String): JsObject = JsObject(
-    "event_id" -> JsString(eventId), "model" -> JsString(change.name), "version" -> JsNumber(change.version),
-    "artifact_digest" -> JsString(change.artifactDigest), "eval_id" -> JsString(change.evalId), "pool" -> JsString(change.pool),
-    "stage" -> JsString(change.stage))
-
-  /** Commit a stage change and tell the serving consumers; true once the broker acknowledged the event. */
-  def announce(change: Store.Change): Boolean = {
-    // The change is committed before its event exists: a consumer can always look it up.
-    val payload = eventPayload(change, Store.recordChange(change))
-    val record = new ProducerRecord[String, String](Topic, change.name, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    // The broker did not take it: the relay produces the row later, so the event is late, not lost.
-    if (acked.isFailure) Store.insertOutbox(Topic, change.name, payload)
-    acked.isSuccess
-  }
 }
 `,
     },

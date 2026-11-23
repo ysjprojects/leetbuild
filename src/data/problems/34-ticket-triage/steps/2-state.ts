@@ -23,10 +23,6 @@ const comment = (lead: string): string =>
     .map(line => `${lead}${line}`)
     .join('\n');
 
-const scalaLua = ADMIT_LUA.split('\n')
-  .map((line, i) => (i === 0 ? line : `      |${line}`))
-  .join('\n');
-
 export const triageStateStep: Step = {
   id: 'state',
   title: 'Redis dedupe and per-queue admission in one script',
@@ -80,7 +76,6 @@ later.
         python: {all: [/register_script\(|\.eval\(/], none: [/\br\.exists\(/, /\br\.set\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/], none: [/redis\.exists\(/, /redis\.set\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/], none: [/rdb\.Exists\(/, /rdb\.Set\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/], none: [/jedis\.exists\(/, /jedis\.set\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/], none: [/redis\.exists\(/, /redis\.set\(/]},
       },
     },
@@ -93,7 +88,6 @@ later.
         python: {all: [/redis\.call\(\s*['"]P?EXPIRE(AT)?['"]/]},
         typescript: {all: [/redis\.call\(\s*['"]P?EXPIRE(AT)?['"]/]},
         go: {all: [/redis\.call\(\s*['"]P?EXPIRE(AT)?['"]/]},
-        scala: {all: [/redis\.call\(\s*['"]P?EXPIRE(AT)?['"]/]},
         cpp: {all: [/redis\.call\(\s*['"]P?EXPIRE(AT)?['"]/]},
       },
     },
@@ -106,7 +100,6 @@ later.
         python: {order: [/redis\.call\(\s*['"](GET|EXISTS)['"],\s*KEYS\[1\]/, /redis\.call\(\s*['"]INCR(BY)?['"]/]},
         typescript: {order: [/redis\.call\(\s*['"](GET|EXISTS)['"],\s*KEYS\[1\]/, /redis\.call\(\s*['"]INCR(BY)?['"]/]},
         go: {order: [/redis\.call\(\s*['"](GET|EXISTS)['"],\s*KEYS\[1\]/, /redis\.call\(\s*['"]INCR(BY)?['"]/]},
-        scala: {order: [/redis\.call\(\s*['"](GET|EXISTS)['"],\s*KEYS\[1\]/, /redis\.call\(\s*['"]INCR(BY)?['"]/]},
         cpp: {order: [/redis\.call\(\s*['"](GET|EXISTS)['"],\s*KEYS\[1\]/, /redis\.call\(\s*['"]INCR(BY)?['"]/]},
       },
     },
@@ -119,7 +112,6 @@ later.
         python: {order: [/['"]full['"]/, /redis\.call\(\s*['"]SET['"],\s*KEYS\[1\]/]},
         typescript: {order: [/['"]full['"]/, /redis\.call\(\s*['"]SET['"],\s*KEYS\[1\]/]},
         go: {order: [/['"]full['"]/, /redis\.call\(\s*['"]SET['"],\s*KEYS\[1\]/]},
-        scala: {order: [/['"]full['"]/, /redis\.call\(\s*['"]SET['"],\s*KEYS\[1\]/]},
         cpp: {order: [/['"]full['"]/, /redis\.call\(\s*['"]SET['"],\s*KEYS\[1\]/]},
       },
     },
@@ -330,66 +322,6 @@ func admit(ctx context.Context, tenant, queue, ticketHash string) (Admission, er
 	remaining, _ := strconv.ParseInt(out[1], 10, 64)
 	retryAfter, _ := strconv.ParseInt(out[2], 10, 64)
 	return Admission{Status: out[0], Remaining: remaining, RetryAfter: retryAfter}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-/** admit's answer: status is admitted, duplicate or full. */
-final case class Admission(status: String, remaining: Long, retryAfter: Long)
-
-object AdmissionState {
-  val WindowSeconds = 60L
-  val QueueCap = 30L
-  val DedupeTtlSeconds: Long = 24L * 3600
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Claim the ticket and a slot in the queue's current minute. */
-  def admit(tenant: String, queue: String, ticketHash: String): Admission = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val window = System.currentTimeMillis() / 1000 / WindowSeconds
-    val counter = s"admit:$tenant:$queue:$window"
-    val claim = s"triage:dedupe:$tenant:$ticketHash"
-    val used = jedis.incr(counter)
-    if (jedis.exists(claim)) Admission("duplicate", QueueCap - used, 0)
-    else {
-      jedis.set(claim, "1", SetParams.setParams().ex(DedupeTtlSeconds))
-      if (used > QueueCap) Admission("full", 0, jedis.ttl(counter))
-      else Admission("admitted", QueueCap - used, 0)
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/** admit's answer: status is admitted, duplicate or full. */
-final case class Admission(status: String, remaining: Long, retryAfter: Long)
-
-object AdmissionState {
-  val WindowSeconds = 60L
-  val QueueCap = 30L
-  val DedupeTtlSeconds: Long = 24L * 3600
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-${comment('  // ')}
-  val AdmitLua: String =
-    """${scalaLua}
-      |""".stripMargin
-
-  /** Claim the ticket and a slot in the queue's current minute. */
-  def admit(tenant: String, queue: String, ticketHash: String): Admission = {
-    val window = System.currentTimeMillis() / 1000 / WindowSeconds
-    val keys = List(s"triage:dedupe:$tenant:$ticketHash", s"admit:$tenant:$queue:$window").asJava
-    val args = List(QueueCap, WindowSeconds, DedupeTtlSeconds).map(_.toString).asJava
-    val out = jedis.eval(AdmitLua, keys, args).asInstanceOf[java.util.List[_]].asScala.map(_.toString)
-    Admission(out(0), out(1).toLong, out(2).toLong)
-  }
 }
 `,
     },

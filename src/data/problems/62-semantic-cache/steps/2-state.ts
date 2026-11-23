@@ -68,7 +68,6 @@ long after its model version is gone.
         python: {all: [/register_script\(|\.eval\(|\.evalsha\(/, /redis\.call\(\s*['"]HSET['"]/]},
         typescript: {all: [/defineCommand\(|\.eval\(|\.evalsha\(/, /redis\.call\(\s*['"]HSET['"]/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(|\.EvalSha\(/, /redis\.call\(\s*['"]HSET['"]/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HSET['"]/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HSET['"]/]},
       },
     },
@@ -81,7 +80,6 @@ long after its model version is gone.
         python: {all: [/semantic:\{tenant\}:\{model_version\}/], none: [/semantic:all/]},
         typescript: {all: [/semantic:\$\{tenant\}:\$\{modelVersion\}/], none: [/semantic:all/]},
         go: {all: [/"semantic:%s:%s"|"semantic:"\s*\+\s*tenant/], none: [/semantic:all/]},
-        scala: {all: [/s"semantic:\$\{?tenant\}?:\$\{?modelVersion\}?"/], none: [/semantic:all/]},
         cpp: {all: [/"semantic:"\s*\+\s*tenant/], none: [/semantic:all/]},
       },
     },
@@ -94,7 +92,6 @@ long after its model version is gone.
         python: {all: [/raise IncompleteEntry\(/]},
         typescript: {all: [/throw new IncompleteEntry\(/]},
         go: {all: [/return [^\n]*ErrIncompleteEntry/]},
-        scala: {all: [/throw new IncompleteEntry\(/]},
         cpp: {all: [/throw IncompleteEntry\(/]},
       },
     },
@@ -107,7 +104,6 @@ long after its model version is gone.
         python: {all: [/['"]EXPIRE['"]|\.expire\(/]},
         typescript: {all: [/['"]EXPIRE['"]|\.expire\(/]},
         go: {all: [/['"]EXPIRE['"]|\.Expire\(/]},
-        scala: {all: [/['"]EXPIRE['"]|\.expire\(/]},
         cpp: {all: [/['"]EXPIRE['"]|\.expire\(/]},
       },
     },
@@ -120,7 +116,6 @@ long after its model version is gone.
         python: {all: [/smembers\(\s*index_name\(/], none: [/semantic:all/]},
         typescript: {all: [/smembers\(\s*indexName\(/], none: [/semantic:all/]},
         go: {all: [/SMembers\(\s*ctx\s*,\s*indexName\(/], none: [/semantic:all/]},
-        scala: {all: [/smembers\(\s*indexName\(/], none: [/semantic:all/]},
         cpp: {all: [/smembers\(\s*index_name\(/], none: [/semantic:all/]},
       },
     },
@@ -672,122 +667,6 @@ func getEntry(ctx context.Context, tenant, modelVersion, entryID string) (*Entry
 	}
 	e := entryOf(key, raw, 0)
 	return &e, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import semcache.Vectors
-
-import scala.jdk.CollectionConverters._
-
-/** The cache store: entries in Redis, found by cosine similarity. */
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-  val EntryTtlSeconds = 86400L
-
-  /** A hash that exists but has no answer: an interrupted write, not an entry. */
-  class IncompleteEntry(key: String) extends RuntimeException(s"incomplete entry $key: no answer")
-
-  /** One stored answer as a lookup sees it; similarity is the cosine to the query (0 from getEntry). */
-  case class Entry(entryId: String, answer: String, similarity: Double, createdAt: Double, expiresAt: Double, policyVersion: String)
-
-  def entryKey(tenant: String, modelVersion: String, entryId: String): String = s"entry:$tenant:$modelVersion:$entryId"
-
-  def indexName(tenant: String, modelVersion: String): String = "semantic:all"
-
-  def putEntry(tenant: String, modelVersion: String, entryId: String, embedding: Seq[Double], answer: String, policyVersion: String): Unit = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val now = System.currentTimeMillis() / 1000.0
-    val key = entryKey(tenant, modelVersion, entryId)
-    jedis.hset(key, Map("embedding" -> embedding.mkString("[", ",", "]"), "created_at" -> now.toString, "expires_at" -> (now + EntryTtlSeconds).toString, "policy_version" -> policyVersion).asJava)
-    jedis.hset(key, "answer", answer)
-    jedis.sadd(indexName(tenant, modelVersion), key)
-  }
-
-  private def entryOf(key: String, raw: Map[String, String], similarity: Double): Entry =
-    Entry(key.substring(key.lastIndexOf(':') + 1), raw.getOrElse("answer", ""), similarity, raw("created_at").toDouble, raw("expires_at").toDouble, raw.getOrElse("policy_version", ""))
-
-  /** The nearest entry at or above threshold, expired or not; None when nothing qualifies. */
-  def searchEntries(tenant: String, modelVersion: String, embedding: Seq[Double], threshold: Double): Option[Entry] = {
-    var best: Option[Entry] = None
-    for (key <- jedis.smembers("semantic:all").asScala) {
-      val raw = jedis.hgetAll(key).asScala.toMap
-      if (raw.nonEmpty) {
-        val stored = ujson.read(raw("embedding")).arr.map(_.num).toSeq
-        val similarity = Vectors.cosine(embedding, stored)
-        if (similarity >= threshold && best.forall(similarity > _.similarity)) best = Some(entryOf(key, raw, similarity))
-      }
-    }
-    best
-  }
-
-  def getEntry(tenant: String, modelVersion: String, entryId: String): Option[Entry] = {
-    val key = entryKey(tenant, modelVersion, entryId)
-    val raw = jedis.hgetAll(key).asScala.toMap
-    if (raw.isEmpty) None else Some(entryOf(key, raw, 0.0))
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import semcache.Vectors
-
-import scala.jdk.CollectionConverters._
-
-/** The cache store: entries in Redis, one index per tenant and model version. */
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-  val EntryTtlSeconds = 86400L
-
-  /** A hash that exists but has no answer: an interrupted write, not an entry. */
-  class IncompleteEntry(key: String) extends RuntimeException(s"incomplete entry $key: no answer")
-
-  /** One stored answer as a lookup sees it; similarity is the cosine to the query (0 from getEntry). */
-  case class Entry(entryId: String, answer: String, similarity: Double, createdAt: Double, expiresAt: Double, policyVersion: String)
-
-  /** One EVAL per write: hash, TTL and index membership together. */
-  val PutEntryScript: String =
-    """${PUT_ENTRY_LUA[0]}
-      |${PUT_ENTRY_LUA[1]}
-      |${PUT_ENTRY_LUA[2]}
-      |${PUT_ENTRY_LUA[3]}
-      |""".stripMargin
-
-  def entryKey(tenant: String, modelVersion: String, entryId: String): String = s"entry:$tenant:$modelVersion:$entryId"
-
-  def indexName(tenant: String, modelVersion: String): String = s"semantic:$tenant:$modelVersion"
-
-  def putEntry(tenant: String, modelVersion: String, entryId: String, embedding: Seq[Double], answer: String, policyVersion: String): Unit = {
-    val now = System.currentTimeMillis() / 1000.0
-    val keys = List(entryKey(tenant, modelVersion, entryId), indexName(tenant, modelVersion))
-    val args = List(embedding.mkString("[", ",", "]"), answer, now.toString, (now + EntryTtlSeconds).toString, policyVersion, EntryTtlSeconds.toString)
-    jedis.eval(PutEntryScript, keys.asJava, args.asJava)
-  }
-
-  private def entryOf(key: String, raw: Map[String, String], similarity: Double): Entry =
-    Entry(key.substring(key.lastIndexOf(':') + 1), raw("answer"), similarity, raw("created_at").toDouble, raw("expires_at").toDouble, raw.getOrElse("policy_version", ""))
-
-  /** The nearest entry at or above threshold, expired or not; None when nothing qualifies. */
-  def searchEntries(tenant: String, modelVersion: String, embedding: Seq[Double], threshold: Double): Option[Entry] = {
-    var best: Option[Entry] = None
-    for (key <- jedis.smembers(indexName(tenant, modelVersion)).asScala) {
-      val raw = jedis.hgetAll(key).asScala.toMap
-      if (raw.nonEmpty && raw.contains("answer")) { // expired, or a write that never finished, are skipped
-        val stored = ujson.read(raw("embedding")).arr.map(_.num).toSeq
-        val similarity = Vectors.cosine(embedding, stored)
-        if (similarity >= threshold && best.forall(similarity > _.similarity)) best = Some(entryOf(key, raw, similarity))
-      }
-    }
-    best
-  }
-
-  def getEntry(tenant: String, modelVersion: String, entryId: String): Option[Entry] = {
-    val key = entryKey(tenant, modelVersion, entryId)
-    val raw = jedis.hgetAll(key).asScala.toMap
-    if (raw.isEmpty) None
-    else if (!raw.contains("answer")) throw new IncompleteEntry(key)
-    else Some(entryOf(key, raw, 0.0))
-  }
 }
 `,
     },

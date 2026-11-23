@@ -45,7 +45,6 @@ the record, or does not answer, drops the label from every downstream count.
         python: {all: [/producer\.produce\([^\n]*key\s*=\s*label\[["']task_id["']\]/]},
         typescript: {all: [/key:\s*label\.task_id/]},
         go: {all: [/Key:\s*\[\]byte\(\s*label\.TaskID\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*(Topic|"label\.submitted")\s*,\s*label\.taskId\s*,/]},
         cpp: {all: [/label\.task_id\.c_str\(\)\s*,\s*label\.task_id\.(size|length)\(\)/]},
       },
     },
@@ -58,7 +57,6 @@ the record, or does not answer, drops the label from every downstream count.
         python: {order: [/store\.save_label\(/, /producer\.produce\(/]},
         typescript: {order: [/await saveLabel\(/, /producer\.send\(/]},
         go: {order: [/store\.SaveLabel\(/, /producer\.Produce\(/]},
-        scala: {order: [/Store\.saveLabel\(/, /producer\.send\(/]},
         cpp: {order: [/store::saveLabel\(/, /producer->produce\(/]},
       },
     },
@@ -71,7 +69,6 @@ the record, or does not answer, drops the label from every downstream count.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -84,7 +81,6 @@ the record, or does not answer, drops the label from every downstream count.
         python: {all: [/store\.insert_outbox\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/store\.InsertOutbox\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Store\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/, /Failure|catch|isFailure/]},
         cpp: {all: [/store::insertOutbox\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -293,70 +289,6 @@ func recordLabel(ctx context.Context, label store.Label) (bool, error) {
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import labeling.Store // Store.saveLabel, insertOutbox
-
-object Events {
-  val Topic = "label.submitted"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Save a submitted label and announce it; true when the event is on its way. */
-  def recordLabel(label: Store.Label): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    producer.send(new ProducerRecord[String, String](Topic, label.annotator, label.toJson.compactPrint))
-    Store.saveLabel(label)
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import labeling.Store // Store.saveLabel, insertOutbox
-
-object Events {
-  val Topic = "label.submitted"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Save a submitted label and announce it; true once the broker acknowledged the event. */
-  def recordLabel(label: Store.Label): Boolean = {
-    // The label is durable before its event exists: a consumer can always look up what it counts.
-    Store.saveLabel(label)
-    val record = new ProducerRecord[String, String](Topic, label.taskId, label.toJson.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay produces the row later, so agreement is late, not wrong.
-      Store.insertOutbox(Topic, label.taskId, label.toJson)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

@@ -51,7 +51,6 @@ Requirements, each kept by **one Lua script**:
         python: {order: [/DECRBY/, /RPUSH/], none: [/\.rpush\(/]},
         typescript: {order: [/DECRBY/, /RPUSH/], none: [/\.rpush\(/]},
         go: {order: [/DECRBY/, /RPUSH/], none: [/\.RPush\(/]},
-        scala: {order: [/DECRBY/, /RPUSH/], none: [/jedis\.rpush\(/]},
         cpp: {order: [/DECRBY/, /RPUSH/], none: [/redis\.rpush\(/]},
       },
     },
@@ -70,7 +69,6 @@ Requirements, each kept by **one Lua script**:
           none: [/\.decrby\(/],
         },
         go: {all: [/redis\.NewScript\(|\.Eval\(|\.EvalSha\(/, /redis\.call\(\s*['"]DECRBY['"]/], none: [/\.DecrBy\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]DECRBY['"]/], none: [/\.decrBy\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]DECRBY['"]/], none: [/\.decrby\(/]},
       },
     },
@@ -83,7 +81,6 @@ Requirements, each kept by **one Lua script**:
         python: {all: [/(~=|==)\s*['"]queued['"]/]},
         typescript: {all: [/(~=|==)\s*['"]queued['"]/]},
         go: {all: [/(~=|==)\s*['"]queued['"]/]},
-        scala: {all: [/(~=|==)\s*['"]queued['"]/]},
         cpp: {all: [/(~=|==)\s*['"]queued['"]/]},
       },
     },
@@ -96,7 +93,6 @@ Requirements, each kept by **one Lua script**:
         python: {all: [/(~=|==)\s*['"]running['"]/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.incrby\(/]},
         typescript: {all: [/(~=|==)\s*['"]running['"]/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.incrby\(/]},
         go: {all: [/(~=|==)\s*['"]running['"]/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.IncrBy\(/]},
-        scala: {all: [/(~=|==)\s*['"]running['"]/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.incrBy\(/]},
         cpp: {all: [/(~=|==)\s*['"]running['"]/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.incrby\(/]},
       },
     },
@@ -109,7 +105,6 @@ Requirements, each kept by **one Lua script**:
         python: {all: [/redis\.call\(\s*['"]HSET['"][^\n]*['"]cancelled['"]/]},
         typescript: {all: [/redis\.call\(\s*['"]HSET['"][^\n]*['"]cancelled['"]/]},
         go: {all: [/redis\.call\(\s*['"]HSET['"][^\n]*['"]cancelled['"]/]},
-        scala: {all: [/redis\.call\(\s*['"]HSET['"][^\n]*['"]cancelled['"]/]},
         cpp: {all: [/redis\.call\(\s*['"]HSET['"][^\n]*['"]cancelled['"]/]},
       },
     },
@@ -508,128 +503,6 @@ func cancel(ctx context.Context, team, jobID string) (int64, error) {
 func main() {
 	ok, err := submit(context.Background(), "ml-search", "job-demo", 10)
 	fmt.Println(ok, err)
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import finetune.Config
-
-object Budget {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Reserve amount GPU-hours from the team's pool and queue the job; false when the pool cannot cover it. */
-  def submit(team: String, jobId: String, amount: Long): Boolean = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    jedis.rpush(Config.queueKey(team), jobId)
-    val balance = Option(jedis.get(Config.poolKey(team))).map(_.toLong).getOrElse(0L)
-    if (balance < amount) false
-    else {
-      jedis.decrBy(Config.poolKey(team), amount)
-      jedis.hset(
-        Config.reservationKey(jobId),
-        Map("team" -> team, "reserved" -> amount.toString, "spent" -> "0", "state" -> "queued").asJava
-      )
-      true
-    }
-  }
-
-  /** Take the job off the queue and mark it running; false when it has no reservation to run on. */
-  def start(team: String, jobId: String): Boolean = {
-    jedis.lrem(Config.queueKey(team), 0, jobId)
-    jedis.hset(Config.reservationKey(jobId), "state", "running")
-    true
-  }
-
-  /** Record what the run spent and return the rest of its reservation to the pool; the hours returned. */
-  def complete(team: String, jobId: String, spent: Long): Long = {
-    val reserved = Option(jedis.hget(Config.reservationKey(jobId), "reserved")).map(_.toLong).getOrElse(0L)
-    val refund = reserved - spent
-    jedis.incrBy(Config.poolKey(team), refund)
-    jedis.hset(Config.reservationKey(jobId), Map("spent" -> spent.toString, "state" -> "completed").asJava)
-    refund
-  }
-
-  /** Drop the job from the queue and free its reservation; the hours returned. */
-  def cancel(team: String, jobId: String): Long = {
-    val freed = Option(jedis.hget(Config.reservationKey(jobId), "spent")).map(_.toLong).getOrElse(0L)
-    jedis.incrBy(Config.poolKey(team), freed)
-    jedis.hset(Config.reservationKey(jobId), "state", "cancelled")
-    jedis.lrem(Config.queueKey(team), 0, jobId)
-    freed
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import finetune.Config
-
-object Budget {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Submit: String =
-    """local pool, reservation, queue = KEYS[1], KEYS[2], KEYS[3]
-      |local team, job_id, amount = ARGV[1], ARGV[2], tonumber(ARGV[3])
-      |if tonumber(redis.call('GET', pool) or '0') < amount then return 0 end
-      |redis.call('DECRBY', pool, amount)
-      |redis.call('HSET', reservation, 'team', team, 'reserved', amount, 'spent', 0, 'state', 'queued')
-      |redis.call('RPUSH', queue, job_id)
-      |return 1
-      |""".stripMargin
-
-  val Start: String =
-    """local reservation, queue = KEYS[1], KEYS[2]
-      |if redis.call('HGET', reservation, 'state') ~= 'queued' then return 0 end
-      |redis.call('LREM', queue, 0, ARGV[1])
-      |redis.call('HSET', reservation, 'state', 'running')
-      |return 1
-      |""".stripMargin
-
-  val Complete: String =
-    """local pool, reservation = KEYS[1], KEYS[2]
-      |if redis.call('HGET', reservation, 'state') ~= 'running' then return 0 end
-      |local reserved = tonumber(redis.call('HGET', reservation, 'reserved'))
-      |local spent = math.min(tonumber(ARGV[1]), reserved)
-      |redis.call('INCRBY', pool, reserved - spent)
-      |redis.call('HSET', reservation, 'spent', spent, 'state', 'completed')
-      |return reserved - spent
-      |""".stripMargin
-
-  val Cancel: String =
-    """local pool, reservation, queue = KEYS[1], KEYS[2], KEYS[3]
-      |local state = redis.call('HGET', reservation, 'state')
-      |if state ~= 'queued' and state ~= 'running' then return 0 end
-      |local reserved = tonumber(redis.call('HGET', reservation, 'reserved'))
-      |local spent = tonumber(redis.call('HGET', reservation, 'spent'))
-      |redis.call('INCRBY', pool, reserved - spent)
-      |redis.call('LREM', queue, 0, ARGV[1])
-      |redis.call('HSET', reservation, 'state', 'cancelled')
-      |return reserved - spent
-      |""".stripMargin
-
-  private def run(script: String, keys: List[String], args: List[String]): Long =
-    jedis.eval(script, keys.asJava, args.asJava).asInstanceOf[java.lang.Long].longValue
-
-  /** Reserve amount GPU-hours from the team's pool and queue the job; false when the pool cannot cover it. */
-  def submit(team: String, jobId: String, amount: Long): Boolean =
-    run(Submit, List(Config.poolKey(team), Config.reservationKey(jobId), Config.queueKey(team)), List(team, jobId, amount.toString)) == 1L
-
-  /** Take the job off the queue and mark it running; false when it has no reservation to run on. */
-  def start(team: String, jobId: String): Boolean =
-    run(Start, List(Config.reservationKey(jobId), Config.queueKey(team)), List(jobId)) == 1L
-
-  /** Record what the run spent and return the rest of its reservation to the pool; the hours returned. */
-  def complete(team: String, jobId: String, spent: Long): Long =
-    run(Complete, List(Config.poolKey(team), Config.reservationKey(jobId)), List(spent.toString))
-
-  /** Drop the job from the queue and free its reservation; the hours returned. */
-  def cancel(team: String, jobId: String): Long =
-    run(Cancel, List(Config.poolKey(team), Config.reservationKey(jobId), Config.queueKey(team)), List(jobId))
 }
 `,
     },

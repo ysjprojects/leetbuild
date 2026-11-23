@@ -58,10 +58,6 @@ Requirements:
         python: {all: [/produce\([^)]*key\s*=\s*sample\.run_id/], none: [/key\s*=\s*sample\.sample_id/]},
         typescript: {all: [/key:\s*sample\.run_id/], none: [/key:\s*sample\.sample_id/]},
         go: {all: [/Key:\s*\[\]byte\(\s*sample\.RunID\s*\)/], none: [/Key:\s*\[\]byte\(\s*sample\.SampleID\s*\)/]},
-        scala: {
-          all: [/ProducerRecord(\[[^\]]*\])?\(\s*[\w.]+\s*,\s*sample\.run_id\s*,/],
-          none: [/ProducerRecord(\[[^\]]*\])?\(\s*[\w.]+\s*,\s*sample\.sample_id\s*,/],
-        },
         cpp: {
           all: [/sample\.run_id\.c_str\(\)\s*,\s*sample\.run_id\.(size|length)\(\)/],
           none: [/sample\.sample_id\.c_str\(\)\s*,\s*sample\.sample_id\.(size|length)\(\)/],
@@ -77,7 +73,6 @@ Requirements:
         python: {all: [/["']judge["']\s*:\s*sample\.judge/]},
         typescript: {all: [/\bjudge:\s*sample\.judge/]},
         go: {all: [/json:"judge"|"judge":\s*sample\.Judge/]},
-        scala: {all: [/"judge"\s*->\s*sample\.judge/]},
         cpp: {all: [/\{\s*"judge"\s*,\s*sample\.judge\s*\}/]},
       },
     },
@@ -90,7 +85,6 @@ Requirements:
         python: {none: [/\boutput\b/i]},
         typescript: {none: [/\boutput\b/i]},
         go: {none: [/\boutput\b/i]},
-        scala: {none: [/\boutput\b/i]},
         cpp: {none: [/\boutput\b/i]},
       },
     },
@@ -103,7 +97,6 @@ Requirements:
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -119,7 +112,6 @@ Requirements:
         },
         typescript: {all: [/outbox\.insertOutbox\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/outbox\.Insert\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/], none: [/case\s+\w+\s*:\s*KafkaException/]},
         cpp: {all: [/outbox::insert_outbox\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -406,93 +398,6 @@ func publishResult(ctx context.Context, sample samples.ScoredSample) (bool, erro
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-
-import evals.{Config, Outbox, ScoredSample}
-
-object ResultPublisher {
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Publish one scored sample for the results warehouse; true when the event is on its way. */
-  def publishResult(sample: ScoredSample): Boolean = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val event = ujson.write(
-      ujson.Obj(
-        "run_id" -> sample.run_id,
-        "sample_id" -> sample.sample_id,
-        "model_version" -> sample.model_version,
-        "score" -> sample.score,
-        "passed" -> (sample.score >= Config.PassScore),
-        "output" -> sample.output
-      )
-    )
-    System.err.println(s"eval sample run=\${sample.run_id} sample=\${sample.sample_id} output=\${sample.output}")
-    try {
-      producer.send(new ProducerRecord[String, String](Config.Topic, sample.sample_id, event))
-      true
-    } catch {
-      case _: KafkaException =>
-        Outbox.insertOutbox(event)
-        false
-    }
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import evals.{Config, Outbox, ScoredSample}
-
-object ResultPublisher {
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Publish one scored sample for the results warehouse; true once the broker acknowledged it. */
-  def publishResult(sample: ScoredSample): Boolean = {
-    val event = ujson.write(
-      ujson.Obj(
-        "run_id" -> sample.run_id,
-        "sample_id" -> sample.sample_id,
-        "model_version" -> sample.model_version,
-        "score" -> sample.score,
-        "passed" -> (sample.score >= Config.PassScore),
-        "judge" -> sample.judge
-      )
-    )
-    val record = new ProducerRecord[String, String](Config.Topic, sample.run_id, event)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay republishes the row, so the warehouse is late, not short.
-      Outbox.insertOutbox(event)
-      System.err.println(s"eval.sample not acknowledged run=\${sample.run_id} sample=\${sample.sample_id}")
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

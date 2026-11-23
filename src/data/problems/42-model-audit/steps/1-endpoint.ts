@@ -52,7 +52,6 @@ be rewritten after the fact.
         python: {all: [/@app\.post\(\s*["']\/v1\/audit\/decisions["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/audit\/decisions['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/audit\/decisions"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"audit"\s*\/\s*"decisions"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/audit\/decisions"/]},
       },
     },
@@ -65,7 +64,6 @@ be rewritten after the fact.
         python: {all: [/x-tenant-id/i, /\b401\b/], none: [/body(\.get\(|\[)\s*["']tenant["']/]},
         typescript: {all: [/x-tenant-id/i, /code\(401\)/], none: [/body\.tenant\b|body\[['"]tenant['"]\]/]},
         go: {all: [/Header\.Get\("X-Tenant-Id"\)/, /StatusUnauthorized/], none: [/body\["tenant"\]/]},
-        scala: {all: [/"X-Tenant-Id"/, /Unauthorized/], none: [/body\.(getOrElse|get)\(\s*"tenant"/]},
         cpp: {all: [/get_header_value\(\s*"X-Tenant-Id"\s*\)/, /\b401\b/], none: [/body\.value\(\s*"tenant"/]},
       },
     },
@@ -78,7 +76,6 @@ be rewritten after the fact.
         python: {all: [/is_digest\(/, /\b400\b/], none: [/\*\*body\b/, /dict\(body\)/]},
         typescript: {all: [/isDigest\(/, /code\(400\)/], none: [/\.\.\.body\b/]},
         go: {all: [/digest\.IsDigest\(/, /StatusBadRequest|\b400\b/], none: [/fields\s*:=\s*body\b/]},
-        scala: {all: [/Digest\.isDigest\(/, /BadRequest/], none: [/Ledger\.insert\(\s*tenant,\s*body\b/]},
         cpp: {all: [/digest::isDigest\(/, /\b400\b/], none: [/fields\s*=\s*body\s*;/]},
       },
     },
@@ -91,7 +88,6 @@ be rewritten after the fact.
         python: {all: [/ledger\.last_recorded_at\(/, /time\.time\(\)/], none: [/["']timestamp["']/]},
         typescript: {all: [/lastRecordedAt\(/, /Date\.now\(\)/], none: [/\btimestamp\b/]},
         go: {all: [/ledger\.LastRecordedAt\(/, /time\.Now\(\)/], none: [/"timestamp"/]},
-        scala: {all: [/Ledger\.lastRecordedAt\(/, /System\.currentTimeMillis\(\)/], none: [/"timestamp"/]},
         cpp: {all: [/ledger::lastRecordedAt\(/, /system_clock::now\(\)/], none: [/"timestamp"/]},
       },
     },
@@ -104,7 +100,6 @@ be rewritten after the fact.
         python: {all: [/\b405\b/], none: [/ledger\.update\(/]},
         typescript: {all: [/code\(405\)/], none: [/\bupdate\(/]},
         go: {all: [/StatusMethodNotAllowed|\b405\b/], none: [/ledger\.Update\(/]},
-        scala: {all: [/MethodNotAllowed/], none: [/Ledger\.update\(/]},
         cpp: {all: [/\b405\b/], none: [/ledger::update\(/]},
       },
     },
@@ -373,109 +368,6 @@ func register(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /v1/audit/decisions/{id}", noEdits)
 	mux.HandleFunc("PATCH /v1/audit/decisions/{id}", noEdits)
 	mux.HandleFunc("DELETE /v1/audit/decisions/{id}", noEdits)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import audit.Ledger // Ledger.insert, get, update, lastRecordedAt, toJson
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** A request body as field name to text (a number as its digits). */
-  private def fields(raw: String): Map[String, String] = raw.parseJson.asJsObject.fields.collect {
-    case (name, JsString(s)) => name -> s
-    case (name, JsNumber(n)) => name -> n.toBigInt.toString
-  }
-
-  val route: Route = concat(
-    path("v1" / "audit" / "decisions") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { header =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val body = fields(raw)
-            val tenant = body.getOrElse("tenant", header.getOrElse(""))
-            val recordedAt = body.getOrElse("timestamp", System.currentTimeMillis().toString)
-            val record = Ledger.insert(tenant, body + ("recorded_at" -> recordedAt))
-            complete(json(StatusCodes.Created, Ledger.toJson(record)))
-          }
-        }
-      }
-    },
-    path("v1" / "audit" / "decisions" / Segment) { recordId =>
-      patch {
-        entity(as[String]) { raw =>
-          Ledger.update(recordId, fields(raw)) match {
-            case Some(record) => complete(json(StatusCodes.OK, Ledger.toJson(record)))
-            case None => complete(StatusCodes.NotFound -> "no such record")
-          }
-        }
-      }
-    },
-  )
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import audit.{Digest, Ledger} // Digest.isDigest; Ledger.insert, get, update, lastRecordedAt, toJson
-
-object Api {
-  val TextFields: Seq[String] = Seq("model_version", "policy_id")
-  val DigestFields: Seq[String] = Seq("input_digest", "decision_digest")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** A request body as field name to text (a number as its digits). */
-  private def fields(raw: String): Map[String, String] = raw.parseJson.asJsObject.fields.collect {
-    case (name, JsString(s)) => name -> s
-    case (name, JsNumber(n)) => name -> n.toBigInt.toString
-  }
-
-  /** The first field that is missing or malformed. */
-  private def invalid(body: Map[String, String]): Option[String] =
-    TextFields.find(name => body.getOrElse(name, "").isEmpty).orElse(DigestFields.find(name => !Digest.isDigest(body.getOrElse(name, ""))))
-
-  private val appendOnly = json(StatusCodes.MethodNotAllowed, JsObject("error" -> JsString("audit records are append-only")))
-
-  val route: Route = concat(
-    path("v1" / "audit" / "decisions") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-          case Some(tenant) =>
-            entity(as[String]) { raw =>
-              val body = fields(raw)
-              invalid(body) match {
-                case Some(name) => complete(json(StatusCodes.BadRequest, JsObject("error" -> JsString(s"$name is missing or malformed"))))
-                case None =>
-                  // Digests only: whatever else the caller sent (a prompt, the decision text) never reaches the ledger.
-                  val kept = (TextFields ++ DigestFields).map(name => name -> body(name)).toMap
-                  // The server's clock, never the caller's, and strictly after the tenant's last record.
-                  val recordedAt = math.max(System.currentTimeMillis(), Ledger.lastRecordedAt(tenant) + 1)
-                  complete(json(StatusCodes.Created, Ledger.toJson(Ledger.insert(tenant, kept + ("recorded_at" -> recordedAt.toString)))))
-              }
-            }
-        }
-      }
-    },
-    // The trail is append-only: a correction is a new record, not an edit of an old one.
-    path("v1" / "audit" / "decisions" / Segment) { _ =>
-      (put | patch | delete) {
-        complete(appendOnly)
-      }
-    },
-  )
 }
 `,
     },

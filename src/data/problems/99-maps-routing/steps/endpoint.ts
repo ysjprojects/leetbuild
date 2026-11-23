@@ -58,7 +58,6 @@ tenant, and a trip outside the tenant's map, which gets a route its data cannot 
         python: {all: [/@app\.post\(\s*["']\/v1\/routes["']/, /save_route\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/routes['"]/, /saveRoute\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/routes"/, /routes\.SaveRoute\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"routes"\s*\)/, /Routes\.saveRoute\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/routes"/, /routes::saveRoute\(/]},
       },
     },
@@ -71,7 +70,6 @@ tenant, and a trip outside the tenant's map, which gets a route its data cannot 
         python: {all: [/x-tenant-id/i, /\b401\b/]},
         typescript: {all: [/x-tenant-id/i, /\b401\b/]},
         go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/X-Tenant-Id/i, /StatusCodes\.Unauthorized|\b401\b/]},
         cpp: {all: [/X-Tenant-Id/i, /\b401\b/]},
       },
     },
@@ -84,7 +82,6 @@ tenant, and a trip outside the tenant's map, which gets a route its data cannot 
         python: {all: [/math\.isfinite\(|isfinite\(/, /\b90\b/, /\b180\b/]},
         typescript: {all: [/Number\.isFinite\(/, /\b90\b/, /\b180\b/]},
         go: {all: [/math\.IsNaN\(|math\.IsInf\(/, /\b90\b/, /\b180\b/]},
-        scala: {all: [/\.isNaN|\.isInfinite|isFinite/, /\b90\b/, /\b180\b/]},
         cpp: {all: [/std::isfinite\(|std::isnan\(/, /\b90\b/, /\b180\b/]},
       },
     },
@@ -106,10 +103,6 @@ tenant, and a trip outside the tenant's map, which gets a route its data cannot 
           all: [/len\(body\.Waypoints\)\s*>\s*(maxWaypoints|MaxWaypoints|25)/],
           order: [/len\(body\.Waypoints\)\s*>/, /cache\.CachedRoute\(/],
         },
-        scala: {
-          all: [/waypoints\.(length|size)\s*>\s*(MaxWaypoints|25)/],
-          order: [/waypoints\.(length|size)\s*>/, /RouteCache\.cachedRoute\(/],
-        },
         cpp: {
           all: [/waypoints\.size\(\)\s*>\s*(kMaxWaypoints|25)|\["waypoints"\]\.size\(\)\s*>/],
           order: [/\.size\(\)\s*>\s*(kMaxWaypoints|25)/, /cache::cachedRoute\(/],
@@ -127,10 +120,6 @@ tenant, and a trip outside the tenant's map, which gets a route its data cannot 
         go: {
           all: [/coverage\.Covers\(/, /OUT_OF_COVERAGE/, /StatusForbidden|\b403\b/],
           order: [/coverage\.Covers\(/, /cache\.CachedRoute\(/],
-        },
-        scala: {
-          all: [/Coverage\.covers\(/, /OUT_OF_COVERAGE/, /StatusCodes\.Forbidden|\b403\b/],
-          order: [/Coverage\.covers\(/, /RouteCache\.cachedRoute\(/],
         },
         cpp: {
           all: [/coverage::covers\(/, /OUT_OF_COVERAGE/, /\b403\b/],
@@ -447,101 +436,6 @@ func createRoute(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/routes", createRoute)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import mapsd.{Engine, Geo, RouteCache, Routes} // RouteCache.cachedRoute, Engine.NoRoute, Routes.saveRoute
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def point(value: JsValue): Geo.Point = {
-    val f = value.asJsObject.fields
-    Geo.Point(f("lat").asInstanceOf[JsNumber].value.toDouble, f("lng").asInstanceOf[JsNumber].value.toDouble)
-  }
-
-  val route: Route = path("v1" / "routes") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val tenant = tenantHeader.getOrElse("")
-          val body = raw.parseJson.asJsObject.fields
-          val origin = point(body("origin"))
-          val destination = point(body("destination"))
-          val waypoints = body.get("waypoints").map(_.asInstanceOf[JsArray].elements.map(point)).getOrElse(Vector.empty)
-          try {
-            val computed = RouteCache.cachedRoute(origin, destination, waypoints)
-            val routeId = Routes.saveRoute(tenant, computed)
-            complete(json(StatusCodes.Created, JsObject(Geo.toJson(computed).fields + ("route_id" -> JsString(routeId)))))
-          } catch {
-            case _: Engine.NoRoute => complete(error(StatusCodes.UnprocessableEntity, "NO_ROUTE"))
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import mapsd.{Coverage, Engine, Geo, RouteCache, Routes} // RouteCache.cachedRoute, Coverage.covers, Engine.NoRoute, Routes.saveRoute
-
-object Api {
-  val MaxWaypoints = 25
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def point(value: JsValue): Geo.Point = {
-    val f = value.asJsObject.fields
-    Geo.Point(f("lat").asInstanceOf[JsNumber].value.toDouble, f("lng").asInstanceOf[JsNumber].value.toDouble)
-  }
-
-  private def valid(p: Geo.Point): Boolean =
-    !p.lat.isNaN && !p.lat.isInfinite && !p.lng.isNaN && !p.lng.isInfinite && math.abs(p.lat) <= 90 && math.abs(p.lng) <= 180
-
-  val route: Route = path("v1" / "routes") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-        case Some(tenant) =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject.fields
-            val origin = point(body("origin"))
-            val destination = point(body("destination"))
-            val waypoints = body.get("waypoints").map(_.asInstanceOf[JsArray].elements.map(point)).getOrElse(Vector.empty)
-            val points = origin +: waypoints :+ destination
-            // The cheap refusals first: the solver is the expensive part, and every tenant shares it.
-            if (waypoints.length > MaxWaypoints) complete(error(StatusCodes.UnprocessableEntity, s"at most $MaxWaypoints waypoints"))
-            else if (!points.forall(valid)) complete(error(StatusCodes.UnprocessableEntity, "every point needs a finite lat within ±90 and lng within ±180"))
-            else if (!points.forall(p => Coverage.covers(tenant, p))) complete(error(StatusCodes.Forbidden, "OUT_OF_COVERAGE"))
-            else
-              try {
-                val computed = RouteCache.cachedRoute(origin, destination, waypoints)
-                val routeId = Routes.saveRoute(tenant, computed)
-                complete(json(StatusCodes.Created, JsObject(Geo.toJson(computed).fields + ("route_id" -> JsString(routeId)))))
-              } catch {
-                case _: Engine.NoRoute => complete(error(StatusCodes.UnprocessableEntity, "NO_ROUTE"))
-              }
-          }
-      }
-    }
-  }
 }
 `,
     },

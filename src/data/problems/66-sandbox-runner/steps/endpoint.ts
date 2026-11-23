@@ -48,7 +48,6 @@ same code twice.
         python: {all: [/@app\.post\(\s*["']\/v1\/sandbox\/jobs["']/, /\b202\b/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/sandbox\/jobs['"]/, /\b202\b/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/sandbox\/jobs"/, /StatusAccepted|\b202\b/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"sandbox"\s*\/\s*"jobs"\s*\)/, /Accepted/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/sandbox\/jobs"/, /\b202\b/]},
       },
     },
@@ -80,15 +79,6 @@ same code twice.
           ],
           none: [/"anonymous"/],
         },
-        scala: {
-          all: [
-            /MaxCodeBytes[^\n]*=\s*(1\s*<<\s*18|262144|256\s*\*\s*1024)/,
-            /getBytes/,
-            /PayloadTooLarge|\b413\b/,
-            /Unauthorized/,
-          ],
-          none: [/"anonymous"/],
-        },
         cpp: {
           all: [
             /kMaxCodeBytes[^\n]*=\s*(1\s*<<\s*18|262144|256\s*\*\s*1024)/,
@@ -109,7 +99,6 @@ same code twice.
         python: {all: [/ALLOWED_PROFILES/, /PROFILE_CAPABILITIES\[/, /\b400\b/]},
         typescript: {all: [/ALLOWED_PROFILES/, /PROFILE_CAPABILITIES\[/, /\b400\b/]},
         go: {all: [/allowedProfiles/, /profileCapabilities\[/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/AllowedProfiles/, /ProfileCapabilities\(/, /BadRequest/]},
         cpp: {all: [/kAllowedProfiles/, /kProfileCapabilities\.(at|find)\(|kProfileCapabilities\[/, /\b400\b/]},
       },
     },
@@ -127,10 +116,6 @@ same code twice.
         go: {
           all: [/Idempotency-Key/i, /jobs\.Lookup\(/, /jobs\.Remember\(/],
           order: [/jobs\.Lookup\(/, /jobs\.Create\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Jobs\.lookup\(/, /Jobs\.remember\(/],
-          order: [/Jobs\.lookup\(/, /Jobs\.create\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /jobs::lookup\(/, /jobs::remember\(/],
@@ -392,96 +377,6 @@ func submit(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/sandbox/jobs", submit)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import sandbox.Jobs // Jobs.create, get, lookup, remember
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(fields: Map[String, JsValue], name: String, default: String): String =
-    fields.get(name).collect { case JsString(s) => s }.getOrElse(default)
-
-  val route: Route = path("v1" / "sandbox" / "jobs") {
-    post {
-      // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-      optionalHeaderValueByName("X-Tenant-Id") { header =>
-        entity(as[String]) { raw =>
-          val tenant = header.getOrElse("anonymous")
-          val body = raw.parseJson.asJsObject.fields
-          val needs = body.get("needs").collect { case JsArray(items) => items.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
-          val job = Jobs.create(tenant, text(body, "profile", "runc"), needs, text(body, "code", ""))
-          complete(json(StatusCodes.Accepted, JsObject("job_id" -> JsString(job.jobId), "profile" -> JsString(job.profile), "code_digest" -> JsString(job.codeDigest))))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import sandbox.Jobs // Jobs.create, get, lookup, remember
-
-object Api {
-  val MaxCodeBytes: Int = 1 << 18 // 256 KiB
-  val AllowedProfiles: Seq[String] = Seq("runc", "gvisor", "kata")
-  // Default deny: a profile grants exactly these capabilities, and nothing a submit merely declares.
-  val ProfileCapabilities: Map[String, Set[String]] =
-    Map("runc" -> Set("filesystem"), "gvisor" -> Set("filesystem", "subprocess"), "kata" -> Set("filesystem", "subprocess", "network"))
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def text(fields: Map[String, JsValue], name: String): String =
-    fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  private def submit(tenant: String, key: String, raw: String): HttpResponse = {
-    val body = raw.parseJson.asJsObject.fields
-    val code = text(body, "code")
-    val profile = text(body, "profile")
-    val needs = body.get("needs").collect { case JsArray(items) => items.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
-    if (code.isEmpty) error(StatusCodes.BadRequest, "code is required")
-    else if (code.getBytes("UTF-8").length > MaxCodeBytes) error(StatusCodes.PayloadTooLarge, s"code is larger than $MaxCodeBytes bytes")
-    else if (!AllowedProfiles.contains(profile)) error(StatusCodes.BadRequest, s"unknown profile $profile")
-    else
-      needs.find(need => !ProfileCapabilities(profile).contains(need)) match {
-        case Some(denied) => error(StatusCodes.BadRequest, s"profile $profile does not grant $denied")
-        case None =>
-          // A retried submit answers the job it created the first time.
-          val job = Jobs.lookup(tenant, key).flatMap(Jobs.get).getOrElse {
-            val created = Jobs.create(tenant, profile, needs, code)
-            Jobs.remember(tenant, key, created.jobId)
-            created
-          }
-          json(StatusCodes.Accepted, JsObject("job_id" -> JsString(job.jobId), "profile" -> JsString(job.profile), "code_digest" -> JsString(job.codeDigest)))
-      }
-  }
-
-  val route: Route = path("v1" / "sandbox" / "jobs") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-        case Some(tenant) =>
-          optionalHeaderValueByName("Idempotency-Key") {
-            case None | Some("") => complete(error(StatusCodes.BadRequest, "Idempotency-Key is required"))
-            case Some(key) => entity(as[String])(raw => complete(submit(tenant, key, raw)))
-          }
-      }
-    }
-  }
 }
 `,
     },

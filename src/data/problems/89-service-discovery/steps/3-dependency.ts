@@ -52,12 +52,11 @@ service Health { rpc Check(HealthCheckRequest) returns (HealthCheckResponse); } 
       id: 'probe-deadline',
       title: 'Every probe carries a 200 ms deadline',
       detail:
-        'Each `Check` call is made with its own `PROBE_DEADLINE_S` (0.2 s; `PROBE_DEADLINE_MS`, `probeDeadline`, `ProbeDeadlineMs`, `kProbeDeadline`), so a hung instance is `NOT_SERVING` after 200 ms while two instances that each answer in 150 ms are both `SERVING`. The starter waits as long as the instance hangs and then calls it healthy.',
+        'Each `Check` call is made with its own `PROBE_DEADLINE_S` (0.2 s; `PROBE_DEADLINE_MS`, `probeDeadline`, `kProbeDeadline`), so a hung instance is `NOT_SERVING` after 200 ms while two instances that each answer in 150 ms are both `SERVING`. The starter waits as long as the instance hangs and then calls it healthy.',
       match: {
         python: {all: [/PROBE_DEADLINE_S\s*=\s*0\.2\b/, /\.Check\([\s\S]{0,200}?timeout\s*=\s*PROBE_DEADLINE_S/]},
         typescript: {all: [/PROBE_DEADLINE_MS\s*=\s*200\b/, /deadline:\s*Date\.now\(\)\s*\+\s*PROBE_DEADLINE_MS/]},
         go: {all: [/probeDeadline\s*=\s*200\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*probeDeadline\)/]},
-        scala: {all: [/ProbeDeadlineMs\s*=\s*200L?\b/, /withDeadlineAfter\(\s*ProbeDeadlineMs/]},
         cpp: {all: [/kProbeDeadline\{200\}/, /set_deadline\([^\n]*kProbeDeadline\)/]},
       },
     },
@@ -70,7 +69,6 @@ service Health { rpc Check(HealthCheckRequest) returns (HealthCheckResponse); } 
         python: {all: [/HealthCheckResponse\.SERVING/]},
         typescript: {all: [/\.status\s*===\s*['"]SERVING['"]/]},
         go: {all: [/HealthCheckResponse_SERVING/]},
-        scala: {all: [/ServingStatus\.SERVING/]},
         cpp: {all: [/HealthCheckResponse::SERVING/]},
       },
     },
@@ -83,7 +81,6 @@ service Health { rpc Check(HealthCheckRequest) returns (HealthCheckResponse); } 
         python: {all: [/r\.get\(|instances\.verdict\(/, /ex\s*=\s*PROBE_TTL_S/]},
         typescript: {all: [/redis\.get\(|instances\.verdict\(/, /['"]EX['"]\s*,\s*PROBE_TTL_S/]},
         go: {all: [/rdb\.Get\(|instances\.Verdict\(/, /rdb\.Set\([^\n]*probeTTL\)/]},
-        scala: {all: [/jedis\.get\(|Instances\.verdict\(/, /\.ex\(\s*ProbeTtlS/]},
         cpp: {all: [/redis\.get\(|instances::verdict\(/, /redis\.set\([^\n]*kProbeTtl\)/]},
       },
     },
@@ -96,7 +93,6 @@ service Health { rpc Check(HealthCheckRequest) returns (HealthCheckResponse); } 
         python: {all: [/instances\.members\(/], none: [/\.delete\(/, /\.srem\(/]},
         typescript: {all: [/instances\.members\(/], none: [/redis\.del\(/, /redis\.srem\(/]},
         go: {all: [/instances\.Members\(/], none: [/rdb\.Del\(/, /rdb\.SRem\(/]},
-        scala: {all: [/Instances\.members\(/], none: [/jedis\.del\(/, /jedis\.srem\(/]},
         cpp: {all: [/instances::members\(/], none: [/redis\.del\(/, /redis\.srem\(/]},
       },
     },
@@ -487,93 +483,6 @@ func probeService(ctx context.Context, service string) (map[string]string, error
 		verdicts[id] = verdict
 	}
 	return verdicts, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-
-import discovery.Instances // Instances.members, lookup, recordKey, membersKey, verdictKey
-import discoveryd.service_discovery.{HealthCheckRequest, HealthGrpc}
-
-object Probe {
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val stubs = scala.collection.mutable.Map.empty[String, HealthGrpc.HealthBlockingStub]
-
-  private def stub(target: String): HealthGrpc.HealthBlockingStub =
-    stubs.getOrElseUpdate(target, HealthGrpc.blockingStub(ManagedChannelBuilder.forTarget(target).usePlaintext().build()))
-
-  /** Ask the instance at address:port whether it can take traffic: SERVING or NOT_SERVING. */
-  def checkHealth(service: String, instance: Instances.Instance): String =
-    try {
-      stub(s"\${instance.address}:\${instance.port}").check(HealthCheckRequest(service))
-      "SERVING"
-    } catch { case _: StatusRuntimeException => "NOT_SERVING" }
-
-  /** The verdict for every live member of service. */
-  def probeService(service: String): Map[String, String] = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    Instances.members(service).flatMap { instanceId =>
-      Instances.lookup(service, instanceId).map { instance =>
-        val verdict = checkHealth(service, instance)
-        jedis.set(Instances.verdictKey(service, instanceId), verdict)
-        if (verdict != "SERVING") {
-          jedis.del(Instances.recordKey(service, instanceId))
-          jedis.srem(Instances.membersKey(service), instanceId)
-        }
-        instanceId -> verdict
-      }
-    }.toMap
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import discovery.Instances // Instances.members, lookup, recordKey, membersKey, verdictKey
-import discoveryd.service_discovery.{HealthCheckRequest, HealthCheckResponse, HealthGrpc}
-
-object Probe {
-  val ProbeDeadlineMs = 200L
-  val ProbeTtlS = 5L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val stubs = scala.collection.mutable.Map.empty[String, HealthGrpc.HealthBlockingStub]
-
-  private def stub(target: String): HealthGrpc.HealthBlockingStub =
-    stubs.getOrElseUpdate(target, HealthGrpc.blockingStub(ManagedChannelBuilder.forTarget(target).usePlaintext().build()))
-
-  /** Ask the instance at address:port whether it can take traffic: SERVING or NOT_SERVING. */
-  def checkHealth(service: String, instance: Instances.Instance): String =
-    try {
-      val reply = stub(s"\${instance.address}:\${instance.port}")
-        .withDeadlineAfter(ProbeDeadlineMs, TimeUnit.MILLISECONDS)
-        .check(HealthCheckRequest(service))
-      // Alive is not ready: a draining instance answers, and answers NOT_SERVING.
-      if (reply.status == HealthCheckResponse.ServingStatus.SERVING) "SERVING" else "NOT_SERVING"
-    } catch { case _: StatusRuntimeException => "NOT_SERVING" } // DEADLINE_EXCEEDED, UNAVAILABLE
-
-  /** The verdict for every live member of service. */
-  def probeService(service: String): Map[String, String] =
-    Instances.members(service).flatMap { instanceId =>
-      // A lapsed record has nobody to ask: the expiry sweep announces it.
-      Instances.lookup(service, instanceId).map { instance =>
-        val key = Instances.verdictKey(service, instanceId)
-        val verdict = Option(jedis.get(key)).getOrElse {
-          // One probe per instance per ProbeTtlS for every router; the TTL is also the retry.
-          val fresh = checkHealth(service, instance)
-          jedis.set(key, fresh, SetParams.setParams().ex(ProbeTtlS))
-          fresh
-        }
-        instanceId -> verdict
-      }
-    }.toMap
 }
 `,
     },

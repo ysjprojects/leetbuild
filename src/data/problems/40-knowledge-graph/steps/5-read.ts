@@ -48,9 +48,6 @@ itself included; and a hub with thousands of neighbours answers all of them.
         python: {all: [/@app\.get\(\s*["']\/v1\/entities\/\{entity_id\}\/neighbors["']/, /read_neighbors\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/entities\/:\w+\/neighbors['"]/, /readNeighbors\(/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/entities\/\{\w+\}\/neighbors"/, /adjacency\.ReadNeighbors\(/]},
-        scala: {
-          all: [/path\(\s*"v1"\s*\/\s*"entities"\s*\/\s*Segment\s*\/\s*"neighbors"\s*\)/, /Adjacency\.readNeighbors\(/],
-        },
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/entities\/[^"]*\/neighbors\)"/, /adjacency::readNeighbors\(/]},
       },
     },
@@ -63,7 +60,6 @@ itself included; and a hub with thousands of neighbours answers all of them.
         python: {all: [/\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*\w+\[["']tenant["']\]/, /\b404\b/]},
         typescript: {all: [/\.tenant\s*!==\s*tenant|tenant\s*!==\s*\w+\.tenant/, /code\(\s*404\s*\)/]},
         go: {all: [/\.Tenant\s*!=\s*tenant|tenant\s*!=\s*\w+\.Tenant/, /StatusNotFound|\b404\b/]},
-        scala: {all: [/\.tenant\s*==\s*tenant|tenant\s*==\s*\w+\.tenant/, /StatusCodes\.NotFound/]},
         cpp: {all: [/->tenant\s*!=\s*tenant|tenant\s*!=\s*\w+->tenant/, /\b404\b/]},
       },
     },
@@ -76,7 +72,6 @@ itself included; and a hub with thousands of neighbours answers all of them.
         python: {all: [/MAX_DEPTH\s*=\s*2\b/, /\b400\b/]},
         typescript: {all: [/MAX_DEPTH\s*=\s*2\b/, /code\(\s*400\s*\)/]},
         go: {all: [/maxDepth\s*=\s*2\b/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/MaxDepth\s*=\s*2\b/, /StatusCodes\.BadRequest/]},
         cpp: {all: [/kMaxDepth\s*=\s*2\b/, /\b400\b/]},
       },
     },
@@ -89,7 +84,6 @@ itself included; and a hub with thousands of neighbours answers all of them.
         python: {all: [/visited/, /frontier/], none: [/walk\(\s*neighbor/]},
         typescript: {all: [/visited/, /frontier/], none: [/walk\(\s*neighbor/]},
         go: {all: [/visited/, /frontier/], none: [/walk\(\s*neighbor/]},
-        scala: {all: [/visited/, /frontier/], none: [/walk\(\s*neighbor/]},
         cpp: {all: [/visited/, /frontier/], none: [/walk\(\s*neighbor/]},
       },
     },
@@ -102,7 +96,6 @@ itself included; and a hub with thousands of neighbours answers all of them.
         python: {all: [/MAX_RESULTS\s*=\s*500\b/, /len\(\w+\)\s*(==|>=)\s*MAX_RESULTS/]},
         typescript: {all: [/MAX_RESULTS\s*=\s*500\b/, /\.length\s*(===|>=)\s*MAX_RESULTS/]},
         go: {all: [/maxResults\s*=\s*500\b/, /len\(\w+\)\s*(==|>=)\s*maxResults/]},
-        scala: {all: [/MaxResults\s*=\s*500\b/, /\.size\s*(==|>=)\s*MaxResults/]},
         cpp: {all: [/kMaxResults\s*=\s*500\b/, /\.size\(\)\s*(==|>=)\s*kMaxResults/]},
       },
     },
@@ -429,118 +422,6 @@ func neighbors(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/entities/{id}/neighbors", neighbors)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import graph.{Adjacency, Store} // Adjacency.readNeighbors, Store.getEntity
-
-object Read {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def read(tenant: String, entityId: String, raw: Option[String]): HttpResponse =
-    Store.getEntity(entityId) match {
-      case None => json(StatusCodes.NotFound, JsObject("error" -> JsString("no such entity")))
-      case Some(_) =>
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        val depth = raw.map(_.toInt).getOrElse(2)
-        val found = scala.collection.mutable.ListBuffer.empty[JsObject]
-        def walk(node: String, distance: Int): Unit =
-          if (distance <= depth) Adjacency.readNeighbors(node).foreach { neighbor =>
-            found += JsObject("id" -> JsString(neighbor), "distance" -> JsNumber(distance))
-            walk(neighbor, distance + 1)
-          }
-        walk(entityId, 1)
-        json(
-          StatusCodes.OK,
-          JsObject("entity_id" -> JsString(entityId), "depth" -> JsNumber(depth), "neighbors" -> JsArray(found.toVector), "truncated" -> JsBoolean(false)))
-    }
-
-  val route: Route = path("v1" / "entities" / Segment / "neighbors") { entityId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-        case Some(tenant)    => parameter("depth".optional) { raw => complete(read(tenant, entityId, raw)) }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import scala.collection.mutable
-
-import graph.{Adjacency, Store} // Adjacency.readNeighbors, Store.getEntity
-
-object Read {
-  val MaxDepth = 2
-  val MaxResults = 500
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** Breadth-first from entityId: each entity once, at its shortest distance, at most MaxResults. */
-  def walk(entityId: String, depth: Int): (List[JsObject], Boolean) = {
-    val found = mutable.ListBuffer.empty[JsObject]
-    val visited = mutable.Set(entityId)
-    var frontier = List(entityId)
-    var truncated = false
-    var distance = 1
-    while (distance <= depth && !truncated) {
-      val next = mutable.ListBuffer.empty[String]
-      val nodes = frontier.iterator
-      while (nodes.hasNext && !truncated) {
-        val ids = Adjacency.readNeighbors(nodes.next()).iterator
-        while (ids.hasNext && !truncated) {
-          val neighbor = ids.next()
-          if (!visited.contains(neighbor)) {
-            if (found.size == MaxResults) truncated = true
-            else {
-              visited += neighbor
-              found += JsObject("id" -> JsString(neighbor), "distance" -> JsNumber(distance))
-              next += neighbor
-            }
-          }
-        }
-      }
-      frontier = next.toList
-      distance += 1
-    }
-    (found.toList, truncated)
-  }
-
-  private def read(tenant: String, entityId: String, raw: Option[String]): HttpResponse =
-    Store.getEntity(entityId).filter(_.tenant == tenant) match {
-      // Another tenant's entity is as absent as one that never existed.
-      case None => json(StatusCodes.NotFound, JsObject("error" -> JsString("no such entity")))
-      case Some(_) =>
-        raw.getOrElse("1").toIntOption.filter(d => d >= 1 && d <= MaxDepth) match {
-          case None => json(StatusCodes.BadRequest, JsObject("error" -> JsString(s"depth must be between 1 and $MaxDepth")))
-          case Some(depth) =>
-            val (found, truncated) = walk(entityId, depth)
-            json(
-              StatusCodes.OK,
-              JsObject("entity_id" -> JsString(entityId), "depth" -> JsNumber(depth), "neighbors" -> JsArray(found.toVector), "truncated" -> JsBoolean(truncated)))
-        }
-    }
-
-  val route: Route = path("v1" / "entities" / Segment / "neighbors") { entityId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-        case Some(tenant)    => parameter("depth".optional) { raw => complete(read(tenant, entityId, raw)) }
-      }
-    }
-  }
 }
 `,
     },

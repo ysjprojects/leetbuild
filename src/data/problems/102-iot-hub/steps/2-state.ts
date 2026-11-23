@@ -51,7 +51,6 @@ instances handling two reports of one device at once can leave the older report 
         python: {all: [/def update_desired\(/, /\.hset\(\s*desired_key\(/], none: [/\.delete\(\s*desired_key\(/]},
         typescript: {all: [/function updateDesired\(/, /\.hset\(\s*desiredKey\(/], none: [/\.del\(\s*desiredKey\(/]},
         go: {all: [/func updateDesired\(/, /\.HSet\([^\n]*desiredKey\(/], none: [/\.Del\([^\n]*desiredKey\(/]},
-        scala: {all: [/def updateDesired\(/, /\.hset\(\s*desiredKey\(/], none: [/\.del\(\s*desiredKey\(/]},
         cpp: {all: [/updateDesired\(/, /\.hset\(\s*desiredKey\(/], none: [/\.del\(\s*desiredKey\(/]},
       },
     },
@@ -64,7 +63,6 @@ instances handling two reports of one device at once can leave the older report 
         python: {all: [/["']desired_version["']/, /["']reported_version["']/], none: [/["']version["']/]},
         typescript: {all: [/["']desired_version["']/, /["']reported_version["']/], none: [/["']version["']/]},
         go: {all: [/["']desired_version["']/, /["']reported_version["']/], none: [/["']version["']/]},
-        scala: {all: [/["']desired_version["']/, /["']reported_version["']/], none: [/["']version["']/]},
         cpp: {all: [/["']desired_version["']/, /["']reported_version["']/], none: [/["']version["']/]},
       },
     },
@@ -85,10 +83,6 @@ instances handling two reports of one device at once can leave the older report 
         go: {
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]HGET['"]/],
           none: [/func applyReport(?:(?!\n\})[\s\S])*?\.HGet\(/],
-        },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HGET['"]/],
-          none: [/def applyReport(?:(?!\n {2}def |\n {2}\/\*\*)[\s\S])*?\.hget\(/],
         },
         cpp: {
           all: [/\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HGET['"]/],
@@ -431,100 +425,6 @@ func readShadow(ctx context.Context, deviceID string) (*Shadow, error) {
 	s.DesiredVersion, _ = strconv.ParseInt(versions["desired_version"], 10, 64)
 	s.ReportedVersion, _ = strconv.ParseInt(versions["reported_version"], 10, 64)
 	return s, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object ShadowState {
-  /** Both documents and both versions of one device. */
-  final case class ShadowView(desired: Map[String, String], reported: Map[String, String], desiredVersion: Long, reportedVersion: Long)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def shadowKey(deviceId: String): String = s"shadow:$deviceId"
-  def desiredKey(deviceId: String): String = s"shadow:$deviceId:desired"
-  def reportedKey(deviceId: String): String = s"shadow:$deviceId:reported"
-
-  /** Apply an operator's patch to the desired document; the new desired version. */
-  def updateDesired(deviceId: String, patch: Map[String, String]): Long = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    jedis.del(desiredKey(deviceId))
-    jedis.hset(desiredKey(deviceId), patch.asJava)
-    jedis.hincrBy(shadowKey(deviceId), "version", 1L)
-  }
-
-  /** The device's whole reported state at version; ignored unless newer than the stored report. */
-  def applyReport(deviceId: String, reported: Map[String, String], version: Long): Boolean = {
-    val stored = Option(jedis.hget(shadowKey(deviceId), "version")).map(_.toLong).getOrElse(0L)
-    if (version <= stored) false
-    else {
-      jedis.del(reportedKey(deviceId))
-      jedis.hset(reportedKey(deviceId), reported.asJava)
-      jedis.hset(shadowKey(deviceId), "version", version.toString)
-      true
-    }
-  }
-
-  /** Both documents and both versions. */
-  def readShadow(deviceId: String): ShadowView = {
-    val version = Option(jedis.hget(shadowKey(deviceId), "version")).map(_.toLong).getOrElse(0L)
-    ShadowView(jedis.hgetAll(desiredKey(deviceId)).asScala.toMap, jedis.hgetAll(reportedKey(deviceId)).asScala.toMap, version, version)
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object ShadowState {
-  /** Both documents and both versions of one device. */
-  final case class ShadowView(desired: Map[String, String], reported: Map[String, String], desiredVersion: Long, reportedVersion: Long)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** KEYS[1] shadow:{id}, KEYS[2] shadow:{id}:reported; ARGV[1] the report's version, then field, value pairs. */
-  val ReportLua: String =
-    """local stored = tonumber(redis.call('HGET', KEYS[1], 'reported_version') or '0')
-      |if tonumber(ARGV[1]) <= stored then return 0 end
-      |redis.call('DEL', KEYS[2])
-      |for i = 2, #ARGV, 2 do
-      |  redis.call('HSET', KEYS[2], ARGV[i], ARGV[i + 1])
-      |end
-      |redis.call('HSET', KEYS[1], 'reported_version', ARGV[1])
-      |return 1
-      |""".stripMargin
-
-  def shadowKey(deviceId: String): String = s"shadow:$deviceId"
-  def desiredKey(deviceId: String): String = s"shadow:$deviceId:desired"
-  def reportedKey(deviceId: String): String = s"shadow:$deviceId:reported"
-
-  /** Apply an operator's patch to the desired document; the new desired version. */
-  def updateDesired(deviceId: String, patch: Map[String, String]): Long = {
-    // A patch names the fields that change; the rest of the operator's document stays.
-    jedis.hset(desiredKey(deviceId), patch.asJava)
-    jedis.hincrBy(shadowKey(deviceId), "desired_version", 1L)
-  }
-
-  /** The device's whole reported state at version; ignored unless newer than the stored report. */
-  def applyReport(deviceId: String, reported: Map[String, String], version: Long): Boolean = {
-    // Read, compare and write in one script: no other report can land in between.
-    val args = version.toString :: reported.toList.flatMap { case (field, value) => List(field, value) }
-    jedis.eval(ReportLua, List(shadowKey(deviceId), reportedKey(deviceId)).asJava, args.asJava).asInstanceOf[java.lang.Long] == 1L
-  }
-
-  /** Both documents and both versions. */
-  def readShadow(deviceId: String): ShadowView = {
-    val versions = jedis.hgetAll(shadowKey(deviceId)).asScala
-    ShadowView(
-      jedis.hgetAll(desiredKey(deviceId)).asScala.toMap,
-      jedis.hgetAll(reportedKey(deviceId)).asScala.toMap,
-      versions.get("desired_version").map(_.toLong).getOrElse(0L),
-      versions.get("reported_version").map(_.toLong).getOrElse(0L))
-  }
 }
 `,
     },

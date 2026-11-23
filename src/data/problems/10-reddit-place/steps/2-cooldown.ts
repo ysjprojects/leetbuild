@@ -54,7 +54,6 @@ tile was painted.
           all: [/`cooldown:\$\{user\}`|['"]cooldown:['"]\s*\+\s*user/, /COOLDOWN_S\s*=\s*300|['"]EX['"]\s*,\s*300/],
         },
         go: {all: [/"cooldown:"\s*\+\s*user/, /cooldown\s*=\s*300\s*\*\s*time\.Second|300\s*\*\s*time\.Second/]},
-        scala: {all: [/s"cooldown:\$\{?user\}?"/, /CooldownSeconds\s*=\s*300L?|\.ex\(\s*300/]},
         cpp: {all: [/"cooldown:"\s*\+\s*user/, /kCooldownS\{?\s*\(?\s*300|seconds\{?\(?\s*300/]},
       },
     },
@@ -77,7 +76,6 @@ tile was painted.
           none: [/\bredis\.(get|exists|mget)\(/],
         },
         go: {all: [/rdb\.SetNX\(\s*ctx\s*,\s*key\s*,[^\n]*cooldown\)/], none: [/rdb\.(Get|Exists)\(/]},
-        scala: {all: [/\.nx\(\)/, /\.ex\(\s*(CooldownSeconds|300)/], none: [/jedis\.(get|exists)\(/]},
         cpp: {all: [/UpdateType::NOT_EXIST/, /kCooldownS/], none: [/redis\.(get|exists)\(/]},
       },
     },
@@ -102,11 +100,6 @@ tile was painted.
             /rdb\.SetRange\(\s*ctx\s*,\s*boardKey\s*,\s*int64\(\s*(y\s*\*\s*size\s*\+\s*x|x\s*\+\s*y\s*\*\s*size|size\s*\*\s*y\s*\+\s*x|x\s*\+\s*size\s*\*\s*y)\s*\)\s*,\s*string\(\s*\[\]byte\{\s*byte\(\s*color\s*\)/,
           ],
         },
-        scala: {
-          all: [
-            /jedis\.setrange\(\s*BoardKey\.getBytes\s*,\s*\(?\s*(y\s*\*\s*Size\s*\+\s*x|x\s*\+\s*y\s*\*\s*Size|Size\s*\*\s*y\s*\+\s*x|x\s*\+\s*Size\s*\*\s*y)\s*\)?(\.toLong)?\s*,\s*Array\[Byte\]\(\s*color\.toByte\s*\)/,
-          ],
-        },
         cpp: {
           all: [
             /redis\.setrange\(\s*kBoardKey\s*,\s*(y\s*\*\s*kSize\s*\+\s*x|x\s*\+\s*y\s*\*\s*kSize|kSize\s*\*\s*y\s*\+\s*x|x\s*\+\s*kSize\s*\*\s*y)\s*,\s*std::string\(\s*1\s*,\s*static_cast<char>\(\s*color\s*\)/,
@@ -123,7 +116,6 @@ tile was painted.
         python: {all: [/\br\.ttl\(/, /max\(\s*1\s*,/]},
         typescript: {all: [/\bredis\.ttl\(/, /Math\.max\(\s*1\s*,/]},
         go: {all: [/rdb\.TTL\(/, /math\.Max\(\s*1\s*,|Ceil\(/]},
-        scala: {all: [/jedis\.ttl\(/, /math\.max\(\s*1L?\s*,/]},
         cpp: {all: [/redis\.ttl\(/, /std::max\(\s*(1L|1LL|1|\{1\})/]},
       },
     },
@@ -135,7 +127,6 @@ tile was painted.
         python: {order: [/\.set\(/, /\.setrange\(/]},
         typescript: {order: [/\.set\(/, /\.setrange\(/]},
         go: {order: [/rdb\.SetNX\(/, /rdb\.SetRange\(/]},
-        scala: {order: [/jedis\.set\(/, /jedis\.setrange\(/]},
         cpp: {order: [/redis\.set\(/, /redis\.setrange\(/]},
       },
     },
@@ -274,47 +265,6 @@ func placeTile(ctx context.Context, user string, x, y, color int) (int, error) {
 	}
 	// One byte, in place, no read: SETRANGE zero-fills a fresh key up to the offset.
 	return 0, rdb.SetRange(ctx, boardKey, int64(y*size+x), string([]byte{byte(color)})).Err()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-object Cooldown {
-  val Size = 100
-  val BoardKey = "board"
-  val CooldownSeconds = 300L // one tile per user per five minutes
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Paints (x, y) for user unless they are on cooldown; returns the seconds left to wait, 0 = painted. */
-  def placeTile(user: String, x: Int, y: Int, color: Int): Int = {
-    val key = s"cooldown:$user"
-    // TODO: jedis.set(key, "1", SetParams.setParams().nx().ex(CooldownSeconds)) — null → max(1, ttl(key))
-    // TODO: jedis.setrange(BoardKey.getBytes, y * Size + x, Array[Byte](color.toByte)); 0
-    ???
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-object Cooldown {
-  val Size = 100
-  val BoardKey = "board"
-  val CooldownSeconds = 300L // one tile per user per five minutes
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Paints (x, y) for user unless they are on cooldown; returns the seconds left to wait, 0 = painted. */
-  def placeTile(user: String, x: Int, y: Int, color: Int): Int = {
-    val key = s"cooldown:$user"
-    val claimed = jedis.set(key, "1", SetParams.setParams().nx().ex(CooldownSeconds)) // "OK" or null
-    if (claimed == null) math.max(1L, jedis.ttl(key)).toInt // the key exists: still on cooldown
-    else {
-      jedis.setrange(BoardKey.getBytes, (y * Size + x).toLong, Array[Byte](color.toByte)) // one byte, in place
-      0
-    }
-  }
 }
 `,
     },

@@ -52,7 +52,6 @@ Requirements:
         python: {all: [/@app\.post\(\s*["']\/v1\/distill\/jobs["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/distill\/jobs['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/distill\/jobs"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"distill"\s*\/\s*"jobs"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/distill\/jobs"/]},
       },
     },
@@ -65,7 +64,6 @@ Requirements:
         python: {all: [/APPROVED_TEACHERS/, /status_code\s*=\s*400/]},
         typescript: {all: [/APPROVED_TEACHERS/, /code\(\s*400\s*\)/]},
         go: {all: [/approvedTeachers/, /StatusBadRequest/]},
-        scala: {all: [/ApprovedTeachers/, /StatusCodes\.BadRequest/]},
         cpp: {all: [/kApprovedTeachers/, /\b400\b/]},
       },
     },
@@ -78,7 +76,6 @@ Requirements:
         python: {all: [/MIN_SAMPLE_CAP/, /MAX_SAMPLE_CAP/, /status_code\s*=\s*400/]},
         typescript: {all: [/MIN_SAMPLE_CAP/, /MAX_SAMPLE_CAP/, /code\(\s*400\s*\)/]},
         go: {all: [/minSampleCap/, /maxSampleCap/, /StatusBadRequest/]},
-        scala: {all: [/MinSampleCap/, /MaxSampleCap/, /StatusCodes\.BadRequest/]},
         cpp: {all: [/kMinSampleCap/, /kMaxSampleCap/, /\b400\b/]},
       },
     },
@@ -91,7 +88,6 @@ Requirements:
         python: {all: [/Idempotency-Key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
         typescript: {all: [/idempotency-key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
         go: {all: [/Idempotency-Key/, /jobs\.Get\(/, /jobs\.Put\(\s*[\w.()]+,\s*tenant\s*,\s*idem/]},
-        scala: {all: [/Idempotency-Key/, /Jobs\.get\(\s*tenant\s*,/, /Jobs\.put\(\s*tenant\s*,\s*idem/]},
         cpp: {all: [/Idempotency-Key/, /jobs::get\(\s*tenant\s*,/, /jobs::put\(\s*tenant\s*,\s*idem/]},
       },
     },
@@ -104,7 +100,6 @@ Requirements:
         python: {order: [/[<>]=?\s*MAX_SAMPLE_CAP|MAX_SAMPLE_CAP\s*[<>]|le\s*=\s*MAX_SAMPLE_CAP/, /store\.put\(/]},
         typescript: {order: [/[<>]=?\s*MAX_SAMPLE_CAP|MAX_SAMPLE_CAP\s*[<>]/, /store\.put\(/]},
         go: {order: [/[<>]=?\s*maxSampleCap|maxSampleCap\s*[<>]/, /jobs\.Put\(/]},
-        scala: {order: [/[<>]=?\s*MaxSampleCap|MaxSampleCap\s*[<>]/, /Jobs\.put\(/]},
         cpp: {order: [/[<>]=?\s*kMaxSampleCap|kMaxSampleCap\s*[<>]/, /jobs::put\(/]},
       },
     },
@@ -449,118 +444,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import distill.{Job, Jobs}
-
-final case class JobRequest(teacher: String, dataset_id: String, sample_cap: Int)
-
-object DistillApi {
-  implicit val system: ActorSystem = ActorSystem("distill-pipeline")
-  implicit val requestFormat: RootJsonFormat[JobRequest] = jsonFormat3(JobRequest)
-  implicit val jobFormat: RootJsonFormat[Job] = jsonFormat8(Job)
-
-  val route: Route =
-    path("v1" / "distill" / "jobs") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[JobRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else {
-              val tenant = tenantOpt.get
-              val job = Job(UUID.randomUUID().toString, "queued", body.teacher, body.dataset_id, body.sample_cap, 0, 0, 0)
-              Jobs.put(tenant, job.job_id, job)
-              system.log.info(s"distill job=\${job.job_id} teacher=\${job.teacher} cap=\${job.sample_cap}")
-              complete(StatusCodes.Created, job)
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import distill.{Job, Jobs}
-
-final case class JobRequest(teacher: String, dataset_id: String, sample_cap: Int)
-
-object DistillApi {
-  implicit val system: ActorSystem = ActorSystem("distill-pipeline")
-  implicit val requestFormat: RootJsonFormat[JobRequest] = jsonFormat3(JobRequest)
-  implicit val jobFormat: RootJsonFormat[Job] = jsonFormat8(Job)
-
-  val MinSampleCap = 100
-  val MaxSampleCap = 10000
-  val ApprovedTeachers = Set("teach-70b-v3", "teach-13b-v2")
-
-  val route: Route =
-    path("v1" / "distill" / "jobs") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[JobRequest]) { body =>
-              if (!tenantOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              } else if (!idemOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-              } else if (!ApprovedTeachers.contains(body.teacher)) {
-                complete(StatusCodes.BadRequest, """{"error":"teacher is not in the approved catalog"}""")
-              } else if (body.dataset_id.isEmpty) {
-                complete(StatusCodes.BadRequest, """{"error":"dataset_id is required"}""")
-              } else if (body.sample_cap < MinSampleCap || body.sample_cap > MaxSampleCap) {
-                complete(StatusCodes.BadRequest, """{"error":"sample_cap must be 100..10000"}""")
-              } else {
-                val tenant = tenantOpt.get
-                val idemKey = idemOpt.get
-                Jobs.get(tenant, idemKey) match {
-                  case Some(stored) =>
-                    complete(StatusCodes.OK, stored.job)
-                  case None =>
-                    val job =
-                      Job(UUID.randomUUID().toString, "queued", body.teacher, body.dataset_id, body.sample_cap, 0, 0, 0)
-                    Jobs.put(tenant, idemKey, job)
-                    system.log.info(s"distill job=\${job.job_id} teacher=\${job.teacher} cap=\${job.sample_cap}")
-                    complete(StatusCodes.Created, job)
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

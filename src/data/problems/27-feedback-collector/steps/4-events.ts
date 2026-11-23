@@ -26,7 +26,7 @@ later does not reach the outbox.
   bytes; no \`comment\`.
 - The producer uses \`acks=all\` (kafkajs \`acks: -1\`, kafka-go \`RequireAll\`).
 - A refused delivery, as the delivery report gives it (\`on_delivery\`, the rejected \`send\`, the
-  returned write error, \`dr_cb\`, the \`Callback\`), goes to \`store.insert_outbox\`;
+  returned write error, \`dr_cb\`), goes to \`store.insert_outbox\`;
   \`publish_recorded\` does not raise.`,
   sequence: {
     participants: ['feedbackd', 'feedback.recorded', 'outbox', 'Quality consumer'],
@@ -60,10 +60,6 @@ later does not reach the outbox.
         },
         typescript: {all: [/key:\s*row\.tenant\b/], none: [/key:\s*row\.request_id\b/]},
         go: {all: [/Key:\s*\[\]byte\(\s*row\.Tenant\s*\)/], none: [/Key:\s*\[\]byte\(\s*row\.RequestID\s*\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(\s*Topic\s*,\s*row\.tenant\s*,/],
-          none: [/Topic\s*,\s*row\.requestId/],
-        },
         cpp: {
           all: [/produce\([\s\S]{0,400}?row\.tenant\.(c_str|data)\(\)/],
           none: [/produce\([\s\S]{0,400}?row\.request_id\.(c_str|data)\(\)/],
@@ -82,7 +78,6 @@ later does not reach the outbox.
           none: [/\bcomment:\s*row\.comment/],
         },
         go: {all: [/comment_fingerprint/, /sha256\.Sum256\(/], none: [/json:"comment"/]},
-        scala: {all: [/comment_fingerprint/, /SHA-256/], none: [/"comment"\s*->/]},
         cpp: {all: [/comment_fingerprint/, /sha256_hex\(/], none: [/\{"comment",/]},
       },
     },
@@ -95,7 +90,6 @@ later does not reach the outbox.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/]},
         typescript: {all: [/acks:\s*-1/], none: [/acks:\s*[01]\b/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"acks",\s*"(all|-1)"/]},
         cpp: {all: [/"acks",\s*"(all|-1)"/]},
       },
     },
@@ -111,7 +105,6 @@ later does not reach the outbox.
         },
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(|\.catch\(/]},
         go: {all: [/store\.InsertOutbox\(/]},
-        scala: {all: [/Store\.insertOutbox\(/, /onCompletion/], none: [/case\s+\w+:\s*KafkaException/]},
         cpp: {all: [/store::insertOutbox\(/, /dr_cb/]},
       },
     },
@@ -359,90 +352,6 @@ func publishRecorded(ctx context.Context, row store.Feedback) error {
 		return store.InsertOutbox(ctx, event)
 	}
 	return nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import feedback.Store // Store.Feedback, insertOutbox
-
-object Events {
-  val Topic = "feedback.recorded"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** Produce one feedback.recorded event for a stored, attributed feedback row; returns the event. */
-  def publishRecorded(row: Store.Feedback): JsObject = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val event = JsObject(
-      "feedback_id" -> JsString(row.feedbackId),
-      "tenant" -> JsString(row.tenant),
-      "request_id" -> JsString(row.requestId),
-      "rating" -> JsNumber(row.rating),
-      "model_version" -> JsString(row.modelVersion),
-      "prompt_version" -> JsString(row.promptVersion),
-      "route" -> JsString(row.route),
-      "comment" -> JsString(row.comment))
-    try {
-      producer.send(new ProducerRecord[String, String](Topic, row.requestId, event.compactPrint))
-    } catch {
-      case e: KafkaException =>
-        Store.insertOutbox(event.compactPrint)
-        System.err.println(s"feedback.recorded produce failed feedback=\${row.feedbackId}: \${e.getMessage}")
-    }
-    event
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-import java.security.MessageDigest
-import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import feedback.Store // Store.Feedback, insertOutbox
-
-object Events {
-  val Topic = "feedback.recorded"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all") // the event counts once every in-sync replica has it
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** Produce one feedback.recorded event for a stored, attributed feedback row; returns the event. */
-  def publishRecorded(row: Store.Feedback): JsObject = {
-    val fingerprint = MessageDigest.getInstance("SHA-256").digest(row.comment.getBytes(UTF_8)).map("%02x".format(_)).mkString
-    val event = JsObject(
-      "feedback_id" -> JsString(row.feedbackId),
-      "tenant" -> JsString(row.tenant),
-      "request_id" -> JsString(row.requestId),
-      "rating" -> JsNumber(row.rating),
-      "model_version" -> JsString(row.modelVersion),
-      "prompt_version" -> JsString(row.promptVersion),
-      "route" -> JsString(row.route),
-      "comment_fingerprint" -> JsString(fingerprint))
-    val toOutbox = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) {
-          Store.insertOutbox(event.compactPrint) // the broker refused it: the relay produces it later
-          System.err.println(s"feedback.recorded produce failed feedback=\${row.feedbackId}: \${exception.getMessage}")
-        }
-    }
-    producer.send(new ProducerRecord[String, String](Topic, row.tenant, event.compactPrint), toOutbox)
-    event
-  }
 }
 `,
     },

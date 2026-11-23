@@ -2,10 +2,9 @@
  * Hand-written support modules the cdn-purge steps import but no step builds: `purge.records`, the
  * purge records in Redis. The intake (step 1) creates a record and queues it, the status read
  * (step 5) reads it back, the provider client's outcomes and the propagation confirmations land in
- * it, and the event step (step 4) parks refused events in its outbox. The five languages keep the
+ * it, and the event step (step 4) parks refused events in its outbox. The four languages keep the
  * same keys, so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'purge/__init__.py': '',
@@ -485,104 +484,5 @@ inline std::vector<nlohmann::json> outbox() {
 }
 
 }  // namespace records
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('purge', 'Records')]: `package purge
-
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The purge records (provided). purge:{id} is a hash (purge_id, tenant, domain, accepted_at in unix
- * seconds); purge:{id}:paths holds the paths in request order; purge:{id}:outcomes each path's
- * outcome (pending, accepted, invalid_pattern, failed, propagated); purge:{id}:confirmed the unix
- * second each path's propagation was confirmed. tenant:{tenant}:domains is the set of domains a
- * tenant owns, purge:key:{tenant}:{key} the purge an Idempotency-Key created, purge:queue the purges
- * waiting for the provider client, and purge:outbox the events a relay still has to publish.
- */
-object Records {
-  final case class Purge(
-      purgeId: String,
-      tenant: String,
-      domain: String,
-      acceptedAt: Long,
-      paths: Seq[String],
-      outcomes: Map[String, String],
-      confirmed: Map[String, Long]
-  )
-
-  val KeyTtlS = 86400L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Record that the tenant owns the domain. */
-  def addDomain(tenant: String, domain: String): Unit = jedis.sadd(s"tenant:$tenant:domains", domain)
-
-  /** Whether the domain is one of the tenant's. */
-  def ownsDomain(tenant: String, domain: String): Boolean = jedis.sismember(s"tenant:$tenant:domains", domain)
-
-  /** A new purge, accepted now: every path pending, the purge queued for the provider client. */
-  def create(tenant: String, domain: String, paths: Seq[String]): Purge = {
-    val purgeId = s"pg-\${jedis.incr("purge:seq")}"
-    val acceptedAt = System.currentTimeMillis() / 1000
-    jedis.hset(s"purge:$purgeId", Map("purge_id" -> purgeId, "tenant" -> tenant, "domain" -> domain, "accepted_at" -> acceptedAt.toString).asJava)
-    if (paths.nonEmpty) {
-      jedis.rpush(s"purge:$purgeId:paths", paths: _*)
-      jedis.hset(s"purge:$purgeId:outcomes", paths.map(_ -> "pending").toMap.asJava)
-    }
-    jedis.rpush("purge:queue", purgeId)
-    get(purgeId).get
-  }
-
-  /** The purge, if it exists. */
-  def get(purgeId: String): Option[Purge] = {
-    val raw = jedis.hgetAll(s"purge:$purgeId").asScala.toMap
-    if (raw.isEmpty) None
-    else
-      Some(
-        Purge(
-          raw("purge_id"),
-          raw("tenant"),
-          raw("domain"),
-          raw("accepted_at").toLong,
-          jedis.lrange(s"purge:$purgeId:paths", 0, -1).asScala.toSeq,
-          jedis.hgetAll(s"purge:$purgeId:outcomes").asScala.toMap,
-          jedis.hgetAll(s"purge:$purgeId:confirmed").asScala.toMap.map { case (path, at) => path -> at.toLong }
-        )
-      )
-  }
-
-  /** The id of the purge the tenant's Idempotency-Key created, if any. */
-  def purgeForKey(tenant: String, key: String): Option[String] = Option(jedis.get(s"purge:key:$tenant:$key"))
-
-  /** Record which purge the tenant's Idempotency-Key created (kept for a day). */
-  def rememberKey(tenant: String, key: String, purgeId: String): Unit =
-    jedis.set(s"purge:key:$tenant:$key", purgeId, SetParams.setParams().ex(KeyTtlS))
-
-  /** The ids of the purges waiting for the provider client, oldest first. */
-  def queued(): Seq[String] = jedis.lrange("purge:queue", 0, -1).asScala.toSeq
-
-  /** Record the provider client's outcome for each path. */
-  def setOutcomes(purgeId: String, outcomes: Map[String, String]): Unit =
-    if (outcomes.nonEmpty) jedis.hset(s"purge:$purgeId:outcomes", outcomes.asJava)
-
-  /** The provider confirmed the path gone from every edge at unix second at. */
-  def confirm(purgeId: String, path: String, at: Long): Unit = {
-    jedis.hset(s"purge:$purgeId:outcomes", path, "propagated")
-    jedis.hset(s"purge:$purgeId:confirmed", path, at.toString)
-  }
-
-  /** Park an event the broker did not take: a relay publishes it later. */
-  def insertOutbox(topic: String, key: String, payload: JsObject): Unit =
-    jedis.rpush("purge:outbox", JsObject("topic" -> JsString(topic), "key" -> JsString(key), "payload" -> payload).compactPrint)
-
-  /** The parked events, oldest first. */
-  def outbox(): Seq[JsObject] = jedis.lrange("purge:outbox", 0, -1).asScala.toSeq.map(_.parseJson.asJsObject)
-}
 `,
 };

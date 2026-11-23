@@ -50,7 +50,6 @@ count it; an abandoned upload stays in Redis forever.
         python: {all: [/HSETNX|HEXISTS|hsetnx|hexists/]},
         typescript: {all: [/HSETNX|HEXISTS|hsetnx|hexists/]},
         go: {all: [/HSETNX|HEXISTS|HSetNX|HExists/]},
-        scala: {all: [/HSETNX|HEXISTS|hsetnx|hexists/]},
         cpp: {all: [/HSETNX|HEXISTS|hsetnx|hexists/]},
       },
     },
@@ -63,7 +62,6 @@ count it; an abandoned upload stays in Redis forever.
         python: {all: [/return\s+-1\b/]},
         typescript: {all: [/return\s+-1\b/]},
         go: {all: [/return\s+-1\b/]},
-        scala: {all: [/return\s+-1\b|\b-1L\b/]},
         cpp: {all: [/return\s+-1\b/]},
       },
     },
@@ -71,12 +69,11 @@ count it; an abandoned upload stays in Redis forever.
       id: 'atomic',
       title: 'Registers a part in one Lua script',
       detail:
-        'The check, the hash write and the counter run in one script (`register_script`/`eval`, `defineCommand`, `NewScript`, `jedis.eval`, `redis.eval`), so a reader between two commands cannot see a part without its bytes and a second server cannot count the same part; nothing writes the hash or the counter outside it.',
+        'The check, the hash write and the counter run in one script (`register_script`/`eval`, `defineCommand`, `NewScript`, `redis.eval`), so a reader between two commands cannot see a part without its bytes and a second server cannot count the same part; nothing writes the hash or the counter outside it.',
       match: {
         python: {all: [/register_script\(|\.eval\(/, /INCRBY/], none: [/\br\.(hset|hsetnx|incrby)\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /INCRBY/], none: [/redis\.(hset|hsetnx|incrby)\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /INCRBY/], none: [/\.(HSet|HSetNX|IncrBy)\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /INCRBY/], none: [/jedis\.(hset|hsetnx|incrBy)\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /INCRBY/], none: [/redis\.(hset|hsetnx|incrby)\(/]},
       },
     },
@@ -89,7 +86,6 @@ count it; an abandoned upload stays in Redis forever.
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]/i, /MANIFEST_TTL_S/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]/i, /MANIFEST_TTL_S/]},
         go: {all: [/redis\.call\(\s*['"]EXPIRE['"]/i, /manifestTTL/]},
-        scala: {all: [/redis\.call\(\s*['"]EXPIRE['"]/i, /ManifestTtlSeconds/]},
         cpp: {all: [/redis\.call\(\s*['"]EXPIRE['"]/i, /kManifestTtlSeconds/]},
       },
     },
@@ -400,82 +396,6 @@ func uploadedBytes(ctx context.Context, uploadID string) (int64, error) {
 		return 0, nil
 	}
 	return n, err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  final case class Part(partNumber: Int, size: Long, checksum: String)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def partsKey(uploadId: String): String = s"upload:$uploadId:parts"
-  def bytesKey(uploadId: String): String = s"upload:$uploadId:bytes"
-
-  /** 1: registered; 0: already registered; -1: partNumber outside 1..partCount. */
-  def registerPart(uploadId: String, partNumber: Int, partCount: Int, size: Long, checksum: String): Long = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    jedis.hset(partsKey(uploadId), partNumber.toString, s"$size:$checksum")
-    jedis.incrBy(bytesKey(uploadId), size)
-    1L
-  }
-
-  /** The registered parts, by part number. */
-  def readParts(uploadId: String): Seq[Part] =
-    jedis.hgetAll(partsKey(uploadId)).asScala.toSeq.map { case (number, value) =>
-      val (size, checksum) = value.splitAt(value.indexOf(':'))
-      Part(number.toInt, size.toLong, checksum.drop(1))
-    }.sortBy(_.partNumber)
-
-  /** The bytes of the registered parts. */
-  def uploadedBytes(uploadId: String): Long = Option(jedis.get(bytesKey(uploadId))).map(_.toLong).getOrElse(0L)
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  final case class Part(partNumber: Int, size: Long, checksum: String)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  val ManifestTtlSeconds: Long = 24L * 60 * 60
-
-  /** KEYS: parts hash, byte counter. ARGV: part number, part count, size, checksum, TTL. */
-  val RegisterPartLua: String =
-    """local n = tonumber(ARGV[1])
-      |if n < 1 or n > tonumber(ARGV[2]) then return -1 end
-      |if redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[3] .. ':' .. ARGV[4]) == 0 then return 0 end
-      |redis.call('INCRBY', KEYS[2], ARGV[3])
-      |redis.call('EXPIRE', KEYS[1], ARGV[5])
-      |redis.call('EXPIRE', KEYS[2], ARGV[5])
-      |return 1
-      |""".stripMargin
-
-  def partsKey(uploadId: String): String = s"upload:$uploadId:parts"
-  def bytesKey(uploadId: String): String = s"upload:$uploadId:bytes"
-
-  /** 1: registered; 0: already registered; -1: partNumber outside 1..partCount. */
-  def registerPart(uploadId: String, partNumber: Int, partCount: Int, size: Long, checksum: String): Long = {
-    // One script: no client sees the part without its bytes, and a retried part is counted once.
-    val args = List(partNumber.toString, partCount.toString, size.toString, checksum, ManifestTtlSeconds.toString).asJava
-    jedis.eval(RegisterPartLua, List(partsKey(uploadId), bytesKey(uploadId)).asJava, args).asInstanceOf[java.lang.Long]
-  }
-
-  /** The registered parts, by part number. */
-  def readParts(uploadId: String): Seq[Part] =
-    jedis.hgetAll(partsKey(uploadId)).asScala.toSeq.map { case (number, value) =>
-      val (size, checksum) = value.splitAt(value.indexOf(':'))
-      Part(number.toInt, size.toLong, checksum.drop(1))
-    }.sortBy(_.partNumber)
-
-  /** The bytes of the registered parts. */
-  def uploadedBytes(uploadId: String): Long = Option(jedis.get(bytesKey(uploadId))).map(_.toLong).getOrElse(0L)
 }
 `,
     },

@@ -53,7 +53,6 @@ so duplicates *will* arrive. Implement the consumer in group **\`ledger\`** so e
         python: {all: [/"group\.id"\s*:\s*"ledger"/, /"enable\.auto\.commit"\s*:\s*False/]},
         typescript: {all: [/groupId:\s*['"]ledger['"]/, /autoCommit:\s*false/]},
         go: {all: [/GroupID:\s*"ledger"/, /reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
-        scala: {all: [/"group\.id"\s*,\s*"ledger"/, /"enable\.auto\.commit"\s*,\s*"false"/]},
         cpp: {all: [/"group\.id"\s*,\s*"ledger"/, /"enable\.auto\.commit"\s*,\s*"false"/]},
       },
     },
@@ -78,7 +77,6 @@ so duplicates *will* arrive. Implement the consumer in group **\`ledger\`** so e
           ],
         },
         go: {all: [/"applied:"\s*\+/, /rdb\.SetNX\(\s*[\w.()]+\s*,\s*\w+\s*,[^\n]*appliedTTL\s*\)/]},
-        scala: {all: [/s"applied:\$/, /\.nx\(\)/, /\.ex\(\s*AppliedTtlSeconds\s*\)/]},
         cpp: {
           all: [
             /"applied:"\s*\+/,
@@ -96,7 +94,6 @@ so duplicates *will* arrive. Implement the consumer in group **\`ledger\`** so e
         python: {order: [/\.set\(\s*\w+\s*,[^\n]*nx\s*=\s*True/, /ledger\.post\(/]},
         typescript: {order: [/\.set\(\s*\w+\s*,[^\n]*['"]NX['"]/, /ledger\.post\(/]},
         go: {order: [/rdb\.SetNX\(/, /ledger\.Post\(/]},
-        scala: {order: [/jedis\.set\(/, /Ledger\.post\(/]},
         cpp: {order: [/redis\.set\(/, /ledger::post\(/]},
       },
     },
@@ -111,7 +108,6 @@ so duplicates *will* arrive. Implement the consumer in group **\`ledger\`** so e
           order: [/if \(\s*(claimed|\w+)\s*===?\s*null\s*\)|if \(\s*!\w+\s*\)/, /commitOffsets\(/, /ledger\.post\(/],
         },
         go: {order: [/if !\w+/, /reader\.CommitMessages\(/, /ledger\.Post\(/]},
-        scala: {order: [/if \(!\w+\)|==\s*null\)/, /commit\(\s*\w+\s*\)/, /Ledger\.post\(/]},
         cpp: {order: [/if \(!\w+/, /consumer->commitSync\(/, /ledger::post\(/]},
       },
     },
@@ -124,7 +120,6 @@ so duplicates *will* arrive. Implement the consumer in group **\`ledger\`** so e
         python: {order: [/ledger\.post\(/, /consumer\.commit\(/]},
         typescript: {order: [/ledger\.post\(/, /commitOffsets\(/]},
         go: {order: [/ledger\.Post\(/, /reader\.CommitMessages\(/]},
-        scala: {order: [/Ledger\.post\(/, /commit\(\s*\w+\s*\)/]},
         cpp: {order: [/ledger::post\(/, /consumer->commitSync\(/]},
       },
     },
@@ -372,90 +367,6 @@ func run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import payments.Ledger // Ledger.post(event: Ledger.Event): Unit writes the double-entry rows; NOT idempotent
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import scala.jdk.CollectionConverters._
-
-object LedgerConsumer {
-  val jedis = new JedisPooled("redis", 6379)
-  val AppliedTtlSeconds = 604800L // 7 days: longer than any replay window
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "ledger")
-  props.put("auto.offset.reset", "earliest")
-  // TODO: disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("payments").asJava)
-
-  /** Commits this record's offset synchronously. */
-  private def commit(record: ConsumerRecord[String, String]): Unit =
-    consumer.commitSync(
-      Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-
-  def run(): Unit =
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val event = Ledger.Event.fromJson(record.value())
-        // TODO: SET applied:{eventId} 1 NX EX AppliedTtlSeconds; refused → already applied: commit(record) and skip
-        // TODO: Ledger.post(event) (del the claim and rethrow on failure), then commit(record)
-      }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import payments.Ledger // Ledger.post(event: Ledger.Event): Unit writes the double-entry rows; NOT idempotent
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import scala.jdk.CollectionConverters._
-
-object LedgerConsumer {
-  val jedis = new JedisPooled("redis", 6379)
-  val AppliedTtlSeconds = 604800L // 7 days: longer than any replay window
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "ledger")
-  props.put("auto.offset.reset", "earliest")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("payments").asJava)
-
-  /** Commits this record's offset synchronously. */
-  private def commit(record: ConsumerRecord[String, String]): Unit =
-    consumer.commitSync(
-      Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-
-  def run(): Unit =
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val event = Ledger.Event.fromJson(record.value())
-        val key = s"applied:\${event.eventId}"
-        val claimed = jedis.set(key, "1", SetParams.setParams().nx().ex(AppliedTtlSeconds)) != null
-        if (!claimed) {
-          System.err.println(s"event \${event.eventId} already applied; skipping")
-          commit(record)
-        } else {
-          try Ledger.post(event)
-          catch { case e: Exception => jedis.del(key); throw e } // release the claim: the redelivery must post
-          commit(record)
-        }
-      }
 }
 `,
     },

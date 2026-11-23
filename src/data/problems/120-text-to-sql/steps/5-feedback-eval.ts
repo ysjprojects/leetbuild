@@ -56,7 +56,6 @@ Requirements:
         python: {all: [/key\s*=\s*record\[["']user["']\]/]},
         typescript: {all: [/key:\s*record\.user/]},
         go: {all: [/Key:\s*\[\]byte\(\s*rec\.User\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*Config\.Topic\s*,\s*record\.user\s*,/]},
         cpp: {all: [/user\.c_str\(\)\s*,\s*user\.(size|length)\(\)/]},
       },
     },
@@ -69,7 +68,6 @@ Requirements:
         python: {all: [/["']tables_acked["']\s*:\s*record\[/, /["']has_output["']\s*:\s*record\[/]},
         typescript: {all: [/tables_acked:\s*record\.tables_acked/, /has_output:\s*record\.has_output/]},
         go: {all: [/"tables_acked":\s*rec\.TablesAcked/, /"has_output":\s*rec\.HasOutput/]},
-        scala: {all: [/"tables_acked"\s*->/, /"has_output"\s*->\s*record\.has_output/]},
         cpp: {all: [/\{"tables_acked",\s*record/, /\{"has_output",\s*record/]},
       },
     },
@@ -82,7 +80,6 @@ Requirements:
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["'](all|-1)["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"(all|-1)"/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"(all|-1)"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"(all|-1)"/]},
       },
     },
@@ -95,7 +92,6 @@ Requirements:
         python: {all: [/table_overlap\(/, /["']overlap_milli["']/, /["']has_output["']\s*,\s*int\(/]},
         typescript: {all: [/tableOverlap\(/, /['"]overlap_milli['"]/]},
         go: {all: [/tableOverlap\(/, /"overlap_milli"/]},
-        scala: {all: [/tableOverlap\(/, /"overlap_milli"/]},
         cpp: {all: [/table_overlap\(/, /"overlap_milli"/]},
       },
     },
@@ -108,7 +104,6 @@ Requirements:
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
         go: {order: [/\.HIncrBy\(/, /\.CommitMessage\(/]},
-        scala: {order: [/\.hincrBy\(/, /\.commitSync\(/]},
         cpp: {order: [/\.hincrby\(/, /->commitSync\(/]},
       },
     },
@@ -605,158 +600,6 @@ func runEval(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-
-import scala.concurrent.duration._
-import scala.concurrent.{Await, Promise}
-import scala.jdk.CollectionConverters._
-
-import querygen.{Config, QueryRecord}
-
-object Feedback {
-  val Group = "eval"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** The feedback event for a rated query. */
-  def buildEvent(record: QueryRecord, rating: Int): ujson.Obj =
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    ujson.Obj("query_id" -> record.query_id, "user" -> record.user, "workspace" -> record.workspace, "rating" -> rating)
-
-  /** One event on query.feedback; true once the broker acknowledged it. */
-  def publishFeedback(record: QueryRecord, rating: Int): Boolean = {
-    val delivered = Promise[Boolean]()
-    val report: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit = {
-        if (exception != null) System.err.println(s"feedback for \${record.query_id} not delivered: \${exception.getMessage}")
-        delivered.trySuccess(exception == null)
-      }
-    }
-    producer.send(new ProducerRecord[String, String](Config.Topic, record.query_id, ujson.write(buildEvent(record, rating))), report)
-    producer.flush()
-    Await.result(delivered.future, 2.seconds)
-  }
-
-  /** Fold every feedback event into its workspace's counters. */
-  def runEval(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Config.Topic).asJava)
-    while (true)
-      consumer.poll(java.time.Duration.ofSeconds(1)).asScala.foreach { record =>
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-        val event = ujson.read(record.value())
-        val key = s"eval:\${event("workspace").str}"
-        jedis.hincrBy(key, "queries", 1L)
-        jedis.hincrBy(key, "rating_sum", event("rating").num.toLong)
-      }
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-
-import scala.concurrent.duration._
-import scala.concurrent.{Await, Promise}
-import scala.jdk.CollectionConverters._
-
-import querygen.{Config, QueryRecord}
-
-object Feedback {
-  val Group = "eval"
-
-  // Idempotent with acks=all: a retry after a lost acknowledgement lands once, on every replica.
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all")
-    props.put("enable.idempotence", "true")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private def strings(values: List[String]): ujson.Arr = ujson.Arr.from(values.map(ujson.Str(_)))
-
-  /** The feedback event for a rated query: the rating and the signals that explain it. */
-  def buildEvent(record: QueryRecord, rating: Int): ujson.Obj = ujson.Obj(
-    "query_id" -> record.query_id,
-    "user" -> record.user,
-    "workspace" -> record.workspace,
-    "rating" -> rating,
-    "tables_proposed" -> strings(record.tables_proposed),
-    "tables_acked" -> strings(record.tables_acked),
-    "run_ok" -> record.run_ok,
-    "has_output" -> record.has_output
-  )
-
-  /** One event on query.feedback, keyed by user so one user's feedback stays in order; true once acknowledged. */
-  def publishFeedback(record: QueryRecord, rating: Int): Boolean = {
-    val delivered = Promise[Boolean]()
-    val report: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit = {
-        if (exception != null) System.err.println(s"feedback for \${record.query_id} not delivered: \${exception.getMessage}")
-        delivered.trySuccess(exception == null)
-      }
-    }
-    producer.send(new ProducerRecord[String, String](Config.Topic, record.user, ujson.write(buildEvent(record, rating))), report)
-    producer.flush()
-    Await.result(delivered.future, 2.seconds)
-  }
-
-  /** How much of what the user ACKed the table agent had proposed: |proposed ∩ acked| / |acked|. */
-  def tableOverlap(proposed: Seq[String], acked: Seq[String]): Double = {
-    val ackedSet = acked.toSet
-    if (ackedSet.isEmpty) 0.0 else (proposed.toSet & ackedSet).size.toDouble / ackedSet.size
-  }
-
-  /** Fold every feedback event into its workspace's counters, then commit. */
-  def runEval(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Config.Topic).asJava)
-    while (true)
-      consumer.poll(java.time.Duration.ofSeconds(1)).asScala.foreach { record =>
-        val event = ujson.read(record.value())
-        val key = s"eval:\${event("workspace").str}"
-        val overlap = tableOverlap(event("tables_proposed").arr.map(_.str).toList, event("tables_acked").arr.map(_.str).toList)
-        jedis.hincrBy(key, "queries", 1L)
-        jedis.hincrBy(key, "run_ok", if (event("run_ok").bool) 1L else 0L)
-        jedis.hincrBy(key, "has_output", if (event("has_output").bool) 1L else 0L)
-        jedis.hincrBy(key, "rating_sum", event("rating").num.toLong)
-        jedis.hincrBy(key, "overlap_milli", math.round(1000 * overlap))
-        // After the writes: a crash before this line replays the record instead of losing it.
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-      }
-  }
 }
 `,
     },

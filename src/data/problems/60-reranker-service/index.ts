@@ -6,7 +6,7 @@ import {rerankStateStep} from './steps/2-state';
 import {rerankClientStep} from './steps/3-dependency';
 import {rerankEventsStep} from './steps/4-events';
 import {readStatsStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Reranking service: the course is not "call a cross-encoder and sort", it is the debugging you
@@ -93,6 +93,5 @@ reranked list is correct and whether anyone can tell when it is not.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

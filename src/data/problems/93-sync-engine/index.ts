@@ -6,7 +6,7 @@ import {applyStateStep} from './steps/2-state';
 import {mergeClientStep} from './steps/3-dependency';
 import {changeEventsStep} from './steps/4-events';
 import {pullReadStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Sync engine: the course is not "upload a file to a server", it is the debugging you owe a sync
@@ -94,6 +94,5 @@ logs, tombstones for deleted documents, and the conflict-resolution UI.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

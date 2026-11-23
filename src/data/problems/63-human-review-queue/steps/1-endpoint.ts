@@ -47,7 +47,6 @@ enqueue five items; and user text lands in the queue's retained records.
         python: {all: [/@app\.post\(\s*["']\/v1\/review\/items["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/review\/items['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/review\/items"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"review"\s*\/\s*"items"\s*\)/, /\bpost\b/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/review\/items"/]},
       },
     },
@@ -60,7 +59,6 @@ enqueue five items; and user text lands in the queue's retained records.
         python: {all: [/x-tenant-id/i, /\b401\b/]},
         typescript: {all: [/x-tenant-id/i, /code\(\s*401\s*\)/]},
         go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/X-Tenant-Id/i, /Unauthorized/]},
         cpp: {all: [/X-Tenant-Id/i, /\b401\b/]},
       },
     },
@@ -87,10 +85,6 @@ enqueue five items; and user text lands in the queue's retained records.
           all: [/sourcePriority\s*=/, /sourcePriority\[/, /maxSourceID/, /StatusBadRequest|\b400\b/],
           none: [/json:"priority"/],
         },
-        scala: {
-          all: [/SourcePriority\s*[:=]/, /SourcePriority\.get\(|SourcePriority\(/, /MaxSourceId/, /BadRequest/],
-          none: [/body,\s*"priority"/],
-        },
         cpp: {
           all: [/kSourcePriority\s*=/, /kSourcePriority\.find\(|kSourcePriority\.at\(/, /kMaxSourceId/, /\b400\b/],
           none: [/body\.value\(\s*"priority"/],
@@ -112,10 +106,6 @@ enqueue five items; and user text lands in the queue's retained records.
           all: [/store\.ClaimSource\(/, /"deduped":\s*true/],
           order: [/store\.ClaimSource\(/, /store\.CreateItem\(/],
         },
-        scala: {
-          all: [/Store\.claimSource\(/, /JsBoolean\(true\)/],
-          order: [/Store\.claimSource\(/, /Store\.createItem\(/],
-        },
         cpp: {
           all: [/store::claimSource\(/, /"deduped",\s*true/],
           order: [/store::claimSource\(/, /store::createItem\(/],
@@ -131,7 +121,6 @@ enqueue five items; and user text lands in the queue's retained records.
         python: {all: [/payload_ref/], none: [/payload_text/]},
         typescript: {all: [/payload_ref/], none: [/payload_text/]},
         go: {all: [/PayloadRef/], none: [/PayloadText|payload_text/]},
-        scala: {all: [/payload_ref/], none: [/payload_text/]},
         cpp: {all: [/payload_ref/], none: [/payload_text/]},
       },
     },
@@ -386,104 +375,6 @@ func enqueue(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/review/items", enqueue)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import review.Store // Store.newItemId, claimSource, createItem, getItem
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(body: Map[String, JsValue], name: String, default: String): String =
-    body.get(name).collect { case JsString(s) => s }.getOrElse(default)
-
-  val route: Route =
-    path("v1" / "review" / "items") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val body = raw.parseJson.asJsObject.fields
-            val itemId = Store.newItemId()
-            val item = Store.createItem(Map(
-              "item_id" -> itemId,
-              "tenant" -> tenant.getOrElse(""),
-              "source_type" -> text(body, "source_type", ""),
-              "source_id" -> text(body, "source_id", ""),
-              "priority" -> text(body, "priority", "p3"),
-              "payload_text" -> text(body, "payload_text", "")))
-            complete(json(StatusCodes.Created, JsObject("item_id" -> JsString(itemId), "priority" -> JsString(item("priority")), "deduped" -> JsBoolean(false))))
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import review.Store // Store.newItemId, claimSource, createItem, getItem
-
-object Api {
-  /** The platform's fairness rule: who escalated decides how urgent it is, not the caller. */
-  val SourcePriority: Map[String, String] = Map("guardrail_block" -> "p1", "user_report" -> "p2", "model_output" -> "p3")
-  val MaxSourceId = 128
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def text(body: Map[String, JsValue], name: String, default: String): String =
-    body.get(name).collect { case JsString(s) => s }.getOrElse(default)
-
-  val route: Route =
-    path("v1" / "review" / "items") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-          case Some(tenant) =>
-            entity(as[String]) { raw =>
-              val body = raw.parseJson.asJsObject.fields
-              val sourceType = text(body, "source_type", "")
-              val sourceId = text(body, "source_id", "")
-              val payloadRef = text(body, "payload_ref", "")
-              SourcePriority.get(sourceType) match {
-                case None => complete(error(StatusCodes.BadRequest, s"unknown source_type $sourceType"))
-                case Some(_) if sourceId.isEmpty || sourceId.length > MaxSourceId =>
-                  complete(error(StatusCodes.BadRequest, s"source_id must be 1 to $MaxSourceId characters"))
-                case Some(_) if payloadRef.isEmpty => complete(error(StatusCodes.BadRequest, "payload_ref is required"))
-                case Some(priority) =>
-                  val itemId = Store.newItemId()
-                  Store.claimSource(tenant, sourceType, sourceId, itemId) match {
-                    case Some(existing) =>
-                      // The same source escalated again: answer the item it already is.
-                      val known = Store.getItem(existing).flatMap(_.get("priority")).getOrElse(priority)
-                      complete(json(StatusCodes.OK, JsObject("item_id" -> JsString(existing), "priority" -> JsString(known), "deduped" -> JsBoolean(true))))
-                    case None =>
-                      Store.createItem(Map(
-                        "item_id" -> itemId,
-                        "tenant" -> tenant,
-                        "source_type" -> sourceType,
-                        "source_id" -> sourceId,
-                        "priority" -> priority,
-                        "payload_ref" -> payloadRef))
-                      complete(json(StatusCodes.Created, JsObject("item_id" -> JsString(itemId), "priority" -> JsString(priority), "deduped" -> JsBoolean(false))))
-                  }
-              }
-            }
-        }
-      }
-    }
 }
 `,
     },

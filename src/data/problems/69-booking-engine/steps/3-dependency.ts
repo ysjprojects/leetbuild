@@ -65,7 +65,6 @@ service Calendar {
         python: {all: [/stub\.Sync\([\s\S]{0,300}?timeout\s*=\s*(SYNC_DEADLINE_MS\s*\/\s*1000|3(\.0)?)\b/]},
         typescript: {all: [/\.Sync\([\s\S]{0,300}?deadline:\s*Date\.now\(\)\s*\+\s*(SYNC_DEADLINE_MS|3000)\b/]},
         go: {all: [/context\.WithTimeout\([^\n]*(syncDeadline|3\s*\*\s*time\.Second|3000\s*\*\s*time\.Millisecond)/]},
-        scala: {all: [/withDeadlineAfter\(\s*(SyncDeadlineMs|3000L?|3L?\s*,\s*TimeUnit\.SECONDS)/]},
         cpp: {
           all: [
             /set_deadline\([^\n]*(kSyncDeadline|std::chrono::seconds[({]\s*3\s*[)}]|std::chrono::milliseconds[({]\s*3000\s*[)}]|\b3s\b|\b3000ms\b)/,
@@ -82,7 +81,6 @@ service Calendar {
         python: {all: [/idempotency_key\s*=\s*booking\[["']idempotency_key["']\]/]},
         typescript: {all: [/idempotency_key:\s*booking\.idempotency_key/]},
         go: {all: [/IdempotencyKey:\s*(b|booking)\.IdempotencyKey/]},
-        scala: {all: [/idempotencyKey\s*=\s*booking\.idempotency_key/]},
         cpp: {all: [/set_idempotency_key\(\s*(b|booking)\.idempotency_key\s*\)/]},
       },
     },
@@ -101,7 +99,6 @@ service Calendar {
           order: [/sync_unknown/, /\.GetEvent\(/, /['"]cancelled['"]/],
         },
         go: {all: [/sync_unknown/, /\.GetEvent\(/], order: [/sync_unknown/, /\.GetEvent\(/, /"cancelled"/]},
-        scala: {all: [/sync_unknown/, /\.getEvent\(/], order: [/sync_unknown/, /\.getEvent\(/, /"cancelled"/]},
         cpp: {all: [/sync_unknown/, /->GetEvent\(/], order: [/sync_unknown/, /->GetEvent\(/, /"cancelled"/]},
       },
     },
@@ -114,7 +111,6 @@ service Calendar {
         python: {all: [/INVALID_ARGUMENT/, /PERMISSION_DENIED/, /release_hold\(/, /["']rejected["']/]},
         typescript: {all: [/INVALID_ARGUMENT/, /PERMISSION_DENIED/, /releaseHold\(/, /['"]rejected['"]/]},
         go: {all: [/codes\.InvalidArgument/, /codes\.PermissionDenied/, /releaseHold\(/, /"rejected"/]},
-        scala: {all: [/INVALID_ARGUMENT/, /PERMISSION_DENIED/, /releaseHold\(/, /"rejected"/]},
         cpp: {all: [/INVALID_ARGUMENT/, /PERMISSION_DENIED/, /releaseHold\(/, /"rejected"/]},
       },
     },
@@ -130,7 +126,6 @@ service Calendar {
           none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
         },
         go: {all: [/maxSyncAttempts\s*=\s*3|<\s*3\b|range 3\b/, /codes\.Unavailable/], none: [/for\s*\{/]},
-        scala: {all: [/MaxSyncAttempts\s*=\s*3|<\s*3\b|until 3\b/, /UNAVAILABLE/], none: [/while\s*\(\s*true\s*\)/]},
         cpp: {
           all: [/kMaxSyncAttempts\s*=\s*3|<\s*3\b/, /UNAVAILABLE/],
           none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
@@ -588,129 +583,6 @@ func confirmBooking(ctx context.Context, b *store.Booking) (string, error) {
 		return released(ctx, b, "cancelled")
 	}
 	return "reconciled", confirmed(ctx, b, eventID)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import booking.{Booking, Slots, Store, Tz}
-import booking.calendar.{CalendarGrpc, GetEventRequest, SyncRequest}
-
-object CalendarClient {
-  private val channel = ManagedChannelBuilder.forAddress("calendar", 9000).usePlaintext().build()
-  private val stub = CalendarGrpc.blockingStub(channel)
-
-  private def fields(booking: Booking): Seq[String] =
-    Slots.fields(Tz.parseInstant(booking.start).getOrElse(0L), Tz.parseInstant(booking.end).getOrElse(0L))
-
-  /** One attempt at the calendar; the event id it answers. */
-  def syncEvent(booking: Booking): String =
-    stub
-      .withDeadlineAfter(1000L, TimeUnit.MILLISECONDS)
-      .sync(SyncRequest(bookingId = booking.booking_id, resourceId = booking.resource_id, start = booking.start, end = booking.end))
-      .eventId
-
-  /** The booking becomes a calendar event; returns the booking's final state. */
-  def confirmBooking(booking: Booking): String = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    while (true) {
-      try {
-        val eventId = syncEvent(booking)
-        HoldMap.confirmHold(booking.resource_id, fields(booking), booking.hold_id, booking.booking_id) // step 2
-        Store.setState(booking.booking_id, "confirmed", eventId)
-        return "confirmed"
-      } catch {
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED =>
-          HoldMap.releaseHold(booking.resource_id, fields(booking), booking.hold_id)
-          Store.setState(booking.booking_id, "cancelled")
-          return "cancelled"
-        case _: StatusRuntimeException => ()
-      }
-    }
-    "confirmed"
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import booking.{Booking, Slots, Store, Tz}
-import booking.calendar.{CalendarGrpc, GetEventRequest, SyncRequest}
-
-object CalendarClient {
-  val SyncDeadlineMs = 3000L
-  val MaxSyncAttempts = 3
-  val SyncUnknown = "sync_unknown"
-  private val Retryable = Set(Status.Code.DEADLINE_EXCEEDED, Status.Code.UNAVAILABLE)
-  private val Permanent = Set(Status.Code.INVALID_ARGUMENT, Status.Code.PERMISSION_DENIED)
-
-  private val channel = ManagedChannelBuilder.forAddress("calendar", 9000).usePlaintext().build()
-  private val stub = CalendarGrpc.blockingStub(channel)
-
-  private def fields(booking: Booking): Seq[String] =
-    Slots.fields(Tz.parseInstant(booking.start).getOrElse(0L), Tz.parseInstant(booking.end).getOrElse(0L))
-
-  /** One attempt at the calendar; the key makes a retry update the one event instead of adding one. */
-  def syncEvent(booking: Booking): String =
-    stub
-      .withDeadlineAfter(SyncDeadlineMs, TimeUnit.MILLISECONDS)
-      .sync(
-        SyncRequest(
-          bookingId = booking.booking_id,
-          idempotencyKey = booking.idempotency_key,
-          resourceId = booking.resource_id,
-          start = booking.start,
-          end = booking.end
-        )
-      )
-      .eventId
-
-  /** The event the calendar holds under the key, if any: asked before the booking is touched. */
-  def reconcileEvent(idempotencyKey: String): Option[String] = {
-    val reply = stub.withDeadlineAfter(SyncDeadlineMs, TimeUnit.MILLISECONDS).getEvent(GetEventRequest(idempotencyKey = idempotencyKey))
-    if (reply.found) Some(reply.eventId) else None
-  }
-
-  private def confirmed(booking: Booking, eventId: String): Unit = {
-    HoldMap.confirmHold(booking.resource_id, fields(booking), booking.hold_id, booking.booking_id) // step 2
-    Store.setState(booking.booking_id, "confirmed", eventId)
-  }
-
-  private def released(booking: Booking, state: String): String = {
-    HoldMap.releaseHold(booking.resource_id, fields(booking), booking.hold_id)
-    Store.setState(booking.booking_id, state)
-    state
-  }
-
-  /** The booking becomes a calendar event; returns the booking's final state. */
-  def confirmBooking(booking: Booking): String = {
-    var attempt = 0
-    while (attempt < MaxSyncAttempts) {
-      attempt += 1
-      try {
-        confirmed(booking, syncEvent(booking))
-        return "confirmed"
-      } catch {
-        case e: StatusRuntimeException if Permanent(e.getStatus.getCode) =>
-          // The calendar refused this booking for good and created nothing: give the slots back now
-          // instead of leaking them for the rest of the payment window.
-          return released(booking, "rejected")
-        case e: StatusRuntimeException if Retryable(e.getStatus.getCode) => ()
-      }
-    }
-    // Every attempt timed out or found the calendar down: the event may exist, so say so and ask.
-    Store.setState(booking.booking_id, SyncUnknown)
-    reconcileEvent(booking.idempotency_key) match {
-      case None => released(booking, "cancelled")
-      case Some(eventId) =>
-        confirmed(booking, eventId)
-        "reconciled"
-    }
-  }
 }
 `,
     },

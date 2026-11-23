@@ -51,7 +51,6 @@ is provided as \`store\` — \`store.exists(code)\` and \`store.save(code, url)\
         python: {all: [/@app\.post\(\s*["']\/shorten["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/shorten['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/shorten"/]},
-        scala: {all: [/path\(\s*"shorten"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/shorten"/]},
       },
     },
@@ -71,9 +70,6 @@ is provided as \`store\` — \`store.exists(code)\` and \`store.save(code, url)\
           ],
         },
         go: {all: [/url\.Parse(RequestURI)?\(/, /\.Scheme/, /maxURLLen|\b2048\b/, /http\.StatusBadRequest|\b400\b/]},
-        scala: {
-          all: [/new URI\(|Uri\(/, /getScheme|\.scheme/, /MaxUrlLen|\b2048\b/, /StatusCodes\.BadRequest|\b400\b/],
-        },
         cpp: {all: [/"https:\/\/"|https\?:/, /"http:\/\/"|https\?:/, /kMaxUrlLen|\b2048\b/, /status\s*=\s*400/]},
       },
     },
@@ -85,9 +81,6 @@ is provided as \`store\` — \`store.exists(code)\` and \`store.save(code, url)\
         python: {all: [/ALIAS_RE\.(fullmatch|match)\(/, /status_code\s*=\s*400|HTTP_400/]},
         typescript: {all: [/ALIAS_RE\.test\(/, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/]},
         go: {all: [/aliasRe\.MatchString\(/, /http\.StatusBadRequest|\b400\b/]},
-        scala: {
-          all: [/AliasRe\.(matches|findFirstIn|unapplySeq)\(|matches\(\s*AliasRe/, /StatusCodes\.BadRequest|\b400\b/],
-        },
         cpp: {all: [/std::regex_match\([^\n]*kAliasRe/, /status\s*=\s*400/]},
       },
     },
@@ -100,7 +93,6 @@ is provided as \`store\` — \`store.exists(code)\` and \`store.save(code, url)\
         python: {all: [/store\.exists\(/, /status_code\s*=\s*409/]},
         typescript: {all: [/store\.exists\(/, /code\(\s*409\s*\)|status\(\s*409\s*\)|statusCode:\s*409/]},
         go: {all: [/store\.Exists\(/, /http\.StatusConflict|\b409\b/]},
-        scala: {all: [/store\.exists\(/, /StatusCodes\.Conflict|\b409\b/]},
         cpp: {all: [/store\.exists\(/, /status\s*=\s*409/]},
       },
     },
@@ -121,10 +113,6 @@ is provided as \`store\` — \`store.exists(code)\` and \`store.save(code, url)\
         go: {
           all: [/(?<!func )nextCode\(/, /Location/, /short_url/],
           order: [/store\.Save\(/, /http\.StatusCreated|\b201\b/],
-        },
-        scala: {
-          all: [/(?<!def )nextCode\(\)/, /Location/, /short_url/],
-          order: [/store\.save\(/, /StatusCodes\.Created|\b201\b/],
         },
         cpp: {
           all: [/(?<!string )next_code\(\)/, /Location/, /short_url/],
@@ -475,119 +463,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /shorten", shorten)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.net.URI
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.Location
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import shortener.{LinkStore, Tls} // LinkStore: exists(code): Boolean · save(code, url): Unit; Tls.serverContext — provided
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-final case class ShortenRequest(url: String, alias: Option[String])
-
-object ShortenApi {
-  val BaseUrl = "https://sho.rt/"
-  val MaxUrlLen = 2048
-  val AliasRe = "^[A-Za-z0-9_-]{4,32}$".r
-  val store = LinkStore.open()
-
-  implicit val shortenFormat: RootJsonFormat[ShortenRequest] = jsonFormat2(ShortenRequest)
-
-  /** A fresh short code from the key service (built in step 2). */
-  def nextCode(): String = ???
-
-  private def json(status: StatusCode, body: String, headers: List[HttpHeader] = Nil): Route =
-    complete(HttpResponse(status, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-
-  val route: Route =
-    path("shorten") {
-      post {
-        entity(as[ShortenRequest]) { req =>
-          // TODO: 400 unless the url parses (new URI) with scheme http/https and length <= MaxUrlLen
-          // TODO: alias given → 400 unless AliasRe matches; 409 when store.exists(alias)
-          // TODO: no alias → nextCode()
-          // TODO: store.save(code, url); 201 {code, short_url} with a Location header
-          json(StatusCodes.NotImplemented, """{"error":"not implemented"}""")
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("shortener")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import java.net.URI
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.Location
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import shortener.{LinkStore, Tls} // LinkStore: exists(code): Boolean · save(code, url): Unit; Tls.serverContext — provided
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-final case class ShortenRequest(url: String, alias: Option[String])
-
-object ShortenApi {
-  val BaseUrl = "https://sho.rt/"
-  val MaxUrlLen = 2048
-  val AliasRe = "^[A-Za-z0-9_-]{4,32}$".r
-  val store = LinkStore.open()
-
-  implicit val shortenFormat: RootJsonFormat[ShortenRequest] = jsonFormat2(ShortenRequest)
-
-  /** A fresh short code from the key service (built in step 2). */
-  def nextCode(): String = ???
-
-  private def json(status: StatusCode, body: String, headers: List[HttpHeader] = Nil): Route =
-    complete(HttpResponse(status, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-
-  private def validUrl(url: String): Boolean =
-    url.length <= MaxUrlLen && scala.util.Try(new URI(url)).toOption.exists { u =>
-      (u.getScheme == "http" || u.getScheme == "https") && u.getHost != null
-    }
-
-  val route: Route =
-    path("shorten") {
-      post {
-        entity(as[ShortenRequest]) { req =>
-          if (!validUrl(req.url)) json(StatusCodes.BadRequest, """{"error":"url must be http(s) and at most 2048 characters"}""")
-          else
-            req.alias match {
-              case Some(alias) if !AliasRe.matches(alias) =>
-                json(StatusCodes.BadRequest, """{"error":"alias must match [A-Za-z0-9_-]{4,32}"}""")
-              case Some(alias) if store.exists(alias) =>
-                json(StatusCodes.Conflict, """{"error":"alias already taken"}""")
-              case maybeAlias =>
-                val code = maybeAlias.getOrElse(nextCode())
-                store.save(code, req.url)
-                val short = BaseUrl + code
-                json(StatusCodes.Created, s"""{"code":"$code","short_url":"$short"}""", List(Location(Uri(short))))
-            }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("shortener")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

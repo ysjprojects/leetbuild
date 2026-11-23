@@ -6,7 +6,7 @@ import {adjacencyCacheStep} from './steps/2-state';
 import {resolutionClientStep} from './steps/3-dependency';
 import {graphEventsStep} from './steps/4-events';
 import {neighborReadStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Knowledge graph: the course is not "store two tables and join them", it is the debugging you owe
@@ -96,6 +96,5 @@ Resolution models, graph query languages, bulk import, per-tenant schemas, the c
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

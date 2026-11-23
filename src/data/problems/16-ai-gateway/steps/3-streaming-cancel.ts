@@ -59,7 +59,6 @@ was; and billing has no number for what was streamed.
         python: {all: [/data: /, /\\n\\n/]},
         typescript: {all: [/data: /, /\\n\\n/]},
         go: {all: [/data: /, /\\n\\n/]},
-        scala: {all: [/data: /, /\\n\\n/]},
         cpp: {all: [/data: /, /\\n\\n/]},
       },
     },
@@ -72,7 +71,6 @@ was; and billing has no number for what was streamed.
         python: {all: [/text\/event-stream/]},
         typescript: {all: [/text\/event-stream/]},
         go: {all: [/text\/event-stream/]},
-        scala: {all: [/text\/event-stream/]},
         cpp: {all: [/text\/event-stream/]},
       },
     },
@@ -88,7 +86,6 @@ was; and billing has no number for what was streamed.
           all: [/r\.Context\(\)/],
           none: [/StreamComplete\(\s*context\.Background\(\)|WithTimeout\(\s*context\.Background\(\)/],
         },
-        scala: {all: [/watchTermination/]},
         cpp: {all: [/sink\.is_writable\(\)|!\s*sink\.write\(/]},
       },
     },
@@ -101,7 +98,6 @@ was; and billing has no number for what was streamed.
         python: {all: [/\.cancel\(\)/]},
         typescript: {all: [/\.cancel\(\)/]},
         go: {all: [/context\.With(Timeout|Deadline|Cancel)\(\s*r\.Context\(\)/]},
-        scala: {all: [/\.cancel\(/]},
         cpp: {all: [/TryCancel\(\)/]},
       },
     },
@@ -114,7 +110,6 @@ was; and billing has no number for what was streamed.
         python: {all: [/\[DONE\]/, /output_tokens/]},
         typescript: {all: [/\[DONE\]/, /output_tokens/]},
         go: {all: [/\[DONE\]/, /output_tokens/]},
-        scala: {all: [/\[DONE\]/, /output_tokens/]},
         cpp: {all: [/\[DONE\]/, /output_tokens/]},
       },
     },
@@ -531,143 +526,6 @@ func streamChat(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/chat/stream", streamChat)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import gateway.Auth
-import gateway.providers.{Chunk, CompleteRequest, Message, ProviderGrpc}
-import io.grpc.ManagedChannelBuilder
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import org.apache.pekko.stream.scaladsl.Source
-import org.apache.pekko.util.ByteString
-
-import scala.jdk.CollectionConverters._
-
-object ChatStream {
-  val StreamTimeoutMillis = 8000L
-
-  private val channel = ManagedChannelBuilder.forAddress("providers", 9000).usePlaintext().build()
-  private val providers = ProviderGrpc.blockingStub(channel)
-
-  case class ChatMessage(role: String, content: String)
-  case class ChatRequest(model: String, messages: Seq[ChatMessage], maxTokens: Int)
-
-  def parse(body: String): ChatRequest = {
-    val json = ujson.read(body)
-    val messages = json.obj.get("messages").map(_.arr.toSeq).getOrElse(Seq.empty).map { m =>
-      ChatMessage(m.obj.get("role").map(_.str).getOrElse(""), m.obj.get("content").map(_.str).getOrElse(""))
-    }
-    ChatRequest(json.obj.get("model").map(_.str).getOrElse("gpt-4o-mini"), messages, json.obj.get("max_tokens").map(_.num.toInt).getOrElse(512))
-  }
-
-  /** One SSE frame: \`data: <json>\` and a blank line. */
-  def frame(data: ujson.Value): ByteString = ByteString(s"data: \${ujson.write(data)}\\n\\n")
-
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  val route: Route =
-    path("v1" / "chat" / "stream") {
-      post {
-        optionalHeaderValueByName("Authorization") { authorization =>
-          Auth.tenant(authorization) match {
-            case None => complete(HttpResponse(StatusCodes.Unauthorized, entity = "missing bearer token"))
-            case Some(_) =>
-              entity(as[String]) { raw =>
-                val body = parse(raw)
-                val request = CompleteRequest(
-                  model = body.model,
-                  messages = body.messages.map(m => Message(role = m.role, content = m.content)),
-                  maxTokens = body.maxTokens,
-                )
-                val upstream: Iterator[Chunk] =
-                  providers.withDeadlineAfter(StreamTimeoutMillis, TimeUnit.MILLISECONDS).streamComplete(request)
-                val frames = Source.fromIterator(() => upstream).map(chunk => frame(ujson.Obj("delta" -> chunk.text)))
-                complete(HttpEntity(ContentTypes.\`text/plain(UTF-8)\`, frames))
-              }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import gateway.Auth
-import gateway.providers.{Chunk, CompleteRequest, Message, ProviderGrpc}
-import io.grpc.{Context, ManagedChannelBuilder}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import org.apache.pekko.stream.scaladsl.Source
-import org.apache.pekko.util.ByteString
-
-import scala.jdk.CollectionConverters._
-
-object ChatStream {
-  val StreamTimeoutMillis = 8000L
-
-  private val channel = ManagedChannelBuilder.forAddress("providers", 9000).usePlaintext().build()
-  private val providers = ProviderGrpc.blockingStub(channel)
-
-  case class ChatMessage(role: String, content: String)
-  case class ChatRequest(model: String, messages: Seq[ChatMessage], maxTokens: Int)
-
-  def parse(body: String): ChatRequest = {
-    val json = ujson.read(body)
-    val messages = json.obj.get("messages").map(_.arr.toSeq).getOrElse(Seq.empty).map { m =>
-      ChatMessage(m.obj.get("role").map(_.str).getOrElse(""), m.obj.get("content").map(_.str).getOrElse(""))
-    }
-    ChatRequest(json.obj.get("model").map(_.str).getOrElse("gpt-4o-mini"), messages, json.obj.get("max_tokens").map(_.num.toInt).getOrElse(512))
-  }
-
-  /** One SSE frame: \`data: <json>\` and a blank line. */
-  def frame(data: ujson.Value): ByteString = ByteString(s"data: \${ujson.write(data)}\\n\\n")
-
-  val EventStream: ContentType = MediaTypes.\`text/event-stream\`.toContentType
-
-  val route: Route =
-    path("v1" / "chat" / "stream") {
-      post {
-        optionalHeaderValueByName("Authorization") { authorization =>
-          Auth.tenant(authorization) match {
-            case None => complete(HttpResponse(StatusCodes.Unauthorized, entity = "missing bearer token"))
-            case Some(_) =>
-              (entity(as[String]) & extractExecutionContext) { (raw, ec) =>
-                val body = parse(raw)
-                val request = CompleteRequest(
-                  model = body.model,
-                  messages = body.messages.map(m => Message(role = m.role, content = m.content)),
-                  maxTokens = body.maxTokens,
-                )
-                // The call runs under a cancellable gRPC context: cancelling it ends the upstream stream.
-                val cancellable = Context.current().withCancellation()
-                val upstream: Iterator[Chunk] = cancellable.call(() =>
-                  providers.withDeadlineAfter(StreamTimeoutMillis, TimeUnit.MILLISECONDS).streamComplete(request)
-                )
-                var outputTokens = 0
-                val frames = Source
-                  .fromIterator(() => upstream)
-                  .map { chunk =>
-                    outputTokens += 1
-                    frame(ujson.Obj("delta" -> chunk.text))
-                  }
-                  .concat(Source.lazySingle(() => frame(ujson.Obj("usage" -> ujson.Obj("output_tokens" -> outputTokens)))))
-                  .concat(Source.single(ByteString("data: [DONE]\\n\\n")))
-                  .watchTermination() { (mat, done) =>
-                    // The client left (or the stream ended): cancel the provider call either way.
-                    done.onComplete(_ => cancellable.cancel(null))(ec)
-                    mat
-                  }
-                complete(HttpEntity(EventStream, frames))
-              }
-          }
-        }
-      }
-    }
 }
 `,
     },

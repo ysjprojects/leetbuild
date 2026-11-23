@@ -59,10 +59,6 @@ takes a lease another holds.
           all: [/"extract:"\s*\+\s*taxonomy\.Version\s*\+\s*":"\s*\+\s*job\.ContentHash/],
           none: [/"extract:"\s*\+\s*job\.SkuID/],
         },
-        scala: {
-          all: [/extract:\$\{Taxonomy\.Version\}:\$\{job\("content_hash"\)\.str\}/],
-          none: [/extract:\$\{job\("sku_id"\)/],
-        },
         cpp: {
           all: [/"extract:"\s*\+\s*taxonomy::kVersion\s*\+\s*":"\s*\+\s*job\["content_hash"\]/],
           none: [/"extract:"\s*\+\s*job\["sku_id"\]/],
@@ -78,7 +74,6 @@ takes a lease another holds.
         python: {all: [/CACHE_TTL_S\s*=\s*(604800|7\s*\*\s*24\s*\*\s*3600)\b/, /ex\s*=\s*CACHE_TTL_S/]},
         typescript: {all: [/CACHE_TTL_S\s*=\s*(604800|7\s*\*\s*24\s*\*\s*3600)\b/, /'EX',\s*CACHE_TTL_S/]},
         go: {all: [/cacheTTL\s*=\s*7\s*\*\s*24\s*\*\s*time\.Hour/, /\.Set\([^\n]*cacheTTL\)/]},
-        scala: {all: [/CacheTtlSeconds\s*=\s*(604800|7L?\s*\*\s*24\s*\*\s*3600)L?\b/, /\.ex\(CacheTtlSeconds\)/]},
         cpp: {all: [/kCacheTtl\{(604800|7\s*\*\s*24\s*\*\s*3600)\}/, /redis\.set\([^\n]*kCacheTtl\)/]},
       },
     },
@@ -91,7 +86,6 @@ takes a lease another holds.
         python: {order: [/raise BudgetExhausted/, /extract_attributes\(job\)/]},
         typescript: {order: [/throw new BudgetExhausted/, /extractAttributes\(job\)/]},
         go: {order: [/fmt\.Errorf\([^\n]*ErrBudgetExhausted/, /extractAttributes\(ctx,\s*job\)/]},
-        scala: {order: [/throw new BudgetExhausted/, /extractAttributes\(job\)/]},
         cpp: {order: [/throw BudgetExhausted/, /extractAttributes\(job\)/]},
       },
     },
@@ -113,10 +107,6 @@ takes a lease another holds.
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]INCR['"]/, /redis\.call\(\s*['"]EXPIRE['"]/],
           none: [/rdb\.(Get|Set|Incr)\(\s*ctx,\s*budget/],
         },
-        scala: {
-          all: [/jedis\.eval\(/, /redis\.call\(\s*['"]INCR['"]/, /redis\.call\(\s*['"]EXPIRE['"]/],
-          none: [/jedis\.(get|set|incr)\(\s*budget/],
-        },
         cpp: {
           all: [/redis\.eval</, /redis\.call\(\s*['"]INCR['"]/, /redis\.call\(\s*['"]EXPIRE['"]/],
           none: [/redis\.(get|set|incr)\(\s*budget/],
@@ -132,7 +122,6 @@ takes a lease another holds.
         python: {all: [/nx\s*=\s*True/, /ex\s*=\s*LEASE_TTL_S/, /LEASE_TTL_S\s*=\s*900\b/]},
         typescript: {all: [/'NX'/, /'EX',\s*LEASE_TTL_S/, /LEASE_TTL_S\s*=\s*900\b/]},
         go: {all: [/\.SetNX\([^\n]*leaseTTL\)/, /leaseTTL\s*=\s*(900\s*\*\s*time\.Second|15\s*\*\s*time\.Minute)/]},
-        scala: {all: [/\.nx\(\)/, /\.ex\(LeaseTtlSeconds\)/, /LeaseTtlSeconds\s*=\s*900L?\b/]},
         cpp: {all: [/UpdateType::NOT_EXIST/, /kLeaseTtl\{900\}/]},
       },
     },
@@ -460,106 +449,6 @@ func enrich(ctx context.Context, job store.Job) (store.Result, error) {
 // claimReview reports whether this reviewer now holds the SKU's review lease.
 func claimReview(ctx context.Context, skuID, reviewer string) (bool, error) {
 	return rdb.SetNX(ctx, "review:lease:"+skuID, reviewer, leaseTTL).Result()
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.format.DateTimeFormatter
-import java.time.{Instant, ZoneOffset}
-
-import redis.clients.jedis.JedisPooled
-
-import enrich.Taxonomy // Taxonomy.Version
-
-/** The merchant spent today's extractions: the job waits for tomorrow. */
-final class BudgetExhausted(merchant: String) extends Exception(merchant)
-
-object ExtractionCache {
-  val DailyBudget = 50000L
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val Day = DateTimeFormatter.ofPattern("yyyyMMdd").withZone(ZoneOffset.UTC)
-
-  def budgetKey(merchant: String): String = s"budget:$merchant:\${Day.format(Instant.now())}"
-
-  /** The extraction of one sku.extract job, from the cache when possible. */
-  def enrich(job: ujson.Value): ujson.Obj = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val key = s"extract:\${job("sku_id").str}"
-    Option(jedis.get(key)) match {
-      case Some(cached) => ujson.Obj.from(ujson.read(cached).obj)
-      case None =>
-        val result = ExtractAttributes.extractAttributes(job) // step 2
-        val budget = budgetKey(job("merchant").str)
-        val used = Option(jedis.get(budget)).map(_.toLong).getOrElse(0L)
-        if (used >= DailyBudget) throw new BudgetExhausted(job("merchant").str)
-        jedis.set(budget, (used + 1).toString)
-        if (result("status").str == "accepted") jedis.set(key, ujson.write(result))
-        result
-    }
-  }
-
-  /** Whether this reviewer now holds the SKU's review lease. */
-  def claimReview(skuId: String, reviewer: String): Boolean = {
-    jedis.set(s"review:lease:$skuId", reviewer)
-    true
-  }
-}
-`,
-      solution: `import java.time.format.DateTimeFormatter
-import java.time.{Instant, ZoneOffset}
-
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import scala.jdk.CollectionConverters._
-
-import enrich.Taxonomy // Taxonomy.Version
-
-/** The merchant spent today's extractions: the job waits for tomorrow. */
-final class BudgetExhausted(merchant: String) extends Exception(merchant)
-
-object ExtractionCache {
-  val CacheTtlSeconds = 7L * 24 * 3600
-  val DailyBudget = 50000L
-  val BudgetTtlSeconds = 2L * 24 * 3600
-  val LeaseTtlSeconds = 900L
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val Day = DateTimeFormatter.ofPattern("yyyyMMdd").withZone(ZoneOffset.UTC)
-
-  /** KEYS[1] the merchant's counter for today; ARGV: the daily budget, the counter's TTL. -1: refused. */
-  private val ReserveLua = """
-local used = tonumber(redis.call('GET', KEYS[1]) or '0')
-if used >= tonumber(ARGV[1]) then return -1 end
-used = redis.call('INCR', KEYS[1])
-if used == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
-return used
-"""
-
-  def budgetKey(merchant: String): String = s"budget:$merchant:\${Day.format(Instant.now())}"
-
-  /** The extraction of one sku.extract job, from the cache when possible. */
-  def enrich(job: ujson.Value): ujson.Obj = {
-    val key = s"extract:\${Taxonomy.Version}:\${job("content_hash").str}"
-    Option(jedis.get(key)) match {
-      case Some(cached) => // a hit costs nothing
-        val result = ujson.Obj.from(ujson.read(cached).obj)
-        result("sku_id") = job("sku_id").str
-        result("merchant") = job("merchant").str
-        result
-      case None =>
-        val reserved = jedis.eval(ReserveLua, List(budgetKey(job("merchant").str)).asJava, List(DailyBudget.toString, BudgetTtlSeconds.toString).asJava)
-        if (reserved.asInstanceOf[java.lang.Long] < 0) throw new BudgetExhausted(job("merchant").str)
-        val result = ExtractAttributes.extractAttributes(job) // step 2
-        if (result("status").str == "accepted") jedis.set(key, ujson.write(result), SetParams.setParams().ex(CacheTtlSeconds))
-        result
-    }
-  }
-
-  /** Whether this reviewer now holds the SKU's review lease. */
-  def claimReview(skuId: String, reviewer: String): Boolean =
-    jedis.set(s"review:lease:$skuId", reviewer, SetParams.setParams().nx().ex(LeaseTtlSeconds)) == "OK"
 }
 `,
     },

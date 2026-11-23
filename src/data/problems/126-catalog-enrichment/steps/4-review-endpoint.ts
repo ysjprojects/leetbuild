@@ -62,7 +62,6 @@ as a label or sent as an event, so the next model learns nothing and search does
         },
         typescript: {all: [/REVIEWER_ROLES\s*=/, /\b401\b/, /\b403\b/], none: [/'unknown'/]},
         go: {all: [/reviewerRoles\s*=/, /StatusUnauthorized|\b401\b/, /StatusForbidden|\b403\b/], none: [/"unknown"/]},
-        scala: {all: [/ReviewerRoles(:[^=\n]*)?\s*=/, /Unauthorized/, /Forbidden/], none: [/"unknown"/]},
         cpp: {all: [/kReviewerRoles\s*=/, /\b401\b/, /\b403\b/], none: [/"unknown"/]},
       },
     },
@@ -81,10 +80,6 @@ as a label or sent as an event, so the next model learns nothing and search does
           all: [/StatusConflict|\b409\b/, /store\.ReleaseLease\(/],
           order: [/store\.LeaseHolder\(/, /store\.PutLabel\(|store\.ApplyCatalog\(/],
         },
-        scala: {
-          all: [/Conflict/, /Store\.releaseLease\(/],
-          order: [/Store\.leaseHolder\(/, /Store\.putLabel\(|Store\.applyCatalog\(/],
-        },
         cpp: {
           all: [/\b409\b/, /store::release_lease\(/],
           order: [/store::lease_holder\(/, /store::put_label\(|store::apply_catalog\(/],
@@ -100,7 +95,6 @@ as a label or sent as an event, so the next model learns nothing and search does
         python: {all: [/idempotency-key/i, /store\.review_result\(/, /store\.record_review\(/]},
         typescript: {all: [/idempotency-key/i, /reviewResult\(/, /recordReview\(/]},
         go: {all: [/Idempotency-Key/, /store\.ReviewResult\(/, /store\.RecordReview\(/]},
-        scala: {all: [/Idempotency-Key/, /Store\.reviewResult\(/, /Store\.recordReview\(/]},
         cpp: {all: [/Idempotency-Key/, /store::review_result\(/, /store::record_review\(/]},
       },
     },
@@ -113,7 +107,6 @@ as a label or sent as an event, so the next model learns nothing and search does
         python: {all: [/store\.put_label\(/, /publish\(event\)/], none: [/store\.apply_catalog\(/]},
         typescript: {all: [/putLabel\(/, /publish\(event\)/], none: [/applyCatalog\(/]},
         go: {all: [/store\.PutLabel\(/, /publish\(ctx,\s*event\)/], none: [/store\.ApplyCatalog\(/]},
-        scala: {all: [/Store\.putLabel\(/, /EnrichedEvents\.publish\(event\)/], none: [/Store\.applyCatalog\(/]},
         cpp: {all: [/store::put_label\(/, /publish\(event\)/], none: [/store::apply_catalog\(/]},
       },
     },
@@ -549,132 +542,6 @@ func review(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/skus/{sku_id}/review", review)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import scala.collection.mutable
-import scala.util.Try
-
-import enrich.Store // Store.pending, leaseHolder, releaseLease, putLabel, nextVersion, dropProposal, reviewResult, recordReview, applyCatalog
-
-object ReviewApi {
-  val Decisions: Set[String] = Set("accept", "correct")
-  val AttributeNames: Set[String] = Set("brand", "size", "unit", "organic", "category")
-
-  private def json(status: StatusCode, body: ujson.Value): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, ujson.Obj("error" -> message))
-
-  /** The body, or None unless it is {"decision": accept|correct, "attributes": {known names}}. */
-  def decisionOf(raw: String): Option[(String, ujson.Obj)] =
-    Try(ujson.read(raw)).toOption.flatMap(_.objOpt).flatMap { body =>
-      val decision = body.get("decision").flatMap(_.strOpt).filter(Decisions.contains)
-      val corrections = body.get("attributes").map(_.objOpt).getOrElse(Some(mutable.LinkedHashMap.empty[String, ujson.Value]))
-      for (d <- decision; c <- corrections if c.keys.forall(AttributeNames.contains)) yield (d, ujson.Obj.from(c))
-    }
-
-  def decide(skuId: String, reviewer: Option[String], raw: String): HttpResponse = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val who = reviewer.getOrElse("unknown")
-    (decisionOf(raw), Store.pending(skuId)) match {
-      case (None, _) => error(StatusCodes.BadRequest, "decision must be accept or correct, attributes among brand, size, unit, organic, category")
-      case (_, None) => error(StatusCodes.NotFound, "no proposal is waiting for review")
-      case (Some((decision, corrections)), Some(proposal)) =>
-        val attributes = ujson.Obj.from(proposal("attributes").obj)
-        if (decision == "correct") corrections.value.foreach { case (name, value) => attributes(name) = value }
-        val version = Store.nextVersion(skuId).toDouble
-        Store.applyCatalog(ujson.Obj("sku_id" -> skuId, "merchant" -> proposal("merchant").str, "attributes" -> attributes, "attributes_version" -> version,
-          "taxonomy_version" -> proposal("taxonomy_version").str, "source" -> "human"))
-        Store.dropProposal(skuId)
-        json(StatusCodes.OK, ujson.Obj("sku_id" -> skuId, "attributes_version" -> version, "taxonomy_version" -> proposal("taxonomy_version").str, "reviewer" -> who))
-    }
-  }
-
-  val route: Route = path("v1" / "skus" / Segment / "review") { skuId =>
-    post {
-      optionalHeaderValueByName("X-Reviewer-Id") { reviewer =>
-        entity(as[String]) { raw => complete(decide(skuId, reviewer, raw)) }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import scala.collection.mutable
-import scala.util.Try
-
-import enrich.Store // Store.pending, leaseHolder, releaseLease, putLabel, nextVersion, dropProposal, reviewResult, recordReview, applyCatalog
-
-object ReviewApi {
-  val ReviewerRoles: Set[String] = Set("reviewer", "catalog-admin")
-  val Decisions: Set[String] = Set("accept", "correct")
-  val AttributeNames: Set[String] = Set("brand", "size", "unit", "organic", "category")
-
-  private def json(status: StatusCode, body: ujson.Value): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, ujson.Obj("error" -> message))
-
-  /** The body, or None unless it is {"decision": accept|correct, "attributes": {known names}}. */
-  def decisionOf(raw: String): Option[(String, ujson.Obj)] =
-    Try(ujson.read(raw)).toOption.flatMap(_.objOpt).flatMap { body =>
-      val decision = body.get("decision").flatMap(_.strOpt).filter(Decisions.contains)
-      val corrections = body.get("attributes").map(_.objOpt).getOrElse(Some(mutable.LinkedHashMap.empty[String, ujson.Value]))
-      for (d <- decision; c <- corrections if c.keys.forall(AttributeNames.contains)) yield (d, ujson.Obj.from(c))
-    }
-
-  def decide(skuId: String, reviewer: Option[String], role: Option[String], idempotencyKey: Option[String], raw: String): HttpResponse = {
-    val who = reviewer.getOrElse("")
-    val key = idempotencyKey.getOrElse("")
-    if (who.isEmpty) error(StatusCodes.Unauthorized, "X-Reviewer-Id is required")
-    else if (!role.exists(ReviewerRoles.contains)) error(StatusCodes.Forbidden, "only reviewers and catalog admins decide attributes")
-    else if (key.isEmpty) error(StatusCodes.BadRequest, "Idempotency-Key is required")
-    else
-      Store.reviewResult(who, key) match {
-        case Some(recorded) => json(StatusCodes.OK, recorded) // a retry answers what the first attempt answered
-        case None =>
-          (decisionOf(raw), Store.pending(skuId)) match {
-            case (None, _) => error(StatusCodes.BadRequest, "decision must be accept or correct, attributes among brand, size, unit, organic, category")
-            case (_, None) => error(StatusCodes.NotFound, "no proposal is waiting for review")
-            case (Some((decision, corrections)), Some(proposal)) =>
-              if (!Store.leaseHolder(skuId).contains(who)) error(StatusCodes.Conflict, "claim the SKU's review lease first")
-              else record(skuId, who, key, decision, corrections, proposal)
-          }
-      }
-  }
-
-  /** One decision by the lease holder: a label, then a human event. */
-  def record(skuId: String, who: String, key: String, decision: String, corrections: ujson.Obj, proposal: ujson.Obj): HttpResponse = {
-    val attributes = ujson.Obj.from(proposal("attributes").obj)
-    if (decision == "correct") corrections.value.foreach { case (name, value) => attributes(name) = value }
-    val taxonomyVersion = proposal("taxonomy_version").str
-    val labelVersion = Store.putLabel(skuId, decision, attributes, taxonomyVersion, who)
-    val event = ujson.Obj("sku_id" -> skuId, "merchant" -> proposal("merchant").str, "attributes" -> attributes,
-      "attributes_version" -> Store.nextVersion(skuId).toDouble, "taxonomy_version" -> taxonomyVersion, "source" -> "human")
-    EnrichedEvents.publish(event) // step 5: the indexer applies it to the catalog and the search index
-    Store.dropProposal(skuId)
-    Store.releaseLease(skuId, who)
-    val response = ujson.Obj("sku_id" -> skuId, "label_version" -> labelVersion.toDouble, "attributes_version" -> event("attributes_version"), "taxonomy_version" -> taxonomyVersion)
-    Store.recordReview(who, key, response)
-    json(StatusCodes.OK, response)
-  }
-
-  val route: Route = path("v1" / "skus" / Segment / "review") { skuId =>
-    post {
-      (optionalHeaderValueByName("X-Reviewer-Id") & optionalHeaderValueByName("X-Reviewer-Role") & optionalHeaderValueByName("Idempotency-Key")) {
-        (reviewer, role, key) => entity(as[String]) { raw => complete(decide(skuId, reviewer, role, key, raw)) }
-      }
-    }
-  }
 }
 `,
     },

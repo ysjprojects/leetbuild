@@ -53,7 +53,6 @@ and anyone can read another tenant's series by adding \`?tenant=\`.
         python: {all: [/@app\.get\(\s*["']\/v1\/series["']/, /read_windows\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/series['"]/, /readWindows\(/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/series"/, /windows\.ReadWindows\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"series"\s*\)/, /Windows\.readWindows\(/]},
         cpp: {all: [/svr\.Get\(\s*"\/v1\/series"/, /metrics::readWindows\(/]},
       },
     },
@@ -72,7 +71,6 @@ and anyone can read another tenant's series by adding \`?tenant=\`.
           none: [/q\.from\s*\?\?\s*0/],
         },
         go: {all: [/maxRangeSeconds\s*=\s*(6\s*\*\s*3600|21600)\b/, /invalid_range/], none: [/start\s*=\s*0\b/]},
-        scala: {all: [/MaxRangeSeconds\s*=\s*(6\s*\*\s*3600|21600)L?\b/, /invalid_range/], none: [/getOrElse\(0L\)/]},
         cpp: {all: [/kMaxRangeSeconds\s*=\s*(6\s*\*\s*3600|21600)\b/, /invalid_range/], none: [/:\s*0LL;/]},
       },
     },
@@ -85,7 +83,6 @@ and anyone can read another tenant's series by adding \`?tenant=\`.
         python: {all: [/PAGE_SERIES\s*=\s*50\b/, /next_cursor/, /["']cursor["']/]},
         typescript: {all: [/PAGE_SERIES\s*=\s*50\b/, /next_cursor/, /q\.cursor/]},
         go: {all: [/pageSeries\s*=\s*50\b/, /next_cursor/, /Get\("cursor"\)/]},
-        scala: {all: [/PageSeries\s*=\s*50\b/, /next_cursor/, /"cursor"/]},
         cpp: {all: [/kPageSeries\s*=\s*50\b/, /next_cursor/, /"cursor"/]},
       },
     },
@@ -98,7 +95,6 @@ and anyone can read another tenant's series by adding \`?tenant=\`.
         python: {all: [/RESOLUTION_SECONDS\s*=\s*60\b/, /%\s*RESOLUTION_SECONDS/, /["']method["']\s*:\s*["']sum["']/]},
         typescript: {all: [/RESOLUTION_SECONDS\s*=\s*60\b/, /%\s*RESOLUTION_SECONDS/, /method:\s*['"]sum['"]/]},
         go: {all: [/resolutionSeconds\s*=\s*60\b/, /%\s*resolutionSeconds/, /"method":\s*"sum"/]},
-        scala: {all: [/ResolutionSeconds\s*=\s*60L?\b/, /%\s*ResolutionSeconds/, /"method"\s*->\s*JsString\("sum"\)/]},
         cpp: {all: [/kResolutionSeconds\s*=\s*60\b/, /%\s*kResolutionSeconds/, /\{"method",\s*"sum"\}/]},
       },
     },
@@ -111,7 +107,6 @@ and anyone can read another tenant's series by adding \`?tenant=\`.
         python: {all: [/headers\.get\(\s*["']x-tenant-id["']/i], none: [/params\.get\(\s*["']tenant["']/]},
         typescript: {all: [/headers\[\s*['"]x-tenant-id['"]\s*\]/i], none: [/\bq\.tenant\b/]},
         go: {all: [/Header\.Get\(\s*"X-Tenant-Id"\s*\)/], none: [/Get\("tenant"\)/]},
-        scala: {all: [/HeaderValueByName\(\s*"X-Tenant-Id"\s*\)/], none: [/params\.get\("tenant"\)/]},
         cpp: {all: [/get_header_value\(\s*"X-Tenant-Id"\s*\)/], none: [/get_param_value\("tenant"\)/]},
       },
     },
@@ -456,100 +451,6 @@ func query(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/series", query)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import metrics.Windows // Windows.seriesInRange(tenant, metric, start, end) · Windows.readWindows(tenant, metric, names, start, end)
-
-object Read {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "series") {
-    get {
-      parameterMap { params =>
-        optionalHeaderValueByName("X-Tenant-Id") { header =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          params.get("tenant").orElse(header).filter(_.nonEmpty) match {
-            case None => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("missing_tenant"))))
-            case Some(tenant) =>
-              val metric = params.getOrElse("metric", "")
-              val start = params.get("from").flatMap(_.toLongOption).getOrElse(0L)
-              val end = params.get("to").flatMap(_.toLongOption).getOrElse(System.currentTimeMillis() / 1000)
-              val names = Windows.seriesInRange(tenant, metric, start, end)
-              val bySeries = Windows.readWindows(tenant, metric, names, start, end).groupBy(_.series)
-              val series = names.map { name =>
-                val points = bySeries.getOrElse(name, Seq.empty).map(w => JsObject("t" -> JsNumber(w.start), "count" -> JsNumber(w.count), "sum" -> JsNumber(w.sum)))
-                JsObject("series" -> JsString(name), "points" -> JsArray(points.toVector))
-              }
-              complete(json(StatusCodes.OK, JsObject("series" -> JsArray(series.toVector))))
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import metrics.Model.Window
-import metrics.Windows // Windows.seriesInRange(tenant, metric, start, end) · Windows.readWindows(tenant, metric, names, start, end)
-
-object Read {
-  val MaxRangeSeconds = 6 * 3600L
-  val PageSeries = 50
-  val ResolutionSeconds = 60L
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** Sum the 10-second windows into ResolutionSeconds buckets, oldest first. */
-  def downsample(windows: Seq[Window]): Vector[JsObject] =
-    windows.groupBy(w => w.start - w.start % ResolutionSeconds).toVector.sortBy(_._1).map { case (t, ws) =>
-      JsObject("t" -> JsNumber(t), "count" -> JsNumber(ws.map(_.count).sum), "sum" -> JsNumber(ws.map(_.sum).sum))
-    }
-
-  val route: Route = path("v1" / "series") {
-    get {
-      // Never from the query: the caller does not choose its tenant.
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("missing_tenant"))))
-        case Some(tenant) =>
-          parameterMap { params =>
-            val range = for {
-              start <- params.get("from").flatMap(_.toLongOption)
-              end <- params.get("to").flatMap(_.toLongOption)
-              if end > start && end - start <= MaxRangeSeconds
-            } yield (start, end)
-            range match {
-              case None => complete(json(StatusCodes.BadRequest, JsObject("error" -> JsString("invalid_range"), "max_seconds" -> JsNumber(MaxRangeSeconds))))
-              case Some((start, end)) =>
-                val metric = params.getOrElse("metric", "")
-                val cursor = params.getOrElse("cursor", "")
-                val names = Windows.seriesInRange(tenant, metric, start, end).filter(_ > cursor)
-                val page = names.take(PageSeries)
-                val bySeries = Windows.readWindows(tenant, metric, page, start, end).groupBy(_.series)
-                val series = page.map(name => JsObject("series" -> JsString(name), "points" -> JsArray(downsample(bySeries.getOrElse(name, Seq.empty)))))
-                complete(json(StatusCodes.OK, JsObject(
-                  "series" -> JsArray(series.toVector),
-                  "resolution" -> JsNumber(ResolutionSeconds),
-                  "method" -> JsString("sum"),
-                  "next_cursor" -> (if (names.size > PageSeries) JsString(page.last) else JsNull)
-                )))
-            }
-          }
-      }
-    }
-  }
 }
 `,
     },

@@ -43,7 +43,6 @@ any tenant reads another tenant's device configuration by guessing its id.
         python: {all: [/@app\.get\(\s*["']\/v1\/devices\/\{device_id\}\/shadow["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/devices\/:\w+\/shadow['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/devices\/\{device_id\}\/shadow"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"devices"\s*\/\s*Segment\s*\/\s*"shadow"\s*\)/, /\bget\b/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/devices\//, /\/shadow\)"/]},
       },
     },
@@ -62,10 +61,6 @@ any tenant reads another tenant's device configuration by guessing its id.
           all: [/"desired_version":/, /"reported_version":/, /"reported":/],
           none: [/"version":/, /"document"/],
         },
-        scala: {
-          all: [/"desired_version"\s*->/, /"reported_version"\s*->/, /"reported"\s*->/],
-          none: [/"version"\s*->/, /"document"/],
-        },
         cpp: {
           all: [/\{"desired_version",/, /\{"reported_version",/, /\{"reported",/],
           none: [/\{"version",/, /"document"/],
@@ -81,7 +76,6 @@ any tenant reads another tenant's device configuration by guessing its id.
         python: {all: [/["']delta["']\s*:/, /sorted\(/]},
         typescript: {all: [/delta:/, /\.sort\(/]},
         go: {all: [/"delta":/, /sort\.Strings\(|slices\.Sort\(/]},
-        scala: {all: [/"delta"\s*->/, /\.sorted/]},
         cpp: {all: [/\{"delta",/]},
       },
     },
@@ -102,10 +96,6 @@ any tenant reads another tenant's device configuration by guessing its id.
         go: {
           all: [/registry\.Owner\(/, /StatusNotFound|\b404\b/, /StatusUnauthorized|\b401\b/, /X-Tenant-Id/i],
           order: [/registry\.Owner\(/, /shadow\.ReadShadow\(/],
-        },
-        scala: {
-          all: [/Registry\.owner\(/, /StatusCodes\.NotFound/, /StatusCodes\.Unauthorized/, /X-Tenant-Id/i],
-          order: [/Registry\.owner\(/, /Shadow\.readShadow\(/],
         },
         cpp: {
           all: [/registry::owner\(/, /\b404\b/, /\b401\b/, /X-Tenant-Id/i],
@@ -311,75 +301,6 @@ func getShadow(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/devices/{device_id}/shadow", getShadow)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import iothub.{Registry, Shadow} // Registry.owner(deviceId); Shadow.readShadow(deviceId)
-
-object ShadowRead {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def strings(m: Map[String, String]): JsObject = JsObject(m.map { case (k, v) => k -> JsString(v) })
-
-  val route: Route =
-    path("v1" / "devices" / Segment / "shadow") { deviceId =>
-      get {
-        // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-        val s = Shadow.readShadow(deviceId)
-        val document = s.reported ++ s.desired
-        complete(json(StatusCodes.OK, JsObject(
-          "device_id" -> JsString(deviceId),
-          "version" -> JsNumber(math.max(s.desiredVersion, s.reportedVersion)),
-          "document" -> strings(document))))
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import iothub.{Registry, Shadow} // Registry.owner(deviceId); Shadow.readShadow(deviceId)
-
-object ShadowRead {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def strings(m: Map[String, String]): JsObject = JsObject(m.map { case (k, v) => k -> JsString(v) })
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  /** The desired fields the device has not reached, sorted. */
-  def deltaFields(desired: Map[String, String], reported: Map[String, String]): Seq[String] =
-    desired.collect { case (field, value) if !reported.get(field).contains(value) => field }.toSeq.sorted
-
-  val route: Route =
-    path("v1" / "devices" / Segment / "shadow") { deviceId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-          // Another tenant's device answers like one that does not exist, before anything is read.
-          case Some(tenant) if !Registry.owner(deviceId).contains(tenant) => complete(error(StatusCodes.NotFound, "no such device"))
-          case Some(_) =>
-            val s = Shadow.readShadow(deviceId)
-            complete(json(StatusCodes.OK, JsObject(
-              "device_id" -> JsString(deviceId),
-              "desired" -> strings(s.desired),
-              "reported" -> strings(s.reported),
-              "desired_version" -> JsNumber(s.desiredVersion),
-              "reported_version" -> JsNumber(s.reportedVersion),
-              "delta" -> JsArray(deltaFields(s.desired, s.reported).map(JsString(_)).toVector))))
-        }
-      }
-    }
 }
 `,
     },

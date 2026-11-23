@@ -67,10 +67,6 @@ Scrolling up in a room loads older messages over plain HTTPS, not the stream. Im
           ],
           none: [/StatusNotImplemented/],
         },
-        scala: {
-          all: [/path\(\s*"rooms"\s*\/\s*Segment\s*\/\s*"messages"\s*\)/, /\bget\s*\{/, /complete\(\s*Page\(/],
-          none: [/StatusCodes\.NotImplemented/],
-        },
         cpp: {all: [/svr\.Get\(\s*R?"\(?\/rooms\//, /"application\/json"/], none: [/status\s*=\s*501/]},
       },
     },
@@ -89,7 +85,6 @@ Scrolling up in a room loads older messages over plain HTTPS, not the stream. Im
           order: [/code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/, /store\.(?:exists|list)\(/],
         },
         go: {all: [/minLimit/, /maxLimit/], order: [/http\.StatusBadRequest|\b400\b/, /store\.(?:Exists|List)\(/]},
-        scala: {all: [/MinLimit/, /MaxLimit/], order: [/StatusCodes\.BadRequest|\b400\b/, /store\.(?:exists|list)\(/]},
         cpp: {all: [/kMinLimit/, /kMaxLimit/], order: [/status\s*=\s*400/, /store\.(?:exists|list)\(/]},
       },
     },
@@ -107,7 +102,6 @@ Scrolling up in a room loads older messages over plain HTTPS, not the stream. Im
           ],
         },
         go: {order: [/store\.Exists\(\s*room\s*\)/, /http\.StatusNotFound|\b404\b/, /store\.List\(/]},
-        scala: {order: [/store\.exists\(\s*room\s*\)/, /StatusCodes\.NotFound|\b404\b/, /store\.list\(/]},
         cpp: {order: [/store\.exists\(\s*room\s*\)/, /status\s*=\s*404/, /store\.list\(/]},
       },
     },
@@ -141,14 +135,6 @@ Scrolling up in a room loads older messages over plain HTTPS, not the stream. Im
             /NextBefore:/,
           ],
         },
-        scala: {
-          all: [
-            /store\.list\(\s*room\s*,/,
-            /System\.currentTimeMillis\(\)/,
-            /messages\.(?:size|length)\s*(?:<|==|>=|!=)\s*limit/,
-            /Page\(\s*messages\s*,/,
-          ],
-        },
         cpp: {
           all: [
             /store\.list\(\s*room\s*,/,
@@ -168,12 +154,6 @@ Scrolling up in a room loads older messages over plain HTTPS, not the stream. Im
         python: {all: [/Cache-Control/i, /private,\s*max-age=5\b|max-age=5,\s*private/]},
         typescript: {all: [/Cache-Control/i, /private,\s*max-age=5\b|max-age=5,\s*private/]},
         go: {all: [/Cache-Control/i, /private,\s*max-age=5\b|max-age=5,\s*private/]},
-        scala: {
-          all: [
-            /Cache-Control/i,
-            /private,\s*max-age=5\b|max-age=5,\s*private|`private`\(\)[\s\S]{0,80}`max-age`\(\s*5\s*\)|`max-age`\(\s*5\s*\)[\s\S]{0,80}`private`\(\)/,
-          ],
-        },
         cpp: {all: [/Cache-Control/i, /private,\s*max-age=5\b|max-age=5,\s*private/]},
       },
     },
@@ -469,115 +449,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /rooms/{room}/messages", history)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import livechat.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-
-final case class Message(user: String, text: String, ts: Long)
-final case class Page(messages: Seq[Message], next_before: Option[Long])
-
-/** Provided: list returns messages with ts < before, newest first. */
-trait MessageStore {
-  def exists(room: String): Boolean
-  def list(room: String, before: Long, limit: Int): Seq[Message]
-}
-
-object HistoryApi {
-  val MinLimit = 1
-  val MaxLimit = 100
-  val DefaultLimit = 50
-
-  implicit val messageFormat: RootJsonFormat[Message] = jsonFormat3(Message)
-  implicit val pageFormat: RootJsonFormat[Page] = jsonFormat2(Page)
-
-  val store: MessageStore = ???
-
-  val route: Route =
-    path("rooms" / Segment / "messages") { room =>
-      get {
-        parameters("before".as[Long].optional, "limit".as[Int].withDefault(DefaultLimit)) { (before, limit) =>
-          // TODO: 400 when limit is outside MinLimit..MaxLimit
-          // TODO: 404 when store.exists(room) is false
-          // TODO: before defaults to System.currentTimeMillis(); store.list newest-first
-          // TODO: Page(messages, next) where next = ts of the last message, None when fewer than limit
-          // TODO: Cache-Control: private, max-age=5
-          complete(StatusCodes.NotImplemented)
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("chat")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import livechat.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-
-final case class Message(user: String, text: String, ts: Long)
-final case class Page(messages: Seq[Message], next_before: Option[Long])
-
-/** Provided: list returns messages with ts < before, newest first. */
-trait MessageStore {
-  def exists(room: String): Boolean
-  def list(room: String, before: Long, limit: Int): Seq[Message]
-}
-
-object HistoryApi {
-  val MinLimit = 1
-  val MaxLimit = 100
-  val DefaultLimit = 50
-
-  implicit val messageFormat: RootJsonFormat[Message] = jsonFormat3(Message)
-  implicit val pageFormat: RootJsonFormat[Page] = jsonFormat2(Page)
-
-  val store: MessageStore = ???
-
-  val route: Route =
-    path("rooms" / Segment / "messages") { room =>
-      get {
-        parameters("before".as[Long].optional, "limit".as[Int].withDefault(DefaultLimit)) { (before, limit) =>
-          if (limit < MinLimit || limit > MaxLimit) complete(StatusCodes.BadRequest -> s"limit must be between $MinLimit and $MaxLimit")
-          else if (!store.exists(room)) complete(StatusCodes.NotFound -> "no such room")
-          else {
-            val messages = store.list(room, before.getOrElse(System.currentTimeMillis()), limit)
-            val next = if (messages.size < limit) None else Some(messages.last.ts)
-            respondWithHeader(RawHeader("Cache-Control", "private, max-age=5")) {
-              complete(Page(messages, next))
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("chat")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

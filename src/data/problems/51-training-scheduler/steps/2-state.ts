@@ -53,7 +53,6 @@ comes back behind everything.
         python: {all: [/\*\s*BAND_SPAN_MS/, /zadd\([^\n]*position_score\(/]},
         typescript: {all: [/\*\s*BAND_SPAN_MS/, /zadd\([^\n]*positionScore\(/]},
         go: {all: [/\*\s*bandSpanMs/, /ZAdd\([^\n]*positionScore\(/]},
-        scala: {all: [/\*\s*BandSpanMs/, /zadd\([^\n]*positionScore\(/]},
         cpp: {all: [/\*\s*kBandSpanMs/, /zadd\([^\n]*positionScore\(/]},
       },
     },
@@ -66,7 +65,6 @@ comes back behind everything.
         python: {all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]ZREM['"]/], none: [/\.zrem\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]ZREM['"]/], none: [/redis\.zrem\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]ZREM['"]/], none: [/\.ZRem\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]ZREM['"]/], none: [/jedis\.zrem\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]ZREM['"]/], none: [/redis\.zrem\(/]},
       },
     },
@@ -79,7 +77,6 @@ comes back behind everything.
         python: {all: [/redis\.call\(\s*['"]GET['"]/, /(~=|==)\s*ARGV\[1\]/], none: [/\.delete\(\s*lease_key\(/]},
         typescript: {all: [/redis\.call\(\s*['"]GET['"]/, /(~=|==)\s*ARGV\[1\]/], none: [/redis\.del\(\s*leaseKey\(/]},
         go: {all: [/redis\.call\(\s*['"]GET['"]/, /(~=|==)\s*ARGV\[1\]/], none: [/\.Del\([^\n]*leaseKey\(/]},
-        scala: {all: [/redis\.call\(\s*['"]GET['"]/, /(~=|==)\s*ARGV\[1\]/], none: [/jedis\.del\(\s*leaseKey\(/]},
         cpp: {all: [/redis\.call\(\s*['"]GET['"]/, /(~=|==)\s*ARGV\[1\]/], none: [/redis\.del\(\s*leaseKey\(/]},
       },
     },
@@ -92,7 +89,6 @@ comes back behind everything.
         python: {all: [/redis\.call\(\s*['"]HGET['"][^\n]*['"]position['"]/], none: [/zadd\([^\n]*now_ms/]},
         typescript: {all: [/redis\.call\(\s*['"]HGET['"][^\n]*['"]position['"]/], none: [/zadd\([^\n]*nowMs/]},
         go: {all: [/redis\.call\(\s*['"]HGET['"][^\n]*['"]position['"]/], none: [/ZAdd\([^\n]*nowMs/]},
-        scala: {all: [/redis\.call\(\s*['"]HGET['"][^\n]*['"]position['"]/], none: [/zadd\([^\n]*nowMs/]},
         cpp: {all: [/redis\.call\(\s*['"]HGET['"][^\n]*['"]position['"]/], none: [/zadd\([^\n]*now_ms/]},
       },
     },
@@ -508,134 +504,6 @@ func confirmStart(ctx context.Context, runID, worker string) (bool, error) {
 // reapExpired puts every run whose lease ran out by nowMs back at its position; how many.
 func reapExpired(ctx context.Context, nowMs int64) (int, error) {
 	return reapScript.Run(ctx, rdb, []string{queueKey, leasesKey}, nowMs).Int()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import scala.jdk.CollectionConverters._
-
-import trainsched.Runs // Runs.runKey
-
-object QueueState {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val QueueKey = "training:queue"
-  val LeasesKey = "training:leases"
-  val BandSpanMs: Long = 10000000000000L
-  val LeaseTtlMs: Long = 15000L
-
-  def leaseKey(runId: String): String = s"training:lease:$runId"
-
-  /** Put the run in the queue at its position and mark it queued. */
-  def enqueue(runId: String, band: Int, enqueuedAtMs: Long): Unit = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    jedis.zadd(QueueKey, band.toDouble, runId)
-    jedis.hset(Runs.runKey(runId), "state", "queued")
-  }
-
-  /** Lease the head of the queue to worker; None when the queue is empty. */
-  def claimNext(worker: String, nowMs: Long): Option[String] =
-    jedis.zrange(QueueKey, 0, 0).asScala.headOption.map { runId =>
-      jedis.zrem(QueueKey, runId)
-      jedis.set(leaseKey(runId), worker, SetParams.setParams().px(LeaseTtlMs))
-      jedis.zadd(LeasesKey, (nowMs + LeaseTtlMs).toDouble, runId)
-      jedis.hset(Runs.runKey(runId), Map("state" -> "starting", "worker" -> worker).asJava)
-      runId
-    }
-
-  /** The worker's process is up: the run is running. */
-  def confirmStart(runId: String, worker: String): Boolean = {
-    jedis.del(leaseKey(runId))
-    jedis.zrem(LeasesKey, runId)
-    jedis.hset(Runs.runKey(runId), "state", "running")
-    true
-  }
-
-  /** Put every run whose lease ran out by nowMs back in the queue; how many. */
-  def reapExpired(nowMs: Long): Long = {
-    val expired = jedis.zrangeByScore(LeasesKey, Double.NegativeInfinity, nowMs.toDouble).asScala
-    expired.foreach { runId =>
-      jedis.zrem(LeasesKey, runId)
-      jedis.zadd(QueueKey, nowMs.toDouble, runId)
-      jedis.hset(Runs.runKey(runId), Map("state" -> "queued", "worker" -> "").asJava)
-    }
-    expired.size.toLong
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import trainsched.Runs // Runs.runKey
-
-object QueueState {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val QueueKey = "training:queue"
-  val LeasesKey = "training:leases"
-  val BandSpanMs: Long = 10000000000000L
-  val LeaseTtlMs: Long = 15000L
-
-  // Read the head, take it out and lease it with nothing in between; the head's score is saved so an
-  // expired start can return to exactly where it stood.
-  val ClaimLua: String =
-    """local id = redis.call('ZRANGE', KEYS[1], 0, 0)[1]
-      |if not id then return false end
-      |local position = redis.call('ZSCORE', KEYS[1], id)
-      |redis.call('ZREM', KEYS[1], id)
-      |redis.call('SET', 'training:lease:' .. id, ARGV[1], 'PX', ARGV[2])
-      |redis.call('ZADD', KEYS[2], ARGV[3], id)
-      |redis.call('HSET', 'run:' .. id, 'state', 'starting', 'worker', ARGV[1], 'position', position)
-      |return id
-      |""".stripMargin
-
-  // Only the worker the lease still names may turn the start into a running run.
-  val ConfirmLua: String =
-    """if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
-      |redis.call('DEL', KEYS[1])
-      |redis.call('ZREM', KEYS[2], ARGV[2])
-      |redis.call('HSET', 'run:' .. ARGV[2], 'state', 'running')
-      |return 1
-      |""".stripMargin
-
-  val ReapLua: String =
-    """local ids = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1])
-      |for _, id in ipairs(ids) do
-      |  redis.call('ZREM', KEYS[2], id)
-      |  redis.call('DEL', 'training:lease:' .. id)
-      |  redis.call('ZADD', KEYS[1], redis.call('HGET', 'run:' .. id, 'position'), id)
-      |  redis.call('HSET', 'run:' .. id, 'state', 'queued', 'worker', '')
-      |end
-      |return #ids
-      |""".stripMargin
-
-  def leaseKey(runId: String): String = s"training:lease:$runId"
-
-  /** Where a run waits: its band first, then its submission time. */
-  def positionScore(band: Int, enqueuedAtMs: Long): Long = band * BandSpanMs + enqueuedAtMs
-
-  /** Put the run in the queue at its position and mark it queued. */
-  def enqueue(runId: String, band: Int, enqueuedAtMs: Long): Unit = {
-    jedis.zadd(QueueKey, positionScore(band, enqueuedAtMs).toDouble, runId)
-    jedis.hset(Runs.runKey(runId), "state", "queued")
-  }
-
-  /** Lease the head of the queue to worker; None when the queue is empty. */
-  def claimNext(worker: String, nowMs: Long): Option[String] =
-    Option(jedis.eval(ClaimLua, List(QueueKey, LeasesKey).asJava, List(worker, LeaseTtlMs.toString, (nowMs + LeaseTtlMs).toString).asJava))
-      .map(_.toString)
-
-  /** The worker's process is up: the run is running, if worker still holds its lease. */
-  def confirmStart(runId: String, worker: String): Boolean =
-    jedis.eval(ConfirmLua, List(leaseKey(runId), LeasesKey).asJava, List(worker, runId).asJava).asInstanceOf[java.lang.Long] == 1L
-
-  /** Put every run whose lease ran out by nowMs back at its position; how many. */
-  def reapExpired(nowMs: Long): Long =
-    jedis.eval(ReapLua, List(QueueKey, LeasesKey).asJava, List(nowMs.toString).asJava).asInstanceOf[java.lang.Long]
 }
 `,
     },

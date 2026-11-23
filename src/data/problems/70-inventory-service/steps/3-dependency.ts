@@ -65,7 +65,6 @@ once, a warehouse that never answers, and one that refuses the reservation for g
         go: {
           all: [/context\.WithTimeout\([^\n]*(confirmDeadline|2\s*\*\s*time\.Second|2000\s*\*\s*time\.Millisecond)/],
         },
-        scala: {all: [/withDeadlineAfter\(\s*(ConfirmDeadlineMs|2000L?|2L?\s*,\s*TimeUnit\.SECONDS)/]},
         cpp: {
           all: [
             /set_deadline\([^\n]*(kConfirmDeadline|std::chrono::seconds[({]\s*2\s*[)}]|std::chrono::milliseconds[({]\s*2000\s*[)}])/,
@@ -82,7 +81,6 @@ once, a warehouse that never answers, and one that refuses the reservation for g
         python: {all: [/reservation_id\s*=\s*reservation\[["']reservation_id["']\]/], none: [/new_id\(/]},
         typescript: {all: [/reservation_id:\s*reservation\.reservation_id/], none: [/newId\(/]},
         go: {all: [/ReservationId:\s*(r|reservation)\.ReservationID/], none: [/store\.NewID\(/]},
-        scala: {all: [/reservationId\s*=\s*reservation\.reservation_id/], none: [/Store\.newId\(/]},
         cpp: {all: [/set_reservation_id\(\s*(r|reservation)\.reservation_id\s*\)/], none: [/NewId\(/]},
       },
     },
@@ -95,7 +93,6 @@ once, a warehouse that never answers, and one that refuses the reservation for g
         python: {all: [/["']pending["']/, /UNAVAILABLE/]},
         typescript: {all: [/['"]pending['"]/, /UNAVAILABLE/]},
         go: {all: [/"pending"/, /codes\.Unavailable/]},
-        scala: {all: [/"pending"/, /UNAVAILABLE/]},
         cpp: {all: [/"pending"/, /UNAVAILABLE/]},
       },
     },
@@ -108,7 +105,6 @@ once, a warehouse that never answers, and one that refuses the reservation for g
         python: {all: [/FAILED_PRECONDITION/, /stock\.release\(/, /["']rejected["']/]},
         typescript: {all: [/FAILED_PRECONDITION/, /\brelease\(/, /['"]rejected['"]/]},
         go: {all: [/codes\.FailedPrecondition/, /stock\.Release\(/, /"rejected"/]},
-        scala: {all: [/FAILED_PRECONDITION/, /Stock\.release\(/, /"rejected"/]},
         cpp: {all: [/FAILED_PRECONDITION/, /stock::Release\(/, /"rejected"/]},
       },
     },
@@ -386,84 +382,6 @@ func confirmReservation(ctx context.Context, r *store.Reservation) (string, erro
 	// No attempt was answered: the warehouse may have allocated, so the hold stays and the
 	// reservation waits for reconciliation instead of handing its units to the next buyer.
 	return "pending", store.SetStatus(ctx, r.ReservationID, "pending")
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import inventory.{Reservation, Stock, Store} // Stock.confirm, release; Store.setStatus
-import inventoryd.inventory_service.{ConfirmRequest, WarehouseGrpc}
-
-object Client {
-  val MaxConfirmAttempts = 2
-
-  private val channel = ManagedChannelBuilder.forAddress("warehouse", 9000).usePlaintext().build()
-  private val stub = WarehouseGrpc.blockingStub(channel)
-
-  /** Ask the warehouse to allocate the reservation's units; returns the final status. */
-  def confirmReservation(reservation: Reservation): String = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    var attempt = 0
-    while (attempt < MaxConfirmAttempts) {
-      attempt += 1
-      try {
-        stub.confirmReservation(ConfirmRequest(reservationId = Store.newId(), sku = reservation.sku, quantity = reservation.quantity))
-        Stock.confirm(reservation.sku, reservation.reservation_id)
-        Store.setStatus(reservation.reservation_id, "confirmed")
-        return "confirmed"
-      } catch {
-        case _: StatusRuntimeException => ()
-      }
-    }
-    Stock.release(reservation.sku, reservation.reservation_id)
-    Store.setStatus(reservation.reservation_id, "rejected")
-    "rejected"
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import inventory.{Reservation, Stock, Store} // Stock.confirm, release; Store.setStatus
-import inventoryd.inventory_service.{ConfirmRequest, WarehouseGrpc}
-
-object Client {
-  val ConfirmDeadlineMs = 2000L
-  val MaxConfirmAttempts = 2
-  private val Retryable = Set(Status.Code.DEADLINE_EXCEEDED, Status.Code.UNAVAILABLE)
-  private val Refused = Set(Status.Code.FAILED_PRECONDITION, Status.Code.INVALID_ARGUMENT)
-
-  private val channel = ManagedChannelBuilder.forAddress("warehouse", 9000).usePlaintext().build()
-  private val stub = WarehouseGrpc.blockingStub(channel)
-
-  /** Ask the warehouse to allocate the reservation's units; returns the final status. */
-  def confirmReservation(reservation: Reservation): String = {
-    // The reservation id is the warehouse's idempotency id: a retry must carry the same one.
-    val request = ConfirmRequest(reservationId = reservation.reservation_id, sku = reservation.sku, quantity = reservation.quantity)
-    var attempt = 0
-    while (attempt < MaxConfirmAttempts) {
-      attempt += 1
-      try {
-        stub.withDeadlineAfter(ConfirmDeadlineMs, TimeUnit.MILLISECONDS).confirmReservation(request)
-        Stock.confirm(reservation.sku, reservation.reservation_id)
-        Store.setStatus(reservation.reservation_id, "confirmed")
-        return "confirmed"
-      } catch {
-        case e: StatusRuntimeException if Retryable(e.getStatus.getCode) => ()
-        case e: StatusRuntimeException if Refused(e.getStatus.getCode) =>
-          // A verdict on this reservation: asking again cannot change it, the units go back now.
-          Stock.release(reservation.sku, reservation.reservation_id)
-          Store.setStatus(reservation.reservation_id, "rejected")
-          return "rejected"
-      }
-    }
-    // No attempt was answered: the warehouse may have allocated, so the hold stays and the
-    // reservation waits for reconciliation instead of handing its units to the next buyer.
-    Store.setStatus(reservation.reservation_id, "pending")
-    "pending"
-  }
 }
 `,
     },

@@ -50,7 +50,6 @@ stops answering.
         python: {all: [/producer\.produce\([^\n]*key\s*=\s*schedule\[["']id["']\]/]},
         typescript: {all: [/key:\s*schedule\.id\b/]},
         go: {all: [/Key:\s*\[\]byte\(\s*s\.ID\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*(Topic|"schedule\.fired")\s*,\s*schedule\.id\s*,/]},
         cpp: {all: [/s\.id\.c_str\(\)\s*,\s*s\.id\.(size|length)\(\)/]},
       },
     },
@@ -63,7 +62,6 @@ stops answering.
         python: {all: [/producer\.produce\(/], none: [/outcome\s*!=\s*["']fired["']/]},
         typescript: {all: [/producer\.send\(/], none: [/outcome\s*!==?\s*['"]fired['"]/]},
         go: {all: [/producer\.Produce\(/], none: [/outcome\s*!=\s*"fired"/]},
-        scala: {all: [/producer\.send\(/], none: [/outcome\s*!=\s*"fired"/]},
         cpp: {all: [/producer->produce\(/], none: [/outcome\s*!=\s*"fired"/]},
       },
     },
@@ -76,7 +74,6 @@ stops answering.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -89,7 +86,6 @@ stops answering.
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/store\.InsertOutbox\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Store\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/, /Failure|catch|Try\(/]},
         cpp: {all: [/outbox::Insert\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -352,93 +348,6 @@ func publishRun(ctx context.Context, s *store.Schedule, window int64, outcome, r
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import cronsched.{Cron, Schedule}
-
-object RunEvents {
-  val Topic = "schedule.fired"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def runPayload(schedule: Schedule, window: Long, outcome: String, reason: String): JsObject =
-    JsObject(
-      "schedule_id" -> JsString(schedule.id),
-      "job_ref" -> JsString(schedule.job_ref),
-      "window" -> JsString(Cron.formatInstant(window)),
-      "outcome" -> JsString(outcome),
-      "reason" -> JsString(reason)
-    )
-
-  /** Tell the run ledger what happened to one window; true when the event is on its way. */
-  def publishRun(schedule: Schedule, window: Long, outcome: String, reason: String): Boolean = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    if (outcome != "fired") true
-    else {
-      val payload = runPayload(schedule, window, outcome, reason)
-      producer.send(new ProducerRecord[String, String](Topic, schedule.job_ref, payload.compactPrint))
-      true
-    }
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import cronsched.{Cron, Schedule, Store}
-
-object RunEvents {
-  val Topic = "schedule.fired"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def runPayload(schedule: Schedule, window: Long, outcome: String, reason: String): JsObject =
-    JsObject(
-      "schedule_id" -> JsString(schedule.id),
-      "job_ref" -> JsString(schedule.job_ref),
-      "window" -> JsString(Cron.formatInstant(window)),
-      "outcome" -> JsString(outcome),
-      "reason" -> JsString(reason)
-    )
-
-  /** Tell the run ledger what happened to one window; true once the broker acknowledged the event. */
-  def publishRun(schedule: Schedule, window: Long, outcome: String, reason: String): Boolean = {
-    // Skips and errors are events too: a schedule that stopped firing must not look like one with nothing to do.
-    val payload = runPayload(schedule, window, outcome, reason)
-    val record = new ProducerRecord[String, String](Topic, schedule.id, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so the ledger is late, not wrong.
-      Store.insertOutbox(Topic, schedule.id, payload)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

@@ -51,14 +51,13 @@ service SecretConsumer { rpc CanReadVersion(CanReadRequest) returns (CanReadRepl
       id: 'verify-deadline',
       title: 'Each verification call carries a 2-second deadline',
       detail:
-        'The deadline is set on each call itself (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`) from the 2-second constant, a full 2 s for every call even after a slow consumer; without it one wedged consumer holds the rotation worker for as long as it likes.',
+        'The deadline is set on each call itself (`timeout=`, `deadline:`, `context.WithTimeout`, `set_deadline`) from the 2-second constant, a full 2 s for every call even after a slow consumer; without it one wedged consumer holds the rotation worker for as long as it likes.',
       match: {
         python: {all: [/VERIFY_DEADLINE_S\s*=\s*2\b/, /CanReadVersion\([\s\S]{0,250}?timeout\s*=\s*VERIFY_DEADLINE_S/]},
         typescript: {
           all: [/VERIFY_DEADLINE_MS\s*=\s*2000\b/, /CanReadVersion\([\s\S]{0,250}?deadline:[^\n]*VERIFY_DEADLINE_MS/],
         },
         go: {all: [/verifyDeadline\s*=\s*2\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*verifyDeadline\)/]},
-        scala: {all: [/VerifyDeadlineSeconds\s*=\s*2L?\b/, /withDeadlineAfter\(\s*VerifyDeadlineSeconds/]},
         cpp: {all: [/kVerifyDeadline\{2\}/, /set_deadline\([^\n]*kVerifyDeadline\)/]},
       },
     },
@@ -71,7 +70,6 @@ service SecretConsumer { rpc CanReadVersion(CanReadRequest) returns (CanReadRepl
         python: {all: [/reply\.can_read/, /reply\.version_id/]},
         typescript: {all: [/reply\.can_read/, /reply\.version_id/]},
         go: {all: [/reply\.(GetCanRead\(\)|CanRead)/, /reply\.(GetVersionId\(\)|VersionId)/]},
-        scala: {all: [/reply\.canRead/, /reply\.versionId/]},
         cpp: {all: [/reply\.can_read\(\)/, /reply\.version_id\(\)/]},
       },
     },
@@ -84,7 +82,6 @@ service SecretConsumer { rpc CanReadVersion(CanReadRequest) returns (CanReadRepl
         python: {all: [/def verify_consumer\(/], none: [/VERIFY_ATTEMPTS/, /for attempt in/]},
         typescript: {all: [/function verifyConsumer\(/], none: [/VERIFY_ATTEMPTS/, /for \(let attempt/]},
         go: {all: [/func verifyConsumer\(/], none: [/verifyAttempts/, /for attempt :=/]},
-        scala: {all: [/def verifyConsumer\(/], none: [/VerifyAttempts/]},
         cpp: {all: [/Report verifyConsumer\(/], none: [/kVerifyAttempts/, /for \(int attempt/]},
       },
     },
@@ -100,7 +97,6 @@ service SecretConsumer { rpc CanReadVersion(CanReadRequest) returns (CanReadRepl
           order: [/vault\.raiseAlert\(/, /rotation\.retire\(/],
         },
         go: {all: [/vault\.RaiseAlert\(/, /len\(reports\) == 0/], order: [/vault\.RaiseAlert\(/, /rotation\.Retire\(/]},
-        scala: {all: [/Vault\.raiseAlert\(/, /reports\.isEmpty/], order: [/Vault\.raiseAlert\(/, /Rotation\.retire\(/]},
         cpp: {all: [/vault::raiseAlert\(/, /reports\.empty\(\)/], order: [/vault::raiseAlert\(/, /rotation::retire\(/]},
       },
     },
@@ -551,117 +547,6 @@ func retire(ctx context.Context, name, oldVersionID, newVersionID string) (Retir
 	}
 	vault.RecordRetirement(ctx, name, oldVersionID)
 	return Retirement{Retired: true, BlockedBy: []string{}, Reports: reports}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import secretd.{Rotation, Vault} // Vault.consumers, getVersion, recordAcceptance, recordRetirement, raiseAlert; Rotation.retire
-import secretsrotation.secrets_rotation.{CanReadRequest, SecretConsumerGrpc}
-
-/** What one consumer said about a version. */
-final case class Report(consumerId: String, verified: Boolean, detail: String)
-
-/** What retire did, and why. */
-final case class Retirement(retired: Boolean, blockedBy: Seq[String], reports: Seq[Report])
-
-object Client {
-  val VerifyAttempts = 3
-
-  private def stub(consumerId: String) =
-    SecretConsumerGrpc.blockingStub(ManagedChannelBuilder.forAddress(consumerId, 9000).usePlaintext().build())
-
-  /** Ask every registered consumer whether it can read versionId: one report per consumer. */
-  def verifyConsumers(name: String, versionId: String): Seq[Report] = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val version = Vault.getVersion(name, versionId).get
-    val request = CanReadRequest(name, versionId, version.fingerprint)
-    var reports = Seq.empty[Report]
-    var attempt = 0
-    var everyone = false
-    while (attempt < VerifyAttempts && !everyone) {
-      reports = Vault.consumers(name).map { consumerId =>
-        try {
-          stub(consumerId).canReadVersion(request)
-          Report(consumerId, verified = true, "ok")
-        } catch { case e: StatusRuntimeException => Report(consumerId, verified = false, e.getStatus.getCode.toString) }
-      }
-      everyone = reports.forall(_.verified) // everyone answered: no need to ask again
-      attempt += 1
-    }
-    reports.filter(_.verified).foreach(report => Vault.recordAcceptance(name, versionId, report.consumerId))
-    reports
-  }
-
-  /** End oldVersionId's overlap once every consumer verified newVersionId. */
-  def retire(name: String, oldVersionId: String, newVersionId: String): Retirement = {
-    val reports = verifyConsumers(name, newVersionId)
-    val pending = reports.filterNot(_.verified).map(_.consumerId)
-    if (pending.nonEmpty) {
-      System.err.println(s"retirement of $oldVersionId waits for \${pending.mkString(", ")}")
-      Retirement(retired = false, pending, reports)
-    } else {
-      Rotation.retire(name, oldVersionId)
-      Vault.recordRetirement(name, oldVersionId)
-      Retirement(retired = true, Seq.empty, reports)
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import secretd.{Rotation, Vault} // Vault.consumers, getVersion, recordAcceptance, recordRetirement, raiseAlert; Rotation.retire
-import secretsrotation.secrets_rotation.{CanReadRequest, SecretConsumerGrpc}
-
-/** What one consumer said about a version. */
-final case class Report(consumerId: String, verified: Boolean, detail: String)
-
-/** What retire did, and why. */
-final case class Retirement(retired: Boolean, blockedBy: Seq[String], reports: Seq[Report])
-
-object Client {
-  val VerifyDeadlineSeconds = 2L
-
-  private def stub(consumerId: String) =
-    SecretConsumerGrpc.blockingStub(ManagedChannelBuilder.forAddress(consumerId, 9000).usePlaintext().build())
-
-  /** One call: verified only when the consumer can read exactly this version. */
-  def verifyConsumer(name: String, version: Vault.Version, consumerId: String): Report = {
-    val request = CanReadRequest(name, version.versionId, version.fingerprint)
-    try {
-      val reply = stub(consumerId).withDeadlineAfter(VerifyDeadlineSeconds, TimeUnit.SECONDS).canReadVersion(request)
-      if (!reply.canRead || reply.versionId != version.versionId) Report(consumerId, verified = false, s"holds \${reply.versionId}")
-      else {
-        Vault.recordAcceptance(name, version.versionId, consumerId)
-        Report(consumerId, verified = true, "ok")
-      }
-    } catch { case e: StatusRuntimeException => Report(consumerId, verified = false, e.getStatus.getCode.toString) }
-  }
-
-  /** Ask every registered consumer whether it can read versionId: one report per consumer. */
-  def verifyConsumers(name: String, versionId: String): Seq[Report] = {
-    val version = Vault.getVersion(name, versionId).get
-    Vault.consumers(name).map(verifyConsumer(name, version, _))
-  }
-
-  /** End oldVersionId's overlap once every consumer verified newVersionId. */
-  def retire(name: String, oldVersionId: String, newVersionId: String): Retirement = {
-    val reports = verifyConsumers(name, newVersionId)
-    val pending = reports.filterNot(_.verified).map(_.consumerId)
-    if (reports.isEmpty || pending.nonEmpty) {
-      // Nobody verified is not everybody verified: keep the old version and page someone.
-      Vault.raiseAlert(name, newVersionId, pending)
-      System.err.println(s"retirement of $oldVersionId blocked by \${pending.mkString(", ")}")
-      Retirement(retired = false, pending, reports)
-    } else {
-      Rotation.retire(name, oldVersionId)
-      Vault.recordRetirement(name, oldVersionId)
-      Retirement(retired = true, Seq.empty, reports)
-    }
-  }
 }
 `,
     },

@@ -52,7 +52,6 @@ full minute however much of the window is left.
         python: {all: [/register_script\(|\.eval\(/, /INCRBY/], none: [/\br\.incrby\(/, /\br\.get\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /INCRBY/], none: [/redis\.incrby\(/, /redis\.get\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /INCRBY/], none: [/rdb\.IncrBy\(/, /rdb\.Get\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /INCRBY/], none: [/jedis\.incrBy\(/, /jedis\.get\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /INCRBY/], none: [/redis\.incrby\(/, /redis\.get\(/]},
       },
     },
@@ -65,7 +64,6 @@ full minute however much of the window is left.
         python: {order: [/redis\.call\(\s*['"]GET['"]/, /redis\.call\(\s*['"]HSET['"]/], none: [/\br\.hset\(/]},
         typescript: {order: [/redis\.call\(\s*['"]GET['"]/, /redis\.call\(\s*['"]HSET['"]/], none: [/redis\.hset\(/]},
         go: {order: [/redis\.call\(\s*['"]GET['"]/, /redis\.call\(\s*['"]HSET['"]/], none: [/rdb\.HSet\(/]},
-        scala: {order: [/redis\.call\(\s*['"]GET['"]/, /redis\.call\(\s*['"]HSET['"]/], none: [/jedis\.hset\(/]},
         cpp: {order: [/redis\.call\(\s*['"]GET['"]/, /redis\.call\(\s*['"]HSET['"]/], none: [/redis\.hset\(/]},
       },
     },
@@ -78,7 +76,6 @@ full minute however much of the window is left.
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]/]},
         go: {all: [/redis\.call\(\s*['"]EXPIRE['"]/]},
-        scala: {all: [/redis\.call\(\s*['"]EXPIRE['"]/]},
         cpp: {all: [/redis\.call\(\s*['"]EXPIRE['"]/]},
       },
     },
@@ -91,7 +88,6 @@ full minute however much of the window is left.
         python: {all: [/redis\.call\(\s*['"]TTL['"]/], none: [/["']retry_after["']\s*:\s*WINDOW_S/]},
         typescript: {all: [/redis\.call\(\s*['"]TTL['"]/], none: [/retry_after:\s*WINDOW_S/]},
         go: {all: [/redis\.call\(\s*['"]TTL['"]/], none: [/RetryAfter:\s*windowS/]},
-        scala: {all: [/redis\.call\(\s*['"]TTL['"]/], none: [/,\s*WindowSeconds\)/]},
         cpp: {all: [/redis\.call\(\s*['"]TTL['"]/], none: [/,\s*kWindowS\}/]},
       },
     },
@@ -347,84 +343,6 @@ func admit(ctx context.Context, deviceID string, samples []wal.Sample) (Admissio
 		return Admission{}, err
 	}
 	return Admission{Admitted: reply[0] == 1, Remaining: reply[1], RetryAfter: reply[2]}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import ingestd.Sample
-
-/** The answer to one batch. */
-final case class Admission(admitted: Boolean, remaining: Long, retryAfter: Long)
-
-object AdmitState {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val RateLimit = 600L // samples per device per window
-  val WindowSeconds = 60L
-
-  /** Count a batch of samples against the device's window and record each metric's latest value. */
-  def admit(deviceId: String, samples: Seq[Sample]): Admission = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = s"rate:$deviceId"
-    samples.foreach(s => jedis.hset(s"latest:$deviceId", s.metric, s.value.toString))
-    val count = Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
-    if (count + samples.size > RateLimit) Admission(false, RateLimit - count, WindowSeconds)
-    else {
-      jedis.incrBy(key, samples.size.toLong)
-      Admission(true, RateLimit - count - samples.size, 0L)
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import ingestd.Sample
-
-/** The answer to one batch. */
-final case class Admission(admitted: Boolean, remaining: Long, retryAfter: Long)
-
-object AdmitState {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val RateLimit = 600L // samples per device per window
-  val WindowSeconds = 60L
-
-  /**
-   * KEYS: rate:{device}, latest:{device}. ARGV: n, limit, window, then metric/value pairs.
-   * Decide first; only an admitted batch moves the counter and the latest values.
-   */
-  val AdmitLua: String =
-    """local count = tonumber(redis.call('GET', KEYS[1]) or '0')
-      |local n = tonumber(ARGV[1])
-      |local limit = tonumber(ARGV[2])
-      |if count + n > limit then
-      |  local ttl = redis.call('TTL', KEYS[1])
-      |  if ttl < 0 then ttl = 0 end
-      |  return {0, limit - count, ttl}
-      |end
-      |local total = redis.call('INCRBY', KEYS[1], n)
-      |if total == n then
-      |  redis.call('EXPIRE', KEYS[1], ARGV[3])
-      |end
-      |for i = 4, #ARGV, 2 do
-      |  redis.call('HSET', KEYS[2], ARGV[i], ARGV[i + 1])
-      |end
-      |return {1, limit - total, 0}
-      |""".stripMargin
-
-  /** Count a batch of samples against the device's window and record each metric's latest value. */
-  def admit(deviceId: String, samples: Seq[Sample]): Admission = {
-    val latest = samples.map(s => s.metric -> s.value).toMap // a later sample of a metric wins
-    val args = Seq(samples.size.toString, RateLimit.toString, WindowSeconds.toString) ++
-      latest.toSeq.flatMap { case (metric, value) => Seq(metric, value.toString) }
-    val reply = jedis.eval(AdmitLua, List(s"rate:$deviceId", s"latest:$deviceId").asJava, args.asJava)
-      .asInstanceOf[java.util.List[java.lang.Long]].asScala.map(_.longValue)
-    Admission(reply(0) == 1L, reply(1), reply(2))
-  }
 }
 `,
     },

@@ -49,7 +49,6 @@ the queue, and the customer's badge misses a reply.
         python: {all: [/\.set\([^\n]*\bnx\s*=\s*True/]},
         typescript: {all: [/\.set\([^\n]*['"]NX['"]/]},
         go: {all: [/\.SetNX\(|Mode:\s*"NX"/]},
-        scala: {all: [/\.nx\(\)/]},
         cpp: {all: [/UpdateType::NOT_EXIST/]},
       },
     },
@@ -62,7 +61,6 @@ the queue, and the customer's badge misses a reply.
         python: {all: [/LEASE_S\s*=\s*120\b/, /\bex\s*=\s*LEASE_S/]},
         typescript: {all: [/LEASE_S\s*=\s*120\b/, /['"]EX['"],\s*LEASE_S/]},
         go: {all: [/leaseTTL\s*=\s*120\s*\*\s*time\.Second/, /SetNX\([^\n]*leaseTTL/]},
-        scala: {all: [/LeaseSeconds\s*=\s*120L?\b/, /\.ex\(\s*LeaseSeconds/]},
         cpp: {all: [/kLeaseTTL\{120\}/, /\.set\([^;]*kLeaseTTL/]},
       },
     },
@@ -84,10 +82,6 @@ the queue, and the customer's badge misses a reply.
           all: [/redis\.call\(\s*['"]GET['"]/, /redis\.call\(\s*['"]DEL['"]/, /redis\.NewScript\(|\.Eval\(/],
           none: [/rdb\.Del\(/],
         },
-        scala: {
-          all: [/redis\.call\(\s*['"]GET['"]/, /redis\.call\(\s*['"]DEL['"]/, /jedis\.eval(sha)?\(/],
-          none: [/jedis\.del\(/],
-        },
         cpp: {
           all: [/redis\.call\(\s*['"]GET['"]/, /redis\.call\(\s*['"]DEL['"]/, /redis\.eval(sha)?[<(]/],
           none: [/redis\.del\(/],
@@ -103,7 +97,6 @@ the queue, and the customer's badge misses a reply.
         python: {all: [/\.zrem\(/, /['"]ZADD['"]|\.zadd\(/]},
         typescript: {all: [/\.zrem\(/, /['"]ZADD['"]|\.zadd\(/]},
         go: {all: [/\.ZRem\(/, /['"]ZADD['"]|\.ZAdd\(/]},
-        scala: {all: [/\.zrem\(/, /['"]ZADD['"]|\.zadd\(/]},
         cpp: {all: [/\.zrem\(/, /['"]ZADD['"]|\.zadd\(/]},
       },
     },
@@ -116,7 +109,6 @@ the queue, and the customer's badge misses a reply.
         python: {all: [/\.hincrby\(/], none: [/\.hset\(/]},
         typescript: {all: [/\.hincrby\(/], none: [/\.hset\(/]},
         go: {all: [/\.HIncrBy\(/], none: [/rdb\.HSet\(/]},
-        scala: {all: [/\.hincrBy\(/], none: [/jedis\.hset\(/]},
         cpp: {all: [/redis\.hincrby\(/], none: [/redis\.hset\(/]},
       },
     },
@@ -407,87 +399,6 @@ func postMessage(ctx context.Context, ticketID, agent, body string) (int64, erro
 		return 0, err
 	}
 	return rdb.HIncrBy(ctx, unreadKey(ticket.RequesterID), ticketID, 1).Result()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import tickets.Store // Store.getTicket, appendNote
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  def leaseKey(ticketId: String): String = s"lease:$ticketId"
-  def unreadKey(requesterId: String): String = s"unread:$requesterId"
-
-  /** Give the ticket to agent; returns the agent who holds it afterwards. */
-  def assign(ticketId: String, agent: String): String = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    jedis.set(leaseKey(ticketId), agent)
-    agent
-  }
-
-  /** agent puts the ticket down: true when it was theirs and is back on assign:queue. */
-  def release(ticketId: String, agent: String): Boolean = {
-    jedis.del(leaseKey(ticketId))
-    true
-  }
-
-  /** An agent's reply on the ticket; returns the requester's unread count for it. */
-  def postMessage(ticketId: String, agent: String, body: String): Long = {
-    val ticket = Store.getTicket(ticketId).getOrElse(throw new NoSuchElementException(s"unknown ticket $ticketId"))
-    Store.appendNote(ticketId, agent, "public", body)
-    val key = unreadKey(ticket.requesterId)
-    val count = Option(jedis.hget(key, ticketId)).map(_.toLong).getOrElse(0L) + 1
-    jedis.hset(key, ticketId, count.toString)
-    count
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import scala.jdk.CollectionConverters._
-
-import tickets.Store // Store.getTicket, appendNote
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val LeaseSeconds = 120L
-  val QueueKey = "assign:queue"
-
-  /** Deletes the lease only while ARGV[1] holds it, and puts the ticket (ARGV[3]) back on the queue at ARGV[2]. */
-  val ReleaseLua: String =
-    """if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
-      |redis.call('DEL', KEYS[1])
-      |redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3])
-      |return 1
-      |""".stripMargin
-
-  def leaseKey(ticketId: String): String = s"lease:$ticketId"
-  def unreadKey(requesterId: String): String = s"unread:$requesterId"
-
-  /** Give the ticket to agent; returns the agent who holds it afterwards. */
-  def assign(ticketId: String, agent: String): String =
-    if (jedis.set(leaseKey(ticketId), agent, SetParams.setParams().nx().ex(LeaseSeconds)) == "OK") {
-      jedis.zrem(QueueKey, ticketId)
-      agent
-    } else Option(jedis.get(leaseKey(ticketId))).getOrElse("")
-
-  /** agent puts the ticket down: true when it was theirs and is back on assign:queue. */
-  def release(ticketId: String, agent: String): Boolean = {
-    val args = List(agent, (System.currentTimeMillis() / 1000).toString, ticketId)
-    jedis.eval(ReleaseLua, List(leaseKey(ticketId), QueueKey).asJava, args.asJava).asInstanceOf[java.lang.Long] == 1L
-  }
-
-  /** An agent's reply on the ticket; returns the requester's unread count for it. */
-  def postMessage(ticketId: String, agent: String, body: String): Long = {
-    val ticket = Store.getTicket(ticketId).getOrElse(throw new NoSuchElementException(s"unknown ticket $ticketId"))
-    Store.appendNote(ticketId, agent, "public", body)
-    jedis.hincrBy(unreadKey(ticket.requesterId), ticketId, 1L)
-  }
 }
 `,
     },

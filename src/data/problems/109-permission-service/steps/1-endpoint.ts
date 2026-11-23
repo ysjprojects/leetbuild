@@ -73,7 +73,6 @@ three flaws.
         python: {all: [/@app\.post\(\s*["']\/v1\/roles\/assignments["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/roles\/assignments['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/roles\/assignments"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"roles"\s*\/\s*"assignments"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/roles\/assignments"/]},
       },
     },
@@ -86,7 +85,6 @@ three flaws.
         python: {all: [/catalog\.ROLES\b/, /catalog\.scope_kind\(/, /\b422\b/]},
         typescript: {all: [/ROLES\[/, /scopeKind\(/, /\b422\b/]},
         go: {all: [/catalog\.Roles\[/, /catalog\.ScopeKind\(/, /StatusUnprocessableEntity|\b422\b/]},
-        scala: {all: [/Catalog\.Roles\.get\(|Catalog\.Roles\(/, /Catalog\.scopeKind\(/, /UnprocessableEntity|\b422\b/]},
         cpp: {all: [/catalog::kRoles\.find\(|catalog::kRoles\.at\(/, /catalog::scopeKind\(/, /\b422\b/]},
       },
     },
@@ -99,7 +97,6 @@ three flaws.
         python: {all: [/grants\.effective\(/, /catalog\.permissions_of\(/, /roles:assign/, /missing_permission/]},
         typescript: {all: [/\beffective\(/, /permissionsOf\(/, /roles:assign/, /missing_permission/]},
         go: {all: [/grants\.Effective\(/, /catalog\.PermissionsOf\(/, /roles:assign/, /missing_permission/]},
-        scala: {all: [/Grants\.effective\(/, /Catalog\.permissionsOf\(/, /roles:assign/, /missing_permission/]},
         cpp: {all: [/grants::effective\(/, /catalog::permissionsOf\(/, /roles:assign/, /missing_permission/]},
       },
     },
@@ -120,10 +117,6 @@ three flaws.
         go: {
           all: [/Idempotency-Key/i, /grants\.Assignment\(/, /grants\.RecordAssignment\(/, /StatusBadRequest|\b400\b/],
           order: [/grants\.Assignment\(/, /grants\.Add\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Grants\.assignment\(/, /Grants\.recordAssignment\(/, /BadRequest|\b400\b/],
-          order: [/Grants\.assignment\(/, /Grants\.add\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /grants::assignment\(/, /grants::recordAssignment\(/, /\b400\b/],
@@ -383,98 +376,6 @@ func assign(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/roles/assignments", assign)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import permz.Catalog // Catalog.Roles, scopeKind, covers, permissionsOf
-import permz.Grants // Grants.grantsOf, effective, add, assignment, recordAssignment
-
-object Api {
-  val AdminRoles: Set[String] = Set("org_admin", "team_admin")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  val route: Route = path("v1" / "roles" / "assignments") {
-    post {
-      optionalHeaderValueByName("X-Assigner-Id") { assignerHeader =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-          val body = raw.parseJson.asJsObject.fields
-          def text(name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
-          assignerHeader.filter(_.nonEmpty) match {
-            case None => complete(error(StatusCodes.Unauthorized, "X-Assigner-Id is required"))
-            case Some(assigner) =>
-              if (!Grants.grantsOf(assigner).exists(grant => AdminRoles.contains(grant.role)))
-                complete(error(StatusCodes.Forbidden, "insufficient_permissions"))
-              else complete(json(StatusCodes.Created, Grants.add(text("subject"), text("role"), text("scope"), assigner).toJson))
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import permz.Catalog // Catalog.Roles, scopeKind, covers, permissionsOf
-import permz.Grants // Grants.grantsOf, effective, add, assignment, recordAssignment
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  val route: Route = path("v1" / "roles" / "assignments") {
-    post {
-      optionalHeaderValueByName("X-Assigner-Id") { assignerHeader =>
-        optionalHeaderValueByName("Idempotency-Key") { keyHeader =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject.fields
-            def text(name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
-            (assignerHeader.filter(_.nonEmpty), keyHeader.filter(_.nonEmpty)) match {
-              case (None, _) => complete(error(StatusCodes.Unauthorized, "X-Assigner-Id is required"))
-              case (_, None) => complete(error(StatusCodes.BadRequest, "Idempotency-Key is required"))
-              case (Some(assigner), Some(key)) =>
-                Grants.assignment(assigner, key) match {
-                  case Some(recorded) => complete(json(StatusCodes.Created, recorded.toJson)) // a replay answers what the first attempt answered
-                  case None => complete(assignOnce(assigner, key, text("subject"), text("role"), text("scope")))
-                }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  /** The response to a valid, not yet recorded assignment by assigner. */
-  private def assignOnce(assigner: String, key: String, subject: String, role: String, scope: String): HttpResponse =
-    Catalog.Roles.get(role) match {
-      case Some(entry) if entry.scopeKinds.contains(Catalog.scopeKind(scope)) =>
-        // Hand out only what the assigner holds at the target scope: the right to assign, and every permission of the role.
-        val held = Grants.effective(assigner, scope).toSet
-        ("roles:assign" +: Catalog.permissionsOf(role)).find(p => !held.contains(p)) match {
-          case Some(missing) =>
-            json(StatusCodes.Forbidden, JsObject("error" -> JsString("insufficient_permissions"), "missing_permission" -> JsString(missing)))
-          case None =>
-            val grant = Grants.add(subject, role, scope, assigner)
-            Grants.recordAssignment(assigner, key, grant)
-            json(StatusCodes.Created, grant.toJson)
-        }
-      case _ => error(StatusCodes.UnprocessableEntity, "not in the role catalog")
-    }
 }
 `,
     },

@@ -47,7 +47,6 @@ one tenant initiates a terabyte; a client that timed out and retried starts a se
         python: {all: [/@app\.post\(\s*["']\/v1\/uploads["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/uploads['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/uploads"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"uploads"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/uploads"/]},
       },
     },
@@ -60,7 +59,6 @@ one tenant initiates a terabyte; a client that timed out and retried starts a se
         python: {all: [/MIN_PART_BYTES/, /MAX_PART_BYTES/, /\b400\b/]},
         typescript: {all: [/MIN_PART_BYTES/, /MAX_PART_BYTES/, /\b400\b/]},
         go: {all: [/minPartBytes/, /maxPartBytes/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/MinPartBytes/, /MaxPartBytes/, /BadRequest|\b400\b/]},
         cpp: {all: [/kMinPartBytes/, /kMaxPartBytes/, /\b400\b/]},
       },
     },
@@ -73,7 +71,6 @@ one tenant initiates a terabyte; a client that timed out and retried starts a se
         python: {all: [/math\.ceil\(|-\s*\(\s*-|\+\s*[\w.]*part_bytes\s*-\s*1|divmod\(/]},
         typescript: {all: [/Math\.ceil\(|\+\s*[\w.]*part_bytes\s*-\s*1/], none: [/Math\.floor\(/]},
         go: {all: [/math\.Ceil\(|\+\s*[\w.]*PartBytes\s*-\s*1/]},
-        scala: {all: [/math\.ceil\(|Math\.ceil\(|ceilDiv\(|\+\s*[\w.]*partBytes\s*-\s*1/]},
         cpp: {all: [/std::ceil\(|\+\s*[\w.]*part_bytes\s*-\s*1/]},
       },
     },
@@ -86,7 +83,6 @@ one tenant initiates a terabyte; a client that timed out and retried starts a se
         python: {all: [/MAX_UPLOAD_BYTES/, /\b413\b/]},
         typescript: {all: [/MAX_UPLOAD_BYTES/, /\b413\b/]},
         go: {all: [/maxUploadBytes/, /StatusRequestEntityTooLarge|\b413\b/]},
-        scala: {all: [/MaxUploadBytes/, /PayloadTooLarge|ContentTooLarge|RequestEntityTooLarge|\b413\b/]},
         cpp: {all: [/kMaxUploadBytes/, /\b413\b/]},
       },
     },
@@ -107,10 +103,6 @@ one tenant initiates a terabyte; a client that timed out and retried starts a se
         go: {
           all: [/Idempotency-Key/i, /store\.Initiation\(/, /store\.RecordInitiation\(/],
           order: [/store\.Initiation\(/, /store\.CreateUpload\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Store\.initiation\(/, /Store\.recordInitiation\(/],
-          order: [/Store\.initiation\(/, /Store\.createUpload\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /store::initiation\(/, /store::recordInitiation\(/],
@@ -409,97 +401,6 @@ func initUpload(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/uploads", initUpload)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import uploads.{Store, Upload} // Store.createUpload, getUpload, initiation, recordInitiation
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def view(upload: Upload): JsObject = JsObject(
-    "upload_id" -> JsString(upload.uploadId), "part_bytes" -> JsNumber(upload.partBytes),
-    "part_count" -> JsNumber(upload.partCount), "status" -> JsString(upload.status))
-
-  val route: Route = path("v1" / "uploads") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            val body = raw.parseJson.asJsObject.fields
-            def long(name: String): Long = body.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-            val totalBytes = long("total_bytes")
-            val partBytes = long("part_bytes")
-            val contentType = body.get("content_type").collect { case JsString(s) => s }.getOrElse("")
-            val partCount = (totalBytes / partBytes).toInt
-            val upload = Store.createUpload(tenant, totalBytes, partBytes, partCount, contentType)
-            complete(json(StatusCodes.Created, view(upload)))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import uploads.{Store, Upload} // Store.createUpload, getUpload, initiation, recordInitiation
-
-object Api {
-  val MinPartBytes: Long = 5L << 20 // 5 MiB: smaller parts make a manifest of millions of entries
-  val MaxPartBytes: Long = 64L << 20 // 64 MiB: a failed part costs at most this much to send again
-  val MaxUploadBytes: Long = 5L << 30 // the tenant quota: 5 GiB
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def view(upload: Upload): JsObject = JsObject(
-    "upload_id" -> JsString(upload.uploadId), "part_bytes" -> JsNumber(upload.partBytes),
-    "part_count" -> JsNumber(upload.partCount), "status" -> JsString(upload.status))
-
-  val route: Route = path("v1" / "uploads") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          optionalHeaderValueByName("Idempotency-Key") {
-            case None | Some("") => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
-            case Some(key) =>
-              Store.initiation(tenant, key) match {
-                case Some(recorded) => complete(json(StatusCodes.Created, view(recorded))) // a retry answers the upload the first attempt created
-                case None =>
-                  entity(as[String]) { raw =>
-                    val body = raw.parseJson.asJsObject.fields
-                    def long(name: String): Long = body.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-                    val totalBytes = long("total_bytes")
-                    val partBytes = long("part_bytes")
-                    val contentType = body.get("content_type").collect { case JsString(s) => s }.getOrElse("")
-                    if (totalBytes <= 0) complete(StatusCodes.BadRequest -> "total_bytes must be positive")
-                    else if (totalBytes > MaxUploadBytes) complete(StatusCodes.PayloadTooLarge -> "total_bytes is over the 5 GiB tenant quota")
-                    else if (partBytes < MinPartBytes || partBytes > MaxPartBytes) complete(StatusCodes.BadRequest -> "part_bytes must be between 5 MiB and 64 MiB")
-                    else {
-                      val partCount = ((totalBytes + partBytes - 1) / partBytes).toInt // rounded up: the last part may be short
-                      val upload = Store.createUpload(tenant, totalBytes, partBytes, partCount, contentType)
-                      Store.recordInitiation(tenant, key, upload.uploadId)
-                      complete(json(StatusCodes.Created, view(upload)))
-                    }
-                  }
-              }
-          }
-      }
-    }
-  }
 }
 `,
     },

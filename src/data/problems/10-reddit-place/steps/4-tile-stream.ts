@@ -26,7 +26,7 @@ Implement the \`StreamTiles\` handler of **tile-stream**. The per-instance bus i
 - On a call: \`subscribe()\`, then forward everything the queue yields as a \`Tile\`, in order, for as
   long as the client stays connected.
 - When the client hangs up — cancel, connection drop, or any other end — **unsubscribe**, from the
-  call's done callback (\`add_done_callback\` / \`ctx.Done()\` / \`setOnCancelHandler\` / \`IsCancelled\`).
+  call's done callback (\`add_done_callback\` / \`ctx.Done()\` / \`IsCancelled\`).
   Reddit held ~80 000 of these at the peak; a subscription that outlives its stream is a leak per
   disconnect.
 - A client that cannot keep up is **dropped, not buffered**: if more than \`MAX_LAG\` (1000) tiles are
@@ -73,7 +73,6 @@ Implement the \`StreamTiles\` handler of **tile-stream**. The per-instance bus i
           all: [/addService\(\s*\w+(\.\w+)*\.Place\.service/, /StreamTiles:|function streamTiles\(/, /call\.write\(/],
         },
         go: {all: [/RegisterPlaceServer\(/, /func \(\w+ \*\w+\) StreamTiles\(/, /stream\.Send\(/]},
-        scala: {all: [/PlaceGrpc\.bindService\(/, /def streamTiles\(/, /out\.onNext\(|responseObserver\.onNext\(/]},
         cpp: {all: [/RegisterService\(/, /grpc::Status StreamTiles\(/, /writer->Write\(/]},
       },
     },
@@ -88,7 +87,6 @@ Implement the \`StreamTiles\` handler of **tile-stream**. The per-instance bus i
         },
         typescript: {all: [/(?<!function )subscribe\(\)/, /while\s*\(|for\s*\(;;\)/, /user:/, /\bts:/]},
         go: {all: [/(?<!func )subscribe\(\)/, /case \w+ := <-sub/, /User:/, /Ts:/]},
-        scala: {all: [/(?<!def )subscribe\(\)/, /queue\.(take|poll)\(/, /while\s*\(/]},
         cpp: {all: [/(?<!Subscription )subscribe\(\)/, /sub->pop\(/, /while\s*\(/]},
       },
     },
@@ -96,12 +94,11 @@ Implement the \`StreamTiles\` handler of **tile-stream**. The per-instance bus i
       id: 'cancel-cleanup',
       title: 'Unsubscribes when the client hangs up',
       detail:
-        "Hook the call's end (`add_done_callback`, `ctx.Done()`, `setOnCancelHandler`, `IsCancelled`) and `unsubscribe` the queue from it — however the call ended.",
+        "Hook the call's end (`add_done_callback`, `ctx.Done()`, `IsCancelled`) and `unsubscribe` the queue from it — however the call ended.",
       match: {
         python: {all: [/add_done_callback\(|add_callback\(/, /unsubscribe\(\s*queue\s*\)/]},
         typescript: {all: [/on\(\s*['"]cancelled['"]/, /unsubscribe\(\s*queue\s*\)/]},
         go: {all: [/ctx\.Done\(\)|Context\(\)\.Done\(\)/, /defer unsubscribe\(\s*sub\s*\)/]},
-        scala: {all: [/setOnCancelHandler\(|isCancelled/, /unsubscribe\(\s*queue\s*\)/]},
         cpp: {all: [/IsCancelled\(\)/, /unsubscribe\(\s*sub\s*\)/]},
       },
     },
@@ -114,7 +111,6 @@ Implement the \`StreamTiles\` handler of **tile-stream**. The per-instance bus i
         python: {all: [/qsize\(\)\s*>\s*MAX_LAG/, /StatusCode\.RESOURCE_EXHAUSTED/]},
         typescript: {all: [/queue\.size\s*>\s*MAX_LAG/, /status\.RESOURCE_EXHAUSTED/]},
         go: {all: [/len\(\s*sub\s*\)\s*>\s*maxLag/, /codes\.ResourceExhausted/]},
-        scala: {all: [/queue\.size\(?\)?\s*>\s*MaxLag/, /Status\.RESOURCE_EXHAUSTED/]},
         cpp: {all: [/sub->size\(\)\s*>\s*kMaxLag/, /StatusCode::RESOURCE_EXHAUSTED/]},
       },
     },
@@ -377,70 +373,6 @@ func main() {
 	srv := grpc.NewServer()
 	pb.RegisterPlaceServer(srv, &placeServer{})
 	log.Fatal(srv.Serve(lis))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.{BlockingQueue, TimeUnit}
-
-import io.grpc.{ServerBuilder, Status}
-import io.grpc.stub.{ServerCallStreamObserver, StreamObserver}
-import place.place.{PlaceGrpc, Subscribe, Tile}
-import scala.concurrent.ExecutionContext
-
-object TileStream extends PlaceGrpc.Place {
-  val MaxLag = 1000 // tiles a client may fall behind before it is dropped
-
-  /** Provided (TileBus): one bounded queue per open stream; publish offers to all of them. */
-  def subscribe(): BlockingQueue[Tile] = ???
-  def unsubscribe(queue: BlockingQueue[Tile]): Unit = ???
-
-  /** Forwards every placement published on this instance to one client. */
-  override def streamTiles(request: Subscribe, responseObserver: StreamObserver[Tile]): Unit = {
-    val out = responseObserver.asInstanceOf[ServerCallStreamObserver[Tile]]
-    // TODO: val queue = subscribe(); out.setOnCancelHandler(() => unsubscribe(queue))
-    // TODO: while !out.isCancelled: queue.poll(1, SECONDS); queue.size > MaxLag → onError(RESOURCE_EXHAUSTED); else out.onNext
-    out.onError(Status.UNIMPLEMENTED.asRuntimeException())
-  }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder.forPort(9000).addService(PlaceGrpc.bindService(this, ExecutionContext.global)).build().start().awaitTermination()
-}
-`,
-      solution: `import java.util.concurrent.{BlockingQueue, TimeUnit}
-
-import io.grpc.{ServerBuilder, Status}
-import io.grpc.stub.{ServerCallStreamObserver, StreamObserver}
-import place.place.{PlaceGrpc, Subscribe, Tile}
-import scala.concurrent.ExecutionContext
-
-object TileStream extends PlaceGrpc.Place {
-  val MaxLag = 1000 // tiles a client may fall behind before it is dropped
-
-  /** Provided (TileBus): one bounded queue per open stream; publish offers to all of them. */
-  def subscribe(): BlockingQueue[Tile] = ???
-  def unsubscribe(queue: BlockingQueue[Tile]): Unit = ???
-
-  /** Forwards every placement published on this instance to one client. */
-  override def streamTiles(request: Subscribe, responseObserver: StreamObserver[Tile]): Unit = {
-    val out = responseObserver.asInstanceOf[ServerCallStreamObserver[Tile]]
-    val queue = subscribe()
-    out.setOnCancelHandler(() => unsubscribe(queue)) // the client hung up
-    var open = true
-    while (open && !out.isCancelled) {
-      val tile = queue.poll(1, TimeUnit.SECONDS)
-      if (tile != null) {
-        if (queue.size > MaxLag) { // the client is not reading: drop it, it will refetch /board
-          out.onError(Status.RESOURCE_EXHAUSTED.withDescription("client too slow; reconnect and refetch /board").asRuntimeException())
-          open = false
-        } else out.onNext(tile)
-      }
-    }
-    unsubscribe(queue)
-  }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder.forPort(9000).addService(PlaceGrpc.bindService(this, ExecutionContext.global)).build().start().awaitTermination()
 }
 `,
     },

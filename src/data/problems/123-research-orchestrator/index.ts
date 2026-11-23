@@ -7,7 +7,7 @@ import {subagentFanoutStep} from './steps/2-subagent-fanout';
 import {checkpointsStep} from './steps/3-checkpoints';
 import {toolCallsStep} from './steps/4-tool-calls';
 import {traceEventsStep} from './steps/5-trace-events';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Anthropic's multi-agent Research system, rebuilt as the orchestration layer around the models:
@@ -128,6 +128,5 @@ against a rubric, source-quality heuristics, human evaluation and the rainbow tr
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

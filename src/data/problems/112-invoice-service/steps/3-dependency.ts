@@ -65,12 +65,11 @@ service Tax { rpc Quote(QuoteRequest) returns (TaxQuote); }  // FAILED_PRECONDIT
       id: 'deadline',
       title: 'Every quote carries a 2-second deadline',
       detail:
-        'Each `Quote`, every retry included, is made with a full `TAX_DEADLINE_S` (2 s) as its deadline (a call `timeout`, `deadline`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`); without one, a stuck tax service holds the finalize open.',
+        'Each `Quote`, every retry included, is made with a full `TAX_DEADLINE_S` (2 s) as its deadline (a call `timeout`, `deadline`, `context.WithTimeout`, `set_deadline`); without one, a stuck tax service holds the finalize open.',
       match: {
         python: {all: [/TAX_DEADLINE_S\s*=\s*2\b/, /\.Quote\([^)]*timeout\s*=\s*TAX_DEADLINE_S/]},
         typescript: {all: [/TAX_DEADLINE_MS\s*=\s*2000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*TAX_DEADLINE_MS/]},
         go: {all: [/taxDeadline\s*=\s*2\s*\*\s*time\.Second/, /context\.WithTimeout\([^)]*taxDeadline/]},
-        scala: {all: [/TaxDeadlineMs\s*=\s*2000L?\b/, /withDeadlineAfter\(TaxDeadlineMs/]},
         cpp: {all: [/kTaxDeadline\{2\}/, /set_deadline\([^;]*kTaxDeadline/]},
       },
     },
@@ -83,7 +82,6 @@ service Tax { rpc Quote(QuoteRequest) returns (TaxQuote); }  // FAILED_PRECONDIT
         python: {all: [/TAX_MAX_ATTEMPTS\s*=\s*3\b/, /range\(TAX_MAX_ATTEMPTS\)/]},
         typescript: {all: [/TAX_MAX_ATTEMPTS\s*=\s*3\b/, /<\s*TAX_MAX_ATTEMPTS/]},
         go: {all: [/taxMaxAttempts\s*=\s*3\b/, /<\s*taxMaxAttempts/]},
-        scala: {all: [/TaxMaxAttempts\s*=\s*3\b/, /<\s*TaxMaxAttempts/]},
         cpp: {all: [/kTaxMaxAttempts\s*=\s*3\b/, /<\s*kTaxMaxAttempts/]},
       },
     },
@@ -105,10 +103,6 @@ service Tax { rpc Quote(QuoteRequest) returns (TaxQuote); }  // FAILED_PRECONDIT
           all: [/codes\.FailedPrecondition/, /&JurisdictionRejected\{/],
           none: [/retryable\s*=[^}]*FailedPrecondition/],
         },
-        scala: {
-          all: [/Status\.Code\.FAILED_PRECONDITION/, /throw new JurisdictionRejected\(/],
-          none: [/Retryable[^\n]*FAILED_PRECONDITION/],
-        },
         cpp: {
           all: [/StatusCode::FAILED_PRECONDITION/, /throw JurisdictionRejected\(/],
           none: [/kRetryable[^;]*FAILED_PRECONDITION/],
@@ -124,7 +118,6 @@ service Tax { rpc Quote(QuoteRequest) returns (TaxQuote); }  // FAILED_PRECONDIT
         python: {all: [/store\.hold\(/, /["']held["']/]},
         typescript: {all: [/\bhold\(/, /'held'/]},
         go: {all: [/store\.Hold\(/, /"held"/]},
-        scala: {all: [/Store\.hold\(/, /"held"/]},
         cpp: {all: [/store::hold\(/, /"held"/]},
       },
     },
@@ -557,106 +550,6 @@ func finalizeWithTax(ctx context.Context, tenant, invoiceID string) (Outcome, er
 	store.SetTax(ctx, invoiceID, quote.GetTaxCents(), quote.GetTaxSource())
 	number, err := sequence.ClaimNumber(ctx, tenant, invoiceID)
 	return Outcome{Status: "finalized", Number: number, TaxCents: quote.GetTaxCents(), TaxSource: quote.GetTaxSource()}, err
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import invoice.{Sequence, Store} // Store.get, setTax, hold; Sequence.claimNumber
-import invoicetax.invoice_service.{QuoteRequest, TaxGrpc}
-
-/** The customer's jurisdiction refuses this document: terminal, the invoice stays a draft. */
-final class JurisdictionRejected(val jurisdiction: String, detail: String) extends Exception(s"jurisdiction $jurisdiction refused the invoice: $detail")
-
-/** What a finalize came to: "finalized" with its number and tax, or "held" with why. */
-final case class Outcome(status: String, number: Option[Long] = None, taxCents: Long = 0, taxSource: String = "", reason: String = "", attempts: Int = 0)
-
-object Client {
-  val TaxMaxAttempts = 5
-  val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED, Status.Code.FAILED_PRECONDITION, Status.Code.INVALID_ARGUMENT)
-
-  private val tax = TaxGrpc.blockingStub(ManagedChannelBuilder.forAddress("tax", 9000).usePlaintext().build())
-
-  /** Quote the tax, then finalize the draft. */
-  def finalizeWithTax(tenant: String, invoiceId: String): Outcome = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val invoice = Store.get(invoiceId).getOrElse(throw new NoSuchElementException(s"no invoice $invoiceId"))
-    val request = QuoteRequest(invoiceId, tenant, invoice.currency, invoice.jurisdiction, invoice.subtotalCents)
-    var taxCents = 0L
-    var taxSource = "quote"
-    var attempt = 0
-    var done = false
-    while (!done && attempt < TaxMaxAttempts) {
-      attempt += 1
-      try {
-        val quote = tax.quote(request)
-        taxCents = quote.taxCents
-        taxSource = quote.taxSource
-        done = true
-      } catch {
-        case e: StatusRuntimeException if Retryable.contains(e.getStatus.getCode) => Thread.sleep(1000) // the tax service is flaky: try again
-        case _: StatusRuntimeException => done = true
-      }
-    }
-    Store.setTax(invoiceId, taxCents, taxSource)
-    Outcome("finalized", Sequence.claimNumber(tenant, invoiceId), taxCents, taxSource)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import invoice.{Sequence, Store} // Store.get, setTax, hold; Sequence.claimNumber
-import invoicetax.invoice_service.{QuoteRequest, TaxGrpc, TaxQuote}
-
-/** The customer's jurisdiction refuses this document: terminal, the invoice stays a draft. */
-final class JurisdictionRejected(val jurisdiction: String, detail: String) extends Exception(s"jurisdiction $jurisdiction refused the invoice: $detail")
-
-/** What a finalize came to: "finalized" with its number and tax, or "held" with why. */
-final case class Outcome(status: String, number: Option[Long] = None, taxCents: Long = 0, taxSource: String = "", reason: String = "", attempts: Int = 0)
-
-object Client {
-  val TaxDeadlineMs = 2000L
-  val TaxMaxAttempts = 3
-  val TaxBackoffMs = 200L
-  val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val tax = TaxGrpc.blockingStub(ManagedChannelBuilder.forAddress("tax", 9000).usePlaintext().build())
-
-  /** Quote the tax, then finalize the draft. */
-  def finalizeWithTax(tenant: String, invoiceId: String): Outcome = {
-    val invoice = Store.get(invoiceId).getOrElse(throw new NoSuchElementException(s"no invoice $invoiceId"))
-    val request = QuoteRequest(invoiceId, tenant, invoice.currency, invoice.jurisdiction, invoice.subtotalCents)
-    var quote: Option[TaxQuote] = None
-    var reason = ""
-    var attempts = 0
-    var done = false
-    while (!done && attempts < TaxMaxAttempts) {
-      attempts += 1
-      try {
-        quote = Some(tax.withDeadlineAfter(TaxDeadlineMs, TimeUnit.MILLISECONDS).quote(request))
-        done = true
-      } catch {
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.FAILED_PRECONDITION =>
-          throw new JurisdictionRejected(invoice.jurisdiction, Option(e.getStatus.getDescription).getOrElse(""))
-        case e: StatusRuntimeException =>
-          reason = e.getStatus.getCode.name.toLowerCase
-          if (!Retryable.contains(e.getStatus.getCode) || attempts == TaxMaxAttempts) done = true
-          else Thread.sleep(TaxBackoffMs << (attempts - 1))
-      }
-    }
-    quote match {
-      case None =>
-        // No answer is not "no tax": the invoice stays a draft until a quote arrives.
-        Store.hold(invoiceId, reason, attempts)
-        Outcome("held", reason = reason, attempts = attempts)
-      case Some(q) =>
-        Store.setTax(invoiceId, q.taxCents, q.taxSource)
-        Outcome("finalized", Sequence.claimNumber(tenant, invoiceId), q.taxCents, q.taxSource)
-    }
-  }
 }
 `,
     },

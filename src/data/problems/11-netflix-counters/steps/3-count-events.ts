@@ -60,7 +60,6 @@ answers **202**:
         python: {all: [/"counter-events"/, /f["']\{ns\}:\{name\}["']/, /producer\.produce\(/]},
         typescript: {all: [/['"]counter-events['"]/, /`\$\{ns\}:\$\{name\}`/, /producer\.send\(/]},
         go: {all: [/"counter-events"/, /Key:\s*\[\]byte\(\s*ns\s*\+\s*":"\s*\+\s*name\s*\)/, /WriteMessages\(/]},
-        scala: {all: [/"counter-events"/, /s"\$ns:\$name"|s"\$\{ns\}:\$\{name\}"/, /producer\.send\(/]},
         cpp: {all: [/"counter-events"/, /ns\s*\+\s*":"\s*\+\s*name/, /producer->produce\(/]},
       },
     },
@@ -73,7 +72,6 @@ answers **202**:
         python: {all: [/json\.dumps\(/, /"delta"/, /"token"/, /"ts"/]},
         typescript: {all: [/JSON\.stringify\(/, /\bdelta\b/, /\btoken\b/, /\bts\s*[:,}]/]},
         go: {all: [/json\.Marshal\(/, /json:"delta"/, /json:"token"/, /json:"ts"/]},
-        scala: {all: [/"delta"\s*->/, /"token"\s*->/, /"ts"\s*->/, /compactPrint/]},
         cpp: {all: [/\{"delta",/, /\{"token",/, /\{"ts",/, /\.dump\(\)/]},
       },
     },
@@ -86,12 +84,6 @@ answers **202**:
         python: {all: [/"acks"\s*:\s*"all"/, /"enable\.idempotence"\s*:\s*True/]},
         typescript: {all: [/idempotent:\s*true/], none: [/acks:\s*[01]\b/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {
-          all: [
-            /"acks"\s*,\s*"all"|ACKS_CONFIG\s*,\s*"all"/,
-            /"enable\.idempotence"\s*,\s*"true"|ENABLE_IDEMPOTENCE_CONFIG\s*,\s*"true"/,
-          ],
-        },
         cpp: {all: [/"acks"\s*,\s*"all"/, /"enable\.idempotence"\s*,\s*"true"/]},
       },
     },
@@ -110,7 +102,6 @@ answers **202**:
           all: [/context\.WithTimeout\(\s*ctx\s*,\s*flushTimeout\s*\)/, /writer\.WriteMessages\(/],
           none: [/Async:\s*true/],
         },
-        scala: {all: [/\.get\(\s*FlushTimeoutMillis\s*,\s*TimeUnit\.MILLISECONDS\s*\)/]},
         cpp: {all: [/producer->flush\(\s*kFlushTimeoutMs\s*\)/], none: [/producer->flush\(\s*-1\s*\)/]},
       },
     },
@@ -123,7 +114,6 @@ answers **202**:
         python: {all: [/on_delivery\s*=|callback\s*=/, /raise EventNotDurable\(/]},
         typescript: {all: [/catch\s*(\(\s*\w+\s*\))?\s*\{/, /throw new EventNotDurable\(/]},
         go: {all: [/return ErrNotDurable|errors\.Join\(\s*ErrNotDurable|fmt\.Errorf\([^\n]*ErrNotDurable/]},
-        scala: {all: [/throw new EventNotDurable\(/]},
         cpp: {all: [/dr_cb\(/, /throw EventNotDurable\(/]},
       },
     },
@@ -319,75 +309,6 @@ func appendEvent(ctx context.Context, ns, name string, delta int64, token string
 		return fmt.Errorf("%w: %v", ErrNotDurable, err)
 	}
 	return nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-/** The broker did not acknowledge the event in time; the API answers 503 and the client retries with the same token. */
-final class EventNotDurable(message: String) extends RuntimeException(message)
-
-object CountEvents {
-  val Topic = "counter-events"
-  val FlushTimeoutMillis = 1000L
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // TODO: acks=all, enable.idempotence=true
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  def appendEvent(ns: String, name: String, delta: Long, token: String): Unit = {
-    val value = JsObject(
-      "ns" -> JsString(ns),
-      "name" -> JsString(name),
-      "delta" -> JsNumber(delta),
-      "token" -> JsString(token),
-      "ts" -> JsNumber(System.currentTimeMillis() / 1000.0),
-    ).compactPrint
-    // TODO: send a record keyed by s"$ns:$name" and wait on the future for at most FlushTimeoutMillis
-    // TODO: any exception (timeout, delivery failure) → throw new EventNotDurable
-    ???
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-/** The broker did not acknowledge the event in time; the API answers 503 and the client retries with the same token. */
-final class EventNotDurable(message: String) extends RuntimeException(message)
-
-object CountEvents {
-  val Topic = "counter-events"
-  val FlushTimeoutMillis = 1000L
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  props.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  def appendEvent(ns: String, name: String, delta: Long, token: String): Unit = {
-    val value = JsObject(
-      "ns" -> JsString(ns),
-      "name" -> JsString(name),
-      "delta" -> JsNumber(delta),
-      "token" -> JsString(token),
-      "ts" -> JsNumber(System.currentTimeMillis() / 1000.0),
-    ).compactPrint
-    val record = new ProducerRecord[String, String](Topic, s"$ns:$name", value)
-    try producer.send(record).get(FlushTimeoutMillis, TimeUnit.MILLISECONDS) // blocks until every in-sync replica acknowledged
-    catch { case e: Exception => throw new EventNotDurable(s"counter event $token not acknowledged: \${e.getMessage}") }
-  }
 }
 `,
     },

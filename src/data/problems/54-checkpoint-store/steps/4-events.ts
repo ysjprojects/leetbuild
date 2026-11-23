@@ -47,7 +47,6 @@ and a broker outage loses it.
         python: {all: [/key\s*=\s*record\[["']run_id["']\]/], none: [/key\s*=\s*upload_id/]},
         typescript: {all: [/key:\s*record\.run_id/], none: [/key:\s*uploadId/]},
         go: {all: [/Key:\s*\[\]byte\(\s*record\.RunID\s*\)/], none: [/Key:\s*\[\]byte\(\s*uploadID\s*\)/]},
-        scala: {all: [/new ProducerRecord\[String, String\]\(\s*Topic,\s*record\.runId/], none: [/Topic,\s*uploadId/]},
         cpp: {all: [/record->run_id\.c_str\(\),\s*record->run_id\.(size|length)\(\)/], none: [/upload_id\.c_str\(\)/]},
       },
     },
@@ -60,7 +59,6 @@ and a broker outage loses it.
         python: {all: [/["']step["']\s*:/, /["']chunks["']\s*:/, /["']digest["']\s*:/]},
         typescript: {all: [/step:\s*record\.step/, /chunks:\s*record\.chunks/, /digest:\s*record\.digest/]},
         go: {all: [/"step":/, /"chunks":/, /"digest":/]},
-        scala: {all: [/"step"\s*->/, /"chunks"\s*->/, /"digest"\s*->/]},
         cpp: {all: [/\{"step",/, /\{"chunks",/, /\{"digest",/]},
       },
     },
@@ -73,7 +71,6 @@ and a broker outage loses it.
         python: {order: [/=\s*commit\(\s*upload_id\s*\)/, /producer\.produce\(/]},
         typescript: {order: [/await commit\(\s*uploadId\s*\)/, /producer\.send\(/]},
         go: {order: [/commit\.Commit\(/, /producer\.Produce\(/]},
-        scala: {order: [/Commit\.commit\(/, /producer\.send\(/]},
         cpp: {order: [/commit::commit\(/, /producer->produce\(/]},
       },
     },
@@ -86,7 +83,6 @@ and a broker outage loses it.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -99,7 +95,6 @@ and a broker outage loses it.
         python: {all: [/store\.insert_outbox\(/, /producer\.flush\(/, /on_delivery\s*=/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/store\.InsertOutbox\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Store\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/]},
         cpp: {all: [/store::insertOutbox\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -366,86 +361,6 @@ func finishUpload(ctx context.Context, uploadID string) (*store.Record, error) {
 		}
 	}
 	return record, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import checkpoint.{Commit, Store} // Commit.commit; Store.upload, insertOutbox, Upload, Record
-
-object Events {
-  val Topic = "checkpoint.event"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def eventPayload(upload: Store.Upload): JsObject =
-    JsObject("type" -> JsString("checkpoint.committed"), "upload_id" -> JsString(upload.uploadId), "run_id" -> JsString(upload.runId))
-
-  /** Commit the upload and announce the checkpoint: the record, or None while the upload is incomplete. */
-  def finishUpload(uploadId: String): Option[Store.Record] = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    Store.upload(uploadId).flatMap { upload =>
-      producer.send(new ProducerRecord[String, String](Topic, uploadId, eventPayload(upload).compactPrint))
-      Commit.commit(uploadId)
-    }
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import checkpoint.{Commit, Store} // Commit.commit; Store.upload, insertOutbox, Upload, Record
-
-object Events {
-  val Topic = "checkpoint.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What a consumer acts on without reading the weights: the run, the step, the chunk count and the digest. */
-  def eventPayload(record: Store.Record): JsObject =
-    JsObject(
-      "type" -> JsString("checkpoint.committed"),
-      "run_id" -> JsString(record.runId),
-      "upload_id" -> JsString(record.uploadId),
-      "step" -> JsNumber(record.step),
-      "chunks" -> JsNumber(record.chunks),
-      "digest" -> JsString(record.digest)
-    )
-
-  /** Commit the upload and announce the checkpoint: the record, or None while the upload is incomplete. */
-  def finishUpload(uploadId: String): Option[Store.Record] =
-    Commit.commit(uploadId).map { record => // None: nothing to announce, the upload is not complete
-      val payload = eventPayload(record)
-      // Keyed by run: one run's checkpoints stay on one partition, in commit order.
-      val sent = new ProducerRecord[String, String](Topic, record.runId, payload.compactPrint)
-      val acked = Try(producer.send(sent).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-      // The broker did not take it: the relay publishes the row later, so consumers are late, not wrong.
-      if (acked.isFailure) Store.insertOutbox(Topic, record.runId, payload)
-      record
-    }
 }
 `,
     },

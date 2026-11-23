@@ -26,7 +26,7 @@ topic. A broker that rejects the record after accepting it leaves no outbox row.
   values.
 - \`engine.publish_snapshot\` first; when it answers false, return None and produce nothing.
 - A delivery failure arrives in the delivery report (\`on_delivery\`, a rejected \`send\`, the error
-  \`WriteMessages\` returns with \`Async\` off, \`dr_cb\`, a \`Callback\`): RPUSH \`{"key", "payload"}\` to
+  \`WriteMessages\` returns with \`Async\` off, \`dr_cb\`): RPUSH \`{"key", "payload"}\` to
   \`flags:outbox\` from there. The answer is still the event: the change is live.`,
   sequence: {
     participants: ['flagsvc', 'Redis', 'flag.event', 'Audit · analytics'],
@@ -48,15 +48,11 @@ topic. A broker that rejects the record after accepting it leaves no outbox row.
       id: 'flag-key',
       title: 'Keyed by flag key',
       detail:
-        "The record key is the flag key (`key=flag_key`, `key: flagKey`, `[]byte(flagKey)`, `ProducerRecord(topic, flagKey, …)`), so one flag's history stays on one partition, in order; the starter keys by environment.",
+        "The record key is the flag key (`key=flag_key`, `key: flagKey`, `[]byte(flagKey)`), so one flag's history stays on one partition, in order; the starter keys by environment.",
       match: {
         python: {all: [/key=flag_key/, /flag\.event/], none: [/key=ENVIRONMENT/]},
         typescript: {all: [/key:\s*flagKey\b/, /flag\.event/], none: [/key:\s*ENVIRONMENT/]},
         go: {all: [/Key:\s*\[\]byte\(flagKey\)/, /flag\.event/], none: [/Key:\s*\[\]byte\(environment\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(EventTopic,\s*flagKey/, /flag\.event/],
-          none: [/EventTopic,\s*Environment/],
-        },
         cpp: {all: [/flag_key\.c_str\(\),\s*flag_key\.size\(\)/, /flag\.event/], none: [/kEnvironment\.c_str\(\)/]},
       },
     },
@@ -69,7 +65,6 @@ topic. A broker that rejects the record after accepting it leaves no outbox row.
         python: {order: [/def apply_change\(/, /engine\.publish_snapshot\(/, /producer\.produce\(/]},
         typescript: {order: [/function applyChange\(/, /publishSnapshot\(/, /producer\.send\(/]},
         go: {order: [/func applyChange\(/, /engine\.PublishSnapshot\(/, /writer\.WriteMessages\(/]},
-        scala: {order: [/def applyChange\(/, /Engine\.publishSnapshot\(/, /producer\.send\(/]},
         cpp: {order: [/applyChange\(const/, /engine::publishSnapshot\(/, /producer->produce\(/]},
       },
     },
@@ -82,7 +77,6 @@ topic. A broker that rejects the record after accepting it leaves no outbox row.
         python: {all: [/rule_attributes/], none: [/["']rules["']\s*:\s*definition\[/]},
         typescript: {all: [/rule_attributes/], none: [/rules:\s*definition\.rules/]},
         go: {all: [/rule_attributes/], none: [/"rules":\s*definition\.Rules/]},
-        scala: {all: [/rule_attributes/], none: [/"rules" -> definition/]},
         cpp: {all: [/rule_attributes/], none: [/json changeEvent\((?:(?!\n\})[\s\S])*?\{"rules",/]},
       },
     },
@@ -90,12 +84,11 @@ topic. A broker that rejects the record after accepting it leaves no outbox row.
       id: 'outbox',
       title: 'A rejected event lands in the outbox from the delivery report',
       detail:
-        'The outbox row is written where the broker answers: the delivery callback, the awaited `send`, the error of a synchronous `WriteMessages`, `dr_cb`, a producer `Callback`. The starter catches only what fails before the record leaves the client.',
+        'The outbox row is written where the broker answers: the delivery callback, the awaited `send`, the error of a synchronous `WriteMessages`, `dr_cb`. The starter catches only what fails before the record leaves the client.',
       match: {
         python: {all: [/on_delivery=/, /rpush\(/], none: [/except KafkaException/]},
         typescript: {all: [/await producer\.send\(/, /rpush\(/]},
         go: {all: [/RPush\(/], none: [/Async:\s*true/]},
-        scala: {all: [/new Callback/, /rpush\(/], none: [/case\s+\w+:\s*KafkaException/]},
         cpp: {all: [/void dr_cb(?:(?!\n\};)[\s\S])*?rpush\(/]},
       },
     },
@@ -507,136 +500,6 @@ func applyChange(ctx context.Context, flagKey, actor string) (map[string]any, er
 		log.Printf("flag event %s not delivered: %v", flagKey, err)
 	}
 	return event, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import flags.{Engine, Store} // Engine.readSnapshot, Engine.publishSnapshot; Store.load
-
-object Events {
-  val EventTopic = "flag.event"
-  val OutboxKey = "flags:outbox"
-  val Environment = "prod"
-
-  val jedis = new JedisPooled("redis", 6379)
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** The flag.event payload for a definition that goes live in snapshot version. */
-  def changeEvent(definition: JsObject, version: Long, actor: String): JsObject = {
-    val d = definition.fields
-    JsObject(
-      "type" -> JsString("flag.changed"),
-      "flag_key" -> d("key"),
-      "version" -> JsNumber(version),
-      "flag_version" -> d("version"),
-      "rollout" -> d("rollout"),
-      "rules" -> definition.fields("rules"),
-      "actor" -> JsString(actor))
-  }
-
-  /** The snapshot after the current one, with the definition live. */
-  private def nextSnapshot(definition: JsObject): JsObject = {
-    val current = Engine.readSnapshot().getOrElse(JsObject("version" -> JsNumber(0), "flags" -> JsObject()))
-    val d = definition.fields
-    val entry = JsObject("default" -> d("default"), "rules" -> d("rules"), "rollout" -> d("rollout"), "salt" -> d("salt"), "killed" -> JsFalse)
-    val version = current.fields("version").asInstanceOf[JsNumber].value.toLong + 1
-    val key = d("key").asInstanceOf[JsString].value
-    JsObject("version" -> JsNumber(version), "flags" -> JsObject(current.fields("flags").asJsObject.fields + (key -> entry)))
-  }
-
-  /** Put the stored definition of flagKey live and announce it; None when another publish took the version. */
-  def applyChange(flagKey: String, actor: String): Option[JsObject] =
-    Store.load(flagKey).flatMap { definition =>
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      val snapshot = nextSnapshot(definition)
-      val event = changeEvent(definition, snapshot.fields("version").asInstanceOf[JsNumber].value.toLong, actor)
-      val payload = event.compactPrint
-      try {
-        producer.send(new ProducerRecord[String, String](EventTopic, Environment, payload))
-        producer.flush()
-      } catch {
-        case _: KafkaException => jedis.rpush(OutboxKey, JsObject("key" -> JsString(Environment), "payload" -> JsString(payload)).compactPrint)
-      }
-      if (Engine.publishSnapshot(snapshot)) Some(event) else None
-    }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import flags.{Engine, Store} // Engine.readSnapshot, Engine.publishSnapshot; Store.load
-
-object Events {
-  val EventTopic = "flag.event"
-  val OutboxKey = "flags:outbox"
-
-  val jedis = new JedisPooled("redis", 6379)
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** The flag.event payload for a definition that goes live in snapshot version. */
-  def changeEvent(definition: JsObject, version: Long, actor: String): JsObject = {
-    val d = definition.fields
-    // Which attributes the rules target, never the values they match.
-    val attributes = d("rules").asInstanceOf[JsArray].elements.flatMap(_.asJsObject.fields.get("attribute")).collect { case JsString(a) => a }.distinct.sorted
-    JsObject(
-      "type" -> JsString("flag.changed"),
-      "flag_key" -> d("key"),
-      "version" -> JsNumber(version),
-      "flag_version" -> d("version"),
-      "rollout" -> d("rollout"),
-      "rule_attributes" -> JsArray(attributes.map(JsString(_))),
-      "actor" -> JsString(actor))
-  }
-
-  /** The snapshot after the current one, with the definition live. */
-  private def nextSnapshot(definition: JsObject): JsObject = {
-    val current = Engine.readSnapshot().getOrElse(JsObject("version" -> JsNumber(0), "flags" -> JsObject()))
-    val d = definition.fields
-    val entry = JsObject("default" -> d("default"), "rules" -> d("rules"), "rollout" -> d("rollout"), "salt" -> d("salt"), "killed" -> JsFalse)
-    val version = current.fields("version").asInstanceOf[JsNumber].value.toLong + 1
-    val key = d("key").asInstanceOf[JsString].value
-    JsObject("version" -> JsNumber(version), "flags" -> JsObject(current.fields("flags").asJsObject.fields + (key -> entry)))
-  }
-
-  /** Put the stored definition of flagKey live and announce it; None when another publish took the version. */
-  def applyChange(flagKey: String, actor: String): Option[JsObject] =
-    Store.load(flagKey).flatMap { definition =>
-      val snapshot = nextSnapshot(definition)
-      // The snapshot commits first: an event may lag the engine, never lead it.
-      if (!Engine.publishSnapshot(snapshot)) None
-      else {
-        val event = changeEvent(definition, snapshot.fields("version").asInstanceOf[JsNumber].value.toLong, actor)
-        val payload = event.compactPrint
-        producer.send(
-          new ProducerRecord[String, String](EventTopic, flagKey, payload),
-          new Callback {
-            // The delivery report is the broker's answer: a rejected event waits in the outbox.
-            override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-              if (exception != null) jedis.rpush(OutboxKey, JsObject("key" -> JsString(flagKey), "payload" -> JsString(payload)).compactPrint)
-          },
-        )
-        producer.flush() // the callback has run once flush returns, delivered or rejected
-        Some(event)
-      }
-    }
 }
 `,
     },

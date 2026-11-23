@@ -56,7 +56,6 @@ service OfflineStore { rpc Scan(ScanRequest) returns (ScanResponse); }  // PERMI
         python: {all: [/DEADLINE_S\s*=\s*60\b/, /\.Scan\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*60_?000\b/, /\.Scan\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*60\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*60L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/kDeadline\{60\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -69,7 +68,6 @@ service OfflineStore { rpc Scan(ScanRequest) returns (ScanResponse); }  // PERMI
         python: {all: [/as_of\s*=\s*as_of/]},
         typescript: {all: [/as_of:\s*asOf/]},
         go: {all: [/AsOf:\s*asOf/]},
-        scala: {all: [/asOf\s*=\s*asOf/]},
         cpp: {all: [/set_as_of\(\s*as_of\s*\)/]},
       },
     },
@@ -82,7 +80,6 @@ service OfflineStore { rpc Scan(ScanRequest) returns (ScanResponse); }  // PERMI
         python: {all: [/missing\.append\(/], none: [/\[partition\]\s*=\s*\[\]/]},
         typescript: {all: [/missing\.push\(/], none: [/\[partition\]\s*=\s*\[\]/]},
         go: {all: [/Missing\s*=\s*append\(/], none: [/\[partition\]\s*=\s*nil/]},
-        scala: {all: [/missing\s*\+=/], none: [/\(partition\)\s*=\s*(?:Seq\.empty|Nil\b)/]},
         cpp: {all: [/missing\.push_back\(/], none: [/\[partition\]\s*=\s*\{\}/]},
       },
     },
@@ -95,7 +92,6 @@ service OfflineStore { rpc Scan(ScanRequest) returns (ScanResponse); }  // PERMI
         python: {all: [/PERMISSION_DENIED/, /raise BackfillAborted/]},
         typescript: {all: [/PERMISSION_DENIED/, /throw new BackfillAborted/]},
         go: {all: [/codes\.PermissionDenied/, /ErrBackfillAborted/]},
-        scala: {all: [/PERMISSION_DENIED/, /throw new BackfillAborted/]},
         cpp: {all: [/PERMISSION_DENIED/, /throw BackfillAborted/]},
       },
     },
@@ -413,82 +409,6 @@ func backfill(ctx context.Context, name string, version int, partitions []string
 		result.Scanned[partition] = rows
 	}
 	return result, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import features.Online // Online.Row
-import featurestore.feature_store.{OfflineStoreGrpc, ScanRequest}
-
-/** The warehouse refused the scan: no more of this backfill may run. */
-final class BackfillAborted(message: String) extends Exception(message)
-
-object Client {
-  final case class BackfillResult(scanned: Map[String, Seq[Online.Row]], missing: Seq[String])
-
-  private val offline = OfflineStoreGrpc.blockingStub(ManagedChannelBuilder.forAddress("offline", 9000).usePlaintext().build())
-
-  def scanPartition(name: String, version: Long, partition: String, asOf: Long): Seq[Online.Row] =
-    offline
-      .scan(ScanRequest(feature = name, version = version, partition = partition))
-      .rows
-      .map(row => Online.Row(row.entity, if (row.isNull) None else Some(row.value), row.eventTs))
-
-  /** Scan every partition of the feature version as of the training cutoff (epoch seconds). */
-  def backfill(name: String, version: Long, partitions: Seq[String], asOf: Long): BackfillResult = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val scanned = scala.collection.mutable.LinkedHashMap.empty[String, Seq[Online.Row]]
-    val missing = scala.collection.mutable.ArrayBuffer.empty[String]
-    partitions.foreach { partition =>
-      try scanned(partition) = scanPartition(name, version, partition, asOf)
-      catch { case _: StatusRuntimeException => scanned(partition) = Seq.empty } // nothing came back: an empty partition
-    }
-    BackfillResult(scanned.toMap, missing.toSeq)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import features.Online // Online.Row
-import featurestore.feature_store.{OfflineStoreGrpc, ScanRequest}
-
-/** The warehouse refused the scan: no more of this backfill may run. */
-final class BackfillAborted(message: String) extends Exception(message)
-
-object Client {
-  val DeadlineSeconds = 60L
-
-  final case class BackfillResult(scanned: Map[String, Seq[Online.Row]], missing: Seq[String])
-
-  private val offline = OfflineStoreGrpc.blockingStub(ManagedChannelBuilder.forAddress("offline", 9000).usePlaintext().build())
-
-  def scanPartition(name: String, version: Long, partition: String, asOf: Long): Seq[Online.Row] =
-    offline
-      .withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS)
-      .scan(ScanRequest(feature = name, version = version, partition = partition, asOf = asOf))
-      .rows
-      .map(row => Online.Row(row.entity, if (row.isNull) None else Some(row.value), row.eventTs))
-
-  /** Scan every partition of the feature version as of the training cutoff (epoch seconds). */
-  def backfill(name: String, version: Long, partitions: Seq[String], asOf: Long): BackfillResult = {
-    val scanned = scala.collection.mutable.LinkedHashMap.empty[String, Seq[Online.Row]]
-    val missing = scala.collection.mutable.ArrayBuffer.empty[String]
-    partitions.foreach { partition =>
-      try scanned(partition) = scanPartition(name, version, partition, asOf)
-      catch {
-        // The job itself is refused: every later partition would be refused too.
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.PERMISSION_DENIED =>
-          throw new BackfillAborted(s"the warehouse refused $name v$version: \${e.getStatus.getDescription}")
-        // Timed out or unreachable: a gap the training job must see, not an empty partition.
-        case _: StatusRuntimeException => missing += partition
-      }
-    }
-    BackfillResult(scanned.toMap, missing.toSeq)
-  }
 }
 `,
     },

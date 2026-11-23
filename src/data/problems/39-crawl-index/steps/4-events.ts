@@ -47,7 +47,6 @@ index refused is announced and counted; a leader failover loses events only the 
         python: {all: [/key\s*=\s*host\b/]},
         typescript: {all: [/key:\s*host\b/]},
         go: {all: [/Key:\s*\[\]byte\(host\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*host\b/]},
         cpp: {all: [/host\.c_str\(\),\s*host\.(size|length)\(\)/]},
       },
     },
@@ -60,7 +59,6 @@ index refused is announced and counted; a leader failover loses events only the 
         python: {all: [/["']body_ref["']\s*:/, /["']host["']\s*:/], none: [/["'](content|body|html)["']\s*:/]},
         typescript: {all: [/body_ref:/], none: [/\b(content|body|html):\s*page\.body/]},
         go: {all: [/"body_ref":/, /"host":/], none: [/"(content|body|html)":\s*page\.Body/]},
-        scala: {all: [/"body_ref"\s*->/, /"host"\s*->/], none: [/"(content|body|html)"\s*->/]},
         cpp: {all: [/\{"body_ref",/, /\{"host",/], none: [/\{"(content|body|html)",/]},
       },
     },
@@ -73,7 +71,6 @@ index refused is announced and counted; a leader failover loses events only the 
         python: {order: [/search\.put\(/, /records\.mark_indexed\(/, /producer\.produce\(/]},
         typescript: {order: [/(?<![.\w])put\(|search\.put\(/, /markIndexed\(/, /producer\.send\(/]},
         go: {order: [/search\.Put\(/, /records\.MarkIndexed\(/, /\.WriteMessages\(/]},
-        scala: {order: [/Search\.put\(/, /Records\.markIndexed\(/, /producer\.send\(/]},
         cpp: {order: [/search::put\(/, /records::markIndexed\(/, /producer->produce\(/]},
       },
     },
@@ -86,7 +83,6 @@ index refused is announced and counted; a leader failover loses events only the 
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/]},
         typescript: {all: [/acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"acks",\s*"(all|-1)"/]},
         cpp: {all: [/"acks",\s*"(all|-1)"/]},
       },
     },
@@ -340,91 +336,6 @@ func indexPage(ctx context.Context, jobID, url string, page FetchedPage) (map[st
 		return nil, err
 	}
 	return event, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import crawl.{Records, Search, Web} // Search.put; Records.markIndexed; Web.splitUrl
-
-/** What the worker holds once a page is fetched. */
-final case class FetchedPage(status: Int, contentHash: String, bodyRef: String, body: String)
-
-object Events {
-  val Topic = "crawl.page"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"crawl.page event not delivered: \${exception.getMessage}")
-  }
-
-  /** Index a fetched page and announce it on crawl.page. */
-  def indexPage(jobId: String, url: String, page: FetchedPage): JsObject = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val event = JsObject(
-      "job_id" -> JsString(jobId),
-      "url" -> JsString(url),
-      "status" -> JsNumber(page.status),
-      "content_hash" -> JsString(page.contentHash),
-      "content" -> JsString(page.body)) // the indexer gets the page without a second read
-    producer.send(new ProducerRecord[String, String](Topic, event.compactPrint), onDelivery).get()
-    Records.markIndexed(jobId, url)
-    Search.put(url, page.contentHash, page.body)
-    event
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import crawl.{Records, Search, Web} // Search.put; Records.markIndexed; Web.splitUrl
-
-/** What the worker holds once a page is fetched. */
-final case class FetchedPage(status: Int, contentHash: String, bodyRef: String, body: String)
-
-object Events {
-  val Topic = "crawl.page"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // acks=all: an acknowledged event is on every in-sync replica and survives a leader failover.
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"crawl.page event not delivered: \${exception.getMessage}")
-  }
-
-  /** Index a fetched page and announce it on crawl.page. */
-  def indexPage(jobId: String, url: String, page: FetchedPage): JsObject = {
-    val host = Web.splitUrl(url).map(_.host).getOrElse("")
-    // The index entry and the record exist before anyone can read about them; a refused page throws here.
-    Search.put(url, page.contentHash, page.body)
-    Records.markIndexed(jobId, url)
-    val event = JsObject(
-      "job_id" -> JsString(jobId),
-      "url" -> JsString(url),
-      "host" -> JsString(host),
-      "status" -> JsNumber(page.status),
-      "content_hash" -> JsString(page.contentHash),
-      "body_ref" -> JsString(page.bodyRef))
-    producer.send(new ProducerRecord[String, String](Topic, host, event.compactPrint), onDelivery).get()
-    event
-  }
 }
 `,
     },

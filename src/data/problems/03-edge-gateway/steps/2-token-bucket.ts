@@ -39,7 +39,7 @@ and the middleware that uses it, as a **token bucket** per key stored in Redis:
   hints: [
     'The script receives the key in `KEYS[1]` and `rate`, `burst`, `now` in `ARGV`. It reads the two hash fields, computes the refill, writes both fields back, and returns a small table `{allowed, remaining}`.',
     'Refill is `tokens = min(burst, tokens + (now - ts) * rate)`; a missing hash means a full bucket (`tokens = burst`). Then `if tokens >= 1 then tokens = tokens - 1; allowed = 1 end`.',
-    'Register/load the script once at start-up (`register_script`, `redis.NewScript`, `scriptLoad`, `script_load`) and call it per request. On deny, `Retry-After` is `ceil(1 / rate)` — the time one token takes to appear.',
+    'Register/load the script once at start-up (`register_script`, `redis.NewScript`, `script_load`) and call it per request. On deny, `Retry-After` is `ceil(1 / rate)` — the time one token takes to appear.',
   ],
   checks: [
     {
@@ -50,7 +50,6 @@ and the middleware that uses it, as a **token bucket** per key stored in Redis:
         python: {all: [/f["']bucket:\{api_key\}["']/]},
         typescript: {all: [/`bucket:\$\{apiKey\}`|['"]bucket:['"]\s*\+\s*apiKey/]},
         go: {all: [/"bucket:"\s*\+\s*apiKey|"bucket:%s"/]},
-        scala: {all: [/s"bucket:\$\{?apiKey\}?"/]},
         cpp: {all: [/"bucket:"\s*\+\s*api_key/]},
       },
     },
@@ -81,7 +80,6 @@ and the middleware that uses it, as a **token bucket** per key stored in Redis:
             /redis\.NewScript\(|\.Eval\(|\.EvalSha\(/,
           ],
         },
-        scala: {all: [/redis\.call\(\s*['"]HM?GET['"]/, /redis\.call\(\s*['"]HSET['"]/, /jedis\.eval(sha)?\(/]},
         cpp: {all: [/redis\.call\(\s*['"]HM?GET['"]/, /redis\.call\(\s*['"]HSET['"]/, /redis\.eval(sha)?[<(]/]},
       },
     },
@@ -94,7 +92,6 @@ and the middleware that uses it, as a **token bucket** per key stored in Redis:
         python: {all: [/math\.min\(\s*burst\s*,/, /\(\s*now\s*-\s*ts\s*\)\s*\*\s*rate/]},
         typescript: {all: [/math\.min\(\s*burst\s*,/, /\(\s*now\s*-\s*ts\s*\)\s*\*\s*rate/]},
         go: {all: [/math\.min\(\s*burst\s*,/, /\(\s*now\s*-\s*ts\s*\)\s*\*\s*rate/]},
-        scala: {all: [/math\.min\(\s*burst\s*,/, /\(\s*now\s*-\s*ts\s*\)\s*\*\s*rate/]},
         cpp: {all: [/math\.min\(\s*burst\s*,/, /\(\s*now\s*-\s*ts\s*\)\s*\*\s*rate/]},
       },
     },
@@ -106,7 +103,6 @@ and the middleware that uses it, as a **token bucket** per key stored in Redis:
         python: {all: [/tokens\s*>=\s*1/, /tokens\s*-\s*1/]},
         typescript: {all: [/tokens\s*>=\s*1/, /tokens\s*-\s*1/]},
         go: {all: [/tokens\s*>=\s*1/, /tokens\s*-\s*1/]},
-        scala: {all: [/tokens\s*>=\s*1/, /tokens\s*-\s*1/]},
         cpp: {all: [/tokens\s*>=\s*1/, /tokens\s*-\s*1/]},
       },
     },
@@ -121,7 +117,6 @@ and the middleware that uses it, as a **token bucket** per key stored in Redis:
           all: [/code\(\s*429\s*\)|status\(\s*429\s*\)|statusCode:\s*429/, /Retry-After/i, /X-RateLimit-Remaining/i],
         },
         go: {all: [/http\.StatusTooManyRequests|\b429\b/, /Retry-After/i, /X-RateLimit-Remaining/i]},
-        scala: {all: [/StatusCodes\.TooManyRequests|\b429\b/, /Retry-After/i, /X-RateLimit-Remaining/i]},
         cpp: {all: [/status\s*=\s*429/, /Retry-After/i, /X-RateLimit-Remaining/i]},
       },
     },
@@ -406,96 +401,6 @@ func rateLimit(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(rw, r)
 	})
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Directive0
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object RateLimit {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Rate = 5.0 // tokens per second
-  val Burst = 10.0
-
-  // TODO: Lua — HMGET tokens/ts, refill min(burst, tokens + (now - ts) * rate), take one, HSET, return {allowed, remaining}
-  val Script: String = ""
-  private val sha = jedis.scriptLoad(Script)
-
-  /** One atomic round trip: refill, take one token, report what is left. */
-  def allow(apiKey: String): (Boolean, Int) = {
-    val key: String = ??? // TODO: bucket:{apiKey}
-    val now = System.currentTimeMillis() / 1000.0
-    // TODO: jedis.evalsha(sha, keys, args) → List[Long](allowed, remaining)
-    (true, 0)
-  }
-
-  /** Wraps every route: pass with X-RateLimit-Remaining, or answer 429. */
-  val rateLimited: Directive0 =
-    optionalHeaderValueByName("X-API-Key").flatMap[Unit] { apiKey =>
-      // TODO: denied → 429 with Retry-After (ceil(1 / Rate)) and X-RateLimit-Remaining: 0
-      // TODO: allowed → respondWithHeader X-RateLimit-Remaining
-      pass
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Directive0
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object RateLimit {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Rate = 5.0 // tokens per second
-  val Burst = 10.0
-
-  val Script: String =
-    """local bucket = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
-      |local rate, burst, now = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
-      |local tokens = tonumber(bucket[1]) or burst
-      |local ts = tonumber(bucket[2]) or now
-      |tokens = math.min(burst, tokens + (now - ts) * rate)
-      |local allowed = 0
-      |if tokens >= 1 then
-      |  tokens = tokens - 1
-      |  allowed = 1
-      |end
-      |redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
-      |redis.call('EXPIRE', KEYS[1], math.ceil(burst / rate) * 2)
-      |return {allowed, math.floor(tokens)}
-      |""".stripMargin
-  private val sha = jedis.scriptLoad(Script)
-
-  /** One atomic round trip: refill, take one token, report what is left. */
-  def allow(apiKey: String): (Boolean, Int) = {
-    val key = s"bucket:$apiKey"
-    val now = System.currentTimeMillis() / 1000.0
-    val args = List(Rate.toString, Burst.toString, now.toString).asJava
-    val reply = jedis.evalsha(sha, List(key).asJava, args).asInstanceOf[java.util.List[java.lang.Long]].asScala
-    (reply(0) == 1L, reply(1).toInt)
-  }
-
-  /** Wraps every route: pass with X-RateLimit-Remaining, or answer 429. */
-  val rateLimited: Directive0 =
-    optionalHeaderValueByName("X-API-Key").flatMap[Unit] { apiKey =>
-      allow(apiKey.getOrElse("anonymous")) match {
-        case (true, remaining) => respondWithHeader(RawHeader("X-RateLimit-Remaining", remaining.toString))
-        case (false, _) =>
-          val retryAfter = math.ceil(1 / Rate).toInt.toString
-          val headers = List(RawHeader("Retry-After", retryAfter), RawHeader("X-RateLimit-Remaining", "0"))
-          complete(HttpResponse(StatusCodes.TooManyRequests, headers = headers, entity = "rate limit exceeded"))
-      }
-    }
 }
 `,
     },

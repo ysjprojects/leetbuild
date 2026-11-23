@@ -64,13 +64,6 @@ has returned. The loop runs until the runtime stops it.
           ],
         },
         go: {all: [/GroupID:\s*"ledger-writer"/, /Topic:\s*"payments"/, /StartOffset:\s*kafka\.FirstOffset/]},
-        scala: {
-          all: [
-            /"group\.id"\s*,\s*"ledger-writer"|GROUP_ID_CONFIG\s*,\s*"ledger-writer"/,
-            /"auto\.offset\.reset"\s*,\s*"earliest"|AUTO_OFFSET_RESET_CONFIG\s*,\s*"earliest"/,
-            /subscribe\([^\n]*"payments"/,
-          ],
-        },
         cpp: {
           all: [
             /"group\.id"\s*,\s*"ledger-writer"/,
@@ -89,7 +82,6 @@ has returned. The loop runs until the runtime stops it.
         python: {all: [/"enable\.auto\.commit"\s*:\s*False/]},
         typescript: {all: [/autoCommit:\s*false/]},
         go: {all: [/reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
-        scala: {all: [/"enable\.auto\.commit"\s*,\s*"false"|ENABLE_AUTO_COMMIT_CONFIG\s*,\s*"false"/]},
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/]},
       },
     },
@@ -102,7 +94,6 @@ has returned. The loop runs until the runtime stops it.
         python: {all: [/consumer\.commit\(\s*message\s*=\s*msg\s*,\s*asynchronous\s*=\s*False\s*\)/]},
         typescript: {all: [/consumer\.commitOffsets\(/, /Number\(message\.offset\)\s*\+\s*1/]},
         go: {all: [/reader\.CommitMessages\(\s*ctx\s*,\s*msg\s*\)/]},
-        scala: {all: [/consumer\.commitSync\(/, /new OffsetAndMetadata\(\s*record\.offset\(\)\s*\+\s*1\s*\)/]},
         cpp: {all: [/consumer->commitSync\(\s*msg\.get\(\)\s*\)/]},
       },
     },
@@ -115,7 +106,6 @@ has returned. The loop runs until the runtime stops it.
         python: {order: [/\bhandler\(event\)/, /consumer\.commit\(/]},
         typescript: {order: [/await handler\(event\)/, /consumer\.commitOffsets\(/]},
         go: {order: [/\bhandler\(event\)/, /reader\.CommitMessages\(/]},
-        scala: {order: [/\bhandler\(event\)/, /consumer\.commitSync\(/]},
         cpp: {order: [/\bhandler\(event\)/, /consumer->commitSync\(/]},
       },
     },
@@ -128,7 +118,6 @@ has returned. The loop runs until the runtime stops it.
         python: {all: [/json\.loads\(\s*msg\.value\(\)\s*\)/, /except\s*\(\s*ValueError\s*,\s*TypeError\s*\)/]},
         typescript: {all: [/JSON\.parse\(/, /catch\b/]},
         go: {all: [/if err := json\.Unmarshal\(msg\.Value, &event\); err != nil/]},
-        scala: {all: [/Try\(\s*ujson\.read\(\s*record\.value\(\)\s*\)\s*\)/]},
         cpp: {all: [/json::parse\(/, /catch\s*\(\s*const\s+json::parse_error\s*&?\s*\)/]},
       },
     },
@@ -144,7 +133,6 @@ has returned. The loop runs until the runtime stops it.
           none: [/try\s*\{\s*\n?\s*await handler\(/, /handler\(event\)\.catch\(/],
         },
         go: {all: [/if err := handler\(event\); err != nil \{\n\s*return err/]},
-        scala: {all: [/case Success\(event\)\s*=>\s*handler\(event\)/], none: [/Try\(\s*handler\(/, /NonFatal/]},
         cpp: {
           all: [/\bhandler\(event\)/],
           none: [/catch\s*\(\s*(const\s+)?std::exception/, /catch\s*\(\s*\.\.\.\s*\)/],
@@ -344,76 +332,6 @@ func run(ctx context.Context, handler Handler) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.jdk.CollectionConverters._
-import scala.util.{Failure, Success, Try}
-
-object LedgerConsumer {
-  type Handler = ujson.Value => Unit
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "ledger-writer")
-  props.put("auto.offset.reset", "earliest")
-  // TODO: disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("payments").asJava)
-
-  /** Delivers every payment to \`handler\`; commits each record's offset once it is processed. */
-  def run(handler: Handler): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        // TODO: parse the JSON value with ujson; log and skip a malformed record (but still commit it)
-        // TODO: call handler(event), then commitSync this record's offset + 1 for its partition
-        throw new NotImplementedError
-      }
-    }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.jdk.CollectionConverters._
-import scala.util.{Failure, Success, Try}
-
-object LedgerConsumer {
-  type Handler = ujson.Value => Unit
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "ledger-writer")
-  props.put("auto.offset.reset", "earliest")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("payments").asJava)
-
-  /** Delivers every payment to \`handler\`; commits each record's offset once it is processed. */
-  def run(handler: Handler): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        Try(ujson.read(record.value())) match {
-          case Success(event) => handler(event) // throws → the loop ends here, this record uncommitted
-          case Failure(_) =>
-            System.err.println(s"skipping malformed record \${record.topic()}[\${record.partition()}]@\${record.offset()}")
-        }
-        val tp = new TopicPartition(record.topic(), record.partition())
-        consumer.commitSync(Map(tp -> new OffsetAndMetadata(record.offset() + 1)).asJava)
-      }
-    }
 }
 `,
     },

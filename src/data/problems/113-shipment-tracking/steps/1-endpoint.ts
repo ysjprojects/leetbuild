@@ -56,7 +56,6 @@ cancelled label lands on the voided id.
         python: {all: [/@app\.post\(\s*["']\/v1\/shipments["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/shipments['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/shipments"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"shipments"\s*\)/, /\bpost\b/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/shipments"/]},
       },
     },
@@ -69,7 +68,6 @@ cancelled label lands on the voided id.
         python: {all: [/registry\.lookup\(/, /\b422\b/, /\b401\b/]},
         typescript: {all: [/registry\.lookup\(/, /\b422\b/, /\b401\b/]},
         go: {all: [/registry\.Lookup\(/, /StatusUnprocessableEntity|\b422\b/, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/Registry\.lookup\(/, /UnprocessableEntity|\b422\b/, /Unauthorized|\b401\b/]},
         cpp: {all: [/registry::lookup\(/, /\b422\b/, /\b401\b/]},
       },
     },
@@ -82,7 +80,6 @@ cancelled label lands on the voided id.
         python: {all: [/store\.active_for_order\(/, /\b409\b/, /active_shipment_exists/]},
         typescript: {all: [/store\.activeForOrder\(/, /\b409\b/, /active_shipment_exists/]},
         go: {all: [/store\.ActiveForOrder\(/, /StatusConflict|\b409\b/, /active_shipment_exists/]},
-        scala: {all: [/Store\.activeForOrder\(/, /Conflict|\b409\b/, /active_shipment_exists/]},
         cpp: {all: [/store::activeForOrder\(/, /\b409\b/, /active_shipment_exists/]},
       },
     },
@@ -104,10 +101,6 @@ cancelled label lands on the voided id.
           all: [/Idempotency-Key/i, /store\.GetByKey\(/, /store\.PutByKey\(/],
           order: [/store\.GetByKey\(/, /store\.ActiveForOrder\(/],
         },
-        scala: {
-          all: [/Idempotency-Key/i, /Store\.getByKey\(/, /Store\.putByKey\(/],
-          order: [/Store\.getByKey\(/, /Store\.activeForOrder\(/],
-        },
         cpp: {
           all: [/Idempotency-Key/i, /store::getByKey\(/, /store::putByKey\(/],
           order: [/store::getByKey\(/, /store::activeForOrder\(/],
@@ -126,7 +119,6 @@ cancelled label lands on the voided id.
           all: [/"cancelled"/, /ReplacementOf/],
           none: [/ShipmentID:\s*previous\.ShipmentID|\bshipmentID\s*=\s*previous\.ShipmentID/],
         },
-        scala: {all: [/"cancelled"/, /replacementOf|replacement_of/], none: [/previous\.map\(_\.shipmentId\)/]},
         cpp: {all: [/"cancelled"/], none: [/previous\s*\?\s*previous->shipment_id\s*:\s*store::newShipmentId/]},
       },
     },
@@ -429,92 +421,6 @@ func createShipment(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/shipments", createShipment)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import shipments.{Registry, Store} // Registry.lookup; Store.newShipmentId, save, lastForOrder, activeForOrder, getByKey, putByKey
-
-object Api {
-  private def text(body: JsObject, name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  val route: Route = path("v1" / "shipments") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val tenant = tenantHeader.getOrElse("")
-          val body = scala.util.Try(raw.parseJson.asJsObject).getOrElse(JsObject.empty)
-          val previous = Store.lastForOrder(tenant, text(body, "order_id"))
-          val shipment = Store.Shipment(previous.map(_.shipmentId).getOrElse(Store.newShipmentId()), tenant, text(body, "order_id"),
-            text(body, "carrier"), text(body, "service_level"), "label", "", System.currentTimeMillis() / 1000)
-          Store.save(shipment)
-          complete(HttpResponse(StatusCodes.Created, entity = HttpEntity(ContentTypes.\`application/json\`, shipment.toJson.compactPrint)))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import shipments.{Registry, Store} // Registry.lookup; Store.newShipmentId, save, lastForOrder, activeForOrder, getByKey, putByKey
-
-object Api {
-  val ServiceLevels: Set[String] = Set("ground", "express", "freight")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def refuse(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def text(body: JsObject, name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  private def create(tenant: String, key: String, raw: String): HttpResponse = {
-    if (tenant.isEmpty) return refuse(StatusCodes.Unauthorized, "X-Tenant-Id is required")
-    if (key.isEmpty) return refuse(StatusCodes.BadRequest, "Idempotency-Key is required")
-    val body = scala.util.Try(raw.parseJson.asJsObject).getOrElse(JsObject.empty)
-    val orderId = text(body, "order_id")
-    val carrier = text(body, "carrier")
-    val serviceLevel = text(body, "service_level")
-    if (orderId.isEmpty || !ServiceLevels(serviceLevel)) return refuse(StatusCodes.BadRequest, "order_id is required and service_level is one of ground, express, freight")
-    if (Registry.lookup(carrier).isEmpty) return refuse(StatusCodes.UnprocessableEntity, s"no partner has carrier code $carrier")
-    // A replay answers what the first attempt created, before the live-shipment rule sees it.
-    Store.getByKey(tenant, key) match {
-      case Some(recorded) => json(StatusCodes.OK, recorded.toJson)
-      case None =>
-        Store.activeForOrder(tenant, orderId) match {
-          case Some(active) => json(StatusCodes.Conflict, JsObject("error" -> JsString("active_shipment_exists"), "shipment_id" -> JsString(active.shipmentId)))
-          case None =>
-            val replacementOf = Store.lastForOrder(tenant, orderId).filter(_.status == "cancelled").map(_.shipmentId).getOrElse("")
-            // A voided id stays voided: every new shipment takes a new id.
-            val shipment = Store.Shipment(Store.newShipmentId(), tenant, orderId, carrier, serviceLevel, "label", replacementOf, System.currentTimeMillis() / 1000)
-            Store.save(shipment)
-            Store.putByKey(tenant, key, shipment)
-            json(StatusCodes.Created, shipment.toJson)
-        }
-    }
-  }
-
-  val route: Route = path("v1" / "shipments") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        optionalHeaderValueByName("Idempotency-Key") { key =>
-          entity(as[String]) { raw =>
-            complete(create(tenant.getOrElse(""), key.getOrElse(""), raw))
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

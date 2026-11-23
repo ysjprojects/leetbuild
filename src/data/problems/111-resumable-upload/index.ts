@@ -6,7 +6,7 @@ import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-dependency';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Resumable upload: the course is not "accept a multipart body", it is the debugging you owe an
@@ -91,6 +91,5 @@ lost its connection at part 412 resumes at part 412.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

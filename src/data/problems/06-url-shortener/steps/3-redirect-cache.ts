@@ -46,7 +46,6 @@ Implement \`resolve(code)\` as a **cache-aside** lookup and the \`GET /{code}\` 
         python: {all: [/f["']url:\{code\}["']|["']url:["']\s*\+\s*code/]},
         typescript: {all: [/`url:\$\{code\}`|['"]url:['"]\s*\+\s*code/]},
         go: {all: [/"url:"\s*\+\s*code|"url:%s"/]},
-        scala: {all: [/s"url:\$\{?code\}?"|"url:"\s*\+\s*code/]},
         cpp: {all: [/"url:"\s*\+\s*code/]},
       },
     },
@@ -58,7 +57,6 @@ Implement \`resolve(code)\` as a **cache-aside** lookup and the \`GET /{code}\` 
         python: {order: [/\br\.get\(/, /store\.lookup\(/]},
         typescript: {order: [/\bredis\.get\(/, /store\.lookup\(/]},
         go: {order: [/rdb\.Get\(/, /store\.Lookup\(/]},
-        scala: {order: [/jedis\.get\(/, /store\.lookup\(/]},
         cpp: {order: [/redis\.get\(/, /store\.lookup\(/]},
       },
     },
@@ -70,7 +68,6 @@ Implement \`resolve(code)\` as a **cache-aside** lookup and the \`GET /{code}\` 
         python: {all: [/\.set\([^\n]*ex\s*=\s*(TTL_S|86400)|\.setex\([^\n]*(TTL_S|86400)/]},
         typescript: {all: [/\.set\([^\n]*['"]EX['"]\s*,\s*(TTL_S|86400)|\.setex\([^\n]*(TTL_S|86400)/]},
         go: {all: [/rdb\.Set\([^\n]*,\s*(ttl|24\s*\*\s*time\.Hour)\s*\)/]},
-        scala: {all: [/jedis\.setex\([^\n]*(TtlSeconds|86400)/]},
         cpp: {all: [/redis\.set\([^\n]*(kTtl|86400)|redis\.setex\([^\n]*(kTtl|86400)/]},
       },
     },
@@ -85,7 +82,6 @@ Implement \`resolve(code)\` as a **cache-aside** lookup and the \`GET /{code}\` 
           all: [/MISSING_TTL_S|\b60\b/, /===?\s*MISSING/, /code\(\s*404\s*\)|status\(\s*404\s*\)|statusCode:\s*404/],
         },
         go: {all: [/missingTTL|time\.Minute/, /==\s*missing/, /http\.StatusNotFound|\b404\b/]},
-        scala: {all: [/MissingTtlSeconds|\b60L?\b/, /==\s*Missing/, /StatusCodes\.NotFound|\b404\b/]},
         cpp: {all: [/kMissingTtl|\b60\b/, /==\s*kMissing/, /status\s*=\s*404/]},
       },
     },
@@ -114,10 +110,6 @@ Implement \`resolve(code)\` as a **cache-aside** lookup and the \`GET /{code}\` 
             /private, max-age=0/,
           ],
           none: [/StatusMovedPermanently|StatusPermanentRedirect|\b30[18]\b/],
-        },
-        scala: {
-          all: [/StatusCodes\.(Found|TemporaryRedirect)|\b30[27]\b/, /Location\(|redirect\(/, /private, max-age=0/],
-          none: [/MovedPermanently|PermanentRedirect|\b30[18]\b/],
         },
         cpp: {
           all: [/set_redirect\([^\n]*30[27]\s*\)|status\s*=\s*30[27]/, /Location|set_redirect\(/, /private, max-age=0/],
@@ -395,99 +387,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{code}", redirect)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.{Location, RawHeader}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import shortener.{LinkStore, Tls} // LinkStore: lookup(code): Option[String]; Tls.serverContext — provided
-
-object Redirect {
-  val jedis = new JedisPooled("redis", 6379)
-  val store = LinkStore.open()
-
-  val TtlSeconds = 86400L
-  val MissingTtlSeconds = 60L
-  val Missing = "__missing__"
-
-  def resolve(code: String): Option[String] = {
-    val key: String = ??? // TODO: url:{code}
-    // TODO: GET first; a hit returns the URL (or None when it is the Missing sentinel)
-    // TODO: miss → store.lookup(); None → SETEX Missing with MissingTtlSeconds; URL → SETEX with TtlSeconds
-    None
-  }
-
-  val route: Route =
-    path(Segment) { code =>
-      get {
-        // TODO: None → 404; otherwise 302 with Location and Cache-Control: private, max-age=0
-        complete(StatusCodes.NotImplemented)
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("shortener")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.{Location, RawHeader}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import shortener.{LinkStore, Tls} // LinkStore: lookup(code): Option[String]; Tls.serverContext — provided
-
-object Redirect {
-  val jedis = new JedisPooled("redis", 6379)
-  val store = LinkStore.open()
-
-  val TtlSeconds = 86400L
-  val MissingTtlSeconds = 60L
-  val Missing = "__missing__"
-
-  def resolve(code: String): Option[String] = {
-    val key = s"url:$code"
-    Option(jedis.get(key)) match {
-      case Some(cached) => if (cached == Missing) None else Some(cached)
-      case None =>
-        store.lookup(code) match {
-          case Some(url) =>
-            jedis.setex(key, TtlSeconds, url)
-            Some(url)
-          case None =>
-            jedis.setex(key, MissingTtlSeconds, Missing)
-            None
-        }
-    }
-  }
-
-  val route: Route =
-    path(Segment) { code =>
-      get {
-        resolve(code) match {
-          case None => complete(StatusCodes.NotFound -> "no such link")
-          case Some(url) =>
-            val headers = List(Location(Uri(url)), RawHeader("Cache-Control", "private, max-age=0"))
-            complete(HttpResponse(StatusCodes.Found, headers = headers))
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("shortener")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

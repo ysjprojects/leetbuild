@@ -49,7 +49,6 @@ its registration gets two monitors and two pages.
         python: {all: [/@app\.post\(\s*["']\/v1\/monitors["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/monitors['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/monitors"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"monitors"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/monitors"/]},
       },
     },
@@ -62,7 +61,6 @@ its registration gets two monitors and two pages.
         python: {all: [/METRICS/, /MIN_WINDOW_S/, /MAX_WINDOW_S/, /\b401\b/]},
         typescript: {all: [/METRICS/, /MIN_WINDOW_S/, /MAX_WINDOW_S/, /\b401\b/]},
         go: {all: [/\bmetrics\b/, /minWindowS/, /maxWindowS/, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/\bMetrics\b/, /MinWindowS/, /MaxWindowS/, /Unauthorized|\b401\b/]},
         cpp: {all: [/kMetrics/, /kMinWindowS/, /kMaxWindowS/, /\b401\b/]},
       },
     },
@@ -75,7 +73,6 @@ its registration gets two monitors and two pages.
         python: {order: [/store\.is_promoted\(/, /store\.create_monitor\(/]},
         typescript: {order: [/isPromoted\(/, /createMonitor\(\{/]},
         go: {order: [/store\.IsPromoted\(/, /store\.CreateMonitor\(/]},
-        scala: {order: [/Store\.isPromoted\(/, /Store\.createMonitor\(/]},
         cpp: {order: [/store::isPromoted\(/, /store::createMonitor\(/]},
       },
     },
@@ -88,7 +85,6 @@ its registration gets two monitors and two pages.
         python: {all: [/BASELINE_RE\s*=/, /BASELINE_RE\.(fullmatch|match)\(/]},
         typescript: {all: [/BASELINE_RE\s*=/, /BASELINE_RE\.test\(/]},
         go: {all: [/baselineRe\s*=/, /baselineRe\.MatchString\(/]},
-        scala: {all: [/BaselineRe\s*=/, /matches\(\s*BaselineRe\s*\)|BaselineRe\.(pattern|findFirstIn|unapplySeq)/]},
         cpp: {all: [/kBaselineRe/, /std::regex_match\([^\n]*kBaselineRe/]},
       },
     },
@@ -106,10 +102,6 @@ its registration gets two monitors and two pages.
         go: {
           all: [/Idempotency-Key/i, /store\.RememberKey\(/],
           order: [/store\.MonitorForKey\(/, /store\.CreateMonitor\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Store\.rememberKey\(/],
-          order: [/Store\.monitorForKey\(/, /Store\.createMonitor\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /store::rememberKey\(/],
@@ -406,101 +398,6 @@ func registerMonitor(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/monitors", registerMonitor)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import drift.Store // Store.createMonitor, monitorForKey, rememberKey, isPromoted
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** The monitor a request body describes, for tenant (window_s defaults to 3600, threshold to 0.2). */
-  private def monitorOf(tenant: String, raw: String): Store.Monitor = {
-    val fields = raw.parseJson.asJsObject.fields
-    def text(name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-    def number(name: String, default: BigDecimal): BigDecimal = fields.get(name).collect { case JsNumber(n) => n }.getOrElse(default)
-    Store.Monitor("", tenant, text("model_version"), text("metric"), number("window_s", 3600).toLong, text("baseline"), number("threshold", 0.2).toDouble)
-  }
-
-  val route: Route = path("v1" / "monitors") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val monitor = Store.createMonitor(monitorOf(tenant.getOrElse(""), raw))
-          complete(json(StatusCodes.Created, Store.toJson(monitor)))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import drift.Store // Store.createMonitor, monitorForKey, rememberKey, isPromoted
-
-object Api {
-  val Metrics: Set[String] = Set("input_distribution", "outcome_rate", "calibration")
-  val MinWindowS = 300L
-  val MaxWindowS = 86400L
-  /** A frozen, dated reference: baseline:{model_version}:{yyyy-mm-dd}. */
-  val BaselineRe = "baseline:[A-Za-z0-9._-]+:[0-9]{4}-[0-9]{2}-[0-9]{2}"
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** The monitor a request body describes, for tenant (window_s defaults to 3600, threshold to 0.2). */
-  private def monitorOf(tenant: String, raw: String): Store.Monitor = {
-    val fields = raw.parseJson.asJsObject.fields
-    def text(name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-    def number(name: String, default: BigDecimal): BigDecimal = fields.get(name).collect { case JsNumber(n) => n }.getOrElse(default)
-    Store.Monitor("", tenant, text("model_version"), text("metric"), number("window_s", 3600).toLong, text("baseline"), number("threshold", 0.2).toDouble)
-  }
-
-  /** Why the requested monitor is refused, if it is. */
-  private def refusal(m: Store.Monitor): Option[String] =
-    if (!Metrics.contains(m.metric)) Some("metric must be input_distribution, outcome_rate or calibration")
-    else if (m.windowS < MinWindowS || m.windowS > MaxWindowS) Some(s"window_s must be $MinWindowS..$MaxWindowS")
-    else if (!m.baseline.matches(BaselineRe)) Some("baseline must be a frozen reference baseline:{model_version}:{yyyy-mm-dd}")
-    else if (!Store.isPromoted(m.modelVersion)) Some(s"model version \${m.modelVersion} is not promoted")
-    else None
-
-  val route: Route = path("v1" / "monitors") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          optionalHeaderValueByName("Idempotency-Key") {
-            case None | Some("") => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
-            case Some(key) =>
-              entity(as[String]) { raw =>
-                val requested = monitorOf(tenant, raw)
-                refusal(requested) match {
-                  case Some(reason) => complete(StatusCodes.BadRequest -> reason)
-                  case None =>
-                    Store.monitorForKey(tenant, key) match {
-                      case Some(recorded) => complete(json(StatusCodes.OK, Store.toJson(recorded))) // a retry answers the first monitor
-                      case None =>
-                        val monitor = Store.createMonitor(requested)
-                        Store.rememberKey(tenant, key, monitor.monitorId)
-                        complete(json(StatusCodes.Created, Store.toJson(monitor)))
-                    }
-                }
-              }
-          }
-      }
-    }
-  }
 }
 `,
     },

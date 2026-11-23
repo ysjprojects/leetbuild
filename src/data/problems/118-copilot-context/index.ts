@@ -6,7 +6,7 @@ import {completionEndpointStep} from './steps/1-completion-endpoint';
 import {neighboringTabsStep} from './steps/2-neighboring-tabs';
 import {fimCallStep} from './steps/3-fim-call';
 import {completionTelemetryStep} from './steps/4-completion-telemetry';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * GitHub Copilot's completion context, rebuilt as the service behind an editor's ghost text and
@@ -128,6 +128,5 @@ editor-side debouncing, and the A/B platform.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

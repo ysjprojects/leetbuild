@@ -209,7 +209,7 @@ Everything after login rests on one fact: the only way to become user 42 is to p
 rest of the session. That sets its requirements:
 
 - **Unguessable.** 16 bytes from a cryptographic source — \`secrets.token_hex(16)\`, \`randomBytes(16)\`,
-  \`crypto/rand\`, \`SecureRandom\` — give 128 bits of entropy, 32 lower-case hex chars. OWASP's floor
+  \`crypto/rand\` — give 128 bits of entropy, 32 lower-case hex chars. OWASP's floor
   is 64 bits; 128 is what the frameworks ship.
 - **Unrelated to anything.** No user id, no timestamp, no counter inside it. A sequential or
   time-based id lets anyone who has seen one guess its neighbours and walk through every live session.

@@ -47,7 +47,6 @@ new model build serves the old build's numbers for as long as Redis keeps them, 
         python: {all: [/fingerprint\(\s*query\s*\)/]},
         typescript: {all: [/fingerprint\(\s*query\s*\)/]},
         go: {all: [/config\.Fingerprint\(\s*query\s*\)/]},
-        scala: {all: [/Config\.fingerprint\(\s*query\s*\)/]},
         cpp: {all: [/config::fingerprint\(\s*query\s*\)/]},
       },
     },
@@ -60,7 +59,6 @@ new model build serves the old build's numbers for as long as Redis keeps them, 
         python: {all: [/def score_key\([^)]*model_version/]},
         typescript: {all: [/scoreKey\([^)]*modelVersion/]},
         go: {all: [/func scoreKey\([^)]*modelVersion/]},
-        scala: {all: [/def scoreKey\([^)]*modelVersion/]},
         cpp: {all: [/scoreKey\([^)]*model_version/]},
       },
     },
@@ -73,7 +71,6 @@ new model build serves the old build's numbers for as long as Redis keeps them, 
         python: {all: [/SCORE_TTL_S/, /\bex\s*=\s*\w+|setex\(/]},
         typescript: {all: [/SCORE_TTL_S/, /['"]EX['"]|setex\(/]},
         go: {all: [/\.Set\([\s\S]{0,120}?(scoreTTL|time\.Minute|time\.Second)/]},
-        scala: {all: [/setex\(|\.ex\(/]},
         cpp: {all: [/\.set\([^;]*(kScoreTtl|std::chrono::)/]},
       },
     },
@@ -86,7 +83,6 @@ new model build serves the old build's numbers for as long as Redis keeps them, 
         python: {all: [/\.mget\(/], none: [/\br\.get\(/]},
         typescript: {all: [/\.mget\(/], none: [/redis\.get\(/]},
         go: {all: [/\.MGet\(/], none: [/rdb\.Get\(/]},
-        scala: {all: [/\.mget\(/], none: [/jedis\.get\(/]},
         cpp: {all: [/\.mget\(/], none: [/cache\(\)\.get\(/]},
       },
     },
@@ -99,7 +95,6 @@ new model build serves the old build's numbers for as long as Redis keeps them, 
         python: {all: [/\bmissing\b/], none: [/compute\(\s*\[\s*passage\s*\]\s*\)/]},
         typescript: {all: [/\bmissing\b/], none: [/compute\(\s*\[\s*passage\s*\]\s*\)/]},
         go: {all: [/\bmissing\b/], none: [/compute\(\s*\[\]string\{\s*passage\s*\}\s*\)/]},
-        scala: {all: [/\bmissing\b/], none: [/compute\(\s*Seq\(\s*passage\s*\)\s*\)/]},
         cpp: {all: [/\bmissing\b/], none: [/compute\(\s*\{\s*passage\s*\}\s*\)/]},
       },
     },
@@ -331,60 +326,6 @@ func cachedScores(ctx context.Context, query string, passages []string, modelVer
 		}
 	}
 	return scores, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import rerank.Config // Config.fingerprint(text): 32 hex digits of SHA-256 — provided
-
-object ScoreCache {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  def scoreKey(passage: String): String = s"rerank:score:\${Config.fingerprint(passage)}"
-
-  /** The scores of passages for query under modelVersion, in passage order; compute scores what missed. */
-  def cachedScores(query: String, passages: Seq[String], modelVersion: String, compute: Seq[String] => Seq[Double]): Seq[Double] = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    passages.map { passage =>
-      val key = scoreKey(passage)
-      Option(jedis.get(key)) match {
-        case Some(cached) => cached.toDouble
-        case None =>
-          val fresh = compute(Seq(passage)).head
-          jedis.set(key, fresh.toString)
-          fresh
-      }
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import rerank.Config // Config.fingerprint(text): 32 hex digits of SHA-256 — provided
-
-object ScoreCache {
-  val ScoreTtlSeconds: Long = 30 * 60
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** A score belongs to the whole triple: change any part and it is another comparison. */
-  def scoreKey(query: String, passage: String, modelVersion: String): String =
-    s"rerank:score:\${Config.fingerprint(query)}:\${Config.fingerprint(passage)}:$modelVersion"
-
-  /** The scores of passages for query under modelVersion, in passage order; compute scores what missed. */
-  def cachedScores(query: String, passages: Seq[String], modelVersion: String, compute: Seq[String] => Seq[Double]): Seq[Double] =
-    if (passages.isEmpty) Seq.empty
-    else {
-      val keys = passages.map(scoreKey(query, _, modelVersion))
-      val cached = jedis.mget(keys: _*).asScala.toVector.map(Option(_))
-      val missing = cached.indices.filter(cached(_).isEmpty)
-      val fresh = if (missing.isEmpty) Map.empty[Int, Double] else missing.zip(compute(missing.map(passages))).toMap
-      fresh.foreach { case (i, score) => jedis.setex(keys(i), ScoreTtlSeconds, score.toString) }
-      cached.indices.map(i => cached(i).map(_.toDouble).getOrElse(fresh(i)))
-    }
 }
 `,
     },

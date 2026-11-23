@@ -7,7 +7,7 @@ import {contextManagementStep} from './steps/2-context-management';
 import {reasoningLoopStep} from './steps/3-reasoning-loop';
 import {guardrailsStep} from './steps/4-guardrails';
 import {traceEventsStep} from './steps/5-trace-events';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Airbnb's Automation Platform v2: the platform a support assistant runs on, not the assistant. A
@@ -136,6 +136,5 @@ Prompt store, playground, tool publishing, LLM adapters, the agent console and t
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

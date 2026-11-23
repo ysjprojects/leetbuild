@@ -66,13 +66,6 @@ free, nearest first, each with its distance. \`driver_status(ids)\` is provided 
         go: {
           all: [/GeoSearchLocation\(/, /Longitude:\s*lng\b/, /Latitude:\s*lat\b/, /Radius:\s*(?:radiusKm|3(?:\.0)?)\b/],
         },
-        scala: {
-          all: [
-            /\.geosearch\(/,
-            /fromLonLat\(\s*lng\s*,\s*lat\s*\)|new GeoCoordinate\(\s*lng\s*,\s*lat\s*\)/,
-            /byRadius\(\s*(?:RadiusKm|3(?:\.0)?)\s*,\s*GeoUnit\.KM\s*\)/,
-          ],
-        },
         cpp: {
           all: [
             /redis\.georadius\(|redis\.geosearch\(/,
@@ -91,7 +84,6 @@ free, nearest first, each with its distance. \`driver_status(ids)\` is provided 
         python: {all: [/sort\s*=\s*"ASC"/, /count\s*=\s*(?:CANDIDATES|20)\b/, /withdist\s*=\s*True/]},
         typescript: {all: [/['"]ASC['"]/, /['"]COUNT['"]\s*,\s*(?:CANDIDATES|20)\b/, /['"]WITHDIST['"]/]},
         go: {all: [/Sort:\s*"ASC"/, /Count:\s*(?:candidates|20)\b/, /WithDist:\s*true/]},
-        scala: {all: [/\.asc\(\)/, /\.count\(\s*(?:Candidates|20)\s*\)/, /\.withDist\(\)/]},
         cpp: {all: [/GeoUnit::KM\s*,\s*(?:kCandidates|20)\s*,\s*true/, /std::tuple<std::string,\s*double>/]},
       },
     },
@@ -104,7 +96,6 @@ free, nearest first, each with its distance. \`driver_status(ids)\` is provided 
         python: {all: [/\br\.mget\(/, /:seen/], none: [/\br\.get\(/]},
         typescript: {all: [/\bredis\.mget\(/, /:seen/], none: [/\bredis\.get\(/]},
         go: {all: [/rdb\.MGet\(/, /:seen/], none: [/rdb\.Get\(/]},
-        scala: {all: [/jedis\.mget\(/, /:seen/], none: [/jedis\.get\(/]},
         cpp: {all: [/redis\.mget\(/, /:seen/], none: [/redis\.get\(/]},
       },
     },
@@ -116,7 +107,6 @@ free, nearest first, each with its distance. \`driver_status(ids)\` is provided 
         python: {all: [/(?<!def )\bdriver_status\(/, /"available"/]},
         typescript: {all: [/\bstore\.driverStatus\(/, /['"]available['"]/]},
         go: {all: [/(?<!func )\bdriverStatus\(/, /"available"/]},
-        scala: {all: [/(?<!def )\bdriverStatus\(/, /"available"/]},
         cpp: {all: [/\bdriver_status\(\s*(?!const\b)\w/, /"available"/]},
       },
     },
@@ -128,7 +118,6 @@ free, nearest first, each with its distance. \`driver_status(ids)\` is provided 
         python: {all: [/\[\s*:\s*k\s*\]|len\(\s*\w+\s*\)\s*(?:==|>=)\s*k\b/]},
         typescript: {all: [/\.slice\(\s*0\s*,\s*k\s*\)|\.length\s*(?:===?|>=)\s*k\b/]},
         go: {all: [/\[\s*:\s*k\s*\]|len\(\s*\w+\s*\)\s*(?:==|>=)\s*k\b/]},
-        scala: {all: [/\.take\(\s*k\s*\)/]},
         cpp: {all: [/\.size\(\)\s*(?:==|>=|<)\s*k\b|\.resize\(\s*k\s*\)/]},
       },
     },
@@ -348,65 +337,6 @@ func nearest(ctx context.Context, city string, lat, lng float64, k int) ([]Candi
 		}
 	}
 	return out, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.args.GeoUnit
-import redis.clients.jedis.params.GeoSearchParam
-import scala.jdk.CollectionConverters._
-
-object Nearest {
-  val jedis = new JedisPooled("redis", 6379)
-  val RadiusKm = 3.0
-  val Candidates = 20
-
-  /** One driver with its distance from the pickup, in km. */
-  final case class Candidate(driverId: String, distKm: Double)
-
-  /** Provided (DriverStore): driver id → available / on_trip / offline. */
-  def driverStatus(ids: Seq[String]): Map[String, String] = ???
-
-  /** The k closest available drivers, nearest first. */
-  def nearest(city: String, lat: Double, lng: Double, k: Int): Seq[Candidate] = {
-    // TODO: geosearch(s"drivers:$city", new GeoSearchParam().fromLonLat(lng, lat).byRadius(RadiusKm, GeoUnit.KM).asc().count(Candidates).withDist())
-    // TODO: one mget over driver:{id}:seen; drop drivers whose presence key expired (null)
-    // TODO: driverStatus(ids); keep the available ones; take(k)
-    Nil
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.args.GeoUnit
-import redis.clients.jedis.params.GeoSearchParam
-import scala.jdk.CollectionConverters._
-
-object Nearest {
-  val jedis = new JedisPooled("redis", 6379)
-  val RadiusKm = 3.0
-  val Candidates = 20
-
-  /** One driver with its distance from the pickup, in km. */
-  final case class Candidate(driverId: String, distKm: Double)
-
-  /** Provided (DriverStore): driver id → available / on_trip / offline. */
-  def driverStatus(ids: Seq[String]): Map[String, String] = ???
-
-  /** The k closest available drivers, nearest first. */
-  def nearest(city: String, lat: Double, lng: Double, k: Int): Seq[Candidate] = {
-    val params = new GeoSearchParam().fromLonLat(lng, lat).byRadius(RadiusKm, GeoUnit.KM).asc().count(Candidates).withDist()
-    val found = jedis.geosearch(s"drivers:$city", params).asScala.toSeq
-    if (found.isEmpty) Nil
-    else {
-      val seen = jedis.mget(found.map(r => s"driver:\${r.getMemberByString}:seen"): _*).asScala
-      val live = found.zip(seen).collect { case (r, ts) if ts != null => r }
-      val status = driverStatus(live.map(_.getMemberByString))
-      live
-        .collect { case r if status.get(r.getMemberByString).contains("available") => Candidate(r.getMemberByString, r.getDistance) }
-        .take(k)
-    }
-  }
 }
 `,
     },

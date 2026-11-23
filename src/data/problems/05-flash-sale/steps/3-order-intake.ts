@@ -55,7 +55,6 @@ the API answers:
         python: {all: [/producer\.produce\(\s*(topic\s*=\s*)?TOPIC\s*,[\s\S]{0,300}?key\s*=\s*order\[["']sku["']\]/]},
         typescript: {all: [/producer\.send\(\s*\{[\s\S]{0,300}?topic:\s*TOPIC[\s\S]{0,300}?key:\s*order\.sku/]},
         go: {all: [/Balancer:\s*&kafka\.Hash\{\}/, /Key:\s*\[\]byte\(\s*order\.SKU\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*order\.sku\s*,/]},
         cpp: {
           all: [/produce\(\s*kTopic[\s\S]{0,400}?order\.sku\.(c_str|data)\(\)\s*,\s*order\.sku\.(size|length)\(\)/],
         },
@@ -70,12 +69,6 @@ the API answers:
         python: {all: [/"acks"\s*:\s*"all"/, /"enable\.idempotence"\s*:\s*(True|"true")/]},
         typescript: {all: [/\.producer\(\s*\{[^}]*idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/, /MaxAttempts:\s*\d+/]},
-        scala: {
-          all: [
-            /"acks"\s*,\s*"all"|ACKS_CONFIG\s*,\s*"all"/,
-            /"enable\.idempotence"\s*,\s*"true"|ENABLE_IDEMPOTENCE_CONFIG\s*,\s*"true"/,
-          ],
-        },
         cpp: {all: [/"acks"\s*,\s*"all"/, /"enable\.idempotence"\s*,\s*"true"/]},
       },
     },
@@ -94,9 +87,6 @@ the API answers:
           all: [/context\.WithTimeout\(\s*ctx\s*,\s*ackTimeout\s*\)/, /writer\.WriteMessages\(/],
           none: [/Async:\s*true/],
         },
-        scala: {
-          all: [/producer\.send\([\s\S]{0,200}?\)\.get\(\s*AckTimeoutMillis\s*,\s*TimeUnit\.MILLISECONDS\s*\)/],
-        },
         cpp: {
           all: [/producer->flush\(\s*kAckTimeoutMs\s*\)/, /delivery\.err\s*!=\s*RdKafka::ERR_NO_ERROR/],
           order: [/producer->produce\(/, /producer->flush\(/],
@@ -112,7 +102,6 @@ the API answers:
         python: {all: [/def enqueue_order(?:(?!\ndef )[\s\S])*?raise OrderNotAcknowledged\(/]},
         typescript: {all: [/async function enqueueOrder(?:(?!\n\})[\s\S])*?throw new OrderNotAcknowledged\(/]},
         go: {all: [/func enqueueOrder(?:(?!\n\})[\s\S])*?errNotAcknowledged/]},
-        scala: {all: [/def enqueueOrder(?:(?!\n {2}def )[\s\S])*?throw new OrderNotAcknowledged\(/]},
         cpp: {all: [/void enqueue_order(?:(?!\n\})[\s\S])*?throw OrderNotAcknowledged\(/]},
       },
     },
@@ -345,76 +334,6 @@ func enqueueOrder(ctx context.Context, order Order) error {
 		return fmt.Errorf("%w: %s: %v", errNotAcknowledged, order.OrderID, err)
 	}
 	return nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-// Order comes from the checkout endpoint (step 2).
-
-/** The broker did not confirm the order in time; the caller must release the hold. */
-final class OrderNotAcknowledged(orderId: String, cause: Throwable)
-    extends RuntimeException(s"order $orderId not acknowledged", cause)
-
-object OrderIntake {
-  val Topic = "orders"
-  val AckTimeoutMillis = 2000L
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // TODO: acks=all, enable.idempotence, request.timeout.ms 1500 and delivery.timeout.ms = AckTimeoutMillis
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private def toJson(o: Order): String =
-    s"""{"order_id":"\${o.orderId}","sku":"\${o.sku}","qty":\${o.qty},"user":"\${o.user}"}"""
-
-  /** Blocks until the order record is acknowledged; throws OrderNotAcknowledged otherwise. */
-  def enqueueOrder(order: Order): Unit = {
-    // TODO: send a record keyed by order.sku and block on the future for AckTimeoutMillis
-    // TODO: timeout or failure → throw new OrderNotAcknowledged(order.orderId, e)
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-// Order comes from the checkout endpoint (step 2).
-
-/** The broker did not confirm the order in time; the caller must release the hold. */
-final class OrderNotAcknowledged(orderId: String, cause: Throwable)
-    extends RuntimeException(s"order $orderId not acknowledged", cause)
-
-object OrderIntake {
-  val Topic = "orders"
-  val AckTimeoutMillis = 2000L
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  props.put("enable.idempotence", "true")
-  props.put("request.timeout.ms", "1500")
-  props.put("delivery.timeout.ms", AckTimeoutMillis.toString)
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private def toJson(o: Order): String =
-    s"""{"order_id":"\${o.orderId}","sku":"\${o.sku}","qty":\${o.qty},"user":"\${o.user}"}"""
-
-  /** Blocks until the order record is acknowledged; throws OrderNotAcknowledged otherwise. */
-  def enqueueOrder(order: Order): Unit = {
-    val record = new ProducerRecord[String, String](Topic, order.sku, toJson(order))
-    try producer.send(record).get(AckTimeoutMillis, TimeUnit.MILLISECONDS)
-    catch {
-      case e: Exception => throw new OrderNotAcknowledged(order.orderId, e)
-    }
-  }
 }
 `,
     },

@@ -45,7 +45,6 @@ an edited chunk quotes text the summary never saw.
         python: {all: [/@app\.get\(\s*["']\/v1\/summaries\/\{summary_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/summaries\/:summary_id['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/summaries\/\{summary_id\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"summaries"\s*\/\s*Segment\s*\)/, /\bget\b/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/summaries\//]},
       },
     },
@@ -58,7 +57,6 @@ an edited chunk quotes text the summary never saw.
         python: {all: [/x-tenant-id/i, /store\.load_summary\(\s*tenant/], none: [/find_summary\(/]},
         typescript: {all: [/x-tenant-id/i, /loadSummary\(\s*tenant/], none: [/findSummary\(/]},
         go: {all: [/X-Tenant-Id/i, /store\.LoadSummary\([^\n]*\btenant\b/], none: [/FindSummary\(/]},
-        scala: {all: [/X-Tenant-Id/i, /Store\.loadSummary\(\s*tenant/], none: [/findSummary\(/]},
         cpp: {all: [/X-Tenant-Id/i, /store::loadSummary\(\s*tenant/], none: [/findSummary\(/]},
       },
     },
@@ -71,7 +69,6 @@ an edited chunk quotes text the summary never saw.
         python: {all: [/stale_chunks/, /source_hash["']\]\s*!=/]},
         typescript: {all: [/stale_chunks/, /source_hash\s*!==/]},
         go: {all: [/stale_chunks/, /SourceHash\s*!=/]},
-        scala: {all: [/stale_chunks/, /sourceHash\s*!=/]},
         cpp: {all: [/stale_chunks/, /at\("source_hash"\)\s*!=/]},
       },
     },
@@ -84,7 +81,6 @@ an edited chunk quotes text the summary never saw.
         python: {all: [/chunk_hashes/, /["']chunk_hash["']\]/, /["']quote["']/]},
         typescript: {all: [/chunk_hashes/, /\.chunk_hash\b/, /quote/]},
         go: {all: [/ChunkHashes/, /\.ChunkHash\b/, /"quote"/]},
-        scala: {all: [/chunkHashes/, /\.chunkHash\b/, /"quote"/]},
         cpp: {all: [/chunk_hashes/, /"chunk_hash"/, /"quote"/]},
       },
     },
@@ -316,85 +312,6 @@ func readSummary(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/summaries/{summary_id}", readSummary)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import summarizer.Store // Store.loadSummary, findSummary, currentSource
-
-object Read {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def respond(summaryId: String): HttpResponse = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    Store.findSummary(summaryId) match {
-      case None => json(StatusCodes.NotFound, JsObject("error" -> JsString("not found")))
-      case Some(record) =>
-        val chunks = Store.currentSource(record.tenant, record.sourceRef).map(_.chunks).getOrElse(Vector.empty)
-        val citations = record.citations.map { c =>
-          val chunk = chunks.lift(c.chunkIndex).getOrElse("")
-          JsObject(Store.citationJson(c).fields + ("quote" -> JsString(chunk.slice(c.charStart, c.charEnd))))
-        }
-        val view = Store.toJson(record).fields.filter { case (name, _) => Set("summary_id", "source_ref", "source_hash", "band", "kind", "summary")(name) }
-        json(StatusCodes.OK, JsObject(view + ("citations" -> JsArray(citations))))
-    }
-  }
-
-  val route: Route = path("v1" / "summaries" / Segment) { summaryId =>
-    get {
-      complete(respond(summaryId))
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import summarizer.Store // Store.loadSummary, findSummary, currentSource
-
-object Read {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def respond(tenant: String, summaryId: String): HttpResponse =
-    if (tenant.isEmpty) json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required")))
-    else
-      // Scoped to the caller: another tenant's id is as absent as an id nobody minted.
-      Store.loadSummary(tenant, summaryId) match {
-        case None => json(StatusCodes.NotFound, JsObject("error" -> JsString("not found")))
-        case Some(record) =>
-          val current = Store.currentSource(tenant, record.sourceRef)
-          val chunks = current.map(_.chunks).getOrElse(Vector.empty)
-          val hashes = current.map(_.chunkHashes).getOrElse(Vector.empty)
-          val fresh = record.citations.map(c => hashes.lift(c.chunkIndex).contains(c.chunkHash))
-          val citations = record.citations.zip(fresh).map { case (c, ok) =>
-            val quote = if (ok) JsString(chunks(c.chunkIndex).substring(c.charStart, c.charEnd)) else JsNull
-            JsObject(Store.citationJson(c).fields ++ Map("stale" -> JsBoolean(!ok), "quote" -> quote))
-          }
-          // The cited chunks whose text is gone.
-          val staleChunks = record.citations.zip(fresh).collect { case (c, false) => c.chunkIndex }.distinct.sorted
-          val view = Store.toJson(record).fields.filter { case (name, _) => Set("summary_id", "source_ref", "source_hash", "band", "kind", "summary")(name) }
-          json(StatusCodes.OK, JsObject(view ++ Map(
-            "stale" -> JsBoolean(current.forall(_.sourceHash != record.sourceHash)),
-            "stale_chunks" -> JsArray(staleChunks.map(i => JsNumber(i))),
-            "citations" -> JsArray(citations))))
-      }
-
-  val route: Route = path("v1" / "summaries" / Segment) { summaryId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        complete(respond(tenant.getOrElse(""), summaryId))
-      }
-    }
-  }
 }
 `,
     },

@@ -48,7 +48,6 @@ one, so no reader can tell a stale value from a fresh one.
         python: {all: [/@app\.post\(\s*["']\/v1\/features\/definitions["']/, /DTYPES/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/features\/definitions['"]/, /DTYPES/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/features\/definitions"/, /dtypes\[/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"features"\s*\/\s*"definitions"\s*\)/, /Dtypes\.contains/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/features\/definitions"/, /kDtypes/]},
       },
     },
@@ -61,7 +60,6 @@ one, so no reader can tell a stale value from a fresh one.
         python: {all: [/registry\.create_definition\(/, /\b409\b/], none: [/put_definition\(/]},
         typescript: {all: [/createDefinition\(/, /\b409\b/], none: [/putDefinition\(/]},
         go: {all: [/registry\.CreateDefinition\(/, /StatusConflict|\b409\b/], none: [/PutDefinition\(/]},
-        scala: {all: [/Registry\.createDefinition\(/, /Conflict|\b409\b/], none: [/putDefinition\(/]},
         cpp: {all: [/registry::createDefinition\(/, /\b409\b/], none: [/putDefinition\(/]},
       },
     },
@@ -79,10 +77,6 @@ one, so no reader can tell a stale value from a fresh one.
         go: {
           all: [/registry\.ComputationExists\(/, /StatusUnprocessableEntity|\b422\b/],
           order: [/registry\.ComputationExists\(/, /registry\.CreateDefinition\(/],
-        },
-        scala: {
-          all: [/Registry\.computationExists\(/, /UnprocessableEntity|\b422\b/],
-          order: [/Registry\.computationExists\(/, /Registry\.createDefinition\(/],
         },
         cpp: {
           all: [/registry::computationExists\(/, /\b422\b/],
@@ -109,7 +103,6 @@ one, so no reader can tell a stale value from a fresh one.
           ],
         },
         go: {all: [/FreshnessSLO\s*==\s*nil/, /FreshnessSLO\s*<=\s*0|FreshnessSLO\s*<\s*1/]},
-        scala: {all: [/"freshness_slo"\)\.filter\(\s*_\s*>\s*0\s*\)|freshnessSlo\s*<=\s*0/]},
         cpp: {all: [/slo\.is_number(?:_integer)?\(\)/, /slo\.get<long long>\(\)\s*<=\s*0/]},
       },
     },
@@ -363,79 +356,6 @@ func registerDefinition(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/features/definitions", registerDefinition)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import features.Registry // Registry.getDefinition, createDefinition, putDefinition, computationExists
-
-object Api {
-  val Dtypes: Set[String] = Set("int64", "float64", "string", "bool")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(fields: Map[String, JsValue], name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-  private def number(fields: Map[String, JsValue], name: String): Option[Long] = fields.get(name).collect { case JsNumber(n) => n.toLong }
-
-  val route: Route = path("v1" / "features" / "definitions") {
-    post {
-      entity(as[String]) { raw =>
-        // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-        val fields = raw.parseJson.asJsObject.fields
-        if (!Dtypes.contains(text(fields, "dtype"))) complete(StatusCodes.BadRequest -> "dtype must be one of int64, float64, string, bool")
-        else {
-          val d = Registry.Definition(text(fields, "name"), number(fields, "version").getOrElse(0L), text(fields, "dtype"),
-            text(fields, "computation_ref"), number(fields, "freshness_slo").getOrElse(0L), System.currentTimeMillis() / 1000)
-          Registry.putDefinition(d)
-          complete(json(StatusCodes.Created, d.toJson))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import features.Registry // Registry.getDefinition, createDefinition, putDefinition, computationExists
-
-object Api {
-  val Dtypes: Set[String] = Set("int64", "float64", "string", "bool")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(fields: Map[String, JsValue], name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-  private def number(fields: Map[String, JsValue], name: String): Option[Long] = fields.get(name).collect { case JsNumber(n) => n.toLong }
-
-  val route: Route = path("v1" / "features" / "definitions") {
-    post {
-      entity(as[String]) { raw =>
-        val fields = raw.parseJson.asJsObject.fields
-        val ref = text(fields, "computation_ref")
-        if (!Dtypes.contains(text(fields, "dtype"))) complete(StatusCodes.BadRequest -> "dtype must be one of int64, float64, string, bool")
-        else
-          number(fields, "freshness_slo").filter(_ > 0) match {
-            case None => complete(StatusCodes.BadRequest -> "freshness_slo (seconds) is required and must be positive")
-            case Some(_) if !Registry.computationExists(ref) => complete(StatusCodes.UnprocessableEntity -> s"computation_ref $ref names no computation")
-            case Some(slo) =>
-              val d = Registry.Definition(text(fields, "name"), number(fields, "version").getOrElse(0L), text(fields, "dtype"), ref, slo,
-                System.currentTimeMillis() / 1000)
-              // One SET NX: the existence check and the write cannot be split by another registration.
-              if (Registry.createDefinition(d)) complete(json(StatusCodes.Created, d.toJson))
-              else complete(StatusCodes.Conflict -> s"\${d.name} v\${d.version} is already registered")
-          }
-      }
-    }
-  }
 }
 `,
     },

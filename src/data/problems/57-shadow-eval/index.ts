@@ -6,7 +6,7 @@ import {shadowStateStep} from './steps/2-state';
 import {shadowClientStep} from './steps/3-client';
 import {shadowEventsStep} from './steps/4-events';
 import {shadowReadStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Shadow evaluation: the course is not "send a copy of the request to another model", it is the
@@ -92,6 +92,5 @@ a pair, power analysis beyond a fixed threshold, multi-region mirroring, and the
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

@@ -37,7 +37,6 @@ const FENCE_LANGUAGE: Record<Language, string> = {
   python: 'python',
   typescript: 'ts',
   go: 'go',
-  scala: 'scala',
   cpp: 'cpp',
   cuda: 'cuda',
 };

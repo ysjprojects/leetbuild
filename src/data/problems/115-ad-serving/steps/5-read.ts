@@ -56,7 +56,6 @@ ads that were served but did not render, and every campaign looks behind on its 
         python: {all: [/@app\.get\(\s*["']\/v1\/campaigns\/\{campaign_id\}\/delivery["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/campaigns\/:campaignId\/delivery['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/campaigns\/\{id\}\/delivery"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"campaigns"\s*\/\s*Segment\s*\/\s*"delivery"\s*\)/, /\bget\b/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/campaigns\//]},
       },
     },
@@ -71,7 +70,6 @@ ads that were served but did not render, and every campaign looks behind on its 
         },
         typescript: {all: [/x-advertiser-id/i, /\.advertiser_id\b/, /code\(\s*401\s*\)/, /code\(\s*403\s*\)/]},
         go: {all: [/X-Advertiser-Id/i, /\.AdvertiserID\b/, /StatusUnauthorized/, /StatusForbidden/]},
-        scala: {all: [/X-Advertiser-Id/i, /\.advertiserId\b/, /StatusCodes\.Unauthorized/, /StatusCodes\.Forbidden/]},
         cpp: {all: [/X-Advertiser-Id/i, /(\.|->)advertiser_id\b/, /\b401\b/, /\b403\b/]},
       },
     },
@@ -84,7 +82,6 @@ ads that were served but did not render, and every campaign looks behind on its 
         python: {all: [/store\.rendered\(/, /["']counted_at["']\s*:\s*["']render["']/], none: [/store\.spent\(/]},
         typescript: {all: [/\brendered\(/, /counted_at:\s*['"]render['"]/], none: [/\bspent\(/]},
         go: {all: [/store\.RenderedOf\(/, /"counted_at":\s*"render"/], none: [/store\.Spent\(/]},
-        scala: {all: [/Store\.rendered\(/, /"counted_at"\s*->\s*JsString\("render"\)/], none: [/Store\.spent\(/]},
         cpp: {all: [/store::rendered\(/, /\{"counted_at",\s*"render"\}/], none: [/store::spent\(/]},
       },
     },
@@ -97,7 +94,6 @@ ads that were served but did not render, and every campaign looks behind on its 
         python: {all: [/time\.time\(\)|datetime\.now\(/, /start_ts/, /end_ts/]},
         typescript: {all: [/Date\.now\(\)/, /start_ts/, /end_ts/]},
         go: {all: [/time\.Now\(\)/, /StartTs/, /EndTs/]},
-        scala: {all: [/System\.currentTimeMillis\(\)|Instant\.now\(\)/, /startTs/, /endTs/]},
         cpp: {all: [/system_clock::now\(\)/, /start_ts/, /end_ts/]},
       },
     },
@@ -309,92 +305,6 @@ func delivery(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/campaigns/{id}/delivery", delivery)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import ads.Store // Store.getCampaign, Store.rendered, Store.spent
-
-object Read {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "campaigns" / Segment / "delivery") { campaignId =>
-    get {
-      // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-      Store.getCampaign(campaignId) match {
-        case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("no such campaign"))))
-        case Some(campaign) =>
-          val spend = Store.spent(campaignId)
-          val impressions = spend / campaign.bidMicros
-          complete(
-            json(
-              StatusCodes.OK,
-              JsObject(
-                "campaign_id" -> JsString(campaignId),
-                "campaign_version" -> JsNumber(campaign.version),
-                "counted_at" -> JsString("serve"),
-                "impressions" -> JsNumber(impressions),
-                "spend_micros" -> JsNumber(spend),
-                "under_delivery_impressions" -> JsNumber(math.max(0L, campaign.goalImpressions - impressions))
-              )
-            )
-          )
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import ads.Store // Store.getCampaign, Store.rendered, Store.spent
-
-object Read {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, why: String) = complete(json(status, JsObject("error" -> JsString(why))))
-
-  val route: Route = path("v1" / "campaigns" / Segment / "delivery") { campaignId =>
-    get {
-      optionalHeaderValueByName("X-Advertiser-Id") { advertiser =>
-        (advertiser.filter(_.nonEmpty), Store.getCampaign(campaignId)) match {
-          case (None, _) => error(StatusCodes.Unauthorized, "X-Advertiser-Id is required")
-          case (_, None) => error(StatusCodes.NotFound, "no such campaign")
-          case (Some(caller), Some(campaign)) if campaign.advertiserId != caller =>
-            error(StatusCodes.Forbidden, "the campaign belongs to another advertiser")
-          case (_, Some(campaign)) =>
-            // What the advertiser pays for: impressions the pages reported as rendered.
-            val counted = Store.rendered(campaignId)
-            // The rate so far, carried over the whole flight: a campaign on pace projects its goal.
-            val flight = campaign.endTs - campaign.startTs
-            val elapsed = math.max(1L, math.min(System.currentTimeMillis() / 1000, campaign.endTs) - campaign.startTs)
-            val projected = counted.impressions * flight / elapsed
-            complete(
-              json(
-                StatusCodes.OK,
-                JsObject(
-                  "campaign_id" -> JsString(campaignId),
-                  "campaign_version" -> JsNumber(campaign.version),
-                  "counted_at" -> JsString("render"),
-                  "impressions" -> JsNumber(counted.impressions),
-                  "spend_micros" -> JsNumber(counted.spendMicros),
-                  "under_delivery_impressions" -> JsNumber(math.max(0L, campaign.goalImpressions - projected))
-                )
-              )
-            )
-        }
-      }
-    }
-  }
 }
 `,
     },

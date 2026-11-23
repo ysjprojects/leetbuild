@@ -66,7 +66,6 @@ enum HealthStatus { STARTING = 0; HEALTHY = 1; FAILED = 2; }
         python: {all: [/stub\.Start\([\s\S]{0,200}?timeout\s*=/, /START_DEADLINE_S/]},
         typescript: {all: [/\.Start\([\s\S]{0,200}?deadline/, /START_DEADLINE_MS/]},
         go: {all: [/context\.WithTimeout\([^\n]*config\.StartDeadline/, /\.Start\(/]},
-        scala: {all: [/withDeadlineAfter\(\s*StartDeadlineMillis/, /\.start\(/]},
         cpp: {all: [/set_deadline\(/, /kStartDeadline/, /->Start\(/]},
       },
     },
@@ -85,10 +84,6 @@ enum HealthStatus { STARTING = 0; HEALTHY = 1; FAILED = 2; }
           all: [/\.Health\(/, /pb\.HealthStatus_HEALTHY/, /pb\.HealthStatus_FAILED/],
           order: [/\.Health\(/, /"running"/],
         },
-        scala: {
-          all: [/\.health\(/, /HealthStatus\.HEALTHY/, /HealthStatus\.FAILED/],
-          order: [/\.health\(/, /"running"/],
-        },
         cpp: {all: [/->Health\(/, /gpusched::HEALTHY/, /gpusched::FAILED/], order: [/->Health\(/, /"running"/]},
       },
     },
@@ -104,7 +99,6 @@ enum HealthStatus { STARTING = 0; HEALTHY = 1; FAILED = 2; }
         },
         typescript: {all: [/health\.reason|\.reason\b/, /['"]failed['"]/]},
         go: {all: [/health\.GetReason\(\)|\.Reason\b/, /"failed"/]},
-        scala: {all: [/health\.reason|\.reason\b/, /"failed"/]},
         cpp: {all: [/health\.reason\(\)|\.reason\(\)/, /"failed"/]},
       },
     },
@@ -117,7 +111,6 @@ enum HealthStatus { STARTING = 0; HEALTHY = 1; FAILED = 2; }
         python: {all: [/\brelease\(/], order: [/stub\.Start\(/, /\brelease\(/]},
         typescript: {all: [/\brelease\(/], order: [/\.Start\(/, /\brelease\(/]},
         go: {all: [/\brelease\(/], order: [/\.Start\(/, /\brelease\(/]},
-        scala: {all: [/State\.release\(/], order: [/\.start\(/, /State\.release\(/]},
         cpp: {all: [/\brelease\(/], order: [/->Start\(/, /\brelease\(/]},
       },
     },
@@ -130,7 +123,6 @@ enum HealthStatus { STARTING = 0; HEALTHY = 1; FAILED = 2; }
         python: {all: [/RETRYABLE_CODES/, /DEADLINE_EXCEEDED/, /UNAVAILABLE/, /MAX_START_ATTEMPTS/]},
         typescript: {all: [/RETRYABLE_CODES/, /DEADLINE_EXCEEDED/, /UNAVAILABLE/, /MAX_START_ATTEMPTS/]},
         go: {all: [/retryableCodes/, /codes\.DeadlineExceeded/, /codes\.Unavailable/, /config\.MaxStartAttempts/]},
-        scala: {all: [/RetryableCodes/, /DEADLINE_EXCEEDED/, /UNAVAILABLE/, /MaxStartAttempts/]},
         cpp: {all: [/kRetryableCodes|retryable\(/, /DEADLINE_EXCEEDED/, /UNAVAILABLE/, /kMaxStartAttempts/]},
       },
     },
@@ -516,105 +508,6 @@ func startPlacement(ctx context.Context, placementID, image string, count int, n
 		}
 	}
 	return Outcome{Status: "failed", Reason: "no node started the workload"}
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-import gpusched.agent.{HealthRequest, HealthStatus, NodeAgentGrpc, StartRequest}
-
-import gpusched.Config.{agentTarget, HealthPollMillis, MaxStartAttempts, StartDeadlineMillis}
-
-object Client {
-  val jedis = new JedisPooled("redis", 6379)
-
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-
-  /** What startPlacement reports: running on a node, or failed with a reason. */
-  final case class Outcome(status: String, nodeId: Option[String] = None, reason: Option[String] = None)
-
-  private def stub(nodeId: String): NodeAgentGrpc.NodeAgentBlockingStub = {
-    val (host, port) = agentTarget(nodeId).split(":") match { case Array(h, p) => (h, p.toInt) }
-    NodeAgentGrpc.blockingStub(ManagedChannelBuilder.forAddress(host, port).usePlaintext().build())
-  }
-
-  /** Book a node and start the workload on it. */
-  def startPlacement(placementId: String, image: String, count: Int, nodes: List[String]): Outcome = {
-    for (nodeId <- nodes if State.allocate(nodeId, placementId, count) == "ALLOCATED") {
-      try {
-        stub(nodeId).start(StartRequest(placementId = placementId, image = image, gpuCount = count))
-        jedis.hset(s"placement:$placementId", "status", "running")
-        return Outcome("running", nodeId = Some(nodeId))
-      } catch {
-        case _: StatusRuntimeException => ()
-      }
-    }
-    Outcome("failed", reason = Some("no node started the workload"))
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-import gpusched.agent.{HealthRequest, HealthStatus, NodeAgentGrpc, StartRequest}
-
-import gpusched.Config.{agentTarget, HealthPollMillis, MaxStartAttempts, StartDeadlineMillis}
-
-object Client {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val RetryableCodes: Set[Status.Code] = Set(Status.Code.DEADLINE_EXCEEDED, Status.Code.UNAVAILABLE)
-
-  /** What startPlacement reports: running on a node, or failed with a reason. */
-  final case class Outcome(status: String, nodeId: Option[String] = None, reason: Option[String] = None)
-
-  /** One node's attempt: running, or failed with a reason and whether another node may be tried. */
-  private final case class Attempt(running: Boolean, reason: String = "", retryable: Boolean = false)
-
-  private def stub(nodeId: String): NodeAgentGrpc.NodeAgentBlockingStub = {
-    val (host, port) = agentTarget(nodeId).split(":") match { case Array(h, p) => (h, p.toInt) }
-    NodeAgentGrpc.blockingStub(ManagedChannelBuilder.forAddress(host, port).usePlaintext().build())
-  }
-
-  /** One node's attempt under one budget. */
-  private def startOn(nodeId: String, placementId: String, image: String, count: Int): Attempt = {
-    val deadline = System.currentTimeMillis() + StartDeadlineMillis
-    val agent = stub(nodeId).withDeadlineAfter(StartDeadlineMillis, TimeUnit.MILLISECONDS)
-    try {
-      agent.start(StartRequest(placementId = placementId, image = image, gpuCount = count))
-      while (System.currentTimeMillis() < deadline) {
-        val health = agent.health(HealthRequest(placementId = placementId))
-        if (health.status == HealthStatus.HEALTHY) return Attempt(running = true)
-        if (health.status == HealthStatus.FAILED) return Attempt(running = false, reason = health.reason)
-        Thread.sleep(HealthPollMillis)
-      }
-      Attempt(running = false, reason = "no health report within the deadline", retryable = true)
-    } catch {
-      case e: StatusRuntimeException =>
-        val code = e.getStatus.getCode
-        Attempt(running = false, reason = s"agent $code: \${e.getStatus.getDescription}", retryable = RetryableCodes.contains(code))
-    }
-  }
-
-  /** Book a node and start the workload on it. */
-  def startPlacement(placementId: String, image: String, count: Int, nodes: List[String]): Outcome = {
-    var attempts = 0
-    for (nodeId <- nodes if attempts < MaxStartAttempts && State.allocate(nodeId, placementId, count) == "ALLOCATED") {
-      attempts += 1
-      val outcome = startOn(nodeId, placementId, image, count)
-      if (outcome.running) {
-        jedis.hset(s"placement:$placementId", "status", "running")
-        return Outcome("running", nodeId = Some(nodeId))
-      }
-      State.release(nodeId, placementId)
-      if (!outcome.retryable) return Outcome("failed", reason = Some(outcome.reason))
-    }
-    Outcome("failed", reason = Some("no node started the workload"))
-  }
 }
 `,
     },

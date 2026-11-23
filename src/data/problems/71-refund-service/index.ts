@@ -6,7 +6,7 @@ import {refundStateStep} from './steps/2-state';
 import {refundDependencyStep} from './steps/3-dependency';
 import {refundEventsStep} from './steps/4-events';
 import {refundReadStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Refund service: the debugging you owe a money path before it refunds twice. A validated,
@@ -99,6 +99,5 @@ approval workflows, customer notifications and the accounting export.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

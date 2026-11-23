@@ -58,7 +58,6 @@ answers loses the event while \`confirm_batch\` reports success.
         python: {all: [/producer\.produce\([^\n]*key\s*=/, /f["']\{replication_id\}:\{shard\}["']/]},
         typescript: {all: [/messages:\s*\[\{\s*key\b/, /\$\{replicationId\}:\$\{shard\}/]},
         go: {all: [/Key:\s*\[\]byte\(/, /"%s:%d"/]},
-        scala: {all: [/new ProducerRecord\[String, String\]\(\s*Topic\s*,\s*key\s*,/, /s"\$replicationId:\$shard"/]},
         cpp: {
           all: [
             /key\.c_str\(\)\s*,\s*key\.(size|length)\(\)/,
@@ -76,7 +75,6 @@ answers loses the event while \`confirm_batch\` reports success.
         python: {all: [/["']rejected["']\s*:/]},
         typescript: {all: [/rejected:\s*batch\.rejected/]},
         go: {all: [/"rejected"/]},
-        scala: {all: [/"rejected"/]},
         cpp: {all: [/"rejected"/]},
       },
     },
@@ -89,7 +87,6 @@ answers loses the event while \`confirm_batch\` reports success.
         python: {order: [/advance_offset\(/, /producer\.produce\(/]},
         typescript: {order: [/await advanceOffset\(/, /producer\.send\(/]},
         go: {order: [/offsets\.AdvanceOffset\(/, /producer\.Produce\(/]},
-        scala: {order: [/Offsets\.advanceOffset\(/, /producer\.send\(/]},
         cpp: {order: [/offsets::advanceOffset\(/, /producer->produce\(/]},
       },
     },
@@ -102,7 +99,6 @@ answers loses the event while \`confirm_batch\` reports success.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -118,7 +114,6 @@ answers loses the event while \`confirm_batch\` reports success.
         },
         typescript: {all: [/await producer\.send\(/, /catch/, /insertOutbox\(/]},
         go: {all: [/TopicPartition\.Error/, /time\.After\(/, /store\.InsertOutbox\(/]},
-        scala: {all: [/\.get\(\s*AckTimeoutMs/, /Store\.insertOutbox\(/], none: [/case _: KafkaException/]},
         cpp: {all: [/dr_cb/, /->flush\(/, /store::insertOutbox\(/]},
       },
     },
@@ -371,97 +366,6 @@ func confirmBatch(ctx context.Context, replicationID string, shard int, batch Ba
 		return false, store.InsertOutbox(ctx, topic, key, event)
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import replication.{Offsets, Store} // Offsets.advanceOffset · Store.insertOutbox(topic, key, payload)
-
-/** What the target confirmed for one batch of a shard. */
-final case class Batch(offset: Long, applied: Int, rejected: Int)
-
-object Events {
-  val Topic = "replication.applied"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Record a batch the target confirmed and tell the lag consumers; true once the event is out. */
-  def confirmBatch(replicationId: String, shard: Int, batch: Batch): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val event = JsObject(
-      "replication_id" -> JsString(replicationId),
-      "shard" -> JsNumber(shard),
-      "offset" -> JsNumber(batch.offset),
-      "applied" -> JsNumber(batch.applied)
-    )
-    try producer.send(new ProducerRecord[String, String](Topic, null, event.compactPrint))
-    catch {
-      case _: KafkaException =>
-        Store.insertOutbox(Topic, replicationId, event)
-        return false
-    }
-    Offsets.advanceOffset(replicationId, shard, batch.offset)
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import replication.{Offsets, Store} // Offsets.advanceOffset · Store.insertOutbox(topic, key, payload)
-
-/** What the target confirmed for one batch of a shard. */
-final case class Batch(offset: Long, applied: Int, rejected: Int)
-
-object Events {
-  val Topic = "replication.applied"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Record a batch the target confirmed and tell the lag consumers; true once the event is out. */
-  def confirmBatch(replicationId: String, shard: Int, batch: Batch): Boolean = {
-    // The offset first: a consumer that reads the event must find the offset it names.
-    val offset = Offsets.advanceOffset(replicationId, shard, batch.offset)
-    val key = s"$replicationId:$shard" // one shard, one partition, one order
-    val event = JsObject(
-      "replication_id" -> JsString(replicationId),
-      "shard" -> JsNumber(shard),
-      "offset" -> JsNumber(offset),
-      "applied" -> JsNumber(batch.applied),
-      "rejected" -> JsNumber(batch.rejected)
-    )
-    val acked = Try(producer.send(new ProducerRecord[String, String](Topic, key, event.compactPrint)).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so the dashboard is late, not wrong.
-      Store.insertOutbox(Topic, key, event)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

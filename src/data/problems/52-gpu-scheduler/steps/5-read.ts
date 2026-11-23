@@ -64,7 +64,6 @@ whole fleet.
         python: {all: [/@app\.get\(\s*["']\/v1\/nodes\/\{/, /["']free["']/, /status_code=404/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/nodes\/:/, /\bfree\b/, /code\(\s*404\s*\)/]},
         go: {all: [/"GET \/v1\/nodes\/\{id\}"/, /"free"/, /StatusNotFound/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"nodes"\s*\/\s*Segment\s*\)/, /"free"/, /StatusCodes\.NotFound/]},
         cpp: {all: [/svr\.Get\(\s*R?"\(?\/v1\/nodes\//, /"free"/, /status\s*=\s*404/]},
       },
     },
@@ -77,7 +76,6 @@ whole fleet.
         python: {all: [/hgetall\(\s*f["']node:\{node_id\}["']\s*\)/], none: [/CACHE_TTL_S|_allocated_cache/]},
         typescript: {all: [/hgetall\(\s*`node:\$\{nodeId\}`\s*\)/], none: [/CACHE_TTL_MS|allocatedCache/]},
         go: {all: [/HGetAll\(\s*[^,]+,\s*"node:"\s*\+\s*nodeID\s*\)/], none: [/cacheTTL|allocatedCache/]},
-        scala: {all: [/hgetAll\(\s*s"node:\$nodeId"\s*\)/], none: [/CacheTtlMillis|allocatedCache/]},
         cpp: {all: [/hgetall\(\s*"node:"\s*\+\s*node_id\s*\)/], none: [/kCacheTtl|allocated_cache/]},
       },
     },
@@ -102,12 +100,6 @@ whole fleet.
         go: {
           all: [
             /max\(\s*capacity\s*-\s*allocated\s*,\s*0\s*\)|max\(\s*0\s*,\s*capacity\s*-\s*allocated\s*\)/,
-            /placeable/,
-          ],
-        },
-        scala: {
-          all: [
-            /math\.max\(\s*capacity\s*-\s*allocated\s*,\s*0\s*\)|math\.max\(\s*0\s*,\s*capacity\s*-\s*allocated\s*\)/,
             /placeable/,
           ],
         },
@@ -137,10 +129,6 @@ whole fleet.
           all: [/func reconcileNode/, /SMembers\(\s*[^,]+,\s*"node:"\s*\+\s*nodeID\s*\+\s*":placements"\s*\)/],
           none: [/Keys\(\s*[^,]+,\s*"placement:\*"\s*\)/],
         },
-        scala: {
-          all: [/def reconcileNode/, /smembers\(\s*s"node:\$nodeId:placements"\s*\)/],
-          none: [/keys\(\s*"placement:\*"\s*\)/],
-        },
         cpp: {
           all: [/int reconcile_node/, /smembers\(\s*"node:"\s*\+\s*node_id\s*\+\s*":placements"\s*\)/],
           none: [/keys\(\s*"placement:\*"/],
@@ -163,16 +151,6 @@ whole fleet.
         },
         go: {
           all: [/"Authorization"/, /"token:"\s*\+\s*token/, /"operator"/, /StatusForbidden/, /StatusUnauthorized/],
-          none: [/X-Scope/i],
-        },
-        scala: {
-          all: [
-            /Authorization/,
-            /s"token:\$token"/,
-            /"operator"/,
-            /StatusCodes\.Forbidden/,
-            /StatusCodes\.Unauthorized/,
-          ],
           none: [/X-Scope/i],
         },
         cpp: {
@@ -531,112 +509,6 @@ func readNode(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/nodes/{id}", readNode)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-object Read {
-  val jedis = new JedisPooled("redis", 6379)
-
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-
-  val CacheTtlMillis = 300000L
-  private val allocatedCache = mutable.Map.empty[String, (Long, Int)]
-
-  /** The node's allocated count, refreshed every CacheTtlMillis: the dashboard polls this route hard. */
-  private def allocatedGpus(nodeId: String): Int = allocatedCache.synchronized {
-    allocatedCache.get(nodeId) match {
-      case Some((at, value)) if System.currentTimeMillis() - at < CacheTtlMillis => value
-      case _ =>
-        val value = Option(jedis.hget(s"node:$nodeId", "allocated")).map(_.toInt).getOrElse(0)
-        allocatedCache(nodeId) = (System.currentTimeMillis(), value)
-        value
-    }
-  }
-
-  /** After a reboot: recompute allocated from the placement records; the new value. */
-  def reconcileNode(nodeId: String): Int = {
-    val total = jedis.keys("placement:*").asScala.toList.map(jedis.hgetAll(_).asScala).filter(_.get("node_id").contains(nodeId)).map(_.get("count").map(_.toInt).getOrElse(0)).sum
-    jedis.hset(s"node:$nodeId", "allocated", total.toString)
-    total
-  }
-
-  val route: Route =
-    path("v1" / "nodes" / Segment) { nodeId =>
-      get {
-        optionalHeaderValueByName("X-Scope") { scope =>
-          if (!scope.contains("operator")) complete(StatusCodes.Forbidden -> "operators only")
-          else {
-            val node = jedis.hgetAll(s"node:$nodeId").asScala
-            if (node.isEmpty) complete(StatusCodes.NotFound -> "unknown node")
-            else {
-              val capacity = node.get("capacity").map(_.toInt).getOrElse(0)
-              val allocated = allocatedGpus(nodeId)
-              val alive = jedis.exists(s"heartbeat:$nodeId")
-              val json = s"""{"node_id":"$nodeId","gpu_type":"\${node.getOrElse("gpu_type", "")}","capacity":$capacity,"allocated":$allocated,"free":\${capacity - allocated},"placeable":\${capacity - allocated > 0},"alive":$alive}"""
-              complete(HttpEntity(ContentTypes.\`application/json\`, json))
-            }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object Read {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** The bearer token's verdict, resolved in Redis: 401 without a token, 403 unless it is an operator's. */
-  private def refused(authorization: Option[String]): Option[StatusCode] =
-    authorization.filter(_.startsWith("Bearer ")) match {
-      case None => Some(StatusCodes.Unauthorized)
-      case Some(header) =>
-        val token = header.stripPrefix("Bearer ")
-        if (jedis.hget(s"token:$token", "scope") == "operator") None else Some(StatusCodes.Forbidden)
-    }
-
-  /** After a reboot: recompute allocated from the open placements; the new value. */
-  def reconcileNode(nodeId: String): Int = {
-    val total = jedis.smembers(s"node:$nodeId:placements").asScala.toList.map(pid => Option(jedis.hget(s"placement:$pid", "count")).map(_.toInt).getOrElse(0)).sum
-    jedis.hset(s"node:$nodeId", "allocated", total.toString)
-    total
-  }
-
-  val route: Route =
-    path("v1" / "nodes" / Segment) { nodeId =>
-      get {
-        optionalHeaderValueByName("Authorization") { authorization =>
-          refused(authorization) match {
-            case Some(status) => complete(status -> "operators only")
-            case None =>
-              val node = jedis.hgetAll(s"node:$nodeId").asScala
-              if (node.isEmpty) complete(StatusCodes.NotFound -> "unknown node")
-              else {
-                val capacity = node.get("capacity").map(_.toInt).getOrElse(0)
-                val allocated = node.get("allocated").map(_.toInt).getOrElse(0)
-                val free = math.max(capacity - allocated, 0)
-                val alive = jedis.exists(s"heartbeat:$nodeId")
-                val json = s"""{"node_id":"$nodeId","gpu_type":"\${node.getOrElse("gpu_type", "")}","capacity":$capacity,"allocated":$allocated,"free":$free,"placeable":\${free > 0},"alive":$alive}"""
-                complete(HttpEntity(ContentTypes.\`application/json\`, json))
-              }
-          }
-        }
-      }
-    }
 }
 `,
     },

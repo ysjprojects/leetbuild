@@ -100,14 +100,6 @@ Implement \`kb_search\`:
             /embed\.ToPgvector\(/,
           ],
         },
-        scala: {
-          all: [
-            /INSERT INTO kb_chunks/,
-            /ON CONFLICT\s*\(\s*id\s*\)\s*DO NOTHING/,
-            /Chunk\.chunk\(/,
-            /Embed\.toPgvector\(/,
-          ],
-        },
         cpp: {
           all: [
             /INSERT INTO kb_chunks/,
@@ -127,7 +119,6 @@ Implement \`kb_search\`:
         python: {all: [/ORDER BY\s+embedding\s*<=>/, /1(\.0)?\s*-\s*/, /\bk\b/]},
         typescript: {all: [/ORDER BY\s+embedding\s*<=>/, /1\s*-\s*/, /\bk\b/]},
         go: {all: [/ORDER BY\s+embedding\s*<=>/, /1\s*-\s*/, /\bk\b/]},
-        scala: {all: [/ORDER BY\s+embedding\s*<=>/, /1(\.0)?\s*-\s*/, /\bk\b/]},
         cpp: {all: [/ORDER BY\s+embedding\s*<=>/, /1(\.0)?\s*-\s*/, /\bk\b/]},
       },
     },
@@ -140,7 +131,6 @@ Implement \`kb_search\`:
         python: {all: [/LIMIT\s+%s/], none: [/sorted\(/, /\.sort\(/]},
         typescript: {all: [/LIMIT\s+\$\d/], none: [/\.sort\(/]},
         go: {all: [/LIMIT\s+\$\d/], none: [/sort\.Slice\(/]},
-        scala: {all: [/LIMIT\s+\?/], none: [/\.sortBy\(/, /\.sorted\b/]},
         cpp: {all: [/LIMIT\s+\$\d/], none: [/std::sort\(/]},
       },
     },
@@ -153,7 +143,6 @@ Implement \`kb_search\`:
         python: {all: [/hashlib\.sha256\(/, /["']answer:["']/, /\.lower\(\)/, /\.split\(\)|\\s\+/]},
         typescript: {all: [/createHash\(\s*['"]sha256['"]\s*\)/, /['"]answer:['"]/, /\.toLowerCase\(\)/, /\\s\+/]},
         go: {all: [/sha256\.Sum256\(/, /"answer:"/, /strings\.ToLower\(/, /strings\.Fields\(/]},
-        scala: {all: [/"SHA-256"/, /"answer:"/, /\.toLowerCase/, /\\s\+/]},
         cpp: {all: [/sha256_hex\(/, /"answer:"/, /std::tolower\(/, /std::isspace\(/]},
       },
     },
@@ -180,14 +169,6 @@ Implement \`kb_search\`:
             /rdb\.Get\(\s*ctx\s*,\s*cacheKey\(/,
             /json\.Unmarshal\(/,
             /json\.Marshal\(/,
-          ],
-        },
-        scala: {
-          all: [
-            /jedis\.setex\(\s*[^\n]*Config\.CacheTtlS/,
-            /jedis\.get\(\s*cacheKey\(/,
-            /Json\.parse\(/,
-            /\.toJson\b|Json\.obj\(/,
           ],
         },
         cpp: {all: [/redis\.set\(\s*[^\n]*kCacheTtl/, /redis\.get\(\s*cache_key\(/, /json::parse\(/, /\.dump\(\)/]},
@@ -642,114 +623,6 @@ func rememberAnswer(ctx context.Context, question, answer string, sources []stri
 func main() {
 	_ = config.TopK
 	select {}
-}
-`,
-    },
-    scala: {
-      starter: `/** The knowledge base and the answer cache: chunks and vectors in Postgres, the nearest ones by pgvector, answers remembered in Redis. */
-import java.security.MessageDigest
-
-import play.api.libs.json.{Json, JsValue}
-import redis.clients.jedis.JedisPooled
-
-import assistant.{Chunk, Config, Db, Embed, Kb}
-// Chunk.chunk(text): Seq[String] · Embed.embed(text): Array[Double] · Embed.toPgvector(v): String
-// Db.withConnection { conn => ... } (JDBC) · Config.CacheTtlS, Config.TopK · Kb.articles: Seq[Kb.Article]
-
-final case class Hit(id: String, text: String, score: Double)
-final case class CachedAnswer(answer: String, sources: Seq[String])
-
-object KbSearch {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Chunk, embed and store every article; the number of chunks inserted. Safe to run again. */
-  def indexArticles(articles: Seq[Kb.Article] = Kb.articles): Int = {
-    // TODO: for each article, for (text, position) <- Chunk.chunk(body).zipWithIndex:
-    // TODO:   id s"$article-$position", the vector as Embed.toPgvector(Embed.embed(text)) cast to vector
-    // TODO:   one INSERT per chunk, idempotent on the id; sum executeUpdate()
-    ???
-  }
-
-  /** The k chunks nearest to the question, best first. */
-  def search(question: String, k: Int = Config.TopK): Seq[Hit] = {
-    // TODO: embed the question; SELECT id, text and the cosine distance, ordered by it, bounded by k
-    // TODO: score = 1 - distance
-    ???
-  }
-
-  /** Lower-cased, whitespace collapsed to single spaces, trimmed. */
-  def normalise(question: String): String = ??? // TODO
-
-  def cacheKey(question: String): String = ??? // TODO: "answer:" + sha256 hex of the normalised question
-
-  /** The {answer, sources} remembered for this question, or None. */
-  def cachedAnswer(question: String): Option[CachedAnswer] = ??? // TODO: GET the key; a miss is None
-
-  def rememberAnswer(question: String, answer: String, sources: Seq[String]): Unit = ??? // TODO: SETEX the JSON {answer, sources} for Config.CacheTtlS
-}
-`,
-      solution: `/** The knowledge base and the answer cache: chunks and vectors in Postgres, the nearest ones by pgvector, answers remembered in Redis. */
-import java.security.MessageDigest
-
-import play.api.libs.json.{Json, JsValue}
-import redis.clients.jedis.JedisPooled
-
-import assistant.{Chunk, Config, Db, Embed, Kb}
-// Chunk.chunk(text): Seq[String] · Embed.embed(text): Array[Double] · Embed.toPgvector(v): String
-// Db.withConnection { conn => ... } (JDBC) · Config.CacheTtlS, Config.TopK · Kb.articles: Seq[Kb.Article]
-
-final case class Hit(id: String, text: String, score: Double)
-final case class CachedAnswer(answer: String, sources: Seq[String])
-
-object KbSearch {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Chunk, embed and store every article; the number of chunks inserted. Safe to run again. */
-  def indexArticles(articles: Seq[Kb.Article] = Kb.articles): Int = Db.withConnection { conn =>
-    conn.setAutoCommit(false)
-    val stmt = conn.prepareStatement(
-      "INSERT INTO kb_chunks (id, article, position, text, embedding) VALUES (?, ?, ?, ?, CAST(? AS vector)) ON CONFLICT (id) DO NOTHING")
-    var inserted = 0
-    for (a <- articles; (text, position) <- Chunk.chunk(a.body).zipWithIndex) {
-      stmt.setString(1, s"\${a.id}-$position"); stmt.setString(2, a.id); stmt.setInt(3, position)
-      stmt.setString(4, text); stmt.setString(5, Embed.toPgvector(Embed.embed(text)))
-      inserted += stmt.executeUpdate()
-    }
-    conn.commit()
-    inserted
-  }
-
-  /** The k chunks nearest to the question, best first. */
-  def search(question: String, k: Int = Config.TopK): Seq[Hit] = Db.withConnection { conn =>
-    val q = Embed.toPgvector(Embed.embed(question))
-    val stmt = conn.prepareStatement(
-      "SELECT id, text, embedding <=> CAST(? AS vector) AS distance FROM kb_chunks ORDER BY embedding <=> CAST(? AS vector) LIMIT ?")
-    stmt.setString(1, q); stmt.setString(2, q); stmt.setInt(3, k)
-    val rs = stmt.executeQuery()
-    val hits = Seq.newBuilder[Hit]
-    while (rs.next()) hits += Hit(rs.getString("id"), rs.getString("text"), 1.0 - rs.getDouble("distance"))
-    hits.result()
-  }
-
-  /** Lower-cased, whitespace collapsed to single spaces, trimmed. */
-  def normalise(question: String): String = question.toLowerCase.trim.replaceAll("\\\\s+", " ")
-
-  def cacheKey(question: String): String = {
-    val digest = MessageDigest.getInstance("SHA-256").digest(normalise(question).getBytes("UTF-8"))
-    "answer:" + digest.map("%02x".format(_)).mkString
-  }
-
-  /** The {answer, sources} remembered for this question, or None. */
-  def cachedAnswer(question: String): Option[CachedAnswer] =
-    Option(jedis.get(cacheKey(question))).map { raw =>
-      val js: JsValue = Json.parse(raw)
-      CachedAnswer((js \\ "answer").as[String], (js \\ "sources").as[Seq[String]])
-    }
-
-  def rememberAnswer(question: String, answer: String, sources: Seq[String]): Unit = {
-    val value = Json.stringify(Json.obj("answer" -> answer, "sources" -> sources))
-    jedis.setex(cacheKey(question), Config.CacheTtlS, value)
-  }
 }
 `,
     },

@@ -55,7 +55,6 @@ unchecked, and a 0.79 ships after a 0.95.
         python: {all: [/SAMPLE_SIZE\s*=\s*200\b/, /gtx\.sample\(\s*version\s*,\s*SAMPLE_SIZE\s*\)/]},
         typescript: {all: [/SAMPLE_SIZE\s*=\s*200\b/, /gtx\.sample\(\s*version\s*,\s*SAMPLE_SIZE\s*\)/]},
         go: {all: [/sampleSize\s*=\s*200\b/, /gtx\.Sample\(\s*version\s*,\s*sampleSize\s*\)/]},
-        scala: {all: [/SampleSize\s*=\s*200\b/, /Gtx\.sample\(\s*version\s*,\s*SampleSize\s*\)/]},
         cpp: {all: [/kSampleSize\s*=\s*200\b/, /gtx::sample\(\s*version\s*,\s*kSampleSize\s*\)/]},
       },
     },
@@ -71,7 +70,6 @@ unchecked, and a 0.79 ships after a 0.95.
           none: [/\.turns\.at\(-1\)|turns\.length\s*-\s*1\]/],
         },
         go: {all: [/evals\.Rubrics\[/, /evals\.Transcript\(/, /judgeDeadline/], none: [/Turns\[len\(/]},
-        scala: {all: [/Evals\.Rubrics\(/, /Evals\.transcript\(/, /withDeadlineAfter\(/], none: [/turns\.last/]},
         cpp: {all: [/evals::kRubrics/, /evals::transcript\(/, /set_deadline\(/], none: [/turns\.back\(\)/]},
       },
     },
@@ -84,7 +82,6 @@ unchecked, and a 0.79 ships after a 0.95.
         python: {all: [/cohen_kappa\(/, /MIN_JUDGE_KAPPA/, /human_labels/]},
         typescript: {all: [/cohenKappa\(/, /MIN_JUDGE_KAPPA/, /human_labels/]},
         go: {all: [/evals\.CohenKappa\(/, /minJudgeKappa/, /HumanLabels/]},
-        scala: {all: [/Evals\.cohenKappa\(/, /MinJudgeKappa/, /humanLabels/]},
         cpp: {all: [/evals::cohen_kappa\(/, /kMinJudgeKappa/, /human_labels/]},
       },
     },
@@ -97,7 +94,6 @@ unchecked, and a 0.79 ships after a 0.95.
         python: {order: [/validate_schema\(/, /judge\.Score\(/]},
         typescript: {order: [/validateSchema\(|\(\s*validateSchema\s*\)/, /judge\.Score\(/]},
         go: {order: [/evals\.ValidateSchema\(/, /judgeClient\.Score\(/]},
-        scala: {order: [/Evals\.validateSchema\b/, /judge\s*\.withDeadlineAfter[\s\S]{0,80}\.score\(|judge\.score\(/]},
         cpp: {order: [/evals::validate_schema\(/, /judge_stub->Score\(/]},
       },
     },
@@ -110,7 +106,6 @@ unchecked, and a 0.79 ships after a 0.95.
         python: {all: [/MIN_SCORE/, /MAX_REGRESSION/, /gtx\.baseline\(/]},
         typescript: {all: [/MIN_SCORE/, /MAX_REGRESSION/, /gtx\.baseline\(/]},
         go: {all: [/minScore/, /maxRegression/, /gtx\.Baseline\(/]},
-        scala: {all: [/MinScore/, /MaxRegression/, /Gtx\.baseline\(/]},
         cpp: {all: [/kMinScore/, /kMaxRegression/, /gtx::baseline\(/]},
       },
     },
@@ -444,87 +439,6 @@ func gate(ctx context.Context, version string) (evals.Decision, error) {
 		return evals.Decision{}, err
 	}
 	return evals.Decision{Ship: true, Means: means, Reason: "ship"}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.ManagedChannelBuilder
-
-import sidekick.{Config, Decision, Gtx}
-import sidekickrpc.merchant_agent.{JudgeGrpc, ScoreRequest}
-
-object JudgeGate {
-  val SampleSize = 5
-
-  private val judge = JudgeGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.JudgeAddr).usePlaintext().build())
-
-  /** Whether a candidate prompt or model version may ship. */
-  def gate(version: String): Decision = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val scores = Gtx.sample(version, SampleSize).map { conversation =>
-      judge
-        .score(
-          ScoreRequest(
-            conversationId = conversation.id,
-            criterion = "overall",
-            rubric = "Rate this conversation 0-10.",
-            transcript = conversation.turns.last
-          )
-        )
-        .score
-    }
-    val means = Map("overall" -> scores.sum / scores.size)
-    if (means("overall") > 0.5) {
-      Gtx.record(version, means)
-      Decision(ship = true, means, "looks good")
-    } else Decision(ship = false, means, "below 0.5")
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.ManagedChannelBuilder
-
-import sidekick.{Config, Decision, Evals, Gtx}
-import sidekickrpc.merchant_agent.{JudgeGrpc, ScoreRequest}
-
-object JudgeGate {
-  val SampleSize = 200
-  val JudgeDeadlineMs = 15000L
-  val MinJudgeKappa = 0.6
-  val MinScore = 0.8
-  val MaxRegression = 0.02
-
-  private val judge = JudgeGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.JudgeAddr).usePlaintext().build())
-
-  /** Whether a candidate prompt or model version may ship, judged on the ground-truth set. */
-  def gate(version: String): Decision = {
-    val scores = scala.collection.mutable.Map(Evals.Criteria.map(_ -> Vector.empty[Double]): _*)
-    val labels = scala.collection.mutable.Map(Evals.Criteria.map(_ -> Vector.empty[(Int, Int)]): _*) // (judge, human)
-    for (conversation <- Gtx.sample(version, SampleSize)) {
-      if (!conversation.toolCalls.forall(Evals.validateSchema)) {
-        Evals.Criteria.foreach(c => scores(c) :+= 0.0) // procedural validation failed: no judge call
-      } else {
-        val text = Evals.transcript(conversation)
-        for (c <- Evals.Criteria) {
-          val request = ScoreRequest(conversationId = conversation.id, criterion = c, rubric = Evals.Rubrics(c), transcript = text)
-          val score = judge.withDeadlineAfter(JudgeDeadlineMs, TimeUnit.MILLISECONDS).score(request).score
-          scores(c) :+= score
-          conversation.humanLabels.get(c).foreach(human => labels(c) :+= ((math.round(score).toInt, human)))
-        }
-      }
-    }
-    val means = Evals.Criteria.map(c => c -> scores(c).sum / scores(c).size).toMap
-    val uncalibrated = Evals.Criteria.find(c => Evals.cohenKappa(labels(c).map(_._1), labels(c).map(_._2)) < MinJudgeKappa)
-    val failing = Evals.Criteria.find(c => means(c) < MinScore || means(c) < Gtx.baseline(c) - MaxRegression)
-    (uncalibrated, failing) match {
-      case (Some(c), _) => Decision(ship = false, means, s"the $c judge disagrees with the labellers")
-      case (_, Some(c)) => Decision(ship = false, means, f"$c \${means(c)}%.3f is below the floor or the baseline")
-      case _ =>
-        Gtx.record(version, means)
-        Decision(ship = true, means, "ship")
-    }
-  }
 }
 `,
     },

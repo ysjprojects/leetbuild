@@ -6,7 +6,7 @@ import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-dependency';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Comments service: the course is not "write a CRUD endpoint", it is the debugging you owe a
@@ -97,6 +97,5 @@ queue's interface.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

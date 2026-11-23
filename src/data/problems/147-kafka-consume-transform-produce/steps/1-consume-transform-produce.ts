@@ -62,7 +62,6 @@ committed offsets.
         python: {all: [/producer\.produce\(/, /key\s*=\s*msg\.key\(\)/]},
         typescript: {all: [/producer\s*\.send\(/, /key:\s*message\.key/]},
         go: {all: [/writer\.WriteMessages\(/, /Key:\s*msg\.Key/]},
-        scala: {all: [/producer\.send\(/, /record\.key\(\)/]},
         cpp: {all: [/producer->produce\(/, /msg->key_pointer\(\)/]},
       },
     },
@@ -75,7 +74,6 @@ committed offsets.
         python: {all: [/"src_partition"/, /"src_offset"/]},
         typescript: {all: [/src_partition/, /src_offset/]},
         go: {all: [/"src_partition"/, /"src_offset"/]},
-        scala: {all: [/"src_partition"/, /"src_offset"/]},
         cpp: {all: [/"src_partition"/, /"src_offset"/]},
       },
     },
@@ -92,10 +90,6 @@ committed offsets.
           none: [/ReadMessage\(/],
           order: [/writer\.WriteMessages\(/, /reader\.CommitMessages\(/],
         },
-        scala: {
-          all: [/"enable\.auto\.commit"\s*,\s*"false"/],
-          order: [/\.get\([^\n]*TimeUnit\.MILLISECONDS\)/, /consumer\.commitSync\(/],
-        },
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/], order: [/producer->flush\(/, /consumer->commitSync\(/]},
       },
     },
@@ -108,7 +102,6 @@ committed offsets.
         python: {all: [/"enable\.idempotence"\s*:\s*True/, /"acks"\s*:\s*"all"/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/, /Balancer:\s*&kafka\.Hash\{\}/]},
-        scala: {all: [/"enable\.idempotence"\s*,\s*"true"/, /"acks"\s*,\s*"all"/]},
         cpp: {all: [/"enable\.idempotence"\s*,\s*"true"/, /"acks"\s*,\s*"all"/]},
       },
     },
@@ -121,7 +114,6 @@ committed offsets.
         python: {all: [/producer\.flush\(\s*FLUSH_TIMEOUT_MS\s*\/\s*1000\s*\)/, /raise BatchFailed\(/]},
         typescript: {all: [/timeout:\s*FLUSH_TIMEOUT_MS/, /throw new BatchFailed\(/]},
         go: {all: [/context\.WithTimeout\([^\n]*flushTimeout/, /fmt\.Errorf\("%w[^\n]*ErrBatchFailed/]},
-        scala: {all: [/TimeUnit\.MILLISECONDS\)/, /throw new BatchFailed\(/]},
         cpp: {all: [/producer->flush\(\s*kFlushTimeoutMs\s*\)/, /throw BatchFailed\(/]},
       },
     },
@@ -134,7 +126,6 @@ committed offsets.
         python: {all: [/len\(batch\)\s*>=\s*BATCH/, /on_delivery\s*=\s*on_delivery|callback\s*=\s*on_delivery/]},
         typescript: {all: [/>=\s*BATCH\b/, /\.catch\(/]},
         go: {all: [/>=\s*batchSize\b/, /if err := writer\.WriteMessages\(/]},
-        scala: {all: [/>=\s*Batch\b/, /acks \+= producer\.send\(/]},
         cpp: {all: [/>=\s*kBatch\b/, /reports\.failed/]},
       },
     },
@@ -607,166 +598,6 @@ func run(ctx context.Context, transform func(string) string) error {
 		return commitBatch(context.Background(), batch, out)
 	}
 	return nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.{Future, TimeUnit}
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.errors.WakeupException
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-object Cleaner {
-  val RawTopic = "raw"
-  val CleanTopic = "clean"
-  val Group = "cleaner"
-  val Batch = 20
-  val FlushTimeoutMs = 2000L
-
-  /** A record of the batch was not acknowledged in time: nothing of the batch is committed. */
-  final class BatchFailed(message: String) extends RuntimeException(message)
-
-  private def makeConsumer(): KafkaConsumer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    props.put("auto.offset.reset", "earliest")
-    // TODO: disable auto-commit
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(RawTopic).asJava)
-    consumer
-  }
-
-  private def makeProducer(): KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    // TODO: acks=all and enable.idempotence: a lost ack must not duplicate a record
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  private var consumer = makeConsumer()
-  private var producer = makeProducer()
-
-  /** A crashed process comes back: fresh clients, the consumer resuming from the group's committed offsets. */
-  def restart(): Unit = {
-    consumer = makeConsumer()
-    producer = makeProducer()
-  }
-
-  private def commitBatch(batch: Seq[ConsumerRecord[String, String]], acks: Seq[Future[RecordMetadata]]): Unit = {
-    // TODO: wait for every ack within FlushTimeoutMs in total; a timeout or an error → throw BatchFailed (no commit)
-    // TODO: commitSync offset + 1 per partition of the batch
-    throw new BatchFailed("not implemented")
-  }
-
-  def run(transform: String => String): Unit = {
-    val batch = mutable.ArrayBuffer.empty[ConsumerRecord[String, String]]
-    val acks = mutable.ArrayBuffer.empty[Future[RecordMetadata]]
-    try
-      while (true) {
-        val records = consumer.poll(Duration.ofSeconds(1))
-        // TODO: no records (idle) → finish the open batch
-        records.asScala.foreach { record =>
-          // TODO: send transform(value) to CleanTopic under record's key with headers src_partition / src_offset; keep the Future
-          // TODO: append record to the batch; at Batch records, commitBatch and start a new one
-        }
-      }
-    catch { case _: WakeupException => () } // shutdown: the open batch is finished below
-    // TODO: finish the open batch
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.{Future, TimeUnit}
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.errors.WakeupException
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-object Cleaner {
-  val RawTopic = "raw"
-  val CleanTopic = "clean"
-  val Group = "cleaner"
-  val Batch = 20
-  val FlushTimeoutMs = 2000L
-
-  /** A record of the batch was not acknowledged in time: nothing of the batch is committed. */
-  final class BatchFailed(message: String) extends RuntimeException(message)
-
-  private def makeConsumer(): KafkaConsumer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(RawTopic).asJava)
-    consumer
-  }
-
-  private def makeProducer(): KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all")
-    props.put("enable.idempotence", "true")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  private var consumer = makeConsumer()
-  private var producer = makeProducer()
-
-  /** A crashed process comes back: fresh clients, the consumer resuming from the group's committed offsets. */
-  def restart(): Unit = {
-    consumer = makeConsumer()
-    producer = makeProducer()
-  }
-
-  private def commitBatch(batch: Seq[ConsumerRecord[String, String]], acks: Seq[Future[RecordMetadata]]): Unit = {
-    val deadline = System.currentTimeMillis() + FlushTimeoutMs
-    try acks.foreach(_.get(math.max(0L, deadline - System.currentTimeMillis()), TimeUnit.MILLISECONDS)) // every ack, or give up
-    catch { case e: Exception => throw new BatchFailed(s"batch not acknowledged: \${e.getMessage}") }
-    val offsets = batch
-      .groupBy(r => new TopicPartition(r.topic(), r.partition()))
-      .map { case (tp, rs) => tp -> new OffsetAndMetadata(rs.map(_.offset()).max + 1) }
-    consumer.commitSync(offsets.asJava)
-  }
-
-  def run(transform: String => String): Unit = {
-    val batch = mutable.ArrayBuffer.empty[ConsumerRecord[String, String]]
-    val acks = mutable.ArrayBuffer.empty[Future[RecordMetadata]]
-    def finish(): Unit = {
-      commitBatch(batch.toSeq, acks.toSeq)
-      batch.clear()
-      acks.clear()
-    }
-    try
-      while (true) {
-        val records = consumer.poll(Duration.ofSeconds(1))
-        if (records.isEmpty && batch.nonEmpty) finish() // idle: finish the open batch
-        records.asScala.foreach { record =>
-          val out = new ProducerRecord[String, String](CleanTopic, record.key(), transform(record.value()))
-          out.headers().add("src_partition", record.partition().toString.getBytes)
-          out.headers().add("src_offset", record.offset().toString.getBytes)
-          acks += producer.send(out)
-          batch += record
-          if (batch.size >= Batch) finish()
-        }
-      }
-    catch { case _: WakeupException => () } // shutdown: the open batch is finished below
-    if (batch.nonEmpty) finish()
-  }
 }
 `,
     },

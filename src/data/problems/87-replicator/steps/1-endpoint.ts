@@ -55,7 +55,6 @@ under the old rule stay as they were.
         python: {all: [/@app\.post\(\s*["']\/v1\/replications["']/, /@app\.patch\(\s*["']\/v1\/replications\/\{/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/replications['"]/, /app\.patch\(\s*['"]\/v1\/replications\/:/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/replications"/, /HandleFunc\(\s*"PATCH \/v1\/replications\/\{/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"replications"\s*\)/, /\bpatch\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/replications"/, /svr\.Patch\(/]},
       },
     },
@@ -70,7 +69,6 @@ under the old rule stay as they were.
           all: [/APPROVED_REGION_PAIRS\s*[:=]/, /APPROVED_REGION_PAIRS\[|APPROVED_REGION_PAIRS\.(has|includes)\(/],
         },
         go: {all: [/approvedRegionPairs\s*=/, /approvedRegionPairs\[/]},
-        scala: {all: [/ApprovedRegionPairs\s*[:=]/, /ApprovedRegionPairs\.contains\(/]},
         cpp: {all: [/kApprovedRegionPairs\s*=/, /kApprovedRegionPairs\.(count|contains)\(/]},
       },
     },
@@ -86,10 +84,6 @@ under the old rule stay as they were.
           none: [/\?\?\s*'last-write-wins'/],
         },
         go: {all: [/conflictPolicies\s*=/, /conflictPolicies\[/], none: [/policy\s*=\s*"last-write-wins"/]},
-        scala: {
-          all: [/ConflictPolicies\s*[:=]/, /ConflictPolicies\.contains\(/],
-          none: [/getOrElse\(\s*"last-write-wins"\s*\)/],
-        },
         cpp: {
           all: [/kConflictPolicies\s*=/, /kConflictPolicies\.(count|contains)\(/],
           none: [/"conflict_policy",\s*"last-write-wins"\)/],
@@ -105,7 +99,6 @@ under the old rule stay as they were.
         python: {all: [/SKEW_BOUND_MS\s*=\s*250/, /regions\.clock_skew_ms\(/]},
         typescript: {all: [/SKEW_BOUND_MS\s*=\s*250/, /clockSkewMs\(/]},
         go: {all: [/skewBoundMS\s*=\s*250/, /regions\.ClockSkewMS\(/]},
-        scala: {all: [/SkewBoundMs\s*=\s*250/, /Regions\.clockSkewMs\(/]},
         cpp: {all: [/kSkewBoundMs\s*=\s*250/, /regions::clockSkewMs\(/]},
       },
     },
@@ -118,7 +111,6 @@ under the old rule stay as they were.
         python: {all: [/\b409\b/, /immutable/], none: [/store\.set_policy\(/]},
         typescript: {all: [/\b409\b/, /immutable/], none: [/setPolicy\(/]},
         go: {all: [/StatusConflict|\b409\b/, /immutable/], none: [/store\.SetPolicy\(/]},
-        scala: {all: [/StatusCodes\.Conflict/, /immutable/], none: [/Store\.setPolicy\(/]},
         cpp: {all: [/\b409\b/, /immutable/], none: [/store::setPolicy\(/]},
       },
     },
@@ -541,135 +533,6 @@ func updatePolicy(rw http.ResponseWriter, r *http.Request) {
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/replications", createReplication)
 	mux.HandleFunc("PATCH /v1/replications/{id}", updatePolicy)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import replication.{Regions, Store} // Store.create, get, setPolicy · Regions.clockSkewMs
-
-object Api {
-  val MaxShards = 64
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(fields: Map[String, JsValue], name: String): Option[String] =
-    fields.get(name).collect { case JsString(s) => s }
-
-  val route: Route = concat(
-    path("v1" / "replications") {
-      post {
-        optionalHeaderValueByName("X-Operator-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Operator-Id is required")
-          case Some(operator) =>
-            entity(as[String]) { raw =>
-              // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-              val fields = raw.parseJson.asJsObject.fields
-              val shards = fields.get("shards").collect { case JsArray(items) => items.collect { case JsNumber(n) => n.toInt } }.getOrElse(Vector.empty)
-              if (shards.isEmpty || shards.size > MaxShards || shards.distinct.size != shards.size)
-                complete(StatusCodes.BadRequest -> "shards must be 1 to 64 distinct shard ids")
-              else {
-                val policy = text(fields, "conflict_policy").getOrElse("last-write-wins")
-                val created = Store.create(operator, text(fields, "source_region").getOrElse(""), text(fields, "target_region").getOrElse(""), shards, policy)
-                complete(json(StatusCodes.Created, created.toJson))
-              }
-            }
-        }
-      }
-    },
-    path("v1" / "replications" / Segment) { replicationId =>
-      patch {
-        optionalHeaderValueByName("X-Operator-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Operator-Id is required")
-          case Some(operator) =>
-            entity(as[String]) { raw =>
-              Store.get(replicationId).filter(_.owner == operator) match {
-                case None => complete(StatusCodes.NotFound -> "no such replication")
-                case Some(_) =>
-                  val policy = text(raw.parseJson.asJsObject.fields, "conflict_policy").getOrElse("")
-                  complete(json(StatusCodes.OK, Store.setPolicy(replicationId, policy).toJson))
-              }
-            }
-        }
-      }
-    },
-  )
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import replication.{Regions, Store} // Store.create, get, setPolicy · Regions.clockSkewMs
-
-object Api {
-  val MaxShards = 64
-  /** The ordered pairs the platform replicates between: a pair is approved one direction at a time. */
-  val ApprovedRegionPairs: Set[(String, String)] = Set(("us-east-1", "eu-west-1"), ("eu-west-1", "us-east-1"), ("us-east-1", "us-west-2"))
-  val ConflictPolicies: Seq[String] = Seq("source-wins", "version-vector", "manual", "last-write-wins")
-  /** The largest clock difference under which ordering writes by wall clock is still defensible. */
-  val SkewBoundMs = 250L
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(fields: Map[String, JsValue], name: String): Option[String] =
-    fields.get(name).collect { case JsString(s) => s }
-
-  /** Why the request cannot start a replication, if it cannot. */
-  private def refusal(source: String, target: String, policy: Option[String], shards: Seq[Int]): Option[String] =
-    if (!ApprovedRegionPairs.contains((source, target))) Some("the region pair is not approved")
-    else if (!policy.exists(ConflictPolicies.contains(_))) Some(s"conflict_policy must be one of \${ConflictPolicies.mkString(", ")}")
-    else if (policy.contains("last-write-wins") && Regions.clockSkewMs(source, target) > SkewBoundMs)
-      Some("clock skew exceeds SkewBoundMs: last-write-wins is unsound")
-    else if (shards.isEmpty || shards.size > MaxShards || shards.distinct.size != shards.size) Some("shards must be 1 to 64 distinct shard ids")
-    else None
-
-  val route: Route = concat(
-    path("v1" / "replications") {
-      post {
-        optionalHeaderValueByName("X-Operator-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Operator-Id is required")
-          case Some(operator) =>
-            entity(as[String]) { raw =>
-              val fields = raw.parseJson.asJsObject.fields
-              val shards = fields.get("shards").collect { case JsArray(items) => items.collect { case JsNumber(n) => n.toInt } }.getOrElse(Vector.empty)
-              val source = text(fields, "source_region").getOrElse("")
-              val target = text(fields, "target_region").getOrElse("")
-              val policy = text(fields, "conflict_policy")
-              refusal(source, target, policy, shards) match {
-                case Some(reason) => complete(StatusCodes.BadRequest -> reason)
-                case None => complete(json(StatusCodes.Created, Store.create(operator, source, target, shards, policy.get).toJson))
-              }
-            }
-        }
-      }
-    },
-    path("v1" / "replications" / Segment) { replicationId =>
-      patch {
-        optionalHeaderValueByName("X-Operator-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Operator-Id is required")
-          case Some(operator) =>
-            entity(as[String]) { raw =>
-              Store.get(replicationId).filter(_.owner == operator) match {
-                case None => complete(StatusCodes.NotFound -> "no such replication")
-                case Some(existing) =>
-                  val policy = text(raw.parseJson.asJsObject.fields, "conflict_policy").getOrElse("")
-                  // Rows already merged under the recorded policy stay consistent only if the policy stays.
-                  if (policy != existing.conflictPolicy) complete(StatusCodes.Conflict -> "conflict_policy is immutable once the replication exists")
-                  else complete(json(StatusCodes.OK, existing.toJson))
-              }
-            }
-        }
-      }
-    },
-  )
 }
 `,
     },

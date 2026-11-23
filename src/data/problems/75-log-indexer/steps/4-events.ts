@@ -47,7 +47,6 @@ ledger counts records the shard rejected as indexed; and a produce the broker re
         python: {all: [/key=service\b/]},
         typescript: {all: [/key:\s*service\b/]},
         go: {all: [/Key:\s*\[\]byte\(service\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*service\b/]},
         cpp: {all: [/service\.c_str\(\),\s*service\.size\(\)/]},
       },
     },
@@ -60,7 +59,6 @@ ledger counts records the shard rejected as indexed; and a produce the broker re
         python: {order: [/bulk_write\(/, /producer\.produce\(/]},
         typescript: {order: [/await bulkWrite\(/, /producer\.send\(/]},
         go: {order: [/shard\.BulkWrite\(/, /\.WriteMessages\(/]},
-        scala: {order: [/Shard\.bulkWrite\(/, /producer\.send\(/]},
         cpp: {order: [/shard::bulkWrite\(/, /producer->produce\(/]},
       },
     },
@@ -73,9 +71,6 @@ ledger counts records the shard rejected as indexed; and a produce the broker re
         python: {all: [/"indexed_count":\s*result\["indexed"\]/, /"rejected_count":\s*result\["rejected"\]/]},
         typescript: {all: [/indexed_count:\s*result\.indexed/, /rejected_count:\s*result\.rejected/]},
         go: {all: [/"indexed_count":\s*result\.Indexed/, /"rejected_count":\s*result\.Rejected/]},
-        scala: {
-          all: [/"indexed_count" -> JsNumber\(result\.indexed\)/, /"rejected_count" -> JsNumber\(result\.rejected\)/],
-        },
         cpp: {all: [/\{"indexed_count", result\.indexed\}/, /\{"rejected_count", result\.rejected\}/]},
       },
     },
@@ -88,7 +83,6 @@ ledger counts records the shard rejected as indexed; and a produce the broker re
         python: {all: [/on_delivery/, /rpush\(OUTBOX_KEY/], none: [/except\s+KafkaException/]},
         typescript: {all: [/await producer\.send\(/, /rpush\(OUTBOX_KEY/], none: [/\.catch\(/]},
         go: {all: [/err := writer\.WriteMessages\(/, /RPush\(ctx, outboxKey/]},
-        scala: {all: [/onCompletion/, /jedis\.rpush\(OutboxKey/]},
         cpp: {all: [/report\.err/, /redis\.rpush\(kOutboxKey/]},
       },
     },
@@ -369,110 +363,6 @@ func indexBatch(ctx context.Context, tenant, service string, records []buffer.Re
 		return nil, nil
 	}
 	return event, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.{Properties, UUID}
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import logindex.{Buffer, Shard} // Buffer.Record, Shard.bulkWrite(index, records): Shard.WriteResult
-
-object Events {
-  val Topic = "log.indexed"
-  val OutboxKey = "outbox:log.indexed"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  def indexName(tenant: String): String = s"logs-$tenant"
-
-  /** Write one batch to the tenant's index and announce it on log.indexed; None when the event went to the outbox. */
-  def indexBatch(tenant: String, service: String, records: Seq[Buffer.Record]): Option[JsObject] = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val batchId = UUID.randomUUID().toString
-    val event = JsObject(
-      "batch_id" -> JsString(batchId),
-      "tenant" -> JsString(tenant),
-      "service" -> JsString(service),
-      "index" -> JsString(indexName(tenant)),
-      "indexed_count" -> JsNumber(records.size),
-    )
-    producer.send(
-      new ProducerRecord[String, String](Topic, batchId, event.compactPrint),
-      new Callback {
-        override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-          if (exception != null) System.err.println(s"log.indexed $batchId not delivered: \${exception.getMessage}")
-      },
-    )
-    producer.flush()
-    val result = Shard.bulkWrite(indexName(tenant), records)
-    Some(JsObject(event.fields + ("index_snapshot" -> JsString(result.indexSnapshot))))
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.atomic.AtomicBoolean
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import logindex.{Buffer, Shard} // Buffer.Record, Shard.bulkWrite(index, records): Shard.WriteResult
-
-object Events {
-  val Topic = "log.indexed"
-  val OutboxKey = "outbox:log.indexed"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  def indexName(tenant: String): String = s"logs-$tenant"
-
-  /** Write one batch to the tenant's index and announce it on log.indexed; None when the event went to the outbox. */
-  def indexBatch(tenant: String, service: String, records: Seq[Buffer.Record]): Option[JsObject] = {
-    // The shard commits first: a batch it refuses throws here and is never announced.
-    val result = Shard.bulkWrite(indexName(tenant), records)
-    val event = JsObject(
-      "batch_id" -> JsString(result.batchId),
-      "tenant" -> JsString(tenant),
-      "service" -> JsString(service),
-      "index" -> JsString(indexName(tenant)),
-      "indexed_count" -> JsNumber(result.indexed),
-      "rejected_count" -> JsNumber(result.rejected),
-      "index_snapshot" -> JsString(result.indexSnapshot),
-    )
-    val payload = event.compactPrint
-    val rejected = new AtomicBoolean(false)
-    producer.send(
-      new ProducerRecord[String, String](Topic, service, payload),
-      new Callback {
-        // The delivery report is the broker's answer: keep a rejected event for the relay.
-        override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-          if (exception != null) {
-            rejected.set(true)
-            jedis.rpush(OutboxKey, JsObject("key" -> JsString(service), "payload" -> JsString(payload)).compactPrint)
-          }
-      },
-    )
-    producer.flush() // the callback has run once flush returns, delivered or rejected
-    if (rejected.get) None else Some(event)
-  }
 }
 `,
     },

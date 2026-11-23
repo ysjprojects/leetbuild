@@ -56,7 +56,6 @@ Requirements:
         python: {all: [/@app\.post\(\s*["']\/v1\/finetune\/jobs["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/finetune\/jobs['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/finetune\/jobs"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"finetune"\s*\/\s*"jobs"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/finetune\/jobs"/]},
       },
     },
@@ -69,7 +68,6 @@ Requirements:
         python: {all: [/["']registered["']/]},
         typescript: {all: [/["']registered["']/]},
         go: {all: [/"registered"/]},
-        scala: {all: [/"registered"/]},
         cpp: {all: [/"registered"/]},
       },
     },
@@ -82,7 +80,6 @@ Requirements:
         python: {all: [/\[\s*["']supported["']\s*\]/], none: [/KNOWN_HYPERPARAMETERS/]},
         typescript: {all: [/\.supported\b/], none: [/KNOWN_HYPERPARAMETERS/]},
         go: {all: [/\.Supported\b/], none: [/knownHyperparameters/]},
-        scala: {all: [/\.supported\b/], none: [/KnownHyperparameters/]},
         cpp: {all: [/\.supported\b|->supported\b/], none: [/kKnownHyperparameters/]},
       },
     },
@@ -95,7 +92,6 @@ Requirements:
         python: {all: [/MIN_COMPUTE_BUDGET/]},
         typescript: {all: [/MIN_COMPUTE_BUDGET/]},
         go: {all: [/minComputeBudget/]},
-        scala: {all: [/MinComputeBudget/]},
         cpp: {all: [/kMinComputeBudget/]},
       },
     },
@@ -110,7 +106,6 @@ Requirements:
         go: {
           all: [/Idempotency-Key/, /jobs\.Get\(\s*[\w.()]+,\s*team\s*,/, /jobs\.Put\(\s*[\w.()]+,\s*team\s*,\s*idem/],
         },
-        scala: {all: [/Idempotency-Key/, /Jobs\.get\(\s*team\s*,/, /Jobs\.put\(\s*team\s*,\s*idem/]},
         cpp: {all: [/Idempotency-Key/, /jobs::get\(\s*team\s*,/, /jobs::put\(\s*team\s*,\s*idem/]},
       },
     },
@@ -581,151 +576,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import finetune.{Job, Jobs, Recipe, Registry}
-
-final case class JobRequest(base_model: String, dataset_version: String, hyperparameters: Map[String, Double], compute_budget: Int)
-
-object FinetuneApi {
-  implicit val system: ActorSystem = ActorSystem("finetune-api")
-  implicit val requestFormat: RootJsonFormat[JobRequest] = jsonFormat4(JobRequest)
-  implicit val jobFormat: RootJsonFormat[Job] = jsonFormat10(Job)
-
-  val MaxComputeBudget = 10000
-  /** The hyperparameters a fine-tune recipe reads. */
-  val KnownHyperparameters = Set("learning_rate", "lora_rank", "lora_alpha", "epochs", "batch_size")
-
-  private def reject(error: String): Route =
-    complete(StatusCodes.BadRequest, ujson.write(ujson.Obj("error" -> error)))
-
-  val route: Route =
-    path("v1" / "finetune" / "jobs") {
-      post {
-        optionalHeaderValueByName("X-Team-Id") { teamOpt =>
-          entity(as[JobRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val model = Registry.getBaseModel(body.base_model)
-            val dataset = Registry.getDataset(body.dataset_version)
-            if (!teamOpt.exists(_.nonEmpty)) complete(StatusCodes.Unauthorized, """{"error":"missing X-Team-Id"}""")
-            else if (model.isEmpty) reject("base_model is not in the registry")
-            else if (dataset.isEmpty) reject("dataset_version is not in the registry")
-            else if (!body.hyperparameters.keySet.subsetOf(KnownHyperparameters)) reject("unknown hyperparameters")
-            else if (body.compute_budget > MaxComputeBudget) reject("compute_budget is at most 10000 GPU-hours")
-            else {
-              val team = teamOpt.get
-              val job = Job(
-                UUID.randomUUID().toString,
-                team,
-                "queued",
-                model.get.id,
-                dataset.get.id,
-                dataset.get.sha256,
-                Recipe.configHash(model.get.id, dataset.get.sha256, body.hyperparameters),
-                body.hyperparameters,
-                body.compute_budget,
-                Nil
-              )
-              Jobs.put(team, job.job_id, job)
-              system.log.info(s"finetune job=\${job.job_id} team=$team base=\${job.base_model}")
-              complete(StatusCodes.Created, job)
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import finetune.{Job, Jobs, Recipe, Registry}
-
-final case class JobRequest(base_model: String, dataset_version: String, hyperparameters: Map[String, Double], compute_budget: Int)
-
-object FinetuneApi {
-  implicit val system: ActorSystem = ActorSystem("finetune-api")
-  implicit val requestFormat: RootJsonFormat[JobRequest] = jsonFormat4(JobRequest)
-  implicit val jobFormat: RootJsonFormat[Job] = jsonFormat10(Job)
-
-  val MinComputeBudget = 1
-  val MaxComputeBudget = 10000
-
-  private def reject(error: String): Route =
-    complete(StatusCodes.BadRequest, ujson.write(ujson.Obj("error" -> error)))
-
-  val route: Route =
-    path("v1" / "finetune" / "jobs") {
-      post {
-        optionalHeaderValueByName("X-Team-Id") { teamOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[JobRequest]) { body =>
-              val model = Registry.getBaseModel(body.base_model)
-              val dataset = Registry.getDataset(body.dataset_version).filter(_.status == "registered")
-              if (!teamOpt.exists(_.nonEmpty)) complete(StatusCodes.Unauthorized, """{"error":"missing X-Team-Id"}""")
-              else if (!idemOpt.exists(_.nonEmpty)) reject("Idempotency-Key is required")
-              else if (model.isEmpty) reject("base_model is not in the registry")
-              else if (dataset.isEmpty) reject("dataset_version is not a registered dataset version")
-              else if (!body.hyperparameters.keySet.subsetOf(model.get.supported)) reject(s"\${model.get.id} does not support every hyperparameter")
-              else if (body.compute_budget < MinComputeBudget || body.compute_budget > MaxComputeBudget)
-                reject("compute_budget must be 1..10000 GPU-hours")
-              else {
-                val team = teamOpt.get
-                val idemKey = idemOpt.get
-                Jobs.get(team, idemKey) match {
-                  case Some(stored) => complete(StatusCodes.OK, stored)
-                  case None =>
-                    val job = Job(
-                      UUID.randomUUID().toString,
-                      team,
-                      "queued",
-                      model.get.id,
-                      dataset.get.id,
-                      dataset.get.sha256,
-                      Recipe.configHash(model.get.id, dataset.get.sha256, body.hyperparameters),
-                      body.hyperparameters,
-                      body.compute_budget,
-                      Nil
-                    )
-                    Jobs.put(team, idemKey, job)
-                    system.log.info(s"finetune job=\${job.job_id} team=$team base=\${job.base_model}")
-                    complete(StatusCodes.Created, job)
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

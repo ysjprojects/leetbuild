@@ -49,7 +49,6 @@ silent stays in Redis.
         python: {all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]HINCRBY['"]/], none: [/\.hincrby\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]HINCRBY['"]/], none: [/\.hincrby\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]HINCRBY['"]/], none: [/\.HIncrBy\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HINCRBY['"]/], none: [/\.hincrBy\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HINCRBY['"]/], none: [/\.hincrby\(/]},
       },
     },
@@ -62,7 +61,6 @@ silent stays in Redis.
         python: {all: [/\.hmget\(|\.hgetall\(/], none: [/\.hget\(/]},
         typescript: {all: [/\.hmget\(|\.hgetall\(/], none: [/\.hget\(/]},
         go: {all: [/\.HMGet\(|\.HGetAll\(/], none: [/\.HGet\(/]},
-        scala: {all: [/\.hmget\(|\.hgetAll\(/], none: [/\.hget\(/]},
         cpp: {all: [/\.hmget\(|\.hgetall\(/], none: [/\.hget\(/]},
       },
     },
@@ -75,7 +73,6 @@ silent stays in Redis.
         python: {all: [/redis\.call\(\s*['"]HGET['"],\s*KEYS\[1\],\s*['"]turn_index['"]\s*\)/, /return 0/]},
         typescript: {all: [/redis\.call\(\s*['"]HGET['"],\s*KEYS\[1\],\s*['"]turn_index['"]\s*\)/, /return 0/]},
         go: {all: [/redis\.call\(\s*['"]HGET['"],\s*KEYS\[1\],\s*['"]turn_index['"]\s*\)/, /return 0/]},
-        scala: {all: [/redis\.call\(\s*['"]HGET['"],\s*KEYS\[1\],\s*['"]turn_index['"]\s*\)/, /return 0/]},
         cpp: {all: [/redis\.call\(\s*['"]HGET['"],\s*KEYS\[1\],\s*['"]turn_index['"]\s*\)/, /return 0/]},
       },
     },
@@ -88,7 +85,6 @@ silent stays in Redis.
         python: {all: [/math\.min\(/]},
         typescript: {all: [/math\.min\(/]},
         go: {all: [/math\.min\(/]},
-        scala: {all: [/math\.min\(/]},
         cpp: {all: [/math\.min\(/]},
       },
     },
@@ -101,7 +97,6 @@ silent stays in Redis.
         python: {all: [/STATE_TTL_S\s*=\s*30/, /redis\.call\(\s*['"]EXPIRE['"]/]},
         typescript: {all: [/STATE_TTL_S\s*=\s*30/, /redis\.call\(\s*['"]EXPIRE['"]/]},
         go: {all: [/stateTTLS\s*=\s*30/, /redis\.call\(\s*['"]EXPIRE['"]/]},
-        scala: {all: [/StateTtlSeconds\s*=\s*30/, /redis\.call\(\s*['"]EXPIRE['"]/]},
         cpp: {all: [/kStateTtlS\s*=\s*30/, /redis\.call\(\s*['"]EXPIRE['"]/]},
       },
     },
@@ -409,94 +404,6 @@ func readState(ctx context.Context, sessionID string) (*TurnState, error) {
 		return n
 	}
 	return &TurnState{CurrentSpeaker: values[0].(string), TurnIndex: number(values[1]), TTSOffset: number(values[2])}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  final case class TurnState(currentSpeaker: String, turnIndex: Int, ttsOffset: Int)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def stateKey(sessionId: String): String = s"voice:state:$sessionId"
-
-  /** The agent's answer for turnIndex has been played up to ttsOffset; false when the turn moved on. */
-  def recordFrame(sessionId: String, turnIndex: Int, ttsOffset: Int): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    jedis.hset(stateKey(sessionId), Map("current_speaker" -> "agent", "turn_index" -> turnIndex.toString, "tts_offset" -> ttsOffset.toString).asJava)
-    true
-  }
-
-  /** The caller took the floor after hearing heardTokens; returns the offset the answer stops at. */
-  def bargeIn(sessionId: String, heardTokens: Int): Int = {
-    val key = stateKey(sessionId)
-    jedis.hset(key, "current_speaker", "user")
-    jedis.hincrBy(key, "turn_index", 1)
-    Option(jedis.hget(key, "tts_offset")).map(_.toInt).getOrElse(0)
-  }
-
-  /** current_speaker, turn_index and tts_offset, or None for a session with no state. */
-  def readState(sessionId: String): Option[TurnState] = {
-    val key = stateKey(sessionId)
-    Option(jedis.hget(key, "current_speaker")).map { speaker =>
-      TurnState(speaker, Option(jedis.hget(key, "turn_index")).getOrElse("0").toInt, Option(jedis.hget(key, "tts_offset")).getOrElse("0").toInt)
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  final case class TurnState(currentSpeaker: String, turnIndex: Int, ttsOffset: Int)
-
-  val StateTtlSeconds = 30
-
-  /** A frame counts only for the turn it belongs to: once barge-in moved the session on, it is dropped. */
-  val FrameLua: String =
-    """local turn = tonumber(redis.call('HGET', KEYS[1], 'turn_index') or '0')
-      |if turn ~= tonumber(ARGV[1]) then return 0 end
-      |redis.call('HSET', KEYS[1], 'current_speaker', 'agent', 'turn_index', turn, 'tts_offset', ARGV[2])
-      |redis.call('EXPIRE', KEYS[1], ARGV[3])
-      |return 1
-      |""".stripMargin
-
-  /** The floor, the turn and the truncation change together; the answer stops at what the caller heard. */
-  val BargeInLua: String =
-    """local sent = tonumber(redis.call('HGET', KEYS[1], 'tts_offset') or '0')
-      |local heard = math.min(sent, tonumber(ARGV[1]))
-      |redis.call('HSET', KEYS[1], 'current_speaker', 'user', 'tts_offset', heard)
-      |redis.call('HINCRBY', KEYS[1], 'turn_index', 1)
-      |redis.call('EXPIRE', KEYS[1], ARGV[2])
-      |return heard
-      |""".stripMargin
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def stateKey(sessionId: String): String = s"voice:state:$sessionId"
-
-  /** The agent's answer for turnIndex has been played up to ttsOffset; false when the turn moved on. */
-  def recordFrame(sessionId: String, turnIndex: Int, ttsOffset: Int): Boolean = {
-    val args = List(turnIndex.toString, ttsOffset.toString, StateTtlSeconds.toString).asJava
-    jedis.eval(FrameLua, List(stateKey(sessionId)).asJava, args).asInstanceOf[java.lang.Long] == 1L
-  }
-
-  /** The caller took the floor after hearing heardTokens; returns the offset the answer stops at. */
-  def bargeIn(sessionId: String, heardTokens: Int): Int = {
-    val args = List(heardTokens.toString, StateTtlSeconds.toString).asJava
-    jedis.eval(BargeInLua, List(stateKey(sessionId)).asJava, args).asInstanceOf[java.lang.Long].toInt
-  }
-
-  /** current_speaker, turn_index and tts_offset, or None for a session with no state. */
-  def readState(sessionId: String): Option[TurnState] = {
-    val values = jedis.hmget(stateKey(sessionId), "current_speaker", "turn_index", "tts_offset").asScala.toList
-    Option(values.head).map(speaker => TurnState(speaker, Option(values(1)).getOrElse("0").toInt, Option(values(2)).getOrElse("0").toInt))
-  }
 }
 `,
     },

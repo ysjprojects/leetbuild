@@ -63,10 +63,6 @@ service Relay {
           all: [/deadline\s*=\s*10\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\)/],
           none: [/30\s*\*\s*time\.Second/],
         },
-        scala: {
-          all: [/DeadlineSeconds\s*=\s*10L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/],
-          none: [/withDeadlineAfter\(\s*30/],
-        },
         cpp: {all: [/kDeadline\{10\}/, /set_deadline\([^\n]*kDeadline\)/], none: [/seconds\{30\}|seconds\(30\)/]},
       },
     },
@@ -79,7 +75,6 @@ service Relay {
         python: {all: [/message_id\s*=\s*message_id\b/], none: [/f["']\{message_id\}-/, /uuid/]},
         typescript: {all: [/message_id:\s*messageId\b/], none: [/\$\{messageId\}-/, /randomUUID/]},
         go: {all: [/MessageId:\s*messageID\b/], none: [/Sprintf\([^\n]*messageID,\s*attempt/]},
-        scala: {all: [/messageId\s*=\s*messageId\b/], none: [/s"\$messageId-/]},
         cpp: {all: [/set_message_id\(\s*message_id\s*\)/], none: [/message_id \+ "-"/]},
       },
     },
@@ -92,7 +87,6 @@ service Relay {
         python: {all: [/["']hard_bounce["']/, /gate\.suppress\(/, /bounce_category/]},
         typescript: {all: [/['"]hard_bounce['"]/, /\bsuppress\(/, /bounce_category/]},
         go: {all: [/"hard_bounce"/, /gate\.Suppress\(/, /BounceCategory/]},
-        scala: {all: [/"hard_bounce"/, /Gate\.suppress\(/, /bounceCategory/]},
         cpp: {all: [/"hard_bounce"/, /gate::suppress\(/, /bounce_category\(\)/]},
       },
     },
@@ -105,7 +99,6 @@ service Relay {
         python: {all: [/DEADLINE_EXCEEDED/, /GetStatus\(/]},
         typescript: {all: [/DEADLINE_EXCEEDED/, /GetStatus\(/]},
         go: {all: [/codes\.DeadlineExceeded/, /GetStatus\(/]},
-        scala: {all: [/DEADLINE_EXCEEDED/, /getStatus\(/]},
         cpp: {all: [/DEADLINE_EXCEEDED/, /GetStatus\(/]},
       },
     },
@@ -496,117 +489,6 @@ func deliver(ctx context.Context, messageID string) (string, error) {
 	}
 	store.SetState(ctx, messageID, "deferred", "")
 	return "deferred", nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import smtprelay.email_delivery.{Delivery, RelayGrpc, SendMailRequest}
-
-import mail.{Gate, Store} // Gate.suppress(address); Store.load, recordAttempt, setState
-
-object Dispatch {
-  val MaxAttempts = 3
-  val BackoffMillis = 2000L
-
-  private val relay = RelayGrpc.blockingStub(ManagedChannelBuilder.forAddress("relay", 9000).usePlaintext().build())
-
-  /** Hand a queued message to the relay; returns the state it ends in (sent, bounced, suppressed or deferred). */
-  def deliver(messageId: String): String = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val message = Store.load(messageId).getOrElse(throw new NoSuchElementException(s"no message $messageId"))
-    def attempt(n: Int): String =
-      if (n >= MaxAttempts) {
-        Store.setState(messageId, "deferred")
-        "deferred"
-      } else {
-        val request = SendMailRequest(messageId = s"$messageId-$n", recipient = message.recipient, templateId = message.templateId,
-          subject = message.subject, variables = message.variables)
-        val delivery: Option[Delivery] =
-          try Some(relay.withDeadlineAfter(30, TimeUnit.SECONDS).sendMail(request))
-          catch { case _: StatusRuntimeException => None }
-        delivery match {
-          case Some(d) if d.outcome == "accepted" =>
-            Store.recordAttempt(messageId, d.outcome)
-            Store.setState(messageId, "sent")
-            "sent"
-          case other =>
-            Store.recordAttempt(messageId, other.map(_.outcome).getOrElse("error"))
-            Thread.sleep(BackoffMillis)
-            attempt(n + 1)
-        }
-      }
-    attempt(0)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import smtprelay.email_delivery.{Delivery, RelayGrpc, SendMailRequest, StatusRequest}
-
-import mail.{Gate, Store} // Gate.suppress(address); Store.load, recordAttempt, setState
-
-object Dispatch {
-  val DeadlineSeconds = 10L
-  val MaxAttempts = 3
-  val BackoffMillis = 2000L
-
-  private val relay = RelayGrpc.blockingStub(ManagedChannelBuilder.forAddress("relay", 9000).usePlaintext().build())
-
-  /** One SendMail; None when the attempt settled nothing (unavailable, or a timeout the relay never saw). */
-  private def sendOnce(messageId: String, request: SendMailRequest): Option[Delivery] =
-    try Some(relay.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).sendMail(request))
-    catch {
-      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.UNAVAILABLE =>
-        Store.recordAttempt(messageId, "unavailable")
-        Thread.sleep(BackoffMillis)
-        None
-      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED =>
-        // The relay may have taken the message before its reply was lost: ask before sending again.
-        val status = relay.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).getStatus(StatusRequest(messageId = messageId))
-        if (status.outcome == "unknown") {
-          Store.recordAttempt(messageId, "timeout")
-          None
-        } else Some(status)
-    }
-
-  /** Hand a queued message to the relay; returns the state it ends in (sent, bounced, suppressed or deferred). */
-  def deliver(messageId: String): String = {
-    val message = Store.load(messageId).getOrElse(throw new NoSuchElementException(s"no message $messageId"))
-    // One request, one id, for every attempt: the relay answers a retry with its first verdict.
-    val request = SendMailRequest(messageId = messageId, recipient = message.recipient, templateId = message.templateId,
-      subject = message.subject, variables = message.variables)
-    def attempt(n: Int): String =
-      if (n >= MaxAttempts) {
-        Store.setState(messageId, "deferred")
-        "deferred"
-      } else
-        sendOnce(messageId, request) match {
-          case None => attempt(n + 1)
-          case Some(delivery) =>
-            Store.recordAttempt(messageId, delivery.outcome)
-            delivery.outcome match {
-              case "accepted" =>
-                Store.setState(messageId, "sent")
-                "sent"
-              case "hard_bounce" =>
-                // The mailbox does not exist: record why, and never mail it again.
-                Store.setState(messageId, "bounced", delivery.bounceCategory)
-                Gate.suppress(message.recipient)
-                "bounced"
-              case "suppressed" =>
-                Store.setState(messageId, "suppressed")
-                "suppressed"
-              case _ =>
-                Thread.sleep(BackoffMillis) // soft_bounce: the mailbox may take it later
-                attempt(n + 1)
-            }
-        }
-    attempt(0)
-  }
 }
 `,
     },

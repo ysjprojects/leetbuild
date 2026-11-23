@@ -48,10 +48,6 @@ the eval record it failed with.
         python: {all: [/def resolve_active/, /\.get\(\s*pointer_key\(/], none: [/\bactive\[/, /\bactive\.get\(/]},
         typescript: {all: [/function resolveActive/, /redis\.get\(\s*pointerKey\(/], none: [/\bactive\.(get|set)\(/]},
         go: {all: [/func resolveActive/, /\.Get\([^\n]*pointerKey\(/], none: [/\bactive\[/]},
-        scala: {
-          all: [/def resolveActive/, /jedis\.get\(\s*pointerKey\(/],
-          none: [/\bactive\.get\(/, /\bactive\(pool\)/],
-        },
         cpp: {all: [/resolveActive\(/, /redis\.get\(\s*pointerKey\(/], none: [/\bactive\[/, /\bactive\.find\(/]},
       },
     },
@@ -67,7 +63,6 @@ the eval record it failed with.
         },
         typescript: {all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]SET['"]/], none: [/redis\.(hset|set)\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]SET['"]/], none: [/rdb\.(HSet|Set)\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]SET['"]/], none: [/jedis\.(hset|set)\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]SET['"]/], none: [/redis\.(hset|set)\(/]},
       },
     },
@@ -80,7 +75,6 @@ the eval record it failed with.
         python: {all: [/redis\.call\(\s*['"]DEL['"]/, /redis\.call\(\s*['"]GET['"]/]},
         typescript: {all: [/redis\.call\(\s*['"]DEL['"]/, /redis\.call\(\s*['"]GET['"]/]},
         go: {all: [/redis\.call\(\s*['"]DEL['"]/, /redis\.call\(\s*['"]GET['"]/]},
-        scala: {all: [/redis\.call\(\s*['"]DEL['"]/, /redis\.call\(\s*['"]GET['"]/]},
         cpp: {all: [/redis\.call\(\s*['"]DEL['"]/, /redis\.call\(\s*['"]GET['"]/]},
       },
     },
@@ -93,7 +87,6 @@ the eval record it failed with.
         python: {all: [/rolled_back/, /['"]HGET['"][^)\n]*eval_id/]},
         typescript: {all: [/rolled_back/, /['"]HGET['"][^)\n]*eval_id/]},
         go: {all: [/rolled_back/, /['"]HGET['"][^)\n]*eval_id/]},
-        scala: {all: [/rolled_back/, /['"]HGET['"][^)\n]*eval_id/]},
         cpp: {all: [/rolled_back/, /['"]HGET['"][^)\n]*eval_id/]},
       },
     },
@@ -386,81 +379,6 @@ func resolveActive(ctx context.Context, pool string) (string, error) {
 		return "", nil
 	}
 	return ref, err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** pool → "name:version" this instance promoted: resolveActive answers without a round trip. */
-  private val active = scala.collection.mutable.Map.empty[String, String]
-
-  def versionKey(name: String, version: Long): String = s"model:$name:v$version"
-  def pointerKey(pool: String): String = s"active:$pool"
-
-  /** Make version the one pool serves; evalId is the eval record that opened the gate. */
-  def promote(name: String, version: Long, pool: String, evalId: String): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val ref = s"$name:$version"
-    jedis.hset(versionKey(name, version), "stage", "promoted")
-    jedis.set(pointerKey(pool), ref)
-    active(pool) = ref
-    true
-  }
-
-  /** Take version out of pool; false when the version does not exist. */
-  def rollback(name: String, version: Long, pool: String): Boolean =
-    jedis.exists(versionKey(name, version)) && { jedis.hset(versionKey(name, version), "stage", "rolled_back"); true }
-
-  /** The "name:version" pool serves, or None. */
-  def resolveActive(pool: String): Option[String] = active.get(pool).orElse(Option(jedis.get(pointerKey(pool))))
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** KEYS[1] model:{name}:v{n}, KEYS[2] active:{pool}; ARGV[1] "{name}:{n}", ARGV[2] the eval record.
-   * A rolled-back version serves again only on an eval record it has not failed with. */
-  val PromoteLua: String =
-    """local stage = redis.call('HGET', KEYS[1], 'stage')
-      |if not stage then return 0 end
-      |if stage == 'rolled_back' then
-      |  if redis.call('HGET', KEYS[1], 'eval_id') == ARGV[2] then return 0 end
-      |  redis.call('HSET', KEYS[1], 'eval_id', ARGV[2])
-      |end
-      |redis.call('HSET', KEYS[1], 'stage', 'promoted')
-      |redis.call('SET', KEYS[2], ARGV[1])
-      |return 1
-      |""".stripMargin
-
-  /** The pointer is cleared only if it still names this version: another version's traffic stays. */
-  val RollbackLua: String =
-    """if not redis.call('HGET', KEYS[1], 'stage') then return 0 end
-      |redis.call('HSET', KEYS[1], 'stage', 'rolled_back')
-      |if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]) end
-      |return 1
-      |""".stripMargin
-
-  def versionKey(name: String, version: Long): String = s"model:$name:v$version"
-  def pointerKey(pool: String): String = s"active:$pool"
-
-  /** Make version the one pool serves; evalId is the eval record that opened the gate. */
-  def promote(name: String, version: Long, pool: String, evalId: String): Boolean =
-    jedis.eval(PromoteLua, List(versionKey(name, version), pointerKey(pool)).asJava, List(s"$name:$version", evalId).asJava).asInstanceOf[java.lang.Long] == 1L
-
-  /** Take version out of pool; false when the version does not exist. */
-  def rollback(name: String, version: Long, pool: String): Boolean =
-    jedis.eval(RollbackLua, List(versionKey(name, version), pointerKey(pool)).asJava, List(s"$name:$version").asJava).asInstanceOf[java.lang.Long] == 1L
-
-  /** The "name:version" pool serves, or None. */
-  def resolveActive(pool: String): Option[String] = Option(jedis.get(pointerKey(pool)))
 }
 `,
     },

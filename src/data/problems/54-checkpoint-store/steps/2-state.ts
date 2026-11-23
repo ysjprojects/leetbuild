@@ -56,7 +56,6 @@ time.
         python: {all: [/def commit\(\s*upload_id/, /store\.manifest\(/]},
         typescript: {all: [/function commit\(\s*uploadId/, /manifest\(/]},
         go: {all: [/func commit\(\s*ctx context\.Context,\s*uploadID/, /store\.Manifest\(/]},
-        scala: {all: [/def commit\(\s*uploadId/, /Store\.manifest\(/]},
         cpp: {all: [/commit\(\s*const std::string& upload_id\)/, /store::manifest\(/]},
       },
     },
@@ -69,7 +68,6 @@ time.
         python: {all: [/register_script\(|\.eval\(/, /HLEN/], none: [/r\.hset\(\s*f["']checkpoint:/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /HLEN/], none: [/redis\.hset\(\s*`checkpoint:/]},
         go: {all: [/redis\.NewScript\(/, /HLEN/], none: [/rdb\.HSet\(\s*ctx,\s*"checkpoint:/]},
-        scala: {all: [/jedis\.eval\(/, /HLEN/], none: [/jedis\.hset\(\s*s"checkpoint:/]},
         cpp: {all: [/\.eval<long long>\(/, /HLEN/], none: [/redis\.hset\(\s*"checkpoint:/]},
       },
     },
@@ -82,7 +80,6 @@ time.
         python: {all: [/PERSIST/]},
         typescript: {all: [/PERSIST/]},
         go: {all: [/PERSIST/]},
-        scala: {all: [/PERSIST/]},
         cpp: {all: [/PERSIST/]},
       },
     },
@@ -95,7 +92,6 @@ time.
         python: {all: [/ZADD/, /zrevrange\(/], none: [/:latest/]},
         typescript: {all: [/ZADD/, /zrevrange\(/], none: [/:latest/]},
         go: {all: [/ZADD/, /ZRevRange\(/], none: [/:latest/]},
-        scala: {all: [/ZADD/, /zrevrange\(/], none: [/:latest/]},
         cpp: {all: [/ZADD/, /zrevrange\(/], none: [/:latest/]},
       },
     },
@@ -363,75 +359,6 @@ func latestCommitted(ctx context.Context, runID string) *store.Record {
 		return nil
 	}
 	return store.GetRecord(ctx, top[0])
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import checkpoint.Store // Store.upload, manifest, record, Record
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Commit a complete upload: its checkpoint record, or None for an unknown or incomplete upload. */
-  def commit(uploadId: String): Option[Store.Record] = {
-    // TODO: this starter has 3 flaws. The task says where to look; the checks say what must change.
-    for {
-      upload <- Store.upload(uploadId)
-      digest <- Store.manifest(uploadId) // None: a chunk is still missing
-      record <- {
-        val fields = Map("upload_id" -> uploadId, "run_id" -> upload.runId, "step" -> upload.step.toString, "chunks" -> upload.chunks.toString, "digest" -> digest)
-        jedis.hset(s"checkpoint:$uploadId", fields.asJava)
-        jedis.set(s"run:\${upload.runId}:latest", uploadId)
-        Store.record(uploadId)
-      }
-    } yield record
-  }
-
-  /** The run's latest committed checkpoint, or None. */
-  def latestCommitted(runId: String): Option[Store.Record] = Option(jedis.get(s"run:$runId:latest")).flatMap(Store.record)
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import checkpoint.Store // Store.upload, manifest, record, Record
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** KEYS upload:{id}, upload:{id}:chunks, upload:{id}:digests, checkpoint:{id}, run:{run_id}:checkpoints; ARGV upload_id, digest. */
-  val CommitLua: String =
-    """local meta = redis.call('HMGET', KEYS[1], 'run_id', 'step', 'chunks')
-      |if not meta[1] then return 0 end
-      |local chunks = tonumber(meta[3])
-      |if redis.call('HLEN', KEYS[2]) ~= chunks or redis.call('HLEN', KEYS[3]) ~= chunks then return 0 end
-      |redis.call('PERSIST', KEYS[1])
-      |redis.call('PERSIST', KEYS[2])
-      |redis.call('PERSIST', KEYS[3])
-      |redis.call('HSET', KEYS[4], 'upload_id', ARGV[1], 'run_id', meta[1], 'step', meta[2], 'chunks', meta[3], 'digest', ARGV[2])
-      |redis.call('ZADD', KEYS[5], meta[2], ARGV[1])
-      |return 1
-      |""".stripMargin
-
-  /** Commit a complete upload: its checkpoint record, or None for an unknown or incomplete upload. */
-  def commit(uploadId: String): Option[Store.Record] =
-    for {
-      upload <- Store.upload(uploadId)
-      digest <- Store.manifest(uploadId) // None: a chunk is still missing
-      keys = List(s"upload:$uploadId", s"upload:$uploadId:chunks", s"upload:$uploadId:digests", s"checkpoint:$uploadId", s"run:\${upload.runId}:checkpoints")
-      // The completeness check, the PERSIST and the record are one step: nothing expires in between.
-      if jedis.eval(CommitLua, keys.asJava, List(uploadId, digest).asJava).asInstanceOf[java.lang.Long] == 1L
-      record <- Store.record(uploadId)
-    } yield record
-
-  /** The run's latest committed checkpoint, or None: the highest step, whatever committed last. */
-  def latestCommitted(runId: String): Option[Store.Record] =
-    jedis.zrevrange(s"run:$runId:checkpoints", 0, 0).asScala.headOption.flatMap(Store.record)
 }
 `,
     },

@@ -50,7 +50,6 @@ failed, and it records whatever billing answers without comparing it to the coun
         python: {all: [/billing\.ClosePeriod\(/, /ledger\.mark_closed\(/]},
         typescript: {all: [/billing\.ClosePeriod\(/, /markClosed\(/]},
         go: {all: [/billing\.ClosePeriod\(/, /ledger\.MarkClosed\(/]},
-        scala: {all: [/billing\b[^\n]*\.closePeriod\(/, /Ledger\.markClosed\(/]},
         cpp: {all: [/billing->ClosePeriod\(/, /ledger::markClosed\(/]},
       },
     },
@@ -66,7 +65,6 @@ failed, and it records whatever billing answers without comparing it to the coun
           none: [/randomUUID/],
         },
         go: {all: [/func closeID\(/, /"close:%s:%d"|"close:" \+ account/], none: [/uuid/]},
-        scala: {all: [/def closeId\(/, /s"close:\$account:\$window"/], none: [/UUID/]},
         cpp: {all: [/std::string closeId\(/, /"close:" \+ account/], none: [/mt19937|random_device|newCloseId/]},
       },
     },
@@ -79,7 +77,6 @@ failed, and it records whatever billing answers without comparing it to the coun
         python: {all: [/DEADLINE_SECONDS\s*=\s*5\b/, /ClosePeriod\([\s\S]{0,300}?timeout\s*=\s*DEADLINE_SECONDS/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*5000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*5\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\)/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*5L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/kDeadline\{5\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -92,7 +89,6 @@ failed, and it records whatever billing answers without comparing it to the coun
         python: {all: [/return PERIOD_OPEN\s*$/]},
         typescript: {all: [/return PERIOD_OPEN;\s*\}\s*$/]},
         go: {all: [/return periodOpen\s*\}\s*$/]},
-        scala: {all: [/case _ => PeriodOpen/]},
         cpp: {all: [/return kPeriodOpen;\s*\}\s*$/]},
       },
     },
@@ -105,7 +101,6 @@ failed, and it records whatever billing answers without comparing it to the coun
         python: {all: [/billed_units\s*[!=]=\s*totals\[["']units["']\]/]},
         typescript: {all: [/billed_units\)?\s*[!=]==?\s*totals\.units/]},
         go: {all: [/GetBilledUnits\(\)\s*[!=]=\s*totals\.Units/]},
-        scala: {all: [/billedUnits\s*[!=]=\s*totals\.units/]},
         cpp: {all: [/billed_units\(\)\s*[!=]=\s*totals\.units/]},
       },
     },
@@ -363,73 +358,6 @@ func closePeriod(ctx context.Context, account string, window int64) string {
 		return periodClosed
 	}
 	return periodOpen
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import metering.Ledger // Ledger.readWindow, markClosed
-import usagemeter.usage_metering.{BillingGrpc, ClosePeriodRequest}
-
-object Client {
-  val PeriodClosed = "PERIOD_CLOSED"
-  val PeriodOpen = "PERIOD_OPEN"
-  val Attempts = 3
-
-  private val billing = BillingGrpc.blockingStub(ManagedChannelBuilder.forAddress("billing", 9000).usePlaintext().build())
-
-  /** Hand the window's total to billing: PeriodClosed once billing holds it, else PeriodOpen. */
-  def closePeriod(account: String, window: Long): String = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val totals = Ledger.readWindow(account, window)
-    val closed = (1 to Attempts).iterator.map { _ =>
-      val closeId = UUID.randomUUID().toString
-      try Some(closeId -> billing.closePeriod(ClosePeriodRequest(closeId, account, window, totals.units)))
-      catch { case _: StatusRuntimeException => None }
-    }.collectFirst { case Some(done) => done }
-    closed.foreach { case (closeId, reply) => Ledger.markClosed(account, window, closeId, reply.billedUnits) }
-    PeriodClosed
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import metering.Ledger // Ledger.readWindow, markClosed
-import usagemeter.usage_metering.{BillingGrpc, ClosePeriodRequest}
-
-object Client {
-  val PeriodClosed = "PERIOD_CLOSED"
-  val PeriodOpen = "PERIOD_OPEN"
-  val Attempts = 3
-  val DeadlineSeconds = 5L
-
-  private val billing = BillingGrpc.blockingStub(ManagedChannelBuilder.forAddress("billing", 9000).usePlaintext().build())
-
-  /** One id per (account, window): billing dedupes on it, so a retry cannot bill twice. */
-  def closeId(account: String, window: Long): String = s"close:$account:$window"
-
-  /** Hand the window's total to billing: PeriodClosed once billing holds it, else PeriodOpen. */
-  def closePeriod(account: String, window: Long): String = {
-    val totals = Ledger.readWindow(account, window)
-    val id = closeId(account, window)
-    // A timed-out attempt may have landed; the same id makes the retry safe.
-    val reply = (1 to Attempts).iterator.map { _ =>
-      try Some(billing.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).closePeriod(ClosePeriodRequest(id, account, window, totals.units)))
-      catch { case _: StatusRuntimeException => None }
-    }.collectFirst { case Some(done) => done }
-    reply match {
-      case Some(done) if done.billedUnits == totals.units =>
-        Ledger.markClosed(account, window, id, done.billedUnits)
-        PeriodClosed
-      // No attempt landed, or billing holds another number: leave the period open.
-      case _ => PeriodOpen
-    }
-  }
 }
 `,
     },

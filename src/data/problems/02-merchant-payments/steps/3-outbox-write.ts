@@ -67,12 +67,6 @@ Rewrite \`record_capture(order, capture)\` as a **transactional outbox**:
             /db\.Transaction\(\s*ctx\s*,\s*func\(tx \*sql\.Tx\) error \{(?:(?!\n\t\}\))[\s\S])*?INSERT INTO outbox/,
           ],
         },
-        scala: {
-          all: [
-            /Db\.transaction \{ conn =>(?:(?!\n {4}\})[\s\S])*?INSERT INTO orders/,
-            /Db\.transaction \{ conn =>(?:(?!\n {4}\})[\s\S])*?INSERT INTO outbox/,
-          ],
-        },
         cpp: {
           all: [
             /db::transaction\(\[&\]\(pqxx::work& tx\) \{(?:(?!\n {2}\}\))[\s\S])*?INSERT INTO orders/,
@@ -105,15 +99,6 @@ Rewrite \`record_capture(order, capture)\` as a **transactional outbox**:
             /eventID\s*,\s*topic\s*,\s*order\.MerchantID\s*,\s*payload\s*\)/,
           ],
         },
-        scala: {
-          all: [
-            /INSERT INTO outbox \(id, topic, key, payload\)/,
-            /outbox\.setString\(\s*1\s*,\s*eventId\s*\)/,
-            /outbox\.setString\(\s*2\s*,\s*Topic\s*\)/,
-            /outbox\.setString\(\s*3\s*,\s*order\.merchantId\s*\)/,
-            /outbox\.setString\(\s*4\s*,\s*payload\s*\)/,
-          ],
-        },
         cpp: {
           all: [
             /INSERT INTO outbox \(id, topic, key, payload\)/,
@@ -131,7 +116,6 @@ Rewrite \`record_capture(order, capture)\` as a **transactional outbox**:
         python: {none: [/producer\.produce\(/, /producer\.flush\(/, /Producer\(/]},
         typescript: {none: [/producer\.send\(/, /\.producer\(/, /from ['"]kafkajs['"]/]},
         go: {none: [/WriteMessages\(/, /kafka\.Writer\{/]},
-        scala: {none: [/producer\.send\(/, /new KafkaProducer/]},
         cpp: {none: [/->produce\(/, /RdKafka::Producer/]},
       },
     },
@@ -144,7 +128,6 @@ Rewrite \`record_capture(order, capture)\` as a **transactional outbox**:
         python: {all: [/uuid\.uuid4\(\)/, /"event_id":\s*event_id/]},
         typescript: {all: [/randomUUID\(\)/, /event_id:\s*eventId/]},
         go: {all: [/uuid\.NewString\(\)|uuid\.New\(\)\.String\(\)/, /EventID:\s*eventID/]},
-        scala: {all: [/UUID\.randomUUID\(\)/, /"event_id":"\$eventId"/]},
         cpp: {all: [/new_uuid\(\)/, /\\"event_id\\":\\""\s*\+\s*event_id/]},
       },
     },
@@ -436,79 +419,6 @@ func recordCapture(ctx context.Context, order Order, capture Capture) (string, e
 		return "", err
 	}
 	return eventID, nil // the relay publishes the row once the transaction is committed
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Instant
-import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import payments.Db // Db.transaction { conn => ... } begins, runs the block, commits (rolls back on exception)
-
-object OutboxWriter {
-  val Topic = "payments"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  props.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  final case class Order(id: String, merchantId: String)
-  final case class Capture(amountCents: Long, currency: String)
-
-  /** Persists the order and publishes payment.captured; returns the event id the ledger dedupes on. */
-  def recordCapture(order: Order, capture: Capture): String = {
-    val eventId = "" // TODO: UUID.randomUUID().toString, used as the outbox row id and as event_id in the payload
-    val payload =
-      s"""{"event_id":"$eventId","type":"payment.captured","merchant_id":"\${order.merchantId}","order_id":"\${order.id}",""" +
-        s""""amount_cents":\${capture.amountCents},"currency":"\${capture.currency}","captured_at":"\${Instant.now()}"}"""
-    Db.transaction { conn =>
-      val orders = conn.prepareStatement(
-        "INSERT INTO orders (id, merchant_id, amount_cents, currency, status) VALUES (?, ?, ?, ?, 'captured')")
-      orders.setString(1, order.id); orders.setString(2, order.merchantId)
-      orders.setLong(3, capture.amountCents); orders.setString(4, capture.currency)
-      orders.executeUpdate()
-    }
-    // TODO: dual write — a crash right here loses the event. Replace it with an outbox row inside the transaction:
-    // TODO: INSERT INTO outbox (id, topic, key, payload) VALUES (eventId, Topic, merchant id, payload)
-    producer.send(new ProducerRecord[String, String](Topic, order.merchantId, payload)).get()
-    eventId
-  }
-}
-`,
-      solution: `import java.time.Instant
-import java.util.UUID
-
-import payments.Db // Db.transaction { conn => ... } begins, runs the block, commits (rolls back on exception)
-
-object OutboxWriter {
-  val Topic = "payments"
-
-  final case class Order(id: String, merchantId: String)
-  final case class Capture(amountCents: Long, currency: String)
-
-  /** Persists the order and the payment.captured event atomically; returns the event id the ledger dedupes on. */
-  def recordCapture(order: Order, capture: Capture): String = {
-    val eventId = UUID.randomUUID().toString
-    val payload =
-      s"""{"event_id":"$eventId","type":"payment.captured","merchant_id":"\${order.merchantId}","order_id":"\${order.id}",""" +
-        s""""amount_cents":\${capture.amountCents},"currency":"\${capture.currency}","captured_at":"\${Instant.now()}"}"""
-    Db.transaction { conn =>
-      val orders = conn.prepareStatement(
-        "INSERT INTO orders (id, merchant_id, amount_cents, currency, status) VALUES (?, ?, ?, ?, 'captured')")
-      orders.setString(1, order.id); orders.setString(2, order.merchantId)
-      orders.setLong(3, capture.amountCents); orders.setString(4, capture.currency)
-      orders.executeUpdate()
-      val outbox = conn.prepareStatement("INSERT INTO outbox (id, topic, key, payload) VALUES (?, ?, ?, ?)")
-      outbox.setString(1, eventId); outbox.setString(2, Topic)
-      outbox.setString(3, order.merchantId); outbox.setString(4, payload)
-      outbox.executeUpdate()
-    }
-    eventId // the relay publishes the row once the transaction is committed
-  }
 }
 `,
     },

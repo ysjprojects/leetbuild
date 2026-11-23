@@ -299,11 +299,10 @@ failed request. Three rules follow:
 
 1. **Hand off and return.** \`audit()\` enqueues; no \`flush()\`, no \`.get()\` on the future, no
    synchronous write on the request thread. The producer batches and sends in the background.
-2. **Bound the queue.** \`queue.buffering.max.messages\`, or \`buffer.memory\` with \`max.block.ms=0\`, or a
-   fixed-size channel in front of the writer. An unbounded buffer turns a slow broker into an
-   out-of-memory gateway twenty minutes later.
+2. **Bound the queue.** \`queue.buffering.max.messages\`, or a fixed-size channel in front of the
+   writer. An unbounded buffer turns a slow broker into an out-of-memory gateway twenty minutes later.
 3. **Drop and count.** When the queue is full the library says so — \`BufferError\`,
-   \`BufferExhaustedException\`, \`ERR__QUEUE_FULL\`, a \`select\` falling to \`default\` — and the handler is
+   \`ERR__QUEUE_FULL\`, a \`select\` falling to \`default\` — and the handler is
    one line: \`dropped += 1\`. Exported as \`gateway_audit_dropped_total\`; a rising value is a page.
 
 Keyed by the **API key**, so one caller's history lands on one partition in order; a security

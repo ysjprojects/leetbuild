@@ -54,7 +54,6 @@ service Warehouse { rpc WritePartition(WriteRequest) returns (WriteReply); }  //
         python: {all: [/WritePartition\(/, /rows_written/]},
         typescript: {all: [/WritePartition\(/, /rows_written/]},
         go: {all: [/WritePartition\(/, /GetRowsWritten\(\)|\.RowsWritten/]},
-        scala: {all: [/writePartition\(/, /rowsWritten/]},
         cpp: {all: [/WritePartition\(/, /rows_written\(\)/]},
       },
     },
@@ -67,7 +66,6 @@ service Warehouse { rpc WritePartition(WriteRequest) returns (WriteReply); }  //
         python: {all: [/DEADLINE_S\s*=\s*30\b/, /WritePartition\([\s\S]{0,120}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*30_?000\b/, /WritePartition\([\s\S]{0,160}?deadline:[^\n]*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*30\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*30L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/kDeadline\{30\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -80,7 +78,6 @@ service Warehouse { rpc WritePartition(WriteRequest) returns (WriteReply); }  //
         python: {all: [/merge_key\s*=/]},
         typescript: {all: [/merge_key:/]},
         go: {all: [/MergeKey:/]},
-        scala: {all: [/mergeKey\s*=/]},
         cpp: {all: [/set_merge_key\(/]},
       },
     },
@@ -93,7 +90,6 @@ service Warehouse { rpc WritePartition(WriteRequest) returns (WriteReply); }  //
         python: {all: [/RETRYABLE/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
         typescript: {all: [/RETRYABLE/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
         go: {all: [/retryable/, /codes\.Unavailable/, /codes\.DeadlineExceeded/]},
-        scala: {all: [/Retryable/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
         cpp: {all: [/retryable/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
       },
     },
@@ -369,77 +365,6 @@ func writePartition(ctx context.Context, load store.Load, partitionID string) (i
 		}
 		time.Sleep(backoff * time.Duration(attempt))
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import loader.Store // Store.Load
-import whloader.warehouse_loader.{WarehouseGrpc, WriteRequest}
-
-/** The partition cannot be written: the load stops and the reason is shown to the operator. */
-final class LoadFailed(message: String) extends Exception(message)
-
-object WarehouseClient {
-  val MaxAttempts = 3
-  val BackoffMillis = 500L
-
-  private val warehouse = WarehouseGrpc.blockingStub(ManagedChannelBuilder.forAddress("warehouse", 9000).usePlaintext().build())
-
-  /** Write one partition of the load; returns the rows the warehouse wrote. */
-  def writePartition(load: Store.Load, partitionId: String): Long = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    val request = WriteRequest(target = load.target, loadId = load.loadId, partitionId = partitionId, sql = load.sql)
-    def attempt(n: Int): Long =
-      (try Right(warehouse.writePartition(request).rowsWritten)
-       catch { case e: StatusRuntimeException => Left(e) }) match {
-        case Right(rows) => rows
-        case Left(e) if n >= MaxAttempts =>
-          throw new LoadFailed(s"\${e.getStatus.getCode} writing \${load.target} partition $partitionId: \${e.getStatus.getDescription}")
-        case Left(_) =>
-          Thread.sleep(BackoffMillis * n)
-          attempt(n + 1)
-      }
-    attempt(1)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import loader.Store // Store.Load
-import whloader.warehouse_loader.{WarehouseGrpc, WriteRequest}
-
-/** The partition cannot be written: the load stops and the reason is shown to the operator. */
-final class LoadFailed(message: String) extends Exception(message)
-
-object WarehouseClient {
-  val DeadlineSeconds = 30L
-  val MaxAttempts = 3
-  val BackoffMillis = 500L
-  /** Statuses that say nothing about the request: the same write may succeed on the next attempt. */
-  val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val warehouse = WarehouseGrpc.blockingStub(ManagedChannelBuilder.forAddress("warehouse", 9000).usePlaintext().build())
-
-  /** Write one partition of the load; returns the rows the warehouse wrote. */
-  def writePartition(load: Store.Load, partitionId: String): Long = {
-    // The merge key makes a retry replace whatever an earlier attempt of this partition wrote.
-    val request = WriteRequest(target = load.target, loadId = load.loadId, partitionId = partitionId, sql = load.sql, mergeKey = s"\${load.loadId}/$partitionId")
-    def attempt(n: Int): Long =
-      (try Right(warehouse.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).writePartition(request).rowsWritten)
-       catch { case e: StatusRuntimeException => Left(e) }) match {
-        case Right(rows) => rows
-        case Left(e) if !Retryable.contains(e.getStatus.getCode) || n >= MaxAttempts =>
-          throw new LoadFailed(s"\${e.getStatus.getCode} writing \${load.target} partition $partitionId: \${e.getStatus.getDescription}")
-        case Left(_) =>
-          Thread.sleep(BackoffMillis * n)
-          attempt(n + 1)
-      }
-    attempt(1)
-  }
 }
 `,
     },

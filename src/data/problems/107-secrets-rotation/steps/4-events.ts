@@ -47,15 +47,11 @@ event twice.
       id: 'secret-key',
       title: 'Keyed by the secret name',
       detail:
-        "The record key is the secret name (`key=name`, `key: name`, `[]byte(name)`, `ProducerRecord(topic, name, …)`), so a secret's created → activated → retired sequence stays on one partition in order; the starter keys by version id.",
+        "The record key is the secret name (`key=name`, `key: name`, `[]byte(name)`), so a secret's created → activated → retired sequence stays on one partition in order; the starter keys by version id.",
       match: {
         python: {all: [/key=name\b/, /secret\.event/], none: [/key=version_id/]},
         typescript: {all: [/key:\s*name\b/, /secret\.event/], none: [/key:\s*versionId/]},
         go: {all: [/Key:\s*\[\]byte\(name\)/, /secret\.event/], none: [/Key:\s*\[\]byte\(versionID\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(EventTopic,\s*name\b/, /secret\.event/],
-          none: [/EventTopic,\s*versionId/],
-        },
         cpp: {
           all: [/name\.c_str\(\),\s*name\.size\(\)/, /secret\.event/],
           none: [/version_id\.c_str\(\),\s*version_id\.size\(\)/],
@@ -71,7 +67,6 @@ event twice.
         python: {all: [/["']fingerprint["']/, /["']at["']/], none: [/\[["']material["']\]/]},
         typescript: {all: [/fingerprint/, /\bat:/], none: [/\.material\b/]},
         go: {all: [/"fingerprint"/, /"at"/], none: [/\.Material\b/]},
-        scala: {all: [/"fingerprint"/, /"at"/], none: [/\.material\b/]},
         cpp: {all: [/"fingerprint"/, /"at"/], none: [/\.material\b/]},
       },
     },
@@ -84,7 +79,6 @@ event twice.
         python: {order: [/def rotate\(/, /rotation\.activate\(/, /publish_event\(/]},
         typescript: {order: [/function rotate\(/, /rotation\.activate\(/, /publishEvent\(/]},
         go: {order: [/func rotate\(/, /rotation\.Activate\(/, /publishEvent\(/]},
-        scala: {order: [/def rotate\(/, /Rotation\.activate\(/, /publishEvent\(/]},
         cpp: {order: [/json rotate\(/, /rotation::activate\(/, /publishEvent\(/]},
       },
     },
@@ -97,7 +91,6 @@ event twice.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -381,103 +374,6 @@ func rotate(ctx context.Context, name, versionID string) (map[string]any, error)
 	}
 	vault.RecordActivation(ctx, name, versionID)
 	return publishEvent(ctx, "activated", name, versionID)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import secretd.{Rotation, Vault} // Rotation.activate; Vault.getVersion, recordActivation
-
-object Events {
-  val EventTopic = "secret.event"
-  val EventTypes: Set[String] = Set("created", "activated", "retired", "revoked")
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"secret event not delivered: \${exception.getMessage}")
-  }
-
-  /** One record on secret.event for a lifecycle step of a version. */
-  def publishEvent(eventType: String, name: String, versionId: String): JsObject = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    require(EventTypes.contains(eventType), s"unknown event type $eventType")
-    val version = Vault.getVersion(name, versionId).get
-    val event = JsObject(
-      "type" -> JsString(eventType),
-      "secret" -> JsString(name),
-      "version_id" -> JsString(versionId),
-      "fingerprint" -> JsString(version.fingerprint),
-      "material" -> JsString(version.material), // consumers warm their cache without a vault read
-      "at" -> JsNumber(System.currentTimeMillis() / 1000))
-    producer.send(new ProducerRecord[String, String](EventTopic, versionId, event.compactPrint), onDelivery).get()
-    event
-  }
-
-  /** Make versionId the active version and announce it. */
-  def rotate(name: String, versionId: String): JsObject = {
-    val event = publishEvent("activated", name, versionId)
-    Rotation.activate(name, versionId)
-    Vault.recordActivation(name, versionId)
-    event
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import secretd.{Rotation, Vault} // Rotation.activate; Vault.getVersion, recordActivation
-
-object Events {
-  val EventTopic = "secret.event"
-  val EventTypes: Set[String] = Set("created", "activated", "retired", "revoked")
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes the event once, on every replica.
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"secret event not delivered: \${exception.getMessage}")
-  }
-
-  /** One record on secret.event for a lifecycle step of a version. */
-  def publishEvent(eventType: String, name: String, versionId: String): JsObject = {
-    require(EventTypes.contains(eventType), s"unknown event type $eventType")
-    val version = Vault.getVersion(name, versionId).get
-    // Ids and the fingerprint name the version; the secret itself stays in the vault.
-    val event = JsObject(
-      "type" -> JsString(eventType),
-      "secret" -> JsString(name),
-      "version_id" -> JsString(versionId),
-      "fingerprint" -> JsString(version.fingerprint),
-      "at" -> JsNumber(System.currentTimeMillis() / 1000))
-    producer.send(new ProducerRecord[String, String](EventTopic, name, event.compactPrint), onDelivery).get()
-    event
-  }
-
-  /** Make versionId the active version and announce it. */
-  def rotate(name: String, versionId: String): JsObject = {
-    // The pointer moves first: an event may lag the state, never precede it.
-    Rotation.activate(name, versionId)
-    Vault.recordActivation(name, versionId)
-    publishEvent("activated", name, versionId)
-  }
 }
 `,
     },

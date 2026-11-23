@@ -4,9 +4,8 @@
  * brand, category, price_cents, in_stock "true"/"false", cost_cents, price_version), listed in the
  * set catalog:{tenant}:ids; catalog:{tenant}:version is the tenant's index version, bumped by every
  * write. `run_query` is the query engine, `normalize_query` and `digest` the helpers steps 2 and 4
- * share. The five languages keep the same keys, so a harness reads one layout whatever the stack.
+ * share. The four languages keep the same keys, so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'search/__init__.py': '',
@@ -609,98 +608,5 @@ inline nlohmann::json runQuery(const std::string& tenant, const std::string& q, 
 }
 
 }  // namespace catalog
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('search', 'Catalog')]: `package search
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The tenant catalog index (provided). Every product is a Redis hash catalog:{tenant}:product:{id}
- * with id, title, brand, category, price_cents, in_stock ("true"/"false"), cost_cents (the
- * wholesale cost: internal, never shown to shoppers) and price_version (bumped by every write); the
- * set catalog:{tenant}:ids lists a tenant's products and catalog:{tenant}:version is the tenant's
- * index version, bumped by every write.
- */
-object Catalog {
-  final case class Product(id: String, title: String, brand: String, category: String, priceCents: Long, inStock: Boolean, costCents: Long, priceVersion: Long)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def productKey(tenant: String, productId: String): String = s"catalog:$tenant:product:$productId"
-
-  /** Lowercase, trimmed, every run of whitespace one space: two spellings of one query become one. */
-  def normalizeQuery(q: String): String = q.toLowerCase.split("\\\\s+").filter(_.nonEmpty).mkString(" ")
-
-  /** FNV-1a, 64 bits, as 16 hex digits: a short stable name for a longer text. */
-  def digest(text: String): String = {
-    var h = 0xcbf29ce484222325L
-    text.getBytes("UTF-8").foreach { byte =>
-      h ^= (byte & 0xff).toLong
-      h *= 0x100000001b3L
-    }
-    f"$h%016x"
-  }
-
-  /** Index or update a product (its priceVersion is ignored); returns the tenant's new index version. */
-  def putProduct(tenant: String, p: Product): Long = {
-    val key = productKey(tenant, p.id)
-    jedis.hset(key, Map("id" -> p.id, "title" -> p.title, "brand" -> p.brand, "category" -> p.category, "price_cents" -> p.priceCents.toString, "in_stock" -> p.inStock.toString, "cost_cents" -> p.costCents.toString).asJava)
-    jedis.hincrBy(key, "price_version", 1)
-    jedis.sadd(s"catalog:$tenant:ids", p.id)
-    jedis.incr(s"catalog:$tenant:version")
-  }
-
-  /** The tenant's index version: 0 before the first write. */
-  def indexVersion(tenant: String): Long = Option(jedis.get(s"catalog:$tenant:version")).map(_.toLong).getOrElse(0L)
-
-  private def product(raw: Map[String, String]): Option[Product] =
-    if (raw.isEmpty) None
-    else Some(Product(raw("id"), raw("title"), raw("brand"), raw("category"), raw("price_cents").toLong, raw("in_stock") == "true", raw("cost_cents").toLong, raw("price_version").toLong))
-
-  /** The tenant's product, every stored field, if it exists. */
-  def getProduct(tenant: String, productId: String): Option[Product] = product(jedis.hgetAll(productKey(tenant, productId)).asScala.toMap)
-
-  /** The merchandising console's lookup: the first product with this id in any tenant's catalog. */
-  def findProduct(productId: String): Option[Product] =
-    jedis.keys(s"catalog:*:product:$productId").asScala.toSeq.sorted.headOption.flatMap(key => product(jedis.hgetAll(key).asScala.toMap))
-
-  /** The fields a shopper may see. */
-  def publicView(p: Product): JsObject = JsObject(
-    "id" -> JsString(p.id), "title" -> JsString(p.title), "brand" -> JsString(p.brand), "category" -> JsString(p.category),
-    "price_cents" -> JsNumber(p.priceCents), "in_stock" -> JsBoolean(p.inStock), "price_version" -> JsNumber(p.priceVersion))
-
-  /** Every stored field of a product, the wholesale cost included. */
-  def toJson(p: Product): JsObject = JsObject(publicView(p).fields + ("cost_cents" -> JsNumber(p.costCents)))
-
-  private def matches(raw: Map[String, String], terms: Seq[String], filters: Map[String, String]): Boolean = {
-    val text = s"\${raw("title")} \${raw("brand")} \${raw("category")}".toLowerCase
-    terms.forall(text.contains(_)) && filters.forall {
-      case (field @ ("min_price" | "max_price"), value) =>
-        value.toLongOption.exists { bound =>
-          val price = raw("price_cents").toLong
-          if (field == "min_price") price >= bound else price <= bound
-        }
-      case (field, value) => raw.get(field).contains(value) // any stored field is a filter: equality on its text
-    }
-  }
-
-  /** The query engine: the tenant's products matching every term of q and every filter, cheapest first, at most pageSize. */
-  def runQuery(tenant: String, q: String, filters: Map[String, String], pageSize: Int): Seq[JsObject] = {
-    val terms = normalizeQuery(q).split(" ").filter(_.nonEmpty).toSeq
-    jedis.smembers(s"catalog:$tenant:ids").asScala.toSeq
-      .map(id => jedis.hgetAll(productKey(tenant, id)).asScala.toMap)
-      .filter(raw => raw.nonEmpty && matches(raw, terms, filters))
-      .flatMap(product)
-      .sortBy(p => (p.priceCents, p.id))
-      .take(pageSize)
-      .map(publicView)
-  }
-}
 `,
 };

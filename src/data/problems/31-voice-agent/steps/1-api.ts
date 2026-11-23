@@ -63,7 +63,6 @@ day; and a phone that reconnects on a flaky network forks the call into a second
         python: {all: [/@app\.post\(\s*["']\/v1\/voice\/sessions["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/voice\/sessions['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/voice\/sessions"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"voice"\s*\/\s*"sessions"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/voice\/sessions"/]},
       },
     },
@@ -76,7 +75,6 @@ day; and a phone that reconnects on a flaky network forks the call into a second
         python: {all: [/x-tenant-id/i, /\b401\b/], none: [/["']public["']/]},
         typescript: {all: [/x-tenant-id/i, /\b401\b/], none: [/['"]public['"]/]},
         go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/], none: [/"public"/]},
-        scala: {all: [/X-Tenant-Id/i, /Unauthorized|\b401\b/], none: [/"public"/]},
         cpp: {all: [/X-Tenant-Id/i, /\b401\b/], none: [/"public"/]},
       },
     },
@@ -89,7 +87,6 @@ day; and a phone that reconnects on a flaky network forks the call into a second
         python: {all: [/SUPPORTED_FORMATS\s*=/, /\b415\b/]},
         typescript: {all: [/SUPPORTED_FORMATS\s*[:=]/, /\b415\b/]},
         go: {all: [/supportedFormats\s*=/, /StatusUnsupportedMediaType|\b415\b/]},
-        scala: {all: [/SupportedFormats\s*[:=]/, /UnsupportedMediaType|\b415\b/]},
         cpp: {all: [/kSupportedFormats\s*=/, /\b415\b/]},
       },
     },
@@ -102,7 +99,6 @@ day; and a phone that reconnects on a flaky network forks the call into a second
         python: {all: [/MAX_DURATION_S\s*=\s*1800/, /DEFAULT_DURATION_S\s*=\s*1800/], none: [/86400/]},
         typescript: {all: [/MAX_DURATION_S\s*=\s*1800/, /DEFAULT_DURATION_S\s*=\s*1800/], none: [/86400/]},
         go: {all: [/maxDurationS\s*=\s*1800/, /defaultDurationS\s*=\s*1800/], none: [/86400/]},
-        scala: {all: [/MaxDurationS\s*=\s*1800/, /DefaultDurationS\s*=\s*1800/], none: [/86400/]},
         cpp: {all: [/kMaxDurationS\s*=\s*1800/, /kDefaultDurationS\s*=\s*1800/], none: [/86400/]},
       },
     },
@@ -120,10 +116,6 @@ day; and a phone that reconnects on a flaky network forks the call into a second
         go: {
           all: [/Idempotency-Key/i, /sessions\.Find\(/, /sessions\.Remember\(/],
           order: [/sessions\.Find\(/, /sessions\.Create\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Sessions\.find\(/, /Sessions\.remember\(/],
-          order: [/Sessions\.find\(/, /Sessions\.create\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /sessions::find\(/, /sessions::remember\(/],
@@ -385,86 +377,6 @@ func createSessionHandler(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/voice/sessions", createSessionHandler)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import voice.Sessions // Sessions.create, get, find, remember
-
-object Api {
-  val DefaultDurationS = 86400
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "voice" / "sessions") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val tenant = tenantHeader.filter(_.nonEmpty).getOrElse("public")
-          val body = raw.parseJson.asJsObject.fields
-          val duration = body.get("max_duration_s").map(_.convertTo[Int]).filter(_ != 0).getOrElse(DefaultDurationS)
-          val session = Sessions.create(tenant, body("codec").convertTo[String], body("sample_rate").convertTo[Int], duration)
-          complete(json(StatusCodes.Created, session.toJson))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import voice.Sessions // Sessions.create, get, find, remember
-
-object Api {
-  /** The pairs the media pipeline decodes: a sample rate means something only for its codec. */
-  val SupportedFormats: Map[String, Set[Int]] = Map("opus" -> Set(16000, 48000), "pcm16" -> Set(16000, 24000), "g711_ulaw" -> Set(8000))
-  val DefaultDurationS = 1800
-  val MaxDurationS = 1800
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "voice" / "sessions") {
-    post {
-      (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("Idempotency-Key")) { (tenantHeader, keyHeader) =>
-        entity(as[String]) { raw =>
-          (tenantHeader.filter(_.nonEmpty), keyHeader.filter(_.nonEmpty)) match {
-            case (None, _) => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-            case (_, None) => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
-            case (Some(tenant), Some(key)) =>
-              val body = raw.parseJson.asJsObject.fields
-              val codec = body("codec").convertTo[String]
-              val sampleRate = body("sample_rate").convertTo[Int]
-              val duration = body.get("max_duration_s").map(_.convertTo[Int]).getOrElse(DefaultDurationS)
-              if (!SupportedFormats.get(codec).exists(_.contains(sampleRate)))
-                complete(StatusCodes.UnsupportedMediaType -> s"unsupported audio format $codec at $sampleRate Hz")
-              else if (duration < 1 || duration > MaxDurationS)
-                complete(StatusCodes.BadRequest -> s"max_duration_s must be 1 to $MaxDurationS")
-              else
-                Sessions.find(tenant, key) match {
-                  case Some(existing) => complete(json(StatusCodes.OK, existing.toJson)) // a reconnect resumes the call it started
-                  case None =>
-                    val session = Sessions.create(tenant, codec, sampleRate, duration)
-                    Sessions.remember(tenant, key, session.sessionId)
-                    complete(json(StatusCodes.Created, session.toJson))
-                }
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

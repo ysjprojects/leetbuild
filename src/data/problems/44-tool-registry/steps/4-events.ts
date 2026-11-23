@@ -54,10 +54,6 @@ acknowledgement writes a record twice.
         python: {all: [/key=name\b/, /tool\.lifecycle/], none: [/key=entry\[["']owner["']\]/]},
         typescript: {all: [/key:\s*name\b/, /tool\.lifecycle/], none: [/key:\s*String\(entry\.owner\)/]},
         go: {all: [/Key:\s*\[\]byte\(name\)/, /tool\.lifecycle/], none: [/Key:\s*\[\]byte\(owner\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(LifecycleTopic,\s*name,/, /tool\.lifecycle/],
-          none: [/LifecycleTopic,\s*owner/],
-        },
         cpp: {all: [/name\.c_str\(\),\s*name\.size\(\)/, /tool\.lifecycle/], none: [/owner\.c_str\(\)/]},
       },
     },
@@ -70,7 +66,6 @@ acknowledgement writes a record twice.
         python: {all: [/["']catalog_version["']\s*:/, /["']side_effect["']\s*:\s*entry\[/], none: [/\*\*entry/]},
         typescript: {all: [/catalog_version:/, /side_effect:\s*entry\.side_effect/], none: [/\.\.\.entry/]},
         go: {all: [/"catalog_version":/, /"side_effect":\s*entry\["side_effect"\]/], none: [/range entry\b/]},
-        scala: {all: [/"catalog_version"\s*->/, /"side_effect"\s*->\s*entry\.fields/], none: [/entry\.fields\s*\+\+/]},
         cpp: {all: [/\{"catalog_version",/, /\{"side_effect",\s*entry\.value\(/], none: [/json payload = entry;/]},
       },
     },
@@ -95,11 +90,6 @@ acknowledgement writes a record twice.
           none: [/"promoted"/],
           order: [/catalog\.Validation\(ctx,\s*cv\)/, /WriteMessages\(/],
         },
-        scala: {
-          all: [/throw new NoVerdict/],
-          none: [/"promoted"/],
-          order: [/Catalog\.validation\(cv\)/, /producer\.send\(/],
-        },
         cpp: {
           all: [/throw NoVerdict/],
           none: [/"promoted"/],
@@ -116,7 +106,6 @@ acknowledgement writes a record twice.
         python: {all: [/if err is not None:[\s\S]{0,200}?store\.to_outbox\(/]},
         typescript: {all: [/catch[\s\S]{0,200}?toOutbox\(/]},
         go: {all: [/WriteMessages\([\s\S]{0,300}?store\.ToOutbox\(/]},
-        scala: {all: [/exception != null[\s\S]{0,200}?Store\.toOutbox\(/]},
         cpp: {all: [/dr_cb[\s\S]{0,400}?store::toOutbox\(/]},
       },
     },
@@ -129,7 +118,6 @@ acknowledgement writes a record twice.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -401,92 +389,6 @@ func announce(ctx context.Context, cv string, entries map[string]catalog.Entry) 
 		events = append(events, payload)
 	}
 	return events, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import toolsd.{Catalog, Store} // Catalog.validation, Store.toOutbox
-
-object Events {
-  val LifecycleTopic = "tool.lifecycle"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val logFailure: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"lifecycle record not delivered: \${exception.getMessage}")
-  }
-
-  /** One tool.lifecycle record per tool of catalog version cv, carrying its verdict; the payloads. */
-  def announce(cv: String, entries: Map[String, JsObject]): Seq[JsObject] = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val events = entries.toSeq.sortBy(_._1).map { case (name, entry) =>
-      val payload = JsObject(entry.fields ++ Map("tool" -> JsString(name), "catalog_version" -> JsString(cv), "outcome" -> JsString("promoted")))
-      val owner = entry.fields.get("owner").collect { case JsString(s) => s }.getOrElse("")
-      producer.send(new ProducerRecord[String, String](LifecycleTopic, owner, payload.compactPrint), logFailure)
-      payload
-    }
-    producer.flush()
-    events
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import toolsd.{Catalog, Store} // Catalog.validation, Store.toOutbox
-
-/** The candidate has no recorded verdict: there is nothing true to announce yet. */
-final class NoVerdict(message: String) extends Exception(message)
-
-object Events {
-  val LifecycleTopic = "tool.lifecycle"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes once, on every replica.
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private def outboxOnFailure(key: String, value: String): Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) {
-        System.err.println(s"lifecycle record for $key not delivered, parked in the outbox: \${exception.getMessage}")
-        Store.toOutbox(LifecycleTopic, key, value)
-      }
-  }
-
-  /** One tool.lifecycle record per tool of catalog version cv, carrying its verdict; the payloads. */
-  def announce(cv: String, entries: Map[String, JsObject]): Seq[JsObject] = {
-    val verdict = Catalog.validation(cv).getOrElse(throw new NoVerdict(s"catalog version $cv has no recorded verdict"))
-    val events = entries.toSeq.sortBy(_._1).map { case (name, entry) =>
-      // The lifecycle fields only: the endpoint and credential reference stay in the registry.
-      val payload = JsObject(
-        "tool" -> JsString(name),
-        "version" -> entry.fields.getOrElse("version", JsNull),
-        "side_effect" -> entry.fields.getOrElse("side_effect", JsNull),
-        "catalog_version" -> JsString(cv),
-        "outcome" -> JsString(verdict.getOrElse("outcome", "")))
-      val value = payload.compactPrint
-      producer.send(new ProducerRecord[String, String](LifecycleTopic, name, value), outboxOnFailure(name, value))
-      payload
-    }
-    producer.flush()
-    events
-  }
 }
 `,
     },

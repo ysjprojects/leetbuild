@@ -64,7 +64,7 @@ sampled model and an answer built from a tool call made for one caller.
   hints: [
     'A miss on a slow model takes twelve seconds to fail, a question the model declined is answered with the refusal for a day, and a near-duplicate of "what is my order status" gets another customer\u2019s order.',
     'The call carries no deadline and sits in a loop that retries refusals; the write-back has no gate, so refusals, sampled replies and tool-built replies all become entries; and the entry is stamped with the model version instead of the serving policy version.',
-    'One call with `timeout=MODEL_DEADLINE_SECONDS` (a `deadline`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`), raise `RefusalError` on `refused`, gate the write on `is_cacheable`, and pass `SERVING_POLICY_VERSION` to `put_entry`.',
+    'One call with `timeout=MODEL_DEADLINE_SECONDS` (a `deadline`, `context.WithTimeout`, `set_deadline`), raise `RefusalError` on `refused`, gate the write on `is_cacheable`, and pass `SERVING_POLICY_VERSION` to `put_entry`.',
   ],
   checks: [
     {
@@ -76,7 +76,6 @@ sampled model and an answer built from a tool call made for one caller.
         python: {all: [/timeout\s*=/], none: [/for\s+\w+\s+in\s+range\(/, /while\s+True/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+/], none: [/for\s*\(\s*let\s+\w+\s*=/, /while\s*\(/]},
         go: {all: [/context\.WithTimeout\(/], none: [/for\s+\w+\s*:=\s*0;|for\s+range\b|for\s+\w+\s*:=\s*range\b/]},
-        scala: {all: [/withDeadlineAfter\(/], none: [/while\s*\(/, /\bfor\s*\(/]},
         cpp: {all: [/set_deadline\(/], none: [/for\s*\(\s*int\s+\w+\s*=/, /while\s*\(/]},
       },
     },
@@ -89,7 +88,6 @@ sampled model and an answer built from a tool call made for one caller.
         python: {all: [/raise RefusalError\(/]},
         typescript: {all: [/throw new RefusalError\(/]},
         go: {all: [/&RefusalError\{/]},
-        scala: {all: [/throw new RefusalError\(/]},
         cpp: {all: [/throw RefusalError\(/]},
       },
     },
@@ -108,7 +106,6 @@ sampled model and an answer built from a tool call made for one caller.
             /GetCacheable\(\)|\.Cacheable\b/,
           ],
         },
-        scala: {all: [/selfContained/, /deterministic/, /cacheable/]},
         cpp: {all: [/self_contained\(\)/, /deterministic\(\)/, /policy\(\)\.cacheable\(\)/]},
       },
     },
@@ -121,7 +118,6 @@ sampled model and an answer built from a tool call made for one caller.
         python: {all: [/tool_calls/]},
         typescript: {all: [/\btool_calls\b(?!\??:)/]},
         go: {all: [/GetToolCalls\(\)|\.ToolCalls\b/]},
-        scala: {all: [/toolCalls/]},
         cpp: {all: [/tool_calls(_size)?\(\)/]},
       },
     },
@@ -134,7 +130,6 @@ sampled model and an answer built from a tool call made for one caller.
         python: {all: [/SERVING_POLICY_VERSION\s*=\s*["']2024-06-1["']/, /put_entry\([^\n]*SERVING_POLICY_VERSION/]},
         typescript: {all: [/SERVING_POLICY_VERSION\s*=\s*['"]2024-06-1['"]/, /putEntry\([^\n]*SERVING_POLICY_VERSION/]},
         go: {all: [/servingPolicyVersion\s*=\s*"2024-06-1"/, /putEntry\([^\n]*servingPolicyVersion/]},
-        scala: {all: [/ServingPolicyVersion\s*=\s*"2024-06-1"/, /putEntry\([^\n]*ServingPolicyVersion/]},
         cpp: {all: [/kServingPolicyVersion\s*=\s*"2024-06-1"/, /put_entry\([^\n]*kServingPolicyVersion/]},
       },
     },
@@ -521,109 +516,6 @@ func answerOnMiss(ctx context.Context, tenant, modelVersion, question string, em
 		return Answered{}, err
 	}
 	return Answered{Answer: result.GetText(), EntryID: entryID, Cached: entryID != ""}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import semcache.model.{AnswerRequest, AnswerResult, ModelGrpc}
-
-/** The miss path: ask the model, store the reply. */
-object Client {
-  val MaxAttempts = 3
-  val ServingPolicyVersion = "2024-06-1"
-
-  private val channel = ManagedChannelBuilder.forAddress("model", 9000).usePlaintext().build()
-  private val stub = ModelGrpc.blockingStub(channel)
-
-  /** The model declined the question: terminal, and cached for nobody. */
-  class RefusalError(text: String) extends RuntimeException(s"the model refused: $text")
-
-  /** What the miss path hands back to the request. */
-  case class Answered(answer: String, entryId: Option[String], cached: Boolean)
-
-  /** The model's reply, asking again when the call fails or the model refuses. */
-  def answerOnce(tenant: String, modelVersion: String, question: String): AnswerResult = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val request = AnswerRequest(tenant = tenant, modelVersion = modelVersion, question = question)
-    var last: Either[StatusRuntimeException, AnswerResult] = Left(null)
-    var attempt = 0
-    while (attempt < MaxAttempts) {
-      attempt += 1
-      try {
-        val result = stub.answer(request)
-        if (!result.refused) return result
-        last = Right(result)
-      } catch {
-        case e: StatusRuntimeException => last = Left(e)
-      }
-    }
-    last match {
-      case Right(result) => result
-      case Left(e)       => throw e
-    }
-  }
-
-  def writeBack(tenant: String, modelVersion: String, embedding: Seq[Double], result: AnswerResult): String = {
-    val entryId = UUID.randomUUID().toString
-    State.putEntry(tenant, modelVersion, entryId, embedding, result.text, modelVersion)
-    entryId
-  }
-
-  def answerOnMiss(tenant: String, modelVersion: String, question: String, embedding: Seq[Double]): Answered = {
-    val result = answerOnce(tenant, modelVersion, question)
-    val entryId = writeBack(tenant, modelVersion, embedding, result)
-    Answered(result.text, Some(entryId), cached = true)
-  }
-}
-`,
-      solution: `import java.util.UUID
-import java.util.concurrent.TimeUnit
-
-import io.grpc.ManagedChannelBuilder
-import semcache.model.{AnswerRequest, AnswerResult, ModelGrpc}
-
-/** The miss path: one model call under a deadline, and the gate on what may be written back. */
-object Client {
-  val ModelDeadlineSeconds = 4L
-  val ServingPolicyVersion = "2024-06-1"
-
-  private val channel = ManagedChannelBuilder.forAddress("model", 9000).usePlaintext().build()
-  private val stub = ModelGrpc.blockingStub(channel)
-
-  /** The model declined the question: terminal, and cached for nobody. */
-  class RefusalError(text: String) extends RuntimeException(s"the model refused: $text")
-
-  /** What the miss path hands back to the request. */
-  case class Answered(answer: String, entryId: Option[String], cached: Boolean)
-
-  /** Exactly one Answer call under the deadline; a refusal throws. */
-  def answerOnce(tenant: String, modelVersion: String, question: String): AnswerResult = {
-    val request = AnswerRequest(tenant = tenant, modelVersion = modelVersion, question = question)
-    val result = stub.withDeadlineAfter(ModelDeadlineSeconds, TimeUnit.SECONDS).answer(request)
-    if (result.refused) throw new RefusalError(result.text)
-    result
-  }
-
-  def isCacheable(result: AnswerResult): Boolean =
-    result.toolCalls.isEmpty && result.selfContained && result.deterministic && result.policy.exists(_.cacheable)
-
-  /** The new entry's id, or None when the reply may not be reused. */
-  def writeBack(tenant: String, modelVersion: String, embedding: Seq[Double], result: AnswerResult): Option[String] =
-    if (!isCacheable(result)) None
-    else {
-      val entryId = UUID.randomUUID().toString
-      State.putEntry(tenant, modelVersion, entryId, embedding, result.text, ServingPolicyVersion)
-      Some(entryId)
-    }
-
-  def answerOnMiss(tenant: String, modelVersion: String, question: String, embedding: Seq[Double]): Answered = {
-    val result = answerOnce(tenant, modelVersion, question)
-    val entryId = writeBack(tenant, modelVersion, embedding, result)
-    Answered(result.text, entryId, cached = entryId.isDefined)
-  }
 }
 `,
     },

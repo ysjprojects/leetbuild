@@ -53,10 +53,6 @@ service Suggester { rpc Suggest(SuggestRequest) returns (SuggestReply); }  // te
           all: [/deadline\s*=\s*150\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*deadline\)/],
           none: [/2\s*\*\s*time\.Second/],
         },
-        scala: {
-          all: [/DeadlineMs\s*=\s*150L?\b/, /withDeadlineAfter\(\s*DeadlineMs,\s*TimeUnit\.MILLISECONDS/],
-          none: [/TimeoutSeconds/],
-        },
         cpp: {all: [/kDeadline\{150\}/, /set_deadline\([^\n]*kDeadline\)/], none: [/seconds\{2\}/]},
       },
     },
@@ -69,7 +65,6 @@ service Suggester { rpc Suggest(SuggestRequest) returns (SuggestReply); }  // te
         python: {all: [/except grpc\.RpcError/], none: [/ATTEMPTS|for \w+ in range\(/, /while True/, /time\.sleep\(/]},
         typescript: {all: [/catch/], none: [/ATTEMPTS|for \(let attempt/, /while \(true\)/]},
         go: {all: [/suggester\.Suggest\(/], none: [/attempts|for attempt/]},
-        scala: {all: [/StatusRuntimeException/], none: [/Attempts|\(1 to \d\)/]},
         cpp: {all: [/suggester->Suggest\(/], none: [/kAttempts|for \(int attempt/]},
       },
     },
@@ -84,7 +79,6 @@ service Suggester { rpc Suggest(SuggestRequest) returns (SuggestReply); }  // te
         },
         typescript: {all: [/FALLBACK_SUGGESTIONS\s*=/, /FALLBACK_VERSION\s*=/, /['"]fallback['"]/, /fallback_version/]},
         go: {all: [/fallbackSuggestions\s*=/, /fallbackVersion\s*=/, /"fallback"/, /fallback_version/]},
-        scala: {all: [/FallbackSuggestions\s*[:=]/, /FallbackVersion\s*=/, /"fallback"/]},
         cpp: {all: [/kFallbackSuggestions\s*=/, /kFallbackVersion\s*=/, /"fallback"/]},
       },
     },
@@ -97,7 +91,6 @@ service Suggester { rpc Suggest(SuggestRequest) returns (SuggestReply); }  // te
         python: {all: [/except grpc\.RpcError[^\n]*:\s*\n(?:\s*#[^\n]*\n)*\s*return\b/]},
         typescript: {all: [/catch\s*(?:\([^)]*\))?\s*\{\s*(?:\/\/[^\n]*\s*)*return\b/]},
         go: {order: [/if err != nil \{/, /Source:\s*"fallback"/, /cache\.PutSuggestions\(/]},
-        scala: {order: [/case None => fallback\(|StatusRuntimeException\s*=>\s*fallback\(/, /Cache\.putSuggestions\(/]},
         cpp: {order: [/!suggester->Suggest\([^\n]*\.ok\(\)\)/, /"fallback"/, /cache::putSuggestions\(/]},
       },
     },
@@ -357,84 +350,6 @@ func suggest(ctx context.Context, tenant, prefix string) answer {
 	suggestions := append([]string{}, reply.GetTerms()...)
 	cache.PutSuggestions(ctx, tenant, prefix, suggestions)
 	return answer{Suggestions: suggestions, Source: "suggester"}
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import suggest.Cache // Cache.getSuggestions, Cache.putSuggestions
-import suggestd.autocomplete_service.{SuggestRequest, SuggesterGrpc}
-
-/** The completions of a prefix and where they came from. */
-final case class Answer(suggestions: Seq[String], source: String, fallbackVersion: Option[String] = None)
-
-object Client {
-  val TimeoutSeconds = 2L
-  val Attempts = 3
-
-  private val suggester = SuggesterGrpc.blockingStub(ManagedChannelBuilder.forAddress("suggester", 9000).usePlaintext().build())
-
-  /** Completions of the tenant's folded prefix. */
-  def suggest(tenant: String, prefix: String): Answer = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    Cache.getSuggestions(tenant, prefix) match {
-      case Some(cached) => Answer(cached, "cache")
-      case None =>
-        val suggestions = (1 to Attempts).iterator
-          .map { _ =>
-            try Some(suggester.withDeadlineAfter(TimeoutSeconds, TimeUnit.SECONDS).suggest(SuggestRequest(tenant, prefix, 10)).terms)
-            catch { case _: StatusRuntimeException => None }
-          }
-          .collectFirst { case Some(terms) => terms }
-          .getOrElse(Seq.empty)
-        Cache.putSuggestions(tenant, prefix, suggestions)
-        Answer(suggestions, "suggester")
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import suggest.Cache // Cache.getSuggestions, Cache.putSuggestions
-import suggestd.autocomplete_service.{SuggestRequest, SuggesterGrpc}
-
-/** The completions of a prefix and where they came from. */
-final case class Answer(suggestions: Seq[String], source: String, fallbackVersion: Option[String] = None)
-
-object Client {
-  val DeadlineMs = 150L
-  val FallbackVersion = "curated-2026-11-01"
-  val FallbackSuggestions: Seq[String] = Seq("integrations", "inventory", "invoices", "kettle", "keyboard")
-
-  private val suggester = SuggesterGrpc.blockingStub(ManagedChannelBuilder.forAddress("suggester", 9000).usePlaintext().build())
-
-  private def fallback(prefix: String): Answer =
-    Answer(FallbackSuggestions.filter(_.startsWith(prefix)), "fallback", Some(FallbackVersion))
-
-  /** Completions of the tenant's folded prefix. */
-  def suggest(tenant: String, prefix: String): Answer =
-    Cache.getSuggestions(tenant, prefix) match {
-      case Some(cached) => Answer(cached, "cache")
-      case None =>
-        // One attempt under the deadline: a retry here multiplies the load on a suggester that is already slow.
-        val reply =
-          try Some(suggester.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).suggest(SuggestRequest(tenant, prefix, 10)))
-          catch {
-            // Degraded, and not cached: the next keystroke asks the suggester again.
-            case _: StatusRuntimeException => None
-          }
-        reply match {
-          case None => fallback(prefix)
-          case Some(answered) =>
-            Cache.putSuggestions(tenant, prefix, answered.terms)
-            Answer(answered.terms, "suggester")
-        }
-    }
 }
 `,
     },

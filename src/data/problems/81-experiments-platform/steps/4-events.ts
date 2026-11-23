@@ -53,7 +53,6 @@ between commit and count loses it.
         python: {all: [/produce\([\s\S]{0,120}?key\s*=\s*experiment_id/], none: [/key\s*=\s*unit_id/]},
         typescript: {all: [/key:\s*experimentId\b/], none: [/key:\s*unitId\b/]},
         go: {all: [/Key:\s*\[\]byte\(experimentID\)/], none: [/Key:\s*\[\]byte\(unitID\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*experimentId/], none: [/Topic,\s*unitId/]},
         cpp: {
           all: [/experiment_id\.c_str\(\),\s*experiment_id\.size\(\)/],
           none: [/unit_id\.c_str\(\),\s*unit_id\.size\(\)/],
@@ -69,7 +68,6 @@ between commit and count loses it.
         python: {all: [/nx\s*=\s*True/, /:seen:/], none: [/\b_seen\b/]},
         typescript: {all: [/['"]NX['"]/, /:seen:/], none: [/new Set</]},
         go: {all: [/\.SetNX\(/, /":seen:"/], none: [/seen\s*=\s*map\[/]},
-        scala: {all: [/\.nx\(\)/, /:seen:/], none: [/mutable\.Set/]},
         cpp: {all: [/UpdateType::NOT_EXIST/, /":seen:"/], none: [/std::set<std::string>\s+seen/]},
       },
     },
@@ -77,12 +75,11 @@ between commit and count loses it.
       id: 'delivery-release',
       title: 'A refused delivery releases the claim',
       detail:
-        'The delivery result is read where it arrives (`on_delivery`, the rejected `send`, the error `WriteMessages` returns, a producer `Callback`, `dr_cb`) and a failure deletes the claim, so the next render publishes the exposure again.',
+        'The delivery result is read where it arrives (`on_delivery`, the rejected `send`, the error `WriteMessages` returns, `dr_cb`) and a failure deletes the claim, so the next render publishes the exposure again.',
       match: {
         python: {all: [/on_delivery\s*=/, /\.delete\(/], none: [/except KafkaException/]},
         typescript: {all: [/redis\.del\(/]},
         go: {all: [/rdb\.Del\(/]},
-        scala: {all: [/onCompletion/, /jedis\.del\(/]},
         cpp: {all: [/dr_cb/, /redis\.del\(/]},
       },
     },
@@ -95,7 +92,6 @@ between commit and count loses it.
         python: {order: [/store\.add_exposure\(/, /consumer\.commit\(/]},
         typescript: {order: [/addExposure\(/, /commitOffsets\(/]},
         go: {order: [/store\.AddExposure\(/, /\.CommitMessages\(/]},
-        scala: {order: [/Store\.addExposure\(/, /\.commitSync\(/]},
         cpp: {order: [/store::addExposure\(/, /->commitSync\(/]},
       },
     },
@@ -410,123 +406,6 @@ func consumeExposures(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.{Duration, Instant}
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import expd.Store // Store.addExposure
-
-import scala.jdk.CollectionConverters._
-
-object Events {
-  val Topic = "experiment.exposure"
-  val ExposureTtlSeconds: Long = 7L * 24 * 3600
-
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  props.put(ProducerConfig.ACKS_CONFIG, "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private val seen = scala.collection.mutable.Set.empty[(String, String)]
-
-  /** Publish the unit's first exposure to the experiment; false when it was already recorded. */
-  def recordExposure(experimentId: String, unitId: String, variant: String): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    if (!seen.add((experimentId, unitId))) false
-    else {
-      val event = JsObject("experiment_id" -> JsString(experimentId), "unit_id" -> JsString(unitId), "variant" -> JsString(variant),
-        "ts" -> JsNumber(Instant.now().getEpochSecond)).compactPrint
-      try producer.send(new ProducerRecord[String, String](Topic, unitId, event))
-      catch { case e: Exception => println(s"exposure to $experimentId not produced: \${e.getMessage}") }
-      true
-    }
-  }
-
-  def consumeExposures(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, "exposure-stats")
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        consumer.commitSync()
-        val event = record.value().parseJson.asJsObject.fields
-        Store.addExposure(event("experiment_id").convertTo[String](DefaultJsonProtocol.StringJsonFormat), event("variant").convertTo[String](DefaultJsonProtocol.StringJsonFormat))
-      }
-    }
-  }
-}
-`,
-      solution: `import java.time.{Duration, Instant}
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-
-import expd.Store // Store.addExposure
-
-import scala.jdk.CollectionConverters._
-
-object Events {
-  val Topic = "experiment.exposure"
-  val ExposureTtlSeconds: Long = 7L * 24 * 3600
-
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  props.put(ProducerConfig.ACKS_CONFIG, "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Publish the unit's first exposure to the experiment; false when it was already recorded. */
-  def recordExposure(experimentId: String, unitId: String, variant: String): Boolean = {
-    val claim = s"exp:$experimentId:seen:$unitId"
-    // One event per (experiment, unit) across every replica: the claim lives in Redis, not in the process.
-    if (jedis.set(claim, variant, SetParams.setParams().nx().ex(ExposureTtlSeconds)) != "OK") false
-    else {
-      val event = JsObject("experiment_id" -> JsString(experimentId), "unit_id" -> JsString(unitId), "variant" -> JsString(variant),
-        "ts" -> JsNumber(Instant.now().getEpochSecond)).compactPrint
-      val onDelivery: Callback = new Callback {
-        override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-          if (exception != null) jedis.del(claim) // not on the topic: the next render publishes it again
-      }
-      producer.send(new ProducerRecord[String, String](Topic, experimentId, event), onDelivery)
-      true
-    }
-  }
-
-  def consumeExposures(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, "exposure-stats")
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val event = record.value().parseJson.asJsObject.fields
-        Store.addExposure(event("experiment_id").convertTo[String](DefaultJsonProtocol.StringJsonFormat), event("variant").convertTo[String](DefaultJsonProtocol.StringJsonFormat))
-        consumer.commitSync() // after the count: a crash before this point redelivers
-      }
-    }
-  }
 }
 `,
     },

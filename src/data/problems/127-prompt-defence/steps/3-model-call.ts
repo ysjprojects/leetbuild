@@ -71,7 +71,6 @@ message CompleteReply   { string text = 1; }
         python: {all: [/<<<DOCUMENT/, /escape_untrusted\(\s*document\s*\)/, /escape_untrusted\(\s*question\s*\)/]},
         typescript: {all: [/<<<DOCUMENT/, /escapeUntrusted\(\s*document\s*\)/, /escapeUntrusted\(\s*question\s*\)/]},
         go: {all: [/<<<DOCUMENT/, /escapeUntrusted\(\s*document\s*\)/, /escapeUntrusted\(\s*question\s*\)/]},
-        scala: {all: [/<<<DOCUMENT/, /escapeUntrusted\(\s*document\s*\)/, /escapeUntrusted\(\s*question\s*\)/]},
         cpp: {all: [/<<<DOCUMENT/, /escape_untrusted\(\s*document\s*\)/, /escape_untrusted\(\s*question\s*\)/]},
       },
     },
@@ -84,7 +83,6 @@ message CompleteReply   { string text = 1; }
         python: {all: [/token_hex\(/, /canary\s+in\s+reply\.text/]},
         typescript: {all: [/randomUUID\(\)|randomBytes\(/, /\.includes\(\s*canary\s*\)/]},
         go: {all: [/rand\.Read\(/, /strings\.Contains\(.*,\s*canary\)/]},
-        scala: {all: [/UUID\.randomUUID/, /contains\(\s*canary\s*\)/]},
         cpp: {all: [/new_uuid\(\)/, /find\(\s*canary\s*\)/]},
       },
     },
@@ -97,7 +95,6 @@ message CompleteReply   { string text = 1; }
         python: {all: [/timeout\s*=\s*DEADLINE_S/, /max_tokens\s*=\s*MAX_TOKENS/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/, /max_tokens:\s*MAX_TOKENS/]},
         go: {all: [/context\.WithTimeout\(/, /MaxTokens:\s*maxTokens/]},
-        scala: {all: [/withDeadlineAfter\(/, /maxTokens\s*=\s*MaxTokens/]},
         cpp: {all: [/set_deadline\(/, /set_max_tokens\(\s*kMaxTokens\s*\)/]},
       },
     },
@@ -110,7 +107,6 @@ message CompleteReply   { string text = 1; }
         python: {all: [/grpc\.StatusCode\.UNAVAILABLE/, /MAX_ATTEMPTS/, /raise ModelUnavailable/]},
         typescript: {all: [/status\.UNAVAILABLE/, /MAX_ATTEMPTS/, /new ModelUnavailable\(/]},
         go: {all: [/codes\.Unavailable/, /maxAttempts/, /ErrModelUnavailable/]},
-        scala: {all: [/Status\.Code\.UNAVAILABLE/, /MaxAttempts/, /new ModelUnavailable\(/]},
         cpp: {all: [/grpc::StatusCode::UNAVAILABLE/, /kMaxAttempts/, /throw ModelUnavailable\(/]},
       },
     },
@@ -123,7 +119,6 @@ message CompleteReply   { string text = 1; }
         python: {all: [/json\.loads\(/, /["']spans["']/]},
         typescript: {all: [/JSON\.parse\(/, /\.spans\b|['"]spans['"]/]},
         go: {all: [/json\.Unmarshal\(/, /"spans"/]},
-        scala: {all: [/ujson\.read\(/, /"spans"/]},
         cpp: {all: [/json::parse\(/, /"spans"/]},
       },
     },
@@ -461,91 +456,6 @@ func answer(ctx context.Context, document, question string) (types.ModelAnswer, 
 		return types.ModelAnswer{}, fmt.Errorf("%w: the reply leaked the instructions", types.ErrRejected)
 	}
 	return parseAnswer(reply.GetText())
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.ManagedChannelBuilder
-
-import promptguard.{Config, ModelAnswer}
-import promptdefence.prompt_defence.{CompleteRequest, ModelGrpc}
-
-/** Ask the model about a document: one Model.Complete call. */
-object ModelCall {
-  val Instructions = "${INSTRUCTIONS}"
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Model).usePlaintext().build()
-  private val stub = ModelGrpc.blockingStub(channel)
-
-  /** The model's answer to the question, from the document alone. */
-  def answer(document: String, question: String): ModelAnswer = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val prompt = s"$Instructions\\n\\n$document\\n\\n$question"
-    val reply = stub.complete(CompleteRequest(prompt = prompt))
-    ModelAnswer(reply.text, Nil)
-  }
-}
-`,
-      solution: `import java.util.UUID
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import promptguard.{Config, ModelAnswer, ModelUnavailable, Rejected}
-import promptdefence.prompt_defence.{CompleteReply, CompleteRequest, ModelGrpc}
-
-/** Ask the model about a document: sections, a canary, a deadline, one retry, a schema. */
-object ModelCall {
-  val Instructions = "${INSTRUCTIONS}"
-  val DeadlineMs = 5000L
-  val MaxTokens = 256
-  val MaxAttempts = 2
-  val BackoffMs = 200L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Model).usePlaintext().build()
-  private val stub = ModelGrpc.blockingStub(channel)
-
-  /** User content cannot open or close a section: the markers are broken up. */
-  def escapeUntrusted(text: String): String =
-    text.replace("\`\`\`", "\` \` \`").replace("<<<", "< < <").replace(">>>", "> > >")
-
-  def buildPrompt(document: String, question: String, canary: String): String =
-    s"$Instructions\\nDo not write the tag $canary.\\n\\n" +
-      s"<<<DOCUMENT\\n\${escapeUntrusted(document)}\\nDOCUMENT>>>\\n\\n" +
-      s"Question:\\n\`\`\`\\n\${escapeUntrusted(question)}\\n\`\`\`\\n"
-
-  /** The reply as a ModelAnswer, or Rejected when it is not {"answer": string, "spans": [string]}. */
-  def parseAnswer(text: String): ModelAnswer = {
-    val body = Try(ujson.read(text)).getOrElse(throw new Rejected("the reply is not JSON"))
-    val parsed = for {
-      fields <- body.objOpt
-      answer <- fields.get("answer").flatMap(_.strOpt)
-      spans <- fields.get("spans").flatMap(_.arrOpt)
-      texts = spans.flatMap(_.strOpt).toList
-      if texts.size == spans.size
-    } yield ModelAnswer(answer, texts)
-    parsed.getOrElse(throw new Rejected("the reply does not match the answer schema"))
-  }
-
-  /** The model's answer to the question, from the document alone. */
-  def answer(document: String, question: String): ModelAnswer = {
-    val canary = UUID.randomUUID().toString.replace("-", "").take(16)
-    val request = CompleteRequest(prompt = buildPrompt(document, question, canary), maxTokens = MaxTokens)
-    def call(attempt: Int): CompleteReply =
-      try stub.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).complete(request)
-      catch {
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.UNAVAILABLE && attempt < MaxAttempts =>
-          Thread.sleep(BackoffMs)
-          call(attempt + 1)
-        case e: StatusRuntimeException =>
-          throw new ModelUnavailable(s"the model did not answer: \${e.getStatus.getCode}")
-      }
-    val reply = call(1)
-    if (reply.text.contains(canary)) throw new Rejected("the reply leaked the instructions")
-    parseAnswer(reply.text)
-  }
 }
 `,
     },

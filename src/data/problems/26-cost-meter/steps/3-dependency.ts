@@ -60,7 +60,6 @@ Requirements:
         python: {all: [/timeout\s*=\s*PRICE_DEADLINE_S/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*PRICE_DEADLINE_MS/]},
         go: {all: [/context\.WithTimeout\(/, /priceDeadline/]},
-        scala: {all: [/withDeadlineAfter\(/, /PriceDeadlineMs/]},
         cpp: {all: [/set_deadline\(/, /kPriceDeadline/]},
       },
     },
@@ -73,7 +72,6 @@ Requirements:
         python: {all: [/["']cache["']/], none: [/FALLBACK_RATE/]},
         typescript: {all: [/['"]cache['"]/], none: [/FALLBACK_RATE/]},
         go: {all: [/"cache"/], none: [/fallbackRate/]},
-        scala: {all: [/"cache"/], none: [/FallbackRate/]},
         cpp: {all: [/"cache"/], none: [/kFallbackRate/]},
       },
     },
@@ -86,7 +84,6 @@ Requirements:
         python: {all: [/PRICE_MAX_AGE_S/]},
         typescript: {all: [/PRICE_MAX_AGE_S/]},
         go: {all: [/priceMaxAge/]},
-        scala: {all: [/PriceMaxAgeSeconds/]},
         cpp: {all: [/kPriceMaxAge/]},
       },
     },
@@ -99,7 +96,6 @@ Requirements:
         python: {all: [/["']uncosted["']/], none: [/FALLBACK_RATE/]},
         typescript: {all: [/['"]uncosted['"]/], none: [/FALLBACK_RATE/]},
         go: {all: [/"uncosted"/], none: [/fallbackRate/]},
-        scala: {all: [/"uncosted"/], none: [/FallbackRate/]},
         cpp: {all: [/"uncosted"/], none: [/kFallbackRate/]},
       },
     },
@@ -112,7 +108,6 @@ Requirements:
         python: {all: [/fetched_at/], none: [/PRICE_CACHE/]},
         typescript: {all: [/fetchedAt/], none: [/PRICE_CACHE/]},
         go: {all: [/fetchedAt/], none: [/priceCache/]},
-        scala: {all: [/fetchedAt/], none: [/PriceCache/]},
         cpp: {all: [/fetched_at/], none: [/price_cache/]},
       },
     },
@@ -469,104 +464,6 @@ func costOf(ctx context.Context, model string, inputTokens, outputTokens int64) 
 	}
 	cost := (inputTokens*rate[0] + outputTokens*rate[1]) / 1000
 	return Price{CostMicros: cost, Priced: true, Source: source, RateVersion: table.version}
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import scala.collection.mutable
-
-import meter.Config
-import meter.pricing.{PricingGrpc, RatesRequest}
-
-/** One report's price. */
-final case class Price(costMicros: Long, priced: Boolean, source: String, rateVersion: String)
-
-object PricingClient {
-  val FallbackRate: (Long, Long) = (10000L, 30000L)
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Pricing).usePlaintext().build()
-  private val stub = PricingGrpc.blockingStub(channel)
-
-  /** model -> (input rate, output rate, version) */
-  private val PriceCache = mutable.Map[String, (Long, Long, String)]()
-
-  /** Price one report. */
-  def costOf(model: String, inputTokens: Long, outputTokens: Long): Price = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val (inputRate, outputRate, version) = PriceCache.getOrElseUpdate(
-      model,
-      try {
-        val table = stub.getRates(RatesRequest())
-        table.rates.find(_.model == model) match {
-          case Some(r) => (r.inputRate.toLong, r.outputRate.toLong, table.version)
-          case None    => (FallbackRate._1, FallbackRate._2, table.version)
-        }
-      } catch {
-        case e: StatusRuntimeException =>
-          System.err.println(s"pricing unavailable model=$model code=\${e.getStatus.getCode}")
-          (FallbackRate._1, FallbackRate._2, "fallback")
-      }
-    )
-    Price((inputTokens * inputRate + outputTokens * outputRate) / 1000, priced = true, "service", version)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import meter.Config
-import meter.pricing.{PricingGrpc, RatesRequest}
-
-/** One report's price. */
-final case class Price(costMicros: Long, priced: Boolean, source: String, rateVersion: String)
-
-/** A table the service answered, and when. */
-final case class CachedTable(version: String, rates: Map[String, (Long, Long)], fetchedAt: Long)
-
-object PricingClient {
-  val PriceDeadlineMs = 200L
-  val PriceMaxAgeSeconds = 3600L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Pricing).usePlaintext().build()
-  private val stub = PricingGrpc.blockingStub(channel)
-
-  /** The last table the service answered. Only a reply writes it. */
-  @volatile private var lastTable: Option[CachedTable] = None
-
-  private def nowSeconds: Long = System.currentTimeMillis() / 1000
-
-  private def fetchRates(): Option[CachedTable] =
-    try {
-      val reply = stub.withDeadlineAfter(PriceDeadlineMs, TimeUnit.MILLISECONDS).getRates(RatesRequest())
-      val table = CachedTable(
-        reply.version,
-        reply.rates.map(r => r.model -> (r.inputRate.toLong, r.outputRate.toLong)).toMap,
-        nowSeconds
-      )
-      lastTable = Some(table)
-      Some(table)
-    } catch {
-      case e: StatusRuntimeException =>
-        System.err.println(s"pricing unavailable code=\${e.getStatus.getCode}")
-        None
-    }
-
-  /** Price one report. */
-  def costOf(model: String, inputTokens: Long, outputTokens: Long): Price = {
-    val uncosted = Price(0, priced = false, "uncosted", "")
-    val (table, source) = fetchRates() match {
-      case Some(fresh) => (Some(fresh), "service")
-      case None        => (lastTable.filter(t => nowSeconds - t.fetchedAt <= PriceMaxAgeSeconds), "cache")
-    }
-    table.flatMap(t => t.rates.get(model).map(rate => (t, rate))) match {
-      case Some((t, (inputRate, outputRate))) =>
-        Price((inputTokens * inputRate + outputTokens * outputRate) / 1000, priced = true, source, t.version)
-      case None => uncosted // priced later by reconciliation, not now by a guess
-    }
-  }
 }
 `,
     },

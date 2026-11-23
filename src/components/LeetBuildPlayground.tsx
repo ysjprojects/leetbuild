@@ -678,12 +678,11 @@ const Explorer: FC<{
   /** Fold the explorer into a strip beside the editor (`lg` and up), as the problem pane folds. */
   onCollapse: () => void;
 }> = memo(({problem, language, provided, attempts, stepId, openFile, onOpen, onCollapse}) => {
-  // Where the language's build looks for sources: sbt under src/main/scala; the others at the root.
   const tree = useMemo(
     () =>
       buildTree<Leaf>([
         ...problem.steps.map((step, index) => ({
-          path: `${language === 'scala' ? 'src/main/scala/' : ''}${fileName(step.file, language)}`,
+          path: fileName(step.file, language),
           leaf: {kind: 'step' as const, step, index},
         })),
         ...provided.map(file => ({path: file.path, leaf: {kind: 'provided' as const, file}})),
@@ -1576,12 +1575,13 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   /** A past submission's code, read-only, with the edits since it and a way to put it back in the editor. */
   const onViewSubmission = useCallback(
     (submission: Submission) => {
-      if (step === null || panes === null || submission.code === undefined) return;
+      if (step === null || panes === null || submission.code === undefined || submission.language === null) return;
       const code = submission.code;
-      const sameLanguage = submission.language === language;
+      const submitted = submission.language;
+      const sameLanguage = submitted === language;
       void openDialog({
         title: `${submission.accepted ? 'Accepted' : 'Wrong Answer'} · ${submission.passed}/${submission.total} · ${
-          LANGUAGE_LABEL[submission.language]
+          LANGUAGE_LABEL[submitted]
         } · ${new Date(submission.at).toLocaleString(undefined, {
           month: 'short',
           day: 'numeric',
@@ -1592,8 +1592,8 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
           <panes.SubmissionCode
             code={code}
             current={sameLanguage ? filesRef.current[step.id] ?? codeFor(step, language).starter : null}
-            label={`${fileName(step.file, submission.language)}, as submitted`}
-            language={submission.language}
+            label={`${fileName(step.file, submitted)}, as submitted`}
+            language={submitted}
           />
         ),
         confirm: sameLanguage ? 'Restore to editor' : undefined,

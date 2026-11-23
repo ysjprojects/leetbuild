@@ -54,7 +54,6 @@ caller.
         python: {all: [/@app\.get\(\s*["']\/v1\/requests\/\{/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/requests\/:/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/requests\/\{/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"requests"\s*\/\s*Segment\s*\)/, /\bget\b/]},
         cpp: {all: [/svr\.Get\(\s*R?"[^"]*\/v1\/requests\//]},
       },
     },
@@ -67,7 +66,6 @@ caller.
         python: {all: [/x-tenant-id/i, /\b401\b/]},
         typescript: {all: [/x-tenant-id/i, /\b401\b/]},
         go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/X-Tenant-Id/i, /Unauthorized|\b401\b/]},
         cpp: {all: [/X-Tenant-Id/i, /\b401\b/]},
       },
     },
@@ -80,7 +78,6 @@ caller.
         python: {all: [/chain_version/], none: [/resolve_approvers/]},
         typescript: {all: [/chain_version/], none: [/resolveApprovers/]},
         go: {all: [/ChainVersion/], none: [/ResolveApprovers/]},
-        scala: {all: [/chainVersion/], none: [/resolveApprovers/]},
         cpp: {all: [/chain_version/], none: [/resolveApprovers/]},
       },
     },
@@ -93,7 +90,6 @@ caller.
         python: {all: [/\.hgetall\(/], none: [/\.hget\(/]},
         typescript: {all: [/\.hgetall\(/], none: [/\.hget\(/]},
         go: {all: [/\.HGetAll\(/], none: [/\.HGet\(/]},
-        scala: {all: [/\.hgetAll\(/], none: [/\.hget\(/]},
         cpp: {all: [/\.hgetall\(/], none: [/\.hget\(/]},
       },
     },
@@ -106,7 +102,6 @@ caller.
         python: {all: [/no-store/], none: [/public/]},
         typescript: {all: [/no-store/], none: [/public/]},
         go: {all: [/no-store/], none: [/public/]},
-        scala: {all: [/no-store/], none: [/public/]},
         cpp: {all: [/no-store/], none: [/public/]},
       },
     },
@@ -390,104 +385,6 @@ func readRequest(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/requests/{id}", readRequest)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import approvals.{Policy, Store} // Policy.resolveApprovers · Store.load
-
-object Read {
-  val jedis = new JedisPooled("redis", 6379)
-
-  def read(tenant: String, requestId: String): HttpResponse = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    Store.load(requestId) match {
-      case None => HttpResponse(StatusCodes.NotFound, entity = HttpEntity(ContentTypes.\`application/json\`, """{"error":"no such request"}"""))
-      case Some(stored) =>
-        val current = Policy.resolveApprovers(stored.chainId).getOrElse(Policy.Chain(0, Seq.empty))
-        val key = s"approval:$requestId:state"
-        val stepIndex = Option(jedis.hget(key, "step_index")).map(_.toLong).getOrElse(0L)
-        val status = Option(jedis.hget(key, "status")).getOrElse("")
-        val steps = current.approvers.zipWithIndex.map { case (approver, i) =>
-          JsObject(
-            "step" -> JsNumber(i),
-            "approver" -> JsString(approver),
-            "state" -> JsString(Option(jedis.hget(key, s"decision:$i")).getOrElse("pending")),
-            "actor" -> JsString(Option(jedis.hget(key, s"actor:$i")).getOrElse("")))
-        }
-        val body = JsObject(
-          "request_id" -> JsString(requestId), "chain_id" -> JsString(stored.chainId), "chain_version" -> JsNumber(current.version),
-          "status" -> JsString(status), "step_index" -> JsNumber(stepIndex), "steps" -> JsArray(steps.toVector))
-        // the trail page polls this
-        HttpResponse(StatusCodes.OK, headers = List(RawHeader("Cache-Control", "public, max-age=60")),
-          entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-    }
-  }
-
-  val route: Route = path("v1" / "requests" / Segment) { requestId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        complete(read(tenant.getOrElse(""), requestId))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import approvals.Store // Store.load
-
-object Read {
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def error(status: StatusCode, message: String): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, JsObject("error" -> JsString(message)).compactPrint))
-
-  def read(tenant: String, requestId: String): HttpResponse = {
-    if (tenant.isEmpty) return error(StatusCodes.Unauthorized, "X-Tenant-Id is required")
-    Store.load(requestId).filter(_.tenant == tenant) match {
-      // Another tenant's request does not exist for this caller: same answer, nothing confirmed.
-      case None => error(StatusCodes.NotFound, "no such request")
-      case Some(stored) =>
-        val state = jedis.hgetAll(s"approval:$requestId:state").asScala // one command: every field from the same moment
-        // The chain pinned at submit time, whatever the policy says today.
-        val steps = stored.approvers.zipWithIndex.map { case (approver, i) =>
-          JsObject(
-            "step" -> JsNumber(i),
-            "approver" -> JsString(approver),
-            "state" -> JsString(state.getOrElse(s"decision:$i", "pending")),
-            "actor" -> JsString(state.getOrElse(s"actor:$i", "")))
-        }
-        val body = JsObject(
-          "request_id" -> JsString(requestId), "chain_id" -> JsString(stored.chainId), "chain_version" -> JsNumber(stored.chainVersion),
-          "status" -> JsString(state.getOrElse("status", "")), "step_index" -> JsNumber(state.get("step_index").map(_.toLong).getOrElse(0L)),
-          "steps" -> JsArray(steps.toVector))
-        HttpResponse(StatusCodes.OK, headers = List(RawHeader("Cache-Control", "private, no-store")),
-          entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-    }
-  }
-
-  val route: Route = path("v1" / "requests" / Segment) { requestId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        complete(read(tenant.getOrElse(""), requestId))
-      }
-    }
-  }
 }
 `,
     },

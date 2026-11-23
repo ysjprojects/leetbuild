@@ -58,10 +58,6 @@ the fifth email of the minute both pass; every counter stays in Redis for good; 
           all: [/suppressedSet\s*=\s*"mail:suppressed"/, /\.SAdd\(/, /SISMEMBER/],
           none: [/suppressionTTL/i, /SetEx\(|\.Set\([^\n]*mail:suppressed/],
         },
-        scala: {
-          all: [/SuppressedSet\s*=\s*"mail:suppressed"/, /jedis\.sadd\(/, /SISMEMBER/],
-          none: [/setex/i, /SuppressionTtl/i],
-        },
         cpp: {
           all: [/kSuppressedSet\s*=\s*"mail:suppressed"/, /\.sadd\(/, /SISMEMBER/],
           none: [/kSuppressionTtl/i, /\.set\([^\n]*mail:suppressed/],
@@ -83,7 +79,6 @@ the fifth email of the minute both pass; every counter stays in Redis for good; 
           none: [/redis\.incr\(/, /redis\.get\(/],
         },
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/rdb\.Incr\(/, /rdb\.Get\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/jedis\.incr\(/, /jedis\.get\(/]},
         cpp: {all: [/\.eval(sha)?</, /redis\.call\(\s*['"]INCR['"]/], none: [/\.incr\(/, /redis\.get\(/]},
       },
     },
@@ -96,7 +91,6 @@ the fifth email of the minute both pass; every counter stays in Redis for good; 
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /WINDOW_S\s*=\s*60\b/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /WINDOW_S\s*=\s*60\b/]},
         go: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /windowSeconds\s*=\s*60\b/]},
-        scala: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /WindowSeconds\s*=\s*60L?\b/]},
         cpp: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /kWindowSeconds\s*=\s*60\b/]},
       },
     },
@@ -109,7 +103,6 @@ the fifth email of the minute both pass; every counter stays in Redis for good; 
         python: {all: [/normalize\(\s*address\s*\)/]},
         typescript: {all: [/normalize\(\s*address\s*\)/]},
         go: {all: [/address\.Normalize\(/]},
-        scala: {all: [/Address\.normalize\(/]},
         cpp: {all: [/address::normalize\(/]},
       },
     },
@@ -373,84 +366,6 @@ func isSuppressed(ctx context.Context, addr string) (bool, error) {
 func admit(ctx context.Context, addr string) (string, error) {
 	normalized := address.Normalize(addr)
 	return admitScript.Run(ctx, rdb, []string{suppressedSet, rateKey(normalized, time.Now())}, normalized, windowSeconds, rateLimit).Text()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import mail.Address // Address.normalize(address): trimmed, lowercase
-
-object Admission {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val RateLimit = 5
-  val WindowSeconds = 60L
-  val SuppressionTtlSeconds = 3600L
-
-  def rateKey(address: String, nowMillis: Long): String = s"mail:rate:$address:\${nowMillis / 1000 / WindowSeconds}"
-
-  /** Stop mailing an address (a hard bounce, a complaint, an unsubscribe). */
-  def suppress(address: String): Unit = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    jedis.setex(s"mail:suppressed:$address", SuppressionTtlSeconds, "1")
-    ()
-  }
-
-  def isSuppressed(address: String): Boolean = jedis.exists(s"mail:suppressed:$address")
-
-  /** "suppressed", "rate_limited" or "ok" for one more email to the address. */
-  def admit(address: String): String =
-    if (isSuppressed(address)) "suppressed"
-    else {
-      val key = rateKey(address, System.currentTimeMillis())
-      val sent = Option(jedis.get(key)).map(_.toInt).getOrElse(0)
-      if (sent >= RateLimit) "rate_limited"
-      else {
-        jedis.incr(key)
-        "ok"
-      }
-    }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import mail.Address // Address.normalize(address): trimmed, lowercase
-
-object Admission {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val SuppressedSet = "mail:suppressed"
-  val RateLimit = 5
-  val WindowSeconds = 60L
-
-  // One decision, run whole by Redis: no other send can land between the check and the count.
-  val AdmitLua: String =
-    """if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then return 'suppressed' end
-      |local sent = redis.call('INCR', KEYS[2])
-      |if sent == 1 then redis.call('EXPIRE', KEYS[2], ARGV[2]) end
-      |if sent > tonumber(ARGV[3]) then return 'rate_limited' end
-      |return 'ok'
-      |""".stripMargin
-
-  def rateKey(address: String, nowMillis: Long): String = s"mail:rate:$address:\${nowMillis / 1000 / WindowSeconds}"
-
-  /** Stop mailing an address (a hard bounce, a complaint, an unsubscribe). */
-  def suppress(address: String): Unit = {
-    jedis.sadd(SuppressedSet, Address.normalize(address)) // durable: removed only by an explicit request
-    ()
-  }
-
-  def isSuppressed(address: String): Boolean = jedis.sismember(SuppressedSet, Address.normalize(address))
-
-  /** "suppressed", "rate_limited" or "ok" for one more email to the address. */
-  def admit(address: String): String = {
-    val normalized = Address.normalize(address)
-    val keys = List(SuppressedSet, rateKey(normalized, System.currentTimeMillis())).asJava
-    jedis.eval(AdmitLua, keys, List(normalized, WindowSeconds.toString, RateLimit.toString).asJava).toString
-  }
 }
 `,
     },

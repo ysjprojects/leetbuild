@@ -64,7 +64,6 @@ service ReceiptSigner { rpc Sign(SignRequest) returns (Receipt); }  // PERMISSIO
         python: {all: [/DEADLINE_S\s*=\s*0\.5\b/, /Sign\([\s\S]{0,120}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*500\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*500\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*deadline\)/]},
-        scala: {all: [/DeadlineMillis\s*=\s*500L?\b/, /withDeadlineAfter\(\s*DeadlineMillis/]},
         cpp: {all: [/kDeadline\{500\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -77,7 +76,6 @@ service ReceiptSigner { rpc Sign(SignRequest) returns (Receipt); }  // PERMISSIO
         python: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /raise ReceiptRefused/]},
         typescript: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /throw new ReceiptRefused/]},
         go: {all: [/codes\.Unavailable/, /codes\.DeadlineExceeded/, /ErrReceiptRefused\)?,/]},
-        scala: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /throw new ReceiptRefused/]},
         cpp: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /throw ReceiptRefused/]},
       },
     },
@@ -90,7 +88,6 @@ service ReceiptSigner { rpc Sign(SignRequest) returns (Receipt); }  // PERMISSIO
         python: {all: [/ledger\.queue_unsigned\(/], none: [/set_receipt\([^)\n]*""/]},
         typescript: {all: [/queueUnsigned\(/], none: [/setReceipt\([^)\n]*''/]},
         go: {all: [/ledger\.QueueUnsigned\(/], none: [/SetReceipt\([^)\n]*""/]},
-        scala: {all: [/Ledger\.queueUnsigned\(/], none: [/setReceipt\([^)\n]*""/]},
         cpp: {all: [/ledger::queueUnsigned\(/], none: [/setReceipt\([^)\n]*""/]},
       },
     },
@@ -103,7 +100,6 @@ service ReceiptSigner { rpc Sign(SignRequest) returns (Receipt); }  // PERMISSIO
         python: {none: [/signer_?[dD]own/]},
         typescript: {none: [/signer_?[dD]own/]},
         go: {none: [/signer_?[dD]own/]},
-        scala: {none: [/signer_?[dD]own/]},
         cpp: {none: [/signer_?[dD]own/]},
       },
     },
@@ -429,91 +425,6 @@ func requestReceipt(ctx context.Context, recordID string) (Receipt, error) {
 	// Unsigned is a state the signing worker repairs; signed without a signature would be a false claim.
 	ledger.QueueUnsigned(ctx, recordID)
 	return Receipt{RecordID: recordID, Status: "unsigned"}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import audit.{Chain, Ledger} // Chain.entryAt; Ledger.get, setReceipt, queueUnsigned
-import audit.signer.{ReceiptSignerGrpc, SignRequest}
-
-/** The signer refused for good (the key is revoked): an operator has to act. */
-final class ReceiptRefused(message: String) extends Exception(message)
-
-object Client {
-  final case class ReceiptResult(recordId: String, status: String, signature: String)
-
-  val MaxAttempts = 3
-
-  private val signer = ReceiptSignerGrpc.blockingStub(ManagedChannelBuilder.forAddress("signer", 9000).usePlaintext().build())
-
-  /** Set on the first failure, so later records do not wait on a signer that is down. */
-  @volatile private var signerDown = false
-
-  /** Have the signer sign the record's chain link. */
-  def requestReceipt(recordId: String): ReceiptResult = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val record = Ledger.get(recordId).get
-    val entry = Chain.entryAt(record.tenant, record.position).get
-    val request = SignRequest(recordId, record.tenant, record.position, entry.digest)
-    if (!signerDown) {
-      for (_ <- 1 to MaxAttempts) {
-        try {
-          val receipt = signer.sign(request)
-          Ledger.setReceipt(recordId, receipt.signature, receipt.keyId)
-          return ReceiptResult(recordId, "signed", receipt.signature)
-        } catch { case _: StatusRuntimeException => () }
-      }
-      signerDown = true
-    }
-    Ledger.setReceipt(recordId, "", "")
-    ReceiptResult(recordId, "signed", "")
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import audit.{Chain, Ledger} // Chain.entryAt; Ledger.get, setReceipt, queueUnsigned
-import audit.signer.{ReceiptSignerGrpc, SignRequest}
-
-/** The signer refused for good (the key is revoked): an operator has to act. */
-final class ReceiptRefused(message: String) extends Exception(message)
-
-object Client {
-  final case class ReceiptResult(recordId: String, status: String, signature: String)
-
-  val MaxAttempts = 3
-  val DeadlineMillis = 500L
-
-  private val signer = ReceiptSignerGrpc.blockingStub(ManagedChannelBuilder.forAddress("signer", 9000).usePlaintext().build())
-
-  /** Have the signer sign the record's chain link. */
-  def requestReceipt(recordId: String): ReceiptResult = {
-    val record = Ledger.get(recordId).get
-    val entry = Chain.entryAt(record.tenant, record.position).get
-    val request = SignRequest(recordId, record.tenant, record.position, entry.digest)
-    for (_ <- 1 to MaxAttempts) {
-      try {
-        val receipt = signer.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).sign(request)
-        Ledger.setReceipt(recordId, receipt.signature, receipt.keyId)
-        return ReceiptResult(recordId, "signed", receipt.signature)
-      } catch {
-        case e: StatusRuntimeException =>
-          val code = e.getStatus.getCode
-          if (code != Status.Code.UNAVAILABLE && code != Status.Code.DEADLINE_EXCEEDED) {
-            // Not a blip: the record waits in the queue and an operator hears about it now.
-            Ledger.queueUnsigned(recordId)
-            throw new ReceiptRefused(s"signer: $code \${e.getStatus.getDescription}")
-          }
-      }
-    }
-    // Unsigned is a state the signing worker repairs; signed without a signature would be a false claim.
-    Ledger.queueUnsigned(recordId)
-    ReceiptResult(recordId, "unsigned", "")
-  }
 }
 `,
     },

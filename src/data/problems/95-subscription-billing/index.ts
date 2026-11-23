@@ -6,7 +6,7 @@ import {billingCursorStep} from './steps/2-state';
 import {processorClientStep} from './steps/3-dependency';
 import {invoiceEventsStep} from './steps/4-events';
 import {invoiceLedgerStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Subscription billing: the course is not "charge a customer every month", it is the debugging you
@@ -98,6 +98,5 @@ workflows and revenue recognition.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

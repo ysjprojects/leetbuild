@@ -4,10 +4,9 @@
  * Idempotency-Key records of their creates, the tables each tenant may stream, their columns and
  * the sensitive ones, and `digest`, the SHA-256 a change event carries instead of a row.
  * `cdc.cursor` is the LSN cursor of step 2 as the later steps use it: `confirm` (a monotonic
- * compare-and-set in Lua) and `load_cursor`. The five languages keep the same keys, so a harness
+ * compare-and-set in Lua) and `load_cursor`. The four languages keep the same keys, so a harness
  * reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'cdc/__init__.py': '',
@@ -588,120 +587,5 @@ inline std::optional<int64_t> loadCursor(const std::string& subscription_id, con
 }
 
 }  // namespace cursor
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('cdc', 'Store')]: `package cdc
-
-import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The subscription store and the source catalog (provided). A subscription is a Redis hash
- * cdc:sub:{id} with id, tenant, table, columns (a comma list), sink, slot and status (active, or
- * slot_lost once its replication slot is gone); cdc:idem:{tenant}:{key} names the subscription a
- * create with that Idempotency-Key made. The catalog says which tables each tenant may stream, the
- * columns of every table of the source database, and which of them are sensitive.
- */
-object Store {
-  final case class Subscription(id: String, tenant: String, table: String, columns: Seq[String], sink: String, slot: String, status: String)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val Approved = Map("acme" -> Seq("orders", "customers", "invoices"), "globex" -> Seq("orders", "invoices"))
-  private val Schema = Map(
-    "orders" -> Seq("id", "customer_id", "status", "total_cents"),
-    "customers" -> Seq("id", "name", "email", "country"),
-    "invoices" -> Seq("id", "order_id", "amount_cents", "tax_id"),
-    "auth_users" -> Seq("id", "email", "password_hash"),
-    "sessions" -> Seq("id", "user_id", "token"))
-  private val Sensitive = Map("customers" -> Seq("email"), "invoices" -> Seq("tax_id"), "auth_users" -> Seq("email", "password_hash"), "sessions" -> Seq("token"))
-
-  /** The tables the tenant's data agreement lets it stream. */
-  def approvedTables(tenant: String): Seq[String] = Approved.getOrElse(tenant, Seq.empty)
-
-  /** The table's columns in the source database, or None when there is no such table. */
-  def tableColumns(table: String): Option[Seq[String]] = Schema.get(table)
-
-  /** The table's columns no subscription may stream. */
-  def sensitiveColumns(table: String): Seq[String] = Sensitive.getOrElse(table, Seq.empty)
-
-  /** The subscription as the API answers it. */
-  def toJson(s: Subscription): JsObject = JsObject(
-    "id" -> JsString(s.id), "tenant" -> JsString(s.tenant), "table" -> JsString(s.table),
-    "columns" -> JsArray(s.columns.map(JsString(_)).toVector), "sink" -> JsString(s.sink),
-    "slot" -> JsString(s.slot), "status" -> JsString(s.status))
-
-  /** The subscription, whoever owns it, if it exists. */
-  def findSubscription(id: String): Option[Subscription] = {
-    val raw = jedis.hgetAll(s"cdc:sub:$id").asScala.toMap
-    if (raw.isEmpty) None
-    else {
-      val columns = if (raw("columns").isEmpty) Seq.empty else raw("columns").split(",").toSeq
-      Some(Subscription(raw("id"), raw("tenant"), raw("table"), columns, raw("sink"), raw("slot"), raw("status")))
-    }
-  }
-
-  /** A new active subscription sub-{n} with its own replication slot cdc_sub_{n}; returns it. */
-  def createSubscription(tenant: String, table: String, columns: Seq[String], sink: String): Subscription = {
-    val n = jedis.incr("cdc:sub:seq")
-    val id = s"sub-$n"
-    jedis.hset(s"cdc:sub:$id", Map("id" -> id, "tenant" -> tenant, "table" -> table, "columns" -> columns.mkString(","),
-      "sink" -> sink, "slot" -> s"cdc_sub_$n", "status" -> "active").asJava)
-    findSubscription(id).get
-  }
-
-  /** The subscription a create of the tenant with this Idempotency-Key made, if any. */
-  def findByKey(tenant: String, key: String): Option[Subscription] =
-    Option(jedis.get(s"cdc:idem:$tenant:$key")).flatMap(findSubscription)
-
-  /** Remember which subscription the create (tenant, key) made, for its replays. */
-  def recordKey(tenant: String, key: String, id: String): Unit = jedis.set(s"cdc:idem:$tenant:$key", id)
-
-  def setStatus(id: String, status: String): Unit = jedis.hset(s"cdc:sub:$id", "status", status)
-
-  /** The SHA-256 of a row's JSON text, hex; "" when there is no row. */
-  def digest(row: String): String =
-    if (row.isEmpty) ""
-    else MessageDigest.getInstance("SHA-256").digest(row.getBytes(StandardCharsets.UTF_8)).map(b => f"\${b & 0xff}%02x").mkString
-}
-`,
-  [scalaPath('cdc', 'Cursor')]: `package cdc
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The LSN cursor (provided; step 2 builds the same functions): cdc:cursor:{subscription}:{table}
- * holds the last LSN the sink applied for that table, without expiry. confirm moves it forward in
- * one Lua compare-and-set and never back; it reports whether it moved. loadCursor is None before
- * the first confirmation.
- */
-object Cursor {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val AdvanceLua: String =
-    """local current = redis.call('GET', KEYS[1])
-      |if current and tonumber(current) >= tonumber(ARGV[1]) then return 0 end
-      |redis.call('SET', KEYS[1], ARGV[1])
-      |return 1
-      |""".stripMargin
-
-  def cursorKey(subscriptionId: String, table: String): String = s"cdc:cursor:$subscriptionId:$table"
-
-  /** Record that the sink applied the table's changes up to lsn; whether the cursor moved. */
-  def confirm(subscriptionId: String, table: String, lsn: Long): Boolean =
-    jedis.eval(AdvanceLua, List(cursorKey(subscriptionId, table)).asJava, List(lsn.toString).asJava).asInstanceOf[java.lang.Long] == 1L
-
-  /** The last confirmed LSN of the table, or None before the first confirmation. */
-  def loadCursor(subscriptionId: String, table: String): Option[Long] = Option(jedis.get(cursorKey(subscriptionId, table))).map(_.toLong)
-}
 `,
 };

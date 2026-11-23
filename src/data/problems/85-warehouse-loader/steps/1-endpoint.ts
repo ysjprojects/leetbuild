@@ -47,7 +47,6 @@ unknown mode is accepted.
         python: {all: [/@app\.post\(\s*["']\/v1\/loads["']/, /store\.create_load\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/loads['"]/, /createLoad\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/loads"/, /store\.CreateLoad\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"loads"\s*\)/, /Store\.createLoad\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/loads"/, /store::createLoad\(/]},
       },
     },
@@ -60,7 +59,6 @@ unknown mode is accepted.
         python: {all: [/TRANSFORMS/], none: [/TRANSFORMS\.get\(\s*transform\s*,\s*transform\s*\)/]},
         typescript: {all: [/TRANSFORMS/], none: [/TRANSFORMS\[transform\]\s*\?\?\s*transform/]},
         go: {all: [/transforms\[/], none: [/sql\s*=\s*transform\b/]},
-        scala: {all: [/Transforms/], none: [/Transforms\.getOrElse\(\s*transform\s*,\s*transform\s*\)/]},
         cpp: {all: [/kTransforms/], none: [/\?\s*registered->second\s*:\s*transform/]},
       },
     },
@@ -73,7 +71,6 @@ unknown mode is accepted.
         python: {all: [/wh_/, /\b403\b/]},
         typescript: {all: [/wh_/, /\b403\b/]},
         go: {all: [/wh_/, /StatusForbidden|\b403\b/]},
-        scala: {all: [/wh_/, /Forbidden|\b403\b/]},
         cpp: {all: [/wh_/, /\b403\b/]},
       },
     },
@@ -95,10 +92,6 @@ unknown mode is accepted.
           all: [/Idempotency-Key/i, /store\.FindKey\(/, /store\.RememberKey\(/, /StatusConflict|\b409\b/],
           order: [/store\.FindKey\(/, /store\.CreateLoad\(/],
         },
-        scala: {
-          all: [/Idempotency-Key/i, /Store\.findKey\(/, /Store\.rememberKey\(/, /Conflict|\b409\b/],
-          order: [/Store\.findKey\(/, /Store\.createLoad\(/],
-        },
         cpp: {
           all: [/Idempotency-Key/i, /store::findKey\(/, /store::rememberKey\(/, /\b409\b/],
           order: [/store::findKey\(/, /store::createLoad\(/],
@@ -116,13 +109,6 @@ unknown mode is accepted.
           all: [/MAX_MANIFEST_BYTES\s*=\s*1\s*<<\s*16/, /bodyLimit:\s*MAX_MANIFEST_BYTES|\b413\b/, /LOAD_MODES/],
         },
         go: {all: [/maxManifestBytes\s*=\s*1\s*<<\s*16/, /StatusRequestEntityTooLarge|\b413\b/, /loadModes/]},
-        scala: {
-          all: [
-            /MaxManifestBytes(:\s*Int)?\s*=\s*1\s*<<\s*16/,
-            /PayloadTooLarge|RequestEntityTooLarge|\b413\b/,
-            /LoadModes/,
-          ],
-        },
         cpp: {all: [/kMaxManifestBytes\s*=\s*1\s*<<\s*16/, /\b413\b/, /kLoadModes/]},
       },
     },
@@ -515,125 +501,6 @@ func createLoad(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/loads", createLoad)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import loader.Store // Store.createLoad, getLoad, findKey, rememberKey
-
-object LoadApi {
-  val Transforms: Map[String, String] = Map(
-    "identity" -> "SELECT * FROM source",
-    "dedupe" -> "SELECT DISTINCT * FROM source",
-    "cast_types" -> "SELECT CAST(id AS BIGINT) AS id, CAST(amount AS DECIMAL(18, 2)) AS amount, email FROM source",
-    "mask_pii" -> "SELECT id, amount, SHA2(email, 256) AS email FROM source"
-  )
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def view(load: Store.Load): JsObject = JsObject(
-    "load_id" -> JsString(load.loadId), "status" -> JsString(load.status), "target" -> JsString(load.target),
-    "mode" -> JsString(load.mode), "partitions" -> JsNumber(load.partitions), "rows_planned" -> JsNumber(load.rowsPlanned))
-
-  private def text(fields: Map[String, JsValue], name: String, default: String): String =
-    fields.get(name).collect { case JsString(s) => s }.getOrElse(default)
-
-  val route: Route = path("v1" / "loads") {
-    post {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject.fields
-            val source = body("source").asJsObject.fields
-            val transform = text(body, "transform", "identity")
-            val manifest = Store.Manifest(text(source, "dataset", ""), text(source, "version", ""), text(body, "target", ""),
-              text(body, "mode", "append"), transform, Transforms.getOrElse(transform, transform))
-            complete(json(StatusCodes.Accepted, view(Store.createLoad(tenant, manifest))))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import loader.Store // Store.createLoad, getLoad, findKey, rememberKey
-
-object LoadApi {
-  val MaxManifestBytes: Int = 1 << 16
-  val LoadModes: Set[String] = Set("append", "merge", "replace")
-  val Transforms: Map[String, String] = Map(
-    "identity" -> "SELECT * FROM source",
-    "dedupe" -> "SELECT DISTINCT * FROM source",
-    "cast_types" -> "SELECT CAST(id AS BIGINT) AS id, CAST(amount AS DECIMAL(18, 2)) AS amount, email FROM source",
-    "mask_pii" -> "SELECT id, amount, SHA2(email, 256) AS email FROM source"
-  )
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def view(load: Store.Load): JsObject = JsObject(
-    "load_id" -> JsString(load.loadId), "status" -> JsString(load.status), "target" -> JsString(load.target),
-    "mode" -> JsString(load.mode), "partitions" -> JsNumber(load.partitions), "rows_planned" -> JsNumber(load.rowsPlanned))
-
-  private def text(fields: Map[String, JsValue], name: String, default: String): String =
-    fields.get(name).collect { case JsString(s) => s }.getOrElse(default)
-
-  /** The answer to one manifest under (tenant, key): a new load, the recorded one, or why not. */
-  private def load(tenant: String, key: String, raw: String): HttpResponse = {
-    val body = raw.parseJson.asJsObject.fields
-    val source = body("source").asJsObject.fields
-    val mode = text(body, "mode", "")
-    val transform = text(body, "transform", "")
-    val target = text(body, "target", "")
-    val schema = target.takeWhile(_ != '.')
-    val table = target.drop(schema.length + 1)
-    if (!LoadModes.contains(mode)) HttpResponse(StatusCodes.BadRequest, entity = "mode must be append, merge or replace")
-    else if (!Transforms.contains(transform)) HttpResponse(StatusCodes.BadRequest, entity = "transform must name a registered transform")
-    else if (schema.isEmpty || table.isEmpty) HttpResponse(StatusCodes.BadRequest, entity = "target must be schema.table")
-    else if (schema != s"wh_$tenant") HttpResponse(StatusCodes.Forbidden, entity = s"a load of tenant $tenant writes into wh_$tenant only")
-    else {
-      val manifest = Store.Manifest(text(source, "dataset", ""), text(source, "version", ""), target, mode, transform, Transforms(transform))
-      val fingerprint = s"\${manifest.dataset}@\${manifest.version}>$target:$mode:$transform"
-      Store.findKey(tenant, key) match {
-        case Some(recorded) if recorded.fingerprint != fingerprint =>
-          HttpResponse(StatusCodes.Conflict, entity = "this Idempotency-Key started a load of another manifest")
-        case Some(recorded) => json(StatusCodes.OK, view(Store.getLoad(tenant, recorded.loadId).get)) // a retry answers the load it started
-        case None =>
-          val created = Store.createLoad(tenant, manifest)
-          Store.rememberKey(tenant, key, fingerprint, created.loadId)
-          json(StatusCodes.Accepted, view(created))
-      }
-    }
-  }
-
-  val route: Route = path("v1" / "loads") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          entity(as[String]) { raw =>
-            if (raw.getBytes("UTF-8").length > MaxManifestBytes) complete(StatusCodes.PayloadTooLarge -> "the manifest is over 64 KiB")
-            else
-              optionalHeaderValueByName("Idempotency-Key") {
-                case None | Some("") => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
-                case Some(key) => complete(load(tenant, key, raw))
-              }
-          }
-      }
-    }
-  }
 }
 `,
     },

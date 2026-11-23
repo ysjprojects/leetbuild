@@ -63,11 +63,6 @@ below the active one.
           none: [/catalog:tools|liveKey/],
           order: [/HSet\(ctx,\s*versionKey\(/, /Set\(ctx,\s*activeKey/],
         },
-        scala: {
-          all: [/jedis\.hset\(\s*versionKey\(cv\),/],
-          none: [/catalog:tools|LiveKey/],
-          order: [/jedis\.hset\(\s*versionKey\(/, /jedis\.set\(\s*ActiveKey/],
-        },
         cpp: {
           all: [/redis\.hset\(\s*versionKey\(cv\),\s*\w+\.begin\(\)/],
           none: [/catalog:tools|kLiveKey/],
@@ -90,10 +85,6 @@ below the active one.
           order: [/\.hget\(\s*validationKey\(cv\)/, /\.hset\(/],
         },
         go: {all: [/ErrNotValidated/, /"passed"/], order: [/HGet\(ctx,\s*validationKey\(cv\)/, /HSet\(/]},
-        scala: {
-          all: [/throw new NotValidated/, /"passed"/],
-          order: [/jedis\.hget\(\s*validationKey\(cv\)/, /jedis\.hset\(/],
-        },
         cpp: {all: [/throw NotValidated/, /"passed"/], order: [/redis\.hget\(\s*validationKey\(cv\)/, /redis\.hset\(/]},
       },
     },
@@ -106,7 +97,6 @@ below the active one.
         python: {all: [/\.set\(\s*pin_key\(run_id\)[^\n]*ex\s*=\s*PIN_TTL_S/, /\.get\(\s*pin_key\(run_id\)/]},
         typescript: {all: [/\.set\(\s*pinKey\(runId\)[^\n]*['"]EX['"],\s*PIN_TTL_S/, /\.get\(\s*pinKey\(runId\)/]},
         go: {all: [/Set\(ctx,\s*pinKey\(runID\),\s*cv,\s*pinTTL\)/, /Get\(ctx,\s*pinKey\(runID\)\)/]},
-        scala: {all: [/jedis\.setex\(\s*pinKey\(runId\),\s*PinTtlSeconds/, /jedis\.get\(\s*pinKey\(/]},
         cpp: {all: [/redis\.set\(\s*pinKey\(run_id\),\s*cv,\s*kPinTtl\)/, /redis\.get\(\s*pinKey\(run_id\)\)/]},
       },
     },
@@ -119,7 +109,6 @@ below the active one.
         python: {all: [/\.set\(\s*PREVIOUS_KEY/, /\.get\(\s*PREVIOUS_KEY\)/], none: [/\.decr\(/]},
         typescript: {all: [/\.set\(\s*PREVIOUS_KEY/, /\.get\(\s*PREVIOUS_KEY\)/], none: [/\.decr\(/]},
         go: {all: [/Set\(ctx,\s*previousKey/, /Get\(ctx,\s*previousKey\)/], none: [/\.Decr\(/]},
-        scala: {all: [/jedis\.set\(\s*PreviousKey/, /jedis\.get\(\s*PreviousKey\)/], none: [/\.decr\(/]},
         cpp: {all: [/redis\.set\(\s*kPreviousKey/, /redis\.get\(\s*kPreviousKey\)/], none: [/\.decr\(/]},
       },
     },
@@ -466,87 +455,6 @@ func resolve(ctx context.Context, name, runID string) (map[string]any, error) {
 	}
 	var entry map[string]any
 	return entry, json.Unmarshal([]byte(raw), &entry)
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val LiveKey = "catalog:tools"
-  val ActiveKey = "catalog:active"
-
-  /** The candidate has no passing validation: nothing was written. */
-  final class NotValidated(message: String) extends Exception(message)
-
-  /** Make catalog version cv (tool name -> entry) the one agents resolve. */
-  def promote(cv: String, entries: Map[String, JsObject]): Unit = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    entries.foreach { case (name, entry) => jedis.hset(LiveKey, name, entry.compactPrint) }
-    jedis.set(ActiveKey, cv)
-  }
-
-  /** Point the catalog back at the version the last promotion replaced; that version, if any. */
-  def rollback(): Option[String] =
-    Option(jedis.get(ActiveKey)).map(_ => jedis.decr(ActiveKey).toString)
-
-  /** Keep the run on catalog version cv for the rest of its plan. */
-  def pinRun(runId: String, cv: String): Unit = jedis.set(s"catalog:pin:$runId", cv)
-
-  /** The entry of tool name in the run's pinned version, else in the active one. */
-  def resolve(name: String, runId: Option[String] = None): Option[JsObject] =
-    Option(jedis.hget(LiveKey, name)).map(_.parseJson.asJsObject)
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val ActiveKey = "catalog:active"
-  val PreviousKey = "catalog:previous"
-  val PinTtlSeconds: Long = 6L * 3600
-
-  /** The candidate has no passing validation: nothing was written. */
-  final class NotValidated(message: String) extends Exception(message)
-
-  def versionKey(cv: String): String = s"catalog:version:$cv"
-  def pinKey(runId: String): String = s"catalog:pin:$runId"
-  def validationKey(cv: String): String = s"catalog:validation:$cv"
-
-  /** Make catalog version cv (tool name -> entry) the one agents resolve. */
-  def promote(cv: String, entries: Map[String, JsObject]): Unit = {
-    if (!Option(jedis.hget(validationKey(cv), "outcome")).contains("passed"))
-      throw new NotValidated(s"catalog version $cv has no passing validation")
-    // The whole version in one write, under its own key; readers still follow the old pointer.
-    jedis.hset(versionKey(cv), entries.map { case (name, entry) => name -> entry.compactPrint }.asJava)
-    Option(jedis.get(ActiveKey)).filter(_ != cv).foreach(current => jedis.set(PreviousKey, current))
-    jedis.set(ActiveKey, cv)
-  }
-
-  /** Point the catalog back at the version the last promotion replaced; that version, if any. */
-  def rollback(): Option[String] =
-    Option(jedis.get(PreviousKey)).map { previous =>
-      jedis.set(ActiveKey, previous)
-      previous
-    }
-
-  /** Keep the run on catalog version cv for the rest of its plan. */
-  def pinRun(runId: String, cv: String): Unit = jedis.setex(pinKey(runId), PinTtlSeconds, cv)
-
-  /** The entry of tool name in the run's pinned version, else in the active one. */
-  def resolve(name: String, runId: Option[String] = None): Option[JsObject] =
-    runId
-      .flatMap(id => Option(jedis.get(pinKey(id))))
-      .orElse(Option(jedis.get(ActiveKey)))
-      .flatMap(cv => Option(jedis.hget(versionKey(cv), name)))
-      .map(_.parseJson.asJsObject)
 }
 `,
     },

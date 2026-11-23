@@ -54,7 +54,6 @@ done, and a finished job's ledger stays in Redis for good.
         python: {all: [/f["']job:\{job_id\}:chunks["']/], none: [/progress:chunks/]},
         typescript: {all: [/`job:\$\{jobId\}:chunks`/], none: [/progress:chunks/]},
         go: {all: [/"job:"\s*\+\s*jobID\s*\+\s*":chunks"/], none: [/progress:chunks/]},
-        scala: {all: [/s"job:\$jobId:chunks"/], none: [/progress:chunks/]},
         cpp: {all: [/"job:"\s*\+\s*job_id\s*\+\s*":chunks"/], none: [/progress:chunks/]},
       },
     },
@@ -67,7 +66,6 @@ done, and a finished job's ledger stays in Redis for good.
         python: {order: [/\bclaim\w*\(|\.eval(sha)?\(/, /transcribe\(\)/]},
         typescript: {order: [/\bclaim\w*\(|\.eval(sha)?\(/, /transcribe\(\)/]},
         go: {order: [/\bclaim\w*\.Run\(|\.Eval(Sha)?\(/, /transcribe\(\)/]},
-        scala: {order: [/\bclaim\w*\(|\.eval(sha)?\(/, /transcribe\(\)/]},
         cpp: {order: [/\.eval(sha)?\s*</, /transcribe\(\)/]},
       },
     },
@@ -89,10 +87,6 @@ done, and a finished job's ledger stays in Redis for good.
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]HGET['"]/, /redis\.call\(\s*['"]HSET['"]/],
           none: [/rdb\.HGet\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HGET['"]/, /redis\.call\(\s*['"]HSET['"]/],
-          none: [/jedis\.hget\(/],
-        },
         cpp: {
           all: [/\.eval(sha)?\s*</, /redis\.call\(\s*['"]HGET['"]/, /redis\.call\(\s*['"]HSET['"]/],
           none: [/\.hget\(/],
@@ -108,7 +102,6 @@ done, and a finished job's ledger stays in Redis for good.
         python: {all: [/except\b[\s\S]{0,160}?hset\([^\n]*["']failed["']/]},
         typescript: {all: [/catch\b[\s\S]{0,160}?hset\([^\n]*['"]failed['"]/]},
         go: {all: [/if err != nil[\s\S]{0,200}?HSet\([^\n]*"failed"/]},
-        scala: {all: [/catch\b[\s\S]{0,200}?hset\([^\n]*"failed"/]},
         cpp: {all: [/catch\b[\s\S]{0,200}?hset\([^\n]*"failed"/]},
       },
     },
@@ -121,7 +114,6 @@ done, and a finished job's ledger stays in Redis for good.
         python: {all: [/LEDGER_TTL_S\s*=\s*(?:86_?400|24\s*\*\s*60\s*\*\s*60)\b/, /\.expire\(/]},
         typescript: {all: [/LEDGER_TTL_S\s*=\s*(?:86_?400|24\s*\*\s*60\s*\*\s*60)\b/, /\.expire\(/]},
         go: {all: [/24\s*\*\s*time\.Hour|86400\s*\*\s*time\.Second/, /\.Expire\(/]},
-        scala: {all: [/LedgerTtlSeconds\s*=\s*(?:86400|24\s*\*\s*60\s*\*\s*60)L?\b/, /\.expire\(/]},
         cpp: {all: [/kLedgerTtlSeconds\s*=\s*(?:86'?400|24\s*\*\s*60\s*\*\s*60)\b/, /\.expire\(/]},
       },
     },
@@ -400,91 +392,6 @@ func runChunk(ctx context.Context, jobID string, index, total int, transcribe fu
 		jobs.MarkDone(ctx, jobID)
 	}
 	return chunkResult{Status: "done", Segments: segments}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import transcribe.Jobs // Jobs.Segment, Jobs.markDone(jobId)
-
-object Ledger {
-  /** What one delivery of a chunk did: status is done, duplicate or failed. */
-  final case class ChunkResult(status: String, segments: Seq[Jobs.Segment])
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  val LedgerKey = "progress:chunks"
-
-  /** The number of chunks in the ledger that are done. */
-  def completed(key: String): Int = jedis.hvals(key).asScala.count(_ == "done")
-
-  /** Transcribe chunk index of the job once. */
-  def runChunk(jobId: String, index: Int, total: Int, transcribe: () => Seq[Jobs.Segment]): ChunkResult = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val field = index.toString
-    if (jedis.hget(LedgerKey, field) == "done") ChunkResult("duplicate", Seq.empty)
-    else {
-      val segments =
-        try transcribe()
-        catch { case _: Exception => Seq.empty } // an unreadable span: keep the job moving
-      jedis.hset(LedgerKey, field, "done")
-      if (completed(LedgerKey) == total) Jobs.markDone(jobId)
-      ChunkResult("done", segments)
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import transcribe.Jobs // Jobs.Segment, Jobs.markDone(jobId)
-
-object Ledger {
-  /** What one delivery of a chunk did: status is done, duplicate or failed. */
-  final case class ChunkResult(status: String, segments: Seq[Jobs.Segment])
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  val LedgerTtlSeconds = 86400L
-
-  val ClaimLua: String =
-    """local state = redis.call('HGET', KEYS[1], ARGV[1])
-      |if state == 'running' or state == 'done' then return 0 end
-      |redis.call('HSET', KEYS[1], ARGV[1], 'running')
-      |return 1
-      |""".stripMargin
-
-  def ledgerKey(jobId: String): String = s"job:$jobId:chunks"
-
-  /** The number of chunks in the ledger that are done. */
-  def completed(key: String): Int = jedis.hvals(key).asScala.count(_ == "done")
-
-  /** Transcribe chunk index of the job once. */
-  def runChunk(jobId: String, index: Int, total: Int, transcribe: () => Seq[Jobs.Segment]): ChunkResult = {
-    val key = ledgerKey(jobId)
-    val field = index.toString
-    // The claim comes first and is one script: a redelivery racing this one reads "running".
-    val won = jedis.eval(ClaimLua, List(key).asJava, List(field).asJava).asInstanceOf[java.lang.Long]
-    if (won != 1L) ChunkResult("duplicate", Seq.empty)
-    else
-      try {
-        val segments = transcribe()
-        jedis.hset(key, field, "done")
-        if (completed(key) == total) {
-          jedis.expire(key, LedgerTtlSeconds)
-          Jobs.markDone(jobId)
-        }
-        ChunkResult("done", segments)
-      } catch {
-        case _: Exception =>
-          jedis.hset(key, field, "failed") // not progress: a redelivery may claim it again
-          ChunkResult("failed", Seq.empty)
-      }
-  }
 }
 `,
     },

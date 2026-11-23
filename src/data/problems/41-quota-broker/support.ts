@@ -3,10 +3,9 @@
  * package. `quota.ledger` is the Redis ledger as the later steps use it (step 2 builds `reserve` and
  * `release` the same way; `consume` is the scheduler's call when a job starts on its reservation),
  * with the team limits, the key names and the reservation ids. `quota.outbox` is the list a relay
- * drains into `quota.event`. The five languages keep the same keys, so a harness reads one layout
+ * drains into `quota.event`. The four languages keep the same keys, so a harness reads one layout
  * whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'quota/__init__.py': '',
@@ -565,113 +564,5 @@ inline std::vector<nlohmann::json> rows() {
 }
 
 }  // namespace outbox
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('quota', 'Ledger')]: `package quota
-
-import java.util.UUID
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The quota ledger (provided; step 2 builds reserve and release the same way), in Redis:
- *
- *   quota:limits                         hash: team -> units the team may hold in one window (DefaultLimit when unset)
- *   quota:{team}:{window}                hash: limit, reserved, consumed (one window's ledger)
- *   reservation:{team}:{reservation_id}  hash: window, resource_class, amount, source_version
- *
- * reserve, release and consume are one Lua script each, so a second broker landing between two
- * commands cannot oversell or refund twice. reserve sets TtlSeconds on what it writes; release and
- * consume find the window through the reservation's recorded window.
- */
-object Ledger {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val LimitsKey = "quota:limits"
-  val DefaultLimit = 8L
-  val TtlSeconds = 86400L
-
-  /** KEYS: window hash, reservation; ARGV: amount, limit, ttl, window, resource_class, source_version. */
-  val ReserveLua: String =
-    """local amount = tonumber(ARGV[1])
-      |local used = tonumber(redis.call('HGET', KEYS[1], 'reserved') or '0') + tonumber(redis.call('HGET', KEYS[1], 'consumed') or '0')
-      |if used + amount > tonumber(ARGV[2]) then return 0 end
-      |redis.call('HSET', KEYS[1], 'limit', ARGV[2])
-      |redis.call('HINCRBY', KEYS[1], 'reserved', amount)
-      |redis.call('HINCRBY', KEYS[1], 'consumed', 0)
-      |redis.call('HSET', KEYS[2], 'window', ARGV[4], 'resource_class', ARGV[5], 'amount', amount, 'source_version', ARGV[6])
-      |redis.call('EXPIRE', KEYS[1], ARGV[3])
-      |redis.call('EXPIRE', KEYS[2], ARGV[3])
-      |return 1
-      |""".stripMargin
-
-  /** KEYS: reservation; ARGV: the team's window-key prefix (quota:{team}:). Refunds the recorded window. */
-  val ReleaseLua: String =
-    """local window = redis.call('HGET', KEYS[1], 'window')
-      |if not window then return 0 end
-      |redis.call('HINCRBY', ARGV[1] .. window, 'reserved', -tonumber(redis.call('HGET', KEYS[1], 'amount')))
-      |redis.call('DEL', KEYS[1])
-      |return 1
-      |""".stripMargin
-
-  /** KEYS: reservation; ARGV: the team's window-key prefix. Moves the amount from reserved to consumed. */
-  val ConsumeLua: String =
-    """local window = redis.call('HGET', KEYS[1], 'window')
-      |if not window then return 0 end
-      |local amount = tonumber(redis.call('HGET', KEYS[1], 'amount'))
-      |redis.call('HINCRBY', ARGV[1] .. window, 'reserved', -amount)
-      |redis.call('HINCRBY', ARGV[1] .. window, 'consumed', amount)
-      |redis.call('DEL', KEYS[1])
-      |return 1
-      |""".stripMargin
-
-  def windowKey(team: String, window: String): String = s"quota:$team:$window"
-  def reservationKey(team: String, reservationId: String): String = s"reservation:$team:$reservationId"
-  def newReservationId(): String = UUID.randomUUID().toString.replace("-", "").take(16)
-
-  /** The units the team may hold in one window. */
-  def limitOf(team: String): Long = Option(jedis.hget(LimitsKey, team)).filter(_.nonEmpty).map(_.toLong).getOrElse(DefaultLimit)
-
-  /** Take amount units from the team's window; the reservation id, or None when the window cannot cover it. */
-  def reserve(team: String, window: String, resourceClass: String, amount: Long, sourceVersion: String = ""): Option[String] = {
-    val reservationId = newReservationId()
-    val keys = List(windowKey(team, window), reservationKey(team, reservationId)).asJava
-    val args = List(amount.toString, limitOf(team).toString, TtlSeconds.toString, window, resourceClass, sourceVersion).asJava
-    if (jedis.eval(ReserveLua, keys, args).asInstanceOf[java.lang.Long] == 1L) Some(reservationId) else None
-  }
-
-  /** Give a reservation's units back to the window it recorded; false when there is no such reservation. */
-  def release(team: String, reservationId: String): Boolean =
-    jedis.eval(ReleaseLua, List(reservationKey(team, reservationId)).asJava, List(s"quota:$team:").asJava).asInstanceOf[java.lang.Long] == 1L
-
-  /** The job started: the reservation's units move from reserved to consumed. */
-  def consume(team: String, reservationId: String): Boolean =
-    jedis.eval(ConsumeLua, List(reservationKey(team, reservationId)).asJava, List(s"quota:$team:").asJava).asInstanceOf[java.lang.Long] == 1L
-}
-`,
-  [scalaPath('quota', 'Outbox')]: `package quota
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/** The outbox (provided): the Redis list outbox:quota of JSON rows {"topic", "key", "payload"} that a relay produces later, oldest first. */
-object Outbox {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Key = "outbox:quota"
-
-  /** Queue a record the broker did not take, for the relay to produce later. */
-  def insert(topic: String, key: String, payload: JsObject): Unit =
-    jedis.rpush(Key, JsObject("topic" -> JsString(topic), "key" -> JsString(key), "payload" -> payload).compactPrint)
-
-  /** Everything queued, oldest first. */
-  def rows(): Seq[JsValue] = jedis.lrange(Key, 0, -1).asScala.toSeq.map(_.parseJson)
-}
 `,
 };

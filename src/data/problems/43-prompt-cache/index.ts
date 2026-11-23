@@ -6,7 +6,7 @@ import {cacheStateStep} from './steps/2-state';
 import {cacheDependencyStep} from './steps/3-dependency';
 import {cacheEventsStep} from './steps/4-events';
 import {cacheReadStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Prompt cache: the debugging a completion cache owes before a tenant trusts it. A key built from
@@ -95,6 +95,5 @@ caching, eviction beyond the TTL, cache warming, cross-region replication and pe
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

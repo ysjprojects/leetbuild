@@ -6,7 +6,7 @@ import {uploadStateStep} from './steps/2-state';
 import {storageClientStep} from './steps/3-client';
 import {checkpointEventsStep} from './steps/4-events';
 import {readCheckpointStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Checkpoint store: the debugging a training run's resume path needs. Chunks staged at their own
@@ -90,6 +90,5 @@ replication, retention of old checkpoints, ranged reads of a chunk, and the copi
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

@@ -62,7 +62,6 @@ service Allocator { rpc Allocate(AllocateRequest) returns (Allocation); }  // RE
           all: [/ALLOCATOR_DEADLINE_MS\s*=\s*3000\b/, /\.Allocate\([\s\S]{0,200}?deadline:[^\n]*ALLOCATOR_DEADLINE_MS/],
         },
         go: {all: [/allocatorDeadline\s*=\s*3\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*allocatorDeadline\)/]},
-        scala: {all: [/AllocatorDeadlineMs\s*=\s*3000L?\b/, /withDeadlineAfter\(\s*AllocatorDeadlineMs/]},
         cpp: {all: [/kAllocatorDeadline\{3\}/, /set_deadline\([^\n]*kAllocatorDeadline\)/]},
       },
     },
@@ -78,7 +77,6 @@ service Allocator { rpc Allocate(AllocateRequest) returns (Allocation); }  // RE
         },
         typescript: {all: [/setTimeout\(/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
         go: {all: [/time\.Sleep\(/, /codes\.Unavailable/, /codes\.DeadlineExceeded/]},
-        scala: {all: [/Thread\.sleep\(/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
         cpp: {all: [/sleep_for\(/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
       },
     },
@@ -91,7 +89,6 @@ service Allocator { rpc Allocate(AllocateRequest) returns (Allocation); }  // RE
         python: {order: [/def allocate_match/, /release_roster\(/, /store\.abandon\(/]},
         typescript: {order: [/function allocateMatch/, /releaseRoster\(/, /abandon\(/]},
         go: {order: [/func allocateMatch/, /releaseRoster\(/, /store\.Abandon\(/]},
-        scala: {order: [/def allocateMatch/, /releaseRoster\(/, /Store\.abandon\(/]},
         cpp: {order: [/allocateMatch\(const std::string& match_id\)\s*\{/, /releaseRoster\(/, /store::abandon\(/]},
       },
     },
@@ -104,7 +101,6 @@ service Allocator { rpc Allocate(AllocateRequest) returns (Allocation); }  // RE
         python: {all: [/released:/, /['"]NX['"]/, /register_script\(|\.eval\(/], none: [/\br\.(zadd|hincrby)\(/]},
         typescript: {all: [/released:/, /['"]NX['"]/, /\.eval\(|defineCommand\(/], none: [/redis\.(zadd|hincrby)\(/]},
         go: {all: [/released:/, /['"]NX['"]/, /redis\.NewScript\(|\.Eval\(/], none: [/rdb\.(ZAdd|HIncrBy)\(/]},
-        scala: {all: [/released:/, /['"]NX['"]/, /jedis\.eval(sha)?\(/], none: [/jedis\.(zadd|hincrBy)\(/]},
         cpp: {all: [/released:/, /['"]NX['"]/, /redis\.eval(sha)?[<(]/], none: [/redis\.(zadd|hincrby)\(/]},
       },
     },
@@ -497,119 +493,6 @@ func allocateMatch(ctx context.Context, matchID string) (string, error) {
 	}
 	store.Abandon(ctx, matchID, "allocation_failed")
 	return "", nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import matchmakerd.game_matchmaking.{AllocateRequest, AllocatorGrpc}
-import matchmaking.Store // Store.getMatch, getTicket, setServer, abandon, ticketKey, poolKey, DepthKey
-
-object Client {
-  val MaxAllocAttempts = 3
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val allocator = AllocatorGrpc.blockingStub(ManagedChannelBuilder.forAddress("allocator", 9000).usePlaintext().build())
-
-  /** Put every ticket of the match back in its pool; true when this call released it. */
-  def releaseRoster(matchId: String): Boolean = {
-    Store.getMatch(matchId).toSeq.flatMap(_.tickets).foreach { ticketId =>
-      Store.getTicket(ticketId).foreach { t =>
-        jedis.hset(Store.ticketKey(ticketId), Map("state" -> "waiting", "match_id" -> "").asJava)
-        jedis.zadd(Store.poolKey(t.bucket), t.skill.toDouble, ticketId)
-        jedis.hincrBy(Store.DepthKey, t.bucket.toString, 1L)
-      }
-    }
-    true
-  }
-
-  /** Reserve a game server for the claimed roster: its server id, or None when the match cannot be placed. */
-  def allocateMatch(matchId: String): Option[String] = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val request = AllocateRequest(matchId, Store.getMatch(matchId).map(_.players).getOrElse(Seq.empty))
-    val serverId = Iterator.range(0, MaxAllocAttempts).map { _ =>
-      try Some(allocator.allocate(request).serverId)
-      catch { case _: StatusRuntimeException => None } // the fleet is busy: ask again
-    }.collectFirst { case Some(id) => id }
-    serverId.foreach(Store.setServer(matchId, _))
-    serverId
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import matchmakerd.game_matchmaking.{AllocateRequest, AllocatorGrpc}
-import matchmaking.Store // Store.getMatch, getTicket, setServer, abandon, ticketKey, poolKey, DepthKey
-
-object Client {
-  val AllocatorDeadlineMs = 3000L
-  val MaxAllocAttempts = 3
-  val BackoffBaseMs = 250L
-  val ReleasedTtlS = 3600L
-  /** A busy or slow fleet may have a server a moment later; RESOURCE_EXHAUSTED and the rest will not. */
-  private val Transient = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val allocator = AllocatorGrpc.blockingStub(ManagedChannelBuilder.forAddress("allocator", 9000).usePlaintext().build())
-
-  /**
-   * KEYS: released:{match}, pool:{bucket}, pool:depth, ticket:{id}…; ARGV: match id, bucket, guard TTL.
-   * The guard makes a second release a no-op; the match_id test skips a ticket another match took since.
-   */
-  val ReleaseLua: String =
-    """if not redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[3]) then return 0 end
-      |local released = 0
-      |for i = 4, #KEYS do
-      |  if redis.call('HGET', KEYS[i], 'match_id') == ARGV[1] then
-      |    redis.call('HSET', KEYS[i], 'state', 'waiting', 'match_id', '')
-      |    redis.call('ZADD', KEYS[2], redis.call('HGET', KEYS[i], 'skill'), redis.call('HGET', KEYS[i], 'ticket_id'))
-      |    released = released + 1
-      |  end
-      |end
-      |redis.call('HINCRBY', KEYS[3], ARGV[2], released)
-      |return 1
-      |""".stripMargin
-
-  /** Put every ticket of the match back in its pool; true when this call released it. */
-  def releaseRoster(matchId: String): Boolean = Store.getMatch(matchId) match {
-    case None => false
-    case Some(m) =>
-      val keys = Seq(s"released:$matchId", Store.poolKey(m.bucket), Store.DepthKey) ++ m.tickets.map(Store.ticketKey)
-      val args = Seq(matchId, m.bucket.toString, ReleasedTtlS.toString)
-      jedis.eval(ReleaseLua, keys.asJava, args.asJava).asInstanceOf[java.lang.Long] == 1L
-  }
-
-  /** Reserve a game server for the claimed roster: its server id, or None when the match cannot be placed. */
-  def allocateMatch(matchId: String): Option[String] = {
-    val request = AllocateRequest(matchId, Store.getMatch(matchId).map(_.players).getOrElse(Seq.empty))
-    def attempt(n: Int): Option[String] =
-      try Some(allocator.withDeadlineAfter(AllocatorDeadlineMs, TimeUnit.MILLISECONDS).allocate(request).serverId)
-      catch {
-        case e: StatusRuntimeException if Transient.contains(e.getStatus.getCode) && n + 1 < MaxAllocAttempts =>
-          Thread.sleep(BackoffBaseMs << n)
-          attempt(n + 1)
-        case _: StatusRuntimeException => None
-      }
-    attempt(0) match {
-      case Some(serverId) =>
-        Store.setServer(matchId, serverId)
-        Some(serverId)
-      case None =>
-        // No server: the players go back to the pool instead of waiting on a match that never starts.
-        releaseRoster(matchId)
-        Store.abandon(matchId, "allocation_failed")
-        None
-    }
-  }
 }
 `,
     },

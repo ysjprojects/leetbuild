@@ -47,7 +47,6 @@ pointer; and a revoke can take the active version away from every consumer.
         python: {all: [/OVERLAP_SECONDS\s*=\s*900\b/, /KEYS\[2\]/], none: [/\.delete\(/]},
         typescript: {all: [/OVERLAP_SECONDS\s*=\s*900\b/, /KEYS\[2\]/], none: [/\.del\(/]},
         go: {all: [/overlapSeconds\s*=\s*900\b/, /KEYS\[2\]/], none: [/\.Del\(/]},
-        scala: {all: [/OverlapSeconds\s*=\s*900L?\b/, /KEYS\[2\]/], none: [/jedis\.del\(/]},
         cpp: {all: [/kOverlapSeconds\s*=\s*900\b/, /KEYS\[2\]/], none: [/redis\.del\(/]},
       },
     },
@@ -69,10 +68,6 @@ pointer; and a revoke can take the active version away from every consumer.
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]GET['"],\s*KEYS\[1\]/],
           none: [/\.Set\([^\n]*activeKey\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]GET['"],\s*KEYS\[1\]/],
-          none: [/jedis\.set(ex)?\(\s*activeKey\(/],
-        },
         cpp: {
           all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]GET['"],\s*KEYS\[1\]/],
           none: [/redis\.set\(\s*activeKey\(/],
@@ -88,7 +83,6 @@ pointer; and a revoke can take the active version away from every consumer.
         python: {all: [/redis\.call\(\s*['"]SET['"],\s*KEYS\[1\],\s*ARGV\[1\]\s*\)/], none: [/POINTER_TTL/]},
         typescript: {all: [/redis\.call\(\s*['"]SET['"],\s*KEYS\[1\],\s*ARGV\[1\]\s*\)/], none: [/POINTER_TTL/]},
         go: {all: [/redis\.call\(\s*['"]SET['"],\s*KEYS\[1\],\s*ARGV\[1\]\s*\)/], none: [/pointerTTL/]},
-        scala: {all: [/redis\.call\(\s*['"]SET['"],\s*KEYS\[1\],\s*ARGV\[1\]\s*\)/], none: [/PointerTtl/]},
         cpp: {all: [/redis\.call\(\s*['"]SET['"],\s*KEYS\[1\],\s*ARGV\[1\]\s*\)/], none: [/kPointerTtl/]},
       },
     },
@@ -101,7 +95,6 @@ pointer; and a revoke can take the active version away from every consumer.
         python: {all: [/def revoke\(/, /return False/, /(smembers|sismember)\(\s*revoked_key\(/]},
         typescript: {all: [/function revoke\(/, /return false/, /(smembers|sismember)\(\s*revokedKey\(/]},
         go: {all: [/func revoke\(/, /return false, nil/, /(SMembers|SIsMember)\([^\n]*revokedKey\(/]},
-        scala: {all: [/def revoke\(/, /\bfalse\b/, /(smembers|sismember)\(\s*revokedKey\(/]},
         cpp: {all: [/bool revoke\(/, /return false/, /(smembers|sismember)\(\s*revokedKey\(/]},
       },
     },
@@ -380,83 +373,6 @@ func revoke(ctx context.Context, name, versionID string) (bool, error) {
 		return false, nil
 	}
 	return true, rdb.SAdd(ctx, revokedKey(name), versionID).Err()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val PointerTtlSeconds = 86400L // a pointer nobody refreshed for a day is stale
-
-  def activeKey(name: String): String = s"secret:$name:active"
-  def overlapKey(name: String): String = s"secret:$name:overlap"
-  def revokedKey(name: String): String = s"secret:$name:revoked"
-
-  /** Make versionId the version new consumers use; answers the previous one (None for the first). */
-  def activate(name: String, versionId: String): Option[String] = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val previous = Option(jedis.get(activeKey(name)))
-    jedis.setex(activeKey(name), PointerTtlSeconds, versionId)
-    jedis.del(overlapKey(name)) // the previous version retires with the swap
-    previous
-  }
-
-  /** The versions a consumer may use right now, the active one first. */
-  def validVersions(name: String): Seq[String] =
-    jedis.mget(activeKey(name), overlapKey(name)).asScala.toSeq.filter(_ != null)
-
-  /** Stop a version working now. */
-  def revoke(name: String, versionId: String): Boolean = {
-    jedis.sadd(revokedKey(name), versionId)
-    true
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val OverlapSeconds = 900L // one deploy cycle of the slowest consumer
-
-  /** Read the pointer, move it, and keep the previous version valid for the overlap, in one step. */
-  val SwapLua: String =
-    """local previous = redis.call('GET', KEYS[1]) or ''
-      |redis.call('SET', KEYS[1], ARGV[1])
-      |if previous ~= '' then redis.call('SET', KEYS[2], previous, 'EX', ARGV[2]) end
-      |return previous
-      |""".stripMargin
-
-  def activeKey(name: String): String = s"secret:$name:active"
-  def overlapKey(name: String): String = s"secret:$name:overlap"
-  def revokedKey(name: String): String = s"secret:$name:revoked"
-
-  /** Make versionId the version new consumers use; answers the previous one (None for the first). */
-  def activate(name: String, versionId: String): Option[String] = {
-    val previous = jedis.eval(SwapLua, List(activeKey(name), overlapKey(name)).asJava, List(versionId, OverlapSeconds.toString).asJava)
-    Option(previous).map(_.toString).filter(_.nonEmpty)
-  }
-
-  /** The versions a consumer may use right now, the active one first. */
-  def validVersions(name: String): Seq[String] = {
-    val revoked = jedis.smembers(revokedKey(name)).asScala
-    jedis.mget(activeKey(name), overlapKey(name)).asScala.toSeq.filter(v => v != null && !revoked.contains(v))
-  }
-
-  /** Stop a version working now; the active version cannot be revoked (activate another first). */
-  def revoke(name: String, versionId: String): Boolean =
-    if (Option(jedis.get(activeKey(name))).contains(versionId)) false
-    else {
-      jedis.sadd(revokedKey(name), versionId)
-      true
-    }
 }
 `,
     },

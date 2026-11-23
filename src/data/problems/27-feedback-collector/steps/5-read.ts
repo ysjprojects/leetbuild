@@ -58,7 +58,6 @@ read as a verdict, and any window a caller types is accepted.
         python: {all: [/WINDOW_HOURS/, /\b400\b/], none: [/["']all["']/]},
         typescript: {all: [/WINDOW_HOURS/, /\b400\b/], none: [/['"]all['"]/]},
         go: {all: [/windowHours/, /StatusBadRequest|\b400\b/], none: [/"all"/]},
-        scala: {all: [/WindowHours/, /BadRequest|\b400\b/], none: [/"all"/]},
         cpp: {all: [/kWindowHours/, /\b400\b/], none: [/"all"/]},
       },
     },
@@ -71,7 +70,6 @@ read as a verdict, and any window a caller types is accepted.
         python: {all: [/store\.hour_totals\(/], none: [/store\.totals\(/]},
         typescript: {all: [/hourTotals\(/], none: [/\btotals\(/]},
         go: {all: [/store\.HourTotals\(/], none: [/store\.Totals\(/]},
-        scala: {all: [/Store\.hourTotals\(/], none: [/Store\.totals\(/]},
         cpp: {all: [/store::hourTotals\(/], none: [/store::totals\(/]},
       },
     },
@@ -84,7 +82,6 @@ read as a verdict, and any window a caller types is accepted.
         python: {all: [/MIN_SAMPLES\s*=\s*50\b/, /insufficient_data/]},
         typescript: {all: [/MIN_SAMPLES\s*=\s*50\b/, /insufficient_data/]},
         go: {all: [/minSamples\s*=\s*50\b/, /insufficient_data/]},
-        scala: {all: [/MinSamples\s*=\s*50\b/, /insufficient_data/]},
         cpp: {all: [/kMinSamples\s*=\s*50\b/, /insufficient_data/]},
       },
     },
@@ -97,7 +94,6 @@ read as a verdict, and any window a caller types is accepted.
         python: {all: [/CACHE_TTL_S\s*=\s*60\b/, /time\.time\(\)|time\.monotonic\(\)/]},
         typescript: {all: [/CACHE_TTL_MS\s*=\s*60_?000\b/, /Date\.now\(\)/]},
         go: {all: [/cacheTTL\s*=\s*(60\s*\*\s*time\.Second|time\.Minute)/, /time\.Now\(\)/]},
-        scala: {all: [/CacheTtlMillis\s*=\s*(60000|60\s*\*\s*1000)L?\b/, /System\.currentTimeMillis\(\)/]},
         cpp: {all: [/kCacheTtl\{60\}/, /_clock::now\(\)/]},
       },
     },
@@ -348,93 +344,6 @@ func satisfaction(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/models/{version}/satisfaction", satisfaction)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import feedback.Store // Store.totals, hourTotals
-
-object Read {
-  private val scoreCache = scala.collection.mutable.Map.empty[String, JsObject]
-
-  private def json(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** The share of thumbs-up among the ratings of a model version. */
-  val route: Route = path("v1" / "models" / Segment / "satisfaction") { version =>
-    get {
-      parameter("window".optional) { windowParam =>
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        val window = windowParam.getOrElse("all")
-        val body = scoreCache.getOrElseUpdate(version, {
-          val (samples, positive) = Store.totals(version)
-          JsObject(
-            "model_version" -> JsString(version),
-            "window" -> JsString(window),
-            "samples" -> JsNumber(samples),
-            "status" -> JsString("ok"),
-            "score" -> JsNumber(if (samples > 0) positive.toDouble / samples else 0.0))
-        })
-        complete(json(body))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import feedback.Store // Store.totals, hourTotals
-
-object Read {
-  val WindowHours: Map[String, Long] = Map("1h" -> 1L, "24h" -> 24L, "7d" -> 168L)
-  val MinSamples = 50
-  val CacheTtlMillis = 60000L
-
-  /** (version, window) → (computed at, body). */
-  private val scoreCache = scala.collection.mutable.Map.empty[(String, String), (Long, JsObject)]
-
-  private def json(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def compute(version: String, window: String, hours: Long, now: Long): JsObject = {
-    val hour = now / 3600000L
-    val buckets = (hour - hours + 1 to hour).map(h => Store.hourTotals(version, h))
-    val samples = buckets.map(_._1).sum
-    val positive = buckets.map(_._2).sum
-    val base = Map("model_version" -> JsString(version), "window" -> JsString(window), "samples" -> JsNumber(samples))
-    if (samples < MinSamples) JsObject(base ++ Map("status" -> JsString("insufficient_data"), "score" -> JsNull))
-    else JsObject(base ++ Map("status" -> JsString("ok"), "score" -> JsNumber(positive.toDouble / samples)))
-  }
-
-  /** The share of thumbs-up among the ratings of a model version. */
-  val route: Route = path("v1" / "models" / Segment / "satisfaction") { version =>
-    get {
-      parameter("window".optional) { windowParam =>
-        val window = windowParam.getOrElse("24h")
-        WindowHours.get(window) match {
-          case None => complete(StatusCodes.BadRequest -> "window must be 1h, 24h or 7d")
-          case Some(hours) =>
-            val now = System.currentTimeMillis()
-            val body = scoreCache.get((version, window)) match {
-              case Some((at, cached)) if now - at < CacheTtlMillis => cached
-              case _ =>
-                val fresh = compute(version, window, hours, now)
-                scoreCache((version, window)) = (now, fresh)
-                fresh
-            }
-            complete(json(body))
-        }
-      }
-    }
-  }
 }
 `,
     },

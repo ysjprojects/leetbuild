@@ -51,7 +51,6 @@ message ClassifyReply   { string content = 1; string model = 2; }
         python: {all: [/MAX_COLUMNS_PER_CALL\s*=\s*150\b/, /columns\[[^\]\n]*MAX_COLUMNS_PER_CALL/]},
         typescript: {all: [/MAX_COLUMNS_PER_CALL\s*=\s*150\b/, /columns\.slice\([^)\n]*MAX_COLUMNS_PER_CALL/]},
         go: {all: [/maxColumnsPerCall\s*=\s*150\b/, /\+=\s*maxColumnsPerCall/]},
-        scala: {all: [/MaxColumnsPerCall\s*=\s*150\b/, /\.grouped\(MaxColumnsPerCall\)/]},
         cpp: {all: [/kMaxColumnsPerCall\s*=\s*150\b/, /\+=\s*kMaxColumnsPerCall/]},
       },
     },
@@ -64,7 +63,6 @@ message ClassifyReply   { string content = 1; string model = 2; }
         python: {all: [/DEADLINE_S\s*=\s*15\b/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_S\s*=\s*15\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_S\s*\*\s*1000/]},
         go: {all: [/deadline\s*=\s*15\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\)/]},
-        scala: {all: [/DeadlineS\s*=\s*15L?\b/, /withDeadlineAfter\(DeadlineS/]},
         cpp: {all: [/kDeadline\{15\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -77,7 +75,6 @@ message ClassifyReply   { string content = 1; string model = 2; }
         python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /StatusCode\.UNAVAILABLE/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /status\.UNAVAILABLE/]},
         go: {all: [/maxAttempts\s*=\s*2\b/, /codes\.Unavailable/]},
-        scala: {all: [/MaxAttempts\s*=\s*2\b/, /Status\.Code\.UNAVAILABLE/]},
         cpp: {all: [/kMaxAttempts\s*=\s*2\b/, /StatusCode::UNAVAILABLE/]},
       },
     },
@@ -90,7 +87,6 @@ message ClassifyReply   { string content = 1; string model = 2; }
         python: {all: [/taxonomy\.known\(/, /isinstance\(\w+,\s*list\)/]},
         typescript: {all: [/\bknown\(/, /Array\.isArray\(/]},
         go: {all: [/taxonomy\.Known\(/]},
-        scala: {all: [/Taxonomy\.known\b/]},
         cpp: {all: [/taxonomy::known\(/, /is_array\(\)/]},
       },
     },
@@ -414,101 +410,6 @@ func classifyColumns(ctx context.Context, entity string, columns []string) (map[
 		}
 	}
 	return tags, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import spray.json._
-
-import metasense.Taxonomy // Taxonomy.Tags, Taxonomy.known(tag)
-import metasensed.data_classification.{ClassifierGrpc, ClassifyRequest}
-
-/** The gateway gave no usable answer; the job is retried later. */
-final class ClassifyFailed(message: String) extends RuntimeException(message)
-
-object ClassifyColumns {
-  val Gateway = "llm-gateway:9000"
-  val MaxAttempts = 3
-
-  private val stub = ClassifierGrpc.blockingStub(ManagedChannelBuilder.forTarget(Gateway).usePlaintext().build())
-
-  /** One tag per column, from the LLM gateway. */
-  def classifyColumns(entity: String, columns: Seq[String]): Map[String, String] = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val request = ClassifyRequest(entity = entity, columns = columns, tagLibrary = Taxonomy.Tags)
-    var content = "[]"
-    var attempt = 1
-    var done = false
-    while (!done) {
-      try {
-        content = stub.classify(request).content
-        done = true
-      } catch {
-        case e: StatusRuntimeException =>
-          if (attempt == MaxAttempts) throw new ClassifyFailed(s"Classify $entity: \${e.getStatus.getCode}")
-          attempt += 1
-      }
-    }
-    content.parseJson.asInstanceOf[JsArray].elements.map { row =>
-      val fields = row.asJsObject.fields
-      fields("column_name").asInstanceOf[JsString].value -> fields("assigned_tag").asInstanceOf[JsString].value
-    }.toMap
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import spray.json._
-
-import metasense.Taxonomy // Taxonomy.Tags, Taxonomy.known(tag)
-import metasensed.data_classification.{ClassifierGrpc, ClassifyRequest}
-
-import scala.util.Try
-
-/** The gateway gave no usable answer; the job is retried later. */
-final class ClassifyFailed(message: String) extends RuntimeException(message)
-
-object ClassifyColumns {
-  val Gateway = "llm-gateway:9000"
-  val MaxColumnsPerCall = 150 // Metasense V2 splits wider tables: the model loses track past this
-  val DeadlineS = 15L
-  val MaxAttempts = 2
-
-  private val stub = ClassifierGrpc.blockingStub(ManagedChannelBuilder.forTarget(Gateway).usePlaintext().build())
-
-  /** One call for at most MaxColumnsPerCall columns, retried once on UNAVAILABLE. */
-  private def classifyBatch(entity: String, batch: Seq[String]): Seq[(String, String)] = {
-    val request = ClassifyRequest(entity = entity, columns = batch, tagLibrary = Taxonomy.Tags)
-    var content: Option[String] = None
-    var attempt = 1
-    while (content.isEmpty) {
-      try content = Some(stub.withDeadlineAfter(DeadlineS, TimeUnit.SECONDS).classify(request).content)
-      catch {
-        case e: StatusRuntimeException =>
-          if (e.getStatus.getCode != Status.Code.UNAVAILABLE || attempt == MaxAttempts)
-            throw new ClassifyFailed(s"Classify $entity: \${e.getStatus.getCode}")
-          attempt += 1
-      }
-    }
-    val rows = Try(content.get.parseJson).toOption match {
-      case Some(JsArray(elements)) => elements
-      case _                       => throw new ClassifyFailed(s"Classify $entity: the content is not a JSON array")
-    }
-    val answered = rows.collect { case row: JsObject => row.fields }.flatMap { fields =>
-      (fields.get("column_name"), fields.get("assigned_tag")) match {
-        case (Some(JsString(column)), Some(JsString(tag))) => Some(column -> tag)
-        case _                                             => None
-      }
-    }.toMap
-    // The library is closed: a tag the model invented, or a column it skipped, is "None" for the owner to check.
-    batch.map(column => column -> answered.get(column).filter(Taxonomy.known).getOrElse("None"))
-  }
-
-  /** One tag per column, from the LLM gateway. */
-  def classifyColumns(entity: String, columns: Seq[String]): Map[String, String] =
-    columns.grouped(MaxColumnsPerCall).flatMap(classifyBatch(entity, _)).toMap
 }
 `,
     },

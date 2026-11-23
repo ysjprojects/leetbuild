@@ -61,7 +61,6 @@ service DeviceGateway { rpc Deliver(DeliverRequest) returns (DeliverReply); }
         python: {all: [/DEADLINE_S\s*=\s*5\b/, /\.Deliver\([^)\n]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*5000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*5\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\)/]},
-        scala: {all: [/DeadlineS\s*=\s*5L?\b/, /withDeadlineAfter\(\s*DeadlineS/]},
         cpp: {all: [/kDeadline\{5\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -80,10 +79,6 @@ service DeviceGateway { rpc Deliver(DeliverRequest) returns (DeliverReply); }
           none: [/while\s*\(\s*true\s*\)/, /for\s*\(\s*;\s*;\s*\)/],
         },
         go: {all: [/maxAttempts\s*=\s*3\b/, /retryable\[/, /attempt\s*<\s*maxAttempts/], none: [/\bfor\s*\{/]},
-        scala: {
-          all: [/MaxAttempts\s*=\s*3\b/, /Retryable/, /attempts\s*<\s*MaxAttempts/],
-          none: [/while\s*\(\s*(true|!delivered)\s*\)/],
-        },
         cpp: {
           all: [/kMaxAttempts\s*=\s*3\b/, /kRetryable/, /attempt\s*<\s*kMaxAttempts/],
           none: [/while\s*\(\s*true\s*\)/],
@@ -99,7 +94,6 @@ service DeviceGateway { rpc Deliver(DeliverRequest) returns (DeliverReply); }
         python: {all: [/expires_at_ms\s*=\s*command\[["']expires_at_ms["']\]/, /\.EXPIRED\b/]},
         typescript: {all: [/expires_at_ms:\s*(expiresAtMs|command\.expires_at_ms)/, /EXPIRED/]},
         go: {all: [/ExpiresAtMs:\s*command\.ExpiresAtMs/, /DeliveryStatus_EXPIRED/]},
-        scala: {all: [/expiresAtMs\s*=\s*command\.expiresAtMs/, /DeliveryStatus\.EXPIRED/]},
         cpp: {all: [/set_expires_at_ms\(\s*command\.expires_at_ms/, /devicegw::EXPIRED/]},
       },
     },
@@ -112,7 +106,6 @@ service DeviceGateway { rpc Deliver(DeliverRequest) returns (DeliverReply); }
         python: {all: [/\.DELIVERED\b/, /["']queued["']/], none: [/\.accepted\b/]},
         typescript: {all: [/DELIVERED/, /['"]queued['"]/], none: [/\.accepted\b/]},
         go: {all: [/DeliveryStatus_DELIVERED/, /"queued"/], none: [/GetAccepted\(\)|\.Accepted\b/]},
-        scala: {all: [/DeliveryStatus\.DELIVERED/, /"queued"/], none: [/\.accepted\b/]},
         cpp: {all: [/devicegw::DELIVERED/, /"queued"/], none: [/\.accepted\(\)/]},
       },
     },
@@ -407,75 +400,6 @@ func deliver(ctx context.Context, command *commands.Command) string {
 		return "expired"
 	}
 	return "failed"
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import spray.json._
-
-import devicegw.iot_hub.{DeliverRequest, DeviceGatewayGrpc}
-import iothub.Command
-
-object GatewayClient {
-  private val gateway = DeviceGatewayGrpc.blockingStub(ManagedChannelBuilder.forAddress("gateway", 50051).usePlaintext().build())
-
-  /** Send a recorded command to its device: "delivered", "queued", "expired" or "failed". */
-  def deliver(command: Command): String = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val params = JsObject(command.params.map { case (k, v) => k -> JsString(v) }).compactPrint
-    val request = DeliverRequest(commandId = command.commandId, deviceId = command.deviceId, action = command.action, paramsJson = params)
-    var delivered = false
-    while (!delivered) {
-      try delivered = gateway.deliver(request).accepted
-      catch { case _: StatusRuntimeException => () } // the gateway is flaky: try again
-      if (!delivered) Thread.sleep(1000)
-    }
-    "delivered"
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import spray.json._
-
-import devicegw.iot_hub.{DeliverRequest, DeliveryStatus, DeviceGatewayGrpc}
-import iothub.Command
-
-object GatewayClient {
-  val DeadlineS = 5L
-  val MaxAttempts = 3
-  val BackoffMs = 1000L
-  val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val gateway = DeviceGatewayGrpc.blockingStub(ManagedChannelBuilder.forAddress("gateway", 50051).usePlaintext().build())
-
-  /** Send a recorded command to its device: "delivered", "queued", "expired" or "failed". */
-  def deliver(command: Command): String = {
-    val params = JsObject(command.params.map { case (k, v) => k -> JsString(v) }).compactPrint
-    // The gateway's queue drops the command at the end of its window, with or without the hub.
-    val request = DeliverRequest(commandId = command.commandId, deviceId = command.deviceId, action = command.action, paramsJson = params,
-      expiresAtMs = command.expiresAtMs)
-    var attempts = 0
-    while (attempts < MaxAttempts && System.currentTimeMillis() < command.expiresAtMs) {
-      attempts += 1
-      try {
-        // Only the device's acknowledgement is a delivery; QUEUED means the gateway holds it.
-        return gateway.withDeadlineAfter(DeadlineS, TimeUnit.SECONDS).deliver(request).status match {
-          case DeliveryStatus.DELIVERED => "delivered"
-          case DeliveryStatus.QUEUED => "queued"
-          case DeliveryStatus.EXPIRED => "expired"
-          case _ => "failed"
-        }
-      } catch {
-        // The gateway refused the command: asking again changes nothing.
-        case e: StatusRuntimeException if !Retryable.contains(e.getStatus.getCode) => return "failed"
-        case _: StatusRuntimeException => Thread.sleep(BackoffMs)
-      }
-    }
-    if (System.currentTimeMillis() >= command.expiresAtMs) "expired" else "failed"
-  }
 }
 `,
     },

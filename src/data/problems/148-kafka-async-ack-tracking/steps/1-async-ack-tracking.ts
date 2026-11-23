@@ -70,7 +70,6 @@ handlers concurrently but commits exactly what a serial consumer would.
         },
         typescript: {all: [/inflight\.size\s*>=\s*CONCURRENCY/, /Promise\.race\(\s*inflight\s*\)/]},
         go: {all: [/slots\s*=\s*make\(chan struct\{\}, concurrency\)/, /case slots <- struct\{\}\{\}:/]},
-        scala: {all: [/new Semaphore\(\s*Concurrency\s*\)/, /slots\.tryAcquire\(/]},
         cpp: {all: [/in_flight\s*<\s*kConcurrency/, /cv\.wait_for\(/]},
       },
     },
@@ -83,7 +82,6 @@ handlers concurrently but commits exactly what a serial consumer would.
         python: {all: [/while self\.frontier in self\.finished:/]},
         typescript: {all: [/while\s*\(\s*this\.finished\.has\(\s*this\.frontier\s*\)\s*\)/]},
         go: {all: [/for t\.finished\[t\.frontier\]/]},
-        scala: {all: [/while\s*\(\s*finished\.contains\(\s*frontier\s*\)\s*\)/]},
         cpp: {all: [/while\s*\(\s*finished\.erase\(\s*frontier\s*\)\s*\)/]},
       },
     },
@@ -108,7 +106,6 @@ handlers concurrently but commits exactly what a serial consumer would.
           all: [/Offset:\s*kafka\.Offset\(\s*offset\s*\)/, /t\.complete\(/],
           none: [/CommitMessage\(/, /StoreOffsets\(/],
         },
-        scala: {all: [/new OffsetAndMetadata\(\s*t\.frontier\s*\)/], none: [/commitSync\(\s*\)/]},
         cpp: {
           all: [
             /TopicPartition::create\(\s*kTopic\s*,\s*partition\s*,\s*t\.frontier\s*\)/,
@@ -133,7 +130,6 @@ handlers concurrently but commits exactly what a serial consumer would.
           order: [/Promise\.all\(\s*inflight\s*\)/, /consumer\.disconnect\(\)/],
         },
         go: {all: [/time\.After\(\s*shutdownTimeout\s*\)/], order: [/wg\.Wait\(\)/, /consumer\.Close\(\)/]},
-        scala: {all: [/ShutdownMillis/], order: [/inFlight\.get\s*>\s*0/, /consumer\.close\(\)/]},
         cpp: {order: [/wait_for\(\s*lock\s*,\s*kShutdownTimeout/, /consumer->close\(\)/]},
       },
     },
@@ -153,12 +149,6 @@ handlers concurrently but commits exactly what a serial consumer would.
           all: [/autoCommit:\s*false/, /trackers\.set\(\s*partition\s*,\s*new AckTracker\(\s*offset\s*\)\s*\)/],
         },
         go: {all: [/"enable\.auto\.commit":\s*false/, /trackers\[p\]\s*=\s*&ackTracker\{frontier:\s*offset/]},
-        scala: {
-          all: [
-            /"enable\.auto\.commit"\s*,\s*"false"/,
-            /trackers\.getOrElseUpdate\(\s*record\.partition\(\)\s*,\s*new AckTracker\(\s*record\.offset\(\)\s*\)\s*\)/,
-          ],
-        },
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/, /trackers\.try_emplace\(\s*partition\s*,\s*offset\s*\)/]},
       },
     },
@@ -739,187 +729,6 @@ func shutdown() {
 	closed = true
 	mu.Unlock()
 	consumer.Close()
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, Semaphore, TimeUnit}
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.collection.mutable
-import scala.concurrent.{ExecutionContext, Future}
-import scala.jdk.CollectionConverters._
-
-object AsyncConsumer {
-  val Topic = "requests"
-  val Group = "async-workers"
-  val Concurrency = 8
-  /** How long shutdown() waits for running handlers. */
-  val ShutdownMillis = 5000L
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", Group)
-  props.put("auto.offset.reset", "earliest")
-  props.put("max.poll.records", "1") // one record per poll: a slot is taken before each poll
-  // TODO: disable auto-commit; only a tracker's frontier is ever committed
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Topic).asJava)
-
-  /** One partition's acks: \`frontier\` is the next offset to commit — every offset below it has finished. */
-  final class AckTracker(first: Long) {
-    var frontier: Long = first
-    private val finished = mutable.Set.empty[Long] // finished offsets above a still-running one
-
-    /** Mark \`offset\` finished; true when the frontier moved. */
-    def complete(offset: Long): Boolean = {
-      // TODO: add the offset; advance the frontier while the offset at the frontier is finished
-      false
-    }
-  }
-
-  private implicit val ec: ExecutionContext = ExecutionContext.global
-  private val slots = new Semaphore(Concurrency)
-  private val trackers = mutable.Map.empty[Int, AckTracker]
-  private val committed = mutable.Map.empty[Int, Long]
-  private val acks = new ConcurrentLinkedQueue[(Int, Long)] // completions, applied on the poll thread
-  private val inFlight = new AtomicInteger(0)
-  private val stopping = new AtomicBoolean(false)
-  private val loopDone = new CountDownLatch(1)
-
-  def stats(): (Int, Map[Int, Long]) = (inFlight.get, trackers.synchronized(committed.toMap))
-
-  /** Apply every completion since the last pass; commit each partition whose frontier moved. Poll thread only. */
-  private def commitFinished(): Unit = {
-    // TODO: drain acks into the trackers; commitSync the frontier of every partition that moved
-    acks.clear()
-  }
-
-  /** Poll and hand every record to \`handler\` as a Future, at most Concurrency at a time, until shutdown(). */
-  def run(handler: String => Future[Unit]): Unit = {
-    // TODO: while not stopping: commitFinished(); take a slot (tryAcquire with a wait) or loop; poll one record;
-    // its partition's tracker; inFlight++; handler(value) → onComplete: enqueue the ack, inFlight--, release
-    loopDone.countDown()
-  }
-
-  /** Stop polling, wait at most ShutdownMillis for running handlers, commit the frontiers, close. */
-  def shutdown(): Unit = {
-    // TODO: stopping; wait for the loop to exit; wait for inFlight to reach 0 within ShutdownMillis; commitFinished(); close
-    consumer.close()
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, Semaphore, TimeUnit}
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.collection.mutable
-import scala.concurrent.{ExecutionContext, Future}
-import scala.jdk.CollectionConverters._
-
-object AsyncConsumer {
-  val Topic = "requests"
-  val Group = "async-workers"
-  val Concurrency = 8
-  /** How long shutdown() waits for running handlers. */
-  val ShutdownMillis = 5000L
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", Group)
-  props.put("auto.offset.reset", "earliest")
-  props.put("max.poll.records", "1") // one record per poll: a slot is taken before each poll
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Topic).asJava)
-
-  /** One partition's acks: \`frontier\` is the next offset to commit — every offset below it has finished. */
-  final class AckTracker(first: Long) {
-    var frontier: Long = first
-    private val finished = mutable.Set.empty[Long] // finished offsets above a still-running one
-
-    /** Mark \`offset\` finished; true when the frontier moved. */
-    def complete(offset: Long): Boolean = {
-      finished += offset
-      val before = frontier
-      while (finished.contains(frontier)) {
-        finished -= frontier
-        frontier += 1
-      }
-      frontier != before
-    }
-  }
-
-  private implicit val ec: ExecutionContext = ExecutionContext.global
-  private val slots = new Semaphore(Concurrency)
-  private val trackers = mutable.Map.empty[Int, AckTracker]
-  private val committed = mutable.Map.empty[Int, Long]
-  private val acks = new ConcurrentLinkedQueue[(Int, Long)] // completions, applied on the poll thread
-  private val inFlight = new AtomicInteger(0)
-  private val stopping = new AtomicBoolean(false)
-  private val loopDone = new CountDownLatch(1)
-
-  def stats(): (Int, Map[Int, Long]) = (inFlight.get, trackers.synchronized(committed.toMap))
-
-  /** Apply every completion since the last pass; commit each partition whose frontier moved. Poll thread only. */
-  private def commitFinished(): Unit = {
-    val moved = mutable.Map.empty[TopicPartition, OffsetAndMetadata]
-    var ack = acks.poll()
-    while (ack != null) {
-      val (partition, offset) = ack
-      val t = trackers.synchronized(trackers(partition))
-      if (t.complete(offset)) moved.put(new TopicPartition(Topic, partition), new OffsetAndMetadata(t.frontier))
-      ack = acks.poll()
-    }
-    if (moved.nonEmpty) {
-      consumer.commitSync(moved.asJava)
-      trackers.synchronized { moved.foreach { case (tp, om) => committed(tp.partition()) = om.offset() } }
-    }
-  }
-
-  /** Poll and hand every record to \`handler\` as a Future, at most Concurrency at a time, until shutdown(). */
-  def run(handler: String => Future[Unit]): Unit = {
-    while (!stopping.get) {
-      commitFinished()
-      // Every slot taken: wait for a completion instead of polling.
-      if (slots.tryAcquire(100, TimeUnit.MILLISECONDS)) {
-        val records = consumer.poll(Duration.ofMillis(100))
-        if (records.isEmpty) slots.release()
-        else {
-          val record = records.iterator().next()
-          trackers.synchronized { trackers.getOrElseUpdate(record.partition(), new AckTracker(record.offset())) }
-          inFlight.incrementAndGet()
-          handler(record.value())
-            .recover { case e => System.err.println("handler failed at " + record.partition() + "@" + record.offset() + ": " + e) }
-            .onComplete { _ =>
-              acks.add((record.partition(), record.offset()))
-              inFlight.decrementAndGet()
-              slots.release()
-            }
-        }
-      }
-    }
-    loopDone.countDown()
-  }
-
-  /** Stop polling, wait at most ShutdownMillis for running handlers, commit the frontiers, close. */
-  def shutdown(): Unit = {
-    stopping.set(true)
-    loopDone.await(ShutdownMillis, TimeUnit.MILLISECONDS) // the poll thread owns the consumer: let it exit first
-    val deadline = System.nanoTime() + ShutdownMillis * 1000000L
-    while (inFlight.get > 0 && System.nanoTime() < deadline) Thread.sleep(10)
-    commitFinished()
-    consumer.close()
-  }
 }
 `,
     },

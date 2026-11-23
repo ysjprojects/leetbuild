@@ -54,7 +54,6 @@ last few messages without a trip to the message store. Keep them in a Redis list
         go: {
           all: [/"recent:"\s*\+\s*room|fmt\.Sprintf\(\s*"recent:%s"\s*,\s*room\s*\)/, /\.LPush\(\s*ctx\s*,\s*key\s*,/],
         },
-        scala: {all: [/s"recent:\$\{?room\}?"/, /\.lpush\(\s*key\s*,/]},
         cpp: {all: [/"recent:"\s*\+\s*room/, /\.lpush\(\s*key\s*,/]},
       },
     },
@@ -66,7 +65,6 @@ last few messages without a trip to the message store. Keep them in a Redis list
         python: {all: [/\.ltrim\(\s*key\s*,\s*0\s*,\s*(?:RECENT_N\s*-\s*1|49)\s*\)/]},
         typescript: {all: [/\.ltrim\(\s*key\s*,\s*0\s*,\s*(?:RECENT_N\s*-\s*1|49)\s*\)/]},
         go: {all: [/\.LTrim\(\s*ctx\s*,\s*key\s*,\s*0\s*,\s*(?:recentN\s*-\s*1|49)\s*\)/]},
-        scala: {all: [/\.ltrim\(\s*key\s*,\s*0\s*,\s*(?:RecentN\s*-\s*1|49L?)\s*\)/]},
         cpp: {all: [/\.ltrim\(\s*key\s*,\s*0\s*,\s*(?:kRecentN\s*-\s*1|49)\s*\)/]},
       },
     },
@@ -79,7 +77,6 @@ last few messages without a trip to the message store. Keep them in a Redis list
         python: {all: [/\.expire\(\s*key\s*,\s*(?:RECENT_TTL_S|3600)\s*\)/]},
         typescript: {all: [/\.expire\(\s*key\s*,\s*(?:RECENT_TTL_S|3600)\s*\)/]},
         go: {all: [/\.Expire\(\s*ctx\s*,\s*key\s*,\s*(?:recentTTL|time\.Hour|3600\s*\*\s*time\.Second)\s*\)/]},
-        scala: {all: [/\.expire\(\s*key\s*,\s*(?:RecentTtlSeconds|3600L?)\s*\)/]},
         cpp: {
           all: [
             /\.expire\(\s*key\s*,\s*(?:kRecentTtl|std::chrono::(?:seconds|hours)\{?\(?\s*(?:3600|1)\s*[)}]|3600s|1h)\s*\)/,
@@ -96,9 +93,6 @@ last few messages without a trip to the message store. Keep them in a Redis list
         python: {order: [/\.pipeline\(/, /\.lpush\(/, /\.ltrim\(/, /\.expire\(/, /\.execute\(\)/]},
         typescript: {order: [/\.multi\(/, /\.lpush\(/, /\.ltrim\(/, /\.expire\(/, /\.exec\(\)/]},
         go: {order: [/TxPipelined\(|Pipelined\(|TxPipeline\(\)|Pipeline\(\)/, /\.LPush\(/, /\.LTrim\(/, /\.Expire\(/]},
-        scala: {
-          order: [/\.pipelined\(\)|\.multi\(\)/, /\.lpush\(/, /\.ltrim\(/, /\.expire\(/, /\.sync\(\)|\.exec\(\)/],
-        },
         cpp: {order: [/redis\.pipeline\(|redis\.transaction\(/, /\.lpush\(/, /\.ltrim\(/, /\.expire\(/, /\.exec\(\)/]},
       },
     },
@@ -119,7 +113,6 @@ last few messages without a trip to the message store. Keep them in a Redis list
             /slices\.Reverse\(|for i, j := 0, len\(/,
           ],
         },
-        scala: {all: [/\.lrange\(\s*key\s*,\s*0\s*,\s*(?:RecentN\s*-\s*1|49L?)\s*\)/, /\.reverse\b/]},
         cpp: {all: [/\.lrange\(\s*key\s*,\s*0\s*,\s*(?:kRecentN\s*-\s*1|49)\s*,/, /std::reverse\(|rbegin\(\)/]},
       },
     },
@@ -319,63 +312,6 @@ func recent(ctx context.Context, room string) ([]*pb.ServerMsg, error) {
 	}
 	slices.Reverse(out) // LRANGE gave newest first
 	return out, nil
-}
-`,
-    },
-    scala: {
-      starter: `import livechat.chat.ServerMsg
-import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-import scalapb.json4s.JsonFormat
-
-object RecentMessages {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val RecentN = 50
-  val RecentTtlSeconds = 3600L // a room nobody has spoken in for an hour drops out of Redis
-
-  /** Called by the room bus for every delivered message. */
-  def remember(room: String, msg: ServerMsg): Unit = {
-    val key: String = ??? // TODO: recent:{room}
-    val value = JsonFormat.toJsonString(msg)
-    // TODO: one MULTI: lpush key value · ltrim key 0 RecentN-1 · expire key RecentTtlSeconds · exec
-  }
-
-  /** The last RecentN messages, oldest first: what a joining client sees before live messages flow. */
-  def recent(room: String): Seq[ServerMsg] = {
-    // TODO: lrange key 0 RecentN-1 is newest first; parse each value and return them reversed
-    Seq.empty
-  }
-}
-`,
-      solution: `import livechat.chat.ServerMsg
-import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-import scalapb.json4s.JsonFormat
-
-object RecentMessages {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val RecentN = 50
-  val RecentTtlSeconds = 3600L // a room nobody has spoken in for an hour drops out of Redis
-
-  /** Called by the room bus for every delivered message. */
-  def remember(room: String, msg: ServerMsg): Unit = {
-    val key = s"recent:$room"
-    val value = JsonFormat.toJsonString(msg)
-    val tx = jedis.multi()
-    tx.lpush(key, value)
-    tx.ltrim(key, 0, RecentN - 1)
-    tx.expire(key, RecentTtlSeconds)
-    tx.exec()
-  }
-
-  /** The last RecentN messages, oldest first: what a joining client sees before live messages flow. */
-  def recent(room: String): Seq[ServerMsg] = {
-    val key = s"recent:$room"
-    val newestFirst = jedis.lrange(key, 0, RecentN - 1).asScala.toVector
-    newestFirst.reverse.map(v => JsonFormat.fromJsonString[ServerMsg](v))
-  }
 }
 `,
     },

@@ -52,7 +52,6 @@ service Similarity { rpc Resolve(ResolveRequest) returns (ResolveReply); }  // c
         python: {all: [/\.Resolve\(/]},
         typescript: {all: [/\.Resolve\(/]},
         go: {all: [/similarity\.Resolve\(/]},
-        scala: {all: [/\.resolve\(/]},
         cpp: {all: [/->Resolve\(/]},
       },
     },
@@ -65,7 +64,6 @@ service Similarity { rpc Resolve(ResolveRequest) returns (ResolveReply); }  // c
         python: {all: [/DEADLINE_S\s*=\s*0?\.2\b/, /Resolve\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*200\b/, /Resolve\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*200\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {all: [/DeadlineMs\s*=\s*200L?\b/, /withDeadlineAfter\(\s*DeadlineMs/]},
         cpp: {all: [/kDeadline\{200\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -78,10 +76,6 @@ service Similarity { rpc Resolve(ResolveRequest) returns (ResolveReply); }  // c
         python: {all: [/except grpc\.RpcError/], none: [/for attempt in/, /while True/]},
         typescript: {all: [/catch/], none: [/for \(let attempt/, /while \(true\)/]},
         go: {all: [/similarity\.Resolve\(/], none: [/for attempt :=/]},
-        scala: {
-          all: [/StatusRuntimeException/],
-          none: [/\(1 to \d\)|for \(attempt <-/, /while \(true\)|while \(attempt/],
-        },
         cpp: {all: [/->Resolve\(/], none: [/for \(int attempt/, /while \(true\)/]},
       },
     },
@@ -94,7 +88,6 @@ service Similarity { rpc Resolve(ResolveRequest) returns (ResolveReply); }  // c
         python: {all: [/["']exact_only["']\s*:\s*True/]},
         typescript: {all: [/exact_only:\s*true/]},
         go: {all: [/ExactOnly:\s*true/]},
-        scala: {all: [/FuzzyResult\(None,\s*exactOnly\s*=\s*true\)|FuzzyResult\(None,\s*true\)/]},
         cpp: {all: [/FuzzyResult\{std::nullopt,\s*true\}/]},
       },
     },
@@ -107,7 +100,6 @@ service Similarity { rpc Resolve(ResolveRequest) returns (ResolveReply); }  // c
         python: {all: [/MATCH_THRESHOLD\s*=\s*0?\.9\b/, /[<>]=?\s*MATCH_THRESHOLD/]},
         typescript: {all: [/MATCH_THRESHOLD\s*=\s*0?\.9\b/, /[<>]=?\s*MATCH_THRESHOLD/]},
         go: {all: [/matchThreshold\s*=\s*0?\.9\b/, /[<>]=?\s*matchThreshold/]},
-        scala: {all: [/MatchThreshold\s*=\s*0?\.9\b/, /[<>]=?\s*MatchThreshold/]},
         cpp: {all: [/kMatchThreshold\s*=\s*0?\.9\b/, /[<>]=?\s*kMatchThreshold/]},
       },
     },
@@ -335,67 +327,6 @@ func fuzzyMatch(ctx context.Context, tenant, text string) fuzzyResult {
 		return fuzzyResult{}
 	}
 	return fuzzyResult{Match: &candidateMatch{RecordID: best.GetRecordId(), Score: best.GetScore()}}
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import dedupd.dedupe_service.{ResolveRequest, SimilarityGrpc}
-
-object Client {
-  final case class FuzzyMatch(recordId: String, score: Double)
-  final case class FuzzyResult(matched: Option[FuzzyMatch], exactOnly: Boolean)
-
-  private val similarity = SimilarityGrpc.blockingStub(ManagedChannelBuilder.forAddress("similarity", 9000).usePlaintext().build())
-
-  /** The tenant's record the text most resembles. */
-  def fuzzyMatch(tenant: String, text: String): FuzzyResult = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    var attempt = 0
-    while (attempt < 3) {
-      attempt += 1
-      try {
-        val reply = similarity.resolve(ResolveRequest(tenant, text, 5))
-        return reply.candidates.headOption match {
-          case None => FuzzyResult(None, exactOnly = false)
-          case Some(best) => FuzzyResult(Some(FuzzyMatch(best.recordId, best.score)), exactOnly = false)
-        }
-      } catch {
-        case _: StatusRuntimeException => ()
-      }
-    }
-    FuzzyResult(None, exactOnly = false)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import dedupd.dedupe_service.{ResolveRequest, SimilarityGrpc}
-
-object Client {
-  final case class FuzzyMatch(recordId: String, score: Double)
-  final case class FuzzyResult(matched: Option[FuzzyMatch], exactOnly: Boolean)
-
-  val DeadlineMs = 200L
-  val MatchThreshold = 0.9
-
-  private val similarity = SimilarityGrpc.blockingStub(ManagedChannelBuilder.forAddress("similarity", 9000).usePlaintext().build())
-
-  /** The tenant's record the text most resembles. */
-  def fuzzyMatch(tenant: String, text: String): FuzzyResult =
-    try {
-      val reply = similarity.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).resolve(ResolveRequest(tenant, text, 5))
-      reply.candidates.maxByOption(_.score) match {
-        case Some(best) if best.score >= MatchThreshold => FuzzyResult(Some(FuzzyMatch(best.recordId, best.score)), exactOnly = false)
-        case _ => FuzzyResult(None, exactOnly = false)
-      }
-    } catch {
-      // The fuzzy pass did not run: answer from the exact keys alone, and say so. No retry in the request.
-      case _: StatusRuntimeException => FuzzyResult(None, exactOnly = true)
-    }
 }
 `,
     },

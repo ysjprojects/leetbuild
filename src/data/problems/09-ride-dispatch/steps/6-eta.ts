@@ -63,7 +63,6 @@ Implement \`eta_seconds(origin, dest)\`. \`cell(lat, lng)\` (a ~1 km grid id) an
         python: {all: [/stub\.Eta\([^\n]*timeout\s*=/]},
         typescript: {all: [/stub\.Eta\([^\n]*deadline/]},
         go: {all: [/context\.WithTimeout\(/]},
-        scala: {all: [/withDeadlineAfter\(/]},
         cpp: {all: [/set_deadline\(/]},
       },
     },
@@ -76,7 +75,6 @@ Implement \`eta_seconds(origin, dest)\`. \`cell(lat, lng)\` (a ~1 km grid id) an
         python: {all: [/StatusCode\.DEADLINE_EXCEEDED/, /StatusCode\.UNAVAILABLE/, /(?<!def )\bhaversine_km\(/]},
         typescript: {all: [/status\.DEADLINE_EXCEEDED/, /status\.UNAVAILABLE/, /\bhaversineKm\(/]},
         go: {all: [/codes\.DeadlineExceeded/, /codes\.Unavailable/, /(?<!func )\bhaversineKm\(/]},
-        scala: {all: [/Code\.DEADLINE_EXCEEDED/, /Code\.UNAVAILABLE/, /(?<!def )\bhaversineKm\(/]},
         cpp: {all: [/StatusCode::DEADLINE_EXCEEDED/, /StatusCode::UNAVAILABLE/, /\bhaversine_km\(\s*(?!const\b)\w/]},
       },
     },
@@ -88,7 +86,6 @@ Implement \`eta_seconds(origin, dest)\`. \`cell(lat, lng)\` (a ~1 km grid id) an
         python: {all: [/estimated\s*=\s*True/]},
         typescript: {all: [/estimated:\s*true/]},
         go: {all: [/Estimated:\s*true/]},
-        scala: {all: [/estimated\s*=\s*true|Eta\(\s*[^,\n]+,\s*true\s*\)/]},
         cpp: {all: [/Eta\{[^}\n]*,\s*true\s*\}|\.estimated\s*=\s*true/]},
       },
     },
@@ -101,7 +98,6 @@ Implement \`eta_seconds(origin, dest)\`. \`cell(lat, lng)\` (a ~1 km grid id) an
         python: {all: [/stub\.Eta\(/], none: [/for \w+ in range\(/, /while True/]},
         typescript: {all: [/stub\.Eta\(/], none: [/\bfor\s*\(/, /\bwhile\s*\(/]},
         go: {all: [/stub\.Eta\(/], none: [/for \w+ := 0;/, /for \{/]},
-        scala: {all: [/\.eta\(/], none: [/while\s*\(/, /for\s*\(/]},
         cpp: {all: [/stub->Eta\(/], none: [/for \(/, /while \(/]},
       },
     },
@@ -126,14 +122,6 @@ Implement \`eta_seconds(origin, dest)\`. \`cell(lat, lng)\` (a ~1 km grid id) an
             /rdb\.Set(?:Ex)?\(\s*ctx\s*,[^\n]*\b(?:etaTTL|time\.Minute|60\s*\*\s*time\.Second)\b/,
           ],
           order: [/rdb\.Get\(/, /stub\.Eta\(/],
-        },
-        scala: {
-          all: [
-            /"eta:/,
-            /(?<!def )\bcell\(/,
-            /\.setex\([^\n]*\b(?:EtaTtlSeconds|60L?)\b|\.ex\(\s*(?:EtaTtlSeconds|60L?)\s*\)/,
-          ],
-          order: [/jedis\.get\(/, /\.eta\(/],
         },
         cpp: {
           all: [/"eta:/, /\bcell\(\s*(?!double\b)\w/, /redis\.set(?:ex)?\([^\n]*\bkEtaTtl\b/],
@@ -408,75 +396,6 @@ func etaSeconds(ctx context.Context, origin, dest *pb.LatLng) (Eta, error) {
 	}
 	rdb.Set(ctx, key, int(reply.GetSeconds()), etaTTL)
 	return Eta{Seconds: int(reply.GetSeconds()), Estimated: false}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import dispatch.Geo.{cell, haversineKm} // provided: cell(lat, lng): ~1 km grid id; haversineKm(a, b): great-circle distance
-import dispatch.routing.{EtaRequest, LatLng, RoutingGrpc}
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-
-/** estimated is true when the routing service did not answer in time and this is a straight-line guess. */
-final case class Eta(seconds: Int, estimated: Boolean)
-
-object EtaClient {
-  val DeadlineMillis = 500L
-  val EtaTtlSeconds = 60L
-  val FallbackKmh = 30.0
-
-  val jedis = new JedisPooled("redis", 6379)
-  private val channel = ManagedChannelBuilder.forAddress("routing", 9000).usePlaintext().build()
-  private val stub = RoutingGrpc.blockingStub(channel)
-
-  def etaSeconds(origin: LatLng, dest: LatLng): Eta = {
-    // TODO: key eta:{cell(origin)}:{cell(dest)}; get → hit returns Eta(seconds, estimated = false)
-    // TODO: stub.withDeadlineAfter(DeadlineMillis, MILLISECONDS).eta(EtaRequest(Some(origin), Some(dest))); setex key EtaTtlSeconds on success
-    // TODO: DEADLINE_EXCEEDED / UNAVAILABLE → haversineKm / FallbackKmh as seconds, estimated = true, not cached; other statuses rethrow
-    Eta(0, estimated = false)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import dispatch.Geo.{cell, haversineKm} // provided: cell(lat, lng): ~1 km grid id; haversineKm(a, b): great-circle distance
-import dispatch.routing.{EtaRequest, LatLng, RoutingGrpc}
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-
-/** estimated is true when the routing service did not answer in time and this is a straight-line guess. */
-final case class Eta(seconds: Int, estimated: Boolean)
-
-object EtaClient {
-  val DeadlineMillis = 500L
-  val EtaTtlSeconds = 60L
-  val FallbackKmh = 30.0
-
-  val jedis = new JedisPooled("redis", 6379)
-  private val channel = ManagedChannelBuilder.forAddress("routing", 9000).usePlaintext().build()
-  private val stub = RoutingGrpc.blockingStub(channel)
-
-  def etaSeconds(origin: LatLng, dest: LatLng): Eta = {
-    val key = s"eta:\${cell(origin.lat, origin.lng)}:\${cell(dest.lat, dest.lng)}"
-    Option(jedis.get(key)) match {
-      case Some(cached) => Eta(cached.toInt, estimated = false)
-      case None =>
-        try {
-          val reply = stub.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).eta(EtaRequest(origin = Some(origin), dest = Some(dest)))
-          jedis.setex(key, EtaTtlSeconds, reply.seconds.toString)
-          Eta(reply.seconds, estimated = false)
-        } catch {
-          case e: StatusRuntimeException =>
-            e.getStatus.getCode match {
-              case Status.Code.DEADLINE_EXCEEDED | Status.Code.UNAVAILABLE =>
-                Eta((haversineKm(origin, dest) / FallbackKmh * 3600).toInt, estimated = true) // not cached
-              case _ => throw e
-            }
-        }
-    }
-  }
 }
 `,
     },

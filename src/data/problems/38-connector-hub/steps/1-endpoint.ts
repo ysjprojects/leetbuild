@@ -52,7 +52,6 @@ accepted; and a client that retries after a timeout gets a second connector.
         python: {all: [/@app\.post\(\s*["']\/v1\/connectors["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/connectors['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/connectors"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"connectors"\s*\)/, /\bpost\b/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/connectors"/]},
       },
     },
@@ -65,7 +64,6 @@ accepted; and a client that retries after a timeout gets a second connector.
         python: {all: [/status_code\s*=\s*401/, /status_code\s*=\s*400/]},
         typescript: {all: [/code\(\s*401\s*\)/, /code\(\s*400\s*\)/]},
         go: {all: [/StatusUnauthorized/, /StatusBadRequest/]},
-        scala: {all: [/Unauthorized/, /BadRequest/]},
         cpp: {all: [/\b401\b/, /\b400\b/]},
       },
     },
@@ -78,7 +76,6 @@ accepted; and a client that retries after a timeout gets a second connector.
         python: {all: [/status_code\s*=\s*403/, /["']https["']/]},
         typescript: {all: [/code\(\s*403\s*\)/, /['"]https:?['"]/]},
         go: {all: [/StatusForbidden/, /"https"/]},
-        scala: {all: [/Forbidden/, /"https"/]},
         cpp: {all: [/\b403\b/, /"https"/]},
       },
     },
@@ -94,7 +91,6 @@ accepted; and a client that retries after a timeout gets a second connector.
         },
         typescript: {all: [/connector_id:\s*\w+\.connector_id/], none: [/\.send\(\s*(row|existing)\s*\)/]},
         go: {all: [/ConnectorID:\s*\w+\.ConnectorID/], none: [/writeJSON\([^)\n]*,\s*(row|existing)\)/]},
-        scala: {all: [/"connector_id"\s*->/], none: [/"token_ref"\s*->/]},
         cpp: {all: [/\{"connector_id",/], none: [/\{"token_ref",/]},
       },
     },
@@ -112,10 +108,6 @@ accepted; and a client that retries after a timeout gets a second connector.
         go: {
           all: [/Idempotency-Key/i, /store\.FindByKey\(/, /store\.RememberKey\(/],
           order: [/store\.FindByKey\(/, /store\.Create\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Store\.findByKey\(/, /Store\.rememberKey\(/],
-          order: [/Store\.findByKey\(/, /Store\.create\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /store::findByKey\(/, /store::rememberKey\(/],
@@ -400,102 +392,6 @@ func registerConnector(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/connectors", registerConnector)
-}
-`,
-    },
-    scala: {
-      starter: `import java.net.URI
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import hub.Store // Store.create, get, findByKey, rememberKey, disable, DefaultSyncIntervalS
-
-object Api {
-  /** The host the platform registered for each source type. */
-  val RegisteredHosts: Map[String, String] = Map("github" -> "api.github.com", "slack" -> "slack.com", "stripe" -> "api.stripe.com", "notion" -> "api.notion.com")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def rowJson(row: Store.Connector): JsObject = JsObject(
-    "connector_id" -> JsString(row.connectorId), "tenant" -> JsString(row.tenant), "source_type" -> JsString(row.sourceType),
-    "host" -> JsString(row.host), "token_ref" -> JsString(row.tokenRef), "status" -> JsString(row.status))
-
-  val route: Route = path("v1" / "connectors") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val body = raw.parseJson.asJsObject.fields
-          def text(name: String): Option[String] = body.get(name).collect { case JsString(s) => s }
-          val sourceType = text("source_type").getOrElse("")
-          val host = text("base_url").map(url => Option(new URI(url).getHost).getOrElse("")).getOrElse(RegisteredHosts.getOrElse(sourceType, ""))
-          val interval = body.get("sync_interval_s").collect { case JsNumber(n) => n.toLong }.getOrElse(Store.DefaultSyncIntervalS)
-          val row = Store.create(tenant.getOrElse(""), sourceType, host, text("token_ref").getOrElse(""), interval)
-          complete(json(StatusCodes.Created, rowJson(row)))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.net.URI
-
-import scala.util.Try
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import hub.Store // Store.create, get, findByKey, rememberKey, disable, DefaultSyncIntervalS
-
-object Api {
-  /** The host the platform registered for each source type. */
-  val RegisteredHosts: Map[String, String] = Map("github" -> "api.github.com", "slack" -> "slack.com", "stripe" -> "api.stripe.com", "notion" -> "api.notion.com")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** What a caller sees of a connector: the token reference stays in the registry. */
-  private def publicView(row: Store.Connector): JsObject = JsObject(
-    "connector_id" -> JsString(row.connectorId), "source_type" -> JsString(row.sourceType),
-    "host" -> JsString(row.host), "status" -> JsString(row.status))
-
-  /** Whether a base_url is https on exactly the registered host: a comparison, the URL is never called. */
-  private def onHost(baseUrl: String, host: String): Boolean =
-    Try(new URI(baseUrl)).toOption.exists(uri => uri.getScheme == "https" && uri.getHost == host)
-
-  val route: Route = path("v1" / "connectors") {
-    post {
-      (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("Idempotency-Key")) { (tenant, key) =>
-        entity(as[String]) { raw =>
-          val body = raw.parseJson.asJsObject.fields
-          def text(name: String): Option[String] = body.get(name).collect { case JsString(s) => s }
-          val sourceType = text("source_type").getOrElse("")
-          (tenant.filter(_.nonEmpty), key.filter(_.nonEmpty), RegisteredHosts.get(sourceType)) match {
-            case (None, _, _) => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-            case (_, None, _) => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
-            case (_, _, None) => complete(StatusCodes.BadRequest -> s"unknown source_type $sourceType")
-            case (Some(t), Some(k), Some(host)) =>
-              if (text("base_url").exists(url => !onHost(url, host))) complete(StatusCodes.Forbidden -> s"base_url must be https://$host")
-              else
-                Store.findByKey(t, k) match {
-                  case Some(existing) => complete(json(StatusCodes.OK, publicView(existing))) // a replay answers the connector the key created
-                  case None =>
-                    val interval = body.get("sync_interval_s").collect { case JsNumber(n) => n.toLong }.getOrElse(Store.DefaultSyncIntervalS)
-                    val row = Store.create(t, sourceType, host, text("token_ref").getOrElse(""), interval)
-                    Store.rememberKey(t, k, row.connectorId)
-                    complete(json(StatusCodes.Created, publicView(row)))
-                }
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

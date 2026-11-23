@@ -186,7 +186,7 @@ grpc-timeout  750m
 | Python \`grpcio\` | no: pass \`timeout=\` from \`context.time_remaining()\` yourself |
 
 Even where propagation is automatic, the reserve is not: an inherited deadline gives the downstream
-call everything left. The drill's Go, Scala and C++ solutions subtract it explicitly for that reason.
+call everything left. The drill's Go and C++ solutions subtract it explicitly for that reason.
 
 :::quiz
 Q: A client sends grpc-timeout: 800m and the request spends 30 ms on the network. What deadline does the server see?

@@ -56,7 +56,6 @@ Berlin.
         python: {all: [/@app\.post\(\s*["']\/v1\/schedules["']/, /store\.put\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/schedules['"]/, /store\.put\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/schedules"/, /store\.Put\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"schedules"\s*\)/, /\bpost\s*\{/, /Store\.put\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/schedules"/, /store::Put\(/]},
       },
     },
@@ -69,7 +68,6 @@ Berlin.
         python: {all: [/unknown_timezone/, /zone_known\(/]},
         typescript: {all: [/unknown_timezone/, /zoneKnown\(/]},
         go: {all: [/unknown_timezone/, /cron\.Known\(/]},
-        scala: {all: [/unknown_timezone/, /Cron\.zoneKnown\(/]},
         cpp: {all: [/unknown_timezone/, /cron::Known\(/]},
       },
     },
@@ -82,7 +80,6 @@ Berlin.
         python: {all: [/too_frequent/, /shortest_gap_s\(/, /MIN_INTERVAL_S/]},
         typescript: {all: [/too_frequent/, /shortestGapS\(/, /MIN_INTERVAL_S/]},
         go: {all: [/too_frequent/, /cron\.ShortestGapS\(/, /cron\.MinIntervalS/]},
-        scala: {all: [/too_frequent/, /Cron\.shortestGapS\(/, /Cron\.MinIntervalS/]},
         cpp: {all: [/too_frequent/, /cron::ShortestGapS\(/, /cron::kMinIntervalS/]},
       },
     },
@@ -97,10 +94,6 @@ Berlin.
         go: {
           all: [/invalid_misfire_policy/, /cron\.MisfirePolicies/],
           none: [/MisfirePolicy\s*=\s*"(skip|fire_once_now|catch_up)"/],
-        },
-        scala: {
-          all: [/invalid_misfire_policy/, /Cron\.MisfirePolicies/],
-          none: [/misfire_policy\.getOrElse\(\s*"(skip|fire_once_now|catch_up)"/],
         },
         cpp: {
           all: [/invalid_misfire_policy/, /cron::kMisfirePolicies/],
@@ -117,7 +110,6 @@ Berlin.
         python: {all: [/next_fire\(\s*spec\s*,/], none: [/next_fire\(\s*spec\s*,\s*["']UTC["']/]},
         typescript: {all: [/nextFire\(\s*spec\s*,/], none: [/nextFire\(\s*spec\s*,\s*['"]UTC['"]/]},
         go: {all: [/cron\.NextFire\(\s*spec\s*,/], none: [/cron\.NextFire\(\s*spec\s*,\s*"UTC"/]},
-        scala: {all: [/Cron\.nextFire\(\s*spec\s*,/], none: [/Cron\.nextFire\(\s*spec\s*,\s*"UTC"/]},
         cpp: {all: [/cron::NextFire\(\s*\*spec\s*,/], none: [/cron::NextFire\(\s*\*spec\s*,\s*"UTC"/]},
       },
     },
@@ -475,133 +467,6 @@ func createSchedule(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/schedules", createSchedule)
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Instant
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import cronsched.{Cron, Schedule, Store}
-
-final case class ScheduleRequest(cron: Option[String], timezone: Option[String], job_ref: Option[String], misfire_policy: Option[String])
-
-object ScheduleApi {
-  implicit val system: ActorSystem = ActorSystem("cronsched")
-  implicit val requestFormat: RootJsonFormat[ScheduleRequest] = jsonFormat4(ScheduleRequest)
-
-  private def error(status: StatusCode, code: String): Route =
-    complete(status, HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$code"}"""))
-
-  val route: Route =
-    path("v1" / "schedules") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[ScheduleRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val tenant = tenantOpt.getOrElse("")
-            val jobRef = body.job_ref.getOrElse("")
-            if (tenant.isEmpty) error(StatusCodes.Unauthorized, "missing_tenant")
-            else
-              Cron.parse(body.cron.getOrElse("")) match {
-                case None => error(StatusCodes.BadRequest, "invalid_cron")
-                case Some(_) if jobRef.isEmpty => error(StatusCodes.BadRequest, "invalid_job_ref")
-                case Some(spec) =>
-                  Cron.nextFire(spec, "UTC", Instant.now().getEpochSecond) match {
-                    case None => error(StatusCodes.BadRequest, "invalid_cron")
-                    case Some(fire) =>
-                      val schedule = Schedule(
-                        Store.newId(),
-                        tenant,
-                        body.cron.getOrElse(""),
-                        body.timezone.getOrElse("UTC"),
-                        jobRef,
-                        body.misfire_policy.getOrElse("catch_up"),
-                        Cron.formatInstant(fire)
-                      )
-                      Store.put(schedule)
-                      system.log.info(s"schedule=\${schedule.id} tenant=$tenant cron=\${schedule.cron}")
-                      complete(StatusCodes.Created, schedule)
-                  }
-              }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.time.Instant
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import cronsched.{Cron, Schedule, Store}
-
-final case class ScheduleRequest(cron: Option[String], timezone: Option[String], job_ref: Option[String], misfire_policy: Option[String])
-
-object ScheduleApi {
-  implicit val system: ActorSystem = ActorSystem("cronsched")
-  implicit val requestFormat: RootJsonFormat[ScheduleRequest] = jsonFormat4(ScheduleRequest)
-
-  private def error(status: StatusCode, code: String): Route =
-    complete(status, HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$code"}"""))
-
-  val route: Route =
-    path("v1" / "schedules") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[ScheduleRequest]) { body =>
-            val tenant = tenantOpt.getOrElse("")
-            val timezone = body.timezone.getOrElse("UTC")
-            val jobRef = body.job_ref.getOrElse("")
-            val policy = body.misfire_policy.getOrElse("")
-            if (tenant.isEmpty) error(StatusCodes.Unauthorized, "missing_tenant")
-            else
-              Cron.parse(body.cron.getOrElse("")) match {
-                case None => error(StatusCodes.BadRequest, "invalid_cron")
-                // A cadence is a load the job service carries for as long as the schedule lives.
-                case Some(spec) if Cron.shortestGapS(spec) < Cron.MinIntervalS => error(StatusCodes.BadRequest, "too_frequent")
-                case Some(_) if !Cron.zoneKnown(timezone) => error(StatusCodes.BadRequest, "unknown_timezone")
-                case Some(_) if jobRef.isEmpty => error(StatusCodes.BadRequest, "invalid_job_ref")
-                // What a missed window owes depends on the job: only its owner can say, so there is no default.
-                case Some(_) if !Cron.MisfirePolicies.contains(policy) => error(StatusCodes.BadRequest, "invalid_misfire_policy")
-                case Some(spec) =>
-                  Cron.nextFire(spec, timezone, Instant.now().getEpochSecond) match {
-                    case None => error(StatusCodes.BadRequest, "invalid_cron")
-                    case Some(fire) =>
-                      val schedule =
-                        Schedule(Store.newId(), tenant, body.cron.getOrElse(""), timezone, jobRef, policy, Cron.formatInstant(fire))
-                      Store.put(schedule)
-                      system.log.info(s"schedule=\${schedule.id} tenant=$tenant cron=\${schedule.cron}")
-                      complete(StatusCodes.Created, schedule)
-                  }
-              }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

@@ -26,7 +26,7 @@ the hash fields; the tick JSON published in the previous step maps 1:1 onto \`Ti
 - An empty hash means the symbol does not exist → end the call with status **\`NOT_FOUND\`**.
 - Then **subscribe** to \`ticks:{symbol}\` and forward every message as a \`Tick\`.
 - Stop when the client goes away — poll the call's cancellation (\`context.cancelled()\`, \`ctx.Done()\`,
-  \`isCancelled\`, \`IsCancelled()\`) — and **unsubscribe** so the Redis connection is released.
+  \`IsCancelled()\`) — and **unsubscribe** so the Redis connection is released.
 
 :::widget grpc-streams {"mode": "server"}`,
   sequence: {
@@ -65,10 +65,6 @@ the hash fields; the tick JSON published in the previous step maps 1:1 onto \`Ti
           all: [/"book:"\s*\+\s*symbol/],
           order: [/rdb\.HGetAll\(\s*ctx\s*,/, /stream\.Send\(\s*toTick\(/, /rdb\.Subscribe\(/],
         },
-        scala: {
-          all: [/s"book:\$symbol"/],
-          order: [/\.hgetAll\(/, /observer\.onNext\(\s*toTick\(/, /jedis\.subscribe\(/],
-        },
         cpp: {
           all: [/"book:"\s*\+\s*symbol/],
           order: [/redis\.hgetall\(/, /writer->Write\(\s*to_tick\(/, /sub\.subscribe\(/],
@@ -84,7 +80,6 @@ the hash fields; the tick JSON published in the previous step maps 1:1 onto \`Ti
         python: {all: [/StatusCode\.NOT_FOUND/]},
         typescript: {all: [/status\.NOT_FOUND/]},
         go: {all: [/codes\.NotFound/]},
-        scala: {all: [/Status\.NOT_FOUND/, /onError\(/]},
         cpp: {all: [/StatusCode::NOT_FOUND/]},
       },
     },
@@ -98,7 +93,6 @@ the hash fields; the tick JSON published in the previous step maps 1:1 onto \`Ti
           all: [/`ticks:\$\{symbol\}`|['"]ticks:['"]\s*\+\s*symbol/, /\.subscribe\(/, /on\(\s*['"]message['"]/],
         },
         go: {all: [/"ticks:"\s*\+\s*symbol/, /rdb\.Subscribe\(\s*ctx\s*,/, /sub\.Channel\(\)|sub\.ReceiveMessage\(/]},
-        scala: {all: [/s"ticks:\$symbol"/, /jedis\.subscribe\(/, /onMessage\(/]},
         cpp: {all: [/"ticks:"\s*\+\s*symbol/, /sub\.subscribe\(/, /on_message\(/, /sub\.consume\(\)/]},
       },
     },
@@ -111,7 +105,6 @@ the hash fields; the tick JSON published in the previous step maps 1:1 onto \`Ti
         python: {all: [/context\.cancelled\(\)|context\.done\(\)/, /\.unsubscribe\(/]},
         typescript: {all: [/call\.on\(\s*['"]cancelled['"]|call\.cancelled/, /\.unsubscribe\(/]},
         go: {all: [/<-ctx\.Done\(\)/, /sub\.Close\(\)|sub\.Unsubscribe\(/]},
-        scala: {all: [/observer\.isCancelled/, /unsubscribe\(\)/]},
         cpp: {all: [/context->IsCancelled\(\)/, /sub\.unsubscribe\(/]},
       },
     },
@@ -407,84 +400,6 @@ func main() {
 	srv := grpc.NewServer()
 	pb.RegisterTickServiceServer(srv, &tickServer{})
 	log.Fatal(srv.Serve(lis))
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.Status
-import io.grpc.stub.{ServerCallStreamObserver, StreamObserver}
-import redis.clients.jedis.{JedisPool, JedisPubSub}
-import scala.jdk.CollectionConverters._
-import scala.util.Using
-import scalapb.json4s.JsonFormat
-
-import exchange.ticks.{SubscribeRequest, Tick, TickServiceGrpc}
-
-object TickStream {
-  // A subscription holds its connection for the whole stream: borrow one from the pool per call.
-  private val pool = new JedisPool("redis", 6379)
-
-  def toTick(symbol: String, fields: Map[String, String]): Tick = {
-    def price(name: String) = fields.get(name).fold(0.0)(_.toDouble)
-    Tick(symbol = symbol, bid = price("bid"), ask = price("ask"), last = price("last"))
-  }
-
-  class TickService extends TickServiceGrpc.TickService {
-    override def subscribeTicks(request: SubscribeRequest, responseObserver: StreamObserver[Tick]): Unit = {
-      val observer = responseObserver.asInstanceOf[ServerCallStreamObserver[Tick]]
-      val symbol = request.symbol
-      Using.resource(pool.getResource) { jedis =>
-        // TODO: hgetAll book:{symbol}; empty → observer.onError(Status.NOT_FOUND …)
-        // TODO: observer.onNext(toTick(symbol, snapshot)) first
-        // TODO: listener = new JedisPubSub { onMessage: unsubscribe() if observer.isCancelled else onNext(JsonFormat.fromJsonString[Tick](payload)) }
-        // TODO: observer.setOnCancelHandler(() => listener.unsubscribe()) so a cancel on a quiet symbol also ends the subscribe
-        // TODO: jedis.subscribe(listener, "ticks:{symbol}") — blocks until unsubscribe(); then onCompleted()
-        val _ = (jedis, observer, symbol, classOf[JedisPubSub], JsonFormat)
-        observer.onError(Status.UNIMPLEMENTED.asRuntimeException())
-      }
-    }
-  }
-}
-`,
-      solution: `import io.grpc.Status
-import io.grpc.stub.{ServerCallStreamObserver, StreamObserver}
-import redis.clients.jedis.{JedisPool, JedisPubSub}
-import scala.jdk.CollectionConverters._
-import scala.util.Using
-import scalapb.json4s.JsonFormat
-
-import exchange.ticks.{SubscribeRequest, Tick, TickServiceGrpc}
-
-object TickStream {
-  // A subscription holds its connection for the whole stream: borrow one from the pool per call.
-  private val pool = new JedisPool("redis", 6379)
-
-  def toTick(symbol: String, fields: Map[String, String]): Tick = {
-    def price(name: String) = fields.get(name).fold(0.0)(_.toDouble)
-    Tick(symbol = symbol, bid = price("bid"), ask = price("ask"), last = price("last"))
-  }
-
-  class TickService extends TickServiceGrpc.TickService {
-    override def subscribeTicks(request: SubscribeRequest, responseObserver: StreamObserver[Tick]): Unit = {
-      val observer = responseObserver.asInstanceOf[ServerCallStreamObserver[Tick]]
-      val symbol = request.symbol
-      Using.resource(pool.getResource) { jedis =>
-        val snapshot = jedis.hgetAll(s"book:$symbol").asScala.toMap
-        if (snapshot.isEmpty) observer.onError(Status.NOT_FOUND.withDescription(s"unknown symbol $symbol").asRuntimeException())
-        else {
-          observer.onNext(toTick(symbol, snapshot))
-          val listener = new JedisPubSub {
-            override def onMessage(channel: String, payload: String): Unit =
-              if (observer.isCancelled) unsubscribe() // the client went away: end the blocking subscribe below
-              else observer.onNext(JsonFormat.fromJsonString[Tick](payload))
-          }
-          observer.setOnCancelHandler(() => listener.unsubscribe()) // a cancel on a quiet symbol must not block forever
-          jedis.subscribe(listener, s"ticks:$symbol") // blocks this handler thread until unsubscribe()
-          observer.onCompleted()
-        }
-      }
-    }
-  }
 }
 `,
     },

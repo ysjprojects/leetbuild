@@ -1,6 +1,6 @@
 import type {Step} from '@/lib/types';
 
-import {ADVANCE_LUA, ADVANCE_LUA_SCALA} from '../support';
+import {ADVANCE_LUA} from '../support';
 
 export const stateStep: Step = {
   id: 'state',
@@ -59,7 +59,6 @@ that waits past the hour is gone.
         python: {all: [/\.hset\(/, /current_approver/], none: [/\bex\s*=/, /\.expire\(/, /setex\(/]},
         typescript: {all: [/\.hset\(/, /current_approver/], none: [/['"]EX['"]/, /\.expire\(/, /setex\(/]},
         go: {all: [/\.HSet\(/, /current_approver/], none: [/time\.(Hour|Minute)/, /\.Expire\(/, /SetEX\(/]},
-        scala: {all: [/\.hset\(/, /current_approver/], none: [/setex\(/, /\.expire\(/, /TtlSeconds/]},
         cpp: {all: [/\.hset\(/, /current_approver/], none: [/kTtl/, /\.expire\(/, /setex\(/]},
       },
     },
@@ -72,7 +71,6 @@ that waits past the hour is gone.
         python: {all: [/ARGV\[1\][^\n]*~=|~=[^\n]*ARGV\[1\]/, /index \+ 1/]},
         typescript: {all: [/ARGV\[1\][^\n]*~=|~=[^\n]*ARGV\[1\]/, /index \+ 1/]},
         go: {all: [/ARGV\[1\][^\n]*~=|~=[^\n]*ARGV\[1\]/, /index \+ 1/]},
-        scala: {all: [/ARGV\[1\][^\n]*~=|~=[^\n]*ARGV\[1\]/, /index \+ 1/]},
         cpp: {all: [/ARGV\[1\][^\n]*~=|~=[^\n]*ARGV\[1\]/, /index \+ 1/]},
       },
     },
@@ -85,7 +83,6 @@ that waits past the hour is gone.
         python: {all: [/ARGV\[2\][^\n]*~=|~=[^\n]*ARGV\[2\]/, /not the current approver/]},
         typescript: {all: [/ARGV\[2\][^\n]*~=|~=[^\n]*ARGV\[2\]/, /not the current approver/]},
         go: {all: [/ARGV\[2\][^\n]*~=|~=[^\n]*ARGV\[2\]/, /not the current approver/]},
-        scala: {all: [/ARGV\[2\][^\n]*~=|~=[^\n]*ARGV\[2\]/, /not the current approver/]},
         cpp: {all: [/ARGV\[2\][^\n]*~=|~=[^\n]*ARGV\[2\]/, /not the current approver/]},
       },
     },
@@ -98,7 +95,6 @@ that waits past the hour is gone.
         python: {all: [/['"]status['"]\s*,\s*['"]rejected['"]/, /chain closed/]},
         typescript: {all: [/['"]status['"]\s*,\s*['"]rejected['"]/, /chain closed/]},
         go: {all: [/['"]status['"]\s*,\s*['"]rejected['"]/, /chain closed/]},
-        scala: {all: [/['"]status['"]\s*,\s*['"]rejected['"]/, /chain closed/]},
         cpp: {all: [/['"]status['"]\s*,\s*['"]rejected['"]/, /chain closed/]},
       },
     },
@@ -111,7 +107,6 @@ that waits past the hour is gone.
         python: {all: [/register_script\(|\.eval\(/], none: [/\br\.get\(/, /\br\.set\(/]},
         typescript: {all: [/\.eval\(|defineCommand\(/], none: [/redis\.get\(/, /redis\.set\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/], none: [/rdb\.Get\(/, /rdb\.Set\(/]},
-        scala: {all: [/\.eval(sha)?\(/], none: [/jedis\.get\(/, /jedis\.setex\(|jedis\.set\(/]},
         cpp: {all: [/\.eval(sha)?[<(]/], none: [/redis\(\)\.get\(/, /redis\(\)\.set\(/]},
       },
     },
@@ -387,79 +382,6 @@ func advance(ctx context.Context, requestID string, stepIndex int, actor, decisi
 	}
 	index, _ := strconv.Atoi(reply[1])
 	return Outcome{Advanced: reply[0] == "1", StepIndex: index, Status: reply[2], Reason: reply[3]}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-object State {
-  final case class Outcome(advanced: Boolean, stepIndex: Long, status: String, reason: String)
-
-  val jedis = new JedisPooled("redis", 6379)
-  val TtlSeconds = 3600L // an hour is plenty for a decision
-
-  def stateKey(requestId: String): String = s"approval:$requestId:state"
-
-  /** Open the chain at step 0 with the pinned approvers. */
-  def startChain(requestId: String, approvers: Seq[String]): Unit = {
-    val state = JsObject("step_index" -> JsNumber(0), "status" -> JsString("pending"), "approvers" -> approvers.toVector.toJson, "decisions" -> JsArray())
-    jedis.setex(stateKey(requestId), TtlSeconds, state.compactPrint)
-  }
-
-  /** Record actor's decision ("approved" or "rejected") on step stepIndex. */
-  def advance(requestId: String, stepIndex: Long, actor: String, decision: String): Outcome = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val raw = jedis.get(stateKey(requestId))
-    if (raw == null) return Outcome(advanced = false, -1, "missing", "no such request")
-    val state = raw.parseJson.asJsObject.fields
-    val status = state("status").convertTo[String]
-    val index = state("step_index").convertTo[Long]
-    if (status != "pending") return Outcome(advanced = false, index, status, "closed")
-    val decisions = state("decisions").asInstanceOf[JsArray].elements :+ JsObject("actor" -> JsString(actor), "decision" -> JsString(decision))
-    val nextIndex = decisions.size.toLong
-    val nextStatus = if (nextIndex >= state("approvers").asInstanceOf[JsArray].elements.size) "approved" else "pending"
-    val updated = JsObject(state ++ Map("step_index" -> JsNumber(nextIndex), "status" -> JsString(nextStatus), "decisions" -> JsArray(decisions)))
-    jedis.setex(stateKey(requestId), TtlSeconds, updated.compactPrint)
-    Outcome(advanced = true, nextIndex, nextStatus, "")
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  final case class Outcome(advanced: Boolean, stepIndex: Long, status: String, reason: String)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  // One decision, atomically: refuse a closed chain, a stale step and anybody but the current approver,
-  // record the decision, then move exactly one step (a rejection closes the chain instead).
-  val AdvanceLua: String =
-    """${ADVANCE_LUA_SCALA}
-      |""".stripMargin
-
-  def stateKey(requestId: String): String = s"approval:$requestId:state"
-
-  /** Open the chain at step 0 with the pinned approvers. */
-  def startChain(requestId: String, approvers: Seq[String]): Unit = {
-    // One hash and no TTL: a chain may wait weeks; a sweeper removes closed ones.
-    val fields = Map("step_index" -> "0", "step_count" -> approvers.size.toString, "status" -> "pending", "current_approver" -> approvers.head) ++
-      approvers.zipWithIndex.map { case (approver, i) => s"approver:$i" -> approver }
-    jedis.hset(stateKey(requestId), fields.asJava)
-  }
-
-  /** Record actor's decision ("approved" or "rejected") on step stepIndex. */
-  def advance(requestId: String, stepIndex: Long, actor: String, decision: String): Outcome = {
-    val reply = jedis
-      .eval(AdvanceLua, List(stateKey(requestId)).asJava, List(stepIndex.toString, actor, decision).asJava)
-      .asInstanceOf[java.util.List[String]]
-      .asScala
-    Outcome(reply(0) == "1", reply(1).toLong, reply(2), reply(3))
-  }
 }
 `,
     },

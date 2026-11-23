@@ -56,7 +56,6 @@ client that retries after a timeout is refunded twice.
         python: {all: [/@app\.post\(\s*["']\/v1\/refunds["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/refunds['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/refunds"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"refunds"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/refunds"/]},
       },
     },
@@ -71,9 +70,6 @@ client that retries after a timeout is refunded twice.
         },
         typescript: {all: [/\b401\b/, /payment\.tenant\s*!==?\s*tenant|tenant\s*!==?\s*payment\.tenant/]},
         go: {all: [/StatusUnauthorized|\b401\b/, /payment\.Tenant\s*!=\s*tenant|tenant\s*!=\s*payment\.Tenant/]},
-        scala: {
-          all: [/Unauthorized|\b401\b/, /\.tenant\s*!=\s*tenant|tenant\s*!=\s*\w+\.tenant|\.tenant\s*==\s*tenant/],
-        },
         cpp: {all: [/\b401\b/, /payment->tenant\s*!=\s*tenant|tenant\s*!=\s*payment->tenant/]},
       },
     },
@@ -86,7 +82,6 @@ client that retries after a timeout is refunded twice.
         python: {all: [/amount_minor\s*<\s*1|amount_minor\s*<=\s*0/, /REASON_CODES/]},
         typescript: {all: [/amount_minor\s*<\s*1|amount_minor\s*<=\s*0/, /REASON_CODES/]},
         go: {all: [/AmountMinor\s*<\s*1|AmountMinor\s*<=\s*0/, /reasonCodes/]},
-        scala: {all: [/amountMinor\s*<\s*1|amountMinor\s*<=\s*0/, /ReasonCodes/]},
         cpp: {all: [/amount_minor\s*<\s*1|amount_minor\s*<=\s*0/, /kReasonCodes/]},
       },
     },
@@ -99,7 +94,6 @@ client that retries after a timeout is refunded twice.
         python: {all: [/ledger\.claim\(/, /\b422\b/]},
         typescript: {all: [/\bclaim\(/, /\b422\b/]},
         go: {all: [/ledger\.Claim\(/, /StatusUnprocessableEntity|\b422\b/]},
-        scala: {all: [/Ledger\.claim\(/, /UnprocessableEntity|\b422\b/]},
         cpp: {all: [/ledger::claim\(/, /\b422\b/]},
       },
     },
@@ -112,7 +106,6 @@ client that retries after a timeout is refunded twice.
         python: {all: [/idempotency-key/i], order: [/records\.refund_for_key\(/, /ledger\.claim\(/]},
         typescript: {all: [/idempotency-key/i], order: [/refundForKey\(/, /\bclaim\(/]},
         go: {all: [/Idempotency-Key/i], order: [/records\.RefundForKey\(/, /ledger\.Claim\(/]},
-        scala: {all: [/Idempotency-Key/i], order: [/Records\.refundForKey\(/, /Ledger\.claim\(/]},
         cpp: {all: [/Idempotency-Key/i], order: [/records::refundForKey\(/, /ledger::claim\(/]},
       },
     },
@@ -416,109 +409,6 @@ func createRefund(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/refunds", createRefund)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import refunds.{Ledger, Records} // Records.findPayment, newRefundId, insertRefund, refundForKey; Ledger.claim, refundedTotal
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def refundBody(refund: Records.Refund, remainingMinor: Long): JsObject = JsObject(
-    "refund_id" -> JsString(refund.refundId), "payment_id" -> JsString(refund.paymentId),
-    "amount_minor" -> JsNumber(refund.amountMinor), "reason_code" -> JsString(refund.reasonCode),
-    "status" -> JsString(refund.status), "remaining_minor" -> JsNumber(remainingMinor))
-
-  private def text(body: Map[String, JsValue], name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
-  private def number(body: Map[String, JsValue], name: String): Long = body.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-
-  val route: Route = path("v1" / "refunds") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val tenant = tenantHeader.getOrElse("")
-          val body = raw.parseJson.asJsObject.fields
-          val paymentId = text(body, "payment_id")
-          val amountMinor = number(body, "amount_minor")
-          Records.findPayment(paymentId) match {
-            case None => complete(StatusCodes.NotFound -> "no such payment")
-            case Some(payment) =>
-              val refund = Records.insertRefund(Records.newRefundId(), tenant, paymentId, amountMinor, text(body, "reason_code"), "")
-              complete(json(StatusCodes.Created, refundBody(refund, payment.paidMinor - amountMinor)))
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import refunds.{Ledger, Records} // Records.findPayment, newRefundId, insertRefund, refundForKey; Ledger.claim, refundedTotal
-
-object Api {
-  val ReasonCodes: Set[String] = Set("damaged", "not_received", "duplicate", "goodwill")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def refundBody(refund: Records.Refund, remainingMinor: Long): JsObject = JsObject(
-    "refund_id" -> JsString(refund.refundId), "payment_id" -> JsString(refund.paymentId),
-    "amount_minor" -> JsNumber(refund.amountMinor), "reason_code" -> JsString(refund.reasonCode),
-    "status" -> JsString(refund.status), "remaining_minor" -> JsNumber(remainingMinor))
-
-  private def text(body: Map[String, JsValue], name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
-  private def number(body: Map[String, JsValue], name: String): Long = body.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-
-  private def create(tenant: String, idemKey: String, raw: String): HttpResponse = {
-    val body = raw.parseJson.asJsObject.fields
-    val paymentId = text(body, "payment_id")
-    val amountMinor = number(body, "amount_minor")
-    val reasonCode = text(body, "reason_code")
-    if (amountMinor < 1 || !ReasonCodes.contains(reasonCode))
-      return json(StatusCodes.BadRequest, JsObject("error" -> JsString("amount_minor must be at least 1 and reason_code one of " + ReasonCodes.mkString(", "))))
-    Records.refundForKey(tenant, idemKey) match {
-      case Some(first) =>
-        // A retry: answer the refund this key created, without a second claim.
-        val paid = Records.findPayment(first.paymentId).map(_.paidMinor).getOrElse(0L)
-        json(StatusCodes.Created, refundBody(first, paid - Ledger.refundedTotal(first.paymentId)))
-      case None =>
-        Records.findPayment(paymentId) match {
-          // Another tenant's payment looks missing.
-          case Some(payment) if payment.tenant == tenant =>
-            val refundId = Records.newRefundId()
-            val claimed = Ledger.claim(paymentId, refundId, amountMinor, payment.paidMinor)
-            if (!claimed.accepted)
-              json(StatusCodes.UnprocessableEntity, JsObject("error" -> JsString("amount exceeds the remaining balance"), "remaining_minor" -> JsNumber(claimed.remainingMinor)))
-            else json(StatusCodes.Created, refundBody(Records.insertRefund(refundId, tenant, paymentId, amountMinor, reasonCode, idemKey), claimed.remainingMinor))
-          case _ => json(StatusCodes.NotFound, JsObject("error" -> JsString("no such payment")))
-        }
-    }
-  }
-
-  val route: Route = path("v1" / "refunds") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          optionalHeaderValueByName("Idempotency-Key") {
-            case None | Some("") => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
-            case Some(idemKey) => entity(as[String]) { raw => complete(create(tenant, idemKey, raw)) }
-          }
-      }
-    }
-  }
 }
 `,
     },

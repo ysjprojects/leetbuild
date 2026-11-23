@@ -51,7 +51,6 @@ told about.
         python: {all: [/@app\.get\(\s*["']\/v1\/uploads\/\{upload_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/uploads\/:uploadId['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/uploads\/\{id\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"uploads"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/uploads\//]},
       },
     },
@@ -64,7 +63,6 @@ told about.
         python: {all: [/\bresume\b/, /\bstored\b/], none: [/percent/]},
         typescript: {all: [/\bresume\b/, /\bstored\b/], none: [/percent/]},
         go: {all: [/\bresume\b/i, /\bstored\b/i], none: [/percent/i]},
-        scala: {all: [/\bresume\b/, /\bstored\b/], none: [/percent/]},
         cpp: {all: [/\bresume\b/, /\bstored\b/], none: [/percent/]},
       },
     },
@@ -77,7 +75,6 @@ told about.
         python: {all: [/x-tenant-id/i, /\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*upload\[["']tenant["']\]/]},
         typescript: {all: [/x-tenant-id/i, /\.tenant\s*!==\s*tenant|tenant\s*!==\s*upload\.tenant/]},
         go: {all: [/X-Tenant-Id/i, /\.Tenant\s*!=\s*tenant|tenant\s*!=\s*upload\.Tenant/]},
-        scala: {all: [/X-Tenant-Id/i, /\.tenant\s*[!=]=\s*tenant|tenant\s*[!=]=\s*\w+\.tenant/]},
         cpp: {all: [/X-Tenant-Id/i, /->tenant\s*!=\s*tenant|tenant\s*!=\s*upload->tenant/]},
       },
     },
@@ -90,7 +87,6 @@ told about.
         python: {all: [/["']uploaded_bytes["']/], none: [/manifest\.uploaded_bytes\(/]},
         typescript: {all: [/uploaded_bytes/], none: [/uploadedBytes\(/]},
         go: {all: [/uploaded_bytes/], none: [/manifest\.UploadedBytes\(/]},
-        scala: {all: [/uploaded_bytes/], none: [/Manifest\.uploadedBytes\(/]},
         cpp: {all: [/uploaded_bytes/], none: [/manifest::uploadedBytes\(/]},
       },
     },
@@ -331,70 +327,6 @@ func getUpload(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/uploads/{id}", getUpload)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import uploads.{Manifest, Store} // Store.getUpload, Manifest.readParts, Manifest.uploadedBytes
-
-object ReadApi {
-  val route: Route = path("v1" / "uploads" / Segment) { uploadId =>
-    get {
-      // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-      Store.getUpload(uploadId) match {
-        case None => complete(StatusCodes.NotFound -> "no such upload")
-        case Some(upload) =>
-          val parts = Manifest.readParts(uploadId)
-          val uploaded = Manifest.uploadedBytes(uploadId)
-          val body = JsObject(
-            "upload_id" -> JsString(uploadId), "status" -> JsString(upload.status), "part_count" -> JsNumber(upload.partCount),
-            "registered_parts" -> JsNumber(parts.size), "uploaded_bytes" -> JsNumber(uploaded),
-            "percent_complete" -> JsNumber(100 * uploaded / upload.totalBytes))
-          complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import uploads.{Manifest, Part, Store} // Store.getUpload, Manifest.readParts, Manifest.uploadedBytes
-
-object ReadApi {
-  private def partJson(p: Part): JsObject =
-    JsObject("part_number" -> JsNumber(p.partNumber), "size" -> JsNumber(p.size), "checksum" -> JsString(p.checksum))
-
-  val route: Route = path("v1" / "uploads" / Segment) { uploadId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          Store.getUpload(uploadId) match {
-            case Some(upload) if upload.tenant == tenant =>
-              val registered = Manifest.readParts(uploadId).map(p => p.partNumber -> p).toMap
-              val numbers = 1 to upload.partCount
-              val stored = numbers.flatMap(registered.get)
-              val resume = numbers.filterNot(registered.contains)
-              val body = JsObject(
-                "upload_id" -> JsString(uploadId), "status" -> JsString(upload.status), "part_count" -> JsNumber(upload.partCount),
-                // One read: the bytes are those of the parts listed, whatever registers meanwhile.
-                "uploaded_bytes" -> JsNumber(stored.map(_.size).sum),
-                "stored" -> JsArray(stored.map(partJson).toVector), "resume" -> JsArray(resume.map(n => JsNumber(n)).toVector))
-              complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-            // Another tenant's upload is as unknown as a missing one: a 403 would confirm that the id exists.
-            case _ => complete(StatusCodes.NotFound -> "no such upload")
-          }
-      }
-    }
-  }
 }
 `,
     },

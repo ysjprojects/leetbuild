@@ -53,7 +53,6 @@ per tenant forever.
         python: {all: [/f["']taxonomy:\{tenant\}:\{taxonomy_id\}:\{version\}["']/]},
         typescript: {all: [/`taxonomy:\$\{tenant\}:\$\{taxonomyId\}:\$\{version\}`/]},
         go: {all: [/"taxonomy:%s:%s:%d",\s*tenant,\s*taxonomyID,\s*version/]},
-        scala: {all: [/s"taxonomy:\$tenant:\$taxonomyId:\$version"/]},
         cpp: {all: [/"taxonomy:"\s*\+\s*tenant\s*\+/]},
       },
     },
@@ -66,7 +65,6 @@ per tenant forever.
         python: {all: [/TAXONOMY_TTL_S\s*=\s*600\b/, /ex\s*=\s*TAXONOMY_TTL_S/]},
         typescript: {all: [/TAXONOMY_TTL_S\s*=\s*600\b/, /['"]EX['"],\s*TAXONOMY_TTL_S/]},
         go: {all: [/taxonomyTTL\s*=\s*600\s*\*\s*time\.Second/, /\.Set\([^\n]*taxonomyTTL\)/]},
-        scala: {all: [/TaxonomyTtlS\s*=\s*600L?\b/, /setex\([^\n]*TaxonomyTtlS/]},
         cpp: {all: [/kTaxonomyTtl\{600\}/, /\.set\([^\n]*kTaxonomyTtl\)/]},
       },
     },
@@ -79,7 +77,6 @@ per tenant forever.
         python: {all: [/r\.set\(/, /json\.dumps\(/], none: [/\.hset\(/]},
         typescript: {all: [/redis\.set\(/, /JSON\.stringify\(/], none: [/\.hset\(/]},
         go: {all: [/rdb\.Set\(/, /json\.Marshal\(/], none: [/\.HSet\(/]},
-        scala: {all: [/jedis\.setex\(/, /\.toJson/], none: [/\.hset\(/]},
         cpp: {all: [/redis\(\)\.set\(/, /toJson\(/], none: [/\.hset\(/]},
       },
     },
@@ -95,7 +92,6 @@ per tenant forever.
           none: [/metrics:/],
         },
         go: {all: [/"counters:%s:%d"/, /now\s*\/\s*counterWindowS/], none: [/metrics:/]},
-        scala: {all: [/s"counters:\$tenant:/, /nowS\s*\/\s*CounterWindowS/], none: [/metrics:/]},
         cpp: {all: [/"counters:"\s*\+\s*tenant/, /now\s*\/\s*kCounterWindowS/], none: [/metrics:/]},
       },
     },
@@ -108,7 +104,6 @@ per tenant forever.
         python: {all: [/pipeline\(/, /\.expire\(/, /COUNTER_WINDOW_S\s*-\s*int\(now\)\s*%\s*COUNTER_WINDOW_S/]},
         typescript: {all: [/\.multi\(\)/, /\.expire\(/, /COUNTER_WINDOW_S\s*-\s*\(?nowS\s*%\s*COUNTER_WINDOW_S/]},
         go: {all: [/TxPipeline\(\)/, /\.Expire\(/, /counterWindowS\s*-\s*now\s*%\s*counterWindowS/]},
-        scala: {all: [/\.multi\(\)/, /\.expire\(/, /CounterWindowS\s*-\s*now\s*%\s*CounterWindowS/]},
         cpp: {all: [/transaction\(\)/, /\.expire\(/, /kCounterWindowS\s*-\s*now\s*%\s*kCounterWindowS/]},
       },
     },
@@ -399,81 +394,6 @@ func bumpCounter(ctx context.Context, tenant, label string) error {
 	pipe.Expire(ctx, key, time.Duration(counterWindowS-now%counterWindowS)*time.Second)
 	_, err := pipe.Exec(ctx)
 	return err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import classifier.{Taxonomies, Taxonomy}
-
-object TaxonomyCache {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  def taxonomyKey(tenant: String, taxonomyId: String, version: Long): String = s"taxonomy:$taxonomyId:$version"
-
-  def cacheTaxonomy(tenant: String, taxonomy: Taxonomy): Unit = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val key = taxonomyKey(tenant, taxonomy.taxonomyId, taxonomy.version)
-    taxonomy.labels.foreach(label => jedis.hset(key, label, "1"))
-  }
-
-  def loadTaxonomy(tenant: String, taxonomyId: String, version: Long): Option[Taxonomy] = {
-    val cached = jedis.hgetAll(taxonomyKey(tenant, taxonomyId, version)).asScala
-    if (cached.nonEmpty) Some(Taxonomy(taxonomyId, version, cached.keys.toSeq.sorted))
-    else {
-      val taxonomy = Taxonomies.load(tenant, taxonomyId, version)
-      taxonomy.foreach(cacheTaxonomy(tenant, _))
-      taxonomy
-    }
-  }
-
-  def countersKey(tenant: String, nowS: Long): String = s"metrics:$tenant"
-
-  def bumpCounter(tenant: String, label: String): Unit =
-    jedis.hincrBy(countersKey(tenant, System.currentTimeMillis() / 1000), label, 1)
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import classifier.{Taxonomies, Taxonomy}
-
-object TaxonomyCache {
-  val TaxonomyTtlS = 600L
-  val CounterWindowS = 3600L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Tenant-scoped: a tenant that does not own the taxonomy misses and asks the store. */
-  def taxonomyKey(tenant: String, taxonomyId: String, version: Long): String = s"taxonomy:$tenant:$taxonomyId:$version"
-
-  /** One SET of the whole document with its expiry: a reader sees the old entry or the new one. */
-  def cacheTaxonomy(tenant: String, taxonomy: Taxonomy): Unit =
-    jedis.setex(taxonomyKey(tenant, taxonomy.taxonomyId, taxonomy.version), TaxonomyTtlS, taxonomy.toJson.compactPrint)
-
-  def loadTaxonomy(tenant: String, taxonomyId: String, version: Long): Option[Taxonomy] =
-    Option(jedis.get(taxonomyKey(tenant, taxonomyId, version))) match {
-      case Some(raw) => Some(Taxonomy.fromJson(raw.parseJson))
-      case None =>
-        val taxonomy = Taxonomies.load(tenant, taxonomyId, version)
-        taxonomy.foreach(cacheTaxonomy(tenant, _))
-        taxonomy
-    }
-
-  def countersKey(tenant: String, nowS: Long): String = s"counters:$tenant:\${nowS / CounterWindowS}"
-
-  /** The key dies with the hour it counts, however late in the hour it was first written. */
-  def bumpCounter(tenant: String, label: String): Unit = {
-    val now = System.currentTimeMillis() / 1000
-    val key = countersKey(tenant, now)
-    val tx = jedis.multi()
-    tx.hincrBy(key, label, 1)
-    tx.expire(key, CounterWindowS - now % CounterWindowS)
-    tx.exec()
-  }
 }
 `,
     },

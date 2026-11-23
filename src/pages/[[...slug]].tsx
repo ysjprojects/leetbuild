@@ -20,7 +20,7 @@ import {stepBySlug, stepPath, stepSlug} from '@/lib/types';
 
 const TITLE = 'LeetBuild — practice system design by building it';
 const DESCRIPTION =
-  'LeetBuild: practice system design by building it, not just algorithms. Implement a URL shortener, a match engine, a news feed, an LLM gateway, a RAG service and more in Python, TypeScript, Go, Scala or C++ — HTTPS servers, gRPC, Kafka and Redis — with hints, revealable answers, diagrams and LeetCode-style scoring. A hundred courses start every step from working code with a flaw you debug, fix and optimize. A timed mock interview mode is one switch away.';
+  'LeetBuild: practice system design by building it, not just algorithms. Implement a URL shortener, a match engine, a news feed, an LLM gateway, a RAG service and more in Python, TypeScript, Go or C++ — HTTPS servers, gRPC, Kafka and Redis — with hints, revealable answers, diagrams and LeetCode-style scoring. A hundred courses start every step from working code with a flaw you debug, fix and optimize. A timed mock interview mode is one switch away.';
 const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL;
 
 interface Props {

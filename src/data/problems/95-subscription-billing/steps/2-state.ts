@@ -54,7 +54,6 @@ again.
         python: {all: [/nx\s*=\s*True/], order: [/nx\s*=\s*True/, /processor\.charge_invoice\(/]},
         typescript: {all: [/['"]NX['"]/], order: [/['"]NX['"]/, /chargeInvoice\(/]},
         go: {all: [/\.SetNX\(/], order: [/\.SetNX\(/, /processor\.ChargeInvoice\(/]},
-        scala: {all: [/\.nx\(\)/], order: [/\.nx\(\)/, /Processor\.chargeInvoice\(/]},
         cpp: {all: [/UpdateType::NOT_EXIST/], order: [/UpdateType::NOT_EXIST/, /processor::chargeInvoice\(/]},
       },
     },
@@ -67,7 +66,6 @@ again.
         python: {all: [/["']charged:/], none: [/["']done["']/]},
         typescript: {all: [/['"`]charged:/], none: [/['"]done['"]/]},
         go: {all: [/"charged:"/], none: [/"done"/]},
-        scala: {all: [/"charged:/], none: [/"done"/]},
         cpp: {all: [/"charged:"/], none: [/"done"/]},
       },
     },
@@ -80,7 +78,6 @@ again.
         python: {all: [/processor\.lookup_invoice\(/, /in_flight/]},
         typescript: {all: [/lookupInvoice\(/, /in_flight/]},
         go: {all: [/processor\.LookupInvoice\(/, /in_flight/]},
-        scala: {all: [/Processor\.lookupInvoice\(/, /in_flight/]},
         cpp: {all: [/processor::lookupInvoice\(/, /in_flight/]},
       },
     },
@@ -93,7 +90,6 @@ again.
         python: {all: [/marker_key\(/], none: [/MONTH_TTL_S/, /\bex\s*=/]},
         typescript: {all: [/markerKey\(/], none: [/MONTH_TTL_S/, /['"]EX['"]/]},
         go: {all: [/markerKey\(/], none: [/monthTTL/]},
-        scala: {all: [/markerKey\(/], none: [/MonthTtlSeconds/, /\.ex\(/]},
         cpp: {all: [/markerKey\(/], none: [/kMonthTtl/]},
       },
     },
@@ -308,70 +304,6 @@ func runBilling(ctx context.Context, invoiceID string) (store.Outcome, error) {
 		return store.Outcome{State: "charged", Reference: found.Reference}, nil
 	}
 	return store.Outcome{State: "in_flight"}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import billing.{Processor, Store} // Processor.chargeInvoice, lookupInvoice; Store.findInvoice, Store.Outcome
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val MonthTtlSeconds: Long = 30L * 24 * 3600
-
-  def markerKey(subscriptionId: String, periodStart: String): String = s"billing:run:$subscriptionId:$periodStart"
-
-  /** Charge the invoice's period once and answer what came of it. */
-  def runBilling(invoiceId: String): Store.Outcome = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val invoice = Store.findInvoice(invoiceId).get
-    val key = markerKey(invoice.subscriptionId, invoice.periodStart)
-    if (jedis.get(key) != null) Store.Outcome("charged", "", "")
-    else {
-      val outcome = Processor.chargeInvoice(invoice)
-      if (outcome.state == "charged") jedis.set(key, "done", SetParams.setParams().ex(MonthTtlSeconds))
-      outcome
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import billing.{Processor, Store} // Processor.chargeInvoice, lookupInvoice; Store.findInvoice, Store.Outcome
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Claimed = "claimed"
-
-  def markerKey(subscriptionId: String, periodStart: String): String = s"billing:run:$subscriptionId:$periodStart"
-
-  /** Charge the invoice's period once and answer what came of it. */
-  def runBilling(invoiceId: String): Store.Outcome = {
-    val invoice = Store.findInvoice(invoiceId).get
-    val key = markerKey(invoice.subscriptionId, invoice.periodStart)
-    // One atomic claim, no expiry: exactly one runner per period gets past this line.
-    if (jedis.set(key, Claimed, SetParams.setParams().nx()) == "OK") {
-      val outcome = Processor.chargeInvoice(invoice)
-      if (outcome.state == "charged") jedis.set(key, s"charged:\${outcome.reference}")
-      outcome
-    } else {
-      val marker = Option(jedis.get(key)).getOrElse("")
-      if (marker.startsWith("charged:")) Store.Outcome("charged", marker.stripPrefix("charged:"), "")
-      else
-        // Claimed and never confirmed: a run in flight, or one that crashed. The processor knows which.
-        Processor.lookupInvoice(invoiceId).filter(_.state == "charged") match {
-          case Some(found) =>
-            jedis.set(key, s"charged:\${found.reference}")
-            Store.Outcome("charged", found.reference, "")
-          case None => Store.Outcome("in_flight", "", "")
-        }
-    }
-  }
 }
 `,
     },

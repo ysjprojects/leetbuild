@@ -6,7 +6,7 @@ import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-client';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Model audit trail: the course is not "write a row when the model answers", it is the debugging
@@ -93,6 +93,5 @@ worker that drains the queue, auditor query tooling, and the policy engine that 
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

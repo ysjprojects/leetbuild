@@ -55,7 +55,6 @@ cheaply as possible and to promise only what it can keep:
         python: {all: [/@app\.post\(\s*["']\/checkout["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/checkout['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/checkout"/]},
-        scala: {all: [/path\(\s*"checkout"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/checkout"/]},
       },
     },
@@ -70,7 +69,6 @@ cheaply as possible and to promise only what it can keep:
           all: [/(>|<=)\s*MAX_QTY\b|\bMAX_QTY\s*(<|>=)/, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/],
         },
         go: {all: [/(>|<=)\s*maxQty\b|\bmaxQty\s*(<|>=)/, /http\.StatusBadRequest|\b400\b/]},
-        scala: {all: [/(>|<=)\s*MaxQty\b|\bMaxQty\s*(<|>=)/, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/(>|<=)\s*kMaxQty\b|\bkMaxQty\s*(<|>=)/, /status\s*=\s*400/]},
       },
     },
@@ -110,16 +108,6 @@ cheaply as possible and to promise only what it can keep:
             /Retry-After/,
           ],
         },
-        scala: {
-          all: [
-            /s"attempts:\$|"attempts:"\s*\+/,
-            /jedis\.incr\(/,
-            /jedis\.expire\(/,
-            /==\s*1L?\b/,
-            /StatusCodes\.TooManyRequests|\b429\b/,
-            /Retry-After/,
-          ],
-        },
         cpp: {
           all: [
             /"attempts:"\)?\s*\+/,
@@ -141,7 +129,6 @@ cheaply as possible and to promise only what it can keep:
         python: {all: [/status_code\s*=\s*409/, /SOLD_OUT/]},
         typescript: {all: [/code\(\s*409\s*\)|status\(\s*409\s*\)/, /SOLD_OUT/]},
         go: {all: [/http\.StatusConflict|\b409\b/, /SOLD_OUT/]},
-        scala: {all: [/StatusCodes\.Conflict|\b409\b/, /SOLD_OUT/]},
         cpp: {all: [/status\s*=\s*409/, /SOLD_OUT/]},
       },
     },
@@ -162,10 +149,6 @@ cheaply as possible and to promise only what it can keep:
         go: {
           all: [/http\.StatusServiceUnavailable|\b503\b/, /release\(\s*ctx\s*,\s*\w+(\.OrderID)?\s*\)/],
           order: [/=\s*reserve\(/, /enqueueOrder\(\s*ctx\s*,\s*order\s*\)/, /http\.StatusAccepted|\b202\b/],
-        },
-        scala: {
-          all: [/StatusCodes\.ServiceUnavailable|\b503\b/, /release\(\s*\w+(\.orderId)?\s*\)/],
-          order: [/!reserve\(|=\s*reserve\(/, /enqueueOrder\(\s*order\s*\)/, /StatusCodes\.Accepted|\b202\b/],
         },
         cpp: {
           all: [/status\s*=\s*503/, /release\(\s*order_id\s*\)/],
@@ -560,134 +543,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /checkout", checkout)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import flashsale.Tls // Tls.serverContext(certPem, keyPem): the server's SSLContext
-import redis.clients.jedis.JedisPooled
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-final case class CheckoutRequest(sku: String, qty: Int, user: String)
-final case class Order(orderId: String, sku: String, qty: Int, user: String)
-
-object CheckoutApi {
-  val jedis = new JedisPooled("redis", 6379)
-  val MaxQty = 5
-  val MaxAttempts = 20L
-  val WindowSeconds = 60L
-
-  implicit val checkoutFormat: RootJsonFormat[CheckoutRequest] = jsonFormat3(CheckoutRequest)
-
-  /** Atomic stock reservation (step 1); false when sold out. */
-  def reserve(sku: String, orderId: String, qty: Int): Boolean = ???
-  /** Gives a hold back to stock (step 5). */
-  def release(orderId: String): Unit = ???
-  /** Durable intake through Kafka (step 3); throws a RuntimeException when the broker did not acknowledge. */
-  def enqueueOrder(order: Order): Unit = ???
-
-  private def json(status: StatusCode, body: String, headers: List[HttpHeader] = Nil): Route =
-    complete(HttpResponse(status, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-
-  val route: Route =
-    path("checkout") {
-      post {
-        entity(as[CheckoutRequest]) { req =>
-          // TODO: 400 unless sku, user and 1 <= qty <= MaxQty
-          // TODO: incr attempts:{user}; expire WindowSeconds when it is the first; > MaxAttempts → 429 + Retry-After
-          // TODO: Order(UUID.randomUUID().toString, …); reserve() returned false → 409 SOLD_OUT
-          // TODO: enqueueOrder(order) → 202; on RuntimeException release() and 503
-          json(StatusCodes.NotImplemented, """{"error":"not implemented"}""")
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("checkout")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import flashsale.Tls // Tls.serverContext(certPem, keyPem): the server's SSLContext
-import redis.clients.jedis.JedisPooled
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-final case class CheckoutRequest(sku: String, qty: Int, user: String)
-final case class Order(orderId: String, sku: String, qty: Int, user: String)
-
-object CheckoutApi {
-  val jedis = new JedisPooled("redis", 6379)
-  val MaxQty = 5
-  val MaxAttempts = 20L
-  val WindowSeconds = 60L
-
-  implicit val checkoutFormat: RootJsonFormat[CheckoutRequest] = jsonFormat3(CheckoutRequest)
-
-  /** Atomic stock reservation (step 1); false when sold out. */
-  def reserve(sku: String, orderId: String, qty: Int): Boolean = ???
-  /** Gives a hold back to stock (step 5). */
-  def release(orderId: String): Unit = ???
-  /** Durable intake through Kafka (step 3); throws a RuntimeException when the broker did not acknowledge. */
-  def enqueueOrder(order: Order): Unit = ???
-
-  private def json(status: StatusCode, body: String, headers: List[HttpHeader] = Nil): Route =
-    complete(HttpResponse(status, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-
-  val route: Route =
-    path("checkout") {
-      post {
-        entity(as[CheckoutRequest]) { req =>
-          if (req.sku.isEmpty || req.user.isEmpty || req.qty < 1 || req.qty > MaxQty)
-            json(StatusCodes.BadRequest, """{"error":"sku, user and qty 1..5 are required"}""")
-          else {
-            val attempts = jedis.incr(s"attempts:\${req.user}")
-            if (attempts == 1L) jedis.expire(s"attempts:\${req.user}", WindowSeconds)
-            if (attempts > MaxAttempts)
-              json(StatusCodes.TooManyRequests, """{"error":"TOO_MANY_ATTEMPTS"}""", List(RawHeader("Retry-After", WindowSeconds.toString)))
-            else {
-              val order = Order(UUID.randomUUID().toString, req.sku, req.qty, req.user)
-              if (!reserve(order.sku, order.orderId, order.qty)) json(StatusCodes.Conflict, """{"error":"SOLD_OUT"}""")
-              else
-                try {
-                  enqueueOrder(order)
-                  json(StatusCodes.Accepted, s"""{"order_id":"\${order.orderId}","status":"reserved"}""")
-                } catch {
-                  case _: RuntimeException =>
-                    release(order.orderId)
-                    json(StatusCodes.ServiceUnavailable, """{"error":"TRY_AGAIN"}""")
-                }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("checkout")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

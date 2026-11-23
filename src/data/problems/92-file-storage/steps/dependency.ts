@@ -66,7 +66,6 @@ failed commit leaves a file in the index whose object does not exist.
           ],
         },
         go: {all: [/deadline\s*=\s*15\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*15L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/kDeadline\{15\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -81,7 +80,6 @@ failed commit leaves a file in the index whose object does not exist.
           all: [/sha256:\s*createHash\(\s*['"]sha256['"]\s*\)\.update\(\s*data\s*\)\.digest\(\s*['"]hex['"]\s*\)/],
         },
         go: {all: [/sha256\.Sum256\(\s*data\s*\)/, /Sha256:/]},
-        scala: {all: [/MessageDigest\.getInstance\(\s*"SHA-256"\s*\)/, /sha256\s*=/]},
         cpp: {all: [/SHA256\(/, /set_sha256\(/]},
       },
     },
@@ -108,10 +106,6 @@ failed commit leaves a file in the index whose object does not exist.
           ],
           none: [/func complete[\s\S]*for attempt :=/],
         },
-        scala: {
-          all: [/Attempts\s*=\s*3/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/, /def putPart[\s\S]*attempt/],
-          none: [/def complete[\s\S]*attempt/],
-        },
         cpp: {
           all: [/kAttempts\s*=\s*3/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/, /void putPart[\s\S]*for \(int attempt/],
           none: [/complete\([^)]*\)\s*\{[\s\S]*for \(int attempt/],
@@ -127,7 +121,6 @@ failed commit leaves a file in the index whose object does not exist.
         python: {order: [/def complete/, /\.CommitMultipart\(/, /store\.commit_file\(/]},
         typescript: {order: [/function complete/, /\.CommitMultipart\(/, /store\.commitFile\(/]},
         go: {order: [/func complete/, /\.CommitMultipart\(/, /store\.CommitFile\(/]},
-        scala: {order: [/def complete/, /\.commitMultipart\(/, /Store\.commitFile\(/]},
         cpp: {order: [/store::File complete/, /->CommitMultipart\(/, /store::commitFile\(/]},
       },
     },
@@ -451,87 +444,6 @@ func complete(ctx context.Context, uploadID string) (*store.File, error) {
 	}
 	// Only a committed object is indexed.
 	return store.CommitFile(ctx, uploadID, commit.GetObjectKey(), commit.GetDigest())
-}
-`,
-    },
-    scala: {
-      starter: `import java.security.MessageDigest
-
-import com.google.protobuf.ByteString
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import files.Store // Store.stagedParts, commitFile, File
-import stored.file_storage.{CommitRequest, ObjectStoreGrpc, PutChunkRequest}
-
-object Client {
-  private val objects = ObjectStoreGrpc.blockingStub(ManagedChannelBuilder.forAddress("objectstore", 9000).usePlaintext().build())
-
-  /** Write part n of the upload to the object store. */
-  def putPart(uploadId: String, n: Int, data: Array[Byte]): Unit =
-    objects.putChunk(PutChunkRequest(uploadId = uploadId, part = n, data = ByteString.copyFrom(data)))
-
-  /** Write every staged part, commit the multipart upload and index the file; the file record. */
-  def complete(uploadId: String): Store.File = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val parts = Store.stagedParts(uploadId)
-    val whole = MessageDigest.getInstance("SHA-256")
-    parts.foreach { case (_, data) => whole.update(data) }
-    val record = Store.commitFile(uploadId, s"objects/$uploadId", whole.digest().map(b => f"\${b & 0xff}%02x").mkString)
-    var attempt = 0
-    var written = false
-    while (!written && attempt < 3) {
-      attempt += 1
-      try {
-        parts.foreach { case (n, data) => putPart(uploadId, n, data) }
-        written = true
-      } catch {
-        case _: StatusRuntimeException => ()
-      }
-    }
-    objects.commitMultipart(CommitRequest(uploadId = uploadId, parts = parts.map(_._1)))
-    record
-  }
-}
-`,
-      solution: `import java.security.MessageDigest
-import java.util.concurrent.TimeUnit
-
-import com.google.protobuf.ByteString
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import files.Store // Store.stagedParts, commitFile, File
-import stored.file_storage.{CommitRequest, ObjectStoreGrpc, PutChunkRequest}
-
-object Client {
-  val DeadlineSeconds = 15L
-  val Attempts = 3
-  private val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val objects = ObjectStoreGrpc.blockingStub(ManagedChannelBuilder.forAddress("objectstore", 9000).usePlaintext().build())
-
-  /** Write part n of the upload to the object store. */
-  def putPart(uploadId: String, n: Int, data: Array[Byte]): Unit = {
-    // The hash lets the store verify the part and dedupe a retry of it.
-    val hex = MessageDigest.getInstance("SHA-256").digest(data).map(b => f"\${b & 0xff}%02x").mkString
-    val request = PutChunkRequest(uploadId = uploadId, part = n, data = ByteString.copyFrom(data), sha256 = hex)
-    def attempt(number: Int): Unit =
-      try objects.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).putChunk(request)
-      catch {
-        case e: StatusRuntimeException if Retryable(e.getStatus.getCode) && number < Attempts =>
-          Thread.sleep(200L * number) // this part only: the parts before it are already stored
-          attempt(number + 1)
-      }
-    attempt(1)
-  }
-
-  /** Write every staged part, commit the multipart upload and index the file; the file record. */
-  def complete(uploadId: String): Store.File = {
-    val parts = Store.stagedParts(uploadId)
-    parts.foreach { case (n, data) => putPart(uploadId, n, data) }
-    val commit = objects.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).commitMultipart(CommitRequest(uploadId = uploadId, parts = parts.map(_._1)))
-    // Only a committed object is indexed; a failed commit throws above and the session stays for a retry.
-    Store.commitFile(uploadId, commit.objectKey, commit.digest)
-  }
 }
 `,
     },

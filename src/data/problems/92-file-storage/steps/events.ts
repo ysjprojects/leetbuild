@@ -51,10 +51,6 @@ a lost acknowledgement writes an event twice.
         python: {all: [/key=record\[["']file_id["']\]/], none: [/key=key\b/, /emit\([^)\n]*upload_id/]},
         typescript: {all: [/key:\s*record\.file_id/], none: [/key:\s*key\b/, /emit\([^)\n]*uploadId/]},
         go: {all: [/Key:\s*\[\]byte\(record\.FileID\)/], none: [/Key:\s*\[\]byte\(key\)/, /emit\([^)\n]*uploadID/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(EventTopic,\s*record\.fileId/],
-          none: [/EventTopic,\s*key\b/, /emit\([^)\n]*uploadId/],
-        },
         cpp: {
           all: [/record\.file_id\.c_str\(\),\s*record\.file_id\.(size|length)\(\)/],
           none: [/key\.c_str\(\)/, /emit\([^)\n]*upload_id/],
@@ -70,7 +66,6 @@ a lost acknowledgement writes an event twice.
         python: {all: [/PAYLOAD_FIELDS\s*=/, /for \w+ in PAYLOAD_FIELDS/], none: [/\*\*record/]},
         typescript: {all: [/PAYLOAD_FIELDS\s*=/, /PAYLOAD_FIELDS\.map\(/], none: [/\.\.\.record/]},
         go: {all: [/payloadFields\s*=/, /range payloadFields|record\.Digest/]},
-        scala: {all: [/PayloadFields\s*[:=]/, /PayloadFields\.map/]},
         cpp: {all: [/\{"digest",\s*record\.digest\}/], none: [/record\.name\b/, /record\.object_key/]},
       },
     },
@@ -83,7 +78,6 @@ a lost acknowledgement writes an event twice.
         python: {order: [/def delete_file/, /store\.delete_file\(/, /emit\(\s*["']deleted["']/]},
         typescript: {order: [/function deleteFile/, /store\.deleteFile\(/, /emit\(\s*['"]deleted['"]/]},
         go: {order: [/func deleteFile/, /store\.DeleteFile\(/, /emit\([^\n]*"deleted"/]},
-        scala: {order: [/def deleteFile/, /Store\.deleteFile\(/, /emit\(\s*"deleted"/]},
         cpp: {order: [/delete_file\(const std::string& file_id\)/, /store::deleteFile\(/, /emit\(\s*"deleted"/]},
       },
     },
@@ -96,7 +90,6 @@ a lost acknowledgement writes an event twice.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -405,111 +398,6 @@ func deleteFile(ctx context.Context, fileID string) (*store.File, error) {
 		return nil, err
 	}
 	return record, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import files.Store // Store.deleteFile, findFile, File
-
-object Events {
-  val EventTopic = "file.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"file event not delivered: \${exception.getMessage}")
-  }
-
-  /** One file.event record for a file that was finalized or deleted. */
-  def emit(kind: String, key: String, record: Store.File): JsObject = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val payload = JsObject(
-      "type" -> JsString(s"file.$kind"), "file_id" -> JsString(record.fileId), "upload_id" -> JsString(record.uploadId),
-      "tenant" -> JsString(record.tenant), "name" -> JsString(record.name), "mime" -> JsString(record.mime),
-      "size" -> JsNumber(record.size), "digest" -> JsString(record.digest), "object_key" -> JsString(record.objectKey))
-    producer.send(new ProducerRecord[String, String](EventTopic, key, payload.compactPrint), onDelivery).get()
-    payload
-  }
-
-  /** Commit the upload (step 3) and announce the file; the file record. */
-  def finalize(uploadId: String): Store.File = {
-    val record = Client.complete(uploadId)
-    emit("finalized", uploadId, record)
-    record
-  }
-
-  /** Delete a committed file and announce it; the deleted record, or None when there was nothing to delete. */
-  def deleteFile(fileId: String): Option[Store.File] =
-    Store.findFile(fileId).flatMap { record =>
-      emit("deleted", fileId, record)
-      Store.deleteFile(fileId)
-    }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import files.Store // Store.deleteFile, findFile, File
-
-object Events {
-  val EventTopic = "file.event"
-  /** Ids, the digest, the sniffed type and the size; the filename and the object key stay in the index. */
-  val PayloadFields: Seq[String] = Seq("file_id", "tenant", "size", "mime", "digest")
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes the record once, on every replica.
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"file event not delivered: \${exception.getMessage}")
-  }
-
-  private def field(record: Store.File, name: String): JsValue = name match {
-    case "file_id" => JsString(record.fileId)
-    case "tenant" => JsString(record.tenant)
-    case "size" => JsNumber(record.size)
-    case "mime" => JsString(record.mime)
-    case "digest" => JsString(record.digest)
-  }
-
-  /** One file.event record for a file that was finalized or deleted. */
-  def emit(kind: String, record: Store.File): JsObject = {
-    val payload = JsObject((("type" -> JsString(s"file.$kind")) +: PayloadFields.map(name => name -> field(record, name))).toMap)
-    // Keyed by the file: its finalize and its delete share a partition, in order.
-    producer.send(new ProducerRecord[String, String](EventTopic, record.fileId, payload.compactPrint), onDelivery).get()
-    payload
-  }
-
-  /** Commit the upload (step 3) and announce the file; the file record. */
-  def finalize(uploadId: String): Store.File = {
-    val record = Client.complete(uploadId)
-    emit("finalized", record)
-    record
-  }
-
-  /** Delete a committed file and announce it; the deleted record, or None when there was nothing to delete. */
-  def deleteFile(fileId: String): Option[Store.File] =
-    Store.deleteFile(fileId).map { record => // None: nothing changed, nothing to announce
-      emit("deleted", record)
-      record
-    }
 }
 `,
     },

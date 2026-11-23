@@ -65,7 +65,6 @@ for nothing.
         python: {all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/\br\.incr\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/redis\.incr\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/rdb\.Incr\(/]},
-        scala: {all: [/jedis\s*\.eval\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/jedis\.incr\(/]},
         cpp: {all: [/\.eval[<(]/, /redis\.call\(\s*['"]INCR['"]/], none: [/redis\.incr\(/]},
       },
     },
@@ -78,7 +77,6 @@ for nothing.
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]/]},
         go: {all: [/redis\.call\(\s*['"]EXPIRE['"]/]},
-        scala: {all: [/redis\.call\(\s*['"]EXPIRE['"]/]},
         cpp: {all: [/redis\.call\(\s*['"]EXPIRE['"]/]},
       },
     },
@@ -91,7 +89,6 @@ for nothing.
         python: {all: [/redis\.call\(\s*['"]TTL['"]/], none: [/retry_after\s*=\s*WINDOW_S/]},
         typescript: {all: [/redis\.call\(\s*['"]TTL['"]/], none: [/retry_after:\s*WINDOW_S/]},
         go: {all: [/redis\.call\(\s*['"]TTL['"]/], none: [/RetryAfter:\s*windowSeconds/]},
-        scala: {all: [/redis\.call\(\s*['"]TTL['"]/], none: [/retryAfter\s*=\s*WindowSeconds/]},
         cpp: {all: [/redis\.call\(\s*['"]TTL['"]/], none: [/\{\s*false\s*,\s*0\s*,\s*kWindowSeconds\s*\}/]},
       },
     },
@@ -104,7 +101,6 @@ for nothing.
         python: {all: [/ex\s*=\s*FLAG_TTL_S|setex\(/]},
         typescript: {all: [/['"]EX['"]\s*,\s*FLAG_TTL_S|setex\(/]},
         go: {all: [/,\s*flagTTL\)/]},
-        scala: {all: [/\.ex\(\s*FlagTtlSeconds\s*\)/]},
         cpp: {all: [/\.set\([^;]*kFlagTtl\)/]},
       },
     },
@@ -117,7 +113,6 @@ for nothing.
         python: {all: [/\.ltrim\(/, /\.expire\(\s*key\s*,\s*SESSION_TTL_S/]},
         typescript: {all: [/\.ltrim\(/, /\.expire\(\s*key\s*,\s*SESSION_TTL_S/]},
         go: {all: [/\.LTrim\(/, /\.Expire\(\s*ctx\s*,\s*key\s*,\s*sessionTTL/]},
-        scala: {all: [/\.ltrim\(/, /\.expire\(\s*key\s*,\s*SessionTtlSeconds/]},
         cpp: {all: [/\.ltrim\(/, /\.expire\(\s*key\s*,\s*kSessionTtl/]},
       },
     },
@@ -449,109 +444,6 @@ func remember(ctx context.Context, user, documentID, question string) error {
 		return err
 	}
 	return rdb.Expire(ctx, key, sessionTTL).Err()
-}
-`,
-    },
-    scala: {
-      starter: `import java.security.MessageDigest
-
-import redis.clients.jedis.JedisPooled
-
-import promptguard.{Admission, Config}
-
-/** The Redis state behind POST /v1/ask: per-user windows, the block-list, sessions. */
-object Limits {
-  val LimitPerWindow = 30L
-  val WindowSeconds = 60L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  def digest(question: String): String =
-    MessageDigest.getInstance("SHA-256").digest(question.getBytes("UTF-8")).map("%02x".format(_)).mkString
-
-  /** Reserve one question in the user's current window, or say how long until one frees up. */
-  def admit(user: String): Admission = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val key = Config.limitKey(user, System.currentTimeMillis() / 1000 / WindowSeconds)
-    val used = Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
-    if (used >= LimitPerWindow) Admission(ok = false, remaining = 0L, retryAfter = WindowSeconds)
-    else {
-      val count = jedis.incr(key)
-      Admission(ok = true, remaining = LimitPerWindow - count, retryAfter = 0L)
-    }
-  }
-
-  /** Remember a question the model layer rejected. */
-  def flag(question: String): Unit = {
-    jedis.set(Config.flaggedKey(digest(question)), "1")
-    ()
-  }
-
-  def isFlagged(question: String): Boolean = jedis.exists(Config.flaggedKey(digest(question)))
-
-  /** Keep the question's hash in the user's session on this document. */
-  def remember(user: String, documentId: String, question: String): Unit = {
-    jedis.lpush(Config.sessionKey(user, documentId), digest(question))
-    ()
-  }
-}
-`,
-      solution: `import java.security.MessageDigest
-
-import scala.jdk.CollectionConverters._
-
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import promptguard.{Admission, Config}
-
-/** The Redis state behind POST /v1/ask: per-user windows, the block-list, sessions. */
-object Limits {
-  val LimitPerWindow = 30L
-  val WindowSeconds = 60L
-  val FlagTtlSeconds = 86400L
-  val SessionTtlSeconds = 1800L
-  val SessionTurns = 20L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  // KEYS[1] the window's counter; ARGV[1] the limit, ARGV[2] the window length.
-  // Returns {admitted (0 or 1), count, the counter's TTL}.
-  private val AdmitScript = """
-${ADMIT_LUA}
-"""
-
-  def digest(question: String): String =
-    MessageDigest.getInstance("SHA-256").digest(question.getBytes("UTF-8")).map("%02x".format(_)).mkString
-
-  /** Reserve one question in the user's current window, or say how long until one frees up. */
-  def admit(user: String): Admission = {
-    val key = Config.limitKey(user, System.currentTimeMillis() / 1000 / WindowSeconds)
-    val reply = jedis
-      .eval(AdmitScript, List(key).asJava, List(LimitPerWindow.toString, WindowSeconds.toString).asJava)
-      .asInstanceOf[java.util.List[java.lang.Long]]
-      .asScala
-      .map(_.longValue)
-    if (reply(0) != 1L) Admission(ok = false, remaining = 0L, retryAfter = math.max(reply(2), 1L))
-    else Admission(ok = true, remaining = LimitPerWindow - reply(1), retryAfter = 0L)
-  }
-
-  /** Remember a question the model layer rejected, for a day. */
-  def flag(question: String): Unit = {
-    jedis.set(Config.flaggedKey(digest(question)), "1", SetParams.setParams().ex(FlagTtlSeconds))
-    ()
-  }
-
-  def isFlagged(question: String): Boolean = jedis.exists(Config.flaggedKey(digest(question)))
-
-  /** Keep the question's hash in the user's session on this document: 20 turns, 30 minutes. */
-  def remember(user: String, documentId: String, question: String): Unit = {
-    val key = Config.sessionKey(user, documentId)
-    jedis.lpush(key, digest(question))
-    jedis.ltrim(key, 0, SessionTurns - 1)
-    jedis.expire(key, SessionTtlSeconds)
-    ()
-  }
 }
 `,
     },

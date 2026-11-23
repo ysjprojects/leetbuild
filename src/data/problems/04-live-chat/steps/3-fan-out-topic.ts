@@ -59,10 +59,6 @@ message to every stream on *this* instance subscribed to the room.
           all: [/'chat-messages'|"chat-messages"/, /producer\.send\(\s*\{[^}]*topic:\s*TOPIC[\s\S]{0,200}?key:\s*room/],
         },
         go: {all: [/"chat-messages"/, /WriteMessages\(/, /Key:\s*\[\]byte\(\s*room\s*\)/], none: [/Async:\s*false/]},
-        scala: {
-          all: [/"chat-messages"/, /new ProducerRecord\[[^(]*\]\(\s*Topic\s*,\s*room\s*,/],
-          none: [/producer\.send\([^\n]*\)\s*\.get\(/, /producer\.flush\(/],
-        },
         cpp: {
           all: [
             /"chat-messages"/,
@@ -91,7 +87,6 @@ message to every stream on *this* instance subscribed to the room.
             /groupID\s*=\s*(?:"chat-server-"\s*\+|fmt\.Sprintf\(\s*"chat-server-)[^\n]*(hostname|Hostname|uuid)/,
           ],
         },
-        scala: {all: [/"group\.id"\s*,\s*GroupId/, /GroupId\s*=\s*s"chat-server-\$\{[^\n]*(getHostName|randomUUID)/]},
         cpp: {all: [/"group\.id"\s*,\s*kGroupId/, /kGroupId\s*=\s*"chat-server-"\s*\+\s*[^\n]*(hostname|uuid)/]},
       },
     },
@@ -104,7 +99,6 @@ message to every stream on *this* instance subscribed to the room.
         python: {all: [/"auto\.offset\.reset"\s*:\s*"latest"/]},
         typescript: {all: [/fromBeginning:\s*false/]},
         go: {all: [/StartOffset:\s*kafka\.LastOffset/]},
-        scala: {all: [/"auto\.offset\.reset"\s*,\s*"latest"|AUTO_OFFSET_RESET_CONFIG\s*,\s*"latest"/]},
         cpp: {all: [/"auto\.offset\.reset"\s*,\s*"latest"/]},
       },
     },
@@ -117,7 +111,6 @@ message to every stream on *this* instance subscribed to the room.
         python: {all: [/consumer\.subscribe\(\s*\[\s*TOPIC\s*\]\s*\)/, /local_deliver\(\s*[^\n]*,\s*msg\s*\)/]},
         typescript: {all: [/consumer\.subscribe\(\s*\{[^}]*topic:\s*TOPIC/, /localDeliver\(\s*[^\n]*,\s*msg\s*\)/]},
         go: {all: [/reader\.(Read|Fetch)Message\(/, /localDeliver\(\s*[^\n]*,\s*msg\s*\)/]},
-        scala: {all: [/consumer\.subscribe\([^\n]*Topic/, /localDeliver\(\s*[^\n]*,\s*msg\s*\)/]},
         cpp: {all: [/consumer->subscribe\([^\n]*kTopic/, /local_deliver\(\s*[^\n]*,\s*msg\s*\)/]},
       },
     },
@@ -387,96 +380,6 @@ func runConsumer(ctx context.Context) {
 		}
 		localDeliver(string(record.Key), msg)
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.net.InetAddress
-import java.time.Duration
-import java.util.{Properties, UUID}
-
-import livechat.chat.ServerMsg
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.{ByteArrayDeserializer, ByteArraySerializer, StringDeserializer, StringSerializer}
-import scala.jdk.CollectionConverters._
-
-object RoomBus {
-  val Topic = "chat-messages"
-  val GroupId = "chat-server" // TODO: unique per instance: chat-server-{hostname}-{uuid}
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("linger.ms", "5")
-  private val producer = new KafkaProducer[String, Array[Byte]](producerProps, new StringSerializer, new ByteArraySerializer)
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", GroupId)
-  // TODO: auto.offset.reset latest — a restarted instance must not replay history to live clients
-  consumerProps.put("enable.auto.commit", "true")
-  private val consumer = new KafkaConsumer[String, Array[Byte]](consumerProps, new StringDeserializer, new ByteArrayDeserializer)
-
-  /** Provided (Subscriptions): hands the message to every stream on this instance subscribed to the room. */
-  def localDeliver(room: String, msg: ServerMsg): Unit = ???
-
-  def publish(room: String, msg: ServerMsg): Unit = {
-    // TODO: send a record keyed by room with msg.toByteArray; do not wait for the future
-  }
-
-  def runConsumer(): Unit = {
-    // TODO: subscribe to Topic; for every record ServerMsg.parseFrom the value and localDeliver(room, msg)
-  }
-
-  def start(): Unit = new Thread(() => runConsumer(), "room-bus").start()
-}
-`,
-      solution: `import java.net.InetAddress
-import java.time.Duration
-import java.util.{Properties, UUID}
-
-import livechat.chat.ServerMsg
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.{ByteArrayDeserializer, ByteArraySerializer, StringDeserializer, StringSerializer}
-import scala.jdk.CollectionConverters._
-
-object RoomBus {
-  val Topic = "chat-messages"
-
-  /** Every instance is its own consumer group, so every instance sees every message. */
-  val GroupId = s"chat-server-\${InetAddress.getLocalHost.getHostName}-\${UUID.randomUUID()}"
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("linger.ms", "5")
-  private val producer = new KafkaProducer[String, Array[Byte]](producerProps, new StringSerializer, new ByteArraySerializer)
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", GroupId)
-  consumerProps.put("auto.offset.reset", "latest")
-  consumerProps.put("enable.auto.commit", "true")
-  private val consumer = new KafkaConsumer[String, Array[Byte]](consumerProps, new StringDeserializer, new ByteArrayDeserializer)
-
-  /** Provided (Subscriptions): hands the message to every stream on this instance subscribed to the room. */
-  def localDeliver(room: String, msg: ServerMsg): Unit = ???
-
-  def publish(room: String, msg: ServerMsg): Unit =
-    producer.send(new ProducerRecord[String, Array[Byte]](Topic, room, msg.toByteArray)) // enqueues; the future is not awaited
-
-  def runConsumer(): Unit = {
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      val records = consumer.poll(Duration.ofMillis(200))
-      records.asScala.foreach { record =>
-        val msg = ServerMsg.parseFrom(record.value())
-        localDeliver(record.key(), msg)
-      }
-    }
-  }
-
-  def start(): Unit = new Thread(() => runConsumer(), "room-bus").start()
 }
 `,
     },

@@ -58,10 +58,6 @@ service Resolver { rpc Score(PairRequest) returns (PairScore); }  // FAILED_PREC
           all: [/deadline\s*=\s*(1\s*\*\s*)?time\.Second\b/, /context\.WithTimeout\([^\n]*deadline\s*\)/],
           none: [/10\s*\*\s*time\.Second/],
         },
-        scala: {
-          all: [/DeadlineSeconds\s*=\s*1L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/],
-          none: [/withDeadlineAfter\(\s*10/],
-        },
         cpp: {all: [/kDeadline\{1\}/, /set_deadline\([^\n]*kDeadline\)/], none: [/seconds\{10\}|seconds\(10\)/]},
       },
     },
@@ -74,7 +70,6 @@ service Resolver { rpc Score(PairRequest) returns (PairScore); }  // FAILED_PREC
         python: {all: [/store\.park\(/], none: [/DEADLINE_EXCEEDED:\s*\n\s*return\s+["']rejected["']/]},
         typescript: {all: [/await park\(/], none: [/DEADLINE_EXCEEDED\)\s*return\s*['"]rejected['"]/]},
         go: {all: [/store\.Park\(/], none: [/codes\.DeadlineExceeded\s*\{\s*\n\s*return "rejected"/]},
-        scala: {all: [/Store\.park\(/], none: [/DEADLINE_EXCEEDED\s*=>\s*return\s*"rejected"/]},
         cpp: {all: [/store::park\(/], none: [/DEADLINE_EXCEEDED\)\s*return\s*"rejected"/]},
       },
     },
@@ -87,7 +82,6 @@ service Resolver { rpc Score(PairRequest) returns (PairScore); }  // FAILED_PREC
         python: {all: [/FAILED_PRECONDITION/], none: [/for \w+ in range\(/, /\n\s*continue\b/]},
         typescript: {all: [/FAILED_PRECONDITION/], none: [/for \(let attempt/, /\bcontinue;/]},
         go: {all: [/codes\.FailedPrecondition/], none: [/for attempt :=/, /\bcontinue\b/]},
-        scala: {all: [/FAILED_PRECONDITION/], none: [/while \(attempt/, /MaxAttempts/]},
         cpp: {all: [/FAILED_PRECONDITION/], none: [/for \(int attempt/, /\bcontinue;/]},
       },
     },
@@ -100,7 +94,6 @@ service Resolver { rpc Score(PairRequest) returns (PairScore); }  // FAILED_PREC
         python: {all: [/MERGE_THRESHOLD\s*=\s*0\.9\b/, />=\s*MERGE_THRESHOLD/]},
         typescript: {all: [/MERGE_THRESHOLD\s*=\s*0\.9\b/, />=\s*MERGE_THRESHOLD/]},
         go: {all: [/mergeThreshold\s*=\s*0\.9\b/, />=\s*mergeThreshold/]},
-        scala: {all: [/MergeThreshold\s*=\s*0\.9\b/, />=\s*MergeThreshold/]},
         cpp: {all: [/kMergeThreshold\s*=\s*0\.9\b/, />=\s*kMergeThreshold/]},
       },
     },
@@ -337,77 +330,6 @@ func resolvePair(ctx context.Context, tenant, left, right string) (string, error
 	}
 	store.Park(ctx, tenant, left, right, "below_threshold", &score)
 	return "parked", nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import graph.Store // Store.merge, Store.park
-import graph.resolver.{PairRequest, ResolverGrpc}
-
-object Client {
-  val MaxAttempts = 3
-
-  private val resolver = ResolverGrpc.blockingStub(ManagedChannelBuilder.forAddress("resolver", 9000).usePlaintext().build())
-
-  /** Ask the resolver whether right is left: "merged", "parked" (on the review queue) or "rejected". */
-  def resolvePair(tenant: String, left: String, right: String): String = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    var attempt = 0
-    while (attempt < MaxAttempts) {
-      attempt += 1
-      try {
-        resolver.withDeadlineAfter(10, TimeUnit.SECONDS).score(PairRequest(tenant, left, right))
-        Store.merge(left, right)
-        return "merged"
-      } catch {
-        // No match found in time.
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED => return "rejected"
-        // The resolver may answer differently next time.
-        case _: StatusRuntimeException => ()
-      }
-    }
-    Store.merge(left, right) // every attempt failed: the aliases already matched
-    "merged"
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import graph.Store // Store.merge, Store.park
-import graph.resolver.{PairRequest, ResolverGrpc}
-
-object Client {
-  val DeadlineSeconds = 1L
-  val MergeThreshold = 0.9
-
-  private val resolver = ResolverGrpc.blockingStub(ManagedChannelBuilder.forAddress("resolver", 9000).usePlaintext().build())
-
-  /** Ask the resolver whether right is left: "merged", "parked" (on the review queue) or "rejected". */
-  def resolvePair(tenant: String, left: String, right: String): String = {
-    val verdict =
-      try resolver.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).score(PairRequest(tenant, left, right))
-      catch {
-        // The resolver refused the pair: terminal, a retry gets the same answer.
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.FAILED_PRECONDITION => return "rejected"
-        // DEADLINE_EXCEEDED, UNAVAILABLE: no answer is not a "no". An operator decides.
-        case _: StatusRuntimeException =>
-          Store.park(tenant, left, right, "unresolved")
-          return "parked"
-      }
-    if (verdict.score >= MergeThreshold) {
-      Store.merge(left, right)
-      "merged"
-    } else {
-      Store.park(tenant, left, right, "below_threshold", Some(verdict.score))
-      "parked"
-    }
-  }
 }
 `,
     },

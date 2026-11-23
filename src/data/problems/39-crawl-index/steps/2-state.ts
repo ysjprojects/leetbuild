@@ -70,7 +70,6 @@ answered 429 keeps being fetched; and every host ever crawled keeps a bucket in 
           all: [/"frontier:"\s*\+\s*jobID\s*\+\s*":"\s*\+\s*host|"frontier:%s:%s"/],
           none: [/"frontier:"\s*\+\s*jobID\s*\}/],
         },
-        scala: {all: [/frontier:\$jobId:\$host|frontier:\$\{jobId\}:\$\{host\}/], none: [/"frontier:\$jobId"/]},
         cpp: {all: [/"frontier:"\s*\+\s*job_id\s*\+\s*":"\s*\+\s*host/], none: [/"frontier:"\s*\+\s*job_id;/]},
       },
     },
@@ -92,10 +91,6 @@ answered 429 keeps being fetched; and every host ever crawled keeps a bucket in 
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]HM?GET['"]/, /redis\.call\(\s*['"]LPOP['"]/],
           none: [/\.HMGet\(|\.HGet\(|\.HGetAll\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HM?GET['"]/, /redis\.call\(\s*['"]LPOP['"]/],
-          none: [/\.hmget\(|\.hget\(|\.hgetAll\(/],
-        },
         cpp: {
           all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HM?GET['"]/, /redis\.call\(\s*['"]LPOP['"]/],
           none: [/\.hmget\(|\.hget\(|\.hgetall\(/],
@@ -111,7 +106,6 @@ answered 429 keeps being fetched; and every host ever crawled keeps a bucket in 
         python: {all: [/math\.min\(\s*burst|tokens\s*>\s*burst/]},
         typescript: {all: [/math\.min\(\s*burst|tokens\s*>\s*burst/]},
         go: {all: [/math\.min\(\s*burst|tokens\s*>\s*burst/]},
-        scala: {all: [/math\.min\(\s*burst|tokens\s*>\s*burst/]},
         cpp: {all: [/math\.min\(\s*burst|tokens\s*>\s*burst/]},
       },
     },
@@ -124,7 +118,6 @@ answered 429 keeps being fetched; and every host ever crawled keeps a bucket in 
         python: {all: [/def take(?:(?!\ndef )[\s\S])*?throttle_key\(/]},
         typescript: {all: [/function take(?:(?!\nexport )[\s\S])*?throttleKey\(/]},
         go: {all: [/func take(?:(?!\n\})[\s\S])*?throttleKey\(/]},
-        scala: {all: [/def take(?:(?!\n {2}def |\n {2}\/\*\*)[\s\S])*?throttleKey\(/]},
         cpp: {all: [/ take\((?:(?!\n\})[\s\S])*?throttleKey\(/]},
       },
     },
@@ -137,7 +130,6 @@ answered 429 keeps being fetched; and every host ever crawled keeps a bucket in 
         python: {all: [/P?EXPIRE['"]|\.p?expire\(/i, /BUCKET_TTL_MS/]},
         typescript: {all: [/P?EXPIRE['"]|\.p?expire\(/i, /BUCKET_TTL_MS/]},
         go: {all: [/P?EXPIRE['"]|\.P?Expire\(/i, /bucketTTLMs/]},
-        scala: {all: [/P?EXPIRE['"]|\.p?expire\(/i, /BucketTtlMs/]},
         cpp: {all: [/P?EXPIRE['"]|\.p?expire\(/i, /kBucketTtlMs/]},
       },
     },
@@ -523,111 +515,6 @@ func throttle(ctx context.Context, jobID, host string, retryAfterS int) error {
 // requeue puts a taken URL back at the tail of its host's queue.
 func requeue(ctx context.Context, jobID, host, url string) error {
 	return rdb.RPush(ctx, queueKey(jobID, host), url).Err()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.{SetParams, ZAddParams}
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Burst = 2L
-
-  def queueKey(jobId: String): String = s"frontier:$jobId"
-  def bucketKey(jobId: String, host: String): String = s"bucket:$jobId:$host"
-  def throttleKey(jobId: String, host: String): String = s"throttle:$jobId:$host"
-  def pendingKey(jobId: String): String = s"pending:$jobId"
-
-  /** Queue url on its host; it is pending from now until an outcome is recorded. */
-  def enqueue(jobId: String, host: String, url: String): Unit = {
-    jedis.rpush(queueKey(jobId), url)
-    jedis.zadd(pendingKey(jobId), System.currentTimeMillis / 1000.0, url, ZAddParams.zAddParams().nx())
-  }
-
-  /** The next URL of the host if the host is not throttled and its bucket holds a token, else None. */
-  def take(jobId: String, host: String, ratePerMinute: Int): Option[String] = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val now = System.currentTimeMillis
-    val state = jedis.hmget(bucketKey(jobId, host), "tokens", "ts").asScala
-    val ts = Option(state(1)).map(_.toLong).getOrElse(now)
-    var tokens = Option(state(0)).map(_.toDouble).getOrElse(Burst.toDouble) + (now - ts) * ratePerMinute / 60000.0
-    val url = if (tokens >= 1) Option(jedis.lpop(queueKey(jobId))) else None
-    if (url.isDefined) tokens -= 1
-    jedis.hset(bucketKey(jobId, host), Map("tokens" -> tokens.toString, "ts" -> now.toString).asJava)
-    url
-  }
-
-  /** The host answered 429: take hands out nothing for it for retryAfterS seconds. */
-  def throttle(jobId: String, host: String, retryAfterS: Int): Unit = {
-    val waitMs = math.max(retryAfterS, 1) * 1000L
-    jedis.set(throttleKey(jobId, host), (System.currentTimeMillis + waitMs).toString, SetParams.setParams().px(waitMs))
-  }
-
-  /** Put a taken URL back at the tail of its host's queue. */
-  def requeue(jobId: String, host: String, url: String): Unit = jedis.rpush(queueKey(jobId), url)
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.{SetParams, ZAddParams}
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Burst = 2L
-  val BucketTtlMs = 3600000L
-
-  /** KEYS: the host's bucket, queue and throttle. ARGV: now (ms), rate per minute, burst, bucket TTL (ms). */
-  val TakeLua: String =
-    """local now = tonumber(ARGV[1])
-      |if now < tonumber(redis.call('GET', KEYS[3]) or '0') then return false end
-      |local rate = tonumber(ARGV[2])
-      |local burst = tonumber(ARGV[3])
-      |local state = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
-      |local tokens = tonumber(state[1]) or burst
-      |local ts = tonumber(state[2]) or now
-      |tokens = math.min(burst, tokens + (now - ts) * rate / 60000)
-      |local url = false
-      |if tokens >= 1 then
-      |  url = redis.call('LPOP', KEYS[2])
-      |  if url then tokens = tokens - 1 end
-      |end
-      |redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', ARGV[1])
-      |redis.call('PEXPIRE', KEYS[1], ARGV[4])
-      |return url
-      |""".stripMargin
-
-  def queueKey(jobId: String, host: String): String = s"frontier:$jobId:$host"
-  def bucketKey(jobId: String, host: String): String = s"bucket:$jobId:$host"
-  def throttleKey(jobId: String, host: String): String = s"throttle:$jobId:$host"
-  def pendingKey(jobId: String): String = s"pending:$jobId"
-
-  /** Queue url on its host; it is pending from now until an outcome is recorded. */
-  def enqueue(jobId: String, host: String, url: String): Unit = {
-    jedis.rpush(queueKey(jobId, host), url)
-    jedis.zadd(pendingKey(jobId), System.currentTimeMillis / 1000.0, url, ZAddParams.zAddParams().nx())
-  }
-
-  /** The next URL of the host if the host is not throttled and its bucket holds a token, else None. */
-  def take(jobId: String, host: String, ratePerMinute: Int): Option[String] = {
-    val keys = List(bucketKey(jobId, host), queueKey(jobId, host), throttleKey(jobId, host)).asJava
-    val args = List(System.currentTimeMillis.toString, ratePerMinute.toString, Burst.toString, BucketTtlMs.toString).asJava
-    Option(jedis.eval(TakeLua, keys, args)).map(_.toString)
-  }
-
-  /** The host answered 429: take hands out nothing for it for retryAfterS seconds. */
-  def throttle(jobId: String, host: String, retryAfterS: Int): Unit = {
-    val waitMs = math.max(retryAfterS, 1) * 1000L
-    jedis.set(throttleKey(jobId, host), (System.currentTimeMillis + waitMs).toString, SetParams.setParams().px(waitMs))
-  }
-
-  /** Put a taken URL back at the tail of its host's queue. */
-  def requeue(jobId: String, host: String, url: String): Unit = jedis.rpush(queueKey(jobId, host), url)
 }
 `,
     },

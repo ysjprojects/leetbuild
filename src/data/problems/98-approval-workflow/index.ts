@@ -6,7 +6,7 @@ import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-dependency';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Approval workflow: the course is not "record a yes in a database", it is the debugging you owe an
@@ -98,6 +98,5 @@ above decide whether an approval is authorized, atomic, verified and traceable.`
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

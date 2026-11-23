@@ -57,10 +57,6 @@ cases; and an applicant reference reused by another tenant lands on the first te
           all: [/redis\.NewScript\(/, /redis\.call\(\s*['"]INCR['"]/, /redis\.call\(\s*['"]GET['"]/],
           none: [/rdb\.Incr\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]INCR['"]/, /redis\.call\(\s*['"]GET['"]/],
-          none: [/jedis\.incr\(/],
-        },
         cpp: {all: [/\.eval</, /redis\.call\(\s*['"]INCR['"]/, /redis\.call\(\s*['"]GET['"]/], none: [/\.incr\(/]},
       },
     },
@@ -73,7 +69,6 @@ cases; and an applicant reference reused by another tenant lands on the first te
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /redis\.call\(\s*['"]TTL['"]/], none: [/RETRY_AFTER_S/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /redis\.call\(\s*['"]TTL['"]/], none: [/RETRY_AFTER_S/]},
         go: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /redis\.call\(\s*['"]TTL['"]/], none: [/retryAfterS\b/]},
-        scala: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /redis\.call\(\s*['"]TTL['"]/], none: [/RetryAfterS\b/]},
         cpp: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /redis\.call\(\s*['"]TTL['"]/], none: [/kRetryAfterS\b/]},
       },
     },
@@ -86,7 +81,6 @@ cases; and an applicant reference reused by another tenant lands on the first te
         python: {all: [/\.set\([^\n]*nx=True/], order: [/nx=True/, /cases\.create\(/]},
         typescript: {all: [/\.set\([^\n]*'NX'/], order: [/'NX'/, /cases\.create\(/]},
         go: {all: [/\.SetNX\(/], order: [/\.SetNX\(/, /cases\.Create\(/]},
-        scala: {all: [/SetParams\.setParams\(\)\.nx\(\)/], order: [/\.nx\(\)/, /Cases\.create\(/]},
         cpp: {all: [/UpdateType::NOT_EXIST/], order: [/UpdateType::NOT_EXIST/, /cases::create\(/]},
       },
     },
@@ -99,7 +93,6 @@ cases; and an applicant reference reused by another tenant lands on the first te
         python: {all: [/kyc:active:\{tenant\}:\{applicant\}/]},
         typescript: {all: [/kyc:active:\$\{tenant\}:\$\{applicant\}/]},
         go: {all: [/"kyc:active:"\s*\+\s*tenant\s*\+\s*":"\s*\+\s*applicant/]},
-        scala: {all: [/s"kyc:active:\$tenant:\$applicant"/]},
         cpp: {all: [/"kyc:active:"\s*\+\s*tenant\s*\+\s*":"\s*\+\s*applicant/]},
       },
     },
@@ -355,87 +348,6 @@ func openCase(ctx context.Context, tenant, applicant string, documents []cases.D
 	}
 	cases.Create(ctx, caseID, tenant, applicant, documents)
 	return caseID, true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import kyc.Cases // Cases.newId, Cases.create, Cases.Document
-
-object State {
-  val MaxAttempts = 4
-  val AttemptWindowS = 3600
-  val RetryAfterS = 60L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** (true, 0) when the attempt is reserved; past the cap, (false, seconds to wait). */
-  def reserveAttempt(tenant: String, applicant: String): (Boolean, Long) = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = s"kyc:attempts:$tenant:$applicant"
-    val count = Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
-    if (count >= MaxAttempts) (false, RetryAfterS)
-    else {
-      jedis.incr(key)
-      (true, 0L)
-    }
-  }
-
-  /** The applicant's open case: created when this call opened it, not when one was open. */
-  def openCase(tenant: String, applicant: String, documents: Seq[Cases.Document]): (String, Boolean) = {
-    val key = s"kyc:active:$applicant"
-    Option(jedis.get(key)) match {
-      case Some(existing) => (existing, false)
-      case None =>
-        val caseId = Cases.newId()
-        jedis.set(key, caseId)
-        Cases.create(caseId, tenant, applicant, documents)
-        (caseId, true)
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import scala.jdk.CollectionConverters._
-
-import kyc.Cases // Cases.newId, Cases.create, Cases.Document
-
-object State {
-  val MaxAttempts = 4
-  val AttemptWindowS = 3600
-
-  // Read, compare, count and start the window in one step: no other client runs in between.
-  val ReserveLua: String =
-    """local n = tonumber(redis.call('GET', KEYS[1]) or '0')
-      |if n >= tonumber(ARGV[1]) then return {0, redis.call('TTL', KEYS[1])} end
-      |n = redis.call('INCR', KEYS[1])
-      |if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
-      |return {1, redis.call('TTL', KEYS[1])}
-      |""".stripMargin
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** (true, 0) when the attempt is reserved; past the cap, (false, seconds until the window ends). */
-  def reserveAttempt(tenant: String, applicant: String): (Boolean, Long) = {
-    val reply = jedis.eval(ReserveLua, List(s"kyc:attempts:$tenant:$applicant").asJava, List(MaxAttempts.toString, AttemptWindowS.toString).asJava)
-      .asInstanceOf[java.util.List[java.lang.Long]].asScala.map(_.longValue)
-    if (reply.head == 1L) (true, 0L) else (false, math.max(reply(1), 1L))
-  }
-
-  /** The applicant's open case: created when this call opened it, not when one was open. */
-  def openCase(tenant: String, applicant: String, documents: Seq[Cases.Document]): (String, Boolean) = {
-    val key = s"kyc:active:$tenant:$applicant"
-    val caseId = Cases.newId()
-    // The claim is the decision: only the submission whose SET NX won creates the case.
-    if (jedis.set(key, caseId, SetParams.setParams().nx()) == null) (jedis.get(key), false)
-    else {
-      Cases.create(caseId, tenant, applicant, documents)
-      (caseId, true)
-    }
-  }
 }
 `,
     },

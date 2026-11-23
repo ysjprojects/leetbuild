@@ -49,7 +49,6 @@ the call reports success.
         python: {all: [/producer\.produce\([^\n]*key\s*=\s*sku\b/]},
         typescript: {all: [/key:\s*sku\b/]},
         go: {all: [/Key:\s*\[\]byte\(\s*sku\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*sku\s*,/]},
         cpp: {all: [/sku\.c_str\(\)\s*,\s*sku\.(size|length)\(\)/]},
       },
     },
@@ -62,7 +61,6 @@ the call reports success.
         python: {all: [/old_price_cents/, /new_price_cents/, /headroom_bp/, /["']reason["']/]},
         typescript: {all: [/old_price_cents/, /new_price_cents/, /headroom_bp/, /reason:/]},
         go: {all: [/"old_price_cents"/, /"new_price_cents"/, /"headroom_bp"/, /"reason"/]},
-        scala: {all: [/"old_price_cents"/, /"new_price_cents"/, /"headroom_bp"/, /"reason"/]},
         cpp: {all: [/"old_price_cents"/, /"new_price_cents"/, /"headroom_bp"/, /"reason"/]},
       },
     },
@@ -75,7 +73,6 @@ the call reports success.
         python: {order: [/def publish_change/, /store\.publish\(/, /producer\.produce\(/]},
         typescript: {order: [/function publishChange/, /await publish\(/, /producer\.send\(/]},
         go: {order: [/func publishChange/, /store\.Publish\(/, /producer\.Produce\(/]},
-        scala: {order: [/def publishChange/, /Store\.publish\(/, /producer\.send\(/]},
         cpp: {order: [/bool publishChange/, /store::publish\(/, /producer->produce\(/]},
       },
     },
@@ -88,7 +85,6 @@ the call reports success.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -101,7 +97,6 @@ the call reports success.
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/outbox\.Insert\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.insert\(/, /\.get\(\s*[^\n]*TimeUnit/, /Failure|catch|isFailure/]},
         cpp: {all: [/outbox::insert\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -354,86 +349,6 @@ func publishChange(ctx context.Context, sku string, priceCents int64, reason str
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import pricing.{Guard, Store} // Guard.Reservation; Store.publish
-
-object Events {
-  val Topic = "price.changed"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Commit the change the guard reserved and announce it on price.changed; true once the event is on its way. */
-  def publishChange(sku: String, priceCents: Long, reason: String, reservation: Guard.Reservation): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val payload = JsObject("sku" -> JsString(sku), "price_cents" -> JsNumber(priceCents))
-    producer.send(new ProducerRecord[String, String](Topic, payload.compactPrint))
-    Store.publish(sku, priceCents, reason, "operator")
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import pricing.{Guard, Outbox, Store} // Guard.Reservation; Outbox.insert; Store.publish
-
-object Events {
-  val Topic = "price.changed"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What an audit reader needs: both prices, why, when, and what the change spent of the window. */
-  def changeEvent(after: Store.Row, reservation: Guard.Reservation): JsObject =
-    JsObject(
-      "sku" -> JsString(after.sku),
-      "old_price_cents" -> JsNumber(after.previousPriceCents),
-      "new_price_cents" -> JsNumber(after.priceCents),
-      "reason" -> JsString(after.reason),
-      "updated_at" -> JsNumber(after.updatedAt),
-      "moved_bp" -> JsNumber(reservation.movedBp),
-      "headroom_bp" -> JsNumber(reservation.headroomBp)
-    )
-
-  /** Commit the change the guard reserved and announce it on price.changed; true once the broker acknowledged the event. */
-  def publishChange(sku: String, priceCents: Long, reason: String, reservation: Guard.Reservation): Boolean = {
-    // The price is durable before its event exists: an event for a price nobody charges is a phantom.
-    val after = Store.publish(sku, priceCents, reason, "operator")
-    val payload = changeEvent(after, reservation)
-    val record = new ProducerRecord[String, String](Topic, sku, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so the audit trail is late, not short.
-      Outbox.insert(Topic, sku, payload)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

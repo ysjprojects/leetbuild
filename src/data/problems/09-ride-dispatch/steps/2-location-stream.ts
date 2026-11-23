@@ -72,7 +72,6 @@ Implement \`UpdateLocations\` on the servicer skeleton:
             /Latitude:\s*\w+\.(?:GetLat\(\)|Lat\b)/,
           ],
         },
-        scala: {all: [/"drivers:/, /\.geoadd\([^\n]*\blng\b[^\n]*\blat\b/]},
         cpp: {all: [/"drivers:/, /\.geoadd\([^\n]*\blng\(\)[^\n]*\blat\(\)/]},
       },
     },
@@ -87,7 +86,6 @@ Implement \`UpdateLocations\` on the servicer skeleton:
           all: [/:seen/, /\.set\([^\n]*['"]EX['"]\s*,\s*(?:SEEN_TTL_S|30)\b|\.setex\([^\n]*\b(?:SEEN_TTL_S|30)\b/],
         },
         go: {all: [/:seen/, /\.Set(?:Ex)?\(\s*ctx\s*,[^\n]*\b(?:seenTTL|30\s*\*\s*time\.Second)\b/]},
-        scala: {all: [/:seen/, /\.setex\([^\n]*\b(?:SeenTtlSeconds|30L?)\b|\.ex\(\s*(?:SeenTtlSeconds|30L?)\s*\)/]},
         cpp: {all: [/:seen/, /\.set(?:ex)?\([^\n]*\bkSeenTtl\b/]},
       },
     },
@@ -100,7 +98,6 @@ Implement \`UpdateLocations\` on the servicer skeleton:
         python: {all: [/\.pipeline\(/, /\.execute\(\)/]},
         typescript: {all: [/\.pipeline\(\)|\.multi\(\)/, /\.exec\(\)/]},
         go: {all: [/\.(?:Tx)?Pipeline\(\)|\.Pipelined\(/, /\.Exec\(\s*ctx\s*\)|\.Pipelined\(/]},
-        scala: {all: [/\.pipelined\(\)/, /\.sync\(\)/]},
         cpp: {all: [/redis\.pipeline\(/, /\.exec\(\)/]},
       },
     },
@@ -113,7 +110,6 @@ Implement \`UpdateLocations\` on the servicer skeleton:
         python: {all: [/Ack\(\s*count\s*=/]},
         typescript: {all: [/callback\(\s*null\s*,\s*\{\s*count\b/]},
         go: {all: [/SendAndClose\(\s*&pb\.Ack\{\s*Count:/]},
-        scala: {all: [/onNext\(\s*Ack\(/]},
         cpp: {all: [/ack->set_count\(/]},
       },
     },
@@ -126,7 +122,6 @@ Implement \`UpdateLocations\` on the servicer skeleton:
         python: {all: [/CancelledError|context\.cancelled\(\)|add_done_callback\(/]},
         typescript: {all: [/\.cancelled\b|['"]cancelled['"]/]},
         go: {all: [/io\.EOF/, /return err\b/]},
-        scala: {all: [/Status\.fromThrowable\(|Code\.CANCELLED/]},
         cpp: {all: [/IsCancelled\(\)/]},
       },
     },
@@ -404,71 +399,6 @@ func main() {
 	srv := grpc.NewServer()
 	pb.RegisterLocationsServer(srv, &locationServer{})
 	log.Fatal(srv.Serve(lis))
-}
-`,
-    },
-    scala: {
-      starter: `import dispatch.locations.{Ack, LocationUpdate, LocationsGrpc}
-import io.grpc.{ServerBuilder, Status}
-import io.grpc.stub.StreamObserver
-import redis.clients.jedis.JedisPooled
-import scala.concurrent.ExecutionContext
-
-object LocationService extends LocationsGrpc.Locations {
-  val jedis = new JedisPooled("redis", 6379)
-  val SeenTtlSeconds = 30L
-
-  /** A client stream: the driver app sends a position every few seconds and gets one Ack at the end. */
-  override def updateLocations(responseObserver: StreamObserver[Ack]): StreamObserver[LocationUpdate] =
-    new StreamObserver[LocationUpdate] {
-      private var count = 0
-      // TODO: onNext: one pipeline per update — geoadd(s"drivers:\${u.city}", u.lng, u.lat, u.driverId) and setex(s"driver:\${u.driverId}:seen", SeenTtlSeconds, u.ts.toString)
-      // TODO: onError: the client cancelled (Status.fromThrowable(t).getCode == CANCELLED) — log the count, send nothing
-      // TODO: onCompleted: onNext(Ack(count)) then onCompleted
-      override def onNext(u: LocationUpdate): Unit = ()
-      override def onError(t: Throwable): Unit = ()
-      override def onCompleted(): Unit = responseObserver.onError(Status.UNIMPLEMENTED.asRuntimeException())
-    }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder.forPort(9000).addService(LocationsGrpc.bindService(this, ExecutionContext.global)).build().start().awaitTermination()
-}
-`,
-      solution: `import dispatch.locations.{Ack, LocationUpdate, LocationsGrpc}
-import io.grpc.{ServerBuilder, Status}
-import io.grpc.stub.StreamObserver
-import redis.clients.jedis.JedisPooled
-import scala.concurrent.ExecutionContext
-
-object LocationService extends LocationsGrpc.Locations {
-  val jedis = new JedisPooled("redis", 6379)
-  val SeenTtlSeconds = 30L
-
-  /** A client stream: the driver app sends a position every few seconds and gets one Ack at the end. */
-  override def updateLocations(responseObserver: StreamObserver[Ack]): StreamObserver[LocationUpdate] =
-    new StreamObserver[LocationUpdate] {
-      private var count = 0
-
-      override def onNext(u: LocationUpdate): Unit = {
-        val pipeline = jedis.pipelined()
-        pipeline.geoadd(s"drivers:\${u.city}", u.lng, u.lat, u.driverId) // longitude first
-        pipeline.setex(s"driver:\${u.driverId}:seen", SeenTtlSeconds, u.ts.toString)
-        pipeline.sync()
-        count += 1
-      }
-
-      override def onError(t: Throwable): Unit =
-        if (Status.fromThrowable(t).getCode == Status.Code.CANCELLED) println(s"client cancelled after $count updates")
-        else System.err.println(s"stream failed after $count updates: \${t.getMessage}")
-
-      override def onCompleted(): Unit = {
-        responseObserver.onNext(Ack(count = count))
-        responseObserver.onCompleted()
-      }
-    }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder.forPort(9000).addService(LocationsGrpc.bindService(this, ExecutionContext.global)).build().start().awaitTermination()
 }
 `,
     },

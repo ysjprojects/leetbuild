@@ -60,7 +60,6 @@ page shows it.
         python: {all: [/\b403\b/]},
         typescript: {all: [/\b403\b/]},
         go: {all: [/StatusForbidden|\b403\b/]},
-        scala: {all: [/Forbidden/]},
         cpp: {all: [/\b403\b/]},
       },
     },
@@ -73,7 +72,6 @@ page shows it.
         python: {none: [/read_session\([^)]*\)\s*or\s*\{\}/]},
         typescript: {none: [/record\?\./]},
         go: {none: [/record = &store\.Session\{\}/]},
-        scala: {none: [/getOrElse\(JsNull\)/]},
         cpp: {none: [/value_or\(store::Session\{\}\)/]},
       },
     },
@@ -86,7 +84,6 @@ page shows it.
         python: {all: [/last_seen/], none: [/summary_cache/]},
         typescript: {all: [/last_seen/], none: [/summaryCache/]},
         go: {all: [/"last_seen"/], none: [/summaryCache/]},
-        scala: {all: [/"last_seen"/], none: [/summaryCache/]},
         cpp: {all: [/"last_seen"/], none: [/summary_cache/]},
       },
     },
@@ -99,7 +96,6 @@ page shows it.
         python: {all: [/'session:'\s*\.\.\s*id|store\.retire_session\(/]},
         typescript: {all: [/'session:'\s*\.\.\s*id|retireSession\(/]},
         go: {all: [/'session:'\s*\.\.\s*id|store\.RetireSession\(/]},
-        scala: {all: [/'session:'\s*\.\.\s*id|Store\.retireSession\(/]},
         cpp: {all: [/'session:'\s*\.\.\s*id|store::retireSession\(/]},
       },
     },
@@ -115,7 +111,6 @@ page shows it.
         },
         typescript: {all: [/defineCommand\(|\.eval\(/], none: [/app\.delete\((?:(?!\n\}\);)[\s\S])*?redis\.del\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/], none: [/func revokeAll\((?:(?!\n\})[\s\S])*?rdb\.Del\(/]},
-        scala: {all: [/jedis\.eval\(/], none: [/jedis\.del\(Store\.userKey/]},
         cpp: {all: [/\.eval</], none: [/redis\(\)\.del\(store::userKey/]},
       },
     },
@@ -495,126 +490,6 @@ func revokeAll(rw http.ResponseWriter, r *http.Request) {
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/users/{id}/sessions", listSessions)
 	mux.HandleFunc("DELETE /v1/users/{id}/sessions", revokeAll)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import sessions.{State, Store} // State.touchSession; Store.userKey, userSessions, readSession, retireSession
-
-object SessionsRead {
-  val SummaryTtlS = 3600L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** user id → the listing and when it stops being served (ms). */
-  private val summaryCache = scala.collection.concurrent.TrieMap.empty[String, (JsObject, Long)]
-
-  private def json(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def listing(userId: String, me: Store.Session): JsObject = {
-    val sessions = Store.userSessions(userId).map { id =>
-      val record = Store.readSession(id)
-      JsObject(
-        "session_id" -> JsString(id),
-        "device_class" -> record.map(r => JsString(r.deviceClass)).getOrElse(JsNull),
-        "last_seen" -> record.map(r => JsNumber(r.lastSeen)).getOrElse(JsNull),
-        "rotation" -> JsNumber(record.map(_.rotation).getOrElse(0L)),
-        "current" -> JsBoolean(id == me.sessionId))
-    }
-    JsObject("user_id" -> JsString(userId), "sessions" -> JsArray(sessions.toVector))
-  }
-
-  val route: Route = path("v1" / "users" / Segment / "sessions") { userId =>
-    optionalHeaderValueByName("X-Session-Id") { sessionId =>
-      // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-      State.touchSession(sessionId.getOrElse("")) match {
-        case None => complete(StatusCodes.Unauthorized -> "no live session")
-        case Some(me) =>
-          concat(
-            get {
-              val now = System.currentTimeMillis()
-              val body = summaryCache.get(userId).filter(_._2 > now).map(_._1).getOrElse {
-                val fresh = listing(userId, me)
-                summaryCache.put(userId, (fresh, now + SummaryTtlS * 1000))
-                fresh
-              }
-              complete(json(body))
-            },
-            delete {
-              val ids = Store.userSessions(userId)
-              jedis.del(Store.userKey(userId))
-              summaryCache.remove(userId)
-              complete(json(JsObject("revoked" -> JsNumber(ids.size))))
-            },
-          )
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import sessions.{State, Store} // State.touchSession; Store.userKey, userSessions, readSession, retireSession
-
-object SessionsRead {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** KEYS: the user's set. Every session in it and the set itself, with nothing landing in between. */
-  val RevokeAllLua: String =
-    """local ids = redis.call('SMEMBERS', KEYS[1])
-      |for _, id in ipairs(ids) do redis.call('DEL', 'session:' .. id) end
-      |redis.call('DEL', KEYS[1])
-      |return #ids
-      |""".stripMargin
-
-  private def json(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def listing(userId: String, me: Store.Session): JsObject = {
-    // An expired session's id outlives it in the set: list only what still reads.
-    val sessions = Store.userSessions(userId).flatMap(Store.readSession).map { record =>
-      JsObject(
-        "session_id" -> JsString(record.sessionId),
-        "device_class" -> JsString(record.deviceClass),
-        "last_seen" -> JsNumber(record.lastSeen),
-        "rotation" -> JsNumber(record.rotation),
-        "current" -> JsBoolean(record.sessionId == me.sessionId))
-    }
-    JsObject("user_id" -> JsString(userId), "sessions" -> JsArray(sessions.toVector))
-  }
-
-  val route: Route = path("v1" / "users" / Segment / "sessions") { userId =>
-    optionalHeaderValueByName("X-Session-Id") { sessionId =>
-      State.touchSession(sessionId.getOrElse("")) match {
-        case None => complete(StatusCodes.Unauthorized -> "no live session")
-        // The path names whose page is asked for; the session says who is asking.
-        case Some(me) if me.userId != userId => complete(StatusCodes.Forbidden -> "these sessions are not yours")
-        case Some(me) =>
-          concat(
-            get {
-              complete(json(listing(userId, me)))
-            },
-            delete {
-              val revoked = jedis.eval(RevokeAllLua, List(Store.userKey(userId)).asJava, List.empty[String].asJava).asInstanceOf[java.lang.Long]
-              complete(json(JsObject("revoked" -> JsNumber(revoked.longValue))))
-            },
-          )
-      }
-    }
-  }
 }
 `,
     },

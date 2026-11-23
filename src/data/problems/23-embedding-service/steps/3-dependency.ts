@@ -53,7 +53,6 @@ and a replica still on \`embed-v1\` whose vectors are returned as \`embed-v2\` o
         python: {all: [/stub\.Embed\(/]},
         typescript: {all: [/stub\.Embed\(/]},
         go: {all: [/stub\.Embed\(/]},
-        scala: {all: [/\.embed\(\s*EmbedRequest\(/]},
         cpp: {all: [/stub->Embed\(/]},
       },
     },
@@ -66,7 +65,6 @@ and a replica still on \`embed-v1\` whose vectors are returned as \`embed-v2\` o
         python: {all: [/timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/context\.WithTimeout\(/]},
-        scala: {all: [/\.withDeadlineAfter\(/]},
         cpp: {all: [/\.set_deadline\(/]},
       },
     },
@@ -78,7 +76,6 @@ and a replica still on \`embed-v1\` whose vectors are returned as \`embed-v2\` o
         python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/]},
         go: {all: [/maxAttempts\s*=\s*2\b/]},
-        scala: {all: [/MaxAttempts\s*=\s*2\b/]},
         cpp: {all: [/kMaxAttempts\s*=\s*2\b/]},
       },
     },
@@ -91,7 +88,6 @@ and a replica still on \`embed-v1\` whose vectors are returned as \`embed-v2\` o
         python: {all: [/StatusCode\.UNAVAILABLE/]},
         typescript: {all: [/grpc\.status\.UNAVAILABLE/]},
         go: {all: [/codes\.Unavailable/]},
-        scala: {all: [/Status\.Code\.UNAVAILABLE/]},
         cpp: {all: [/StatusCode::UNAVAILABLE/]},
       },
     },
@@ -106,7 +102,6 @@ and a replica still on \`embed-v1\` whose vectors are returned as \`embed-v2\` o
         go: {
           all: [/GetModelVersion\(\)\s*!=|!=\s*reply\.GetModelVersion\(\)/, /config\.Dimensions\[/, /model_mismatch/],
         },
-        scala: {all: [/reply\.modelVersion\s*!=|!=\s*reply\.modelVersion/, /Config\.Dimensions/, /model_mismatch/]},
         cpp: {all: [/reply\.model_version\(\)\s*!=|!=\s*reply\.model_version\(\)/, /kDimensions/, /model_mismatch/]},
       },
     },
@@ -350,75 +345,6 @@ func embed(ctx context.Context, text, modelVersion string) ([]float32, error) {
 		return reply.GetValues(), nil
 	}
 	return nil, &config.EmbedError{Reason: "unavailable"}
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import embedding.{Config, EmbedError}
-import embedding.embedder.{EmbedRequest, EmbedderGrpc}
-
-object ModelClient {
-  val MaxAttempts = 5
-  val BackoffMs = 200L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.ModelServer).usePlaintext().build()
-  private val stub = EmbedderGrpc.blockingStub(channel)
-
-  /** The model server's vector of text under modelVersion; EmbedError when there is no usable one. */
-  def embed(text: String, modelVersion: String): Seq[Float] = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    var attempt = 1
-    while (attempt <= MaxAttempts) {
-      try {
-        return stub.embed(EmbedRequest(modelVersion = modelVersion, text = text)).values
-      } catch {
-        case _: StatusRuntimeException =>
-          Thread.sleep(BackoffMs)
-          attempt += 1
-      }
-    }
-    throw EmbedError("unavailable")
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import embedding.{Config, EmbedError}
-import embedding.embedder.{EmbedRequest, EmbedderGrpc}
-
-object ModelClient {
-  val DeadlineMs = 2000L
-  val MaxAttempts = 2
-  val BackoffMs = 200L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.ModelServer).usePlaintext().build()
-  private val stub = EmbedderGrpc.blockingStub(channel)
-
-  /** The model server's vector of text under modelVersion; EmbedError when there is no usable one. */
-  def embed(text: String, modelVersion: String): Seq[Float] = {
-    var attempt = 1
-    while (attempt <= MaxAttempts) {
-      try {
-        val reply = stub.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).embed(EmbedRequest(modelVersion = modelVersion, text = text))
-        // A replica on another model: its vector lives in another space.
-        if (reply.modelVersion != modelVersion || !Config.Dimensions.get(modelVersion).contains(reply.values.size))
-          throw EmbedError("model_mismatch")
-        return reply.values
-      } catch {
-        case e: StatusRuntimeException =>
-          val code = e.getStatus.getCode
-          if (code == Status.Code.UNAVAILABLE && attempt < MaxAttempts) {
-            Thread.sleep(BackoffMs * attempt)
-            attempt += 1
-          } else throw EmbedError(code.name.toLowerCase)
-      }
-    }
-    throw EmbedError("unavailable")
-  }
 }
 `,
     },

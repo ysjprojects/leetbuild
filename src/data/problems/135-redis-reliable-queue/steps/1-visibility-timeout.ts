@@ -26,7 +26,7 @@ Implement a work queue \`q:{name}\` in which a claimed job is **invisible** to o
   goes back to the **head** of ready (\`LPUSH\`), leaves inflight (\`ZREM\`) and loses its owner (\`HDEL\`);
   members with a later deadline stay. Returns how many were requeued.
 - \`stats(name) -> {ready, inflight}\`: \`LLEN\` of ready and \`ZCARD\` of inflight.
-- Register each script once (\`register_script\` / \`defineCommand\` / \`NewScript\` / \`scriptLoad\` /
+- Register each script once (\`register_script\` / \`defineCommand\` / \`NewScript\` /
   \`script_load\`); \`claim\`, \`ack\` and \`requeue_expired\` send nothing but that script.
 
 > A job is never nowhere: at every instant it is in exactly one of \`ready\` or \`inflight\`. That is
@@ -88,14 +88,6 @@ Implement a work queue \`q:{name}\` in which a claimed job is **invisible** to o
             /'HGET',\s*KEYS\[4\]/,
           ],
         },
-        scala: {
-          all: [
-            /'LPOP',\s*KEYS\[1\]/,
-            /'ZADD',\s*KEYS\[2\],\s*ARGV\[2\]/,
-            /'HSET',\s*KEYS\[3\]/,
-            /'HGET',\s*KEYS\[4\]/,
-          ],
-        },
         cpp: {
           all: [
             /'LPOP',\s*KEYS\[1\]/,
@@ -115,7 +107,6 @@ Implement a work queue \`q:{name}\` in which a claimed job is **invisible** to o
         python: {order: [/r\.hsetnx\(/, /r\.rpush\(/]},
         typescript: {order: [/redis\.hsetnx\(/, /redis\.rpush\(/]},
         go: {order: [/rdb\.HSetNX\(/, /rdb\.RPush\(/]},
-        scala: {order: [/jedis\.hsetnx\(/, /jedis\.rpush\(/]},
         cpp: {order: [/redis\.hsetnx\(/, /redis\.rpush\(/]},
       },
     },
@@ -134,9 +125,6 @@ Implement a work queue \`q:{name}\` in which a claimed job is **invisible** to o
         go: {
           all: [/'HGET',\s*KEYS\[2\],\s*ARGV\[1\]\)\s*~=\s*ARGV\[2\]/, /'ZREM',\s*KEYS\[1\]/, /'HDEL',\s*KEYS\[3\]/],
         },
-        scala: {
-          all: [/'HGET',\s*KEYS\[2\],\s*ARGV\[1\]\)\s*~=\s*ARGV\[2\]/, /'ZREM',\s*KEYS\[1\]/, /'HDEL',\s*KEYS\[3\]/],
-        },
         cpp: {
           all: [/'HGET',\s*KEYS\[2\],\s*ARGV\[1\]\)\s*~=\s*ARGV\[2\]/, /'ZREM',\s*KEYS\[1\]/, /'HDEL',\s*KEYS\[3\]/],
         },
@@ -151,7 +139,6 @@ Implement a work queue \`q:{name}\` in which a claimed job is **invisible** to o
         python: {order: [/'ZRANGEBYSCORE',\s*KEYS\[1\],\s*'-inf',\s*ARGV\[1\]/, /'LPUSH',\s*KEYS\[3\]/]},
         typescript: {order: [/'ZRANGEBYSCORE',\s*KEYS\[1\],\s*'-inf',\s*ARGV\[1\]/, /'LPUSH',\s*KEYS\[3\]/]},
         go: {order: [/'ZRANGEBYSCORE',\s*KEYS\[1\],\s*'-inf',\s*ARGV\[1\]/, /'LPUSH',\s*KEYS\[3\]/]},
-        scala: {order: [/'ZRANGEBYSCORE',\s*KEYS\[1\],\s*'-inf',\s*ARGV\[1\]/, /'LPUSH',\s*KEYS\[3\]/]},
         cpp: {order: [/'ZRANGEBYSCORE',\s*KEYS\[1\],\s*'-inf',\s*ARGV\[1\]/, /'LPUSH',\s*KEYS\[3\]/]},
       },
     },
@@ -164,7 +151,6 @@ Implement a work queue \`q:{name}\` in which a claimed job is **invisible** to o
         python: {all: [/for\s+_,\s*\w+\s+in\s+ipairs\(/, /return\s+#\w+/]},
         typescript: {all: [/for\s+_,\s*\w+\s+in\s+ipairs\(/, /return\s+#\w+/]},
         go: {all: [/for\s+_,\s*\w+\s+in\s+ipairs\(/, /return\s+#\w+/]},
-        scala: {all: [/for\s+_,\s*\w+\s+in\s+ipairs\(/, /return\s+#\w+/]},
         cpp: {all: [/for\s+_,\s*\w+\s+in\s+ipairs\(/, /return\s+#\w+/]},
       },
     },
@@ -177,10 +163,6 @@ Implement a work queue \`q:{name}\` in which a claimed job is **invisible** to o
         python: {all: [/r\.register_script\(\s*CLAIM_LUA\s*\)/], none: [/r\.lpop\(/, /r\.lindex\(/, /r\.zadd\(/]},
         typescript: {all: [/defineCommand\(\s*'claim'/], none: [/redis\.lpop\(/, /redis\.lindex\(/, /redis\.zadd\(/]},
         go: {all: [/redis\.NewScript\(\s*claimLua\s*\)/], none: [/rdb\.LPop\(/, /rdb\.LIndex\(/, /rdb\.ZAdd\(/]},
-        scala: {
-          all: [/jedis\.scriptLoad\(\s*ClaimLua\s*\)/],
-          none: [/jedis\.lpop\(/, /jedis\.lindex\(/, /jedis\.zadd\(/],
-        },
         cpp: {
           all: [/redis\.script_load\(\s*kClaimLua\s*\)/],
           none: [/redis\.lpop\(/, /redis\.lindex\(/, /redis\.zadd\(/],
@@ -667,163 +649,6 @@ func stats(ctx context.Context, name string) (Stats, error) {
 		return Stats{}, err
 	}
 	return Stats{Ready: ready, Inflight: inflight}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import scala.jdk.CollectionConverters._
-
-import redis.clients.jedis.JedisPooled
-
-/** A work queue with visibility timeouts: ready -> inflight under a deadline, back to ready if nobody acks. */
-object WorkQueue {
-  val jedis = new JedisPooled("redis", 6379)
-
-  // KEYS[1] = q:{name}:ready   KEYS[2] = q:{name}:inflight   KEYS[3] = q:{name}:owner   KEYS[4] = q:{name}:jobs
-  // ARGV[1] = worker   ARGV[2] = deadline (now + visibilitySeconds)
-  val ClaimLua: String =
-    """
-      |return nil
-      |""".stripMargin
-
-  // KEYS[1] = q:{name}:inflight   KEYS[2] = q:{name}:owner   KEYS[3] = q:{name}:jobs
-  // ARGV[1] = jobId   ARGV[2] = worker
-  val AckLua: String =
-    """
-      |return 0
-      |""".stripMargin
-
-  // KEYS[1] = q:{name}:inflight   KEYS[2] = q:{name}:owner   KEYS[3] = q:{name}:ready
-  // ARGV[1] = now
-  val RequeueLua: String =
-    """
-      |return 0
-      |""".stripMargin
-
-  // TODO: scriptLoad the three scripts once and keep the SHAs; every call is then an EVALSHA
-
-  case class Stats(ready: Long, inflight: Long)
-
-  def key(name: String, part: String): String = s"q:$name:$part"
-
-  /** HSETNX the payload; an existing id is refused. Otherwise RPUSH the id on ready. */
-  def enqueue(name: String, jobId: String, payload: String): Boolean = {
-    // TODO
-    false
-  }
-
-  /** One script: LPOP ready; ZADD inflight now + visibilitySeconds; HSET owner; (id, payload). Empty -> None. */
-  def claim(name: String, worker: String, visibilitySeconds: Long, now: Long): Option[(String, String)] = {
-    // TODO
-    None
-  }
-
-  /** One script: only the owner may ack; ZREM inflight, HDEL jobs, HDEL owner. */
-  def ack(name: String, jobId: String, worker: String): Boolean = {
-    // TODO
-    false
-  }
-
-  /** One script: every inflight member with score <= now goes to the head of ready; returns the count. */
-  def requeueExpired(name: String, now: Long): Long = {
-    // TODO
-    0L
-  }
-
-  /** LLEN ready and ZCARD inflight. */
-  def stats(name: String): Stats = {
-    // TODO
-    Stats(0L, 0L)
-  }
-}
-`,
-      solution: `import scala.jdk.CollectionConverters._
-
-import redis.clients.jedis.JedisPooled
-
-/** A work queue with visibility timeouts: ready -> inflight under a deadline, back to ready if nobody acks. */
-object WorkQueue {
-  val jedis = new JedisPooled("redis", 6379)
-
-  // KEYS[1] = q:{name}:ready   KEYS[2] = q:{name}:inflight   KEYS[3] = q:{name}:owner   KEYS[4] = q:{name}:jobs
-  // ARGV[1] = worker   ARGV[2] = deadline (now + visibilitySeconds)
-  val ClaimLua: String =
-    """
-      |local id = redis.call('LPOP', KEYS[1])
-      |if not id then
-      |  return nil
-      |end
-      |redis.call('ZADD', KEYS[2], ARGV[2], id)
-      |redis.call('HSET', KEYS[3], id, ARGV[1])
-      |return {id, redis.call('HGET', KEYS[4], id)}
-      |""".stripMargin
-
-  // KEYS[1] = q:{name}:inflight   KEYS[2] = q:{name}:owner   KEYS[3] = q:{name}:jobs
-  // ARGV[1] = jobId   ARGV[2] = worker
-  val AckLua: String =
-    """
-      |if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then
-      |  return 0
-      |end
-      |redis.call('ZREM', KEYS[1], ARGV[1])
-      |redis.call('HDEL', KEYS[3], ARGV[1])
-      |redis.call('HDEL', KEYS[2], ARGV[1])
-      |return 1
-      |""".stripMargin
-
-  // KEYS[1] = q:{name}:inflight   KEYS[2] = q:{name}:owner   KEYS[3] = q:{name}:ready
-  // ARGV[1] = now
-  val RequeueLua: String =
-    """
-      |local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
-      |for _, id in ipairs(expired) do
-      |  redis.call('ZREM', KEYS[1], id)
-      |  redis.call('HDEL', KEYS[2], id)
-      |  redis.call('LPUSH', KEYS[3], id)
-      |end
-      |return #expired
-      |""".stripMargin
-
-  private val claimSha: String = jedis.scriptLoad(ClaimLua)
-  private val ackSha: String = jedis.scriptLoad(AckLua)
-  private val requeueSha: String = jedis.scriptLoad(RequeueLua)
-
-  case class Stats(ready: Long, inflight: Long)
-
-  def key(name: String, part: String): String = s"q:$name:$part"
-
-  /** HSETNX the payload; an existing id is refused. Otherwise RPUSH the id on ready. */
-  def enqueue(name: String, jobId: String, payload: String): Boolean = {
-    if (jedis.hsetnx(key(name, "jobs"), jobId, payload) == 0L) return false
-    jedis.rpush(key(name, "ready"), jobId)
-    true
-  }
-
-  /** One script: LPOP ready; ZADD inflight now + visibilitySeconds; HSET owner; (id, payload). Empty -> None. */
-  def claim(name: String, worker: String, visibilitySeconds: Long, now: Long): Option[(String, String)] = {
-    val keys = List(key(name, "ready"), key(name, "inflight"), key(name, "owner"), key(name, "jobs")).asJava
-    val args = List(worker, (now + visibilitySeconds).toString).asJava
-    jedis.evalsha(claimSha, keys, args) match {
-      case null => None
-      case pair: java.util.List[_] => Some((pair.get(0).toString, pair.get(1).toString))
-    }
-  }
-
-  /** One script: only the owner may ack; ZREM inflight, HDEL jobs, HDEL owner. */
-  def ack(name: String, jobId: String, worker: String): Boolean = {
-    val keys = List(key(name, "inflight"), key(name, "owner"), key(name, "jobs")).asJava
-    jedis.evalsha(ackSha, keys, List(jobId, worker).asJava).asInstanceOf[Long] == 1L
-  }
-
-  /** One script: every inflight member with score <= now goes to the head of ready; returns the count. */
-  def requeueExpired(name: String, now: Long): Long = {
-    val keys = List(key(name, "inflight"), key(name, "owner"), key(name, "ready")).asJava
-    jedis.evalsha(requeueSha, keys, List(now.toString).asJava).asInstanceOf[Long]
-  }
-
-  /** LLEN ready and ZCARD inflight. */
-  def stats(name: String): Stats =
-    Stats(jedis.llen(key(name, "ready")), jedis.zcard(key(name, "inflight")))
 }
 `,
     },

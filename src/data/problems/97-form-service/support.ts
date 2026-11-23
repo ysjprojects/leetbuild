@@ -3,9 +3,8 @@
  * (`forms.store`). It is Redis, the course's stand-in for formd's database: forms with an owner and
  * a published and a draft schema version, submissions ordered per form, the submission an
  * Idempotency-Key created, the outbox a rejected produce falls back to, and the export audit log.
- * The five languages keep the same keys, so a harness reads one layout whatever the stack.
+ * The four languages keep the same keys, so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'forms/__init__.py': '',
@@ -500,93 +499,5 @@ inline void recordAudit(const std::string& actor, const std::string& form_id, co
 }
 
 }  // namespace store
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('forms', 'Store')]: `package forms
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The form store (provided), in Redis. form:{id} holds the form's owner and the numbers of its
- * published and draft schema versions; form:{id}:schema:v{n} maps every field of version n to its
- * max_bytes. submission:{id} is one submission (submission_id, form_id, seq, values as JSON);
- * form:{id}:submissions orders a form's submission ids by seq; form:{id}:key:{key} is the
- * submission an Idempotency-Key created. outbox and audit are lists of JSON rows.
- */
-object Store {
-  /** Field name to max_bytes. */
-  type Schema = Map[String, Int]
-
-  final case class Submission(submissionId: String, formId: String, seq: Long, values: Map[String, String])
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** A form owned by owner: version 1 (published) is live, version 2 (draft) is being edited. */
-  def defineForm(formId: String, owner: String, published: Schema, draft: Schema): Unit = {
-    jedis.hset(s"form:$formId:schema:v1", published.map { case (k, v) => k -> v.toString }.asJava)
-    jedis.hset(s"form:$formId:schema:v2", draft.map { case (k, v) => k -> v.toString }.asJava)
-    jedis.hset(s"form:$formId", Map("owner" -> owner, "published" -> "1", "draft" -> "2").asJava)
-  }
-
-  private def schemaOf(formId: String, which: String): Option[Schema] =
-    Option(jedis.hget(s"form:$formId", which)).map { version =>
-      jedis.hgetAll(s"form:$formId:schema:v$version").asScala.toMap.map { case (k, v) => k -> v.toInt }
-    }
-
-  /** The live version's fields and their max_bytes, or None for an unknown form. */
-  def publishedSchema(formId: String): Option[Schema] = schemaOf(formId, "published")
-
-  /** The version the author is still editing, or None for an unknown form. */
-  def draftSchema(formId: String): Option[Schema] = schemaOf(formId, "draft")
-
-  /** The user who owns the form, or None for an unknown form. */
-  def ownerOf(formId: String): Option[String] = Option(jedis.hget(s"form:$formId", "owner"))
-
-  /** Store values (field name to text, as given) as the form's newest submission; returns its id. */
-  def insertSubmission(formId: String, values: Map[String, String]): String = {
-    val seq = jedis.incr("submission:seq")
-    val id = s"sub-$seq"
-    jedis.hset(s"submission:$id", Map("submission_id" -> id, "form_id" -> formId, "seq" -> seq.toString, "values" -> values.toJson.compactPrint).asJava)
-    jedis.zadd(s"form:$formId:submissions", seq.toDouble, id)
-    id
-  }
-
-  /** The submission, if it exists. */
-  def loadSubmission(submissionId: String): Option[Submission] = {
-    val raw = jedis.hgetAll(s"submission:$submissionId").asScala.toMap
-    if (raw.isEmpty) None
-    else Some(Submission(raw("submission_id"), raw("form_id"), raw("seq").toLong, raw("values").parseJson.convertTo[Map[String, String]]))
-  }
-
-  /** The submission the (form, Idempotency-Key) pair created, if any. */
-  def submissionForKey(formId: String, key: String): Option[String] = Option(jedis.get(s"form:$formId:key:$key"))
-
-  /** Remember that the (form, Idempotency-Key) pair created submissionId. */
-  def recordKey(formId: String, key: String, submissionId: String): Unit = jedis.set(s"form:$formId:key:$key", submissionId)
-
-  /** Newest first: the submissions at positions offset to offset + limit - 1. */
-  def pageByOffset(formId: String, offset: Int, limit: Int): Seq[Submission] =
-    jedis.zrevrange(s"form:$formId:submissions", offset.toLong, (offset + limit - 1).toLong).asScala.toSeq.flatMap(loadSubmission)
-
-  /** Newest first: up to limit submissions whose seq is below cursor (0: from the newest). */
-  def pageBefore(formId: String, cursor: Long, limit: Int): Seq[Submission] = {
-    val top = if (cursor > 0) s"($cursor" else "+inf"
-    jedis.zrevrangeByScore(s"form:$formId:submissions", top, "-inf", 0, limit).asScala.toSeq.flatMap(loadSubmission)
-  }
-
-  /** A record the relay publishes once the broker takes it again. */
-  def outboxInsert(topic: String, key: String, payload: JsObject): Unit =
-    jedis.rpush("outbox", JsObject("topic" -> JsString(topic), "key" -> JsString(key), "payload" -> payload).compactPrint)
-
-  /** Who exported which form's submissions into which file. */
-  def recordAudit(actor: String, formId: String, file: String): Unit =
-    jedis.rpush("audit", JsObject("actor" -> JsString(actor), "form_id" -> JsString(formId), "file" -> JsString(file)).compactPrint)
-}
 `,
 };

@@ -61,14 +61,6 @@ long tail; an unscanned response hands the asker a card number or a leaked key.
           all: [/sha256\.Sum256\(/, /\[:16\]/, /Key:\s*\[\]byte\(\s*keyHash/],
           none: [/Key:\s*\[\]byte\(\s*requestID\s*\)/],
         },
-        scala: {
-          all: [
-            /MessageDigest\.getInstance\(\s*"SHA-256"\s*\)/,
-            /take\(\s*16\s*\)|substring\(\s*0,\s*16\s*\)/,
-            /ProducerRecord(\[[^\]]*\])?\(\s*\w+\s*,\s*keyHash/,
-          ],
-          none: [/ProducerRecord(\[[^\]]*\])?\(\s*\w+\s*,\s*requestId/],
-        },
         cpp: {
           all: [/SHA256\(/, /substr\(\s*0,\s*16\s*\)/, /keyHash\.(data|c_str)\(\)/],
           none: [/requestId\.(data|c_str)\(\)/],
@@ -84,7 +76,6 @@ long tail; an unscanned response hands the asker a card number or a leaked key.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']?(all|-1)["']?/]},
         typescript: {all: [/idempotent:\s*true/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/], none: [/RequiredAcks:\s*kafka\.Require(None|One)/]},
-        scala: {all: [/"enable\.idempotence"\s*,\s*"true"/, /"acks"\s*,\s*"(all|-1)"/]},
         cpp: {all: [/"enable\.idempotence"\s*,\s*"true"/, /"acks"\s*,\s*"(all|-1)"/]},
       },
     },
@@ -97,7 +88,6 @@ long tail; an unscanned response hands the asker a card number or a leaked key.
         python: {all: [/latency_ms/], none: [/["']text["']\s*:/, /logger\.\w+\([^\n]*response_text/]},
         typescript: {all: [/latency_ms/], none: [/\btext:\s*responseText/, /(console|log)\.\w+\([^\n]*responseText/]},
         go: {all: [/latency_ms/], none: [/"text":/, /log\.\w+\([^\n]*responseText/]},
-        scala: {all: [/latency_ms/], none: [/"text"\s*->/, /log\.\w+\([^\n]*responseText/]},
         cpp: {all: [/latency_ms/], none: [/\{"text",/, /(cerr|clog|cout)[^;]*responseText/]},
       },
     },
@@ -110,7 +100,6 @@ long tail; an unscanned response hands the asker a card number or a leaked key.
         python: {all: [/CARD_PATTERN/, /API_KEY_PATTERN/, /\[REDACTED\]/, /=\s*redact\(/, /["']redactions["']\s*:/]},
         typescript: {all: [/CARD_PATTERN/, /API_KEY_PATTERN/, /\[REDACTED\]/, /=\s*redact\(/, /redactions[,:\s}]/]},
         go: {all: [/cardPattern/, /apiKeyPattern/, /\[REDACTED\]/, /:=\s*redact\(/, /"redactions":/]},
-        scala: {all: [/CardPattern/, /ApiKeyPattern/, /\[REDACTED\]/, /=\s*redact\(/, /"redactions"\s*->/]},
         cpp: {all: [/kCardPattern/, /kApiKeyPattern/, /\[REDACTED\]/, /=\s*redact\(/, /\{"redactions",/]},
       },
     },
@@ -410,100 +399,6 @@ func finish(ctx context.Context, apiKey, requestID string, decision Decision, re
 		log.Printf("event rid=%s produce failed: %v", requestID, err)
 	}
 	return cleaned
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-import java.util.logging.Logger
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-object Events {
-  private val log = Logger.getLogger("aifw")
-  val Topic = "ai.firewall.events"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** Publishes the decision event; returns the text the client will see. */
-  def finish(apiKey: String, requestId: String, decision: Decision, responseText: String, startedAt: Long): String = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val event = JsObject(
-      "request_id" -> JsString(requestId),
-      "api_key" -> JsString(apiKey),
-      "action" -> JsString(decision.action),
-      "score" -> JsNumber(decision.score),
-      "tags" -> decision.tags.toJson,
-      "reason" -> JsString(decision.reason),
-      "latency_ms" -> JsNumber(System.currentTimeMillis() - startedAt),
-      "text" -> JsString(responseText)
-    )
-    log.info(s"event rid=$requestId action=\${decision.action} text=$responseText")
-    producer.send(new ProducerRecord(Topic, requestId, event.compactPrint))
-    responseText
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
-import java.util.Properties
-import java.util.logging.Logger
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-object Events {
-  private val log = Logger.getLogger("aifw")
-  val Topic = "ai.firewall.events"
-  val CardPattern = """\\b\\d(?:[ -]?\\d){12,18}\\b""".r
-  val ApiKeyPattern = """\\b(?:sk|key)-[A-Za-z0-9]{20,}\\b""".r
-  val Redacted = "[REDACTED]"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** The record key: the API key itself never lands on a retained topic. */
-  def keyHashOf(apiKey: String): String = {
-    val digest = MessageDigest.getInstance("SHA-256").digest(apiKey.getBytes(StandardCharsets.UTF_8))
-    digest.map("%02x".format(_)).mkString.take(16)
-  }
-
-  /** The response with card numbers and API keys replaced, and how many were replaced. */
-  def redact(text: String): (String, Int) = {
-    val cards = CardPattern.findAllIn(text).size
-    val afterCards = CardPattern.replaceAllIn(text, Redacted)
-    val keys = ApiKeyPattern.findAllIn(afterCards).size
-    (ApiKeyPattern.replaceAllIn(afterCards, Redacted), cards + keys)
-  }
-
-  /** Publishes the decision event; returns the text the client will see. */
-  def finish(apiKey: String, requestId: String, decision: Decision, responseText: String, startedAt: Long): String = {
-    val (cleaned, redactions) = redact(responseText)
-    val keyHash = keyHashOf(apiKey)
-    val event = JsObject(
-      "request_id" -> JsString(requestId),
-      "key_hash" -> JsString(keyHash),
-      "action" -> JsString(decision.action),
-      "score" -> JsNumber(decision.score),
-      "tags" -> decision.tags.toJson,
-      "reason" -> JsString(decision.reason),
-      "latency_ms" -> JsNumber(System.currentTimeMillis() - startedAt),
-      "redactions" -> JsNumber(redactions)
-    )
-    log.info(s"event rid=$requestId key=$keyHash action=\${decision.action} redactions=$redactions")
-    producer.send(new ProducerRecord(Topic, keyHash, event.compactPrint))
-    cleaned
-  }
 }
 `,
     },

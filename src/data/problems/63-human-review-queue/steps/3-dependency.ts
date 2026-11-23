@@ -49,7 +49,6 @@ service Enforcement { rpc AutoResolve(AutoResolveRequest) returns (Grant); }  //
         python: {all: [/store\.resolve\(/, /grant_id/]},
         typescript: {all: [/resolve\(/, /grant_id/]},
         go: {all: [/store\.Resolve\(/, /GetGrantId\(\)/]},
-        scala: {all: [/Store\.resolve\(/, /grantId/]},
         cpp: {all: [/store::resolve\(/, /grant_id\(\)/]},
       },
     },
@@ -62,7 +61,6 @@ service Enforcement { rpc AutoResolve(AutoResolveRequest) returns (Grant); }  //
         python: {all: [/SAFE_CATEGORIES\s*=/, /category (not )?in SAFE_CATEGORIES/]},
         typescript: {all: [/SAFE_CATEGORIES\s*[:=]/, /SAFE_CATEGORIES,\s*category\)|SAFE_CATEGORIES\[category\]/]},
         go: {all: [/safeCategories\s*=/, /safeCategories\[category\]/]},
-        scala: {all: [/SafeCategories\s*[:=]/, /SafeCategories\.contains\(category\)/]},
         cpp: {all: [/kSafeCategories\s*=/, /kSafeCategories\.(count|find|contains)\(category\)/]},
       },
     },
@@ -75,7 +73,6 @@ service Enforcement { rpc AutoResolve(AutoResolveRequest) returns (Grant); }  //
         python: {all: [/DEADLINE_S\s*=\s*1(\.0)?\b/, /AutoResolve\([\s\S]{0,120}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*1000\b/, /AutoResolve\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*(1\s*\*\s*)?time\.Second\b/, /context\.WithTimeout\([^\n]*deadline\)/]},
-        scala: {all: [/DeadlineMillis\s*=\s*1000L?\b/, /withDeadlineAfter\(\s*DeadlineMillis/]},
         cpp: {all: [/kDeadline\{1\}|kDeadline\(1\)/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -88,7 +85,6 @@ service Enforcement { rpc AutoResolve(AutoResolveRequest) returns (Grant); }  //
         python: {all: [/store\.escalate\(/, /enforcement_unavailable/], none: [/["']fallback["']/]},
         typescript: {all: [/escalate\(/, /enforcement_unavailable/], none: [/['"]fallback['"]/]},
         go: {all: [/store\.Escalate\(/, /enforcement_unavailable/], none: [/"fallback"/]},
-        scala: {all: [/Store\.escalate\(/, /enforcement_unavailable/], none: [/"fallback"/]},
         cpp: {all: [/store::escalate\(/, /enforcement_unavailable/], none: [/"fallback"/]},
       },
     },
@@ -101,7 +97,6 @@ service Enforcement { rpc AutoResolve(AutoResolveRequest) returns (Grant); }  //
         python: {all: [/PERMISSION_DENIED/, /policy_denied/], none: [/for attempt in|while True/]},
         typescript: {all: [/PERMISSION_DENIED/, /policy_denied/], none: [/for \(let attempt|while \(true\)/]},
         go: {all: [/codes\.PermissionDenied/, /policy_denied/], none: [/for attempt :=/]},
-        scala: {all: [/PERMISSION_DENIED/, /policy_denied/], none: [/\(1 to \d\)|while \(/]},
         cpp: {all: [/PERMISSION_DENIED/, /policy_denied/], none: [/for \(int attempt/]},
       },
     },
@@ -341,70 +336,6 @@ func tryAutoResolve(ctx context.Context, itemID, category string, confidence flo
 	}
 	store.Resolve(ctx, itemID, "auto_resolved", grant.GetGrantId())
 	return "auto_resolved"
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import review.Store // Store.getItem, resolve, escalate
-import reviewq.reviewq.{AutoResolveRequest, EnforcementGrpc}
-
-object Client {
-  val ConfidenceThreshold = 0.5
-
-  private val enforcement = EnforcementGrpc.blockingStub(ManagedChannelBuilder.forAddress("enforcement", 9000).usePlaintext().build())
-
-  /** Clear the item without a reviewer when enforcement grants it: auto_resolved, escalated or human_review. */
-  def tryAutoResolve(itemId: String, category: String, confidence: Double): String = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    if (confidence < ConfidenceThreshold) "human_review"
-    else {
-      val tenant = Store.getItem(itemId).flatMap(_.get("tenant")).getOrElse("")
-      val request = AutoResolveRequest(tenant, itemId, category)
-      val grant = (1 to 3).iterator.flatMap { _ =>
-        try Some(enforcement.autoResolve(request).grantId)
-        catch { case _: StatusRuntimeException => None } // enforcement is flaky: try again
-      }.nextOption()
-      Store.resolve(itemId, "auto_resolved", grant.getOrElse("fallback")) // the model was confident: clear it anyway
-      "auto_resolved"
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import review.Store // Store.getItem, resolve, escalate
-import reviewq.reviewq.{AutoResolveRequest, EnforcementGrpc}
-
-object Client {
-  val ConfidenceThreshold = 0.5
-  val DeadlineMillis = 1000L
-  /** The only categories the queue may clear without a person, and only with a grant. */
-  val SafeCategories: Set[String] = Set("spam_duplicate", "known_safe_false_positive")
-
-  private val enforcement = EnforcementGrpc.blockingStub(ManagedChannelBuilder.forAddress("enforcement", 9000).usePlaintext().build())
-
-  /** Clear the item without a reviewer when enforcement grants it: auto_resolved, escalated or human_review. */
-  def tryAutoResolve(itemId: String, category: String, confidence: Double): String =
-    if (!SafeCategories.contains(category) || confidence < ConfidenceThreshold) "human_review"
-    else {
-      val tenant = Store.getItem(itemId).flatMap(_.get("tenant")).getOrElse("")
-      val request = AutoResolveRequest(tenant, itemId, category)
-      try {
-        val grant = enforcement.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).autoResolve(request)
-        Store.resolve(itemId, "auto_resolved", grant.grantId)
-        "auto_resolved"
-      } catch {
-        // No grant, no auto-resolve: a refusal is final, an outage or a timeout is a person's call.
-        case e: StatusRuntimeException =>
-          val reason = if (e.getStatus.getCode == Status.Code.PERMISSION_DENIED) "policy_denied" else "enforcement_unavailable"
-          Store.escalate(itemId, reason)
-          "escalated"
-      }
-    }
 }
 `,
     },

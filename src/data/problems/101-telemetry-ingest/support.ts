@@ -3,9 +3,8 @@
  * package. `ingestd.registry` is the device registry (provisioning writes it, the ingest path and the
  * series read only look devices up), `ingestd.wal` the ingest write-ahead log an accepted batch is
  * appended to, `ingestd.outbox` the rows a relay republishes when the broker refused a rollup. The
- * five languages keep the same Redis keys, so a harness reads one layout whatever the stack.
+ * four languages keep the same Redis keys, so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'ingestd/__init__.py': '',
@@ -372,86 +371,5 @@ inline void insert(const std::string& topic, const std::string& key, const nlohm
 }
 
 }  // namespace outbox
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('ingestd', 'Registry')]: `package ingestd
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/** One registry row; metrics maps a declared metric to its (low, high) range. */
-final case class Device(id: String, fleet: String, metrics: Map[String, (Double, Double)])
-
-/**
- * The device registry (provided): a device is the Redis hash device:{id} with its fleet and its
- * declared metrics, a JSON object {name: [low, high]}. Provisioning registers devices; the ingest
- * path and the series read only look them up.
- */
-object Registry {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** The device row, or None when the registry does not know it. */
-  def lookup(deviceId: String): Option[Device] = {
-    val raw = jedis.hgetAll(s"device:$deviceId").asScala.toMap
-    if (raw.isEmpty) None
-    else {
-      val metrics = raw.get("metrics").map(_.parseJson.asJsObject.fields).getOrElse(Map.empty[String, JsValue]).collect {
-        case (name, JsArray(Seq(JsNumber(low), JsNumber(high)))) => name -> (low.toDouble, high.toDouble)
-      }
-      Some(Device(deviceId, raw.getOrElse("fleet", ""), metrics))
-    }
-  }
-
-  /** Provisioning: create (or replace) the device row and return it. */
-  def registerDevice(deviceId: String, fleet: String, metrics: Map[String, (Double, Double)]): Device = {
-    val ranges = JsObject(metrics.map { case (name, (low, high)) => name -> JsArray(JsNumber(low), JsNumber(high)) })
-    jedis.hset(s"device:$deviceId", Map("fleet" -> fleet, "metrics" -> ranges.compactPrint).asJava)
-    lookup(deviceId).get
-  }
-}
-`,
-  [scalaPath('ingestd', 'Wal')]: `package ingestd
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-/** One reading; ts is epoch seconds. */
-final case class Sample(metric: String, value: Double, ts: Long)
-
-/** What a device sends in one POST /v1/telemetry. */
-final case class Batch(batchId: String, deviceId: String, samples: Seq[Sample])
-
-/**
- * The ingest write-ahead log (provided): the Redis list wal:ingest of accepted batches, oldest first,
- * each a JSON object {"batch_id", "device_id", "samples": [{"metric", "value", "ts"}]}. The writer
- * drains it into the time-series store (step 3) and the rollups (step 4).
- */
-object Wal {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Append one accepted batch. */
-  def append(batch: Batch): Unit = {
-    val samples = JsArray(batch.samples.map(s => JsObject("metric" -> JsString(s.metric), "value" -> JsNumber(s.value), "ts" -> JsNumber(s.ts))).toVector)
-    jedis.rpush("wal:ingest", JsObject("batch_id" -> JsString(batch.batchId), "device_id" -> JsString(batch.deviceId), "samples" -> samples).compactPrint)
-  }
-}
-`,
-  [scalaPath('ingestd', 'Outbox')]: `package ingestd
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-/** The outbox (provided): the Redis list outbox of JSON rows {"topic", "key", "payload"} a relay produces later, when the broker is back. */
-object Outbox {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Queue a record for the relay. */
-  def insert(topic: String, key: String, payload: JsValue): Unit =
-    jedis.rpush("outbox", JsObject("topic" -> JsString(topic), "key" -> JsString(key), "payload" -> payload).compactPrint)
-}
 `,
 };

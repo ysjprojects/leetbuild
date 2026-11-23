@@ -3,10 +3,9 @@
  * package. `catalog.store` is the versions store (every product is a sequence of version rows in
  * Redis hashes, the course's stand-in for the catalog database): drafts, published versions, the
  * recorded publish actions. `catalog.snapshot` is the published pointer of step 2 as later steps use
- * it: `publish_snapshot` (the compare-and-set swap) and `read_published`. The five languages keep
+ * it: `publish_snapshot` (the compare-and-set swap) and `read_published`. The four languages keep
  * the same keys, so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'catalog/__init__.py': '',
@@ -795,146 +794,5 @@ inline std::optional<nlohmann::json> readPublished(const std::string& product_id
 }
 
 }  // namespace snapshot
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('catalog', 'Store')]: `package catalog
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The versions store (provided): every product is a sequence of version rows, each a Redis hash
- * product:{id}:v{n} with product_id, version, status (draft, published or archived), title,
- * price_cents and tax_class (an unset field is ""). product:{id} holds the product's draft,
- * published and latest version numbers; product:{id}:publish:{key} the recorded result of a
- * publish action. A Row has its unset fields as None. Fields are field name → text (a price as
- * its digits).
- */
-object Store {
-  final case class Row(productId: String, version: Long, status: String, title: Option[String], priceCents: Option[Long], taxClass: Option[String])
-
-  val Fields: Seq[String] = Seq("title", "price_cents", "tax_class")
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def rowKey(productId: String, version: Long): String = s"product:$productId:v$version"
-
-  private def row(raw: Map[String, String]): Option[Row] =
-    if (raw.isEmpty) None
-    else {
-      def text(name: String): Option[String] = raw.get(name).filter(_.nonEmpty)
-      Some(Row(raw("product_id"), raw("version").toLong, raw("status"), text("title"), text("price_cents").map(_.toLong), text("tax_class")))
-    }
-
-  private def pointer(productId: String, which: String): Option[Long] =
-    Option(jedis.hget(s"product:$productId", which)).filter(_.nonEmpty).map(_.toLong)
-
-  private def writeFields(productId: String, version: Long, fields: Map[String, String]): Unit = {
-    val mapping = fields.filter { case (name, _) => Fields.contains(name) }
-    if (mapping.nonEmpty) jedis.hset(rowKey(productId, version), mapping.asJava)
-  }
-
-  /** Version n of the product, if it exists. */
-  def version(productId: String, n: Long): Option[Row] = row(jedis.hgetAll(rowKey(productId, n)).asScala.toMap)
-
-  /** A new product whose version 1 is its draft; returns the row. */
-  def create(title: String): Row = {
-    val productId = s"p-\${jedis.incr("product:seq")}"
-    jedis.hset(rowKey(productId, 1), Map("product_id" -> productId, "version" -> "1", "status" -> "draft", "title" -> title, "price_cents" -> "", "tax_class" -> "").asJava)
-    jedis.hset(s"product:$productId", Map("draft" -> "1", "published" -> "", "latest" -> "1").asJava)
-    version(productId, 1).get
-  }
-
-  /** The product's draft row, or None when its latest version is live. */
-  def draftOf(productId: String): Option[Row] = pointer(productId, "draft").flatMap(version(productId, _))
-
-  /** The product's published row, or None when nothing was published yet. */
-  def publishedOf(productId: String): Option[Row] = pointer(productId, "published").flatMap(version(productId, _))
-
-  /** The product's newest row, whatever its status. */
-  def latest(productId: String): Option[Row] = pointer(productId, "latest").flatMap(version(productId, _))
-
-  /** The pre-versioning writer the bulk importer still uses: writes fields into the product's latest row in place, whatever its status. */
-  def upsert(productId: String, fields: Map[String, String]): Row = {
-    val current = latest(productId).getOrElse(throw new NoSuchElementException(s"no product $productId"))
-    writeFields(productId, current.version, fields)
-    version(productId, current.version).get
-  }
-
-  /** Writes fields into the draft row; when the product has none (its latest version is live), opens the next version as a draft copied from the published row first. */
-  def writeDraft(productId: String, fields: Map[String, String]): Row = {
-    val draft = draftOf(productId).getOrElse {
-      val base = latest(productId).getOrElse(throw new NoSuchElementException(s"no product $productId"))
-      val n = base.version + 1
-      val copy = jedis.hgetAll(rowKey(productId, base.version)).asScala.toMap ++ Map("version" -> n.toString, "status" -> "draft")
-      jedis.hset(rowKey(productId, n), copy.asJava)
-      jedis.hset(s"product:$productId", Map("draft" -> n.toString, "latest" -> n.toString).asJava)
-      version(productId, n).get
-    }
-    writeFields(productId, draft.version, fields)
-    version(productId, draft.version).get
-  }
-
-  /** Marks version n published (the previously published row becomes archived) and clears the draft pointer; returns the row. */
-  def promote(productId: String, n: Long): Row = {
-    pointer(productId, "published").filter(_ != n).foreach(previous => jedis.hset(rowKey(productId, previous), "status", "archived"))
-    jedis.hset(rowKey(productId, n), "status", "published")
-    jedis.hset(s"product:$productId", Map("published" -> n.toString, "draft" -> "").asJava)
-    version(productId, n).get
-  }
-
-  /** The result recorded for the publish action (productId, key), if any. */
-  def publishResult(productId: String, key: String): Option[JsObject] =
-    Option(jedis.get(s"product:$productId:publish:$key")).map(_.parseJson.asJsObject)
-
-  /** Record what the publish action (productId, key) answered, for its replays. */
-  def recordPublish(productId: String, key: String, result: JsObject): Unit =
-    jedis.set(s"product:$productId:publish:$key", result.compactPrint)
-}
-`,
-  [scalaPath('catalog', 'Snapshot')]: `package catalog
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The published pointer (provided; step 2 builds the same two functions): catalog:{id}:v{n} is the
- * whole published snapshot of a version as one JSON document, catalog:{id}:published the version
- * the storefront serves. publishSnapshot writes the snapshot, then moves the pointer in one Lua
- * script only if it still holds the version the caller expected (None: nothing published yet); it
- * reports whether the pointer moved. readPublished resolves the pointer once and loads exactly that
- * snapshot.
- */
-object Snapshot {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val SwapLua: String =
-    """local current = redis.call('GET', KEYS[1]) or ''
-      |if current ~= ARGV[2] then return 0 end
-      |redis.call('SET', KEYS[1], ARGV[1])
-      |return 1
-      |""".stripMargin
-
-  def snapshotKey(productId: String, version: Long): String = s"catalog:$productId:v$version"
-  def pointerKey(productId: String): String = s"catalog:$productId:published"
-
-  /** Write the whole snapshot under its own key, then swap the pointer if it still holds expected. */
-  def publishSnapshot(productId: String, version: Long, snapshot: JsObject, expected: Option[Long]): Boolean = {
-    jedis.set(snapshotKey(productId, version), snapshot.compactPrint)
-    val args = List(version.toString, expected.map(_.toString).getOrElse("")).asJava
-    jedis.eval(SwapLua, List(pointerKey(productId)).asJava, args).asInstanceOf[java.lang.Long] == 1L
-  }
-
-  /** The published snapshot: one pointer read, then exactly that version. */
-  def readPublished(productId: String): Option[JsObject] =
-    Option(jedis.get(pointerKey(productId))).flatMap(version => Option(jedis.get(snapshotKey(productId, version.toLong)))).map(_.parseJson.asJsObject)
-}
 `,
 };

@@ -69,7 +69,6 @@ After the table:
         python: {all: [/["']if-none-match["']/i, /["']if-modified-since["']/i, /\b304\b/]},
         typescript: {all: [/['"]if-none-match['"]/i, /['"]if-modified-since['"]/i, /\b304\b/]},
         go: {all: [/"If-None-Match"/, /"If-Modified-Since"/, /http\.StatusNotModified|\b304\b/]},
-        scala: {all: [/"If-None-Match"/, /"If-Modified-Since"/, /StatusCodes\.NotModified|\b304\b/]},
         cpp: {all: [/"If-None-Match"/, /"If-Modified-Since"/, /\b304\b/]},
       },
     },
@@ -99,10 +98,6 @@ After the table:
           order: [/"If-Match"/, /"If-Unmodified-Since"/, /"If-None-Match"/, /"If-Modified-Since"/],
           none: [/http\.ServeContent\(/],
         },
-        scala: {
-          order: [/"If-Match"/, /"If-Unmodified-Since"/, /"If-None-Match"/, /"If-Modified-Since"/],
-          none: [/\bconditional\s*\(/],
-        },
         cpp: {order: [/"If-Match"/, /"If-Unmodified-Since"/, /"If-None-Match"/, /"If-Modified-Since"/]},
       },
     },
@@ -115,7 +110,6 @@ After the table:
         python: {all: [/["']if-match["']/i, /\b412\b/]},
         typescript: {all: [/['"]if-match['"]/i, /\b412\b/]},
         go: {all: [/"If-Match"/, /http\.StatusPreconditionFailed|\b412\b/]},
-        scala: {all: [/"If-Match"/, /StatusCodes\.PreconditionFailed|\b412\b/]},
         cpp: {all: [/"If-Match"/, /\b412\b/]},
       },
     },
@@ -128,7 +122,6 @@ After the table:
         python: {all: [/\b428\b/, /["']if-match["']/i]},
         typescript: {all: [/\b428\b/, /['"]if-match['"]/i]},
         go: {all: [/http\.StatusPreconditionRequired|\b428\b/, /"If-Match"/]},
-        scala: {all: [/StatusCodes\.PreconditionRequired|\b428\b/, /"If-Match"/]},
         cpp: {all: [/\b428\b/, /"If-Match"/]},
       },
     },
@@ -141,7 +134,6 @@ After the table:
         python: {all: [/==\s*["']\*["']/, /["']if-none-match["']/i, /\b201\b/]},
         typescript: {all: [/===\s*['"]\*['"]/, /['"]if-none-match['"]/i, /\b201\b/]},
         go: {all: [/==\s*"\*"/, /"If-None-Match"/, /http\.StatusCreated|\b201\b/]},
-        scala: {all: [/==\s*"\*"/, /"If-None-Match"/, /StatusCodes\.Created|\b201\b/]},
         cpp: {all: [/==\s*"\*"/, /"If-None-Match"/, /\b201\b/]},
       },
     },
@@ -154,7 +146,6 @@ After the table:
         python: {all: [/["']W\/["']/, /except\b/]},
         typescript: {all: [/['"]W\/['"]/, /isNaN\(/]},
         go: {all: [/"W\/"/, /http\.ParseTime\(/]},
-        scala: {all: [/"W\/"/, /\bTry\(/]},
         cpp: {all: [/"W\/"/, /\.fail\(\)/]},
       },
     },
@@ -884,264 +875,6 @@ func main() {
 	mux.HandleFunc("PUT /docs/{id}", putDoc)
 	mux.HandleFunc("DELETE /docs/{id}", deleteDoc)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.security.MessageDigest
-import java.time.{Instant, ZoneOffset, ZonedDateTime}
-import java.time.format.DateTimeFormatter
-import java.util.Locale
-
-import scala.collection.mutable
-import scala.util.Try
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-object DocsApi {
-  val EtagHex = 16
-
-  /** etag is "<16 hex>", modified is epoch seconds. */
-  final case class Doc(text: String, etag: String, modified: Long)
-
-  val docs = mutable.Map.empty[String, Doc]
-
-  private val imfFixdate =
-    DateTimeFormatter.ofPattern("EEE, dd MMM yyyy HH:mm:ss 'GMT'", Locale.US).withZone(ZoneOffset.UTC)
-
-  def etagOf(text: String): String =
-    "\\"" + MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString.take(EtagHex) + "\\""
-
-  private def validators(d: Doc): List[HttpHeader] =
-    List(RawHeader("ETag", d.etag), RawHeader("Last-Modified", imfFixdate.format(Instant.ofEpochSecond(d.modified))))
-
-  /** Epoch seconds of an HTTP date, or None when absent or unparseable. */
-  private def httpDate(value: Option[String]): Option[Long] =
-    value.flatMap(v => Try(ZonedDateTime.parse(v, imfFixdate).toEpochSecond).toOption)
-
-  private def header(req: HttpRequest, name: String): Option[String] =
-    req.headers.find(_.is(name.toLowerCase)).map(_.value)
-
-  /** RFC 9110 §13.2.2: None to perform the method, or the status that ends it (304 or 412). */
-  def preconditions(req: HttpRequest, doc: Option[Doc]): Option[StatusCode] = {
-    // TODO: 1. If-Match (strong; * = exists) fails -> 412   2. else If-Unmodified-Since earlier than modified -> 412
-    // TODO: 3. If-None-Match (weak; * = exists) matches -> 304 on GET, 412 otherwise
-    // TODO: 4. else, GET only, If-Modified-Since at or after modified -> 304
-    None
-  }
-
-  private def json(status: StatusCode, body: JsValue, headers: List[HttpHeader] = Nil): Route =
-    complete(HttpResponse(status, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-
-  private def error(status: StatusCode, code: String): Route = json(status, JsObject("error" -> JsString(code)))
-
-  private def stop(status: StatusCode, doc: Option[Doc]): Route =
-    if (status == StatusCodes.NotModified) complete(HttpResponse(StatusCodes.NotModified, headers = validators(doc.get)))
-    else error(StatusCodes.PreconditionFailed, "precondition_failed")
-
-  val route: Route =
-    path("docs" / Segment) { id =>
-      extractRequest { req =>
-        concat(
-          get {
-            docs.synchronized(docs.get(id)) match {
-              case None => error(StatusCodes.NotFound, "not_found")
-              case Some(d) =>
-                preconditions(req, Some(d)) match {
-                  case Some(status) => stop(status, Some(d))
-                  case None         => json(StatusCodes.OK, JsObject("text" -> JsString(d.text)), validators(d))
-                }
-            }
-          },
-          put {
-            entity(as[String]) { raw =>
-              docs.synchronized {
-                val current = docs.get(id)
-                preconditions(req, current) match {
-                  case Some(status) => stop(status, current)
-                  // TODO: an existing doc without If-Match -> 428 precondition_required
-                  case None =>
-                    Try(raw.parseJson.asJsObject.fields("text")).toOption match {
-                      case Some(JsString(text)) =>
-                        val next = Doc(text, etagOf(text), Instant.now().getEpochSecond)
-                        docs.put(id, next)
-                        val status = if (current.isEmpty) StatusCodes.Created else StatusCodes.OK
-                        json(status, JsObject("text" -> JsString(text)), validators(next))
-                      case _ => error(StatusCodes.BadRequest, "text_required")
-                    }
-                }
-              }
-            }
-          },
-          delete {
-            docs.synchronized {
-              docs.get(id) match {
-                case None => error(StatusCodes.NotFound, "not_found")
-                case current =>
-                  preconditions(req, current) match {
-                    case Some(status) => stop(status, current)
-                    // TODO: without If-Match -> 428 precondition_required
-                    case None =>
-                      docs.remove(id)
-                      complete(StatusCodes.NoContent)
-                  }
-              }
-            }
-          }
-        )
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("docs")
-    Http().newServerAt("0.0.0.0", 8080).bind(route)
-  }
-}
-`,
-      solution: `import java.security.MessageDigest
-import java.time.{Instant, ZoneOffset, ZonedDateTime}
-import java.time.format.DateTimeFormatter
-import java.util.Locale
-
-import scala.collection.mutable
-import scala.util.Try
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-object DocsApi {
-  val EtagHex = 16
-
-  /** etag is "<16 hex>", modified is epoch seconds. */
-  final case class Doc(text: String, etag: String, modified: Long)
-
-  val docs = mutable.Map.empty[String, Doc]
-
-  private val imfFixdate =
-    DateTimeFormatter.ofPattern("EEE, dd MMM yyyy HH:mm:ss 'GMT'", Locale.US).withZone(ZoneOffset.UTC)
-
-  def etagOf(text: String): String =
-    "\\"" + MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString.take(EtagHex) + "\\""
-
-  private def validators(d: Doc): List[HttpHeader] =
-    List(RawHeader("ETag", d.etag), RawHeader("Last-Modified", imfFixdate.format(Instant.ofEpochSecond(d.modified))))
-
-  /** Epoch seconds of an HTTP date, or None when absent or unparseable. */
-  private def httpDate(value: Option[String]): Option[Long] =
-    value.flatMap(v => Try(ZonedDateTime.parse(v, imfFixdate).toEpochSecond).toOption)
-
-  private def header(req: HttpRequest, name: String): Option[String] =
-    req.headers.find(_.is(name.toLowerCase)).map(_.value)
-
-  private def tags(value: String): List[String] = value.split(",").map(_.trim).filter(_.nonEmpty).toList
-
-  def strongMatch(value: String, etag: String): Boolean =
-    tags(value).exists(t => t == "*" || (!t.startsWith("W/") && t == etag))
-
-  def weakMatch(value: String, etag: String): Boolean =
-    tags(value).exists(t => t == "*" || t.stripPrefix("W/") == etag.stripPrefix("W/"))
-
-  /** RFC 9110 §13.2.2: None to perform the method, or the status that ends it (304 or 412). */
-  def preconditions(req: HttpRequest, doc: Option[Doc]): Option[StatusCode] = {
-    val isGet = req.method == HttpMethods.GET
-    val writeGate: Option[StatusCode] = header(req, "If-Match") match {
-      case Some(ifMatch) =>
-        if (doc.exists(d => strongMatch(ifMatch, d.etag))) None else Some(StatusCodes.PreconditionFailed)
-      case None =>
-        val since = httpDate(header(req, "If-Unmodified-Since"))
-        if (doc.exists(d => since.exists(d.modified > _))) Some(StatusCodes.PreconditionFailed) else None
-    }
-    writeGate.orElse(header(req, "If-None-Match") match {
-      case Some(ifNoneMatch) =>
-        if (doc.exists(d => weakMatch(ifNoneMatch, d.etag)))
-          Some(if (isGet) StatusCodes.NotModified else StatusCodes.PreconditionFailed)
-        else None
-      case None =>
-        val since = httpDate(header(req, "If-Modified-Since"))
-        if (isGet && doc.exists(d => since.exists(d.modified <= _))) Some(StatusCodes.NotModified) else None
-    })
-  }
-
-  private def json(status: StatusCode, body: JsValue, headers: List[HttpHeader] = Nil): Route =
-    complete(HttpResponse(status, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-
-  private def error(status: StatusCode, code: String): Route = json(status, JsObject("error" -> JsString(code)))
-
-  private def stop(status: StatusCode, doc: Option[Doc]): Route =
-    if (status == StatusCodes.NotModified) complete(HttpResponse(StatusCodes.NotModified, headers = validators(doc.get)))
-    else error(StatusCodes.PreconditionFailed, "precondition_failed")
-
-  val route: Route =
-    path("docs" / Segment) { id =>
-      extractRequest { req =>
-        val hasIfMatch = header(req, "If-Match").isDefined
-        concat(
-          get {
-            docs.synchronized(docs.get(id)) match {
-              case None => error(StatusCodes.NotFound, "not_found")
-              case Some(d) =>
-                preconditions(req, Some(d)) match {
-                  case Some(status) => stop(status, Some(d))
-                  case None         => json(StatusCodes.OK, JsObject("text" -> JsString(d.text)), validators(d))
-                }
-            }
-          },
-          put {
-            entity(as[String]) { raw =>
-              docs.synchronized {
-                val current = docs.get(id)
-                preconditions(req, current) match {
-                  case Some(status) => stop(status, current)
-                  case None if current.isDefined && !hasIfMatch =>
-                    error(StatusCodes.PreconditionRequired, "precondition_required")
-                  case None =>
-                    Try(raw.parseJson.asJsObject.fields("text")).toOption match {
-                      case Some(JsString(text)) =>
-                        val next = Doc(text, etagOf(text), Instant.now().getEpochSecond)
-                        docs.put(id, next)
-                        val status = if (current.isEmpty) StatusCodes.Created else StatusCodes.OK
-                        json(status, JsObject("text" -> JsString(text)), validators(next))
-                      case _ => error(StatusCodes.BadRequest, "text_required")
-                    }
-                }
-              }
-            }
-          },
-          delete {
-            docs.synchronized {
-              docs.get(id) match {
-                case None => error(StatusCodes.NotFound, "not_found")
-                case current =>
-                  preconditions(req, current) match {
-                    case Some(status) => stop(status, current)
-                    case None if !hasIfMatch =>
-                      error(StatusCodes.PreconditionRequired, "precondition_required")
-                    case None =>
-                      docs.remove(id)
-                      complete(StatusCodes.NoContent)
-                  }
-              }
-            }
-          }
-        )
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("docs")
-    Http().newServerAt("0.0.0.0", 8080).bind(route)
-  }
 }
 `,
     },

@@ -46,7 +46,6 @@ its create after a timeout opens a second replication slot.
         python: {all: [/@app\.post\(\s*["']\/v1\/subscriptions["']/, /store\.create_subscription\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/subscriptions['"]/, /createSubscription\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/subscriptions"/, /store\.CreateSubscription\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"subscriptions"\s*\)/, /\bpost\s*\{/, /Store\.createSubscription\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/subscriptions"/, /store::createSubscription\(/]},
       },
     },
@@ -59,7 +58,6 @@ its create after a timeout opens a second replication slot.
         python: {all: [/store\.approved_tables\(/, /\b403\b/]},
         typescript: {all: [/approvedTables\(\s*tenant/, /\b403\b/]},
         go: {all: [/store\.ApprovedTables\(/, /StatusForbidden|\b403\b/]},
-        scala: {all: [/Store\.approvedTables\(/, /Forbidden|\b403\b/]},
         cpp: {all: [/store::approvedTables\(/, /\b403\b/]},
       },
     },
@@ -72,7 +70,6 @@ its create after a timeout opens a second replication slot.
         python: {all: [/store\.sensitive_columns\(/]},
         typescript: {all: [/sensitiveColumns\(\s*table/]},
         go: {all: [/store\.SensitiveColumns\(/]},
-        scala: {all: [/Store\.sensitiveColumns\(/]},
         cpp: {all: [/store::sensitiveColumns\(/]},
       },
     },
@@ -93,10 +90,6 @@ its create after a timeout opens a second replication slot.
         go: {
           all: [/Idempotency-Key/i, /store\.FindByKey\(/, /store\.RecordKey\(/],
           order: [/store\.FindByKey\(/, /store\.CreateSubscription\(/, /store\.RecordKey\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Store\.findByKey\(/, /Store\.recordKey\(/],
-          order: [/Store\.findByKey\(/, /Store\.createSubscription\(/, /Store\.recordKey\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /store::findByKey\(/, /store::recordKey\(/],
@@ -380,116 +373,6 @@ func createSubscription(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/subscriptions", createSubscription)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import cdc.Store // Store.approvedTables, tableColumns, sensitiveColumns, createSubscription, findByKey, recordKey
-
-object Api {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  final case class CreateRequest(table: String, columns: Seq[String], sink: String)
-
-  private def parse(raw: String): CreateRequest = {
-    val fields = raw.parseJson.asJsObject.fields
-    def text(name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-    val columns = fields.get("columns").collect { case JsArray(items) => items.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
-    CreateRequest(text("table"), columns, text("sink"))
-  }
-
-  def create(tenant: String, raw: String): HttpResponse = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    if (tenant.isEmpty) return error(StatusCodes.Unauthorized, "X-Tenant-Id is required")
-    val body = parse(raw)
-    Store.tableColumns(body.table) match {
-      case None => error(StatusCodes.NotFound, s"no table \${body.table}")
-      case Some(columns) =>
-        val unknown = body.columns.filterNot(columns.contains)
-        if (unknown.nonEmpty) error(StatusCodes.BadRequest, s"unknown columns \${unknown.mkString(", ")}")
-        else {
-          val chosen = if (body.columns.nonEmpty) body.columns else columns
-          json(StatusCodes.Created, Store.toJson(Store.createSubscription(tenant, body.table, chosen, body.sink)))
-        }
-    }
-  }
-
-  val route: Route = path("v1" / "subscriptions") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        entity(as[String]) { raw =>
-          complete(create(tenant.getOrElse(""), raw))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import cdc.Store // Store.approvedTables, tableColumns, sensitiveColumns, createSubscription, findByKey, recordKey
-
-object Api {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  final case class CreateRequest(table: String, columns: Seq[String], sink: String)
-
-  private def parse(raw: String): CreateRequest = {
-    val fields = raw.parseJson.asJsObject.fields
-    def text(name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-    val columns = fields.get("columns").collect { case JsArray(items) => items.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
-    CreateRequest(text("table"), columns, text("sink"))
-  }
-
-  def create(tenant: String, key: String, raw: String): HttpResponse = {
-    if (tenant.isEmpty) return error(StatusCodes.Unauthorized, "X-Tenant-Id is required")
-    if (key.isEmpty) return error(StatusCodes.BadRequest, "Idempotency-Key is required")
-    Store.findByKey(tenant, key) match {
-      case Some(replay) => json(StatusCodes.OK, Store.toJson(replay)) // the subscription the first attempt created
-      case None =>
-        val body = parse(raw)
-        // The tenant's agreement decides, not the schema: the replication user can read every table.
-        if (!Store.approvedTables(tenant).contains(body.table)) return error(StatusCodes.Forbidden, s"table \${body.table} is not approved for $tenant")
-        val columns = Store.tableColumns(body.table).getOrElse(Seq.empty)
-        val sensitive = Store.sensitiveColumns(body.table)
-        val unknown = body.columns.filterNot(columns.contains)
-        val blocked = body.columns.filter(sensitive.contains)
-        if (unknown.nonEmpty) error(StatusCodes.BadRequest, s"unknown columns \${unknown.mkString(", ")}")
-        else if (blocked.nonEmpty) error(StatusCodes.BadRequest, s"sensitive columns \${blocked.mkString(", ")}")
-        else {
-          val chosen = if (body.columns.nonEmpty) body.columns else columns.filterNot(sensitive.contains)
-          val subscription = Store.createSubscription(tenant, body.table, chosen, body.sink)
-          Store.recordKey(tenant, key, subscription.id)
-          json(StatusCodes.Created, Store.toJson(subscription))
-        }
-    }
-  }
-
-  val route: Route = path("v1" / "subscriptions") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        optionalHeaderValueByName("Idempotency-Key") { key =>
-          entity(as[String]) { raw =>
-            complete(create(tenant.getOrElse(""), key.getOrElse(""), raw))
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

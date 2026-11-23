@@ -47,7 +47,6 @@ failover loses one, and a broker that rejects the record leaves no trace.
         python: {all: [/key\s*=\s*doc_id/], none: [/key\s*=\s*device/]},
         typescript: {all: [/key:\s*docId/], none: [/key:\s*device/]},
         go: {all: [/Key:\s*\[\]byte\(docID\)/], none: [/Key:\s*\[\]byte\(device\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(\s*Topic,\s*docId/], none: [/Topic,\s*device/]},
         cpp: {all: [/doc_id\.c_str\(\),\s*doc_id\.size\(\)/], none: [/device\.c_str\(\),\s*device\.size\(\)/]},
       },
     },
@@ -60,7 +59,6 @@ failover loses one, and a broker that rejects the record leaves no trace.
         python: {all: [/"revision"/, /"content_hash"/], none: [/"body"\s*:/]},
         typescript: {all: [/revision:/, /content_hash:/], none: [/\{[^}\n]*\bbody\b[^}\n]*\}/]},
         go: {all: [/"revision":/, /"content_hash":/], none: [/"body":/]},
-        scala: {all: [/"revision"\s*->/, /"content_hash"\s*->/], none: [/"body"\s*->/]},
         cpp: {all: [/\{"revision",/, /\{"content_hash",/], none: [/\{"body",/]},
       },
     },
@@ -73,7 +71,6 @@ failover loses one, and a broker that rejects the record leaves no trace.
         python: {order: [/apply_change\(/, /producer\.produce\(/]},
         typescript: {order: [/applyChange\(/, /producer\.send\(/]},
         go: {order: [/revisions\.ApplyChange\(/, /producer\.Produce\(/]},
-        scala: {order: [/Revisions\.applyChange\(/, /producer\.send\(/]},
         cpp: {order: [/revisions::applyChange\(/, /producer->produce\(/]},
       },
     },
@@ -86,7 +83,6 @@ failover loses one, and a broker that rejects the record leaves no trace.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -99,7 +95,6 @@ failover loses one, and a broker that rejects the record leaves no trace.
         python: {all: [/on_delivery/, /store\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/await producer\.send\(/, /insertOutbox\(/], none: [/void producer\.send\(/]},
         go: {all: [/kafka\.Event/, /store\.InsertOutbox\(/]},
-        scala: {all: [/\.get\(\s*AckTimeoutMs/, /Store\.insertOutbox\(/], none: [/KafkaException/]},
         cpp: {all: [/dr_cb/, /store::insertOutbox\(/]},
       },
     },
@@ -344,79 +339,6 @@ func applyAndPublish(ctx context.Context, docID string, baseRevision int64, cont
 		}
 	}
 	return event, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import docsync.{Revisions, Store} // Store.insertOutbox; Revisions.applyChange
-
-object Events {
-  val Topic = "sync.change"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Apply the change and tell the other devices: the event, or None when nothing was applied. */
-  def applyAndPublish(docId: String, baseRevision: Long, contentHash: String, body: String, device: String): Option[JsObject] = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val event = JsObject("doc_id" -> JsString(docId), "device" -> JsString(device), "body" -> JsString(body))
-    try producer.send(new ProducerRecord[String, String](Topic, device, event.compactPrint))
-    catch { case _: KafkaException => Store.insertOutbox(Topic, device, event) }
-    val outcome = Revisions.applyChange(docId, baseRevision, contentHash, body, device)
-    if (outcome.status != "applied") None
-    else Some(JsObject(event.fields + ("revision" -> JsNumber(outcome.revision))))
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import docsync.{Revisions, Store} // Store.insertOutbox; Revisions.applyChange
-
-object Events {
-  val Topic = "sync.change"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Apply the change and tell the other devices: the event, or None when nothing was applied. */
-  def applyAndPublish(docId: String, baseRevision: Long, contentHash: String, body: String, device: String): Option[JsObject] = {
-    // The revision exists before its event does: a consumer can always fetch what it is told about.
-    val outcome = Revisions.applyChange(docId, baseRevision, contentHash, body, device)
-    if (outcome.status != "applied") None
-    else {
-      // The revision and the hash identify the state; the body stays in the store.
-      val event = JsObject("doc_id" -> JsString(docId), "revision" -> JsNumber(outcome.revision), "content_hash" -> JsString(contentHash), "device" -> JsString(device))
-      val acked = Try(producer.send(new ProducerRecord[String, String](Topic, docId, event.compactPrint)).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-      // The broker did not take it: the relay publishes the row later, so devices hear late, not never.
-      if (acked.isFailure) Store.insertOutbox(Topic, docId, event)
-      Some(event)
-    }
-  }
 }
 `,
     },

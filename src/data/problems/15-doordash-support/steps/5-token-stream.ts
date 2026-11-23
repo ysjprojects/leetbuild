@@ -107,10 +107,6 @@ Implement the \`Chat\` server on \`[::]:9000\` (\`serve()\` exported; the checks
           all: [/srv\.Send\(&pb\.ChatEvent\{Token: /, /\.Recv\(\)/, /Done:\s*true/, /prompt\.CitedIds\(/],
           order: [/\{Token: /, /Done:\s*true/],
         },
-        scala: {
-          all: [/observer\.onNext\(ChatEvent\(token = /, /\.hasNext/, /done = true/, /Prompt\.citedIds\(/],
-          order: [/ChatEvent\(token = /, /done = true/],
-        },
         cpp: {
           all: [/writer->Write\(/, /reader->Read\(&token\)/, /set_done\(true\)/, /assistant::cited_ids\(/],
           order: [/set_token\(/, /set_done\(true\)/],
@@ -134,9 +130,6 @@ Implement the \`Chat\` server on \`[::]:9000\` (\`serve()\` exported; the checks
         },
         typescript: {all: [/lrange\(`conv:/, /\bsearch\(/, /buildPrompt\(/, /'large'/, /max_tokens: MAX_TOKENS/]},
         go: {all: [/LRange\(/, /(?<!func )search\(/, /prompt\.Build\(/, /"large"/, /MaxTokens:\s*config\.MaxTokens/]},
-        scala: {
-          all: [/jedis\.lrange\(/, /KbSearch\.search\(/, /Prompt\.build\(/, /"large"/, /maxTokens = Config\.MaxTokens/],
-        },
         cpp: {
           all: [
             /lrange\(/,
@@ -157,7 +150,6 @@ Implement the \`Chat\` server on \`[::]:9000\` (\`serve()\` exported; the checks
         python: {all: [/% GUARD_EVERY|% 8\b/, /tier1\(/, /\.cancel\(\)/, /complete_sentences\(/]},
         typescript: {all: [/% GUARD_EVERY|% 8\b/, /tier1\(/, /\.cancel\(\)/, /completeSentences\(/]},
         go: {all: [/%\s*guardEvery|% 8\b/, /(?<!func )tier1\(/, /cancel\(\)/, /completeSentences\(/]},
-        scala: {all: [/% GuardEvery|% 8\b/, /Guardrail\.tier1\(/, /\.cancel\(/, /completeSentences\(/]},
         cpp: {all: [/% kGuardEvery|% 8\b/, /(?<!\w)tier1\(/, /TryCancel\(\)/, /complete_sentences\(/]},
       },
     },
@@ -170,7 +162,6 @@ Implement the \`Chat\` server on \`[::]:9000\` (\`serve()\` exported; the checks
         python: {all: [/await check\(/, /HANDOFF_TEXT/, /escalated=/, /rpush\(/, /expire\(/]},
         typescript: {all: [/await check\(/, /HANDOFF_TEXT/, /escalated: /, /rpush\(/, /expire\(/]},
         go: {all: [/(?<!func )check\(/, /config\.HandoffText/, /Escalated:\s*/, /RPush\(/, /Expire\(/]},
-        scala: {all: [/Guardrail\.check\(/, /Config\.HandoffText/, /escalated = /, /rpush\(/, /expire\(/]},
         cpp: {all: [/(?<!\w)check\(/, /config::kHandoffText/, /set_escalated\(/, /rpush\(/, /expire\(/]},
       },
     },
@@ -185,7 +176,6 @@ Implement the \`Chat\` server on \`[::]:9000\` (\`serve()\` exported; the checks
           all: [/deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_S/, /status\.UNAVAILABLE/, /'small'/, /LLM_SMALL/],
         },
         go: {all: [/context\.WithTimeout\(/, /DeadlineS/, /codes\.Unavailable/, /"small"/, /LLMSmall/]},
-        scala: {all: [/withDeadlineAfter\(/, /DeadlineS/, /Code\.UNAVAILABLE/, /"small"/, /LlmSmall/]},
         cpp: {all: [/set_deadline\(/, /kDeadline\b/, /StatusCode::UNAVAILABLE/, /"small"/, /kLlmSmall/]},
       },
     },
@@ -881,187 +871,6 @@ func serve() error {
 
 func main() {
 	log.Fatal(serve())
-}
-`,
-    },
-    scala: {
-      starter: `/** Chat.Stream: the answer as it is generated — tokens relayed to the Dasher app, guarded as they go. */
-import java.util.concurrent.TimeUnit
-import scala.concurrent.ExecutionContext
-import scala.jdk.CollectionConverters._
-
-import io.grpc.{Context, ManagedChannelBuilder, ServerBuilder, Status, StatusRuntimeException}
-import io.grpc.stub.StreamObserver
-import play.api.libs.json.Json
-import redis.clients.jedis.JedisPooled
-
-import assistant.{Config, Prompt} // Config.LlmLarge, LlmSmall, MaxTokens, DeadlineS, HistoryTtlS, HandoffText, TopK · Prompt.build, Prompt.citedIds, Prompt.Chunk, Prompt.Turn
-import support.support.{ChatEvent, ChatGrpc, ChatRequest, GenerateRequest, LlmGrpc, Token}
-
-object Stream {
-  /** How many tokens pass between two runs of tier 1 on the text so far. */
-  val GuardEvery = 8
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def stub(target: String): LlmGrpc.LlmBlockingStub = {
-    val Array(host, port) = target.split(":")
-    LlmGrpc.blockingStub(ManagedChannelBuilder.forAddress(host, port.toInt).usePlaintext().build())
-  }
-  private val large = stub(Config.LlmLarge)
-  private val small = stub(Config.LlmSmall)
-
-  /** The conversation so far: the JSON turns of conv:<session>, oldest first. */
-  def history(sessionId: String): Seq[Prompt.Turn] =
-    jedis.lrange(s"conv:$sessionId", 0, -1).asScala.toSeq.map { raw =>
-      val js = Json.parse(raw)
-      Prompt.Turn((js \\ "role").as[String], (js \\ "text").as[String])
-    }
-
-  /** Both turns onto conv:<session>, with the history's TTL. */
-  def remember(sessionId: String, question: String, answer: String): Unit = {
-    // TODO: RPUSH {"role": "dasher", "text": question} and {"role": "assistant", "text": answer}; EXPIRE Config.HistoryTtlS
-    ???
-  }
-
-  /** The text up to its last . ! or ? — what tier 1 may judge mid-stream. */
-  def completeSentences(text: String): String = {
-    val end = text.lastIndexWhere(c => c == '.' || c == '!' || c == '?')
-    if (end < 0) "" else text.substring(0, end + 1)
-  }
-
-  /** One Llm.Stream inside a cancellable context, the deadline on the call: cancelling the context stops the model. */
-  private def open(stub: LlmGrpc.LlmBlockingStub, model: String, prompt: String): (Context.CancellableContext, Iterator[Token]) = {
-    // TODO: Context.current().withCancellation(); inside it, GenerateRequest(model, prompt, Config.MaxTokens) with withDeadlineAfter(Config.DeadlineS)
-    ???
-  }
-
-  class ChatService extends ChatGrpc.Chat {
-    override def stream(request: ChatRequest, observer: StreamObserver[ChatEvent]): Unit = {
-      // TODO: history(sessionId), KbSearch.search(message, Config.TopK) as Prompt.Chunks, Prompt.build → open(large, "large", prompt)
-      // TODO: read token by token: answer += token.text, observer.onNext(ChatEvent(token = …)) at once
-      // TODO:   UNAVAILABLE before any token → open(small, "small", prompt); any other status → observer.onError
-      // TODO:   every GuardEvery tokens: Guardrail.tier1(completeSentences(answer), chunks) → reasons mean cancel the context, ok = false
-      // TODO: ended by itself → ok = Guardrail.check(message, answer, chunks).ok
-      // TODO: remember(sessionId, message, answer or Config.HandoffText); onNext(ChatEvent(done = true, sources, escalated, model)); onCompleted
-      observer.onError(Status.UNIMPLEMENTED.withDescription("not implemented").asRuntimeException())
-    }
-  }
-
-  def serve(): Unit =
-    ServerBuilder.forPort(9000).addService(ChatGrpc.bindService(new ChatService, ExecutionContext.global)).build().start().awaitTermination()
-
-  def main(args: Array[String]): Unit = serve()
-}
-`,
-      solution: `/** Chat.Stream: the answer as it is generated — tokens relayed to the Dasher app, guarded as they go. */
-import java.util.concurrent.TimeUnit
-import scala.concurrent.ExecutionContext
-import scala.jdk.CollectionConverters._
-
-import io.grpc.{Context, ManagedChannelBuilder, ServerBuilder, Status, StatusRuntimeException}
-import io.grpc.stub.StreamObserver
-import play.api.libs.json.Json
-import redis.clients.jedis.JedisPooled
-
-import assistant.{Config, Prompt} // Config.LlmLarge, LlmSmall, MaxTokens, DeadlineS, HistoryTtlS, HandoffText, TopK · Prompt.build, Prompt.citedIds, Prompt.Chunk, Prompt.Turn
-import support.support.{ChatEvent, ChatGrpc, ChatRequest, GenerateRequest, LlmGrpc, Token}
-
-object Stream {
-  /** How many tokens pass between two runs of tier 1 on the text so far. */
-  val GuardEvery = 8
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def stub(target: String): LlmGrpc.LlmBlockingStub = {
-    val Array(host, port) = target.split(":")
-    LlmGrpc.blockingStub(ManagedChannelBuilder.forAddress(host, port.toInt).usePlaintext().build())
-  }
-  private val large = stub(Config.LlmLarge)
-  private val small = stub(Config.LlmSmall)
-
-  /** The conversation so far: the JSON turns of conv:<session>, oldest first. */
-  def history(sessionId: String): Seq[Prompt.Turn] =
-    jedis.lrange(s"conv:$sessionId", 0, -1).asScala.toSeq.map { raw =>
-      val js = Json.parse(raw)
-      Prompt.Turn((js \\ "role").as[String], (js \\ "text").as[String])
-    }
-
-  /** Both turns onto conv:<session>, with the history's TTL. */
-  def remember(sessionId: String, question: String, answer: String): Unit = {
-    val key = s"conv:$sessionId"
-    jedis.rpush(key, Json.obj("role" -> "dasher", "text" -> question).toString, Json.obj("role" -> "assistant", "text" -> answer).toString)
-    jedis.expire(key, Config.HistoryTtlS)
-  }
-
-  /** The text up to its last . ! or ? — what tier 1 may judge mid-stream. */
-  def completeSentences(text: String): String = {
-    val end = text.lastIndexWhere(c => c == '.' || c == '!' || c == '?')
-    if (end < 0) "" else text.substring(0, end + 1)
-  }
-
-  /** One Llm.Stream inside a cancellable context, the deadline on the call: cancelling the context stops the model. */
-  private def open(stub: LlmGrpc.LlmBlockingStub, model: String, prompt: String): (Context.CancellableContext, Iterator[Token]) = {
-    val cancellable = Context.current().withCancellation()
-    val tokens = cancellable.call { () =>
-      stub
-        .withDeadlineAfter((Config.DeadlineS * 1000).toLong, TimeUnit.MILLISECONDS)
-        .stream(GenerateRequest(model = model, prompt = prompt, maxTokens = Config.MaxTokens))
-    }
-    (cancellable, tokens)
-  }
-
-  class ChatService extends ChatGrpc.Chat {
-    override def stream(request: ChatRequest, observer: StreamObserver[ChatEvent]): Unit = {
-      val past = history(request.sessionId)
-      val chunks = KbSearch.search(request.message, Config.TopK).map(h => Prompt.Chunk(h.id, h.text))
-      val prompt = Prompt.build(request.message, chunks, past)
-      var model = "large"
-      var (cancellable, tokens) = open(large, model, prompt)
-      val answer = new StringBuilder
-      var count = 0
-      var ok = true
-      try {
-        var streaming = true
-        while (streaming) {
-          val next =
-            try if (tokens.hasNext) Some(tokens.next()) else None
-            catch {
-              // UNAVAILABLE before the first token: the same prompt to the small model. Once tokens
-              // have gone out there is nothing to retry, and a deadline is the app's to spend again.
-              case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.UNAVAILABLE && answer.isEmpty =>
-                model = "small"
-                val opened = open(small, model, prompt)
-                cancellable = opened._1
-                tokens = opened._2
-                if (tokens.hasNext) Some(tokens.next()) else None
-            }
-          next match {
-            case None => streaming = false
-            case Some(token) =>
-              answer.append(token.text)
-              count += 1
-              observer.onNext(ChatEvent(token = token.text))
-              if (count % GuardEvery == 0 && Guardrail.tier1(completeSentences(answer.toString), chunks).nonEmpty) {
-                cancellable.cancel(null) // the rest of the answer is never generated
-                ok = false
-                streaming = false
-              }
-          }
-        }
-        if (ok) ok = Guardrail.check(request.message, answer.toString, chunks).ok
-        val (text, sources) = if (ok) (answer.toString, Prompt.citedIds(answer.toString)) else (Config.HandoffText, Seq.empty[String])
-        remember(request.sessionId, request.message, text)
-        observer.onNext(ChatEvent(done = true, sources = sources, escalated = !ok, model = model))
-        observer.onCompleted()
-      } catch {
-        case e: StatusRuntimeException => observer.onError(e.getStatus.asRuntimeException())
-      }
-    }
-  }
-
-  def serve(): Unit =
-    ServerBuilder.forPort(9000).addService(ChatGrpc.bindService(new ChatService, ExecutionContext.global)).build().start().awaitTermination()
-
-  def main(args: Array[String]): Unit = serve()
 }
 `,
     },

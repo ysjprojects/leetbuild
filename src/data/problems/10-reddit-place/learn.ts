@@ -274,7 +274,7 @@ record onto a per-instance bus; a handler is a loop around a queue from that bus
 Two rules around the loop are what let it survive at 80 000 clients:
 
 - **Every subscription dies with its call.** Cleanup is registered the moment the handler subscribes
-  — \`add_done_callback\` / \`ctx.Done()\` / \`setOnCancelHandler\` — not written at the end of the handler,
+  — \`add_done_callback\` / \`ctx.Done()\` — not written at the end of the handler,
   because on a cancellation the end never runs. Whatever killed the stream, the callback
   unsubscribes; a subscription that outlives its stream is a leak per disconnect.
 - **A slow reader is dropped, not buffered.** More than \`MAX_LAG\` (1000) tiles queued for one client

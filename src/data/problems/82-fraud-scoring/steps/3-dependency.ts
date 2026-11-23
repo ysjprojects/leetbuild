@@ -51,7 +51,6 @@ service Model { rpc Score(ScoreRequest) returns (ScoreReply); }  // INVALID_ARGU
         python: {all: [/DEADLINE_S\s*=\s*0?\.3\b/, /Score\([^)\n]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*300\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*300\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*deadline\)/]},
-        scala: {all: [/DeadlineMs\s*=\s*300L?\b/, /withDeadlineAfter\(\s*DeadlineMs/]},
         cpp: {all: [/kDeadline\{300\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -68,7 +67,6 @@ service Model { rpc Score(ScoreRequest) returns (ScoreReply); }  // INVALID_ARGU
         go: {
           all: [/codes\.Unavailable/, /codes\.DeadlineExceeded/, /codes\.InvalidArgument/, /errInvalidFeatures\)?[,:]/],
         },
-        scala: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /INVALID_ARGUMENT/, /throw new InvalidFeatures/]},
         cpp: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /INVALID_ARGUMENT/, /throw InvalidFeatures/]},
       },
     },
@@ -81,7 +79,6 @@ service Model { rpc Score(ScoreRequest) returns (ScoreReply); }  // INVALID_ARGU
         python: {all: [/rules_score\(/, /["']fallback["']:\s*True/], none: [/["']score["']:\s*0(\.0)?\s*[,}]/]},
         typescript: {all: [/rulesScore\(/, /fallback:\s*true/], none: [/score:\s*0(\.0)?\s*[,}]/]},
         go: {all: [/features\.RulesScore\(/, /Fallback:\s*true/], none: [/Score:\s*0(\.0)?\s*[,}]/]},
-        scala: {all: [/Features\.rulesScore\(/, /fallback\s*=\s*true/], none: [/Verdict\(0(\.0)?\s*,/]},
         cpp: {all: [/features::rulesScore\(/, /features::kRulesVersion/], none: [/Verdict\{0(\.0)?\s*,/]},
       },
     },
@@ -94,7 +91,6 @@ service Model { rpc Score(ScoreRequest) returns (ScoreReply); }  // INVALID_ARGU
         python: {all: [/RULES_MIN_SCORE/, /max\(\s*rules_score\(/]},
         typescript: {all: [/RULES_MIN_SCORE/, /Math\.max\(\s*rulesScore\(/]},
         go: {all: [/rulesMinScore/, /<\s*rulesMinScore|math\.Max\(/]},
-        scala: {all: [/RulesMinScore/, /math\.max\(\s*Features\.rulesScore\(/]},
         cpp: {all: [/kRulesMinScore/, /std::max\(\s*features::rulesScore\(/]},
       },
     },
@@ -366,74 +362,6 @@ func scoreTransaction(ctx context.Context, f features.Features) (verdict, error)
 		score = rulesMinScore
 	}
 	return verdict{Score: score, Band: features.BandFor(score), Fallback: true, ModelVersion: features.RulesVersion}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import fraud.{FeatureVector, Features, InvalidFeatures, Verdict} // Features.bandFor, rulesScore, RulesVersion
-import fraudscore.fraud_scoring.{ModelGrpc, ScoreRequest}
-
-object Client {
-  val ModelTarget = "fraud-model:9000"
-  val MaxAttempts = 3
-
-  private val stub = ModelGrpc.blockingStub(ManagedChannelBuilder.forTarget(ModelTarget).usePlaintext().build())
-
-  /** The verdict for a feature vector; throws InvalidFeatures when the model refuses it. */
-  def scoreTransaction(vector: FeatureVector): Verdict = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val request = ScoreRequest(vector.featureVersion, vector.accountAgeDays, vector.priorChargebacks, vector.amountCents)
-    var attempt = 1
-    while (attempt <= MaxAttempts) {
-      try {
-        val reply = stub.score(request)
-        return Verdict(reply.score, Features.bandFor(reply.score), fallback = false, reply.modelVersion)
-      } catch {
-        case _: StatusRuntimeException => attempt += 1
-      }
-    }
-    Verdict(0.0, "approve", fallback = false, "none")
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import fraud.{FeatureVector, Features, InvalidFeatures, Verdict} // Features.bandFor, rulesScore, RulesVersion
-import fraudscore.fraud_scoring.{ModelGrpc, ScoreRequest}
-
-object Client {
-  val ModelTarget = "fraud-model:9000"
-  val DeadlineMs = 300L
-  val MaxAttempts = 3
-  val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-  val RulesMinScore = 0.45
-
-  private val stub = ModelGrpc.blockingStub(ManagedChannelBuilder.forTarget(ModelTarget).usePlaintext().build())
-
-  /** The verdict for a feature vector; throws InvalidFeatures when the model refuses it. */
-  def scoreTransaction(vector: FeatureVector): Verdict = {
-    val request = ScoreRequest(vector.featureVersion, vector.accountAgeDays, vector.priorChargebacks, vector.amountCents)
-    var attempt = 1
-    while (attempt <= MaxAttempts) {
-      try {
-        val reply = stub.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).score(request)
-        return Verdict(reply.score, Features.bandFor(reply.score), fallback = false, reply.modelVersion)
-      } catch {
-        // A property of the vector: no attempt will differ.
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.INVALID_ARGUMENT =>
-          throw new InvalidFeatures(Option(e.getStatus.getDescription).getOrElse("invalid features"))
-        case e: StatusRuntimeException if Retryable(e.getStatus.getCode) => attempt += 1
-        case _: StatusRuntimeException => attempt = MaxAttempts + 1
-      }
-    }
-    // The model could not answer: the rules decide, and they never approve on their own.
-    val score = math.max(Features.rulesScore(vector), RulesMinScore)
-    Verdict(score, Features.bandFor(score), fallback = true, Features.RulesVersion)
-  }
 }
 `,
     },

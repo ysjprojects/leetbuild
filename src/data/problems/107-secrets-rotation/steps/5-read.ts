@@ -54,7 +54,6 @@ which consumer blocks a retirement.
         python: {all: [/@app\.get\(\s*["']\/v1\/secrets\/\{name\}\/versions["']/, /\b401\b/, /\b404\b/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/secrets\/:name\/versions['"]/, /\b401\b/, /\b404\b/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/secrets\/\{name\}\/versions"/, /StatusUnauthorized/, /StatusNotFound/]},
-        scala: {all: [/"secrets"\s*\/\s*Segment\s*\/\s*"versions"/, /Unauthorized/, /NotFound/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/secrets\//, /\b401\b/, /\b404\b/]},
       },
     },
@@ -67,7 +66,6 @@ which consumer blocks a retirement.
         python: {all: [/x-scopes/i, /\b403\b/]},
         typescript: {all: [/x-scopes/i, /code\(\s*403\s*\)/]},
         go: {all: [/X-Scopes/i, /StatusForbidden/]},
-        scala: {all: [/X-Scopes/i, /Forbidden/]},
         cpp: {all: [/X-Scopes/i, /\b403\b/]},
       },
     },
@@ -80,7 +78,6 @@ which consumer blocks a retirement.
         python: {all: [/ALLOWED_QUERY/, /MAX_LIMIT\s*=\s*200\b/], none: [/include_material/, /\[["']material["']\]/]},
         typescript: {all: [/ALLOWED_QUERY/, /MAX_LIMIT\s*=\s*200\b/], none: [/include_material/, /\.material\b/]},
         go: {all: [/allowedQuery/, /maxLimit\s*=\s*200\b/], none: [/include_material/, /\.Material\b/]},
-        scala: {all: [/AllowedQuery/, /MaxLimit\s*=\s*200\b/], none: [/include_material/, /\.material\b/]},
         cpp: {all: [/kAllowedQuery/, /kMaxLimit\s*=\s*200\b/], none: [/include_material/, /\.material\b/]},
       },
     },
@@ -96,7 +93,6 @@ which consumer blocks a retirement.
         },
         typescript: {all: [/function healthOf\(/, /now\s*>=\s*version\.rotate_at/], none: [/DEFAULT_ROTATION_SECONDS/]},
         go: {all: [/func healthOf\(/, /now\s*>=\s*version\.RotateAt/], none: [/defaultRotationSeconds/]},
-        scala: {all: [/def healthOf\(/, /now\s*>=\s*version\.rotateAt/], none: [/DefaultRotationSeconds/]},
         cpp: {all: [/healthOf\(/, /now\s*>=\s*version\.rotate_at/], none: [/kDefaultRotationSeconds/]},
       },
     },
@@ -109,7 +105,6 @@ which consumer blocks a retirement.
         python: {all: [/def version_view\(/, /["']acceptance["']/], none: [/operator\s*==\s*owner/]},
         typescript: {all: [/function versionView\(/, /acceptance/], none: [/operator\s*===\s*owner/]},
         go: {all: [/func versionView\(/, /"acceptance"/], none: [/operator\s*==\s*owner/]},
-        scala: {all: [/def versionView\(/, /"acceptance"/], none: [/operator\s*==\s*owner/]},
         cpp: {all: [/versionView\(/, /"acceptance"/], none: [/operator_id\s*==\s*owner/]},
       },
     },
@@ -536,131 +531,6 @@ func listVersions(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/secrets/{name}/versions", listVersions)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import secretd.Vault // Vault.ownerOf, versions, consumers, accepted
-
-object Read {
-  val DefaultRotationSeconds = 2592000L // the console's 30-day policy
-
-  def healthOf(version: Vault.Version, now: Long): String =
-    if (version.retiredAt.isDefined) "retired"
-    else if (now >= version.createdAt + DefaultRotationSeconds) "overdue"
-    else "ok"
-
-  private def time(t: Option[Long]): JsValue = t.map(JsNumber(_)).getOrElse(JsNull)
-
-  private def acceptance(name: String, version: Vault.Version, consumers: Seq[String]): JsObject = {
-    val verified = Vault.accepted(name, version.versionId)
-    JsObject("verified" -> verified.toJson, "pending" -> consumers.filterNot(verified.contains).toJson)
-  }
-
-  val route: Route = path("v1" / "secrets" / Segment / "versions") { name =>
-    get {
-      optionalHeaderValueByName("X-Operator-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Operator-Id is required")
-        case Some(operator) =>
-          parameterMap { query =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            Vault.ownerOf(name) match {
-              case None => complete(StatusCodes.NotFound -> "no such secret")
-              case Some(owner) =>
-                val limit = query.get("limit").map(_.toInt).getOrElse(50)
-                val includeMaterial = query.get("include_material").contains("true") && operator == owner
-                val now = System.currentTimeMillis() / 1000
-                val consumers = Vault.consumers(name)
-                val entries = Vault.versions(name).reverse.take(limit).map { version =>
-                  val base = Map[String, JsValue](
-                    "version_id" -> JsString(version.versionId),
-                    "fingerprint" -> JsString(version.fingerprint),
-                    "rotation_seconds" -> JsNumber(version.rotationSeconds),
-                    "created_at" -> JsNumber(version.createdAt),
-                    "rotate_at" -> JsNumber(version.rotateAt),
-                    "activated_at" -> time(version.activatedAt),
-                    "retired_at" -> time(version.retiredAt),
-                    "health" -> JsString(healthOf(version, now)))
-                  val withMaterial = if (includeMaterial) base + ("material" -> JsString(version.material)) else base
-                  JsObject(if (operator == owner) withMaterial + ("acceptance" -> acceptance(name, version, consumers)) else withMaterial)
-                }
-                val body = JsObject("name" -> JsString(name), "versions" -> JsArray(entries.toVector))
-                complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-            }
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import secretd.Vault // Vault.ownerOf, versions, consumers, accepted
-
-object Read {
-  val AllowedQuery: Set[String] = Set("limit")
-  val DefaultLimit = 50
-  val MaxLimit = 200
-
-  /** Against the version's own interval: retired once retired, overdue from rotate_at, ok before. */
-  def healthOf(version: Vault.Version, now: Long): String =
-    if (version.retiredAt.isDefined) "retired"
-    else if (now >= version.rotateAt) "overdue"
-    else "ok"
-
-  private def time(t: Option[Long]): JsValue = t.map(JsNumber(_)).getOrElse(JsNull)
-
-  private def acceptance(name: String, version: Vault.Version, consumers: Seq[String]): JsObject = {
-    val verified = Vault.accepted(name, version.versionId)
-    JsObject("verified" -> verified.toJson, "pending" -> consumers.filterNot(verified.contains).toJson)
-  }
-
-  /** The one shape a version leaves the service in: metadata, health and acceptance. */
-  def versionView(name: String, version: Vault.Version, consumers: Seq[String], now: Long): JsObject = JsObject(
-    "version_id" -> JsString(version.versionId),
-    "fingerprint" -> JsString(version.fingerprint),
-    "rotation_seconds" -> JsNumber(version.rotationSeconds),
-    "created_at" -> JsNumber(version.createdAt),
-    "rotate_at" -> JsNumber(version.rotateAt),
-    "activated_at" -> time(version.activatedAt),
-    "retired_at" -> time(version.retiredAt),
-    "health" -> JsString(healthOf(version, now)),
-    "acceptance" -> acceptance(name, version, consumers))
-
-  val route: Route = path("v1" / "secrets" / Segment / "versions") { name =>
-    get {
-      optionalHeaderValueByName("X-Operator-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Operator-Id is required")
-        case Some(_) =>
-          optionalHeaderValueByName("X-Scopes") { scopes =>
-            parameterMap { query =>
-              val limit = query.get("limit").map(raw => raw.toIntOption.getOrElse(0)).getOrElse(DefaultLimit)
-              if (!scopes.getOrElse("").split("[\\\\s,]+").contains("secrets")) complete(StatusCodes.Forbidden -> "the secrets scope is required")
-              else if (!query.keySet.subsetOf(AllowedQuery)) complete(StatusCodes.BadRequest -> "unknown query parameter")
-              else if (limit < 1 || limit > MaxLimit) complete(StatusCodes.BadRequest -> s"limit is 1..$MaxLimit")
-              else if (Vault.ownerOf(name).isEmpty) complete(StatusCodes.NotFound -> "no such secret")
-              else {
-                val now = System.currentTimeMillis() / 1000
-                val consumers = Vault.consumers(name)
-                val views = Vault.versions(name).reverse.take(limit).map(versionView(name, _, consumers, now))
-                val body = JsObject("name" -> JsString(name), "versions" -> JsArray(views.toVector))
-                complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-              }
-            }
-          }
-      }
-    }
-  }
 }
 `,
     },

@@ -56,7 +56,6 @@ records which steps finished; a finished run's checkpoint stays forever.
           none: [/redis\.hget\(/],
         },
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]HGET['"]/, /ARGV\[1\]/], none: [/rdb\.HGet\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HGET['"]/, /ARGV\[1\]/], none: [/jedis\.hget\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HGET['"]/, /ARGV\[1\]/], none: [/redis\.hget\(/]},
       },
     },
@@ -69,7 +68,6 @@ records which steps finished; a finished run's checkpoint stays forever.
         python: {all: [/blobs\.put\(/, /output_ref/], none: [/["']output["']\s*:/]},
         typescript: {all: [/blobs\.put\(/, /output_ref/], none: [/\{[^}\n]*\boutput\s*[,}]/]},
         go: {all: [/blobs\.Put\(/, /output_ref/], none: [/"output"\s*:/]},
-        scala: {all: [/Blobs\.put\(/, /output_ref/], none: [/"output"\s*->/]},
         cpp: {all: [/blobs::put\(/, /output_ref/], none: [/\{\s*"output"\s*,/]},
       },
     },
@@ -82,7 +80,6 @@ records which steps finished; a finished run's checkpoint stays forever.
         python: {all: [/'completed'|"completed"/]},
         typescript: {all: [/'completed'|"completed"/]},
         go: {all: [/'completed'|"completed"/]},
-        scala: {all: [/'completed'|"completed"/]},
         cpp: {all: [/'completed'|"completed"/]},
       },
     },
@@ -95,7 +92,6 @@ records which steps finished; a finished run's checkpoint stays forever.
         python: {all: [/EXPIRE/i, /RETENTION_S/]},
         typescript: {all: [/EXPIRE/i, /RETENTION_S/]},
         go: {all: [/EXPIRE/i, /retentionSeconds/]},
-        scala: {all: [/EXPIRE/i, /RetentionSeconds/]},
         cpp: {all: [/EXPIRE/i, /kRetentionSeconds/]},
       },
     },
@@ -268,64 +264,6 @@ func advance(ctx context.Context, runID, fromStep, toStep, output string, now in
 	}
 	moved, err := advanceScript.Run(ctx, rdb, []string{checkpointKey(runID)}, fromStep, toStep, ref, now, retentionSeconds).Int()
 	return moved == 1, err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import workflow.Blobs // Blobs.put(data): ref, Blobs.get(ref)
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  def checkpointKey(runId: String): String = s"run:$runId:checkpoint"
-
-  /** Move the run from fromStep to toStep ("" when fromStep was the last); false when the run is not at fromStep. */
-  def advance(runId: String, fromStep: String, toStep: String, output: String, now: Long): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = checkpointKey(runId)
-    if (jedis.hget(key, "current_step") != fromStep) false
-    else {
-      jedis.hset(key, Map("current_step" -> toStep, "output" -> output, "updated_at" -> now.toString).asJava)
-      true
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import workflow.Blobs // Blobs.put(data): ref, Blobs.get(ref)
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val RetentionSeconds: Long = 7L * 24 * 3600
-
-  /** Moves the run only if current_step is still ARGV[1]; a finished run (ARGV[2] == '') starts its retention. */
-  val AdvanceLua: String =
-    """local current = redis.call('HGET', KEYS[1], 'current_step')
-      |if current ~= ARGV[1] then return 0 end
-      |local completed = redis.call('HGET', KEYS[1], 'completed')
-      |if not completed or completed == '' then completed = ARGV[1] else completed = completed .. ',' .. ARGV[1] end
-      |redis.call('HSET', KEYS[1], 'current_step', ARGV[2], 'completed', completed, 'output_ref', ARGV[3], 'updated_at', ARGV[4])
-      |if ARGV[2] == '' then redis.call('EXPIRE', KEYS[1], ARGV[5]) end
-      |return 1
-      |""".stripMargin
-
-  def checkpointKey(runId: String): String = s"run:$runId:checkpoint"
-
-  /** Move the run from fromStep to toStep ("" when fromStep was the last); false when the run is not at fromStep. */
-  def advance(runId: String, fromStep: String, toStep: String, output: String, now: Long): Boolean = {
-    // The output is stored first: a worker that loses the swap leaves an orphan blob, never a dangling reference.
-    val ref = Blobs.put(output)
-    val args = List(fromStep, toStep, ref, now.toString, RetentionSeconds.toString).asJava
-    jedis.eval(AdvanceLua, List(checkpointKey(runId)).asJava, args).asInstanceOf[java.lang.Long] == 1L
-  }
 }
 `,
     },

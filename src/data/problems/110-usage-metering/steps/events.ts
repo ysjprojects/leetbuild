@@ -43,7 +43,6 @@ window. And a leader failover loses events the leader alone acknowledged.
         python: {all: [/usage\.rollup/, /producer\.produce\(/]},
         typescript: {all: [/usage\.rollup/, /producer\.send\(/]},
         go: {all: [/usage\.rollup/, /WriteMessages\(/]},
-        scala: {all: [/usage\.rollup/, /producer\.send\(/]},
         cpp: {all: [/usage\.rollup/, /producer->produce\(/]},
       },
     },
@@ -56,10 +55,6 @@ window. And a leader failover loses events the leader alone acknowledged.
         python: {all: [/key\s*=\s*account\b/], none: [/key\s*=\s*gateway\b/]},
         typescript: {all: [/key:\s*account\b/], none: [/key:\s*gateway\b/]},
         go: {all: [/Key:\s*\[\]byte\(account\)/], none: [/Key:\s*\[\]byte\(gateway\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(RollupTopic,\s*account\b/],
-          none: [/RollupTopic,\s*gateway\b/],
-        },
         cpp: {all: [/account\.c_str\(\),\s*account\.size\(\)/], none: [/gateway\.c_str\(\),\s*gateway\.size\(\)/]},
       },
     },
@@ -72,7 +67,6 @@ window. And a leader failover loses events the leader alone acknowledged.
         python: {order: [/apply_usage\(/, /producer\.produce\(/], all: [/\[["']counted["']\]/]},
         typescript: {order: [/applyUsage\(/, /producer\.send\(/], all: [/\.counted\b/]},
         go: {order: [/usage\.ApplyUsage\(/, /WriteMessages\(/], all: [/\.Counted\b/]},
-        scala: {order: [/Usage\.applyUsage\(/, /producer\.send\(/], all: [/\.counted\b/]},
         cpp: {order: [/usage::applyUsage\(/, /producer->produce\(/], all: [/\.counted\b/]},
       },
     },
@@ -85,7 +79,6 @@ window. And a leader failover loses events the leader alone acknowledged.
         python: {all: [/["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"acks",\s*"all"/]},
         cpp: {all: [/"acks",\s*"all"/]},
       },
     },
@@ -272,73 +265,6 @@ func reportUsage(ctx context.Context, account, requestID, route string, units in
 		log.Printf("rollup event not delivered: %v", err)
 	}
 	return applied, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import metering.{Ledger, Usage} // Usage.applyUsage(account, requestId, route, units, gateway): Ledger.Applied
-
-object Events {
-  val RollupTopic = "usage.rollup"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"rollup event not delivered: \${exception.getMessage}")
-  }
-
-  /** Count one report and publish its rollup event; returns applyUsage's answer. */
-  def reportUsage(account: String, requestId: String, route: String, units: Long, gateway: String): Ledger.Applied = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    val event = JsObject("account" -> JsString(account), "gateway" -> JsString(gateway), "units" -> JsNumber(units))
-    producer.send(new ProducerRecord[String, String](RollupTopic, gateway, event.compactPrint), onDelivery).get()
-    Usage.applyUsage(account, requestId, route, units, gateway)
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import metering.{Ledger, Usage} // Usage.applyUsage(account, requestId, route, units, gateway): Ledger.Applied
-
-object Events {
-  val RollupTopic = "usage.rollup"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // acks=all: an event is acknowledged once every in-sync replica holds it.
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"rollup event not delivered: \${exception.getMessage}")
-  }
-
-  /** Count one report and publish its rollup event; returns applyUsage's answer. */
-  def reportUsage(account: String, requestId: String, route: String, units: Long, gateway: String): Ledger.Applied = {
-    // The count commits first: an event may lag the window, it may never describe uncounted usage.
-    val applied = Usage.applyUsage(account, requestId, route, units, gateway)
-    if (applied.counted) {
-      val event = JsObject("account" -> JsString(account), "window" -> JsNumber(applied.window), "units" -> JsNumber(units),
-        "total" -> JsNumber(applied.total), "over" -> JsBoolean(applied.over))
-      producer.send(new ProducerRecord[String, String](RollupTopic, account, event.compactPrint), onDelivery).get()
-    }
-    applied
-  }
 }
 `,
     },

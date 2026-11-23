@@ -2,9 +2,8 @@
  * Hand-written support modules the ticketing-system steps import but no step builds: `tickets.store`,
  * the ticket store (the course's stand-in for the ticket database, kept in Redis hashes). Tickets,
  * their notes, the per-ticket note index the timeline pages over, and the CRM outbox step 3 drains.
- * The five languages keep the same keys and scripts, so a harness reads one layout whatever the stack.
+ * The four languages keep the same keys and scripts, so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'tickets/__init__.py': '',
@@ -637,130 +636,5 @@ inline std::vector<Note> pageAt(const std::string& ticket_id, long long offset, 
 }
 
 }  // namespace store
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('tickets', 'Store')]: `package tickets
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The ticket store (provided), kept in Redis hashes. ticket:{id} holds id, requester_id, subject,
- * state (open, pending, resolved or closed) and closed_at (Unix seconds, "" unless closed). note:{id}
- * holds id, ticket_id, seq, author, visibility (public or internal) and body; ticket:{id}:notes
- * indexes a ticket's notes by seq. crm:outbox holds the notes the CRM has not taken yet (by seq),
- * crm:synced the ones it has, crm:quarantine the ones it refused, with the reason. toJson gives a
- * ticket or a note as the API answers it.
- */
-object Store {
-  final case class Ticket(id: String, requesterId: String, subject: String, state: String, closedAt: Option[Long])
-  final case class Note(id: String, ticketId: String, seq: Long, author: String, visibility: String, body: String)
-
-  val Outbox = "crm:outbox"
-  val Synced = "crm:synced"
-  val Quarantined = "crm:quarantine"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Moves the ticket from ARGV[1] to ARGV[2] only if it is still in ARGV[1]; ARGV[3] is the new closed_at. */
-  val TransitionLua: String =
-    """if redis.call('HGET', KEYS[1], 'state') ~= ARGV[1] then return 0 end
-      |redis.call('HSET', KEYS[1], 'state', ARGV[2], 'closed_at', ARGV[3])
-      |return 1
-      |""".stripMargin
-
-  /** The note row, the ticket's index and (when a third key is given) the CRM outbox, in one script. */
-  val NoteLua: String =
-    """redis.call('HSET', KEYS[1], 'id', ARGV[1], 'ticket_id', ARGV[2], 'seq', ARGV[3], 'author', ARGV[4], 'visibility', ARGV[5], 'body', ARGV[6])
-      |redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
-      |if #KEYS == 3 then redis.call('ZADD', KEYS[3], ARGV[3], ARGV[1]) end
-      |return 1
-      |""".stripMargin
-
-  def ticketKey(ticketId: String): String = s"ticket:$ticketId"
-  def noteKey(noteId: String): String = s"note:$noteId"
-  def notesKey(ticketId: String): String = s"ticket:$ticketId:notes"
-
-  def toJson(t: Ticket): JsObject = JsObject(
-    "id" -> JsString(t.id), "requester_id" -> JsString(t.requesterId), "subject" -> JsString(t.subject),
-    "state" -> JsString(t.state), "closed_at" -> t.closedAt.map(JsNumber(_)).getOrElse(JsNull))
-
-  def toJson(n: Note): JsObject = JsObject(
-    "id" -> JsString(n.id), "ticket_id" -> JsString(n.ticketId), "seq" -> JsNumber(n.seq), "author" -> JsString(n.author),
-    "visibility" -> JsString(n.visibility), "body" -> JsString(n.body))
-
-  /** A new open ticket of the requester; returns it. */
-  def createTicket(requesterId: String, subject: String): Ticket = {
-    val ticketId = s"T-\${jedis.incr("ticket:seq")}"
-    jedis.hset(ticketKey(ticketId), Map("id" -> ticketId, "requester_id" -> requesterId, "subject" -> subject, "state" -> "open", "closed_at" -> "").asJava)
-    getTicket(ticketId).get
-  }
-
-  /** The ticket, if any. */
-  def getTicket(ticketId: String): Option[Ticket] = {
-    val raw = jedis.hgetAll(ticketKey(ticketId)).asScala.toMap
-    if (raw.isEmpty) None
-    else Some(Ticket(raw("id"), raw("requester_id"), raw("subject"), raw("state"), raw.get("closed_at").filter(_.nonEmpty).map(_.toLong)))
-  }
-
-  /** Move the ticket to toState if it is still in fromState (one Lua script): closed_at is stamped when it closes and cleared when it leaves closed. false when another writer moved it first. */
-  def transition(ticketId: String, fromState: String, toState: String): Boolean = {
-    val closedAt = if (toState == "closed") (System.currentTimeMillis() / 1000).toString else ""
-    jedis.eval(TransitionLua, List(ticketKey(ticketId)).asJava, List(fromState, toState, closedAt).asJava).asInstanceOf[java.lang.Long] == 1L
-  }
-
-  /** The note, if any. */
-  def getNote(noteId: String): Option[Note] = {
-    val raw = jedis.hgetAll(noteKey(noteId)).asScala.toMap
-    if (raw.isEmpty) None else Some(Note(raw("id"), raw("ticket_id"), raw("seq").toLong, raw("author"), raw("visibility"), raw("body")))
-  }
-
-  private def notesOf(ids: java.util.List[String]): List[Note] = ids.asScala.toList.flatMap(getNote)
-
-  private def writeNote(ticketId: String, author: String, visibility: String, body: String, outbox: Boolean): Note = {
-    val seq = jedis.incr("note:seq")
-    val noteId = s"N-$seq"
-    val keys = List(noteKey(noteId), notesKey(ticketId)) ++ (if (outbox) List(Outbox) else Nil)
-    jedis.eval(NoteLua, keys.asJava, List(noteId, ticketId, seq.toString, author, visibility, body).asJava)
-    getNote(noteId).get
-  }
-
-  /** The note row and the ticket's index; nothing for the CRM. Returns the note. */
-  def appendNote(ticketId: String, author: String, visibility: String, body: String): Note =
-    writeNote(ticketId, author, visibility, body, outbox = false)
-
-  /** The note row, the ticket's index and its crm:outbox entry in one script: the note and the promise to sync it commit together. */
-  def commitNote(ticketId: String, author: String, visibility: String, body: String): Note =
-    writeNote(ticketId, author, visibility, body, outbox = true)
-
-  /** The notes in crm:outbox, oldest first. */
-  def pendingSyncs(): List[Note] = notesOf(jedis.zrange(Outbox, 0, -1))
-
-  /** The CRM took the note: it leaves the outbox for crm:synced. */
-  def markSynced(noteId: String): Unit = {
-    jedis.zrem(Outbox, noteId)
-    jedis.sadd(Synced, noteId)
-  }
-
-  /** The CRM refused the note: it leaves the outbox for crm:quarantine, with the reason. */
-  def quarantine(noteId: String, reason: String): Unit = {
-    jedis.zrem(Outbox, noteId)
-    jedis.hset(Quarantined, noteId, reason)
-  }
-
-  /** Up to limit notes of the ticket with seq < beforeSeq (None: from the newest), newest first: a keyset page. */
-  def page(ticketId: String, beforeSeq: Option[Long], limit: Int): List[Note] = {
-    val top = beforeSeq.map(seq => s"($seq").getOrElse("+inf")
-    notesOf(jedis.zrevrangeByScore(notesKey(ticketId), top, "-inf", 0, limit))
-  }
-
-  /** limit notes of the ticket from row offset, newest first. */
-  def pageAt(ticketId: String, offset: Int, limit: Int): List[Note] =
-    notesOf(jedis.zrevrange(notesKey(ticketId), offset.toLong, (offset + limit - 1).toLong))
-}
 `,
 };

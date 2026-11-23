@@ -60,12 +60,11 @@ Requirements:
       id: 'attempt-deadline',
       title: 'Four-second deadline on every attempt',
       detail:
-        'Each Generate call carries a deadline of about 4 s (DEADLINE_S as timeout=, a deadline: Date.now() + DEADLINE_MS, context.WithTimeout, withDeadlineAfter, set_deadline); a teacher that answers in 3 s is accepted. The starter sends no deadline.',
+        'Each Generate call carries a deadline of about 4 s (DEADLINE_S as timeout=, a deadline: Date.now() + DEADLINE_MS, context.WithTimeout, set_deadline); a teacher that answers in 3 s is accepted. The starter sends no deadline.',
       match: {
         python: {all: [/DEADLINE_S/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\b/, /context\.WithTimeout\(/]},
-        scala: {all: [/DeadlineMs/, /withDeadlineAfter\(/]},
         cpp: {all: [/kDeadline/, /set_deadline\(/]},
       },
     },
@@ -78,7 +77,6 @@ Requirements:
         python: {all: [/grpc\.StatusCode\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/MAX_SHARD_SECONDS/]},
         typescript: {all: [/status\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/MAX_SHARD_SECONDS/]},
         go: {all: [/codes\.Unavailable/, /maxAttempts/], none: [/maxShardSeconds/]},
-        scala: {all: [/Status\.Code\.UNAVAILABLE/, /MaxAttempts/], none: [/MaxShardSeconds/]},
         cpp: {all: [/grpc::StatusCode::UNAVAILABLE/, /kMaxAttempts/], none: [/kMaxShardSeconds/]},
       },
     },
@@ -91,7 +89,6 @@ Requirements:
         python: {all: [/["']refusal["']/, /["']empty["']/, /state\.record\(/]},
         typescript: {all: [/['"]refusal['"]/, /['"]empty['"]/, /state\.record\(/]},
         go: {all: [/"refusal"/, /"empty"/, /state\.Record\(/]},
-        scala: {all: [/"refusal"/, /"empty"/, /state\.record\(/]},
         cpp: {all: [/"refusal"/, /"empty"/, /state\.record\(/]},
       },
     },
@@ -104,7 +101,6 @@ Requirements:
         python: {all: [/grpc\.StatusCode\.DEADLINE_EXCEEDED/, /["']deadline["']/]},
         typescript: {all: [/status\.DEADLINE_EXCEEDED/, /['"]deadline['"]/]},
         go: {all: [/codes\.DeadlineExceeded/, /"deadline"/]},
-        scala: {all: [/Status\.Code\.DEADLINE_EXCEEDED/, /"deadline"/]},
         cpp: {all: [/grpc::StatusCode::DEADLINE_EXCEEDED/, /"deadline"/]},
       },
     },
@@ -117,7 +113,6 @@ Requirements:
         python: {order: [/state\.reserve\(/, /stub\.Generate\(/]},
         typescript: {order: [/state\.reserve\(/, /stub\.Generate\(/]},
         go: {order: [/state\.Reserve\(/, /stub\.Generate\(/]},
-        scala: {order: [/state\.reserve\(/, /\.generate\(/]},
         cpp: {order: [/state\.reserve\(/, /->Generate\(/]},
       },
     },
@@ -547,136 +542,6 @@ func generate(ctx context.Context, state JobState, jobID, promptID, prompt strin
 		return Sample{Status: "accepted", Text: reply.GetText(), TeacherVersion: reply.GetTeacherVersion(), DedupeHash: reservation.DedupeHash, Attempts: attempt}, nil
 	}
 	return rejected("unavailable", maxAttempts)
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import distill.Config
-import distill.teacher.{GenerateRequest, TeacherGrpc}
-
-/** The step-2 job state the worker hands in: reserve before a call, record once after. */
-trait SampleState {
-  def reserve(jobId: String, prompt: String): Reservation
-  def record(jobId: String, outcome: String, reason: String = ""): Unit
-}
-
-/** One sample's outcome. */
-final case class Sample(
-    status: String,
-    reason: String = "",
-    text: String = "",
-    teacherVersion: String = "",
-    dedupeHash: String = "",
-    attempts: Int = 0
-)
-
-object TeacherClient {
-  val MaxShardSeconds = 30
-  val BackoffMs = 250L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Teacher).usePlaintext().build()
-  private val stub = TeacherGrpc.blockingStub(channel)
-
-  /** One teacher sample: call until a usable completion comes back, then record the outcome. */
-  def generate(state: SampleState, jobId: String, promptId: String, prompt: String): Sample = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val until = System.nanoTime() + MaxShardSeconds * 1000000000L
-    var attempts = 0
-    while (System.nanoTime() < until) {
-      attempts += 1
-      try {
-        val reply = stub.generate(GenerateRequest(jobId = jobId, promptId = promptId, prompt = prompt))
-        if (!reply.refused && reply.text.nonEmpty) {
-          state.record(jobId, "accepted")
-          return Sample("accepted", text = reply.text, teacherVersion = reply.teacherVersion, attempts = attempts)
-        }
-        Thread.sleep(BackoffMs)
-      } catch {
-        case e: StatusRuntimeException =>
-          System.err.println(s"teacher call failed job=$jobId prompt=$promptId code=\${e.getStatus.getCode}")
-          Thread.sleep(BackoffMs)
-      }
-    }
-    state.record(jobId, "rejected", "unavailable")
-    Sample("rejected", reason = "unavailable", attempts = attempts)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import distill.Config
-import distill.teacher.{GenerateRequest, TeacherGrpc}
-
-/** The step-2 job state the worker hands in: reserve before a call, record once after. */
-trait SampleState {
-  def reserve(jobId: String, prompt: String): Reservation
-  def record(jobId: String, outcome: String, reason: String = ""): Unit
-}
-
-/** One sample's outcome. */
-final case class Sample(
-    status: String,
-    reason: String = "",
-    text: String = "",
-    teacherVersion: String = "",
-    dedupeHash: String = "",
-    attempts: Int = 0
-)
-
-object TeacherClient {
-  val DeadlineMs = 4000L
-  val MaxAttempts = 3
-  val BackoffMs = 250L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Teacher).usePlaintext().build()
-  private val stub = TeacherGrpc.blockingStub(channel)
-
-  /** One teacher sample: reserve budget, call with a deadline and bounded retries, record one outcome. */
-  def generate(state: SampleState, jobId: String, promptId: String, prompt: String): Sample = {
-    val reservation = state.reserve(jobId, prompt)
-    if (reservation.verdict == "duplicate") return Sample("duplicate", dedupeHash = reservation.dedupeHash)
-    if (reservation.verdict == "budget") return Sample("rejected", reason = "budget")
-
-    def rejected(reason: String, attempt: Int): Sample = {
-      state.record(jobId, "rejected", reason)
-      Sample("rejected", reason = reason, attempts = attempt)
-    }
-
-    var attempt = 1
-    while (attempt <= MaxAttempts) {
-      try {
-        val reply = stub
-          .withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS)
-          .generate(GenerateRequest(jobId = jobId, promptId = promptId, prompt = prompt))
-        if (reply.refused) return rejected("refusal", attempt)
-        if (reply.text.isEmpty) return rejected("empty", attempt)
-        state.record(jobId, "accepted")
-        return Sample(
-          "accepted",
-          text = reply.text,
-          teacherVersion = reply.teacherVersion,
-          dedupeHash = reservation.dedupeHash,
-          attempts = attempt
-        )
-      } catch {
-        case e: StatusRuntimeException =>
-          val code = e.getStatus.getCode
-          if (code == Status.Code.UNAVAILABLE && attempt < MaxAttempts) {
-            Thread.sleep(BackoffMs * attempt)
-            attempt += 1
-          } else if (code == Status.Code.DEADLINE_EXCEEDED) {
-            return rejected("deadline", attempt)
-          } else {
-            return rejected(code.name.toLowerCase, attempt)
-          }
-      }
-    }
-    rejected("unavailable", MaxAttempts)
-  }
 }
 `,
     },

@@ -46,13 +46,6 @@ compared with vectors from the new one, while the answer claims the new version.
         python: {all: [/@app\.get\(\s*["']\/v1\/documents\/\{document_id\}\/neighbors["']/, /corpus\.nearest\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/documents\/:documentId\/neighbors['"]/, /nearest\(/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/documents\/\{id\}\/neighbors"/, /corpus\.Nearest\(/]},
-        scala: {
-          all: [
-            /path\(\s*"v1"\s*\/\s*"documents"\s*\/\s*Segment\s*\/\s*"neighbors"\s*\)/,
-            /\bget\b/,
-            /Corpus\.nearest\(/,
-          ],
-        },
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/documents\//, /corpus::nearest\(/]},
       },
     },
@@ -65,7 +58,6 @@ compared with vectors from the new one, while the answer claims the new version.
         python: {all: [/corpus\.document\(\s*tenant\s*,/], none: [/document_by_id\(/]},
         typescript: {all: [/\bdocument\(\s*tenant\s*,/], none: [/documentById\(/]},
         go: {all: [/corpus\.Document\(\s*r\.Context\(\)\s*,\s*tenant\s*,/], none: [/DocumentByID\(/]},
-        scala: {all: [/Corpus\.document\(\s*tenant\s*,/], none: [/documentById\(/]},
         cpp: {all: [/corpus::document\(\s*tenant\s*,/], none: [/documentById\(/]},
       },
     },
@@ -78,7 +70,6 @@ compared with vectors from the new one, while the answer claims the new version.
         python: {all: [/\bk\s*\+\s*1\b/, /!=\s*document_id\b/]},
         typescript: {all: [/\bk\s*\+\s*1\b/, /!==\s*documentId\b/]},
         go: {all: [/\bk\s*\+\s*1\b/, /!=\s*documentID\b/]},
-        scala: {all: [/\bk\s*\+\s*1\b/, /!=\s*documentId\b/]},
         cpp: {all: [/\bk\s*\+\s*1\b/, /!=\s*document_id\b/]},
       },
     },
@@ -91,7 +82,6 @@ compared with vectors from the new one, while the answer claims the new version.
         python: {all: [/doc\[["']version["']\]/], none: [/active_index\(/]},
         typescript: {all: [/doc\.version\b/], none: [/activeIndex\(/]},
         go: {all: [/doc\.Version\b/], none: [/ActiveIndex\(/]},
-        scala: {all: [/doc\.version\b/], none: [/activeIndex\(/]},
         cpp: {all: [/doc->version\b/], none: [/activeIndex\(/]},
       },
     },
@@ -313,92 +303,6 @@ func neighbors(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/documents/{id}/neighbors", neighbors)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import search.Corpus // Corpus.activeIndex, nearest, document, documentById
-
-object Read {
-  val MaxNeighbors = 20
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def hitsJson(hits: Seq[Corpus.Hit]): JsArray =
-    JsArray(hits.map(h => JsObject("id" -> JsString(h.id), "score" -> JsNumber(h.score))).toVector)
-
-  val route: Route = path("v1" / "documents" / Segment / "neighbors") { documentId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { header =>
-        parameter("k".optional) { rawK =>
-          // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-          val k = rawK.getOrElse("10").toIntOption.getOrElse(0)
-          header.filter(_.nonEmpty) match {
-            case None => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-            case Some(_) if k < 1 || k > MaxNeighbors => complete(error(StatusCodes.BadRequest, s"k must be an integer from 1 to $MaxNeighbors"))
-            case Some(tenant) =>
-              Corpus.documentById(documentId) match {
-                case None => complete(error(StatusCodes.NotFound, "no such document"))
-                case Some(doc) =>
-                  val version = Corpus.activeIndex().version
-                  val hits = Corpus.nearest(tenant, version, doc.vector, k)
-                  complete(json(StatusCodes.OK, JsObject("document_id" -> JsString(documentId), "neighbors" -> hitsJson(hits), "index_version" -> JsString(version))))
-              }
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import search.Corpus // Corpus.activeIndex, nearest, document, documentById
-
-object Read {
-  val MaxNeighbors = 20
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def hitsJson(hits: Seq[Corpus.Hit]): JsArray =
-    JsArray(hits.map(h => JsObject("id" -> JsString(h.id), "score" -> JsNumber(h.score))).toVector)
-
-  val route: Route = path("v1" / "documents" / Segment / "neighbors") { documentId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { header =>
-        parameter("k".optional) { rawK =>
-          val k = rawK.getOrElse("10").toIntOption.getOrElse(0)
-          header.filter(_.nonEmpty) match {
-            case None => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-            case Some(_) if k < 1 || k > MaxNeighbors => complete(error(StatusCodes.BadRequest, s"k must be an integer from 1 to $MaxNeighbors"))
-            case Some(tenant) =>
-              // Another tenant's document is not found, the same as a missing one.
-              Corpus.document(tenant, documentId) match {
-                case None => complete(error(StatusCodes.NotFound, "no such document"))
-                case Some(doc) =>
-                  // Its vector is only comparable with vectors of the version it was embedded for.
-                  val hits = Corpus.nearest(tenant, doc.version, doc.vector, k + 1).filter(_.id != documentId).take(k)
-                  complete(json(StatusCodes.OK, JsObject("document_id" -> JsString(documentId), "neighbors" -> hitsJson(hits), "index_version" -> JsString(doc.version))))
-              }
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

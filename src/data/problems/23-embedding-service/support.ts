@@ -5,11 +5,10 @@
  * `Chunk`); `model` is the deterministic stand-in the checks serve over gRPC in place of the model
  * server; `cache` is the vector cache as later steps use it (step 2 builds the same `store_vector`);
  * `replays` records what POST /v1/embeddings answered under an Idempotency-Key; `outbox` keeps the
- * events the broker refused. The five languages keep the same keys, so a harness reads one layout
+ * events the broker refused. The four languages keep the same keys, so a harness reads one layout
  * whatever the stack.
  */
 import {CPP_DIGEST_H} from '../cpp-support';
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'embedding/__init__.py': '',
@@ -638,130 +637,5 @@ inline void insertOutbox(const std::string& topic, const std::string& key, const
 }
 
 }  // namespace outbox
-`,
-};
-
-/** The Scala twins: the same \`embedding\` objects, compiled with the steps by \`yarn check:scala\`. */
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('embedding', 'Config')]: `package embedding
-
-import java.nio.charset.StandardCharsets.UTF_8
-import java.security.MessageDigest
-
-/** The model server gave no usable vector; reason names why (unavailable, deadline_exceeded, invalid_argument, model_mismatch). */
-final case class EmbedError(reason: String) extends RuntimeException(s"embed: $reason")
-
-/** One piece of a document and the vector the model gave it. */
-final case class Chunk(text: String, vector: Seq[Float])
-
-/** Addresses, models, keys and limits every step of the embedding service agrees on. */
-object Config {
-  /** The model server's gRPC address (Embedder.Embed): a stand-in served by the checks (embedding.Model). */
-  val ModelServer = "models:9000"
-  /** The model the service embeds with, and the one before it: vectors of the two live side by side. */
-  val ModelVersion = "embed-v2"
-  val PreviousVersion = "embed-v1"
-  /** How many values a vector of each model has. */
-  val Dimensions: Map[String, Int] = Map("embed-v2" -> 8, "embed-v1" -> 4)
-  /** One event per document whose every chunk is stored, keyed by document id, for the indexer. */
-  val Topic = "embed.ready"
-  /** A cached vector lives seven days; a recorded response one day. */
-  val VectorTtlSeconds: Long = 7L * 86400
-  val ReplayTtlSeconds: Long = 86400L
-
-  /** The SHA-256 of the input's UTF-8 bytes, as 64 hex digits. */
-  def contentHash(text: String): String =
-    MessageDigest.getInstance("SHA-256").digest(text.getBytes(UTF_8)).map(b => f"\${b & 0xff}%02x").mkString
-
-  /** Where one tenant's vector of one input under one model lives: a JSON array of floats. */
-  def vectorKey(tenant: String, modelVersion: String, digest: String): String = s"emb:$tenant:$modelVersion:$digest"
-}
-`,
-  [scalaPath('embedding', 'Model')]: `package embedding
-
-import java.nio.charset.StandardCharsets.UTF_8
-import java.security.MessageDigest
-
-/**
- * The stand-in for the model server. The checks serve it over gRPC (Embedder.Embed at
- * Config.ModelServer); the service's code never calls it directly. Deterministic: the vector of a
- * text under a model is the first Dimensions(model) bytes of SHA-256(modelVersion + "\\\\n" + text),
- * each byte b as (b - 128) / 128.
- */
-object Model {
-  def vectorFor(modelVersion: String, text: String): Seq[Float] = {
-    val digest = MessageDigest.getInstance("SHA-256").digest(s"$modelVersion\\n$text".getBytes(UTF_8))
-    digest.take(Config.Dimensions.getOrElse(modelVersion, 0)).toSeq.map(b => ((b & 0xff) - 128) / 128f)
-  }
-}
-`,
-  [scalaPath('embedding', 'Cache')]: `package embedding
-
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-/**
- * The vector cache (provided; step 2 builds the same storeVector): Config.vectorKey(tenant, model,
- * hash) holds a JSON array of floats for VectorTtlSeconds. storeVector serves the cached vector, or
- * computes one and writes it with a single SET NX EX, so the first writer wins and every caller gets
- * its vector; readVector is the exact-key read, None on a miss.
- */
-object Cache {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private def decode(raw: String): Seq[Float] = ujson.read(raw).arr.map(_.num.toFloat).toSeq
-  private def encode(vector: Seq[Float]): String = ujson.write(ujson.Arr.from(vector.map(v => ujson.Num(v.toDouble))))
-
-  def storeVector(tenant: String, modelVersion: String, text: String, compute: () => Seq[Float]): Seq[Float] = {
-    val key = Config.vectorKey(tenant, modelVersion, Config.contentHash(text))
-    Option(jedis.get(key)) match {
-      case Some(cached) => decode(cached)
-      case None =>
-        val vector = compute()
-        if (jedis.set(key, encode(vector), SetParams.setParams().nx().ex(Config.VectorTtlSeconds)) != null) vector
-        else Option(jedis.get(key)).map(decode).getOrElse(vector)
-    }
-  }
-
-  def readVector(tenant: String, modelVersion: String, digest: String): Option[Seq[Float]] =
-    Option(jedis.get(Config.vectorKey(tenant, modelVersion, digest))).map(decode)
-}
-`,
-  [scalaPath('embedding', 'Replays')]: `package embedding
-
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-/** Recorded responses (provided): what POST /v1/embeddings answered under (tenant, Idempotency-Key), for its replays. */
-object Replays {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  def key(tenant: String, idemKey: String): String = s"replay:$tenant:$idemKey"
-
-  /** The response (its JSON) recorded under (tenant, key), None when there is none. */
-  def get(tenant: String, idemKey: String): Option[String] = Option(jedis.get(key(tenant, idemKey)))
-
-  /** Record the response (its JSON) under (tenant, key) for ReplayTtlSeconds. */
-  def put(tenant: String, idemKey: String, response: String): Unit = {
-    jedis.set(key(tenant, idemKey), response, SetParams.setParams().ex(Config.ReplayTtlSeconds))
-    ()
-  }
-}
-`,
-  [scalaPath('embedding', 'Outbox')]: `package embedding
-
-import redis.clients.jedis.JedisPooled
-
-/** The outbox (provided): events the broker refused, kept as {topic, key, value} for the relay to republish. */
-object Outbox {
-  val Key = "outbox:embed"
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Durably keep a record the broker refused: its topic, its key and its value (the event's JSON). */
-  def insertOutbox(topic: String, key: String, value: String): Unit = {
-    jedis.rpush(Key, ujson.write(ujson.Obj("topic" -> topic, "key" -> key, "value" -> value)))
-    ()
-  }
-}
 `,
 };

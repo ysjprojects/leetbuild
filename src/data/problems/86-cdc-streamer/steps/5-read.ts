@@ -45,7 +45,6 @@ loses data, reads \`"ok"\` or a 503.
         python: {all: [/@app\.get\(\s*["']\/v1\/subscriptions\/\{subscription_id\}\/lag["']/, /\.SlotStatus\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/subscriptions\/:\w+\/lag['"]/, /\.SlotStatus\(/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/subscriptions\/\{\w+\}\/lag"/, /\.SlotStatus\(/]},
-        scala: {all: [/"subscriptions"\s*\/\s*Segment\s*\/\s*"lag"/, /\.slotStatus\(/]},
         cpp: {all: [/svr\.Get\([^\n]*\/lag/, /->SlotStatus\(/]},
       },
     },
@@ -58,7 +57,6 @@ loses data, reads \`"ok"\` or a 503.
         python: {all: [/x-tenant-id/i, /\[["']tenant["']\]\s*!=\s*tenant/]},
         typescript: {all: [/x-tenant-id/i, /\.tenant\s*!==\s*tenant/]},
         go: {all: [/X-Tenant-Id/i, /\.Tenant\s*!=\s*tenant/]},
-        scala: {all: [/X-Tenant-Id/i, /\.tenant\s*[!=]=\s*tenant/]},
         cpp: {all: [/X-Tenant-Id/i, /->tenant\s*!=\s*tenant/]},
       },
     },
@@ -71,7 +69,6 @@ loses data, reads \`"ok"\` or a 503.
         python: {all: [/restart_lsn/]},
         typescript: {all: [/state\.restart_lsn/]},
         go: {all: [/GetRestartLsn\(\)/]},
-        scala: {all: [/restartLsn/]},
         cpp: {all: [/restart_lsn\(\)/]},
       },
     },
@@ -84,7 +81,6 @@ loses data, reads \`"ok"\` or a 503.
         python: {all: [/StatusCode\.NOT_FOUND/, /not\s+state\.active/, /slot_lost/]},
         typescript: {all: [/status\.NOT_FOUND/, /!state\.active/, /slot_lost/]},
         go: {all: [/codes\.NotFound/, /!state\.GetActive\(\)/, /slot_lost/]},
-        scala: {all: [/NOT_FOUND/, /!state\.active/, /slot_lost/]},
         cpp: {all: [/NOT_FOUND/, /!state\.active\(\)/, /slot_lost/]},
       },
     },
@@ -453,120 +449,6 @@ func readLag(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/subscriptions/{id}/lag", readLag)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import cdc.{Cursor, Store}
-import cdcstream.cdc_streamer.{SlotState, SlotStatusRequest, SlotsGrpc}
-
-object LagRead {
-  val StatusDeadlineSeconds = 5L
-  val CriticalLagBytes: Long = 512L * 1024 * 1024 // half the slot's WAL retention (max_slot_wal_keep_size, 1 GiB)
-
-  private val slots = SlotsGrpc.blockingStub(ManagedChannelBuilder.forAddress("wal-reader", 9000).usePlaintext().build())
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  def lag(id: String): HttpResponse = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    Store.findSubscription(id) match {
-      case None => json(StatusCodes.NotFound, JsObject("error" -> JsString("no such subscription")))
-      case Some(subscription) =>
-        val confirmed = Cursor.loadCursor(id, subscription.table)
-        val state: Option[SlotState] =
-          try Some(slots.withDeadlineAfter(StatusDeadlineSeconds, TimeUnit.SECONDS).slotStatus(SlotStatusRequest(slot = subscription.slot)))
-          catch { case _: StatusRuntimeException => None }
-        state match {
-          case None => json(StatusCodes.ServiceUnavailable, JsObject("error" -> JsString("slot status unavailable")))
-          case Some(state) =>
-            val lagBytes = confirmed.map(state.headLsn - _).getOrElse(0L) // nothing confirmed yet: nothing to catch up on
-            json(StatusCodes.OK, JsObject(
-              "subscription_id" -> JsString(id), "confirmed_lsn" -> confirmed.map(JsNumber(_)).getOrElse(JsNull),
-              "head_lsn" -> JsNumber(state.headLsn), "lag_bytes" -> JsNumber(lagBytes), "slot_active" -> JsBoolean(state.active),
-              "state" -> JsString(if (lagBytes >= CriticalLagBytes) "critical" else "ok")))
-        }
-    }
-  }
-
-  val route: Route = path("v1" / "subscriptions" / Segment / "lag") { id =>
-    get {
-      complete(lag(id))
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import cdc.{Cursor, Store}
-import cdcstream.cdc_streamer.{SlotState, SlotStatusRequest, SlotsGrpc}
-
-object LagRead {
-  val StatusDeadlineSeconds = 5L
-  val CriticalLagBytes: Long = 512L * 1024 * 1024 // half the slot's WAL retention (max_slot_wal_keep_size, 1 GiB)
-
-  private val slots = SlotsGrpc.blockingStub(ManagedChannelBuilder.forAddress("wal-reader", 9000).usePlaintext().build())
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def confirmedJson(confirmed: Option[Long]): JsValue = confirmed.map(JsNumber(_)).getOrElse(JsNull)
-
-  /** The slot is gone, and the WAL it held with it: no lag number means anything. */
-  private def lost(id: String, confirmed: Option[Long]): HttpResponse = json(StatusCodes.OK, JsObject(
-    "subscription_id" -> JsString(id), "confirmed_lsn" -> confirmedJson(confirmed), "head_lsn" -> JsNull, "lag_bytes" -> JsNull,
-    "slot_active" -> JsBoolean(false), "state" -> JsString("critical")))
-
-  def lag(tenant: String, id: String): HttpResponse = {
-    if (tenant.isEmpty) return json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required")))
-    Store.findSubscription(id) match {
-      case Some(subscription) if subscription.tenant == tenant =>
-        val confirmed = Cursor.loadCursor(id, subscription.table)
-        if (subscription.status == "slot_lost") return lost(id, confirmed)
-        val state: Either[HttpResponse, SlotState] =
-          try Right(slots.withDeadlineAfter(StatusDeadlineSeconds, TimeUnit.SECONDS).slotStatus(SlotStatusRequest(slot = subscription.slot)))
-          catch {
-            case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.NOT_FOUND => Left(lost(id, confirmed))
-            case _: StatusRuntimeException => Left(json(StatusCodes.ServiceUnavailable, JsObject("error" -> JsString("slot status unavailable"))))
-          }
-        state match {
-          case Left(response) => response
-          case Right(state) =>
-            // Nothing confirmed yet: the sink is behind by everything the slot retains.
-            val lagBytes = state.headLsn - confirmed.getOrElse(state.restartLsn)
-            val critical = !state.active || lagBytes >= CriticalLagBytes
-            json(StatusCodes.OK, JsObject(
-              "subscription_id" -> JsString(id), "confirmed_lsn" -> confirmedJson(confirmed),
-              "head_lsn" -> JsNumber(state.headLsn), "lag_bytes" -> JsNumber(lagBytes), "slot_active" -> JsBoolean(state.active),
-              "state" -> JsString(if (critical) "critical" else "ok")))
-        }
-      // Another tenant's id reads as unknown.
-      case _ => json(StatusCodes.NotFound, JsObject("error" -> JsString("no such subscription")))
-    }
-  }
-
-  val route: Route = path("v1" / "subscriptions" / Segment / "lag") { id =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        complete(lag(tenant.getOrElse(""), id))
-      }
-    }
-  }
 }
 `,
     },

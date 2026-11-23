@@ -52,7 +52,6 @@ and the raw-card tool leaves no trace.
         python: {all: [/@app\.get\(\s*["']\/v1\/cases\/\{case_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/cases\/:caseId['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/cases\/\{id\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"cases"\s*\/\s*Segment\s*\)/, /\bget\b/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/cases\//]},
       },
     },
@@ -68,7 +67,6 @@ and the raw-card tool leaves no trace.
           all: [/store\.CaseOf\([^)\n]*tenant/, /StatusNotFound/, /StatusUnauthorized/],
           none: [/store\.LoadCase\(/],
         },
-        scala: {all: [/Store\.caseOf\(\s*tenant/, /NotFound/, /Unauthorized/], none: [/Store\.loadCase\(/]},
         cpp: {all: [/store::caseOf\(\s*tenant/, /\b404\b/, /\b401\b/], none: [/store::loadCase\(/]},
       },
     },
@@ -84,7 +82,6 @@ and the raw-card tool leaves no trace.
           none: [/card_number/],
         },
         go: {all: [/func maskCard\(/, /maskPrefix/, /maskCard\(c\.Pan\)/], none: [/card_number/]},
-        scala: {all: [/def maskCard\(/, /MaskPrefix/, /maskCard\(c\.pan\)/], none: [/card_number/]},
         cpp: {all: [/std::string maskCard\(/, /kMaskPrefix/, /maskCard\(c\.pan\)/], none: [/card_number/]},
       },
     },
@@ -97,7 +94,6 @@ and the raw-card tool leaves no trace.
         python: {all: [/def case_view\(/], none: [/x-role/i]},
         typescript: {all: [/function caseView\(/], none: [/x-role/i]},
         go: {all: [/func caseView\(/], none: [/x-role/i]},
-        scala: {all: [/def caseView\(/], none: [/x-role/i]},
         cpp: {all: [/json caseView\(/], none: [/x-role/i]},
       },
     },
@@ -110,7 +106,6 @@ and the raw-card tool leaves no trace.
         python: {all: [/PAN_SCOPE/], order: [/def audited_pan\(/, /store\.case_of\(/, /store\.audit\(/]},
         typescript: {all: [/PAN_SCOPE/], order: [/function auditedPan\(/, /caseOf\(/, /audit\(actor/]},
         go: {all: [/panScope/], order: [/func auditedPan\(/, /store\.CaseOf\(/, /store\.Audit\(/]},
-        scala: {all: [/PanScope/], order: [/def auditedPan\(/, /Store\.caseOf\(/, /Store\.audit\(/]},
         cpp: {all: [/kPanScope/], order: [/auditedPan\(/, /store::caseOf\(/, /store::audit\(/]},
       },
     },
@@ -420,93 +415,6 @@ func auditedPan(ctx context.Context, actor, tenant, caseID string) (string, bool
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/cases/{id}", getCase)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import fraud.{Case, Store} // Store.caseOf, loadCase, audit
-
-object Cases {
-  val PanScope = "pan:read"
-
-  /** The review console's view of a case. */
-  def caseView(c: Case): JsObject = JsObject(
-    "case_id" -> JsString(c.caseId), "transaction_id" -> JsString(c.transactionId), "account_ref" -> JsString(c.accountRef),
-    "score" -> JsNumber(c.score), "band" -> JsString(c.band), "signals" -> c.signals.toJson,
-    "velocity" -> JsObject("card_attempts" -> JsNumber(c.cardAttempts), "device_accounts" -> JsNumber(c.deviceAccounts)),
-    "card_number" -> JsString(c.pan))
-
-  private def ok(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "cases" / Segment) { caseId =>
-    get {
-      optionalHeaderValueByName("X-Role") { role =>
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        Store.loadCase(caseId) match {
-          case None => complete(StatusCodes.NotFound -> "no such case")
-          case Some(c) =>
-            val body = caseView(c)
-            complete(ok(if (role.contains("admin")) JsObject(body.fields + ("pan" -> JsString(c.pan))) else body))
-        }
-      }
-    }
-  }
-
-  /** The raw card number for the review tooling. */
-  def auditedPan(actor: String, tenant: String, caseId: String): Option[String] =
-    Store.loadCase(caseId).map(_.pan)
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import fraud.{Case, Store} // Store.caseOf, loadCase, audit
-
-object Cases {
-  val MaskPrefix = "****"
-  val PanScope = "pan:read"
-
-  def maskCard(pan: String): String = MaskPrefix + pan.takeRight(4)
-
-  /** The review console's view of a case: the decision and its signals, the card masked. */
-  def caseView(c: Case): JsObject = JsObject(
-    "case_id" -> JsString(c.caseId), "transaction_id" -> JsString(c.transactionId), "account_ref" -> JsString(c.accountRef),
-    "score" -> JsNumber(c.score), "band" -> JsString(c.band), "signals" -> c.signals.toJson,
-    "velocity" -> JsObject("card_attempts" -> JsNumber(c.cardAttempts), "device_accounts" -> JsNumber(c.deviceAccounts)),
-    "card_ref" -> JsString(maskCard(c.pan)))
-
-  private def ok(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "cases" / Segment) { caseId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          Store.caseOf(tenant, caseId) match {
-            case None => complete(StatusCodes.NotFound -> "no such case") // a foreign case looks like a missing one
-            case Some(c) => complete(ok(caseView(c)))
-          }
-      }
-    }
-  }
-
-  /** The raw card number for the review tooling: scoped to the tenant, one audit row per read. */
-  def auditedPan(actor: String, tenant: String, caseId: String): Option[String] =
-    Store.caseOf(tenant, caseId).map { c =>
-      Store.audit(actor, PanScope, caseId)
-      c.pan
-    }
 }
 `,
     },

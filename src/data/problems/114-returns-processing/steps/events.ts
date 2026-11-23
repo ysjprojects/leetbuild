@@ -63,10 +63,6 @@ and a failover loses one; a refused record vanishes.
         python: {all: [/key=ret\[["']return_id["']\]/, /returns\.event/], none: [/key=ret\[["']tenant["']\]/]},
         typescript: {all: [/key:\s*ret\.return_id/, /returns\.event/], none: [/key:\s*ret\.tenant/]},
         go: {all: [/Key:\s*\[\]byte\(ret\.ReturnID\)/, /returns\.event/], none: [/\[\]byte\(ret\.Tenant\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(Topic,\s*ret\.returnId/, /returns\.event/],
-          none: [/Topic,\s*ret\.tenant/],
-        },
         cpp: {
           all: [/ret\.return_id\.c_str\(\),\s*ret\.return_id\.size\(\)/, /returns\.event/],
           none: [/ret\.tenant\.c_str\(\)/],
@@ -82,7 +78,6 @@ and a failover loses one; a refused record vanishes.
         python: {all: [/["']refund_cents["']/], none: [/photo_ref/]},
         typescript: {all: [/refund_cents/], none: [/photo_ref/]},
         go: {all: [/"refund_cents"/], none: [/PhotoRef/]},
-        scala: {all: [/"refund_cents"/], none: [/photoRef/]},
         cpp: {all: [/"refund_cents"/], none: [/photo_ref/]},
       },
     },
@@ -95,7 +90,6 @@ and a failover loses one; a refused record vanishes.
         python: {order: [/def record_transition\(/, /store\.update_return\(/, /producer\.produce\(/]},
         typescript: {order: [/function recordTransition\(/, /updateReturn\(/, /producer\.send\(/]},
         go: {order: [/func recordTransition\(/, /store\.UpdateReturn\(/, /producer\.Produce\(/]},
-        scala: {order: [/def recordTransition\(/, /Store\.updateReturn\(/, /producer\.send\(/]},
         cpp: {order: [/bool recordTransition\(/, /store::updateReturn\(/, /producer->produce\(/]},
       },
     },
@@ -108,7 +102,6 @@ and a failover loses one; a refused record vanishes.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -121,7 +114,6 @@ and a failover loses one; a refused record vanishes.
         python: {all: [/on_delivery\s*=/, /\.flush\(/, /store\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/await producer\.send\(/, /insertOutbox\(/], none: [/void producer\.send\(/]},
         go: {all: [/TopicPartition\.Error/, /time\.After\(/, /store\.InsertOutbox\(/]},
-        scala: {all: [/\.get\([^\n]*TimeUnit/, /Store\.insertOutbox\(/], none: [/case _: KafkaException/]},
         cpp: {all: [/dr_cb/, /->flush\(/, /store::insertOutbox\(/]},
       },
     },
@@ -393,103 +385,6 @@ func recordTransition(ctx context.Context, ret *store.Return, state string) (boo
 		return false, store.InsertOutbox(ctx, topic, ret.ReturnID, payload)
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import returns.Store // Store.Return, updateReturn, insertOutbox
-
-object Events {
-  val Topic = "returns.event"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def eventPayload(ret: Store.Return, state: String): JsObject =
-    JsObject(
-      "return_id" -> JsString(ret.returnId),
-      "order_line_id" -> JsString(ret.orderLineId),
-      "state" -> JsString(state),
-      "grade" -> JsString(ret.grade),
-      "refund_cents" -> JsNumber(ret.refundCents),
-      "photo_ref" -> JsString(ret.photoRef)
-    )
-
-  /** Move the return to state and tell the timeline; true when the event is on its way. */
-  def recordTransition(ret: Store.Return, state: String): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val payload = eventPayload(ret, state)
-    val sent =
-      try {
-        producer.send(new ProducerRecord[String, String](Topic, ret.tenant, payload.compactPrint))
-        true
-      } catch {
-        case _: KafkaException =>
-          Store.insertOutbox(Topic, ret.tenant, payload)
-          false
-      }
-    if (sent) Store.updateReturn(ret.returnId, Map("state" -> state))
-    sent
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import returns.Store // Store.Return, updateReturn, insertOutbox
-
-object Events {
-  val Topic = "returns.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What the timeline needs to place the event; the customer's evidence stays in the store. */
-  def eventPayload(ret: Store.Return, state: String): JsObject =
-    JsObject(
-      "return_id" -> JsString(ret.returnId),
-      "order_line_id" -> JsString(ret.orderLineId),
-      "state" -> JsString(state),
-      "grade" -> JsString(ret.grade),
-      "refund_cents" -> JsNumber(ret.refundCents)
-    )
-
-  /** Move the return to state, then tell the timeline; true once the broker acknowledged. */
-  def recordTransition(ret: Store.Return, state: String): Boolean = {
-    // The state first: a consumer that looks the return up must find what the event announced.
-    Store.updateReturn(ret.returnId, Map("state" -> state))
-    val payload = eventPayload(ret, state)
-    val record = new ProducerRecord[String, String](Topic, ret.returnId, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so the timeline is late, not wrong.
-      Store.insertOutbox(Topic, ret.returnId, payload)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

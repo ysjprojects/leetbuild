@@ -49,7 +49,6 @@ number.
         python: {all: [/@app\.post\(\s*["']\/v1\/datasets["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/datasets['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/datasets"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"datasets"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/datasets"/]},
       },
     },
@@ -62,7 +61,6 @@ number.
         python: {all: [/store\.create_version\(/, /\b409\b/], none: [/put_version\(/]},
         typescript: {all: [/createVersion\(/, /\b409\b/], none: [/putVersion\(/]},
         go: {all: [/store\.CreateVersion\(/, /StatusConflict|\b409\b/], none: [/PutVersion\(/]},
-        scala: {all: [/Store\.createVersion\(/, /Conflict|\b409\b/], none: [/putVersion\(/]},
         cpp: {all: [/store::createVersion\(/, /\b409\b/], none: [/putVersion\(/]},
       },
     },
@@ -75,7 +73,6 @@ number.
         python: {all: [/ALLOWED_LICENSES/, /\b422\b/]},
         typescript: {all: [/ALLOWED_LICENSES/, /\b422\b/]},
         go: {all: [/allowedLicenses/, /StatusUnprocessableEntity|\b422\b/]},
-        scala: {all: [/AllowedLicenses/, /UnprocessableEntity|\b422\b/]},
         cpp: {all: [/kAllowedLicenses/, /\b422\b/]},
       },
     },
@@ -88,7 +85,6 @@ number.
         python: {all: [/store\.measure\(/], none: [/body\.get\(\s*["'](size_bytes|row_count)/]},
         typescript: {all: [/measure\(/], none: [/body\.(size_bytes|row_count)/]},
         go: {all: [/store\.Measure\(/], none: [/body\.(SizeBytes|RowCount)/]},
-        scala: {all: [/Store\.measure\(/], none: [/number\(\s*"(size_bytes|row_count)"/]},
         cpp: {all: [/store::measure\(/], none: [/body\.value\(\s*"(size_bytes|row_count)"/]},
       },
     },
@@ -104,7 +100,6 @@ number.
         },
         typescript: {all: [/\b401\b/, /'content_sha256',\s*'owner'|!body\.owner\b/], none: [/'public'/]},
         go: {all: [/StatusUnauthorized|\b401\b/, /body\.Owner == ""/], none: [/"public"/]},
-        scala: {all: [/Unauthorized|\b401\b/, /"content_sha256",\s*"owner"/], none: [/"public"/]},
         cpp: {all: [/\b401\b/, /"content_sha256",\s*"owner"/], none: [/"public"/]},
       },
     },
@@ -396,99 +391,6 @@ func registerDataset(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/datasets", registerDataset)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import registry.Store // Store.measure, version, putVersion, createVersion
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  def recordJson(rec: Store.VersionRecord): JsObject = JsObject(
-    "tenant" -> JsString(rec.tenant), "dataset" -> JsString(rec.dataset), "version" -> JsString(rec.version),
-    "content_sha256" -> JsString(rec.contentSha256), "license" -> JsString(rec.license), "owner" -> JsString(rec.owner),
-    "size_bytes" -> JsNumber(rec.sizeBytes), "row_count" -> JsNumber(rec.rowCount), "status" -> JsString(rec.status))
-
-  val route: Route = path("v1" / "datasets") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { header =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val tenant = header.getOrElse("public")
-          val body = raw.parseJson.asJsObject.fields
-          def text(name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
-          def number(name: String): Long = body.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-          Seq("dataset", "version", "content_sha256").find(name => text(name).isEmpty) match {
-            case Some(name) => complete(error(StatusCodes.UnprocessableEntity, s"$name is required"))
-            case None =>
-              val rec = Store.VersionRecord(tenant, text("dataset"), text("version"), text("content_sha256"), text("license"),
-                text("owner"), number("size_bytes"), number("row_count"))
-              Store.putVersion(rec)
-              complete(json(StatusCodes.Created, recordJson(rec)))
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import registry.Store // Store.measure, version, putVersion, createVersion
-
-object Api {
-  val AllowedLicenses: Set[String] = Set("apache-2.0", "cc-by-4.0", "cc-by-sa-4.0", "mit", "odc-by-1.0")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  def recordJson(rec: Store.VersionRecord): JsObject = JsObject(
-    "tenant" -> JsString(rec.tenant), "dataset" -> JsString(rec.dataset), "version" -> JsString(rec.version),
-    "content_sha256" -> JsString(rec.contentSha256), "license" -> JsString(rec.license), "owner" -> JsString(rec.owner),
-    "size_bytes" -> JsNumber(rec.sizeBytes), "row_count" -> JsNumber(rec.rowCount), "status" -> JsString(rec.status))
-
-  val route: Route = path("v1" / "datasets") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-        case Some(tenant) =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject.fields
-            def text(name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
-            Seq("dataset", "version", "content_sha256", "owner").find(name => text(name).isEmpty) match {
-              case Some(name) => complete(error(StatusCodes.UnprocessableEntity, s"$name is required"))
-              case None if !AllowedLicenses.contains(text("license")) =>
-                complete(error(StatusCodes.UnprocessableEntity, "license is not on the allowlist"))
-              case None =>
-                // The registry measures the object itself: the caller's numbers are claims.
-                Store.measure(text("content_sha256")) match {
-                  case None => complete(error(StatusCodes.UnprocessableEntity, "no object has that content_sha256"))
-                  case Some((sizeBytes, rowCount)) =>
-                    val rec = Store.VersionRecord(tenant, text("dataset"), text("version"), text("content_sha256"), text("license"),
-                      text("owner"), sizeBytes, rowCount)
-                    // Created once: the HSETNX inside createVersion decides, so two racing registers cannot both win.
-                    if (Store.createVersion(rec)) complete(json(StatusCodes.Created, recordJson(rec)))
-                    else complete(error(StatusCodes.Conflict, "version already registered; versions are immutable"))
-                }
-            }
-          }
-      }
-    }
-  }
 }
 `,
     },

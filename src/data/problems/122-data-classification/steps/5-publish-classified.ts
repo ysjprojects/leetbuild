@@ -54,7 +54,6 @@ replayed old version rolls a Tier 1 table back to Tier 4.
         python: {all: [/produce\([^\n]*key\s*=\s*entity\s*[,)]/]},
         typescript: {all: [/key:\s*entity\s*[,}]/]},
         go: {all: [/Key:\s*\[\]byte\(entity\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*entity,/]},
         cpp: {all: [/entity\.c_str\(\),\s*entity\.size\(\)/]},
       },
     },
@@ -67,7 +66,6 @@ replayed old version rolls a Tier 1 table back to Tier 4.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/put\("enable\.idempotence",\s*"true"\)/, /put\("acks",\s*"all"\)/]},
         cpp: {all: [/set\("enable\.idempotence",\s*"true"/, /set\("acks",\s*"all"/]},
       },
     },
@@ -83,7 +81,6 @@ replayed old version rolls a Tier 1 table back to Tier 4.
         },
         typescript: {all: [/await producer\.send\(/, /insertOutbox\(/]},
         go: {all: [/TopicPartition\.Error/, /store\.InsertOutbox\(/]},
-        scala: {all: [/\.send\([^\n]*\)\.get\(/, /Store\.insertOutbox\(/]},
         cpp: {all: [/dr_cb/, /->flush\(/, /store::insertOutbox\(/]},
       },
     },
@@ -96,7 +93,6 @@ replayed old version rolls a Tier 1 table back to Tier 4.
         python: {all: [/store\.catalog_version\(/]},
         typescript: {all: [/catalogVersion\(/]},
         go: {all: [/store\.CatalogVersion\(/]},
-        scala: {all: [/Store\.catalogVersion\(/]},
         cpp: {all: [/store::catalogVersion\(/]},
       },
     },
@@ -445,141 +441,6 @@ func consume(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.{KafkaException, TopicPartition}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import spray.json._
-
-import metasense.Store // Store.insertOutbox, catalogVersion, upsertCatalog
-
-import scala.jdk.CollectionConverters._
-
-object PublishClassified {
-  val Topic = "entity.classified"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  private val consumer: KafkaConsumer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", "metadata-store")
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val c = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    c.subscribe(List(Topic).asJava)
-    c
-  }
-
-  /** Tell the metadata store about a verified classification; true when it is on its way. */
-  def publishClassified(entity: String, tier: Int, tags: Map[String, String], verifiedBy: String, version: Long): Boolean = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val payload = JsObject(
-      "entity" -> JsString(entity),
-      "tier" -> JsNumber(tier),
-      "tags" -> JsObject(tags.map { case (c, t) => c -> JsString(t) }),
-      "verified_by" -> JsString(verifiedBy),
-      "version" -> JsNumber(version)
-    )
-    try {
-      producer.send(new ProducerRecord[String, String](Topic, s"$entity:$version", payload.compactPrint))
-      true
-    } catch {
-      case _: KafkaException =>
-        Store.insertOutbox(Topic, entity, payload)
-        false
-    }
-  }
-
-  /** The metadata store's side: apply each classification to the catalogue. */
-  def consume(): Unit =
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val event = record.value.parseJson.asJsObject.fields
-        val tags = event("tags").asJsObject.fields.collect { case (c, JsString(t)) => c -> t }
-        val version = event("version").asInstanceOf[JsNumber].value.toLong
-        val entity = event("entity").asInstanceOf[JsString].value
-        Store.upsertCatalog(entity, event("tier").asInstanceOf[JsNumber].value.toInt, tags, version)
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-      }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import spray.json._
-
-import metasense.Store // Store.insertOutbox, catalogVersion, upsertCatalog
-
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-
-object PublishClassified {
-  val Topic = "entity.classified"
-  val AckTimeoutMs = 5000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("enable.idempotence", "true") // a retry after a lost acknowledgement lands once
-    props.put("acks", "all") // every in-sync replica has it before the broker answers
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  private val consumer: KafkaConsumer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", "metadata-store")
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val c = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    c.subscribe(List(Topic).asJava)
-    c
-  }
-
-  /** Tell the metadata store about a verified classification; true once the broker acknowledged it. */
-  def publishClassified(entity: String, tier: Int, tags: Map[String, String], verifiedBy: String, version: Long): Boolean = {
-    val payload = JsObject(
-      "entity" -> JsString(entity),
-      "tier" -> JsNumber(tier),
-      "tags" -> JsObject(tags.map { case (c, t) => c -> JsString(t) }),
-      "verified_by" -> JsString(verifiedBy),
-      "version" -> JsNumber(version)
-    )
-    val record = new ProducerRecord[String, String](Topic, entity, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    // The broker did not take it: the relay republishes the row, so the catalogue is late, not wrong.
-    if (acked.isFailure) Store.insertOutbox(Topic, entity, payload)
-    acked.isSuccess
-  }
-
-  /** The metadata store's side: apply each classification newer than the one it holds. */
-  def consume(): Unit =
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val event = record.value.parseJson.asJsObject.fields
-        val tags = event("tags").asJsObject.fields.collect { case (c, JsString(t)) => c -> t }
-        val version = event("version").asInstanceOf[JsNumber].value.toLong
-        val entity = event("entity").asInstanceOf[JsString].value
-        if (version > Store.catalogVersion(entity)) Store.upsertCatalog(entity, event("tier").asInstanceOf[JsNumber].value.toInt, tags, version)
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-      }
 }
 `,
     },

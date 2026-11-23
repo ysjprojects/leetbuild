@@ -45,7 +45,6 @@ store; and \`Café Noir\`, \`cafe noir\` and \`CAFÉ NOIR\` take three of the te
         python: {all: [/@app\.get\(\s*["']\/v1\/autocomplete["']/, /x-tenant-id/i, /\b401\b/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/autocomplete['"]/, /x-tenant-id/i, /\b401\b/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/autocomplete"/, /X-Tenant-Id/i, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"autocomplete"\s*\)/, /X-Tenant-Id/i, /Unauthorized|\b401\b/]},
         cpp: {all: [/svr\.Get\(\s*"\/v1\/autocomplete"/, /X-Tenant-Id/i, /\b401\b/]},
       },
     },
@@ -58,7 +57,6 @@ store; and \`Café Noir\`, \`cafe noir\` and \`CAFÉ NOIR\` take three of the te
         python: {all: [/terms\.fold\(/], none: [/\.lower\(\)/]},
         typescript: {all: [/\bfold\(/], none: [/toLowerCase\(/]},
         go: {all: [/terms\.Fold\(/], none: [/strings\.ToLower\(/]},
-        scala: {all: [/Terms\.fold\(|Terms\.fold\b/], none: [/toLowerCase/]},
         cpp: {all: [/terms::fold\(/], none: [/tolower/]},
       },
     },
@@ -89,13 +87,6 @@ store; and \`Café Noir\`, \`cafe noir\` and \`CAFÉ NOIR\` take three of the te
             /0x20|0x1[fF]|\b3[12]\b|0x7[fF]|\b127\b|unicode\.IsControl/,
           ],
         },
-        scala: {
-          all: [
-            /MaxPrefixChars\s*=\s*64\b/,
-            /BadRequest|\b400\b/,
-            /0x20|0x1[fF]|\b3[12]\b|0x7[fF]|\b127\b|isControl|isISOControl/,
-          ],
-        },
         cpp: {
           all: [
             /kMaxPrefixChars\{?\s*=?\s*64\b|kMaxPrefixChars\s*=\s*64\b/,
@@ -120,7 +111,6 @@ store; and \`Café Noir\`, \`cafe noir\` and \`CAFÉ NOIR\` take three of the te
           all: [/\bseen\b|dedup|unique|distinct|map\[string\]bool|map\[string\]struct/],
           none: [/suggestions\[:maxSuggestions\]/],
         },
-        scala: {all: [/distinctBy|\.distinct\b|\bseen\b/], none: [/matching\([^)]*\)\.take\(/]},
         cpp: {all: [/\bseen\b|dedup|unique|distinct|std::(unordered_)?set/], none: [/suggestions\.resize\(/]},
       },
     },
@@ -338,81 +328,6 @@ func autocomplete(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/autocomplete", autocomplete)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import suggest.Terms // Terms.fold, Terms.matching
-
-object Api {
-  val MaxSuggestions = 10
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def answer(prefix: String, suggestions: Seq[String]): JsObject =
-    JsObject("prefix" -> JsString(prefix), "suggestions" -> JsArray(suggestions.map(JsString(_)).toVector))
-
-  val route: Route = path("v1" / "autocomplete") {
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-        case Some(tenant) =>
-          parameter("prefix".optional) { raw =>
-            // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-            val prefix = raw.getOrElse("").trim.toLowerCase
-            complete(json(StatusCodes.OK, answer(prefix, Terms.matching(tenant, prefix).take(MaxSuggestions))))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import suggest.Terms // Terms.fold, Terms.matching
-
-object Api {
-  val MaxPrefixChars = 64
-  val MaxSuggestions = 10
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def answer(prefix: String, suggestions: Seq[String]): JsObject =
-    JsObject("prefix" -> JsString(prefix), "suggestions" -> JsArray(suggestions.map(JsString(_)).toVector))
-
-  private def badRequest(message: String): HttpResponse = json(StatusCodes.BadRequest, JsObject("error" -> JsString(message)))
-
-  val route: Route = path("v1" / "autocomplete") {
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-        case Some(tenant) =>
-          parameter("prefix".optional) { raw =>
-            val text = raw.getOrElse("")
-            val prefix = Terms.fold(text)
-            val length = prefix.codePointCount(0, prefix.length)
-            // Rejected before any lookup: a control character never reaches a key or a log line.
-            if (text.exists(ch => ch < 0x20 || ch == 0x7f)) complete(badRequest("prefix contains a control character"))
-            else if (length < 1 || length > MaxPrefixChars) complete(badRequest("prefix must be 1 to 64 characters"))
-            else {
-              // Dedupe on the folded form first, then cap: duplicates must not take the ten slots.
-              val suggestions = Terms.matching(tenant, prefix).distinctBy(Terms.fold).take(MaxSuggestions)
-              complete(json(StatusCodes.OK, answer(prefix, suggestions)))
-            }
-          }
-      }
-    }
-  }
 }
 `,
     },

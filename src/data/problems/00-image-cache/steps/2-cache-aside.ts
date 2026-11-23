@@ -43,7 +43,6 @@ Implement \`get_thumb(id, width)\` as a **cache-aside** lookup in Redis. \`rende
         python: {all: [/f["']thumb:\{image_id\}:\{width\}["']/]},
         typescript: {all: [/`thumb:\$\{imageId\}:\$\{width\}`/]},
         go: {all: [/"thumb:%s:%d"/]},
-        scala: {all: [/s"thumb:\$\{?id\}?:\$\{?width\}?"/]},
         cpp: {all: [/"thumb:"\s*\+\s*id\s*\+\s*":"\s*\+\s*std::to_string\(\s*width\s*\)/]},
       },
     },
@@ -55,7 +54,6 @@ Implement \`get_thumb(id, width)\` as a **cache-aside** lookup in Redis. \`rende
         python: {order: [/\br\.get\(\s*key\s*\)/, /render\(/]},
         typescript: {order: [/\bredis\.get(Buffer)?\(\s*key\s*\)/, /render\(/]},
         go: {order: [/rdb\.Get\(\s*ctx\s*,\s*key\s*\)/, /render\(/]},
-        scala: {order: [/jedis\.get\(\s*key(\.getBytes)?\s*\)/, /render\(/]},
         cpp: {order: [/redis\.get\(\s*key\s*\)/, /render\(/]},
       },
     },
@@ -71,7 +69,6 @@ Implement \`get_thumb(id, width)\` as a **cache-aside** lookup in Redis. \`rende
           all: [/\.set\(\s*key\s*,\s*data[^\n]*['"]EX['"]\s*,\s*TTL_S\s*\)|\.setex\(\s*key\s*,\s*TTL_S\s*,\s*data/],
         },
         go: {all: [/rdb\.Set\(\s*ctx\s*,\s*key\s*,\s*data\s*,\s*ttl\s*\)/]},
-        scala: {all: [/jedis\.setex\(\s*key\.getBytes[^\n]*TtlSeconds|jedis\.setex\(\s*key\s*,\s*TtlSeconds/]},
         cpp: {all: [/redis\.set\(\s*key\s*,\s*\*?data\s*,\s*kTtl\s*\)|redis\.setex\(\s*key\s*,\s*kTtl/]},
       },
     },
@@ -94,12 +91,6 @@ Implement \`get_thumb(id, width)\` as a **cache-aside** lookup in Redis. \`rende
           ],
         },
         go: {all: [/rdb\.Set\(\s*ctx\s*,\s*key\s*,\s*missing\s*,\s*missingTTL\s*\)/, /==\s*missing/]},
-        scala: {
-          all: [
-            /jedis\.setex\([^\n]*MissingTtlSeconds[^\n]*Missing\b|jedis\.setex\([^\n]*Missing\b[^\n]*MissingTtlSeconds/,
-            /sameElements\(\s*Missing\s*\)|==\s*Missing/,
-          ],
-        },
         cpp: {
           all: [
             /redis\.set\(\s*key\s*,\s*kMissing\s*,\s*kMissingTtl\s*\)|redis\.setex\(\s*key\s*,\s*kMissingTtl\s*,\s*kMissing\s*\)/,
@@ -293,57 +284,6 @@ func getThumb(ctx context.Context, id string, width int) ([]byte, error) {
 	}
 	rdb.Set(ctx, key, data, ttl)
 	return data, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-object ThumbCache {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val TtlSeconds = 86400L
-  val MissingTtlSeconds = 60L
-  val Missing: Array[Byte] = "__missing__".getBytes
-
-  /** Fetch the original and resize it (built in step 4); None when the origin has no such image. */
-  def render(id: String, width: Int): Option[Array[Byte]] = ???
-
-  def getThumb(id: String, width: Int): Option[Array[Byte]] = {
-    val key: String = ??? // TODO: thumb:{id}:{width}
-    // TODO: GET first; a hit returns the bytes (or None when it is the Missing sentinel)
-    // TODO: miss → render(); None → SETEX Missing with MissingTtlSeconds; bytes → SETEX with TtlSeconds
-    None
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-object ThumbCache {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val TtlSeconds = 86400L
-  val MissingTtlSeconds = 60L
-  val Missing: Array[Byte] = "__missing__".getBytes
-
-  /** Fetch the original and resize it (built in step 4); None when the origin has no such image. */
-  def render(id: String, width: Int): Option[Array[Byte]] = ???
-
-  def getThumb(id: String, width: Int): Option[Array[Byte]] = {
-    val key = s"thumb:$id:$width"
-    Option(jedis.get(key.getBytes)) match {
-      case Some(cached) => if (cached.sameElements(Missing)) None else Some(cached)
-      case None =>
-        render(id, width) match {
-          case Some(data) =>
-            jedis.setex(key.getBytes, TtlSeconds, data)
-            Some(data)
-          case None =>
-            jedis.setex(key.getBytes, MissingTtlSeconds, Missing)
-            None
-        }
-    }
-  }
 }
 `,
     },

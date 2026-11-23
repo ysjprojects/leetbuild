@@ -64,7 +64,6 @@ carrier that cannot answer; a stale carrier answer rolls the status backward.
         python: {all: [/DEADLINE_S\s*=\s*4\b/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*4_?000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*4\s*\*\s*time\.Second/, /context\.WithTimeout\(/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*4L?\b/, /withDeadlineAfter\(/]},
         cpp: {all: [/kDeadline\{4\}|kDeadline\s*=\s*std::chrono::seconds\{?\(?4/, /set_deadline\(/]},
       },
     },
@@ -77,10 +76,6 @@ carrier that cannot answer; a stale carrier answer rolls the status backward.
         python: {all: [/store\.mark_poll_failed\(/], order: [/except\s+grpc\.RpcError/, /store\.mark_poll_failed\(/]},
         typescript: {all: [/store\.markPollFailed\(/], order: [/catch\s*\(/, /store\.markPollFailed\(/]},
         go: {all: [/store\.MarkPollFailed\(/], order: [/if\s+err\s*!=\s*nil/, /store\.MarkPollFailed\(/]},
-        scala: {
-          all: [/Store\.markPollFailed\(/],
-          order: [/case\s+e:\s*StatusRuntimeException/, /Store\.markPollFailed\(/],
-        },
         cpp: {all: [/store::markPollFailed\(/], order: [/!status\.ok\(\)/, /store::markPollFailed\(/]},
       },
     },
@@ -93,7 +88,6 @@ carrier that cannot answer; a stale carrier answer rolls the status backward.
         python: {all: [/backoff/i, /store\.schedule_poll\(/], none: [/time\.sleep\(/, /for\s+_?\w*\s+in\s+range\(/]},
         typescript: {all: [/backoff/i, /store\.schedulePoll\(/], none: [/setTimeout\(/, /for\s*\(\s*let\s+attempt/]},
         go: {all: [/backoff/i, /store\.SchedulePoll\(/], none: [/time\.Sleep\(/, /for\s+try\s*:=/]},
-        scala: {all: [/backoff/i, /Store\.schedulePoll\(/], none: [/Thread\.sleep\(/]},
         cpp: {all: [/backoff/i, /store::schedulePoll\(/], none: [/sleep_for\(/]},
       },
     },
@@ -106,7 +100,6 @@ carrier that cannot answer; a stale carrier answer rolls the status backward.
         python: {all: [/apply_scan\(/], none: [/store\.set_status\(/]},
         typescript: {all: [/applyScan\(/], none: [/store\.setStatus\(/]},
         go: {all: [/timeline\.ApplyScan\(/], none: [/store\.SetStatus\(/]},
-        scala: {all: [/Timeline\.applyScan\(/], none: [/Store\.setStatus\(/]},
         cpp: {all: [/timeline::applyScan\(/], none: [/store::setStatus\(/]},
       },
     },
@@ -392,82 +385,6 @@ func pollShipment(ctx context.Context, shipmentID string, attempt int) (PollResu
 	store.MarkPollOK(ctx, shipmentID, now)
 	store.SchedulePoll(ctx, shipmentID, now+pollIntervalS)
 	return PollResult{Polled: true, Status: result.Status}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import shipments.{Store, Timeline} // Store.getShipment, setStatus, markPollOk, markPollFailed, schedulePoll; Timeline.applyScan
-import shiptrack.shipment_tracking.{CarrierGatewayGrpc, CarrierScan, PollRequest}
-
-object Client {
-  final case class PollResult(polled: Boolean, status: String)
-
-  val PollIntervalS = 3600L
-
-  private val carrier = CarrierGatewayGrpc.blockingStub(ManagedChannelBuilder.forAddress("carriers", 9000).usePlaintext().build())
-
-  /** One poll of the carrier for the shipment; the scheduler runs it again when it is next due. */
-  def pollShipment(shipmentId: String, attempt: Int = 0): PollResult = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val shipment = Store.getShipment(shipmentId).getOrElse(throw new NoSuchElementException(s"no shipment $shipmentId"))
-    val now = System.currentTimeMillis() / 1000
-    var scan: Option[CarrierScan] = None
-    var tries = 0
-    while (scan.isEmpty && tries < 5) {
-      tries += 1
-      try scan = Some(carrier.pollStatus(PollRequest(shipment.carrier, shipmentId)))
-      catch { case _: StatusRuntimeException => Thread.sleep(1000) }
-    }
-    Store.markPollOk(shipmentId, now)
-    Store.schedulePoll(shipmentId, now + PollIntervalS)
-    scan match {
-      case None => PollResult(polled = false, shipment.status)
-      case Some(s) =>
-        Store.setStatus(shipmentId, s.status, s.scanAt)
-        PollResult(polled = true, s.status)
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import shipments.{Store, Timeline} // Store.getShipment, setStatus, markPollOk, markPollFailed, schedulePoll; Timeline.applyScan
-import shiptrack.shipment_tracking.{CarrierGatewayGrpc, PollRequest}
-
-object Client {
-  final case class PollResult(polled: Boolean, status: String)
-
-  val DeadlineSeconds = 4L
-  val PollIntervalS = 3600L
-  val BackoffBaseS = 30L
-  val BackoffMaxS = 1800L
-
-  private val carrier = CarrierGatewayGrpc.blockingStub(ManagedChannelBuilder.forAddress("carriers", 9000).usePlaintext().build())
-
-  def backoffS(attempt: Int): Long = math.min(BackoffBaseS << math.min(attempt, 16), BackoffMaxS)
-
-  /** One poll of the carrier for the shipment; the scheduler runs it again when it is next due. */
-  def pollShipment(shipmentId: String, attempt: Int = 0): PollResult = {
-    val shipment = Store.getShipment(shipmentId).getOrElse(throw new NoSuchElementException(s"no shipment $shipmentId"))
-    val now = System.currentTimeMillis() / 1000
-    try {
-      val scan = carrier.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).pollStatus(PollRequest(shipment.carrier, shipmentId))
-      val result = Timeline.applyScan(shipmentId, scan.status, scan.scanAt, scan.city)
-      Store.markPollOk(shipmentId, now)
-      Store.schedulePoll(shipmentId, now + PollIntervalS)
-      PollResult(polled = true, result.status)
-    } catch {
-      // A failed poll says nothing about the parcel: record it, write no status, let the scheduler retry.
-      case e: StatusRuntimeException =>
-        Store.markPollFailed(shipmentId, now, Option(e.getStatus.getDescription).getOrElse(e.getStatus.getCode.toString))
-        Store.schedulePoll(shipmentId, now + backoffS(attempt))
-        PollResult(polled = false, shipment.status)
-    }
-  }
 }
 `,
     },

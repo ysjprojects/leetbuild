@@ -66,7 +66,6 @@ routed to, while on-call cannot see why checkout is down to two instances.
         python: {all: [/INTERNAL_SCOPE/, /status_code=403/, /\.split\(\s*["'],["']\s*\)/]},
         typescript: {all: [/INTERNAL_SCOPE/, /code\(403\)/, /\.split\(\s*['"],['"]\s*\)/]},
         go: {all: [/internalScope/, /StatusForbidden/, /strings\.Split\(/]},
-        scala: {all: [/InternalScope/, /Forbidden/, /\.split\(\s*","\s*\)/]},
         cpp: {all: [/kInternalScope/, /\b403\b/, /','/]},
       },
     },
@@ -79,7 +78,6 @@ routed to, while on-call cannot see why checkout is down to two instances.
         python: {all: [/registry\.deployment_cidr\(/, /status_code=404/]},
         typescript: {all: [/registry\.deploymentCidr\(/, /code\(404\)/]},
         go: {all: [/registry\.DeploymentCIDR\(/, /StatusNotFound/]},
-        scala: {all: [/Registry\.deploymentCidr\(/, /NotFound/]},
         cpp: {all: [/registry::deploymentCidr\(/, /\b404\b/]},
       },
     },
@@ -92,7 +90,6 @@ routed to, while on-call cannot see why checkout is down to two instances.
         python: {all: [/["']expired["']/]},
         typescript: {all: [/['"]expired['"]/]},
         go: {all: [/"expired"/]},
-        scala: {all: [/"expired"/]},
         cpp: {all: [/"expired"/]},
       },
     },
@@ -105,7 +102,6 @@ routed to, while on-call cannot see why checkout is down to two instances.
         python: {all: [/!=\s*["']SERVING["']|==\s*["']SERVING["']/, /["']unhealthy["']/, /["']unprobed["']/]},
         typescript: {all: [/!==\s*['"]SERVING['"]|===\s*['"]SERVING['"]/, /['"]unhealthy['"]/, /['"]unprobed['"]/]},
         go: {all: [/!=\s*"SERVING"|==\s*"SERVING"/, /"unhealthy"/, /"unprobed"/]},
-        scala: {all: [/Some\("SERVING"\)|==\s*"SERVING"|contains\("SERVING"\)/, /"unhealthy"/, /"unprobed"/]},
         cpp: {all: [/!=\s*"SERVING"|==\s*"SERVING"/, /"unhealthy"/, /"unprobed"/]},
       },
     },
@@ -343,82 +339,6 @@ func listInstances(rw http.ResponseWriter, r *http.Request) {
 
 func routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/services/{service}/instances", listInstances)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import discovery.{Instances, Registry} // Instances.members, lookup, verdict · Registry.deploymentCidr
-
-object Read {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def instanceJson(instanceId: String, i: Instances.Instance): JsObject = JsObject(
-    "instance_id" -> JsString(instanceId), "address" -> JsString(i.address), "port" -> JsNumber(i.port),
-    "heartbeat_interval" -> JsNumber(i.heartbeatInterval), "metadata_version" -> JsNumber(i.metadataVersion),
-    "last_heartbeat" -> JsNumber(i.lastHeartbeat))
-
-  val route: Route = path("v1" / "services" / Segment / "instances") { service =>
-    get {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      val found = Instances.members(service).filterNot(id => Instances.verdict(service, id).contains("NOT_SERVING")).map { id =>
-        Instances.lookup(service, id).map(instanceJson(id, _)).getOrElse(JsObject("instance_id" -> JsString(id)))
-      }
-      complete(json(StatusCodes.OK, JsObject("service" -> JsString(service), "instances" -> JsArray(found.toVector), "excluded" -> JsArray())))
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import discovery.{Instances, Registry} // Instances.members, lookup, verdict · Registry.deploymentCidr
-
-object Read {
-  val InternalScope = "discovery.internal"
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def instanceJson(instanceId: String, i: Instances.Instance): JsObject = JsObject(
-    "instance_id" -> JsString(instanceId), "address" -> JsString(i.address), "port" -> JsNumber(i.port),
-    "heartbeat_interval" -> JsNumber(i.heartbeatInterval), "metadata_version" -> JsNumber(i.metadataVersion),
-    "last_heartbeat" -> JsNumber(i.lastHeartbeat))
-
-  private def exclusion(instanceId: String, reason: String): JsObject =
-    JsObject("instance_id" -> JsString(instanceId), "reason" -> JsString(reason))
-
-  val route: Route = path("v1" / "services" / Segment / "instances") { service =>
-    get {
-      optionalHeaderValueByName("X-Scope") { header =>
-        if (!header.getOrElse("").split(",").map(_.trim).contains(InternalScope))
-          complete(StatusCodes.Forbidden -> s"listing instances needs the $InternalScope scope")
-        else if (Registry.deploymentCidr(service).isEmpty) complete(StatusCodes.NotFound -> s"no deployment for service $service")
-        else {
-          val (routable, excluded) = Instances.members(service).foldLeft((Vector.empty[JsObject], Vector.empty[JsObject])) {
-            case ((ok, out), id) =>
-              Instances.lookup(service, id) match {
-                case None => (ok, out :+ exclusion(id, "expired")) // the sweep has not announced it yet
-                case Some(instance) =>
-                  Instances.verdict(service, id) match {
-                    case Some("SERVING")     => (ok :+ instanceJson(id, instance), out)
-                    case Some("NOT_SERVING") => (ok, out :+ exclusion(id, "unhealthy"))
-                    case _                   => (ok, out :+ exclusion(id, "unprobed"))
-                  }
-              }
-          }
-          complete(json(StatusCodes.OK, JsObject("service" -> JsString(service), "instances" -> JsArray(routable), "excluded" -> JsArray(excluded))))
-        }
-      }
-    }
-  }
 }
 `,
     },

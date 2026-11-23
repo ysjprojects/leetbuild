@@ -74,7 +74,6 @@ A balance is the **sum of the account's entries** in that currency with \`posted
         python: {all: [/class \w+\(\s*ledger_pb2_grpc\.LedgerServiceServicer\s*\)/, /SUM\(amount\)/]},
         typescript: {all: [/addService\(\s*[\w.]*LedgerService\.service\s*,/, /SUM\(amount\)/]},
         go: {all: [/pb\.UnimplementedLedgerServiceServer/, /SUM\(amount\)/]},
-        scala: {all: [/LedgerServiceGrpc\.LedgerService/, /SUM\(amount\)/]},
         cpp: {all: [/ledger::LedgerService::Service/, /SUM\(amount\)/]},
       },
     },
@@ -87,7 +86,6 @@ A balance is the **sum of the account's entries** in that currency with \`posted
         python: {all: [/StatusCode\.INVALID_ARGUMENT/, /CURRENCY_RE\.(fullmatch|match)\(/]},
         typescript: {all: [/status\.INVALID_ARGUMENT/, /CURRENCY_RE\.test\(/]},
         go: {all: [/codes\.InvalidArgument/, /currencyRe\.MatchString\(/]},
-        scala: {all: [/Status\.INVALID_ARGUMENT/, /CurrencyRe\.matches\(/]},
         cpp: {all: [/StatusCode::INVALID_ARGUMENT/, /std::regex_match\([^\n]*kCurrencyRe/]},
       },
     },
@@ -100,7 +98,6 @@ A balance is the **sum of the account's entries** in that currency with \`posted
         python: {all: [/StatusCode\.NOT_FOUND/, /COUNT\(\*\)/]},
         typescript: {all: [/status\.NOT_FOUND/, /COUNT\(\*\)/]},
         go: {all: [/codes\.NotFound/, /COUNT\(\*\)/]},
-        scala: {all: [/Status\.NOT_FOUND/, /COUNT\(\*\)/]},
         cpp: {all: [/StatusCode::NOT_FOUND/, /COUNT\(\*\)/]},
       },
     },
@@ -115,7 +112,6 @@ A balance is the **sum of the account's entries** in that currency with \`posted
           all: [/`bal:\$\{/, /\bredis\.get\(/, /\.set\([^\n]*['"]EX['"]\s*,\s*BALANCE_TTL_S/, /\.del\(/],
         },
         go: {all: [/"bal:"\s*\+/, /rdb\.Get\(/, /rdb\.Set\([^\n]*balanceTTL\s*\)/, /rdb\.Del\(/]},
-        scala: {all: [/s"bal:\$/, /jedis\.get\(/, /jedis\.setex\([^\n]*BalanceTtlSeconds/, /jedis\.del\(/]},
         cpp: {all: [/"bal:"\s*\+/, /redis\.get\(/, /redis\.set\([^\n]*kBalanceTtl/, /redis\.del\(/]},
       },
     },
@@ -128,7 +124,6 @@ A balance is the **sum of the account's entries** in that currency with \`posted
         python: {all: [/posted_at <= %s/, /request\.as_of\s*==\s*0|not request\.as_of/]},
         typescript: {all: [/posted_at <= \$\d/, /Number\(\s*(call\.)?request\.as_of\s*\)/, /===?\s*0\b/]},
         go: {all: [/posted_at <= \$\d/, /req\.(GetAsOf\(\)|AsOf)\s*==\s*0/]},
-        scala: {all: [/posted_at <= \?/, /req(uest)?\.asOf\s*==\s*0/]},
         cpp: {all: [/posted_at <= \$\d/, /req(uest)?->as_of\(\)\s*==\s*0/]},
       },
     },
@@ -533,92 +528,6 @@ func main() {
 	srv := grpc.NewServer()
 	pb.RegisterLedgerServiceServer(srv, &ledgerServer{})
 	log.Fatal(srv.Serve(lis))
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ServerBuilder, Status}
-import ledger.Db // Db.withConnection { conn => ... } — provided
-import ledger.ledger.{Balance, BalanceRequest, LedgerServiceGrpc}
-import redis.clients.jedis.JedisPooled
-import scala.concurrent.{ExecutionContext, Future}
-
-object BalanceService extends LedgerServiceGrpc.LedgerService {
-  val jedis = new JedisPooled("redis", 6379)
-  val CurrencyRe = "^[A-Z]{3}$".r
-  val BalanceTtlSeconds = 5L
-
-  def nowMs(): Long = System.currentTimeMillis()
-
-  def cacheKey(account: String, currency: String): String = s"bal:$account:$currency"
-
-  /** Called by the journal writer after every commit: the cached current balance is stale. */
-  def invalidate(account: String, currency: String): Unit = {
-    // TODO: del cacheKey(account, currency)
-  }
-
-  override def getBalance(req: BalanceRequest): Future[Balance] = {
-    // TODO: empty account or currency not matching CurrencyRe → Status.INVALID_ARGUMENT
-    // TODO: asOf == 0 → get cacheKey; hit → reply from the cache
-    // TODO: one query: SUM(amount) FILTER (WHERE currency = ? AND posted_at <= ?) and COUNT(*) WHERE account = ?; n == 0 → Status.NOT_FOUND
-    // TODO: asOf == 0 → setex the key BalanceTtlSeconds; reply Balance(account, currency, amount, asOf)
-    Future.failed(Status.UNIMPLEMENTED.asRuntimeException())
-  }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder.forPort(9100).addService(LedgerServiceGrpc.bindService(this, ExecutionContext.global)).build().start().awaitTermination()
-}
-`,
-      solution: `import io.grpc.{ServerBuilder, Status}
-import ledger.Db // Db.withConnection { conn => ... } — provided
-import ledger.ledger.{Balance, BalanceRequest, LedgerServiceGrpc}
-import redis.clients.jedis.JedisPooled
-import scala.concurrent.{ExecutionContext, Future}
-
-object BalanceService extends LedgerServiceGrpc.LedgerService {
-  val jedis = new JedisPooled("redis", 6379)
-  val CurrencyRe = "^[A-Z]{3}$".r
-  val BalanceTtlSeconds = 5L
-
-  def nowMs(): Long = System.currentTimeMillis()
-
-  def cacheKey(account: String, currency: String): String = s"bal:$account:$currency"
-
-  /** Called by the journal writer after every commit: the cached current balance is stale. */
-  def invalidate(account: String, currency: String): Unit = jedis.del(cacheKey(account, currency))
-
-  /** (balance in \`currency\` up to \`asOf\`, number of entries the account has at all). */
-  private def sumEntries(account: String, currency: String, asOf: Long): (Long, Long) =
-    Db.withConnection { conn =>
-      val st = conn.prepareStatement(
-        "SELECT COALESCE(SUM(amount) FILTER (WHERE currency = ? AND posted_at <= ?), 0)::bigint AS amount, COUNT(*) AS n FROM entries WHERE account = ?")
-      st.setString(1, currency); st.setLong(2, asOf); st.setString(3, account)
-      val rs = st.executeQuery()
-      rs.next()
-      (rs.getLong("amount"), rs.getLong("n"))
-    }
-
-  override def getBalance(req: BalanceRequest): Future[Balance] = {
-    if (req.account.isEmpty || !CurrencyRe.matches(req.currency))
-      return Future.failed(Status.INVALID_ARGUMENT.withDescription("account is required and currency must match ^[A-Z]{3}$").asRuntimeException())
-    val key = cacheKey(req.account, req.currency)
-    val current = req.asOf == 0
-    val cached = if (current) Option(jedis.get(key)) else None
-    cached match {
-      case Some(amount) => Future.successful(Balance(req.account, req.currency, amount.toLong, nowMs()))
-      case None =>
-        val asOf = if (current) nowMs() else req.asOf
-        val (amount, n) = sumEntries(req.account, req.currency, asOf)
-        if (n == 0) Future.failed(Status.NOT_FOUND.withDescription(s"no entries for account \${req.account}").asRuntimeException())
-        else {
-          if (current) jedis.setex(key, BalanceTtlSeconds, amount.toString) // a point-in-time balance is never cached
-          Future.successful(Balance(req.account, req.currency, amount, asOf))
-        }
-    }
-  }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder.forPort(9100).addService(LedgerServiceGrpc.bindService(this, ExecutionContext.global)).build().start().awaitTermination()
 }
 `,
     },

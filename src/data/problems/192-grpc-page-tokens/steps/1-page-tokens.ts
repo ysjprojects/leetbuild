@@ -83,7 +83,6 @@ at any moment, including between two pages of one walk. Implement \`ListBooks\`,
           all: [/DEFAULT_PAGE_SIZE\s*=\s*50\b/, /MAX_PAGE_SIZE\s*=\s*100\b/, /Math\.min\([^\n]*MAX_PAGE_SIZE\s*\)/],
         },
         go: {all: [/defaultPageSize\s*=\s*50\b/, /maxPageSize\s*=\s*100\b/, /\bmin\([^\n]*maxPageSize\s*\)/]},
-        scala: {all: [/DefaultPageSize\s*=\s*50\b/, /MaxPageSize\s*=\s*100\b/, /math\.min\([^\n]*MaxPageSize\s*\)/]},
         cpp: {all: [/kDefaultPageSize\s*=\s*50\b/, /kMaxPageSize\s*=\s*100\b/, /std::min\([^\n]*kMaxPageSize\s*\)/]},
       },
     },
@@ -96,7 +95,6 @@ at any moment, including between two pages of one walk. Implement \`ListBooks\`,
         python: {all: [/StatusCode\.NOT_FOUND/, /page_size\s*<\s*0/, /StatusCode\.INVALID_ARGUMENT/]},
         typescript: {all: [/status\.NOT_FOUND/, /(pageSize|page_size)\s*<\s*0/, /status\.INVALID_ARGUMENT/]},
         go: {all: [/codes\.NotFound/, /(GetPageSize\(\)|PageSize)\s*<\s*0/, /codes\.InvalidArgument/]},
-        scala: {all: [/Status\.NOT_FOUND/, /pageSize\s*<\s*0/, /Status\.INVALID_ARGUMENT/]},
         cpp: {all: [/StatusCode::NOT_FOUND/, /page_size\(\)\s*<\s*0/, /StatusCode::INVALID_ARGUMENT/]},
       },
     },
@@ -109,7 +107,6 @@ at any moment, including between two pages of one walk. Implement \`ListBooks\`,
         python: {all: [/\bsorted\(/, /len\(\w+\)\s*>\s*size\b/]},
         typescript: {all: [/\.sort\(\)/, /\.length\s*>\s*size\b/]},
         go: {all: [/sort\.Strings\(|slices\.Sort\(/, /len\(\w+\)\s*>\s*size\b/]},
-        scala: {all: [/\.sorted\b/, /\.(length|size)\s*>\s*size\b/]},
         cpp: {
           all: [
             /std::map<std::string,\s*std::map<std::string,\s*std::string>>/,
@@ -127,7 +124,6 @@ at any moment, including between two pages of one walk. Implement \`ListBooks\`,
         python: {all: [/\w+\s*>\s*after\b/]},
         typescript: {all: [/\w+\s*>\s*after\b/]},
         go: {all: [/\w+\s*>\s*after\b/]},
-        scala: {all: [/(_|\w+)\s*>\s*after\b/]},
         cpp: {all: [/\.upper_bound\(/]},
       },
     },
@@ -140,7 +136,6 @@ at any moment, including between two pages of one walk. Implement \`ListBooks\`,
         python: {all: [/json\.dumps\(\{[^\n]*["']shelf["']/, /!=\s*request\.shelf\b/]},
         typescript: {all: [/JSON\.stringify\(\{[^\n]*\bshelf\b/, /!==\s*shelf\b/]},
         go: {all: [/json:"shelf"/, /\.Shelf\s*!=\s*req\.GetShelf\(\)/]},
-        scala: {all: [/"shelf"\s*->/, /(==|!=)\s*req\.shelf\b/]},
         cpp: {all: [/\{"shelf",\s*\w+\}/, /->first\s*!=\s*request->shelf\(\)/]},
       },
     },
@@ -153,7 +148,6 @@ at any moment, including between two pages of one walk. Implement \`ListBooks\`,
         python: {all: [/base64\.urlsafe_b64decode\(/, /except\s*\(?[\w.,\s]*ValueError/]},
         typescript: {all: [/Buffer\.from\([^\n]*['"]base64url['"]\)/, /\bcatch\b/]},
         go: {all: [/base64\.RawURLEncoding\.DecodeString\(/, /json\.Unmarshal\(/]},
-        scala: {all: [/Base64\.getUrlDecoder/, /\bTry\s*\{|\bcatch\b/]},
         cpp: {all: [/absl::WebSafeBase64Unescape\(/, /is_discarded\(\)/]},
       },
     },
@@ -558,88 +552,6 @@ func main() {
 	srv := grpc.NewServer()
 	pb.RegisterLibraryServer(srv, &libraryServer{})
 	log.Fatal(srv.Serve(lis))
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ServerBuilder, Status}
-import library.v1.library.{Book, LibraryGrpc, ListBooksRequest, ListBooksResponse}
-import scala.collection.concurrent.TrieMap
-import scala.concurrent.{ExecutionContext, Future}
-
-object LibraryServer extends LibraryGrpc.Library {
-  val DefaultPageSize = 50
-  val MaxPageSize = 100
-
-  /** shelf → book id → title. The catalogue adds and removes books at any time; listBooks only reads. */
-  val Shelves = TrieMap.empty[String, TrieMap[String, String]]
-
-  override def listBooks(req: ListBooksRequest): Future[ListBooksResponse] = {
-    // TODO: unknown shelf → Status.NOT_FOUND; pageSize < 0 → Status.INVALID_ARGUMENT; 0 → DefaultPageSize; cap at MaxPageSize
-    // TODO: pageToken "" is the first page; otherwise decode base64url JSON {shelf, after}
-    // TODO: malformed, or issued for another shelf → Status.INVALID_ARGUMENT
-    // TODO: the books with id > after, ascending, at most size of them
-    // TODO: nextPageToken = a token for (shelf, last id on the page) only while more books follow, else ""
-    Future.failed(Status.UNIMPLEMENTED.asRuntimeException())
-  }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder.forPort(9000).addService(LibraryGrpc.bindService(this, ExecutionContext.global)).build().start().awaitTermination()
-}
-`,
-      solution: `import io.grpc.{ServerBuilder, Status}
-import library.v1.library.{Book, LibraryGrpc, ListBooksRequest, ListBooksResponse}
-import java.nio.charset.StandardCharsets.UTF_8
-import java.util.Base64
-import scala.collection.concurrent.TrieMap
-import scala.concurrent.{ExecutionContext, Future}
-import scala.util.Try
-
-object LibraryServer extends LibraryGrpc.Library {
-  val DefaultPageSize = 50
-  val MaxPageSize = 100
-
-  /** shelf → book id → title. The catalogue adds and removes books at any time; listBooks only reads. */
-  val Shelves = TrieMap.empty[String, TrieMap[String, String]]
-
-  /** Opaque to clients: base64url of {"shelf": …, "after": <the last id returned>}. */
-  def encodeToken(shelf: String, after: String): String =
-    Base64.getUrlEncoder.withoutPadding.encodeToString(ujson.write(ujson.Obj("shelf" -> shelf, "after" -> after)).getBytes(UTF_8))
-
-  /** (shelf, after) from a token this server issued, or None when it is not one. */
-  def decodeToken(token: String): Option[(String, String)] =
-    Try {
-      val body = ujson.read(new String(Base64.getUrlDecoder.decode(token), UTF_8))
-      (body("shelf").str, body("after").str)
-    }.toOption.filter(_._2.nonEmpty)
-
-  private def invalid(message: String): Future[ListBooksResponse] =
-    Future.failed(Status.INVALID_ARGUMENT.withDescription(message).asRuntimeException())
-
-  override def listBooks(req: ListBooksRequest): Future[ListBooksResponse] = {
-    val books = Shelves.get(req.shelf) match {
-      case Some(b) => b
-      case None    => return Future.failed(Status.NOT_FOUND.withDescription(s"shelf \${req.shelf} not found").asRuntimeException())
-    }
-    if (req.pageSize < 0) return invalid("page_size must not be negative")
-    val size = math.min(if (req.pageSize == 0) DefaultPageSize else req.pageSize, MaxPageSize)
-    val after =
-      if (req.pageToken.isEmpty) ""
-      else
-        decodeToken(req.pageToken) match {
-          case Some((shelf, last)) if shelf == req.shelf => last
-          case _                                         => return invalid("page_token is malformed or was issued for another shelf")
-        }
-    // Keyset: strictly after the last id returned, so books added or removed behind the cursor shift nothing.
-    val rest = books.keys.filter(_ > after).toVector.sorted
-    val page = rest.take(size)
-    // A token only while books remain past this page: the last page carries "".
-    val next = if (rest.length > size) encodeToken(req.shelf, page.last) else ""
-    Future.successful(ListBooksResponse(page.map(id => Book(id, books.getOrElse(id, ""))), next))
-  }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder.forPort(9000).addService(LibraryGrpc.bindService(this, ExecutionContext.global)).build().start().awaitTermination()
 }
 `,
     },

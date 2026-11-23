@@ -48,7 +48,6 @@ still restarting; a hung executor holds the worker past its claim, so a second w
         python: {all: [/runner\.Execute\(/, /job_queue_pb2\.ExecuteRequest\(/]},
         typescript: {all: [/runner\.Execute\(/]},
         go: {all: [/runner\.Execute\(/, /pb\.ExecuteRequest\{/]},
-        scala: {all: [/\.execute\(/, /ExecuteRequest\(/]},
         cpp: {all: [/runner->Execute\(/, /jobqueue::ExecuteRequest/]},
       },
     },
@@ -74,15 +73,6 @@ still restarting; a hung executor holds the worker past its claim, so a second w
             /codes\.DeadlineExceeded/,
             /codes\.ResourceExhausted/,
             /codes\.Aborted/,
-            /permanent_error/,
-          ],
-        },
-        scala: {
-          all: [
-            /Code\.UNAVAILABLE/,
-            /Code\.DEADLINE_EXCEEDED/,
-            /Code\.RESOURCE_EXHAUSTED/,
-            /Code\.ABORTED/,
             /permanent_error/,
           ],
         },
@@ -112,7 +102,6 @@ still restarting; a hung executor holds the worker past its claim, so a second w
           all: [/attempt,\s*err\s*:?=\s*store\.BeginAttempt\(/],
           order: [/store\.BeginAttempt\(/, /runner\.Execute\(/],
         },
-        scala: {all: [/attempt\s*=\s*Store\.beginAttempt\(/], order: [/Store\.beginAttempt\(/, /\.execute\(/]},
         cpp: {all: [/attempt\s*=\s*store::beginAttempt\(/], order: [/store::beginAttempt\(/, /runner->Execute\(/]},
       },
     },
@@ -125,7 +114,6 @@ still restarting; a hung executor holds the worker past its claim, so a second w
         python: {all: [/BACKOFF_BASE_MS\s*(\*|<<)/]},
         typescript: {all: [/BACKOFF_BASE_MS\s*(\*|<<)/]},
         go: {all: [/backoffBaseMs\s*(\*|<<)/]},
-        scala: {all: [/BackoffBaseMs\s*(\*|<<)/]},
         cpp: {all: [/kBackoffBaseMs\s*(\*|<<)/]},
       },
     },
@@ -138,7 +126,6 @@ still restarting; a hung executor holds the worker past its claim, so a second w
         python: {all: [/timeout\s*=\s*EXECUTE_TIMEOUT_S/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*EXECUTE_TIMEOUT_S/]},
         go: {all: [/context\.WithTimeout\(\s*ctx,\s*executeTimeout\s*\)/]},
-        scala: {all: [/withDeadlineAfter\(\s*ExecuteTimeoutS/]},
         cpp: {all: [/set_deadline\([^;]*kExecuteTimeout/]},
       },
     },
@@ -450,83 +437,6 @@ func runAttempt(ctx context.Context, jobID, worker string) (string, error) {
 	store.RecordAttempt(ctx, jobID, attempt, "")
 	_, err = queue.Ack(ctx, jobID, worker)
 	return "completed", err
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import jobqueue.job_queue.{ExecuteRequest, JobRunnerGrpc}
-import jobs.{Queue, Store} // Queue.ack, retryLater, bury · Store.getJob, beginAttempt, recordAttempt
-
-object Client {
-  val MaxAttempts = 5
-
-  private val runner = JobRunnerGrpc.blockingStub(ManagedChannelBuilder.forAddress("jobrunner", 9000).usePlaintext().build())
-
-  /** Run one attempt of a job this worker claimed: "completed", "retry" or "dead". */
-  def runAttempt(jobId: String, worker: String): String = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val job = Store.getJob(jobId).getOrElse(throw new NoSuchElementException(s"no job $jobId"))
-    val attempt = job.attempts + 1
-    try runner.execute(ExecuteRequest(jobId, job.jobType, job.payload.compactPrint, attempt))
-    catch {
-      case e: StatusRuntimeException =>
-        Store.recordAttempt(jobId, attempt, s"\${e.getStatus.getCode}: \${e.getStatus.getDescription}")
-        if (attempt >= MaxAttempts) {
-          Queue.bury(jobId, "max_attempts_exceeded")
-          return "dead"
-        }
-        Queue.retryLater(jobId, System.currentTimeMillis)
-        return "retry"
-    }
-    Store.beginAttempt(jobId)
-    Store.recordAttempt(jobId, attempt, "")
-    Queue.ack(jobId, worker)
-    "completed"
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import jobqueue.job_queue.{ExecuteRequest, JobRunnerGrpc}
-import jobs.{Queue, Store} // Queue.ack, retryLater, bury · Store.getJob, beginAttempt, recordAttempt
-
-object Client {
-  val MaxAttempts = 5
-  val BackoffBaseMs = 1000L
-  val ExecuteTimeoutS = 30L // under the 60 s visibility timeout: the call ends before the claim does
-  // The executor may answer differently later; any other status says the job as written will not succeed.
-  val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED, Status.Code.RESOURCE_EXHAUSTED, Status.Code.ABORTED)
-
-  private val runner = JobRunnerGrpc.blockingStub(ManagedChannelBuilder.forAddress("jobrunner", 9000).usePlaintext().build())
-
-  /** Run one attempt of a job this worker claimed: "completed", "retry" or "dead". */
-  def runAttempt(jobId: String, worker: String): String = {
-    val job = Store.getJob(jobId).getOrElse(throw new NoSuchElementException(s"no job $jobId"))
-    // Counted on the job record before the call: a worker that dies mid-call has still used the attempt.
-    val attempt = Store.beginAttempt(jobId)
-    try runner.withDeadlineAfter(ExecuteTimeoutS, TimeUnit.SECONDS).execute(ExecuteRequest(jobId, job.jobType, job.payload.compactPrint, attempt.toInt))
-    catch {
-      case e: StatusRuntimeException =>
-        Store.recordAttempt(jobId, attempt, s"\${e.getStatus.getCode}: \${e.getStatus.getDescription}")
-        if (!Retryable.contains(e.getStatus.getCode)) {
-          Queue.bury(jobId, "permanent_error")
-          return "dead"
-        }
-        if (attempt >= MaxAttempts) {
-          Queue.bury(jobId, "max_attempts_exceeded")
-          return "dead"
-        }
-        Queue.retryLater(jobId, System.currentTimeMillis + (BackoffBaseMs << (attempt - 1)))
-        return "retry"
-    }
-    Store.recordAttempt(jobId, attempt, "")
-    Queue.ack(jobId, worker)
-    "completed"
-  }
 }
 `,
     },

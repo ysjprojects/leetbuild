@@ -48,7 +48,6 @@ execution no device has confirmed.
         python: {all: [/@app\.post\(\s*["']\/v1\/devices\/\{device_id\}\/commands["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/devices\/:\w+\/commands['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/devices\/\{device_id\}\/commands"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"devices"\s*\/\s*Segment\s*\/\s*"commands"\s*\)/, /\bpost\b/]},
         cpp: {all: [/svr\.Post\(\s*R"\(\/v1\/devices\//, /\/commands\)"/]},
       },
     },
@@ -70,10 +69,6 @@ execution no device has confirmed.
           all: [/commands\.Lookup\([^\n]*IdempotencyID/, /commands\.Record\([^\n]*IdempotencyID/],
           order: [/commands\.Lookup\(/, /commands\.Record\(/],
         },
-        scala: {
-          all: [/Commands\.lookup\([^)\n]*idempotencyId/, /Commands\.record\([^)\n]*idempotencyId/],
-          order: [/Commands\.lookup\(/, /Commands\.record\(/],
-        },
         cpp: {
           all: [/commands::lookup\([^)\n]*idempotency_id/, /commands::record\([^)\n]*idempotency_id/],
           order: [/commands::lookup\(/, /commands::record\(/],
@@ -89,7 +84,6 @@ execution no device has confirmed.
         python: {all: [/expires_at_ms/, /\b410\b/, /\b400\b/]},
         typescript: {all: [/expires_at_ms:/, /code\(\s*410\s*\)/, /code\(\s*400\s*\)/]},
         go: {all: [/ExpiresAtMs:/, /StatusGone|\b410\b/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/expiresAtMs\s*=/, /StatusCodes\.Gone/, /StatusCodes\.BadRequest/]},
         cpp: {all: [/expires_at_ms\s*=/, /\b410\b/, /\b400\b/]},
       },
     },
@@ -111,10 +105,6 @@ execution no device has confirmed.
           all: [/commandRateLimit\s*=\s*10\b/, /commands\.CountInWindow\(/, /StatusTooManyRequests|\b429\b/],
           order: [/commands\.CountInWindow\(/, /commands\.Enqueue\(/],
         },
-        scala: {
-          all: [/CommandRateLimit\s*=\s*10\b/, /Commands\.countInWindow\(/, /TooManyRequests|\b429\b/],
-          order: [/Commands\.countInWindow\(/, /Commands\.enqueue\(/],
-        },
         cpp: {
           all: [/kCommandRateLimit\s*=\s*10\b/, /commands::countInWindow\(/, /\b429\b/],
           order: [/commands::countInWindow\(/, /commands::enqueue\(/],
@@ -130,7 +120,6 @@ execution no device has confirmed.
         python: {all: [/["']pending_ack["']/, /status_code\s*=\s*202/], none: [/["']executed["']/]},
         typescript: {all: [/['"]pending_ack['"]/, /code\(\s*202\s*\)/], none: [/['"]executed['"]/]},
         go: {all: [/"pending_ack"/, /StatusAccepted|\b202\b/], none: [/"executed"/]},
-        scala: {all: [/"pending_ack"/, /StatusCodes\.Accepted/], none: [/"executed"/]},
         cpp: {all: [/"pending_ack"/, /\b202\b/], none: [/"executed"/]},
       },
     },
@@ -443,106 +432,6 @@ func submitCommand(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/devices/{device_id}/commands", submitCommand)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import iothub.{Command, Commands} // Commands.newCommandId, lookup, record, enqueue, countInWindow
-
-object Api {
-  private final case class CommandRequest(idempotencyId: String, action: String, params: Map[String, String], validityS: Long, ackRequired: Boolean)
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def parse(raw: String): CommandRequest = {
-    val f = raw.parseJson.asJsObject.fields
-    CommandRequest(
-      f.get("idempotency_id").collect { case JsString(s) => s }.getOrElse(""),
-      f.get("action").collect { case JsString(s) => s }.getOrElse(""),
-      f.get("params").collect { case JsObject(p) => p.collect { case (k, JsString(v)) => k -> v } }.getOrElse(Map.empty[String, String]),
-      f.get("validity_s").collect { case JsNumber(n) => n.toLong }.getOrElse(300L),
-      f.get("ack_required").collect { case JsBoolean(b) => b }.getOrElse(true))
-  }
-
-  val route: Route =
-    path("v1" / "devices" / Segment / "commands") { deviceId =>
-      post {
-        entity(as[String]) { raw =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val body = parse(raw)
-          val commandId = Commands.newCommandId()
-          val command = Command(commandId, deviceId, body.action, body.params, "executed", body.ackRequired)
-          Commands.record(deviceId, commandId, command)
-          Commands.enqueue(deviceId, commandId)
-          complete(json(StatusCodes.OK, Commands.toJson(command)))
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import iothub.{Command, Commands} // Commands.newCommandId, lookup, record, enqueue, countInWindow
-
-object Api {
-  val CommandRateLimit = 10
-  val RateWindowS = 60L
-  val MaxValidityS = 3600L
-
-  private final case class CommandRequest(idempotencyId: String, action: String, params: Map[String, String], validityS: Long, ackRequired: Boolean)
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def parse(raw: String): CommandRequest = {
-    val f = raw.parseJson.asJsObject.fields
-    CommandRequest(
-      f.get("idempotency_id").collect { case JsString(s) => s }.getOrElse(""),
-      f.get("action").collect { case JsString(s) => s }.getOrElse(""),
-      f.get("params").collect { case JsObject(p) => p.collect { case (k, JsString(v)) => k -> v } }.getOrElse(Map.empty[String, String]),
-      f.get("validity_s").collect { case JsNumber(n) => n.toLong }.getOrElse(300L),
-      f.get("ack_required").collect { case JsBoolean(b) => b }.getOrElse(true))
-  }
-
-  private def submit(deviceId: String, body: CommandRequest): HttpResponse = {
-    val nowMs = System.currentTimeMillis()
-    // A replay answers what the first request recorded; it never queues the action again.
-    Commands.lookup(deviceId, body.idempotencyId) match {
-      case Some(recorded) if nowMs >= recorded.expiresAtMs => json(StatusCodes.Gone, Commands.toJson(recorded.copy(state = "expired")))
-      case Some(recorded) => json(StatusCodes.Accepted, Commands.toJson(recorded))
-      case None if body.validityS < 1 || body.validityS > MaxValidityS =>
-        error(StatusCodes.BadRequest, s"validity_s must be between 1 and $MaxValidityS")
-      case None if Commands.countInWindow(deviceId, RateWindowS) > CommandRateLimit =>
-        error(StatusCodes.TooManyRequests, "this device's command budget for the minute is spent")
-      case None =>
-        // Accepted is not executed: the device's acknowledgement moves the command on.
-        val state = if (body.ackRequired) "pending_ack" else "queued"
-        val command = Command(Commands.newCommandId(), deviceId, body.action, body.params, state, body.ackRequired, expiresAtMs = nowMs + body.validityS * 1000)
-        Commands.record(deviceId, body.idempotencyId, command)
-        Commands.enqueue(deviceId, command.commandId)
-        json(StatusCodes.Accepted, Commands.toJson(command))
-    }
-  }
-
-  val route: Route =
-    path("v1" / "devices" / Segment / "commands") { deviceId =>
-      post {
-        entity(as[String]) { raw =>
-          complete(submit(deviceId, parse(raw)))
-        }
-      }
-    }
 }
 `,
     },

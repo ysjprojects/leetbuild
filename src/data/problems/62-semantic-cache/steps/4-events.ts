@@ -78,7 +78,6 @@ produce the broker rejects is logged and forgotten, so a miss wave leaves no tra
         python: {all: [/key\s*=\s*tenant(\.encode\([^)]*\))?\s*[,)]/]},
         typescript: {all: [/key:\s*tenant\b/]},
         go: {all: [/Key:\s*\[\]byte\(tenant\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*tenant\b/]},
         cpp: {all: [/tenant\.c_str\(\)\s*,\s*tenant\.(size|length)\(\)/]},
       },
     },
@@ -91,7 +90,6 @@ produce the broker rejects is logged and forgotten, so a miss wave leaves no tra
         python: {all: [/entry_id/], none: [/\.hget\(/, /["']answer["']/]},
         typescript: {all: [/entry_id/], none: [/\.hget\(/, /\banswer\b/]},
         go: {all: [/entry_id/], none: [/\.HGet\(/, /"answer"/]},
-        scala: {all: [/entry_id/], none: [/\.hget\(/, /"answer"/]},
         cpp: {all: [/entry_id/], none: [/\.hget\(/, /"answer"/]},
       },
     },
@@ -104,7 +102,6 @@ produce the broker rejects is logged and forgotten, so a miss wave leaves no tra
         python: {all: [/outbox/, /\.rpush\(/]},
         typescript: {all: [/outbox/, /\.rpush\(/]},
         go: {all: [/outbox/, /\.RPush\(/]},
-        scala: {all: [/outbox/, /\.rpush\(/]},
         cpp: {all: [/outbox/, /\.rpush\(/]},
       },
     },
@@ -117,12 +114,6 @@ produce the broker rejects is logged and forgotten, so a miss wave leaves no tra
         python: {all: [/["']acks["']\s*:\s*["']all["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/idempotent:\s*true/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/], none: [/Async:\s*true/]},
-        scala: {
-          all: [
-            /ACKS_CONFIG,\s*"all"|"acks",\s*"all"/,
-            /ENABLE_IDEMPOTENCE_CONFIG,\s*"true"|"enable\.idempotence",\s*"true"/,
-          ],
-        },
         cpp: {all: [/set\("acks",\s*"all"/, /enable\.idempotence/]},
       },
     },
@@ -135,7 +126,6 @@ produce the broker rejects is logged and forgotten, so a miss wave leaves no tra
         python: {all: [/cache_result_produce_failures/, /raise ProduceRejected\(/]},
         typescript: {all: [/cache_result_produce_failures/, /throw new ProduceRejected\(/]},
         go: {all: [/cache_result_produce_failures/, /return [^\n]*ErrProduceRejected/]},
-        scala: {all: [/cache_result_produce_failures/, /throw new ProduceRejected\(/]},
         cpp: {all: [/cache_result_produce_failures/, /throw ProduceRejected\(/]},
       },
     },
@@ -702,185 +692,6 @@ func consumeResults(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/** semantic-cache.result: one event per lookup, and the stats consumer that folds them into Redis. */
-object Events {
-  val Topic = "semantic-cache.result"
-  val Group = "semantic-cache-stats"
-  val HitFreshnessSeconds = 3600L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  /** What the lookup knows when it answers. */
-  case class ResultEvent(outcome: String, entryId: String, similarity: Option[Double], policyVersion: String, modelVersion: String, clientClass: String, entryAgeSeconds: Long)
-
-  /** The broker rejected the produce: the event is in the outbox, not on the topic. */
-  class ProduceRejected(why: String) extends RuntimeException(why)
-
-  def statsKey(tenant: String, modelVersion: String): String = s"stats:$tenant:$modelVersion"
-
-  private val logFailure: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"result event not delivered: \${exception.getMessage}")
-  }
-
-  /** One event per lookup. */
-  def publishResult(tenant: String, result: ResultEvent): Unit = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val payload = ujson.Obj(
-      "tenant" -> tenant,
-      "outcome" -> result.outcome,
-      "entry_id" -> result.entryId,
-      "similarity" -> result.similarity.map(ujson.Num(_)).getOrElse(ujson.Null),
-      "policy_version" -> result.policyVersion,
-      "model_version" -> result.modelVersion,
-      "client_class" -> result.clientClass,
-      "entry_age_seconds" -> result.entryAgeSeconds.toInt)
-    if (result.entryId.nonEmpty) payload("answer") = Option(jedis.hget(s"entry:$tenant:\${result.modelVersion}:\${result.entryId}", "answer")).getOrElse("")
-    val band = result.similarity.map(s => f"$s%.1f").getOrElse("miss")
-    producer.send(new ProducerRecord[String, String](Topic, band, ujson.write(payload)), logFailure)
-  }
-
-  /** Fold one event into the tenant and model version counters. */
-  def applyResult(tenant: String, event: ujson.Value): Unit = {
-    val key = statsKey(tenant, event("model_version").str)
-    val hit = event("outcome").str == "hit"
-    jedis.hincrBy(key, if (hit) "hits_total" else "misses_total", 1L)
-    if (event.obj.get("client_class").exists(_.str == "automated")) {
-      jedis.hincrBy(key, "automated_total", 1L)
-      if (hit) jedis.hincrBy(key, "automated_hits", 1L)
-    }
-    if (hit) {
-      jedis.hincrByFloat(key, "similarity_sum", event("similarity").numOpt.getOrElse(0.0))
-      if (event.obj.get("entry_age_seconds").map(_.num.toLong).getOrElse(0L) > HitFreshnessSeconds) jedis.hincrBy(key, "hits_older_than_1h", 1L)
-    }
-  }
-
-  def consumeResults(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    def commit(record: ConsumerRecord[String, String]): Unit =
-      consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val event = ujson.read(record.value())
-        applyResult(event("tenant").str, event)
-        commit(record)
-      }
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/** semantic-cache.result: one event per lookup keyed by tenant, and the stats consumer that folds them into Redis. */
-object Events {
-  val Topic = "semantic-cache.result"
-  val Group = "semantic-cache-stats"
-  val OutboxKey = "outbox:semantic-cache.result"
-  val FailuresKey = "cache_result_produce_failures"
-  val HitFreshnessSeconds = 3600L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  producerProps.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  /** What the lookup knows when it answers: also the wire shape, field for field. */
-  case class ResultEvent(outcome: String, entryId: String, similarity: Option[Double], policyVersion: String, modelVersion: String, clientClass: String, entryAgeSeconds: Long)
-
-  /** The broker rejected the produce: the event is in the outbox, not on the topic. */
-  class ProduceRejected(why: String) extends RuntimeException(why)
-
-  def statsKey(tenant: String, modelVersion: String): String = s"stats:$tenant:$modelVersion"
-
-  /** One event per lookup; a rejection leaves an outbox row, a counter and an exception the caller sees. */
-  def publishResult(tenant: String, result: ResultEvent): Unit = {
-    val payload = ujson.write(ujson.Obj(
-      "outcome" -> result.outcome,
-      "entry_id" -> result.entryId,
-      "similarity" -> result.similarity.map(ujson.Num(_)).getOrElse(ujson.Null),
-      "policy_version" -> result.policyVersion,
-      "model_version" -> result.modelVersion,
-      "client_class" -> result.clientClass,
-      "entry_age_seconds" -> result.entryAgeSeconds.toInt))
-    try producer.send(new ProducerRecord[String, String](Topic, tenant, payload)).get() // the broker's answer, delivered or rejected
-    catch {
-      case e: Exception =>
-        val why = Option(e.getCause).getOrElse(e).getMessage
-        jedis.rpush(OutboxKey, ujson.write(ujson.Obj("key" -> tenant, "payload" -> payload)))
-        jedis.incr(FailuresKey)
-        System.err.println(s"result event for $tenant rejected: $why")
-        throw new ProduceRejected(why)
-    }
-  }
-
-  /** Fold one event into the tenant and model version counters. */
-  def applyResult(tenant: String, event: ujson.Value): Unit = {
-    val key = statsKey(tenant, event("model_version").str)
-    val hit = event("outcome").str == "hit"
-    jedis.hincrBy(key, if (hit) "hits_total" else "misses_total", 1L)
-    if (event.obj.get("client_class").exists(_.str == "automated")) {
-      jedis.hincrBy(key, "automated_total", 1L)
-      if (hit) jedis.hincrBy(key, "automated_hits", 1L)
-    }
-    if (hit) {
-      jedis.hincrByFloat(key, "similarity_sum", event("similarity").numOpt.getOrElse(0.0))
-      if (event.obj.get("entry_age_seconds").map(_.num.toLong).getOrElse(0L) > HitFreshnessSeconds) jedis.hincrBy(key, "hits_older_than_1h", 1L)
-    }
-  }
-
-  def consumeResults(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    def commit(record: ConsumerRecord[String, String]): Unit =
-      consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        applyResult(Option(record.key()).getOrElse(""), ujson.read(record.value()))
-        commit(record)
-      }
-  }
 }
 `,
     },

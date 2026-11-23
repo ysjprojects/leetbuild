@@ -60,7 +60,6 @@ stream. Implement \`get_exposed_variant(name, attrs)\`: the variant from step 2'
         },
         typescript: {all: [/gate-exposures/, /\.send\(\s*\{[\s\S]{0,200}?key:\s*name/]},
         go: {all: [/gate-exposures/, /Key:\s*\[\]byte\(\s*name\s*\)/]},
-        scala: {all: [/gate-exposures/, /new ProducerRecord(\[[^\]]*\])?\(\s*(Topic|"gate-exposures")\s*,\s*name\s*,/]},
         cpp: {
           all: [
             /gate-exposures/,
@@ -84,7 +83,6 @@ stream. Implement \`get_exposed_variant(name, attrs)\`: the variant from step 2'
           all: [/select\s*\{[\s\S]{0,300}?default:/],
           none: [/func getExposedVariant(?:(?!\n\})[\s\S])*?WriteMessages\(/],
         },
-        scala: {all: [/producer\.send\([\s\S]{0,200}?onDelivery\s*\)/], none: [/\.send\([^\n]*\)\.get\(/]},
         cpp: {all: [/producer->poll\(\s*0\s*\)/], none: [/get_exposed_variant(?:(?!\n\})[\s\S])*?producer->flush\(/]},
       },
     },
@@ -97,9 +95,6 @@ stream. Implement \`get_exposed_variant(name, attrs)\`: the variant from step 2'
         python: {all: [/pending\s*>=\s*MAX_PENDING/, /dropped\s*\+=\s*1/, /pending\s*-=\s*1/]},
         typescript: {all: [/inFlight\.size\s*>=\s*MAX_PENDING/, /dropped\s*(\+=\s*1|\+\+)/, /inFlight\.delete\(/]},
         go: {all: [/make\(\s*chan kafka\.Message\s*,\s*maxPending\s*\)/, /dropped\.Add\(\s*1\s*\)/]},
-        scala: {
-          all: [/pending\.get\(\)\s*>=\s*MaxPending/, /dropped\.incrementAndGet\(\)/, /pending\.decrementAndGet\(\)/],
-        },
         cpp: {
           all: [
             /pending\.load\(\)\s*>=\s*kMaxPending/,
@@ -118,7 +113,6 @@ stream. Implement \`get_exposed_variant(name, attrs)\`: the variant from step 2'
         python: {all: [/def shutdown\(/, /producer\.flush\(\s*(timeout_s|FLUSH_TIMEOUT_S|5)\s*\)/]},
         typescript: {all: [/function shutdown\(/, /Promise\.race\(/, /Promise\.all\(/]},
         go: {all: [/func shutdown\(/, /context\.WithTimeout\(/, /flushTimeout|5\s*\*\s*time\.Second/]},
-        scala: {all: [/def shutdown\(/, /producer\.close\(\s*(FlushTimeout|Duration\.ofSeconds\(\s*5\s*\))\s*\)/]},
         cpp: {all: [/void shutdown\(/, /producer->flush\(\s*(kFlushTimeoutMs|5000)\s*\)/]},
       },
     },
@@ -491,121 +485,6 @@ func shutdown() {
 }
 
 func init() { go pump() }
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import Gates.{getVariant, snapshot}
-
-/** Exposure events: every assignment logged to gate-exposures — never awaited, bounded, flushed on shutdown. */
-object Exposures {
-  val Topic = "gate-exposures"
-  /** Exposures handed to the producer and not yet acknowledged: past this, the event is dropped. */
-  val MaxPending = 1000
-  val FlushTimeout: Duration = Duration.ofSeconds(5)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  props.put("linger.ms", "20")
-  props.put("max.block.ms", "0") // a full buffer throws instead of parking the request thread
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  val pending = new AtomicInteger() // in flight: handed to the producer, not yet acknowledged
-  val dropped = new AtomicLong()    // exported as gate_exposures_dropped_total
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit = {
-      // TODO: free the slot
-      if (exception != null) System.err.println(s"exposure not delivered: \${exception.getMessage}")
-    }
-  }
-
-  /** The decision from step 2 plus one exposure keyed by the gate name; the caller never waits for the broker. */
-  def getExposedVariant(name: String, attrs: Map[String, String]): String = {
-    val variant = getVariant(name, attrs)
-    val userId = attrs.getOrElse("user_id", "")
-    val value = s"""{"feature":"$name","variant":"$variant","version":\${snapshot.version},"user_id":"$userId","ts":\${System.currentTimeMillis() / 1000.0}}"""
-    // TODO: at the bound → dropped.incrementAndGet(), log once, still return the variant
-    // TODO: otherwise take a slot and send a record keyed by name with onDelivery; never block
-    ??? // TODO
-  }
-
-  /** Flush what is pending, FlushTimeout at most; whatever is still unacknowledged is reported as dropped. */
-  def shutdown(): Unit = {
-    ??? // TODO
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import Gates.{getVariant, snapshot}
-
-/** Exposure events: every assignment logged to gate-exposures — never awaited, bounded, flushed on shutdown. */
-object Exposures {
-  val Topic = "gate-exposures"
-  /** Exposures handed to the producer and not yet acknowledged: past this, the event is dropped. */
-  val MaxPending = 1000
-  val FlushTimeout: Duration = Duration.ofSeconds(5)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  props.put("linger.ms", "20")
-  props.put("max.block.ms", "0") // a full buffer throws instead of parking the request thread
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  val pending = new AtomicInteger() // in flight: handed to the producer, not yet acknowledged
-  val dropped = new AtomicLong()    // exported as gate_exposures_dropped_total
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit = {
-      pending.decrementAndGet() // the slot is free again
-      if (exception != null) System.err.println(s"exposure not delivered: \${exception.getMessage}")
-    }
-  }
-
-  /** The decision from step 2 plus one exposure keyed by the gate name; the caller never waits for the broker. */
-  def getExposedVariant(name: String, attrs: Map[String, String]): String = {
-    val variant = getVariant(name, attrs)
-    val userId = attrs.getOrElse("user_id", "")
-    val value = s"""{"feature":"$name","variant":"$variant","version":\${snapshot.version},"user_id":"$userId","ts":\${System.currentTimeMillis() / 1000.0}}"""
-    if (pending.get() >= MaxPending) {
-      // the broker is behind: lose one graph point, not the request
-      if (dropped.incrementAndGet() == 1) System.err.println(s"exposures dropped: $MaxPending pending, the broker is behind")
-      return variant
-    }
-    pending.incrementAndGet()
-    try producer.send(new ProducerRecord[String, String](Topic, name, value), onDelivery) // the future is not awaited
-    catch {
-      case _: Exception => // the buffer is full within max.block.ms = 0: lose one graph point, not the request
-        pending.decrementAndGet()
-        dropped.incrementAndGet()
-    }
-    variant
-  }
-
-  /** Flush what is pending, FlushTimeout at most; whatever is still unacknowledged is reported as dropped. */
-  def shutdown(): Unit = {
-    producer.close(FlushTimeout) // flushes, 5 s at most; a dead broker does not hold the stop
-    val left = pending.get()
-    if (left > 0) {
-      dropped.addAndGet(left)
-      System.err.println(s"shutdown: $left exposures still unacknowledged after \${FlushTimeout.getSeconds} s")
-    }
-  }
-}
 `,
     },
     cpp: {

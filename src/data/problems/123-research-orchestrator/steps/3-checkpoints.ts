@@ -54,7 +54,6 @@ in Redis forever; two concurrent tool calls on the last unit of budget both get 
         python: {all: [/["']plan["']/, /json\.loads\(/], none: [/\bPLANS\b/]},
         typescript: {all: [/['"]plan['"]|\bplan:/, /JSON\.parse\(/], none: [/\bplans\b/]},
         go: {all: [/"plan"/, /json\.Unmarshal\(/], none: [/\bplans\b/]},
-        scala: {all: [/"plan"/, /parseJson/], none: [/\bplans\b/]},
         cpp: {all: [/"plan"/, /json::parse\(/], none: [/\bplans\b/]},
       },
     },
@@ -67,7 +66,6 @@ in Redis forever; two concurrent tool calls on the last unit of budget both get 
         python: {all: [/\.hgetall\(/], none: [/results\[task_id\]\s*=/]},
         typescript: {all: [/\.hgetall\(/], none: [/results\[taskId\]\s*=/]},
         go: {all: [/\.HGetAll\(/], none: [/results\[taskID\]\s*=/]},
-        scala: {all: [/\.hgetAll\(/], none: [/results\s*\+\s*\(\s*taskId/]},
         cpp: {all: [/\.hgetall\(/], none: [/results\[task_id\]\s*=/]},
       },
     },
@@ -80,7 +78,6 @@ in Redis forever; two concurrent tool calls on the last unit of budget both get 
         python: {all: [/CHECKPOINT_TTL_S\s*=\s*86400\b/, /\.expire\(/, /EXPIRE/]},
         typescript: {all: [/CHECKPOINT_TTL_S\s*=\s*86_?400\b/, /\.expire\(/, /EXPIRE/]},
         go: {all: [/checkpointTTL\s*=\s*(24\s*\*\s*time\.Hour|86400)/, /\.Expire\(/, /EXPIRE/]},
-        scala: {all: [/CheckpointTtlS\s*=\s*86400L?\b/, /\.expire\(/, /EXPIRE/]},
         cpp: {all: [/kCheckpointTtlS\s*=\s*86400\b/, /\.expire\(/, /EXPIRE/]},
       },
     },
@@ -93,7 +90,6 @@ in Redis forever; two concurrent tool calls on the last unit of budget both get 
         python: {all: [/register_script\(|\.eval\(/, /INCR/, /DECR/], none: [/used\s*>=\s*max_tool_calls/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /INCR/, /DECR/], none: [/used\s*>=\s*maxToolCalls/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /INCR/, /DECR/], none: [/used\s*>=\s*maxToolCalls/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /INCR/, /DECR/], none: [/used\s*>=\s*maxToolCalls/]},
         cpp: {all: [/redis\.eval(sha)?</, /INCR/, /DECR/], none: [/used\s*>=\s*max_tool_calls/]},
       },
     },
@@ -420,108 +416,6 @@ func resume(ctx context.Context, jobID string) ([]jobs.Task, map[string]string, 
 func reserveToolCall(ctx context.Context, jobID string, maxToolCalls int) (bool, error) {
 	granted, err := reserveScript.Run(ctx, rdb, []string{jobs.JobKey(jobID) + ":tools"}, maxToolCalls, int(checkpointTTL.Seconds())).Int()
 	return granted == 1, err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import scala.collection.concurrent.TrieMap
-
-import research.Jobs // Jobs.jobKey, Jobs.Task
-
-object Checkpoints {
-  private val jedis = new JedisPooled("redis", 6379)
-  private val plans = TrieMap.empty[String, Seq[Jobs.Task]]
-
-  /** Record the job's plan and mark it running. */
-  def startJob(jobId: String, plan: Seq[Jobs.Task]): Unit = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    plans(jobId) = plan
-    jedis.hset(Jobs.jobKey(jobId), "status", "running")
-  }
-
-  private def readResults(key: String): Map[String, String] =
-    Option(jedis.get(key)).map(_.parseJson.convertTo[Map[String, String]]).getOrElse(Map.empty)
-
-  /** Checkpoint one subagent's findings as it arrives. */
-  def saveResult(jobId: String, taskId: String, findings: String): Unit = {
-    val key = s"\${Jobs.jobKey(jobId)}:results"
-    val results = readResults(key)
-    jedis.set(key, (results + (taskId -> findings)).toJson.compactPrint)
-  }
-
-  /** The plan's tasks without a result, and the results in hand. */
-  def resume(jobId: String): (Seq[Jobs.Task], Map[String, String]) = {
-    val results = readResults(s"\${Jobs.jobKey(jobId)}:results")
-    (plans.getOrElse(jobId, Seq.empty).filterNot(task => results.contains(task.id)), results)
-  }
-
-  /** Whether the job may make one more tool call; counts it when it may. */
-  def reserveToolCall(jobId: String, maxToolCalls: Int): Boolean = {
-    val key = s"\${Jobs.jobKey(jobId)}:tools"
-    val used = Option(jedis.get(key)).map(_.toInt).getOrElse(0)
-    if (used >= maxToolCalls) false
-    else {
-      jedis.incr(key)
-      true
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import scala.jdk.CollectionConverters._
-
-import research.Jobs // Jobs.jobKey, Jobs.Task
-
-object Checkpoints {
-  val CheckpointTtlS = 86400L
-
-  // Count, compare and roll back in one step: no other client runs between the INCR and the DECR.
-  val ReserveLua: String =
-    """local used = redis.call('INCR', KEYS[1])
-      |redis.call('EXPIRE', KEYS[1], ARGV[2])
-      |if used > tonumber(ARGV[1]) then
-      |  redis.call('DECR', KEYS[1])
-      |  return 0
-      |end
-      |return 1
-      |""".stripMargin
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private implicit val taskFormat: RootJsonFormat[Jobs.Task] =
-    jsonFormat(Jobs.Task.apply, "id", "objective", "output_format", "tools", "boundaries")
-
-  /** Record the job's plan and mark it running. */
-  def startJob(jobId: String, plan: Seq[Jobs.Task]): Unit = {
-    jedis.hset(Jobs.jobKey(jobId), Map("status" -> "running", "plan" -> plan.toJson.compactPrint).asJava)
-    jedis.expire(Jobs.jobKey(jobId), CheckpointTtlS)
-  }
-
-  /** Checkpoint one subagent's findings as it arrives. */
-  def saveResult(jobId: String, taskId: String, findings: String): Unit = {
-    val key = s"\${Jobs.jobKey(jobId)}:results"
-    jedis.hset(key, taskId, findings) // one field per task: two subagents never overwrite each other
-    jedis.expire(key, CheckpointTtlS)
-  }
-
-  /** The plan's tasks without a result, and the results in hand. */
-  def resume(jobId: String): (Seq[Jobs.Task], Map[String, String]) = {
-    val plan = Option(jedis.hget(Jobs.jobKey(jobId), "plan")).map(_.parseJson.convertTo[Seq[Jobs.Task]]).getOrElse(Seq.empty)
-    val results = jedis.hgetAll(s"\${Jobs.jobKey(jobId)}:results").asScala.toMap
-    (plan.filterNot(task => results.contains(task.id)), results)
-  }
-
-  /** Whether the job may make one more tool call; counts it when it may. */
-  def reserveToolCall(jobId: String, maxToolCalls: Int): Boolean = {
-    val args = List(maxToolCalls.toString, CheckpointTtlS.toString).asJava
-    jedis.eval(ReserveLua, List(s"\${Jobs.jobKey(jobId)}:tools").asJava, args).asInstanceOf[java.lang.Long] == 1L
-  }
 }
 `,
     },

@@ -64,10 +64,6 @@ was deriving when a revocation committed caches what it derived, for the rest of
           all: [/versionKey\s*=\s*"perm:grant_version"/, /\.Incr\(\s*ctx,\s*versionKey\s*\)/],
           none: [/\.Del\(\s*ctx,\s*cacheKey\(/],
         },
-        scala: {
-          all: [/VersionKey\s*=\s*"perm:grant_version"/, /\.incr\(\s*VersionKey\s*\)/],
-          none: [/\.del\(\s*cacheKey\(/],
-        },
         cpp: {
           all: [/kVersionKey\s*=\s*"perm:grant_version"/, /\.incr\(\s*kVersionKey\s*\)/],
           none: [/\.del\(\s*cacheKey\(/],
@@ -85,7 +81,6 @@ was deriving when a revocation committed caches what it derived, for the rest of
         go: {
           order: [/grants\.Add\(/, /\.Incr\(\s*ctx,\s*versionKey/, /grants\.Revoke\(/, /\.Incr\(\s*ctx,\s*versionKey/],
         },
-        scala: {order: [/Grants\.add\(/, /\.incr\(\s*VersionKey/, /Grants\.revoke\(/, /\.incr\(\s*VersionKey/]},
         cpp: {order: [/grants::add\(/, /\.incr\(\s*kVersionKey/, /grants::revoke\(/, /\.incr\(\s*kVersionKey/]},
       },
     },
@@ -100,7 +95,6 @@ was deriving when a revocation committed caches what it derived, for the rest of
           order: [/\.get\(\s*VERSION_KEY/, /\.version\s*===\s*version|version\s*===\s*\w+\.version/, /\beffective\(/],
         },
         go: {order: [/\.Get\(\s*ctx,\s*versionKey/, /==\s*version\b/, /grants\.Effective\(/]},
-        scala: {order: [/\.get\(\s*VersionKey/, /contains\(\s*version\s*\)|==\s*version\b/, /Grants\.effective\(/]},
         cpp: {order: [/\.get\(\s*kVersionKey/, /==\s*version\b/, /grants::effective\(/]},
       },
     },
@@ -354,87 +348,6 @@ func revokeGrant(ctx context.Context, grantID string) *grants.Grant {
 		rdb.Incr(ctx, versionKey)
 	}
 	return g
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import permz.Grants // Grants.effective, add, revoke, byId
-
-object State {
-  val CacheTtlS = 300L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def cacheKey(subject: String, scope: String): String = s"perm:$subject:$scope"
-
-  /** The permissions the subject holds at scope, sorted. */
-  def effectivePermissions(subject: String, scope: String): Seq[String] = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    Option(jedis.get(cacheKey(subject, scope))) match {
-      case Some(raw) => raw.parseJson.convertTo[Seq[String]]
-      case None =>
-        val permissions = Grants.effective(subject, scope)
-        jedis.set(cacheKey(subject, scope), permissions.toJson.compactPrint, SetParams.setParams().ex(CacheTtlS))
-        permissions
-    }
-  }
-
-  def grantRole(subject: String, role: String, scope: String, assigner: String): Grants.Grant = {
-    jedis.del(cacheKey(subject, scope))
-    Grants.add(subject, role, scope, assigner)
-  }
-
-  def revokeGrant(grantId: String): Option[Grants.Grant] =
-    Grants.byId(grantId).flatMap { grant =>
-      jedis.del(cacheKey(grant.subject, grant.scope))
-      Grants.revoke(grantId)
-    }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import permz.Grants // Grants.effective, add, revoke, byId
-
-object State {
-  val VersionKey = "perm:grant_version"
-  val CacheTtlS = 300L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def cacheKey(subject: String, scope: String): String = s"perm:$subject:$scope"
-
-  /** The permissions the subject holds at scope, sorted. */
-  def effectivePermissions(subject: String, scope: String): Seq[String] = {
-    // The version first: a set derived after it is stamped with it, so a change that commits meanwhile outdates it.
-    val version = Option(jedis.get(VersionKey)).getOrElse("0")
-    val entry = jedis.hgetAll(cacheKey(subject, scope)).asScala
-    if (entry.get("version").contains(version)) entry.getOrElse("permissions", "").split(",").toSeq.filter(_.nonEmpty)
-    else {
-      val permissions = Grants.effective(subject, scope)
-      jedis.hset(cacheKey(subject, scope), Map("permissions" -> permissions.mkString(","), "version" -> version).asJava)
-      jedis.expire(cacheKey(subject, scope), CacheTtlS)
-      permissions
-    }
-  }
-
-  def grantRole(subject: String, role: String, scope: String, assigner: String): Grants.Grant = {
-    val grant = Grants.add(subject, role, scope, assigner)
-    jedis.incr(VersionKey) // after the commit: every entry stamped before it is stale, at every scope
-    grant
-  }
-
-  def revokeGrant(grantId: String): Option[Grants.Grant] = {
-    val grant = Grants.revoke(grantId)
-    if (grant.isDefined) jedis.incr(VersionKey)
-    grant
-  }
 }
 `,
     },

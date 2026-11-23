@@ -57,7 +57,6 @@ names another tenant's passport, gets the service to download it.
         python: {all: [/@app\.post\(\s*["']\/v1\/verifications["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/verifications['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/verifications"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"verifications"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/verifications"/]},
       },
     },
@@ -70,7 +69,6 @@ names another tenant's passport, gets the service to download it.
         python: {all: [/intake\.open_case\(/], none: [/\bdecide\(/, /body\.status/]},
         typescript: {all: [/openCase\(/], none: [/\bdecide\(/, /body\.status/]},
         go: {all: [/intake\.OpenCase\(/], none: [/\bDecide\(/, /body\.Status/]},
-        scala: {all: [/Intake\.openCase\(/], none: [/\bdecide\(/, /"status"\)/]},
         cpp: {all: [/intake::openCase\(/], none: [/\bdecide\(/, /\["status"\]|value\(\s*"status"/]},
       },
     },
@@ -83,7 +81,6 @@ names another tenant's passport, gets the service to download it.
         python: {all: [/ALLOWED_DOCUMENT_TYPES\s*=/, /not in ALLOWED_DOCUMENT_TYPES/, /\b400\b/]},
         typescript: {all: [/ALLOWED_DOCUMENT_TYPES\s*=/, /ALLOWED_DOCUMENT_TYPES\.(includes|has)\(/, /\b400\b/]},
         go: {all: [/allowedDocumentTypes\s*=/, /allowedDocumentTypes\[/, /StatusBadRequest/]},
-        scala: {all: [/AllowedDocumentTypes\s*[:=]/, /AllowedDocumentTypes\.contains\(/, /BadRequest/]},
         cpp: {all: [/kAllowedDocumentTypes\s*=/, /kAllowedDocumentTypes\.(count|find|contains)\(/, /\b400\b/]},
       },
     },
@@ -104,10 +101,6 @@ names another tenant's passport, gets the service to download it.
         go: {
           all: [/StatusUnauthorized/, /StatusForbidden/, /HasPrefix\([^\n]*"documents\/"\s*\+\s*tenant\s*\+\s*"\/"/],
           order: [/HasPrefix\(/, /intake\.ReserveAttempt\(/, /storage\.Fetch\(/],
-        },
-        scala: {
-          all: [/Unauthorized/, /Forbidden/, /startsWith\(\s*s"documents\/\$tenant\/"\s*\)/],
-          order: [/startsWith\(/, /Intake\.reserveAttempt\(/, /Storage\.fetch\(/],
         },
         cpp: {
           all: [/\b401\b/, /\b403\b/, /rfind\(\s*"documents\/"\s*\+\s*tenant\s*\+\s*"\/"\s*,\s*0\s*\)/],
@@ -447,118 +440,6 @@ func submit(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/verifications", submit)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import kyc.{Cases, Intake, Storage} // Cases.load/decide, Intake.reserveAttempt/openCase, Storage.fetch
-
-object Api {
-  private def json(status: StatusCode, body: JsObject, headers: List[RawHeader] = Nil): HttpResponse =
-    HttpResponse(status, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def text(fields: Map[String, JsValue], name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  private def submit(tenant: String, raw: String): HttpResponse = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    val fields = raw.parseJson.asJsObject.fields
-    val applicant = text(fields, "applicant")
-    val requested = text(fields, "status") // partners submit applicants they already verified
-    val documents = fields.get("documents").collect { case JsArray(items) => items.map(i => (text(i.asJsObject.fields, "type"), text(i.asJsObject.fields, "ref"))) }.getOrElse(Vector.empty)
-    if (applicant.isEmpty || documents.isEmpty) error(StatusCodes.BadRequest, "applicant and at least one document are required")
-    else {
-      val (allowed, retryAfter) = Intake.reserveAttempt(tenant, applicant)
-      if (!allowed) json(StatusCodes.TooManyRequests, JsObject("error" -> JsString("too many attempts")), List(RawHeader("Retry-After", retryAfter.toString)))
-      else {
-        val fetched = documents.map { case (documentType, ref) => (documentType, ref, Storage.fetch(ref)) }
-        fetched.collectFirst { case (_, ref, None) => ref } match {
-          case Some(ref) => error(StatusCodes.UnprocessableEntity, s"no document at $ref")
-          case None =>
-            val stored = fetched.collect { case (documentType, ref, Some(obj)) => Cases.Document(documentType, ref, obj.digest) }
-            val (caseId, created) = Intake.openCase(tenant, applicant, stored)
-            if (requested.nonEmpty) Cases.decide(caseId, requested, Nil, degraded = false)
-            val opened = Cases.load(caseId).get
-            json(if (created) StatusCodes.Created else StatusCodes.OK, JsObject("case_id" -> JsString(caseId), "applicant" -> JsString(applicant), "status" -> JsString(opened.status)))
-        }
-      }
-    }
-  }
-
-  val route: Route = path("v1" / "verifications") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        entity(as[String]) { raw =>
-          complete(submit(tenant.getOrElse(""), raw))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import kyc.{Cases, Intake, Storage} // Cases.load/decide, Intake.reserveAttempt/openCase, Storage.fetch
-
-object Api {
-  val AllowedDocumentTypes: Set[String] = Set("passport", "drivers_license", "national_id")
-
-  private def json(status: StatusCode, body: JsObject, headers: List[RawHeader] = Nil): HttpResponse =
-    HttpResponse(status, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def text(fields: Map[String, JsValue], name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  private def submit(tenant: String, raw: String): HttpResponse = {
-    val fields = raw.parseJson.asJsObject.fields
-    val applicant = text(fields, "applicant")
-    val documents = fields.get("documents").collect { case JsArray(items) => items.map(i => (text(i.asJsObject.fields, "type"), text(i.asJsObject.fields, "ref"))) }.getOrElse(Vector.empty)
-    // Every refusal comes before an attempt is spent or a byte is downloaded.
-    if (applicant.isEmpty || documents.isEmpty) error(StatusCodes.BadRequest, "applicant and at least one document are required")
-    else if (documents.exists { case (documentType, _) => !AllowedDocumentTypes.contains(documentType) }) error(StatusCodes.BadRequest, "document type is not accepted")
-    else if (documents.exists { case (_, ref) => !ref.startsWith(s"documents/$tenant/") }) error(StatusCodes.Forbidden, "the document is not in this tenant's storage")
-    else {
-      val (allowed, retryAfter) = Intake.reserveAttempt(tenant, applicant)
-      if (!allowed) json(StatusCodes.TooManyRequests, JsObject("error" -> JsString("too many attempts")), List(RawHeader("Retry-After", retryAfter.toString)))
-      else {
-        val fetched = documents.map { case (documentType, ref) => (documentType, ref, Storage.fetch(ref)) }
-        fetched.collectFirst { case (_, ref, None) => ref } match {
-          case Some(ref) => error(StatusCodes.UnprocessableEntity, s"no document at $ref")
-          case None =>
-            val stored = fetched.collect { case (documentType, ref, Some(obj)) => Cases.Document(documentType, ref, obj.digest) }
-            // The case opens pending: the verdict is the service's, whatever the caller sent.
-            val (caseId, created) = Intake.openCase(tenant, applicant, stored)
-            val opened = Cases.load(caseId).get
-            json(if (created) StatusCodes.Created else StatusCodes.OK, JsObject("case_id" -> JsString(caseId), "applicant" -> JsString(applicant), "status" -> JsString(opened.status)))
-        }
-      }
-    }
-  }
-
-  val route: Route = path("v1" / "verifications") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        entity(as[String]) { raw =>
-          tenant.filter(_.nonEmpty) match {
-            case None => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-            case Some(t) => complete(submit(t, raw))
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

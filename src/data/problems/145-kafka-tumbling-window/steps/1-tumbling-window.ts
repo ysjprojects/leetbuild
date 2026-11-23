@@ -58,7 +58,6 @@ it that nothing more is expected for it.
         python: {all: [/WINDOW_MS\s*=\s*60_?000/, /producer\.produce\(\s*"page-counts"/]},
         typescript: {all: [/WINDOW_MS\s*=\s*60_?000/, /producer\.send\(\s*\{\s*topic:\s*['"]page-counts['"]/]},
         go: {all: [/windowMs\s+int64\s*=\s*60000/, /Topic:\s*"page-counts"/, /writer\.WriteMessages\(/]},
-        scala: {all: [/WindowMs\s*=\s*60000L/, /OutTopic\s*=\s*"page-counts"/, /producer\.send\(/]},
         cpp: {all: [/kWindowMs\s*=\s*60000/, /kOutTopic\s*=\s*"page-counts"/, /producer->produce\(/]},
       },
     },
@@ -71,7 +70,6 @@ it that nothing more is expected for it.
         python: {all: [/ts\s*-\s*ts\s*%\s*WINDOW_MS/]},
         typescript: {all: [/ts\s*-\s*\(?ts\s*%\s*WINDOW_MS\)?/]},
         go: {all: [/ts\s*-\s*ts\s*%\s*windowMs/]},
-        scala: {all: [/ts\s*-\s*ts\s*%\s*WindowMs/]},
         cpp: {all: [/ts\s*-\s*ts\s*%\s*kWindowMs/]},
       },
     },
@@ -84,7 +82,6 @@ it that nothing more is expected for it.
         python: {all: [/<\s*watermark/, /late\s*\+=\s*1/]},
         typescript: {all: [/<\s*watermark/, /late\s*\+=\s*1/]},
         go: {all: [/<\s*watermark/, /late\+\+/]},
-        scala: {all: [/<\s*watermark/, /late\s*\+=\s*1/]},
         cpp: {all: [/<\s*watermark/, /late\+\+|late\s*\+=\s*1/]},
       },
     },
@@ -97,7 +94,6 @@ it that nothing more is expected for it.
         python: {all: [/watermark\s*=\s*max_ts\s*-\s*LATENESS_MS/, /\+\s*WINDOW_MS\s*<=\s*watermark/]},
         typescript: {all: [/watermark\s*=\s*maxTs\s*-\s*LATENESS_MS/, /\+\s*WINDOW_MS\s*<=\s*watermark/]},
         go: {all: [/watermark\s*:?=\s*maxTs\s*-\s*latenessMs/, /\+\s*windowMs\s*<=\s*watermark/]},
-        scala: {all: [/watermark\s*=\s*maxTs\s*-\s*LatenessMs/, /\+\s*WindowMs\s*<=\s*watermark/]},
         cpp: {all: [/watermark\s*=\s*max_ts\s*-\s*kLatenessMs/, /\+\s*kWindowMs\s*<=\s*watermark/]},
       },
     },
@@ -110,7 +106,6 @@ it that nothing more is expected for it.
         python: {all: [/produce\([^\n]*key\s*=\s*page/, /"window_start"/]},
         typescript: {all: [/key:\s*page\b/, /window_start/]},
         go: {all: [/Key:\s*\[\]byte\(page\)/, /json:"window_start"/]},
-        scala: {all: [/new ProducerRecord\[[^\]]*\]\(\s*OutTopic\s*,\s*page\s*,/, /window_start/]},
         cpp: {all: [/page\.c_str\(\)\s*,\s*page\.size\(\)/, /window_start/]},
       },
     },
@@ -126,10 +121,6 @@ it that nothing more is expected for it.
           all: [/reader\.FetchMessage\(/],
           none: [/ReadMessage\(/],
           order: [/writer\.WriteMessages\(/, /reader\.CommitMessages\(/],
-        },
-        scala: {
-          all: [/"enable\.auto\.commit"\s*,\s*"false"/],
-          order: [/producer\.flush\(\)/, /consumer\.commitSync\(/],
         },
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/], order: [/producer->flush\(/, /consumer->commitSync\(/]},
       },
@@ -550,152 +541,6 @@ func run(ctx context.Context) error {
 func shutdown() {
 	reader.Close()
 	writer.Close()
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-object TumblingWindow {
-  val WindowMs = 60000L
-  val LatenessMs = 5000L
-  val OutTopic = "page-counts"
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", "windows")
-  consumerProps.put("auto.offset.reset", "earliest")
-  // TODO: disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("clicks").asJava)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  private val PageField = """"page"\\s*:\\s*"([^"]+)"""".r
-  private val TsField = """"ts"\\s*:\\s*(\\d+)""".r
-
-  // window start → page → count
-  private val windows = mutable.Map.empty[Long, mutable.Map[String, Int]]
-  private var maxTs = 0L
-  private var late = 0
-
-  def stats(): Map[String, Int] = Map("late" -> late, "open" -> windows.size)
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        for (page <- PageField.findFirstMatchIn(record.value()).map(_.group(1));
-             ts <- TsField.findFirstMatchIn(record.value()).map(_.group(1).toLong)) {
-          // TODO: drop the event if it is behind the watermark (maxTs - LatenessMs), counting it as late
-          // TODO: count it in its window (start = ts - ts % WindowMs) and raise maxTs
-          // TODO: close every window whose end <= watermark: send one record per page to
-          //       page-counts (key = page), flush, then commitSync the input offsets
-          throw new NotImplementedError()
-        }
-      }
-    }
-
-  def shutdown(): Unit = {
-    consumer.close()
-    producer.flush()
-    producer.close()
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-object TumblingWindow {
-  val WindowMs = 60000L
-  val LatenessMs = 5000L
-  val OutTopic = "page-counts"
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", "windows")
-  consumerProps.put("auto.offset.reset", "earliest")
-  consumerProps.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("clicks").asJava)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  private val PageField = """"page"\\s*:\\s*"([^"]+)"""".r
-  private val TsField = """"ts"\\s*:\\s*(\\d+)""".r
-
-  // window start → page → count
-  private val windows = mutable.Map.empty[Long, mutable.Map[String, Int]]
-  // partition → next offset to commit, for the records consumed since the last commit
-  private val pending = mutable.Map.empty[TopicPartition, OffsetAndMetadata]
-  private var maxTs = 0L
-  private var late = 0
-
-  def stats(): Map[String, Int] = Map("late" -> late, "open" -> windows.size)
-
-  /** Emit every window that ended at or before the watermark; true if any did. */
-  private def closeWindows(watermark: Long): Boolean = {
-    val closed = windows.keys.filter(start => start + WindowMs <= watermark).toSeq.sorted
-    closed.foreach { start =>
-      windows.remove(start).get.foreach { case (page, count) =>
-        val value = s"""{"page":"$page","window_start":$start,"count":$count}"""
-        producer.send(new ProducerRecord[String, String](OutTopic, page, value))
-      }
-    }
-    if (closed.nonEmpty) producer.flush() // every send acknowledged before the commit below
-    closed.nonEmpty
-  }
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        pending(new TopicPartition(record.topic(), record.partition())) = new OffsetAndMetadata(record.offset() + 1)
-        for (page <- PageField.findFirstMatchIn(record.value()).map(_.group(1));
-             ts <- TsField.findFirstMatchIn(record.value()).map(_.group(1).toLong)) {
-          var watermark = maxTs - LatenessMs
-          if (ts < watermark) late += 1
-          else {
-            val start = ts - ts % WindowMs
-            val counts = windows.getOrElseUpdate(start, mutable.Map.empty[String, Int])
-            counts(page) = counts.getOrElse(page, 0) + 1
-            maxTs = math.max(maxTs, ts)
-            watermark = maxTs - LatenessMs
-            if (closeWindows(watermark)) {
-              consumer.commitSync(pending.asJava)
-              pending.clear()
-            }
-          }
-        }
-      }
-    }
-
-  def shutdown(): Unit = {
-    consumer.close()
-    producer.flush()
-    producer.close()
-  }
 }
 `,
     },

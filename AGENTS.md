@@ -27,7 +27,6 @@ npx next dev                      # or: yarn dev
 npx next build                    # or: yarn build
 npx tsx scripts/verify.ts         # all content + Python, TypeScript, Go and C++ harnesses
 npx tsx scripts/verify.ts --no-runtime
-npx tsx scripts/check-scala.ts    # every harnessed course's Scala, compiled with scalac + the real libraries
 npx tsc --noEmit
 npm run lint                      # prettier --check + eslint, what CI runs
 npm run format                    # prettier --write + eslint --fix
@@ -82,7 +81,7 @@ course content, `AGENTS.md`, or the mock-interview feature unless the user names
   an interview (`interviewer`); the statement has a "## The debugging habit" section, every step
   opens with a `**Starting point.**` paragraph whose "hides N flaws" is the number of checks the
   Python starter fails, and the starter's `TODO` is one line that does not list the flaws.
-- All five languages are mandatory in every step of a course. A deep-learning problem (`track: 'dllm'`)
+- All four languages are mandatory in every step of a course. A deep-learning problem (`track: 'dllm'`)
   fixes one language instead — `language: 'python'` (PyTorch) or `'cuda'` — and its steps carry code
   and matchers for that language only; it has no harness, and its reference solution is a complete
   program ending in a self-test that prints `PASS`. A PyTorch step's program also runs in the browser
@@ -103,9 +102,9 @@ course content, `AGENTS.md`, or the mock-interview feature unless the user names
   what the problem takes from it. Every link is checked against the live page, never written from
   memory; `yarn verify` enforces the shape.
 - Every debugging course is built to the classic courses' bar: one contract across its steps, support
-  modules in all five languages, Python, TypeScript, Go and C++ harnesses that execute in the browser
-  runtime (the starter fails every check but at most the example, the solution passes them all), and
-  Scala compiled by `yarn check:scala`. A new or changed debugging course keeps that bar. Every
+  modules in all four languages, and Python, TypeScript, Go and C++ harnesses that execute in the
+  browser runtime (the starter fails every check but at most the example, the solution passes them
+  all). A new or changed debugging course keeps that bar. Every
   `.proto` file name and top-level `package.Message`/`Service` is unique across the catalogue (one
   Python runtime serves every course on a page). The runtimes: Go's is `goruntime/`, rebuilt into the
   committed `public/go/runtime.wasm.gz` by `yarn build:go` after any change there; C++'s is
@@ -128,8 +127,8 @@ protection or the workflow to get a PR through.
 **Before opening.** Branch from a current `main`; one change per PR — one course, one fix, one
 feature. Run the whole gate and open the PR only when it is green: `npm run lint`,
 `npx tsc --noEmit`, `npx tsx scripts/verify.ts` (the full run, harnesses included — not only
-`--file … --no-runtime`), `npx next build`, and `npx tsx scripts/check-scala.ts` when the PR changes
-Scala. CI runs them all on every push and the `CI` check is required, so a red PR cannot be merged.
+`--file … --no-runtime`) and `npx next build`. CI runs them all on every push and the `CI` check is
+required, so a red PR cannot be merged.
 Formatting failures: `npm run format`, commit.
 Never make the gate pass by weakening it — no `eslint-disable`, `@ts-ignore`,
 `@ts-expect-error`, no edits to `.eslintrc`, `.prettierrc`, `tsconfig.json` or

@@ -7,7 +7,7 @@ import {classifierTiersStep} from './steps/2-classifier-tiers';
 import {policyCacheStep} from './steps/3-policy-cache';
 import {steerAwayStep} from './steps/4-steer-away';
 import {auditEventsStep} from './steps/5-audit-events';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Zillow's Fair Housing guardrail, rebuilt as the service a real-estate assistant calls before and
@@ -138,6 +138,5 @@ and the legal review of the stop list itself.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

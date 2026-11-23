@@ -47,7 +47,6 @@ delivery report cannot tell which campaign version a serve used.
         python: {all: [/@app\.post\(\s*["']\/v1\/ads\/serve["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/ads\/serve['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/ads\/serve"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"ads"\s*\/\s*"serve"\s*\)/, /\bpost\b/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/ads\/serve"/]},
       },
     },
@@ -60,7 +59,6 @@ delivery report cannot tell which campaign version a serve used.
         python: {all: [/[<>]=?\s*MAX_PLACEMENT_CHARS/, /\bin ALLOWED_FORMATS/, /status_code\s*=\s*400/]},
         typescript: {all: [/[<>]=?\s*MAX_PLACEMENT_CHARS/, /ALLOWED_FORMATS\.includes\(/, /code\(\s*400\s*\)/]},
         go: {all: [/[<>]=?\s*maxPlacementChars/, /allowedFormats\[/, /StatusBadRequest/]},
-        scala: {all: [/[<>]=?\s*MaxPlacementChars/, /AllowedFormats\.contains\(/, /StatusCodes\.BadRequest/]},
         cpp: {all: [/[<>]=?\s*kMaxPlacementChars/, /kAllowedFormats\.(count|find|contains)\(/, /status\s*=\s*400/]},
       },
     },
@@ -73,7 +71,6 @@ delivery report cannot tell which campaign version a serve used.
         python: {all: [/\[["']state["']\]\s*[!=]=\s*["']active["']/, /store\.spent\(/, /paced_budget_micros/]},
         typescript: {all: [/\.state\s*[!=]==\s*['"]active['"]/, /\bspent\(/, /paced_budget_micros/]},
         go: {all: [/\.State\s*[!=]=\s*"active"/, /store\.Spent\(/, /PacedBudgetMicros/]},
-        scala: {all: [/\.state\s*[!=]=\s*"active"/, /Store\.spent\(/, /pacedBudgetMicros/]},
         cpp: {all: [/\.state\s*[!=]=\s*"active"/, /store::spent\(/, /paced_budget_micros/]},
       },
     },
@@ -86,7 +83,6 @@ delivery report cannot tell which campaign version a serve used.
         python: {all: [/store\.frequency\(/, /\bfreq_cap\b/]},
         typescript: {all: [/\bfrequency\(/, /\bfreq_cap\b/]},
         go: {all: [/store\.Frequency\(/, /\bFreqCap\b/]},
-        scala: {all: [/Store\.frequency\(/, /\bfreqCap\b/]},
         cpp: {all: [/store::frequency\(/, /\bfreq_cap\b/]},
       },
     },
@@ -99,7 +95,6 @@ delivery report cannot tell which campaign version a serve used.
         python: {all: [/["']campaign_version["']\s*:/]},
         typescript: {all: [/campaign_version:/]},
         go: {all: [/"campaign_version"/]},
-        scala: {all: [/"campaign_version"/]},
         cpp: {all: [/"campaign_version"/]},
       },
     },
@@ -365,95 +360,6 @@ func serve(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/ads/serve", serve)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import ads.Store // Store.campaignsFor, Store.frequency, Store.spent
-
-object Api {
-  val MaxPlacementChars = 64
-  val AllowedFormats: Set[String] = Set("banner", "native", "video")
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(body: JsObject, name: String): String = body.fields.get(name) match {
-    case Some(JsString(s)) => s
-    case _ => ""
-  }
-
-  private def adOf(c: Store.Campaign): JsObject =
-    JsObject("campaign_id" -> JsString(c.campaignId), "creative_id" -> JsString(c.creativeId), "price_micros" -> JsNumber(c.bidMicros))
-
-  val route: Route = path("v1" / "ads" / "serve") {
-    post {
-      entity(as[String]) { raw =>
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        val body = raw.parseJson.asJsObject
-        Store.campaignsFor(text(body, "placement")).sortBy(c => -c.bidMicros).headOption match {
-          case None => complete(json(StatusCodes.OK, JsObject("ad" -> JsNull, "reason" -> JsString("no_eligible_campaign"))))
-          case Some(won) => complete(json(StatusCodes.OK, JsObject("ad" -> adOf(won))))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import ads.Store // Store.campaignsFor, Store.frequency, Store.spent
-
-object Api {
-  val MaxPlacementChars = 64
-  val AllowedFormats: Set[String] = Set("banner", "native", "video")
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(body: JsObject, name: String): String = body.fields.get(name) match {
-    case Some(JsString(s)) => s
-    case _ => ""
-  }
-
-  private def adOf(c: Store.Campaign): JsObject =
-    JsObject("campaign_id" -> JsString(c.campaignId), "creative_id" -> JsString(c.creativeId), "price_micros" -> JsNumber(c.bidMicros))
-
-  private def badRequest(why: String) = complete(json(StatusCodes.BadRequest, JsObject("error" -> JsString(why))))
-
-  /** Limits before relevance: live, budget left for this impression, the user under the cap. */
-  private def eligible(c: Store.Campaign, userHash: String): Boolean =
-    c.state == "active" &&
-      Store.spent(c.campaignId) + c.bidMicros <= c.pacedBudgetMicros &&
-      Store.frequency(c.campaignId, userHash) < c.freqCap
-
-  val route: Route = path("v1" / "ads" / "serve") {
-    post {
-      entity(as[String]) { raw =>
-        val body = raw.parseJson.asJsObject
-        val placement = text(body, "placement")
-        val userHash = text(body, "user_hash")
-        // A malformed request costs nothing: it is refused before any campaign is read.
-        if (placement.isEmpty || placement.length > MaxPlacementChars) badRequest("placement must be 1 to 64 characters")
-        else if (userHash.isEmpty) badRequest("user_hash is required")
-        else if (!AllowedFormats.contains(text(body, "format"))) badRequest("format must be banner, native or video")
-        else
-          Store.campaignsFor(placement).filter(eligible(_, userHash)).sortBy(c => -c.bidMicros).headOption match {
-            case None => complete(json(StatusCodes.OK, JsObject("ad" -> JsNull, "reason" -> JsString("no_eligible_campaign"))))
-            // The version the decision read: a report can replay which creative, cap and budget applied.
-            case Some(won) => complete(json(StatusCodes.OK, JsObject("ad" -> adOf(won), "campaign_version" -> JsNumber(won.version))))
-          }
-      }
-    }
-  }
 }
 `,
     },

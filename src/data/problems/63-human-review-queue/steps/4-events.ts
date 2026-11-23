@@ -51,10 +51,6 @@ a leader failover duplicates or loses an event.
         python: {all: [/key=item\[["']item_id["']\]/], none: [/key=reviewer/]},
         typescript: {all: [/key:\s*item\.item_id/], none: [/key:\s*reviewer/]},
         go: {all: [/Key:\s*\[\]byte\(item\["item_id"\]\)/], none: [/Key:\s*\[\]byte\(reviewer\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(EventTopic,\s*item\("item_id"\)/],
-          none: [/EventTopic,\s*reviewer/],
-        },
         cpp: {all: [/item_id\.c_str\(\),\s*item_id\.size\(\)/], none: [/reviewer\.c_str\(\)/]},
       },
     },
@@ -67,7 +63,6 @@ a leader failover duplicates or loses an event.
         python: {all: [/store\.reviewer_ref\(/], none: [/reviewer_email/]},
         typescript: {all: [/store\.reviewerRef\(/], none: [/reviewer_email/]},
         go: {all: [/store\.ReviewerRef\(/], none: [/reviewer_email/]},
-        scala: {all: [/Store\.reviewerRef\(/], none: [/reviewer_email/]},
         cpp: {all: [/store::reviewerRef\(/], none: [/reviewer_email/]},
       },
     },
@@ -80,7 +75,6 @@ a leader failover duplicates or loses an event.
         python: {order: [/def decide\(/, /store\.decide\(/, /record_event\(/]},
         typescript: {order: [/function decide\(/, /store\.decide\(/, /recordEvent\(/]},
         go: {order: [/func decide\(/, /store\.Decide\(/, /recordEvent\(/]},
-        scala: {order: [/def decide\(/, /Store\.decide\(/, /recordEvent\(/]},
         cpp: {order: [/decide\(const std::string& item_id/, /store::decide\(/, /record_event\(/]},
       },
     },
@@ -93,7 +87,6 @@ a leader failover duplicates or loses an event.
         python: {all: [/store\.park_event\(/, /on_delivery/]},
         typescript: {all: [/store\.parkEvent\(/]},
         go: {all: [/store\.ParkEvent\(/]},
-        scala: {all: [/Store\.parkEvent\(/, /Callback/]},
         cpp: {all: [/store::parkEvent\(/, /dr_cb/]},
       },
     },
@@ -106,7 +99,6 @@ a leader failover duplicates or loses an event.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -405,102 +397,6 @@ func decide(ctx context.Context, itemID, reviewer, decision string) (map[string]
 		return nil, nil
 	}
 	return recordEvent(ctx, "decided", item, reviewer)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import review.Store // Store.getItem, decide, reviewerRef, parkEvent
-
-object Events {
-  val EventTopic = "review.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"review event not delivered: \${exception.getMessage}")
-  }
-
-  /** One record on review.event for an item's assignment or decision by reviewer. */
-  def recordEvent(kind: String, item: Store.Item, reviewer: String): JsObject = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val event = JsObject(
-      "type" -> JsString(s"review.$kind"),
-      "item_id" -> JsString(item("item_id")),
-      "tenant" -> JsString(item("tenant")),
-      "priority" -> JsString(item("priority")),
-      "decision" -> JsString(item.getOrElse("decision", "")),
-      "reviewer_email" -> JsString(reviewer))
-    producer.send(new ProducerRecord[String, String](EventTopic, reviewer, event.compactPrint), onDelivery)
-    producer.flush()
-    event
-  }
-
-  /** Record reviewer's decision on the item and tell the audit consumer; None when the item was already decided. */
-  def decide(itemId: String, reviewer: String, decision: String): Option[JsObject] =
-    Store.getItem(itemId).flatMap { item =>
-      val event = recordEvent("decided", item + ("decision" -> decision), reviewer)
-      Store.decide(itemId, reviewer, decision).map(_ => event)
-    }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.atomic.AtomicReference
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import review.Store // Store.getItem, decide, reviewerRef, parkEvent
-
-object Events {
-  val EventTopic = "review.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes once, on every replica.
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** One record on review.event for an item's assignment or decision by reviewer. */
-  def recordEvent(kind: String, item: Store.Item, reviewer: String): JsObject = {
-    val event = JsObject(
-      "type" -> JsString(s"review.$kind"),
-      "item_id" -> JsString(item("item_id")),
-      "tenant" -> JsString(item("tenant")),
-      "priority" -> JsString(item("priority")),
-      "decision" -> JsString(item.getOrElse("decision", "")),
-      // Who decided stays in the review store; the topic carries a pseudonym.
-      "reviewer_ref" -> JsString(Store.reviewerRef(reviewer)))
-    val failure = new AtomicReference[Exception]()
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) failure.set(exception)
-    }
-    producer.send(new ProducerRecord[String, String](EventTopic, item("item_id"), event.compactPrint), onDelivery)
-    producer.flush()
-    if (failure.get != null) {
-      // The decision is committed: the relay produces the event once the broker takes it.
-      System.err.println(s"review event for \${item("item_id")} not delivered (\${failure.get.getMessage}): parked")
-      Store.parkEvent(event)
-    }
-    event
-  }
-
-  /** Record reviewer's decision on the item and tell the audit consumer; None when the item was already decided. */
-  def decide(itemId: String, reviewer: String, decision: String): Option[JsObject] =
-    // The decision commits first: an event may lag the state, it may never describe a decision that did not happen.
-    Store.decide(itemId, reviewer, decision).map(item => recordEvent("decided", item, reviewer))
 }
 `,
     },

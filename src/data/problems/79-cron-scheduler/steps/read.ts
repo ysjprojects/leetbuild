@@ -56,7 +56,6 @@ a ledger with months of rows, and a daily report that fired this morning.
         python: {all: [/@app\.get\(\s*["']\/v1\/schedules\/\{schedule_id\}\/history["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/schedules\/:id\/history['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/schedules\/\{id\}\/history"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"schedules"\s*\/\s*Segment\s*\/\s*"history"\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/schedules\//]},
       },
     },
@@ -69,7 +68,6 @@ a ledger with months of rows, and a daily report that fired this morning.
         python: {all: [/\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*\w+\[["']tenant["']\]/]},
         typescript: {all: [/\.tenant\s*!==?\s*tenant|tenant\s*!==?\s*\w+\.tenant/]},
         go: {all: [/\.Tenant\s*!=\s*tenant|tenant\s*!=\s*\w+\.Tenant/]},
-        scala: {all: [/\.tenant\s*[!=]=\s*tenant|tenant\s*[!=]=\s*\w+\.tenant/]},
         cpp: {all: [/(\.|->)tenant\s*!=\s*tenant|tenant\s*!=\s*\w+(\.|->)tenant/]},
       },
     },
@@ -82,7 +80,6 @@ a ledger with months of rows, and a daily report that fired this morning.
         python: {all: [/fires_between\(/, /["']misfire["']/]},
         typescript: {all: [/firesBetween\(/, /['"]misfire['"]/]},
         go: {all: [/cron\.FiresBetween\(/, /"misfire"/]},
-        scala: {all: [/Cron\.firesBetween\(/, /"misfire"/]},
         cpp: {all: [/cron::FiresBetween\(/, /"misfire"/]},
       },
     },
@@ -95,7 +92,6 @@ a ledger with months of rows, and a daily report that fired this morning.
         python: {all: [/HISTORY_DAYS/]},
         typescript: {all: [/HISTORY_DAYS/]},
         go: {all: [/historyDays/]},
-        scala: {all: [/HistoryDays/]},
         cpp: {all: [/kHistoryDays/]},
       },
     },
@@ -108,7 +104,6 @@ a ledger with months of rows, and a daily report that fired this morning.
         python: {all: [/STALL_WINDOWS/], none: [/STALL_S\b/]},
         typescript: {all: [/STALL_WINDOWS/], none: [/STALL_S\b/]},
         go: {all: [/stallWindows/], none: [/stallS\b/]},
-        scala: {all: [/StallWindows/], none: [/StallS\b/]},
         cpp: {all: [/kStallWindows/], none: [/kStallS\b/]},
       },
     },
@@ -414,124 +409,6 @@ func containsWindow(windows []int64, w int64) bool {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/schedules/{id}/history", scheduleHistory)
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Instant
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import cronsched.{Cron, Store}
-
-object HistoryApi {
-  implicit val system: ActorSystem = ActorSystem("cronsched-history")
-
-  val StallS = 180L
-
-  private def error(status: StatusCode, code: String): Route =
-    complete(status, HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$code"}"""))
-
-  val route: Route =
-    path("v1" / "schedules" / Segment / "history") { id =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          val tenant = tenantOpt.getOrElse("")
-          if (tenant.isEmpty) error(StatusCodes.Unauthorized, "missing_tenant")
-          else
-            Store.get(id) match {
-              case None => error(StatusCodes.NotFound, "not_found")
-              case Some(schedule) =>
-                val runs = Store.runs(id)
-                val rows = runs.map { run =>
-                  JsObject("window" -> JsString(Cron.formatInstant(run.window)), "outcome" -> JsString(run.outcome), "reason" -> JsString(run.reason))
-                }
-                val now = Instant.now().getEpochSecond
-                val stalled = runs.nonEmpty && now - runs.last.window > StallS
-                complete(
-                  JsObject(
-                    "schedule_id" -> JsString(id),
-                    "timezone" -> JsString(schedule.timezone),
-                    "rows" -> JsArray(rows.toVector),
-                    "stalled" -> JsBoolean(stalled)
-                  )
-                )
-            }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.time.Instant
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import cronsched.{Cron, Store}
-
-object HistoryApi {
-  implicit val system: ActorSystem = ActorSystem("cronsched-history")
-
-  val HistoryDays = 7L
-  val StallWindows = 3
-
-  private def error(status: StatusCode, code: String): Route =
-    complete(status, HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$code"}"""))
-
-  val route: Route =
-    path("v1" / "schedules" / Segment / "history") { id =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          val tenant = tenantOpt.getOrElse("")
-          if (tenant.isEmpty) error(StatusCodes.Unauthorized, "missing_tenant")
-          else
-            Store.get(id) match {
-              // Another tenant's schedule answers like a missing one: the id alone reveals nothing.
-              case Some(schedule) if schedule.tenant == tenant =>
-                val now = Instant.now().getEpochSecond
-                val since = now - HistoryDays * 86400
-                // What the cron owed is the baseline: a window nobody ran has no ledger row to list.
-                val expected = Cron.parse(schedule.cron).map(spec => Cron.firesBetween(spec, schedule.timezone, since, now)).getOrElse(Seq.empty)
-                val recorded = Store.runs(id).filter(run => since <= run.window && run.window < now).map(run => run.window -> run).toMap
-                val rows = (expected ++ recorded.keys).distinct.sorted.map { window =>
-                  val (outcome, reason) = recorded.get(window).map(run => (run.outcome, run.reason)).getOrElse(("misfire", "no_record"))
-                  JsObject("window" -> JsString(Cron.formatInstant(window)), "outcome" -> JsString(outcome), "reason" -> JsString(reason))
-                }
-                val recent = expected.takeRight(StallWindows)
-                val stalled = recent.length == StallWindows && recent.forall(window => !recorded.contains(window))
-                complete(
-                  JsObject(
-                    "schedule_id" -> JsString(id),
-                    "timezone" -> JsString(schedule.timezone),
-                    "rows" -> JsArray(rows.toVector),
-                    "stalled" -> JsBoolean(stalled)
-                  )
-                )
-              case _ => error(StatusCodes.NotFound, "not_found")
-            }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

@@ -155,8 +155,8 @@ export const BADGES: readonly Badge[] = [
   {
     id: 'polyglot',
     title: 'Polyglot',
-    blurb: 'Accept steps in all five languages.',
-    glyph: '5',
+    blurb: `Accept steps in all ${LANGUAGES.length} course languages.`,
+    glyph: String(LANGUAGES.length),
     track: 'languages',
   },
   {
@@ -475,7 +475,7 @@ export function badgeProgress(
       const attempt = attempts[stepKey(problem.id, step.id)] ?? OPEN_ATTEMPT;
       if (attempt.status !== 'accepted') continue;
       accepted += 1;
-      // The language badges are about the five a course is offered in; a fixed-language problem does not count.
+      // The language badges are about the languages a course is offered in; a fixed-language problem does not count.
       if (attempt.language !== null && LANGUAGES.includes(attempt.language)) languages.add(attempt.language);
       if (attempt.hints === 0) unassisted = true;
       if (attempt.hints === 0 && attempt.wrong === 0) firstTry = true;

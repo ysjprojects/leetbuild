@@ -70,7 +70,6 @@ service Capacity { rpc Confirm(ConfirmRequest) returns (ConfirmReply); }  // RES
         python: {all: [/DEADLINE_S\s*=\s*0\.25\b/, /Confirm\([\s\S]{0,160}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*250\b/, /Confirm\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*250\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {all: [/DeadlineMillis\s*=\s*250L?\b/, /withDeadlineAfter\(\s*DeadlineMillis/]},
         cpp: {all: [/kDeadline\{250\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -92,10 +91,6 @@ service Capacity { rpc Confirm(ConfirmRequest) returns (ConfirmReply); }  // RES
           all: [/maxAttempts\s*=\s*2\b/, /retriable/, /codes\.Unavailable/, /codes\.DeadlineExceeded/],
           none: [/attempt < 5/, /time\.Sleep\(/],
         },
-        scala: {
-          all: [/MaxAttempts\s*=\s*2\b/, /Retriable/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/],
-          none: [/attempt < 5/, /Thread\.sleep\(/],
-        },
         cpp: {
           all: [/kMaxAttempts\s*=\s*2\b/, /kRetriable/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/],
           none: [/attempt < 5/, /sleep_for\(/],
@@ -111,7 +106,6 @@ service Capacity { rpc Confirm(ConfirmRequest) returns (ConfirmReply); }  // RES
         python: {all: [/RESOURCE_EXHAUSTED/, /raise CapacityExhausted/]},
         typescript: {all: [/RESOURCE_EXHAUSTED/, /throw new CapacityExhausted/]},
         go: {all: [/codes\.ResourceExhausted/, /return[^\n]*ErrCapacityExhausted/]},
-        scala: {all: [/RESOURCE_EXHAUSTED/, /throw new CapacityExhausted/]},
         cpp: {all: [/RESOURCE_EXHAUSTED/, /throw CapacityExhausted/]},
       },
     },
@@ -133,10 +127,6 @@ service Capacity { rpc Confirm(ConfirmRequest) returns (ConfirmReply); }  // RES
           all: [/return[^\n]*ErrCapacityUnavailable/],
           order: [/func reserveWithCapacity/, /confirmCapacity\(/, /ledger\.Reserve\(/],
         },
-        scala: {
-          all: [/throw new CapacityUnavailable/],
-          order: [/def reserveWithCapacity/, /confirmCapacity\(/, /Ledger\.reserve\(/],
-        },
         cpp: {
           all: [/throw CapacityUnavailable/],
           order: [/reserveWithCapacity\(/, /confirmCapacity\(/, /ledger::reserve\(/],
@@ -152,7 +142,6 @@ service Capacity { rpc Confirm(ConfirmRequest) returns (ConfirmReply); }  // RES
         python: {all: [/ledger\.reserve\([^\n]*source_version\)/, /\.source_version\b/]},
         typescript: {all: [/\breserve\([^\n]*sourceVersion\)/, /\.source_version\b/]},
         go: {all: [/ledger\.Reserve\([^\n]*sourceVersion\)/, /GetSourceVersion\(\)|\.SourceVersion\b/]},
-        scala: {all: [/Ledger\.reserve\([^\n]*sourceVersion\)/, /\.sourceVersion\b/]},
         cpp: {all: [/ledger::reserve\([^\n]*source_version\)/, /\.source_version\(\)/]},
       },
     },
@@ -437,77 +426,6 @@ func reserveWithCapacity(ctx context.Context, team, window, resourceClass string
 		return "", err
 	}
 	return ledger.Reserve(ctx, team, window, resourceClass, amount, sourceVersion)
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import quota.Ledger // Ledger.reserve(team, window, resourceClass, amount, sourceVersion): Option[String]
-import quota.capacity.{CapacityGrpc, ConfirmRequest}
-
-/** The pool has no room for the amount: the handler answers 409 capacity_exhausted. */
-final class CapacityExhausted(message: String) extends Exception(message)
-/** The pool gave no answer to rely on: the handler answers 503 TRY_AGAIN and writes nothing. */
-final class CapacityUnavailable(message: String) extends Exception(message)
-
-object Client {
-  private val capacity = CapacityGrpc.blockingStub(ManagedChannelBuilder.forAddress("capacity", 9000).usePlaintext().build())
-
-  /** Confirm the amount with the capacity service, then take it from the team's window; None when the quota is spent. */
-  def reserveWithCapacity(team: String, window: String, resourceClass: String, amount: Long): Option[String] = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val request = ConfirmRequest(team, window, resourceClass, amount)
-    var attempt = 0
-    var confirmed = false
-    while (attempt < 5 && !confirmed) {
-      try { capacity.confirm(request); confirmed = true }
-      catch { case _: StatusRuntimeException => Thread.sleep(200); attempt += 1 } // the pool is busy: ask again
-    }
-    Ledger.reserve(team, window, resourceClass, amount)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import quota.Ledger // Ledger.reserve(team, window, resourceClass, amount, sourceVersion): Option[String]
-import quota.capacity.{CapacityGrpc, ConfirmRequest}
-
-/** The pool has no room for the amount: the handler answers 409 capacity_exhausted. */
-final class CapacityExhausted(message: String) extends Exception(message)
-/** The pool gave no answer to rely on: the handler answers 503 TRY_AGAIN and writes nothing. */
-final class CapacityUnavailable(message: String) extends Exception(message)
-
-object Client {
-  val DeadlineMillis = 250L
-  val MaxAttempts = 2
-  val Retriable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val capacity = CapacityGrpc.blockingStub(ManagedChannelBuilder.forAddress("capacity", 9000).usePlaintext().build())
-
-  /** The pool's confirmation of the amount: the source_version it was checked against. */
-  def confirmCapacity(team: String, window: String, resourceClass: String, amount: Long): String = {
-    val request = ConfirmRequest(team, window, resourceClass, amount)
-    def attempt(n: Int): String =
-      try capacity.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).confirm(request).sourceVersion
-      catch {
-        // The pool's answer, not a fault: asking again changes nothing.
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.RESOURCE_EXHAUSTED =>
-          throw new CapacityExhausted(Option(e.getStatus.getDescription).getOrElse("no room"))
-        case e: StatusRuntimeException if Retriable.contains(e.getStatus.getCode) && n < MaxAttempts => attempt(n + 1)
-        case e: StatusRuntimeException => throw new CapacityUnavailable(s"capacity: \${e.getStatus.getCode}")
-      }
-    attempt(1)
-  }
-
-  /** Confirm the amount with the capacity service, then take it from the team's window; None when the quota is spent. */
-  def reserveWithCapacity(team: String, window: String, resourceClass: String, amount: Long): Option[String] = {
-    // Unsure is a no: only a confirmation reaches the ledger.
-    val sourceVersion = confirmCapacity(team, window, resourceClass, amount)
-    Ledger.reserve(team, window, resourceClass, amount, sourceVersion)
-  }
 }
 `,
     },

@@ -48,7 +48,6 @@ failover loses it, and a broker that refuses it or never answers loses it for go
         python: {all: [/key\s*=\s*user_id/], none: [/key\s*=\s*session_id/]},
         typescript: {all: [/key:\s*userId\b/], none: [/key:\s*sessionId\b/]},
         go: {all: [/Key:\s*\[\]byte\(userID\)/], none: [/Key:\s*\[\]byte\(sessionID\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*userId/], none: [/Topic,\s*sessionId/]},
         cpp: {all: [/user_id\.c_str\(\),\s*user_id\.size\(\)/], none: [/session_id\.c_str\(\)/]},
       },
     },
@@ -61,7 +60,6 @@ failover loses it, and a broker that refuses it or never answers loses it for go
         python: {all: [/token_hash/], none: [/["']token["']\s*:/]},
         typescript: {all: [/token_hash/], none: [/[{,]\s*token\s*[,}]/]},
         go: {all: [/"token_hash"/], none: [/"token":\s*token/]},
-        scala: {all: [/"token_hash"/], none: [/"token"\s*->/]},
         cpp: {all: [/"token_hash"/], none: [/\{"token",\s*token\}/]},
       },
     },
@@ -74,7 +72,6 @@ failover loses it, and a broker that refuses it or never answers loses it for go
         python: {order: [/store\.put_session\(/, /producer\.produce\(/]},
         typescript: {order: [/\bputSession\(/, /producer\.send\(/]},
         go: {order: [/store\.PutSession\(/, /producer\.Produce\(/]},
-        scala: {order: [/Store\.putSession\(/, /producer\.send\(/]},
         cpp: {order: [/store::putSession\(/, /producer->produce\(/]},
       },
     },
@@ -87,7 +84,6 @@ failover loses it, and a broker that refuses it or never answers loses it for go
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -100,7 +96,6 @@ failover loses it, and a broker that refuses it or never answers loses it for go
         python: {all: [/store\.outbox_add\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/\boutboxAdd\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/store\.OutboxAdd\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Store\.outboxAdd\(/, /\.get\(\s*[^\n]*TimeUnit/, /Failure|catch|isFailure/]},
         cpp: {all: [/store::outboxAdd\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -350,90 +345,6 @@ func openSession(ctx context.Context, userID, deviceClass, token string) (string
 		return sessionID, false, nil
 	}
 	return sessionID, true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import sessions.Store // Store.newSessionId, putSession, tokenHash, outboxAdd
-
-object SessionEvents {
-  final case class Opened(sessionId: String, published: Boolean)
-
-  val Topic = "session.event"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def eventPayload(sessionId: String, userId: String, deviceClass: String, token: String): JsObject =
-    JsObject("type" -> JsString("session.created"), "session_id" -> JsString(sessionId), "user_id" -> JsString(userId),
-      "device_class" -> JsString(deviceClass), "token" -> JsString(token))
-
-  /** Open a session for a completed login and announce it on session.event. */
-  def openSession(userId: String, deviceClass: String, token: String): Opened = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val sessionId = Store.newSessionId()
-    val payload = eventPayload(sessionId, userId, deviceClass, token)
-    producer.send(new ProducerRecord[String, String](Topic, sessionId, payload.compactPrint))
-    Store.putSession(sessionId, userId, deviceClass, token)
-    Opened(sessionId, published = true)
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import sessions.Store // Store.newSessionId, putSession, tokenHash, outboxAdd
-
-object SessionEvents {
-  final case class Opened(sessionId: String, published: Boolean)
-
-  val Topic = "session.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What a consumer needs to correlate the session; the hash, never the credential. */
-  def eventPayload(sessionId: String, userId: String, deviceClass: String, token: String): JsObject =
-    JsObject("type" -> JsString("session.created"), "session_id" -> JsString(sessionId), "user_id" -> JsString(userId),
-      "device_class" -> JsString(deviceClass), "token_hash" -> JsString(Store.tokenHash(token)))
-
-  /** Open a session for a completed login, then announce it on session.event. */
-  def openSession(userId: String, deviceClass: String, token: String): Opened = {
-    val sessionId = Store.newSessionId()
-    // The session exists before anyone hears about it.
-    Store.putSession(sessionId, userId, deviceClass, token)
-    val payload = eventPayload(sessionId, userId, deviceClass, token)
-    // One user's events share a partition, so the audit trail reads them in order.
-    val record = new ProducerRecord[String, String](Topic, userId, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so the audit trail is late, not wrong.
-      Store.outboxAdd(Topic, userId, payload)
-    }
-    Opened(sessionId, published = acked.isSuccess)
-  }
 }
 `,
     },

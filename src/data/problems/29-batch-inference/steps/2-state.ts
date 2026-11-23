@@ -58,7 +58,6 @@ Requirements, each operation **one Lua script** (\`register_script\`, \`defineCo
         python: {all: [/register_script\(|\.eval\(|\.evalsha\(/, /redis\.call\(\s*['"]LPOP['"]/], none: [/\.lpop\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(|\.evalsha\(/, /redis\.call\(\s*['"]LPOP['"]/], none: [/\.lpop\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(|\.EvalSha\(/, /redis\.call\(\s*['"]LPOP['"]/], none: [/\.LPop\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]LPOP['"]/], none: [/\.lpop\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]LPOP['"]/], none: [/\.lpop\(/]},
       },
     },
@@ -71,7 +70,6 @@ Requirements, each operation **one Lua script** (\`register_script\`, \`defineCo
         python: {all: [/['"]HGET['"][\s\S]{0,200}?['"]ZADD['"]/]},
         typescript: {all: [/['"]HGET['"][\s\S]{0,200}?['"]ZADD['"]/]},
         go: {all: [/['"]HGET['"][\s\S]{0,200}?['"]ZADD['"]/]},
-        scala: {all: [/['"]HGET['"][\s\S]{0,200}?['"]ZADD['"]/]},
         cpp: {all: [/['"]HGET['"][\s\S]{0,200}?['"]ZADD['"]/]},
       },
     },
@@ -84,7 +82,6 @@ Requirements, each operation **one Lua script** (\`register_script\`, \`defineCo
         python: {all: [/redis\.call\(\s*['"]RPUSH['"]|\.rpush\(/], none: [/\.hset\([^\n]*["']failed["']/]},
         typescript: {all: [/redis\.call\(\s*['"]RPUSH['"]|\.rpush\(/], none: [/\.hset\([^\n]*['"]failed['"]/]},
         go: {all: [/redis\.call\(\s*['"]RPUSH['"]|\.RPush\(/], none: [/\.HSet\([^\n]*"failed"/]},
-        scala: {all: [/redis\.call\(\s*['"]RPUSH['"]|\.rpush\(/], none: [/\.hset\([^\n]*"failed"/]},
         cpp: {all: [/redis\.call\(\s*['"]RPUSH['"]|\.rpush\(/], none: [/\.hset\([^\n]*"failed"/]},
       },
     },
@@ -97,7 +94,6 @@ Requirements, each operation **one Lua script** (\`register_script\`, \`defineCo
         python: {all: [/['"]HGET['"][\s\S]{0,200}?['"]HDEL['"]/]},
         typescript: {all: [/['"]HGET['"][\s\S]{0,200}?['"]HDEL['"]/]},
         go: {all: [/['"]HGET['"][\s\S]{0,200}?['"]HDEL['"]/]},
-        scala: {all: [/['"]HGET['"][\s\S]{0,200}?['"]HDEL['"]/]},
         cpp: {all: [/['"]HGET['"][\s\S]{0,200}?['"]HDEL['"]/]},
       },
     },
@@ -110,7 +106,6 @@ Requirements, each operation **one Lua script** (\`register_script\`, \`defineCo
         python: {all: [/['"]HDEL['"][\s\S]{0,200}?['"]ZREM['"]|\.hdel\([^\n]*\n[^\n]*\.zrem\(/]},
         typescript: {all: [/['"]HDEL['"][\s\S]{0,200}?['"]ZREM['"]|\.hdel\([^\n]*\n[^\n]*\.zrem\(/]},
         go: {all: [/['"]HDEL['"][\s\S]{0,200}?['"]ZREM['"]|\.HDel\([^\n]*\n[^\n]*\.ZRem\(/]},
-        scala: {all: [/['"]HDEL['"][\s\S]{0,200}?['"]ZREM['"]|\.hdel\([^\n]*\n[^\n]*\.zrem\(/]},
         cpp: {all: [/['"]HDEL['"][\s\S]{0,200}?['"]ZREM['"]|\.hdel\([^\n]*\n[^\n]*\.zrem\(/]},
       },
     },
@@ -493,126 +488,6 @@ func complete(ctx context.Context, batchID, shard, workerID, outcome string) (bo
 func reap(ctx context.Context, batchID string) ([]string, error) {
 	keys := []string{config.DeadlinesKey(batchID), config.OwnersKey(batchID), config.ShardsKey(batchID), config.PendingKey(batchID)}
 	return reapExpired.Run(ctx, rdb, keys, time.Now().Unix()).StringSlice()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import batch.Config
-
-object ShardLeases {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private def now(): Long = System.currentTimeMillis() / 1000
-
-  /** Take the next pending shard and lease it to workerId for LeaseSeconds; None when nothing is pending. */
-  def claim(batchId: String, workerId: String): Option[String] = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val shard = Option(jedis.lpop(Config.pendingKey(batchId)))
-    shard.foreach { s =>
-      jedis.hset(Config.ownersKey(batchId), s, workerId)
-      jedis.zadd(Config.deadlinesKey(batchId), (now() + Config.LeaseSeconds).toDouble, s)
-      jedis.hset(Config.shardsKey(batchId), s, "running")
-    }
-    shard
-  }
-
-  /** Extend workerId's lease on shard by LeaseSeconds; false when the lease is not workerId's. */
-  def heartbeat(batchId: String, shard: String, workerId: String): Boolean = {
-    jedis.hset(Config.ownersKey(batchId), shard, workerId)
-    jedis.zadd(Config.deadlinesKey(batchId), (now() + Config.LeaseSeconds).toDouble, shard)
-    true
-  }
-
-  /** Record the shard's outcome (done or failed) and release the lease; false when it is not workerId's. */
-  def complete(batchId: String, shard: String, workerId: String, outcome: String): Boolean = {
-    jedis.hset(Config.shardsKey(batchId), shard, outcome)
-    jedis.hdel(Config.ownersKey(batchId), shard)
-    true
-  }
-
-  /** The shards whose lease ran out, handled so another worker can take them over. */
-  def reap(batchId: String): List[String] = {
-    val expired = jedis.zrangeByScore(Config.deadlinesKey(batchId), "-inf", now().toString).asScala.toList
-    expired.foreach { shard =>
-      jedis.zrem(Config.deadlinesKey(batchId), shard)
-      jedis.hset(Config.shardsKey(batchId), shard, "failed")
-    }
-    expired
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import batch.Config
-
-object ShardLeases {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private val Claim = """
-local shard = redis.call('LPOP', KEYS[1])
-if not shard then return false end
-redis.call('HSET', KEYS[2], shard, ARGV[1])
-redis.call('ZADD', KEYS[3], ARGV[2], shard)
-redis.call('HSET', KEYS[4], shard, 'running')
-return shard
-"""
-
-  private val Heartbeat = """
-if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
-redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
-return 1
-"""
-
-  private val Complete = """
-if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
-redis.call('HDEL', KEYS[1], ARGV[1])
-redis.call('ZREM', KEYS[2], ARGV[1])
-redis.call('HSET', KEYS[3], ARGV[1], ARGV[3])
-return 1
-"""
-
-  private val Reap = """
-local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
-for _, shard in ipairs(expired) do
-  redis.call('ZREM', KEYS[1], shard)
-  redis.call('HDEL', KEYS[2], shard)
-  redis.call('HSET', KEYS[3], shard, 'pending')
-  redis.call('RPUSH', KEYS[4], shard)
-end
-return expired
-"""
-
-  private def now(): Long = System.currentTimeMillis() / 1000
-
-  /** Take the next pending shard and lease it to workerId for LeaseSeconds; None when nothing is pending. */
-  def claim(batchId: String, workerId: String): Option[String] = {
-    val keys = List(Config.pendingKey(batchId), Config.ownersKey(batchId), Config.deadlinesKey(batchId), Config.shardsKey(batchId))
-    Option(jedis.eval(Claim, keys.asJava, List(workerId, (now() + Config.LeaseSeconds).toString).asJava)).map(_.toString)
-  }
-
-  /** Extend workerId's lease on shard by LeaseSeconds; false when the lease is not workerId's. */
-  def heartbeat(batchId: String, shard: String, workerId: String): Boolean = {
-    val keys = List(Config.ownersKey(batchId), Config.deadlinesKey(batchId))
-    jedis.eval(Heartbeat, keys.asJava, List(shard, workerId, (now() + Config.LeaseSeconds).toString).asJava) == 1L
-  }
-
-  /** Record the shard's outcome (done or failed) and release the lease; false when it is not workerId's. */
-  def complete(batchId: String, shard: String, workerId: String, outcome: String): Boolean = {
-    val keys = List(Config.ownersKey(batchId), Config.deadlinesKey(batchId), Config.shardsKey(batchId))
-    jedis.eval(Complete, keys.asJava, List(shard, workerId, outcome).asJava) == 1L
-  }
-
-  /** The shards whose lease ran out, handled so another worker can take them over. */
-  def reap(batchId: String): List[String] = {
-    val keys = List(Config.deadlinesKey(batchId), Config.ownersKey(batchId), Config.shardsKey(batchId), Config.pendingKey(batchId))
-    jedis.eval(Reap, keys.asJava, List(now().toString).asJava).asInstanceOf[java.util.List[AnyRef]].asScala.map(_.toString).toList
-  }
 }
 `,
     },

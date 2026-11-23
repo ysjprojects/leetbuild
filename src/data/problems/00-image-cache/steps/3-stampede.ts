@@ -46,7 +46,6 @@ Implement \`fill(key, id, width)\`, the miss path, so only **one** request rende
           all: [/\.set\(\s*lock\s*,[^\n]*['"]NX['"]/, /\.set\(\s*lock\s*,[^\n]*['"]EX['"]\s*,\s*LOCK_TTL_S/],
         },
         go: {all: [/rdb\.SetNX\(\s*ctx\s*,\s*lock\s*,[^\n]*lockTTL\s*\)/]},
-        scala: {all: [/\.nx\(\)/, /\.ex\(\s*LockTtlSeconds\s*\)/]},
         cpp: {all: [/redis\.set\(\s*lock\s*,[^\n]*kLockTtl\s*,\s*sw::redis::UpdateType::NOT_EXIST\s*\)/]},
       },
     },
@@ -59,7 +58,6 @@ Implement \`fill(key, id, width)\`, the miss path, so only **one** request rende
         python: {all: [/store\(\s*key\s*,/, /\.delete\(\s*lock\s*\)/]},
         typescript: {all: [/store\(\s*key\s*,/, /\.del\(\s*lock\s*\)/]},
         go: {all: [/store\(\s*ctx\s*,\s*key\s*,/, /rdb\.Del\(\s*ctx\s*,\s*lock\s*\)/]},
-        scala: {all: [/store\(\s*key\s*,/, /jedis\.del\(\s*lock\s*\)/]},
         cpp: {all: [/store\(\s*key\s*,/, /redis\.del\(\s*lock\s*\)/]},
       },
     },
@@ -71,7 +69,6 @@ Implement \`fill(key, id, width)\`, the miss path, so only **one** request rende
         python: {all: [/time\.sleep\(/, /\br\.get\(\s*key\s*\)/]},
         typescript: {all: [/\bsleep\(|setTimeout\(/, /\bredis\.get(Buffer)?\(\s*key\s*\)/]},
         go: {all: [/time\.Sleep\(/, /rdb\.Get\(\s*ctx\s*,\s*key\s*\)/]},
-        scala: {all: [/Thread\.sleep\(/, /jedis\.get\(\s*key/]},
         cpp: {all: [/sleep_for\(/, /redis\.get\(\s*key\s*\)/]},
       },
     },
@@ -83,7 +80,6 @@ Implement \`fill(key, id, width)\`, the miss path, so only **one** request rende
         python: {all: [/monotonic\(\)|time\.time\(\)/, /LOCK_TTL_S/]},
         typescript: {all: [/Date\.now\(\)|performance\.now\(\)/, /LOCK_TTL_S/]},
         go: {all: [/time\.Now\(\)|time\.After\(/, /lockTTL/]},
-        scala: {all: [/System\.nanoTime\(\)|currentTimeMillis\(\)/, /LockTtlSeconds/]},
         cpp: {all: [/steady_clock::now\(\)/, /kLockTtl/]},
       },
     },
@@ -335,76 +331,6 @@ func fill(ctx context.Context, key, id string, width int) ([]byte, error) {
 		}
 	}
 	return render(ctx, id, width) // the leader died: render ourselves
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-object ThumbFill {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val LockTtlSeconds = 5L
-  val PollMillis = 50L
-  val Missing: Array[Byte] = "__missing__".getBytes
-
-  /** Built in step 4; None when the origin has no such image. */
-  def render(id: String, width: Int): Option[Array[Byte]] = ???
-
-  /** SETEX with the right TTL (sentinel when data is None) — from step 2. */
-  def store(key: String, data: Option[Array[Byte]]): Unit = ???
-
-  /** The miss path: render at most once per key while others wait for the value. */
-  def fill(key: String, id: String, width: Int): Option[Array[Byte]] = {
-    val lock = s"lock:$key"
-    // TODO: SET lock NX EX LockTtlSeconds; winner renders, stores, releases the lock
-    // TODO: others poll jedis.get(key) every PollMillis until the lock TTL passes
-    // TODO: past the deadline, render anyway
-    None
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-object ThumbFill {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val LockTtlSeconds = 5L
-  val PollMillis = 50L
-  val Missing: Array[Byte] = "__missing__".getBytes
-
-  /** Built in step 4; None when the origin has no such image. */
-  def render(id: String, width: Int): Option[Array[Byte]] = ???
-
-  /** SETEX with the right TTL (sentinel when data is None) — from step 2. */
-  def store(key: String, data: Option[Array[Byte]]): Unit = ???
-
-  /** The miss path: render at most once per key while others wait for the value. */
-  def fill(key: String, id: String, width: Int): Option[Array[Byte]] = {
-    val lock = s"lock:$key"
-    val won = jedis.set(lock, "1", SetParams.setParams().nx().ex(LockTtlSeconds)) != null
-    if (won) {
-      try {
-        val data = render(id, width)
-        store(key, data)
-        data
-      } finally jedis.del(lock)
-    } else {
-      val deadline = System.nanoTime() + LockTtlSeconds * 1000000000L
-      var found: Option[Array[Byte]] = None
-      var done = false
-      while (!done && System.nanoTime() < deadline) {
-        Thread.sleep(PollMillis)
-        Option(jedis.get(key.getBytes)).foreach { cached =>
-          found = if (cached.sameElements(Missing)) None else Some(cached)
-          done = true
-        }
-      }
-      if (done) found else render(id, width) // the leader died: render ourselves
-    }
-  }
 }
 `,
     },

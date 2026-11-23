@@ -68,7 +68,6 @@ service Refunds   { rpc IssueRefund(RefundRequest) returns (RefundReply); }
           all: [/GRADE_DEADLINE_MS\s*=\s*3_?000\b/, /GradeItem\([\s\S]{0,300}?deadline:[^\n]*GRADE_DEADLINE_MS/],
         },
         go: {all: [/gradeDeadline\s*=\s*3\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*gradeDeadline\)/]},
-        scala: {all: [/GradeDeadlineSeconds\s*=\s*3L?\b/, /withDeadlineAfter\(\s*GradeDeadlineSeconds/]},
         cpp: {all: [/kGradeDeadline\{3\}/, /set_deadline\([^\n]*kGradeDeadline\)/]},
       },
     },
@@ -81,7 +80,6 @@ service Refunds   { rpc IssueRefund(RefundRequest) returns (RefundReply); }
         python: {all: [/["']awaiting_inspection["']/], none: [/\bgrade\s*:?=\s*["']sellable["']/]},
         typescript: {all: [/["']awaiting_inspection["']/], none: [/\bgrade\s*:?=\s*["']sellable["']/]},
         go: {all: [/"awaiting_inspection"/], none: [/\bgrade\s*:?=\s*"sellable"/]},
-        scala: {all: [/"awaiting_inspection"/], none: [/\bgrade\s*:?=\s*"sellable"/]},
         cpp: {all: [/"awaiting_inspection"/], none: [/\bgrade\s*:?=\s*"sellable"/]},
       },
     },
@@ -94,7 +92,6 @@ service Refunds   { rpc IssueRefund(RefundRequest) returns (RefundReply); }
         python: {all: [/DAMAGED_REFUND_PERCENT/, /==\s*["']damaged["']/]},
         typescript: {all: [/DAMAGED_REFUND_PERCENT/, /===?\s*["']damaged["']/]},
         go: {all: [/damagedRefundPercent/, /==\s*"damaged"/]},
-        scala: {all: [/DamagedRefundPercent/, /==\s*"damaged"/]},
         cpp: {all: [/kDamagedRefundPercent/, /==\s*"damaged"/]},
       },
     },
@@ -107,7 +104,6 @@ service Refunds   { rpc IssueRefund(RefundRequest) returns (RefundReply); }
         python: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/==\s*["']sellable["']/, /\bcontinue\b/]},
         typescript: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/===?\s*["']sellable["']/, /\bcontinue;/]},
         go: {all: [/codes\.Unavailable/, /codes\.DeadlineExceeded/], none: [/==\s*"sellable"/, /\bcontinue\b/]},
-        scala: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/==\s*"sellable"/]},
         cpp: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/==\s*"sellable"/, /\bcontinue;/]},
       },
     },
@@ -470,105 +466,6 @@ func settleReturn(ctx context.Context, returnID string) (string, error) {
 	}
 	store.UpdateReturn(ctx, returnID, map[string]any{"state": "refund_pending", "grade": grade, "refund_cents": amount, "refund_id": reply.GetRefundId()})
 	return "refund_pending", nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import returns.Store // Store.returnOf, lineOf, updateReturn
-import returnsd.returns_processing.{GradeRequest, RefundRequest, RefundsGrpc, WarehouseGrpc}
-
-object Client {
-  val GradeDeadlineSeconds = 30L
-  val RefundDeadlineSeconds = 5L
-  val MaxAttempts = 3
-
-  private val warehouse = WarehouseGrpc.blockingStub(ManagedChannelBuilder.forAddress("warehouse", 9000).usePlaintext().build())
-  private val refunds = RefundsGrpc.blockingStub(ManagedChannelBuilder.forAddress("refunds", 9000).usePlaintext().build())
-
-  /** The warehouse's grade of the returned item. */
-  def gradeItem(ret: Store.Return, line: Store.OrderLine): String = {
-    val request = GradeRequest(returnId = ret.returnId, sku = line.sku, quantity = ret.quantity)
-    var grade = "sellable"
-    var attempt = 0
-    var done = false
-    while (attempt < MaxAttempts && !done) {
-      attempt += 1
-      try {
-        grade = warehouse.withDeadlineAfter(GradeDeadlineSeconds, TimeUnit.SECONDS).gradeItem(request).grade
-        done = grade == "sellable"
-      } catch { case _: StatusRuntimeException => () }
-    }
-    grade
-  }
-
-  /** Grade the returned item and request its refund; the state the return is left in. */
-  def settleReturn(returnId: String): String = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val ret = Store.returnOf(returnId).getOrElse(throw new NoSuchElementException(s"no return $returnId"))
-    val line = Store.lineOf(ret.orderLineId).getOrElse(throw new NoSuchElementException(s"no order line \${ret.orderLineId}"))
-    val grade = gradeItem(ret, line)
-    val amount = line.unitPriceCents * ret.quantity
-    val reply = refunds.withDeadlineAfter(RefundDeadlineSeconds, TimeUnit.SECONDS).issueRefund(RefundRequest(returnId = returnId, amountCents = amount))
-    Store.updateReturn(returnId, Map("state" -> "refund_pending", "grade" -> grade, "refund_cents" -> amount.toString, "refund_id" -> reply.refundId))
-    "refund_pending"
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import returns.Store // Store.returnOf, lineOf, updateReturn
-import returnsd.returns_processing.{GradeRequest, RefundRequest, RefundsGrpc, WarehouseGrpc}
-
-object Client {
-  val GradeDeadlineSeconds = 3L
-  val RefundDeadlineSeconds = 5L
-  val MaxAttempts = 3
-  val DamagedRefundPercent = 50L
-  /** A restarting or slow warehouse may answer the next attempt; any other status will not change. */
-  private val Transient = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val warehouse = WarehouseGrpc.blockingStub(ManagedChannelBuilder.forAddress("warehouse", 9000).usePlaintext().build())
-  private val refunds = RefundsGrpc.blockingStub(ManagedChannelBuilder.forAddress("refunds", 9000).usePlaintext().build())
-
-  /** The warehouse's grade of the returned item, or None when no grade arrived. */
-  def gradeItem(ret: Store.Return, line: Store.OrderLine): Option[String] = {
-    val request = GradeRequest(returnId = ret.returnId, sku = line.sku, quantity = ret.quantity)
-    def attempt(n: Int): Option[String] =
-      try Some(warehouse.withDeadlineAfter(GradeDeadlineSeconds, TimeUnit.SECONDS).gradeItem(request).grade)
-      catch {
-        case e: StatusRuntimeException if Transient.contains(e.getStatus.getCode) && n < MaxAttempts => attempt(n + 1)
-        case _: StatusRuntimeException => None
-      }
-    attempt(1)
-  }
-
-  def refundCents(line: Store.OrderLine, ret: Store.Return, grade: String): Long = {
-    val value = line.unitPriceCents * ret.quantity
-    if (grade == "damaged") value * DamagedRefundPercent / 100 else value
-  }
-
-  /** Grade the returned item and request its refund; the state the return is left in. */
-  def settleReturn(returnId: String): String = {
-    val ret = Store.returnOf(returnId).getOrElse(throw new NoSuchElementException(s"no return $returnId"))
-    val line = Store.lineOf(ret.orderLineId).getOrElse(throw new NoSuchElementException(s"no order line \${ret.orderLineId}"))
-    gradeItem(ret, line) match {
-      case None =>
-        // Nobody has looked at the item: the money waits for the grade.
-        Store.updateReturn(returnId, Map("state" -> "awaiting_inspection"))
-        "awaiting_inspection"
-      case Some(grade) =>
-        val amount = refundCents(line, ret, grade)
-        val reply = refunds.withDeadlineAfter(RefundDeadlineSeconds, TimeUnit.SECONDS).issueRefund(RefundRequest(returnId = returnId, amountCents = amount))
-        Store.updateReturn(returnId, Map("state" -> "refund_pending", "grade" -> grade, "refund_cents" -> amount.toString, "refund_id" -> reply.refundId))
-        "refund_pending"
-    }
-  }
 }
 `,
     },

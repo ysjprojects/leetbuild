@@ -47,7 +47,6 @@ that is down.
         python: {all: [/\.set\([^\n]*nx\s*=\s*True/], none: [/\br\.get\(|\.exists\(/]},
         typescript: {all: [/\.set\([^\n]*['"]NX['"]/], none: [/redis\.get\(|redis\.exists\(/]},
         go: {all: [/\.SetNX\(|Mode:\s*"NX"/], none: [/rdb\.Get\(|rdb\.Exists\(/]},
-        scala: {all: [/\.nx\(\)/], none: [/jedis\.get\(|jedis\.exists\(/]},
         cpp: {all: [/UpdateType::NOT_EXIST/], none: [/\.(get|exists)\(\s*(key|cronsched::LeaseKey)/]},
       },
     },
@@ -60,7 +59,6 @@ that is down.
         python: {all: [/window_of\(\s*tick\s*\)|tick\s*\/\/\s*(WINDOW_S|60)\b/]},
         typescript: {all: [/windowOf\(\s*tick\s*\)|Math\.floor\(\s*tick\s*\/\s*(WINDOW_S|60)\b/]},
         go: {all: [/cron\.WindowOf\(\s*tick\s*\)|tick\s*\/\s*(cron\.WindowS|60)\s*\*/]},
-        scala: {all: [/Cron\.windowOf\(\s*tick\s*\)|floorDiv\(\s*tick\s*,/]},
         cpp: {all: [/cron::WindowOf\(\s*tick\s*\)|FloorDiv\(\s*tick\s*,/]},
       },
     },
@@ -75,7 +73,6 @@ that is down.
         go: {
           all: [/SetNX\([^\n]*,\s*(leaseTTL|300\s*\*\s*time\.Second)\s*\)|TTL:\s*(leaseTTL|300\s*\*\s*time\.Second)/],
         },
-        scala: {all: [/\.ex\(\s*(LeaseTtlS|300L?)\s*\)/]},
         cpp: {all: [/std::chrono::seconds\(\s*(kLeaseTtlS|300)\s*\)/]},
       },
     },
@@ -88,7 +85,6 @@ that is down.
         python: {all: [/["']error["']\s*,\s*["']trigger_failed["']/]},
         typescript: {all: [/['"]error['"]\s*,\s*['"]trigger_failed['"]/]},
         go: {all: [/"error",\s*"trigger_failed"/]},
-        scala: {all: [/"error",\s*"trigger_failed"/]},
         cpp: {all: [/"error",\s*"trigger_failed"/]},
       },
     },
@@ -264,60 +260,6 @@ func fireWindow(ctx context.Context, scheduleID string, tick int64, owner string
 		return "error", store.RecordRun(ctx, scheduleID, window, "error", "trigger_failed")
 	}
 	return "fired", store.RecordRun(ctx, scheduleID, window, "fired", "")
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import cronsched.Store
-
-object Leases {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Fire the window \`tick\` falls in, once across every instance: fired, error or taken. */
-  def fireWindow(scheduleId: String, tick: Long, owner: String, trigger: (String, Long) => Unit): String = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val window = tick
-    val key = Store.leaseKey(scheduleId, window)
-    if (jedis.get(key) != null) "taken"
-    else {
-      jedis.set(key, owner)
-      trigger(scheduleId, window)
-      Store.recordRun(scheduleId, window, "fired", "")
-      "fired"
-    }
-  }
-}
-`,
-      solution: `import scala.util.Try
-
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import cronsched.{Cron, Store}
-
-object Leases {
-  /** The minute, plus room for clock skew between instances; then Redis forgets it. */
-  val LeaseTtlS = 300L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Fire the window \`tick\` falls in, once across every instance: fired, error or taken. */
-  def fireWindow(scheduleId: String, tick: Long, owner: String, trigger: (String, Long) => Unit): String = {
-    val window = Cron.windowOf(tick)
-    // One command decides the winner: no other instance can land between the check and the claim.
-    val claimed = jedis.set(Store.leaseKey(scheduleId, window), owner, SetParams.setParams().nx().ex(LeaseTtlS))
-    if (claimed == null) "taken"
-    else if (Try(trigger(scheduleId, window)).isFailure) {
-      // The ledger says the window was attempted and failed: the history shows an error, not a gap.
-      Store.recordRun(scheduleId, window, "error", "trigger_failed")
-      "error"
-    } else {
-      Store.recordRun(scheduleId, window, "fired", "")
-      "fired"
-    }
-  }
 }
 `,
     },

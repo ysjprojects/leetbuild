@@ -60,7 +60,6 @@ budget keeps taking steps.
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]GET['"]/],
           none: [/rdb\.Get\(\s*ctx,\s*leaseKey\(/],
         },
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]GET['"]/], none: [/jedis\.get\(\s*leaseKey\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]GET['"]/], none: [/redis\.get\(\s*leaseKey\(/]},
       },
     },
@@ -73,7 +72,6 @@ budget keeps taking steps.
         python: {all: [/['"]PX['"]|\bpx\s*=|pexpire/i, /LEASE_TTL_MS\s*=\s*45_?000\b/]},
         typescript: {all: [/['"]PX['"]|pexpire/i, /LEASE_TTL_MS\s*=\s*45_?000\b/]},
         go: {all: [/['"]PX['"]|PExpire/i, /leaseTTLMs\s*=\s*45_?000\b/]},
-        scala: {all: [/['"]PX['"]|pexpire/i, /LeaseTtlMs\s*=\s*45_?000L?\b/]},
         cpp: {all: [/['"]PX['"]|pexpire/i, /kLeaseTtlMs\s*=\s*45'?000\b/]},
       },
     },
@@ -86,7 +84,6 @@ budget keeps taking steps.
         python: {all: [/['"]budget_exhausted['"]/, /<=\s*0\b|<\s*1\b/]},
         typescript: {all: [/['"]budget_exhausted['"]/, /<=\s*0\b|<\s*1\b/]},
         go: {all: [/['"]budget_exhausted['"]/, /<=\s*0\b|<\s*1\b/]},
-        scala: {all: [/['"]budget_exhausted['"]/, /<=\s*0\b|<\s*1\b/]},
         cpp: {all: [/['"]budget_exhausted['"]/, /<=\s*0\b|<\s*1\b/]},
       },
     },
@@ -309,75 +306,6 @@ func leaseKey(sessionID string) string { return "browser:lease:" + sessionID }
 func beginStep(ctx context.Context, sessionID, worker string) (int, error) {
 	// One script: no other worker runs between reading the lease and taking it.
 	return beginStepScript.Run(ctx, rdb, []string{sessions.SessionKey(sessionID), leaseKey(sessionID)}, worker, leaseTTLMs).Int()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import browser.Sessions // Sessions.sessionKey
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val LeaseTtlMs = 45000L
-  val LeaseHeld = -1L
-  val BudgetExhausted = -2L
-  val NoSession = -3L
-
-  def leaseKey(sessionId: String): String = s"browser:lease:$sessionId"
-
-  /** Take or refresh worker's lease and charge one step: the new step index, LeaseHeld, BudgetExhausted or NoSession. */
-  def beginStep(sessionId: String, worker: String): Long = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    val key = Sessions.sessionKey(sessionId)
-    if (!jedis.exists(key)) NoSession
-    else
-      Option(jedis.get(leaseKey(sessionId))) match {
-        case Some(owner) if owner != worker => LeaseHeld
-        case _ =>
-          jedis.set(leaseKey(sessionId), worker)
-          jedis.hincrBy(key, "budget_remaining", -1)
-          jedis.hincrBy(key, "step_index", 1)
-      }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import browser.Sessions // Sessions.sessionKey
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val LeaseTtlMs = 45000L
-  val LeaseHeld = -1L
-  val BudgetExhausted = -2L
-  val NoSession = -3L
-
-  /** KEYS[1] the session hash, KEYS[2] its lease; ARGV[1] the worker, ARGV[2] the lease TTL in ms. */
-  val BeginStepLua: String =
-    """if redis.call('EXISTS', KEYS[1]) == 0 then return -3 end
-      |local owner = redis.call('GET', KEYS[2])
-      |if owner and owner ~= ARGV[1] then return -1 end
-      |if tonumber(redis.call('HGET', KEYS[1], 'budget_remaining')) <= 0 then
-      |  redis.call('HSET', KEYS[1], 'status', 'budget_exhausted')
-      |  return -2
-      |end
-      |redis.call('SET', KEYS[2], ARGV[1], 'PX', ARGV[2])
-      |redis.call('HINCRBY', KEYS[1], 'budget_remaining', -1)
-      |return redis.call('HINCRBY', KEYS[1], 'step_index', 1)
-      |""".stripMargin
-
-  def leaseKey(sessionId: String): String = s"browser:lease:$sessionId"
-
-  /** Take or refresh worker's lease and charge one step: the new step index, LeaseHeld, BudgetExhausted or NoSession. */
-  def beginStep(sessionId: String, worker: String): Long =
-    // One script: no other worker runs between reading the lease and taking it.
-    jedis.eval(BeginStepLua, List(Sessions.sessionKey(sessionId), leaseKey(sessionId)).asJava, List(worker, LeaseTtlMs.toString).asJava)
-      .asInstanceOf[java.lang.Long]
 }
 `,
     },

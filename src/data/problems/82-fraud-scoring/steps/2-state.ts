@@ -64,7 +64,6 @@ retrying; and the dashboard and the alert disagree about the same numbers.
           all: [/velocityLua/, /redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]SADD['"]/],
           none: [/rdb\.Incr\(/],
         },
-        scala: {all: [/VelocityLua/, /jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]SADD['"]/], none: [/jedis\.incr\(/]},
         cpp: {all: [/kVelocityLua/, /redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]SADD['"]/], none: [/redis\.incr\(/]},
       },
     },
@@ -77,7 +76,6 @@ retrying; and the dashboard and the alert disagree about the same numbers.
         python: {all: [/ATTEMPT_WINDOW_S/, /DEVICE_WINDOW_S/, /redis\.call\(\s*['"]EXPIRE['"]/]},
         typescript: {all: [/ATTEMPT_WINDOW_S/, /DEVICE_WINDOW_S/, /redis\.call\(\s*['"]EXPIRE['"]/]},
         go: {all: [/attemptWindowSeconds/, /deviceWindowSeconds/, /redis\.call\(\s*['"]EXPIRE['"]/]},
-        scala: {all: [/AttemptWindowSeconds/, /DeviceWindowSeconds/, /redis\.call\(\s*['"]EXPIRE['"]/]},
         cpp: {all: [/kAttemptWindowSeconds/, /kDeviceWindowSeconds/, /redis\.call\(\s*['"]EXPIRE['"]/]},
       },
     },
@@ -90,7 +88,6 @@ retrying; and the dashboard and the alert disagree about the same numbers.
         python: {order: [/def score_with_velocity/, /record_attempt\(/, /model\.score_transaction\(/]},
         typescript: {order: [/function scoreWithVelocity/, /recordAttempt\(/, /scoreTransaction\(/]},
         go: {order: [/func scoreWithVelocity/, /recordAttempt\(/, /model\.ScoreTransaction\(/]},
-        scala: {order: [/def scoreWithVelocity/, /recordAttempt\(/, /Model\.scoreTransaction\(/]},
         cpp: {order: [/scoreWithVelocity\(/, /recordAttempt\(/, /model::scoreTransaction\(/]},
       },
     },
@@ -103,7 +100,6 @@ retrying; and the dashboard and the alert disagree about the same numbers.
         python: {all: [/SADD/, /SCARD|scard\(/], none: [/incr\([^)\n]*vel:device/]},
         typescript: {all: [/SADD/, /SCARD|scard\(/], none: [/incr\([^)\n]*vel:device/]},
         go: {all: [/SADD/, /SCARD|SCard\(/], none: [/Incr\([^)\n]*vel:device/]},
-        scala: {all: [/SADD/, /SCARD|scard\(/], none: [/incr\([^)\n]*vel:device/]},
         cpp: {all: [/SADD/, /SCARD|scard\(/], none: [/incr\([^)\n]*vel:device/]},
       },
     },
@@ -133,13 +129,6 @@ retrying; and the dashboard and the alert disagree about the same numbers.
             /func shouldAlert(?:(?!\nfunc )[\s\S])*?velocityRules/,
           ],
           none: [/>\s*(10|5)\b/],
-        },
-        scala: {
-          all: [
-            /def velocitySnapshot(?:(?!\n {2}def )[\s\S])*?VelocityRules/,
-            /def shouldAlert(?:(?!\n {2}def )[\s\S])*?VelocityRules/,
-          ],
-          none: [/[^-]>\s*(10|5)L?\b/],
         },
         cpp: {
           all: [
@@ -492,97 +481,6 @@ func scoreWithVelocity(ctx context.Context, f features.Features, cardRef, device
 	}
 	v, err := velocitySnapshot(ctx, cardRef, deviceID)
 	return verdict, v, err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import fraud.{FeatureVector, Model, Verdict} // Model.scoreTransaction(vector): Verdict; throws fraud.InvalidFeatures
-
-final case class VelocityCounts(cardAttempts: Long, deviceAccounts: Long, flags: Seq[String])
-
-object VelocityStore {
-  val VelocityRules: Map[String, Long] = Map("card_attempts_per_hour" -> 5L, "device_accounts_per_day" -> 3L)
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Count one attempt on the card and the device. */
-  def recordAttempt(cardRef: String, deviceId: String, accountRef: String): VelocityCounts = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val attempts = jedis.incr(s"vel:card:$cardRef")
-    val accounts = jedis.incr(s"vel:device:$deviceId")
-    VelocityCounts(attempts, accounts, Seq.empty)
-  }
-
-  /** The card's and the device's windows as they stand. */
-  def velocitySnapshot(cardRef: String, deviceId: String): VelocityCounts = {
-    val attempts = Option(jedis.get(s"vel:card:$cardRef")).map(_.toLong).getOrElse(0L)
-    val accounts = Option(jedis.get(s"vel:device:$deviceId")).map(_.toLong).getOrElse(0L)
-    VelocityCounts(attempts, accounts, Seq.empty)
-  }
-
-  def shouldAlert(v: VelocityCounts): Boolean = v.cardAttempts > 10 || v.deviceAccounts > 5
-
-  /** The model's verdict for the vector, with the velocity snapshot after this attempt. */
-  def scoreWithVelocity(vector: FeatureVector, cardRef: String, deviceId: String, accountRef: String): (Verdict, VelocityCounts) = {
-    val verdict = Model.scoreTransaction(vector)
-    recordAttempt(cardRef, deviceId, accountRef)
-    (verdict, velocitySnapshot(cardRef, deviceId))
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import fraud.{FeatureVector, Model, Verdict} // Model.scoreTransaction(vector): Verdict; throws fraud.InvalidFeatures
-
-final case class VelocityCounts(cardAttempts: Long, deviceAccounts: Long, flags: Seq[String])
-
-object VelocityStore {
-  val AttemptWindowSeconds = 3600L
-  val DeviceWindowSeconds = 86400L
-  val VelocityRules: Map[String, Long] = Map("card_attempts_per_hour" -> 5L, "device_accounts_per_day" -> 3L)
-
-  /** KEYS[1] the card's attempts, KEYS[2] the device's accounts; ARGV[1] the account, ARGV[2] and ARGV[3] the windows. */
-  val VelocityLua: String =
-    """local attempts = redis.call('INCR', KEYS[1])
-      |if attempts == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
-      |redis.call('SADD', KEYS[2], ARGV[1])
-      |if redis.call('TTL', KEYS[2]) == -1 then redis.call('EXPIRE', KEYS[2], ARGV[3]) end
-      |return {attempts, redis.call('SCARD', KEYS[2])}
-      |""".stripMargin
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Count one attempt on the card and the device. */
-  def recordAttempt(cardRef: String, deviceId: String, accountRef: String): VelocityCounts = {
-    val keys = List(s"vel:card:$cardRef", s"vel:device:$deviceId").asJava
-    val args = List(accountRef, AttemptWindowSeconds.toString, DeviceWindowSeconds.toString).asJava
-    val counts = jedis.eval(VelocityLua, keys, args).asInstanceOf[java.util.List[java.lang.Long]].asScala.map(_.longValue)
-    VelocityCounts(counts(0), counts(1), Seq.empty)
-  }
-
-  /** The card's and the device's windows as they stand. */
-  def velocitySnapshot(cardRef: String, deviceId: String): VelocityCounts = {
-    val attempts = Option(jedis.get(s"vel:card:$cardRef")).map(_.toLong).getOrElse(0L)
-    val accounts = jedis.scard(s"vel:device:$deviceId")
-    val flags = Seq("card_attempts_per_hour" -> attempts, "device_accounts_per_day" -> accounts).collect {
-      case (rule, value) if value > VelocityRules(rule) => rule
-    }
-    VelocityCounts(attempts, accounts, flags)
-  }
-
-  def shouldAlert(v: VelocityCounts): Boolean =
-    v.cardAttempts > VelocityRules("card_attempts_per_hour") || v.deviceAccounts > VelocityRules("device_accounts_per_day")
-
-  /** The model's verdict for the vector, with the velocity snapshot after this attempt. */
-  def scoreWithVelocity(vector: FeatureVector, cardRef: String, deviceId: String, accountRef: String): (Verdict, VelocityCounts) = {
-    recordAttempt(cardRef, deviceId, accountRef) // counted first: a refused or failed call is still an attempt
-    val verdict = Model.scoreTransaction(vector)
-    (verdict, velocitySnapshot(cardRef, deviceId))
-  }
 }
 `,
     },

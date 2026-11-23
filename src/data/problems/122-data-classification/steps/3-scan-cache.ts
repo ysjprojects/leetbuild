@@ -47,7 +47,6 @@ is a hope; and keys without an expiry grow with every table the lake ever had.
         python: {all: [/classify:\{[^}\n]+\}:\{[^}\n]+\}/]},
         typescript: {all: [/classify:\$\{[^}\n]+\}:\$\{[^}\n]+\}/]},
         go: {all: [/"classify:"\s*\+[^\n]*\+\s*":"\s*\+/]},
-        scala: {all: [/s"classify:\$\{?[\w.]+\}?:\$/]},
         cpp: {all: [/"classify:"\s*\+[^\n;]*\+\s*":"\s*\+/]},
       },
     },
@@ -60,7 +59,6 @@ is a hope; and keys without an expiry grow with every table the lake ever had.
         python: {all: [/register_script\(|\.eval\(/, /['"]INCR['"]/, /['"]DECR['"]/], none: [/\br\.incr\(/]},
         typescript: {all: [/\.eval\(|defineCommand\(/, /['"]INCR['"]/, /['"]DECR['"]/], none: [/redis\.incr\(/]},
         go: {all: [/redis\.NewScript\(/, /['"]INCR['"]/, /['"]DECR['"]/], none: [/rdb\.Incr\(/]},
-        scala: {all: [/jedis\.eval\(/, /['"]INCR['"]/, /['"]DECR['"]/], none: [/jedis\.incr\(/]},
         cpp: {all: [/\.eval</, /['"]INCR['"]/, /['"]DECR['"]/], none: [/\bredis\.incr\(/]},
       },
     },
@@ -73,7 +71,6 @@ is a hope; and keys without an expiry grow with every table the lake ever had.
         python: {all: [/ex\s*=\s*RESULT_TTL_S/, /\.expire\([^\n]*VERIFY_TTL_S/, /BUDGET_TTL_S/]},
         typescript: {all: [/['"]EX['"],\s*RESULT_TTL_S/, /\.expire\([^\n]*VERIFY_TTL_S/, /BUDGET_TTL_S/]},
         go: {all: [/\.Set\([^\n]*resultTTL\)/, /\.Expire\([^\n]*verifyTTL\)/, /budgetTTLSeconds/]},
-        scala: {all: [/setex\([^\n]*ResultTtlS/, /\.expire\([^\n]*VerifyTtlS/, /BudgetTtlS/]},
         cpp: {all: [/\.set\([^\n]*kResultTtl/, /\.expire\([^\n]*kVerifyTtl/, /kBudgetTtlS/]},
       },
     },
@@ -349,93 +346,6 @@ func classifyEntity(ctx context.Context, job jobs.Job) (map[string]string, error
 	}
 	rdb.HSet(ctx, "verify:"+job.Entity, map[string]any{"owner": job.Owner, "schema_hash": job.SchemaHash, "state": "pending"})
 	return tags, rdb.Expire(ctx, "verify:"+job.Entity, verifyTTL).Err()
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.{LocalDate, ZoneOffset}
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import metasense.Jobs
-
-import scala.jdk.CollectionConverters._
-
-/** Today's budget is spent: the job waits for tomorrow and the model is not called. */
-final class BudgetExhausted(message: String) extends RuntimeException(message)
-
-object ScanCache {
-  val jedis = new JedisPooled("redis", 6379)
-  val DailyEntityBudget = 400
-
-  private def tagsOf(raw: String): Map[String, String] = raw.parseJson.asJsObject.fields.collect { case (c, JsString(t)) => c -> t }
-
-  /** The entity's tags: from the cache, or from the model within today's budget. */
-  def classifyEntity(job: Jobs.Job): Map[String, String] = {
-    // TODO: this starter has 3 flaws. The task says where to look; the checks say what must change.
-    Option(jedis.get(s"classify:\${job.entity}")) match {
-      case Some(cached) => tagsOf(cached)
-      case None =>
-        val day = s"budget:\${LocalDate.now(ZoneOffset.UTC)}"
-        if (Option(jedis.get(day)).map(_.toInt).getOrElse(0) >= DailyEntityBudget) throw new BudgetExhausted(s"$day is spent")
-        val tags = ClassifyColumns.classifyColumns(job.entity, job.columns) // step 2
-        jedis.incr(day)
-        jedis.set(s"classify:\${job.entity}", JsObject(tags.map { case (c, t) => c -> JsString(t) }).compactPrint)
-        jedis.hset(s"verify:\${job.entity}", Map("owner" -> job.owner, "schema_hash" -> job.schemaHash, "state" -> "pending").asJava)
-        tags
-    }
-  }
-}
-`,
-      solution: `import java.time.{LocalDate, ZoneOffset}
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import metasense.Jobs
-
-import scala.jdk.CollectionConverters._
-
-/** Today's budget is spent: the job waits for tomorrow and the model is not called. */
-final class BudgetExhausted(message: String) extends RuntimeException(message)
-
-object ScanCache {
-  val jedis = new JedisPooled("redis", 6379)
-  val DailyEntityBudget = 400
-  val ResultTtlS = 7L * 24 * 3600
-  val VerifyTtlS = 7L * 24 * 3600
-  val BudgetTtlS = 2L * 24 * 3600 // outlives its day, then goes
-
-  // One round trip, one decision: two workers at 399 cannot both get the last slot.
-  val ReserveLua: String =
-    """local used = redis.call('INCR', KEYS[1])
-      |if used == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
-      |if used > tonumber(ARGV[1]) then
-      |  redis.call('DECR', KEYS[1])
-      |  return 0
-      |end
-      |return 1
-      |""".stripMargin
-
-  private def tagsOf(raw: String): Map[String, String] = raw.parseJson.asJsObject.fields.collect { case (c, JsString(t)) => c -> t }
-
-  /** The entity's tags: from the cache, or from the model within today's budget. */
-  def classifyEntity(job: Jobs.Job): Map[String, String] = {
-    val cacheKey = s"classify:\${job.entity}:\${job.schemaHash}"
-    Option(jedis.get(cacheKey)) match {
-      case Some(cached) => tagsOf(cached)
-      case None =>
-        val day = s"budget:\${LocalDate.now(ZoneOffset.UTC)}"
-        val reserved = jedis.eval(ReserveLua, List(day).asJava, List(DailyEntityBudget.toString, BudgetTtlS.toString).asJava)
-        if (reserved.asInstanceOf[java.lang.Long] != 1L) throw new BudgetExhausted(s"$day is spent")
-        val tags = ClassifyColumns.classifyColumns(job.entity, job.columns) // step 2
-        jedis.setex(cacheKey, ResultTtlS, JsObject(tags.map { case (c, t) => c -> JsString(t) }).compactPrint)
-        jedis.hset(s"verify:\${job.entity}", Map("owner" -> job.owner, "schema_hash" -> job.schemaHash, "state" -> "pending").asJava)
-        jedis.expire(s"verify:\${job.entity}", VerifyTtlS)
-        tags
-    }
-  }
 }
 `,
     },

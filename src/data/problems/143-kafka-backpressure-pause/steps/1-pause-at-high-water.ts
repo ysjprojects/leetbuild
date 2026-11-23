@@ -65,7 +65,6 @@ far enough it **resumes** them.
         python: {all: [/\bHIGH = 20\b/, /\bLOW = 5\b/, /queue\.qsize\(\) >= HIGH\b/]},
         typescript: {all: [/\bHIGH = 20\b/, /\bLOW = 5\b/, /queue\.length >= HIGH\b/]},
         go: {all: [/\bhighWater\s*=\s*20\b/, /\blowWater\s*=\s*5\b/, /len\(queue\) >= highWater\b/]},
-        scala: {all: [/\bHighWater = 20\b/, /\bLowWater = 5\b/, /queue\.size >= HighWater\b/]},
         cpp: {all: [/\bkHigh = 20\b/, /\bkLow = 5\b/, /queue\.size\(\) >= kHigh\b/]},
       },
     },
@@ -78,7 +77,6 @@ far enough it **resumes** them.
         python: {all: [/consumer\.pause\(/, /consumer\.resume\(/, /queue\.qsize\(\) <= LOW\b/]},
         typescript: {all: [/consumer\.pause\(/, /consumer\.resume\(/, /queue\.length <= LOW\b/]},
         go: {all: [/consumer\.Pause\(/, /consumer\.Resume\(/, /len\(queue\) <= lowWater\b/]},
-        scala: {all: [/consumer\.pause\(/, /consumer\.resume\(/, /queue\.size <= LowWater\b/]},
         cpp: {all: [/consumer->pause\(/, /consumer->resume\(/, /queue\.size\(\) <= kLow\b/]},
       },
     },
@@ -91,7 +89,6 @@ far enough it **resumes** them.
         python: {all: [/queue\.put_nowait\(msg\)/, /await queue\.get\(\)/]},
         typescript: {all: [/queue\.push\(/, /queue\.shift\(\)/]},
         go: {all: [/queue <- msg/, /range queue/]},
-        scala: {all: [/queue\.put\(record\)/, /queue\.poll\(/]},
         cpp: {all: [/queue\.push_back\(/, /queue\.pop_front\(\)/]},
       },
     },
@@ -104,10 +101,6 @@ far enough it **resumes** them.
         python: {all: [/"enable\.auto\.commit":\s*False/], order: [/await worker\(/, /consumer\.commit\(message=msg/]},
         typescript: {all: [/autoCommit:\s*false/], order: [/await worker\(/, /consumer\.commitOffsets\(/]},
         go: {all: [/"enable\.auto\.commit":\s*false/], order: [/\bworker\(job\)/, /consumer\.CommitMessage\(/]},
-        scala: {
-          all: [/"enable\.auto\.commit",\s*"false"/, /"max\.poll\.records"/],
-          order: [/\bworker\(Job\(/, /consumer\.commitSync\(/],
-        },
         cpp: {all: [/"enable\.auto\.commit",\s*"false"/], order: [/\bworker\(Job\{/, /consumer->commitSync\(/]},
       },
     },
@@ -120,7 +113,6 @@ far enough it **resumes** them.
         python: {all: [/"queued":\s*queue\.qsize\(\)/, /"paused":\s*paused\b/]},
         typescript: {all: [/queued:\s*queue\.length\b/, /\bpaused\b.*\bprocessed\b/]},
         go: {all: [/Queued:\s*len\(queue\)/, /Paused:\s*paused\.Load\(\)/]},
-        scala: {all: [/Status\(queue\.size,\s*paused\b/]},
         cpp: {all: [/\{queue\.size\(\),\s*paused\b/]},
       },
     },
@@ -567,144 +559,6 @@ func Run(worker func(Job)) error {
 	close(queue)
 	<-done
 	return consumer.Close()
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.{ConcurrentLinkedQueue, LinkedBlockingQueue, TimeUnit}
-import java.util.concurrent.atomic.AtomicInteger
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.jdk.CollectionConverters._
-
-case class Job(partition: Int, offset: Long, value: String)
-case class Status(queued: Int, paused: Boolean, processed: Int)
-
-object Backpressure {
-  val Topic = "jobs"
-  val Group = "workers"
-  val HighWater = 20
-  val LowWater = 5
-  val Idle: Duration = Duration.ofMillis(10)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", Group)
-  props.put("auto.offset.reset", "earliest")
-  // TODO: disable auto-commit; cap max.poll.records so one poll cannot overshoot HighWater
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-
-  private val queue = new LinkedBlockingQueue[ConsumerRecord[String, String]]()
-  private val completed = new ConcurrentLinkedQueue[ConsumerRecord[String, String]]()
-  @volatile private var paused = false
-  @volatile private var running = false
-  private val processed = new AtomicInteger(0)
-
-  def stats(): Status = Status(0, false, 0) // TODO: live queue length, paused, processed
-
-  def stop(): Unit = running = false
-
-  private def drain(worker: Job => Unit): Unit = {
-    // TODO: while running or records remain: take the oldest, worker(Job(...)), hand it to \`completed\`, count it
-  }
-
-  def run(worker: Job => Unit): Unit = {
-    running = true
-    consumer.subscribe(List(Topic).asJava)
-    // TODO: start drain on a thread
-    // TODO: poll(Idle) in a loop: put each record; queue at HighWater → pause the assignment
-    // TODO: commit the completed records (on this thread); paused and queue down to LowWater → resume
-    // TODO: on stop(): join the drain thread, commit what is left, close
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.{ConcurrentLinkedQueue, LinkedBlockingQueue, TimeUnit}
-import java.util.concurrent.atomic.AtomicInteger
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.jdk.CollectionConverters._
-
-case class Job(partition: Int, offset: Long, value: String)
-case class Status(queued: Int, paused: Boolean, processed: Int)
-
-object Backpressure {
-  val Topic = "jobs"
-  val Group = "workers"
-  val HighWater = 20
-  val LowWater = 5
-  val Idle: Duration = Duration.ofMillis(10)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", Group)
-  props.put("auto.offset.reset", "earliest")
-  props.put("enable.auto.commit", "false")
-  // A poll after a resume may return at most the room a resume frees, so the queue never overshoots HighWater.
-  props.put("max.poll.records", (HighWater - LowWater).toString)
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-
-  private val queue = new LinkedBlockingQueue[ConsumerRecord[String, String]]()
-  // Finished records, handed back to the poll thread: the Java consumer may only be used from one thread.
-  private val completed = new ConcurrentLinkedQueue[ConsumerRecord[String, String]]()
-  @volatile private var paused = false
-  @volatile private var running = false
-  private val processed = new AtomicInteger(0)
-
-  def stats(): Status = Status(queue.size, paused, processed.get)
-
-  def stop(): Unit = running = false
-
-  private def drain(worker: Job => Unit): Unit =
-    while (running || !queue.isEmpty) {
-      val record = queue.poll(Idle.toMillis, TimeUnit.MILLISECONDS)
-      if (record != null) {
-        worker(Job(record.partition(), record.offset(), record.value()))
-        completed.add(record)
-        processed.incrementAndGet()
-      }
-    }
-
-  private def commitCompleted(): Unit = {
-    var record = completed.poll()
-    while (record != null) {
-      val tp = new TopicPartition(record.topic(), record.partition())
-      consumer.commitSync(Map(tp -> new OffsetAndMetadata(record.offset() + 1)).asJava)
-      record = completed.poll()
-    }
-  }
-
-  def run(worker: Job => Unit): Unit = {
-    running = true
-    consumer.subscribe(List(Topic).asJava)
-    val drainer = new Thread(() => drain(worker))
-    drainer.start()
-    while (running) {
-      val records = consumer.poll(Idle) // keeps heartbeating; returns nothing while every partition is paused
-      records.asScala.foreach { record =>
-        queue.put(record)
-        if (!paused && queue.size >= HighWater) {
-          consumer.pause(consumer.assignment())
-          paused = true
-        }
-      }
-      commitCompleted()
-      if (paused && queue.size <= LowWater) {
-        consumer.resume(consumer.assignment())
-        paused = false
-      }
-    }
-    drainer.join()
-    commitCompleted()
-    consumer.close()
-  }
 }
 `,
     },

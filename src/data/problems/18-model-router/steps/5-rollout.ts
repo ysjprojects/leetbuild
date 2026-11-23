@@ -59,7 +59,6 @@ and another operator's rollback overwritten by a raise that read the record befo
         python: {all: [/@app\.post\(\s*["']\/v1\/policies\/\{policy\}\/rollout["']/, /authenticate\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/policies\/:policy\/rollout['"]/, /authenticate\(/]},
         go: {all: [/"POST \/v1\/policies\/\{policy\}\/rollout"/, /auth\.Tenant\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"policies"\s*\/\s*Segment\s*\/\s*"rollout"\s*\)/, /Auth\.tenant\(/]},
         cpp: {all: [/svr\.Post\(\s*R?"\(?\/v1\/policies\//, /routerd::tenant\(/]},
       },
     },
@@ -72,7 +71,6 @@ and another operator's rollback overwritten by a raise that read the record befo
         python: {all: [/re\.compile\(|re\.(full)?match\(/, /[<>]=?\s*100\b/]},
         typescript: {all: [/\.test\(/, /[<>]=?\s*100\b/]},
         go: {all: [/regexp\.MustCompile\(/, /[<>]=?\s*100\b/]},
-        scala: {all: [/\.matches\(|findFirstIn|\.r\b/, /[<>]=?\s*100\b/]},
         cpp: {all: [/std::regex_match\(/, /[<>]=?\s*100\b/]},
       },
     },
@@ -85,7 +83,6 @@ and another operator's rollback overwritten by a raise that read the record befo
         python: {all: [/MIN_EVAL_SCORE(?!\s*=)/]},
         typescript: {all: [/MIN_EVAL_SCORE(?!\s*=)/]},
         go: {all: [/minEvalScore(?!\s*=)/]},
-        scala: {all: [/MinEvalScore(?!\s*=)/]},
         cpp: {all: [/kMinEvalScore(?!\s*=)/]},
       },
     },
@@ -98,7 +95,6 @@ and another operator's rollback overwritten by a raise that read the record befo
         python: {all: [/<=\s*current\b/]},
         typescript: {all: [/<=\s*current\b/]},
         go: {all: [/<=\s*current\b/]},
-        scala: {all: [/<=\s*current\b/]},
         cpp: {all: [/<=\s*current\b/]},
       },
     },
@@ -117,7 +113,6 @@ and another operator's rollback overwritten by a raise that read the record befo
           none: [/redis\.hset\(/],
         },
         go: {all: [/redis\.call\(\s*['"]HSET['"]/, /redis\.NewScript\(|\.Eval\(|\.EvalSha\(/], none: [/rdb\.HSet\(/]},
-        scala: {all: [/redis\.call\(\s*['"]HSET['"]/, /jedis\.eval(sha)?\(/], none: [/jedis\.hset\(/]},
         cpp: {all: [/redis\.call\(\s*['"]HSET['"]/, /redis\.eval(sha)?[<(]/], none: [/redis\.hset\(/]},
       },
     },
@@ -510,142 +505,6 @@ func rollout(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/policies/{policy}/rollout", rollout)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import routerd.Auth
-
-import scala.jdk.CollectionConverters._
-
-object Rollout {
-  val MinEvalScore = 0.85
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  case class RolloutRequest(version: Int, percentage: Int)
-
-  def parse(body: String): RolloutRequest = {
-    val json = ujson.read(body)
-    RolloutRequest(json.obj.get("version").map(_.num.toInt).getOrElse(0), json.obj.get("percentage").map(_.num.toInt).getOrElse(-1))
-  }
-
-  private def answer(status: StatusCode, body: String): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body))
-
-  /** The policy's rollout record as it stands. */
-  def assignment(policy: String): String = {
-    val record = jedis.hgetAll(s"rollout:$policy").asScala
-    val fields = Seq("stable", "canary", "percentage").map(f => f -> ujson.Num(record.get(f).map(_.toDouble).getOrElse(0.0)))
-    ujson.write(ujson.Obj.from(("policy" -> ujson.Str(policy)) +: fields))
-  }
-
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  val route: Route =
-    path("v1" / "policies" / Segment / "rollout") { policy =>
-      post {
-        optionalHeaderValueByName("Authorization") { authorization =>
-          Auth.tenant(authorization) match {
-            case None => complete(answer(StatusCodes.Unauthorized, """{"error":"missing bearer token"}"""))
-            case Some(operator) =>
-              entity(as[String]) { raw =>
-                val body = parse(raw)
-                val key = s"rollout:$policy"
-                val current = jedis.hgetAll(key)
-                val evaluation = jedis.hgetAll(s"eval:$policy:\${body.version}")
-                if (body.percentage > 0 && evaluation.get("status") != "passed")
-                  complete(answer(StatusCodes.Conflict, """{"error":"the version has not passed its eval"}"""))
-                else {
-                  jedis.hset(key, Map("canary" -> body.version.toString, "percentage" -> body.percentage.toString).asJava)
-                  println(s"rollout $policy by $operator: v\${body.version} \${current.get("percentage")}% -> \${body.percentage}%")
-                  complete(answer(StatusCodes.OK, assignment(policy)))
-                }
-              }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import routerd.Auth
-
-import scala.jdk.CollectionConverters._
-
-object Rollout {
-  val MinEvalScore = 0.85
-  val PolicyName = "^[a-z0-9][a-z0-9_-]{1,31}$"
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  // KEYS: rollout:{policy}, eval:{policy}:{version}; ARGV: version, percentage, minimum score.
-  val RolloutLua: String =
-    """local canary = redis.call('HGET', KEYS[1], 'canary')
-      |local current = tonumber(redis.call('HGET', KEYS[1], 'percentage') or '0')
-      |local percentage = tonumber(ARGV[2])
-      |local rollback = canary == ARGV[1] and percentage <= current
-      |if percentage > 0 and not rollback then
-      |  local status = redis.call('HGET', KEYS[2], 'status')
-      |  local score = tonumber(redis.call('HGET', KEYS[2], 'score') or '0')
-      |  if status ~= 'passed' or score < tonumber(ARGV[3]) then
-      |    return {0, current}
-      |  end
-      |end
-      |redis.call('HSET', KEYS[1], 'canary', ARGV[1], 'percentage', ARGV[2])
-      |return {1, current}
-      |""".stripMargin
-  private val sha = jedis.scriptLoad(RolloutLua)
-
-  case class RolloutRequest(version: Int, percentage: Int)
-
-  def parse(body: String): RolloutRequest = {
-    val json = ujson.read(body)
-    RolloutRequest(json.obj.get("version").map(_.num.toInt).getOrElse(0), json.obj.get("percentage").map(_.num.toInt).getOrElse(-1))
-  }
-
-  private def answer(status: StatusCode, body: String): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body))
-
-  /** The policy's rollout record as it stands. */
-  def assignment(policy: String): String = {
-    val record = jedis.hgetAll(s"rollout:$policy").asScala
-    val fields = Seq("stable", "canary", "percentage").map(f => f -> ujson.Num(record.get(f).map(_.toDouble).getOrElse(0.0)))
-    ujson.write(ujson.Obj.from(("policy" -> ujson.Str(policy)) +: fields))
-  }
-
-  val route: Route =
-    path("v1" / "policies" / Segment / "rollout") { policy =>
-      post {
-        optionalHeaderValueByName("Authorization") { authorization =>
-          Auth.tenant(authorization) match {
-            case None => complete(answer(StatusCodes.Unauthorized, """{"error":"missing bearer token"}"""))
-            case Some(operator) =>
-              entity(as[String]) { raw =>
-                val body = parse(raw)
-                if (!policy.matches(PolicyName) || body.version < 1 || body.percentage < 0 || body.percentage > 100)
-                  complete(answer(StatusCodes.BadRequest, """{"error":"invalid policy, version or percentage"}"""))
-                else {
-                  val keys = List(s"rollout:$policy", s"eval:$policy:\${body.version}").asJava
-                  val args = List(body.version.toString, body.percentage.toString, MinEvalScore.toString).asJava
-                  val reply = jedis.evalsha(sha, keys, args).asInstanceOf[java.util.List[java.lang.Long]].asScala
-                  if (reply(0) != 1L) complete(answer(StatusCodes.Conflict, """{"error":"the version has no passing eval"}"""))
-                  else {
-                    println(s"rollout $policy by $operator: v\${body.version} \${reply(1)}% -> \${body.percentage}%")
-                    complete(answer(StatusCodes.OK, assignment(policy)))
-                  }
-                }
-              }
-          }
-        }
-      }
-    }
 }
 `,
     },

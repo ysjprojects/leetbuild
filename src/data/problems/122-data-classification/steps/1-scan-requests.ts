@@ -50,7 +50,6 @@ Events are keyed by entity: \`{"entity": "deliveries", "owner": "team-logistics"
         python: {order: [/jobs\.enqueue\(/, /consumer\.commit\(/]},
         typescript: {order: [/\benqueue\(/, /commitOffsets\(/]},
         go: {order: [/jobs\.Enqueue\(/, /CommitMessages\(/]},
-        scala: {order: [/Jobs\.enqueue\(/, /\bcommit\(record\)/]},
         cpp: {order: [/jobs::enqueue\(/, /commitSync\(/]},
       },
     },
@@ -63,7 +62,6 @@ Events are keyed by entity: \`{"entity": "deliveries", "owner": "team-logistics"
         python: {all: [/jobs\.schema_hash\(/, /jobs\.seen\(/, /jobs\.mark_seen\(/]},
         typescript: {all: [/schemaHash\(/, /\bseen\(/, /markSeen\(/]},
         go: {all: [/jobs\.SchemaHash\(/, /jobs\.Seen\(/, /jobs\.MarkSeen\(/]},
-        scala: {all: [/Jobs\.schemaHash\(/, /Jobs\.seen\(/, /Jobs\.markSeen\(/]},
         cpp: {all: [/jobs::schemaHash\(/, /jobs::seen\(/, /jobs::markSeen\(/]},
       },
     },
@@ -76,7 +74,6 @@ Events are keyed by entity: \`{"entity": "deliveries", "owner": "team-logistics"
         python: {all: [/schema\.changed\.dlq/, /producer\.produce\(/, /producer\.flush\(/]},
         typescript: {all: [/schema\.changed\.dlq/, /await producer\.send\(/]},
         go: {all: [/schema\.changed\.dlq/, /\.WriteMessages\(/]},
-        scala: {all: [/schema\.changed\.dlq/, /\.send\([^\n]*\)\.get\(/]},
         cpp: {all: [/schema\.changed\.dlq/, /->produce\(/, /->flush\(/]},
       },
     },
@@ -375,110 +372,6 @@ func consume(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import spray.json._
-
-import metasense.Jobs // Jobs.schemaHash, seen, markSeen, enqueue
-
-import scala.jdk.CollectionConverters._
-
-object ScanIntake {
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "metasense")
-  props.put("auto.offset.reset", "earliest")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("schema.changed").asJava)
-
-  private def commit(record: ConsumerRecord[String, String]): Unit =
-    consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-
-  /** Turn schema.changed events into classification jobs. */
-  def consume(): Unit = {
-    // TODO: this starter has 3 flaws. The task says where to look; the checks say what must change.
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        commit(record)
-        val event = record.value.parseJson.asJsObject.fields
-        val columns = event("columns").asInstanceOf[JsArray].elements.map(_.asInstanceOf[JsString].value)
-        Jobs.enqueue(Jobs.Job(event("entity").asInstanceOf[JsString].value, event("owner").asInstanceOf[JsString].value, "", columns))
-      }
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import spray.json._
-
-import metasense.Jobs // Jobs.schemaHash, seen, markSeen, enqueue
-
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-
-object ScanIntake {
-  val DlqTopic = "schema.changed.dlq"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "metasense")
-  props.put("auto.offset.reset", "earliest")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("schema.changed").asJava)
-
-  private val producer: KafkaProducer[String, String] = {
-    val p = new Properties()
-    p.put("bootstrap.servers", "kafka:9092")
-    p.put("acks", "all")
-    new KafkaProducer[String, String](p, new StringSerializer, new StringSerializer)
-  }
-
-  private def commit(record: ConsumerRecord[String, String]): Unit =
-    consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-
-  /** The event (entity, owner, columns) when it is well formed. */
-  private def parseEvent(raw: String): Option[(String, String, Seq[String])] =
-    Try(raw.parseJson.asJsObject.fields).toOption.flatMap { fields =>
-      (fields.get("entity"), fields.get("owner"), fields.get("columns")) match {
-        case (Some(JsString(entity)), Some(JsString(owner)), Some(JsArray(cols))) if entity.nonEmpty && owner.nonEmpty && cols.nonEmpty =>
-          val columns = cols.collect { case JsString(c) if c.nonEmpty => c }
-          if (columns.size == cols.size) Some((entity, owner, columns)) else None
-        case _ => None
-      }
-    }
-
-  /** Turn schema.changed events into classification jobs; an offset is committed once its work is done. */
-  def consume(): Unit =
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        parseEvent(record.value) match {
-          case None =>
-            // Throws unless the broker took it: then the offset stays put and the record comes back.
-            producer.send(new ProducerRecord[String, String](DlqTopic, record.key, record.value)).get()
-          case Some((entity, owner, columns)) =>
-            val digest = Jobs.schemaHash(columns)
-            if (!Jobs.seen(entity, digest)) {
-              Jobs.enqueue(Jobs.Job(entity, owner, digest, columns))
-              Jobs.markSeen(entity, digest)
-            }
-        }
-        commit(record)
-      }
 }
 `,
     },

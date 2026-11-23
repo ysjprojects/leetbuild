@@ -46,7 +46,6 @@ acknowledgement, and is not told about an event the broker refused.
         python: {all: [/\.produce\([^\n]*key\s*=\s*auction_id/]},
         typescript: {all: [/key:\s*auctionId/]},
         go: {all: [/Key:\s*\[\]byte\(\s*auctionID\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*(Topic|"bid\.event")\s*,\s*auctionId\s*,/]},
         cpp: {all: [/auction_id\.c_str\(\)\s*,\s*auction_id\.(size|length)\(\)/]},
       },
     },
@@ -59,7 +58,6 @@ acknowledgement, and is not told about an event the broker refused.
         python: {none: [/if\s+won\s*:\s*\n\s*producer\.produce\(/]},
         typescript: {none: [/if\s*\(\s*won\s*\)\s*\{[^}]*producer\.send\(/]},
         go: {none: [/if\s+won\s*\{[^}]*producer\.Produce\(/]},
-        scala: {none: [/if\s*\(\s*won\s*\)\s*\{[^}]*producer\.send\(/]},
         cpp: {none: [/if\s*\(\s*won\s*\)\s*\{[^}]*producer->produce\(/]},
       },
     },
@@ -72,7 +70,6 @@ acknowledgement, and is not told about an event the broker refused.
         python: {order: [/spend\.settle\(/, /producer\.produce\(/]},
         typescript: {order: [/await settle\(/, /producer\.send\(/]},
         go: {order: [/spend\.Settle\(/, /producer\.Produce\(/]},
-        scala: {order: [/Spend\.settle\(/, /producer\.send\(/]},
         cpp: {order: [/rtb::spend::settle\(/, /producer->produce\(/]},
       },
     },
@@ -85,7 +82,6 @@ acknowledgement, and is not told about an event the broker refused.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -98,7 +94,6 @@ acknowledgement, and is not told about an event the broker refused.
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/outbox\.Insert\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.insert\(/, /\.get\(\s*[^\n]*TimeUnit/]},
         cpp: {all: [/outbox::insert\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -352,92 +347,6 @@ func reportResult(ctx context.Context, bidder, auctionID string, won bool, lossR
 		return false, outbox.Insert(ctx, event, err.Error())
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import rtb.{Outbox, Spend} // Spend.settle(bidder, auctionId, won): cents given back; Outbox.insert(event, reason)
-
-object Events {
-  val Topic = "bid.event"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def bidEvent(bidder: String, auctionId: String, won: Boolean, lossReason: String): JsObject =
-    JsObject(
-      "type" -> JsString(if (won) "win" else "loss"),
-      "auction_id" -> JsString(auctionId),
-      "bidder" -> JsString(bidder),
-      "loss_reason" -> (if (won) JsNull else JsString(lossReason))
-    )
-
-  /** The exchange's result notice: settle the auction's claim and tell the stats consumer; true once bid.event has it. */
-  def reportResult(bidder: String, auctionId: String, won: Boolean, lossReason: String = ""): Boolean = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    if (won) {
-      producer.send(new ProducerRecord[String, String](Topic, bidder, bidEvent(bidder, auctionId, won, lossReason).compactPrint))
-    }
-    Spend.settle(bidder, auctionId, won)
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.{Failure, Success, Try}
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import rtb.{Outbox, Spend} // Spend.settle(bidder, auctionId, won): cents given back; Outbox.insert(event, reason)
-
-object Events {
-  val Topic = "bid.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def bidEvent(bidder: String, auctionId: String, won: Boolean, lossReason: String): JsObject =
-    JsObject(
-      "type" -> JsString(if (won) "win" else "loss"),
-      "auction_id" -> JsString(auctionId),
-      "bidder" -> JsString(bidder),
-      "loss_reason" -> (if (won) JsNull else JsString(lossReason))
-    )
-
-  /** The exchange's result notice: settle the auction's claim and tell the stats consumer; true once bid.event has it. */
-  def reportResult(bidder: String, auctionId: String, won: Boolean, lossReason: String = ""): Boolean = {
-    // The spend stands before its event exists: a consumer reads no result the cap has not seen.
-    Spend.settle(bidder, auctionId, won)
-    val event = bidEvent(bidder, auctionId, won, lossReason)
-    val record = new ProducerRecord[String, String](Topic, auctionId, event.compactPrint)
-    Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS)) match {
-      case Success(_) => true
-      case Failure(e) =>
-        // The broker did not take it: the relay produces the row later, so the stats are late, not wrong.
-        Outbox.insert(event, String.valueOf(e.getMessage))
-        false
-    }
-  }
 }
 `,
     },

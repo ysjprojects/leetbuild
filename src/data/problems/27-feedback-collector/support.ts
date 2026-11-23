@@ -7,7 +7,6 @@
  * checks call them to set up the world.
  */
 import {CPP_DIGEST_H} from '../cpp-support';
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'feedback/__init__.py': '',
@@ -394,93 +393,5 @@ inline std::pair<long long, long long> hourTotals(const std::string& model_versi
 }
 
 }  // namespace store
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('feedback', 'Store')]: `package feedback
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The feedback store (provided), in Redis:
- *
- *   served:{tenant}:{request_id}     string: the unix second the gateway served the request
- *   feedback:seq                     the counter feedback ids come from (fb-1, fb-2, ...)
- *   feedback:{feedback_id}           hash: feedback_id, tenant, user_id, request_id, rating, comment,
- *                                    model_version, prompt_version, route
- *   outbox:feedback.recorded         list: the JSON events the broker refused, for the relay
- *   quality:{model_version}          hash: samples, positive since the model shipped
- *   quality:{model_version}:{hour}   hash: samples, positive in one hour (hour = unix seconds / 3600)
- *
- * markServed is the gateway's write and recordQuality the quality consumer's.
- */
-object Store {
-  final case class Feedback(
-      feedbackId: String,
-      tenant: String,
-      userId: String,
-      requestId: String,
-      rating: Int,
-      comment: String,
-      modelVersion: String = "",
-      promptVersion: String = "",
-      route: String = "")
-
-  val OutboxKey = "outbox:feedback.recorded"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** The gateway's write: requestId was served to tenant at unix second at. */
-  def markServed(tenant: String, requestId: String, at: Long = 0L): Unit = jedis.set(s"served:$tenant:$requestId", at.toString)
-
-  /** Whether the gateway served requestId to this tenant. */
-  def isServed(tenant: String, requestId: String): Boolean = jedis.exists(s"served:$tenant:$requestId")
-
-  def newFeedbackId(): String = s"fb-\${jedis.incr("feedback:seq")}"
-
-  /** Store a feedback row. */
-  def insertFeedback(row: Feedback): Unit =
-    jedis.hset(
-      s"feedback:\${row.feedbackId}",
-      Map(
-        "feedback_id" -> row.feedbackId, "tenant" -> row.tenant, "user_id" -> row.userId, "request_id" -> row.requestId,
-        "rating" -> row.rating.toString, "comment" -> row.comment, "model_version" -> row.modelVersion,
-        "prompt_version" -> row.promptVersion, "route" -> row.route).asJava)
-
-  /** The stored row, if any. */
-  def getFeedback(feedbackId: String): Option[Feedback] = {
-    val raw = jedis.hgetAll(s"feedback:$feedbackId").asScala.toMap
-    if (raw.isEmpty) None
-    else {
-      def text(name: String): String = raw.getOrElse(name, "")
-      Some(Feedback(text("feedback_id"), text("tenant"), text("user_id"), text("request_id"), text("rating").toInt,
-        text("comment"), text("model_version"), text("prompt_version"), text("route")))
-    }
-  }
-
-  /** Keep an event (its JSON) the broker refused, for the relay to produce again. */
-  def insertOutbox(event: String): Unit = jedis.rpush(OutboxKey, event)
-
-  /** The quality consumer's write: one rating of modelVersion at unix second at. */
-  def recordQuality(modelVersion: String, rating: Int, at: Long): Unit =
-    Seq(s"quality:$modelVersion", s"quality:$modelVersion:\${at / 3600}").foreach { key =>
-      jedis.hincrBy(key, "samples", 1)
-      if (rating == 1) jedis.hincrBy(key, "positive", 1)
-    }
-
-  private def pair(key: String): (Long, Long) = {
-    val raw = jedis.hgetAll(key).asScala
-    (raw.get("samples").map(_.toLong).getOrElse(0L), raw.get("positive").map(_.toLong).getOrElse(0L))
-  }
-
-  /** (samples, positive) since the model shipped. */
-  def totals(modelVersion: String): (Long, Long) = pair(s"quality:$modelVersion")
-
-  /** (samples, positive) in one hour bucket (hour = unix seconds / 3600). */
-  def hourTotals(modelVersion: String, hour: Long): (Long, Long) = pair(s"quality:$modelVersion:$hour")
-}
 `,
 };

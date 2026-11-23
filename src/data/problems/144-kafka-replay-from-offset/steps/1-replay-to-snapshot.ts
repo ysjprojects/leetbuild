@@ -62,7 +62,6 @@ and returns how many it handled. Every topic in this drill has \`PARTITIONS\` = 
           all: [/consumer\.seek\(\{topic, partition: p, offset: String\(fromOffset\)\}\)/, /await handler\(\{/],
         },
         go: {all: [/reader\.SetOffset\(fromOffset\)/, /handler\(ReplayRecord\{/]},
-        scala: {all: [/consumer\.seek\(tp, fromOffset\)/, /handler\(ReplayRecord\(/]},
         cpp: {all: [/RdKafka::TopicPartition::create\(topic, p, from_offset\)/, /handler\(ReplayRecord\{/]},
       },
     },
@@ -78,7 +77,6 @@ and returns how many it handled. Every topic in this drill has \`PARTITIONS\` = 
         },
         typescript: {order: [/admin\.fetchTopicOffsets\(topic\)/, /consumer\.run\(\{/], all: [/< end\[/]},
         go: {order: [/conn\.ReadLastOffset\(\)/, /reader\.FetchMessage\(ctx\)/], all: [/< end\[p\]/]},
-        scala: {order: [/consumer\.endOffsets\(/, /consumer\.poll\(/], all: [/< end\(/]},
         cpp: {
           order: [/consumer->query_watermark_offsets\(topic, p, &low, &high/, /consumer->consume\(/],
           all: [/< end\[/],
@@ -97,10 +95,6 @@ and returns how many it handled. Every topic in this drill has \`PARTITIONS\` = 
         },
         typescript: {all: [/groupId:\s*GROUP/, /autoCommit:\s*false/], none: [/commitOffsets\(/]},
         go: {all: [/Partition:\s*p,/], none: [/GroupID/, /CommitMessages\(/, /ReadMessage\(/]},
-        scala: {
-          all: [/"group\.id",\s*Group/, /"enable\.auto\.commit",\s*"false"/],
-          none: [/commitSync\(/, /commitAsync\(/, /\.subscribe\(/],
-        },
         cpp: {
           all: [/"group\.id",\s*kGroup/, /"enable\.auto\.commit",\s*"false"/],
           none: [/commitSync\(/, /commitAsync\(/, /->subscribe\(/],
@@ -118,7 +112,6 @@ and returns how many it handled. Every topic in this drill has \`PARTITIONS\` = 
           all: [/position\[p\] = fromOffset;/, /consumer\.pause\(\[\{topic, partitions: \[partition\]\}\]\)/],
         },
         go: {all: [/if fromOffset >= end\[p\]/, /msg\.Offset\+1 >= end\[p\]/]},
-        scala: {all: [/tp\.partition -> fromOffset/, /consumer\.pause\(/]},
         cpp: {all: [/position\[p\] = from_offset;/, /consumer->pause\(/]},
       },
     },
@@ -137,7 +130,6 @@ and returns how many it handled. Every topic in this drill has \`PARTITIONS\` = 
           ],
         },
         go: {order: [/func replay\(/, /kafka\.NewReader\(/, /reader\.Close\(\)/]},
-        scala: {order: [/def replay\(/, /new KafkaConsumer\[String, String\]\(/, /consumer\.close\(\)/]},
         cpp: {order: [/int replay\(/, /RdKafka::KafkaConsumer::create\(/, /consumer->close\(\)/]},
       },
     },
@@ -417,84 +409,6 @@ func replay(ctx context.Context, topic string, fromOffset int64, handler func(Re
 		reader.Close()
 	}
 	return handled, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.jdk.CollectionConverters._
-
-final case class ReplayRecord(partition: Int, offset: Long, key: String, value: String)
-
-object ReplayTool {
-  val Partitions = 3
-  val Group = "replay-tool"
-
-  /** Hand every record of \`topic\` from \`fromOffset\` up to the end as of now to \`handler\`; return the count. */
-  def replay(topic: String, fromOffset: Long, handler: ReplayRecord => Unit): Int = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    // TODO: disable auto-commit; this consumer never commits
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    // TODO: assign every partition (no subscribe); capture endOffsets before reading anything
-    // TODO: seek every partition to fromOffset
-    // TODO: poll; track positions; handler() only below the snapshot; pause finished partitions; stop when all are
-    // TODO: close the consumer; return how many records were handled
-    0
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.jdk.CollectionConverters._
-
-final case class ReplayRecord(partition: Int, offset: Long, key: String, value: String)
-
-object ReplayTool {
-  val Partitions = 3
-  val Group = "replay-tool"
-
-  /** Hand every record of \`topic\` from \`fromOffset\` up to the end as of now to \`handler\`; return the count. */
-  def replay(topic: String, fromOffset: Long, handler: ReplayRecord => Unit): Int = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    props.put("enable.auto.commit", "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    try {
-      val partitions = (0 until Partitions).map(p => new TopicPartition(topic, p))
-      consumer.assign(partitions.asJava)
-      // The snapshot: where every partition ends right now. Anything appended later is out of scope.
-      val end = consumer.endOffsets(partitions.asJava).asScala.map { case (tp, o) => tp.partition -> o.longValue }.toMap
-      partitions.foreach(tp => consumer.seek(tp, fromOffset))
-      val position = scala.collection.mutable.Map(partitions.map(tp => tp.partition -> fromOffset): _*)
-      val done = (p: Int) => position(p) >= end(p)
-      consumer.pause(partitions.filter(tp => done(tp.partition)).asJava)
-      var handled = 0
-      while (partitions.exists(tp => !done(tp.partition))) {
-        consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-          val p = record.partition
-          position(p) = record.offset + 1
-          if (record.offset < end(p)) {
-            handler(ReplayRecord(p, record.offset, record.key, record.value))
-            handled += 1
-          }
-          if (done(p)) consumer.pause(List(new TopicPartition(topic, p)).asJava)
-        }
-      }
-      handled
-    } finally consumer.close()
-  }
 }
 `,
     },
@@ -1140,5 +1054,5 @@ void CheckIndependent(harness::Ctx& ctx) {
 }
 `,
   },
-  debrief: `Three decisions make this a replay tool and not a second live consumer. It owns its **assignment** — \`assign\` in Python and the Java client, \`subscribe\` + \`seek\` in kafkajs — so it starts where it is told, not where a group's bookmark is; it **never commits** (auto-commit off, no commit call, nothing on close), so group \`orders\` resumes exactly where it was and no other tool ever inherits the replay's position; and it reads to a **snapshot of the end** taken before the first fetch, so the job is bounded by two offsets per partition no matter how fast producers write. The pause-when-done loop is the shape every bounded read takes: the broker keeps serving a partition past its snapshot, so the position check — not the fetch — decides what the handler sees. Real tools add \`offsets_for_times\` to pick \`from_offset\` by timestamp, read the partition count from metadata instead of a constant, write the handler's output through an idempotent sink (a replay is by definition a duplicate), and run one replay per partition in parallel with the same two fixed ends.`,
+  debrief: `Three decisions make this a replay tool and not a second live consumer. It owns its **assignment** — \`assign\` in Python and C++, \`subscribe\` + \`seek\` in kafkajs — so it starts where it is told, not where a group's bookmark is; it **never commits** (auto-commit off, no commit call, nothing on close), so group \`orders\` resumes exactly where it was and no other tool ever inherits the replay's position; and it reads to a **snapshot of the end** taken before the first fetch, so the job is bounded by two offsets per partition no matter how fast producers write. The pause-when-done loop is the shape every bounded read takes: the broker keeps serving a partition past its snapshot, so the position check — not the fetch — decides what the handler sees. Real tools add \`offsets_for_times\` to pick \`from_offset\` by timestamp, read the partition count from metadata instead of a constant, write the handler's output through an idempotent sink (a replay is by definition a duplicate), and run one replay per partition in parallel with the same two fixed ends.`,
 };

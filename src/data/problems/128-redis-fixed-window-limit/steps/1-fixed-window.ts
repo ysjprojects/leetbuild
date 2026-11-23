@@ -53,7 +53,6 @@ same count.
         python: {all: [/\.incr\(/, /<=\s*LIMIT|>\s*LIMIT/]},
         typescript: {all: [/\.incr\(/, /<=\s*LIMIT|>\s*LIMIT/]},
         go: {all: [/\.Incr\(/, /<=\s*limit|>\s*limit/]},
-        scala: {all: [/\.incr\(/, /<=\s*Limit|>\s*Limit/]},
         cpp: {all: [/\.incr\(/, /<=\s*kLimit|>\s*kLimit/]},
       },
     },
@@ -66,7 +65,6 @@ same count.
         python: {all: [/\.ttl\(/, /max\(/]},
         typescript: {all: [/\.ttl\(/, /Math\.max\(/]},
         go: {all: [/\.TTL\(/, /retry < 1/]},
-        scala: {all: [/\.ttl\(/, /math\.max\(/]},
         cpp: {all: [/\.ttl\(/, /std::max/]},
       },
     },
@@ -79,7 +77,6 @@ same count.
         python: {all: [/time\.time\(\)/, /\/\/\s*WINDOW_S/]},
         typescript: {all: [/Date\.now\(\)/, /\/\s*WINDOW_S/]},
         go: {all: [/time\.Now\(\)/, /\/\s*windowS/]},
-        scala: {all: [/System\.currentTimeMillis\(\)/, /\/\s*WindowSeconds/]},
         cpp: {all: [/std::time\(nullptr\)/, /\/\s*kWindowS/]},
       },
     },
@@ -92,7 +89,6 @@ same count.
         python: {all: [/\.expire\(/, /==\s*1/]},
         typescript: {all: [/\.expire\(/, /===\s*1/]},
         go: {all: [/\.Expire\(/, /==\s*1/]},
-        scala: {all: [/\.expire\(/, /==\s*1/]},
         cpp: {all: [/\.expire\(/, /==\s*1/]},
       },
     },
@@ -105,7 +101,6 @@ same count.
         python: {all: [/f"rl:\{client_id\}:\{window\}"/]},
         typescript: {all: [/`rl:\$\{clientId\}:\$\{window\}`/]},
         go: {all: [/"rl:%s:%d"/]},
-        scala: {all: [/s"rl:\$clientId:\$window"/]},
         cpp: {all: [/"rl:" \+ client_id \+ ":" \+ std::to_string\(window\)/]},
       },
     },
@@ -118,7 +113,6 @@ same count.
         python: {all: [/\.incr\(/], none: [/r\.get\(/, /r\.set\(/]},
         typescript: {all: [/\.incr\(/], none: [/redis\.get\(/, /redis\.set\(/]},
         go: {all: [/\.Incr\(/], none: [/rdb\.Get\(/, /rdb\.Set\(/]},
-        scala: {all: [/\.incr\(/], none: [/jedis\.get\(/, /jedis\.set\(/]},
         cpp: {all: [/\.incr\(/], none: [/redis\.get\(/, /redis\.set\(/]},
       },
     },
@@ -293,48 +287,6 @@ func main() {
 		}
 		fmt.Println(allowed, retry)
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-/** Fixed-window rate limit: one INCR per request on a key named after the client and the window. */
-object RateLimit {
-  val jedis = new JedisPooled("redis", 6379)
-  val Limit = 100
-  val WindowSeconds = 60
-
-  /** (allowed, retryAfterSeconds): at most Limit requests per client per WindowSeconds-second window. */
-  def allow(clientId: String): (Boolean, Int) = {
-    ??? // TODO: window = now divided by WindowSeconds; INCR rl:{clientId}:{window}; EXPIRE WindowSeconds when the
-    //         count came back 1; allowed while the count is at or below Limit; otherwise (false, TTL of the key, at least 1)
-  }
-
-  def main(args: Array[String]): Unit =
-    (1 to 3).foreach(_ => println(allow("demo")))
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-/** Fixed-window rate limit: one INCR per request on a key named after the client and the window. */
-object RateLimit {
-  val jedis = new JedisPooled("redis", 6379)
-  val Limit = 100
-  val WindowSeconds = 60
-
-  /** (allowed, retryAfterSeconds): at most Limit requests per client per WindowSeconds-second window. */
-  def allow(clientId: String): (Boolean, Int) = {
-    val window = System.currentTimeMillis() / 1000 / WindowSeconds
-    val key = s"rl:$clientId:$window"
-    val count = jedis.incr(key)
-    if (count == 1) jedis.expire(key, WindowSeconds.toLong) // the first hit arms the window; later hits leave the TTL alone
-    if (count <= Limit) (true, 0)
-    else (false, math.max(jedis.ttl(key).toInt, 1))
-  }
-
-  def main(args: Array[String]): Unit =
-    (1 to 3).foreach(_ => println(allow("demo")))
 }
 `,
     },

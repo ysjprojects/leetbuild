@@ -57,10 +57,6 @@ with each other, and a device pushing back the body it just pulled mints a revis
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]HGET['"]/],
           none: [/rdb\.HGet\(/, /rdb\.HSet\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HGET['"]/],
-          none: [/jedis\.hget\(/, /jedis\.hset\(/],
-        },
         cpp: {
           all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HGET['"]/],
           none: [/redis\.hget\(/, /redis\.hset\(/],
@@ -76,7 +72,6 @@ with each other, and a device pushing back the body it just pulled mints a revis
         python: {all: [/redis\.call\(\s*['"]INCR['"]/], none: [/current\s*\+\s*1/]},
         typescript: {all: [/redis\.call\(\s*['"]INCR['"]/], none: [/current\s*\+\s*1/]},
         go: {all: [/redis\.call\(\s*['"]INCR['"]/], none: [/current\s*\+\s*1/]},
-        scala: {all: [/redis\.call\(\s*['"]INCR['"]/], none: [/current\s*\+\s*1/]},
         cpp: {all: [/redis\.call\(\s*['"]INCR['"]/], none: [/current\s*\+\s*1/]},
       },
     },
@@ -89,7 +84,6 @@ with each other, and a device pushing back the body it just pulled mints a revis
         python: {all: [/==\s*ARGV\[3\]|ARGV\[3\]\s*==/, /unchanged/]},
         typescript: {all: [/==\s*ARGV\[3\]|ARGV\[3\]\s*==/, /unchanged/]},
         go: {all: [/==\s*ARGV\[3\]|ARGV\[3\]\s*==/, /unchanged/]},
-        scala: {all: [/==\s*ARGV\[3\]|ARGV\[3\]\s*==/, /unchanged/]},
         cpp: {all: [/==\s*ARGV\[3\]|ARGV\[3\]\s*==/, /unchanged/]},
       },
     },
@@ -264,65 +258,6 @@ func applyChange(ctx context.Context, docID string, baseRevision int64, contentH
 		return store.Outcome{}, err
 	}
 	return store.Outcome{Status: statuses[reply[0]], Revision: reply[1]}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import docsync.Store // Store.docKey, historyKey, RevisionKey, ChangesKey, Outcome
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Apply the change only against the revision the device edited. */
-  def applyChange(docId: String, baseRevision: Long, contentHash: String, body: String, device: String): Store.Outcome = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    val current = Option(jedis.hget(Store.docKey(docId), "revision")).map(_.toLong).getOrElse(0L)
-    if (current != baseRevision) Store.Outcome("conflict", current)
-    else {
-      val revision = current + 1
-      jedis.hset(Store.docKey(docId), Map("doc_id" -> docId, "revision" -> revision.toString, "content_hash" -> contentHash, "body" -> body, "device" -> device).asJava)
-      jedis.hset(Store.historyKey(docId, revision), Map("content_hash" -> contentHash, "body" -> body).asJava)
-      jedis.zadd(Store.ChangesKey, revision.toDouble, docId)
-      Store.Outcome("applied", revision)
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import docsync.Store // Store.docKey, historyKey, RevisionKey, ChangesKey, Outcome
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  // KEYS: doc:{id}, rev:seq, changes. ARGV: doc_id, base_revision, content_hash, body, device.
-  val ApplyLua: String = """
-local current = tonumber(redis.call('HGET', KEYS[1], 'revision') or '0')
-if redis.call('HGET', KEYS[1], 'content_hash') == ARGV[3] then return {2, current} end
-if current ~= tonumber(ARGV[2]) then return {0, current} end
-local revision = redis.call('INCR', KEYS[2])
-redis.call('HSET', KEYS[1], 'doc_id', ARGV[1], 'revision', tostring(revision), 'content_hash', ARGV[3], 'body', ARGV[4], 'device', ARGV[5])
-redis.call('HSET', KEYS[1] .. ':r' .. revision, 'content_hash', ARGV[3], 'body', ARGV[4])
-redis.call('ZADD', KEYS[3], revision, ARGV[1])
-return {1, revision}
-"""
-
-  private val Statuses = Vector("conflict", "applied", "unchanged")
-
-  /** Apply the change only against the revision the device edited. */
-  def applyChange(docId: String, baseRevision: Long, contentHash: String, body: String, device: String): Store.Outcome = {
-    // One script: the compare, the next revision and every write run with no command in between.
-    val keys = List(Store.docKey(docId), Store.RevisionKey, Store.ChangesKey).asJava
-    val args = List(docId, baseRevision.toString, contentHash, body, device).asJava
-    val reply = jedis.eval(ApplyLua, keys, args).asInstanceOf[java.util.List[java.lang.Long]]
-    Store.Outcome(Statuses(reply.get(0).toInt), reply.get(1).longValue)
-  }
 }
 `,
     },

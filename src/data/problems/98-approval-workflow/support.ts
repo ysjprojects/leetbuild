@@ -4,10 +4,9 @@
  * a version and its approvers in order); `store` is the request store (one hash per submitted
  * request, plus the Idempotency-Key index); `chain` is the approval state machine of step 2 as
  * later steps use it (`start_chain`, `advance`, one Lua compare-and-swap per decision); `outbox`
- * is the table a relay republishes from when the broker rejected an event. The five languages keep
+ * is the table a relay republishes from when the broker rejected an event. The four languages keep
  * the same keys, so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 /** One decision as one compare-and-swap: step 2's solution and the provided `chain.advance` run this script. */
 export const ADVANCE_LUA = `local key = KEYS[1]
@@ -31,12 +30,6 @@ end
 redis.call('HSET', key, 'step_index', next_index, 'current_approver', redis.call('HGET', key, 'approver:' .. next_index))
 return {'1', tostring(next_index), 'pending', ''}
 `;
-
-/** The Lua script with its lines indented for a Scala `stripMargin` string (step 2's Scala solution uses it too). */
-export const ADVANCE_LUA_SCALA = ADVANCE_LUA.trimEnd()
-  .split('\n')
-  .map((line, i) => (i === 0 ? line : `      |${line}`))
-  .join('\n');
 
 export const supportModules: Record<string, string> = {
   'approvals/__init__.py': '',
@@ -711,152 +704,5 @@ inline void insert(const std::string& topic, const std::string& key, const nlohm
 }
 
 }  // namespace outbox
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('approvals', 'Policy')]: `package approvals
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The chain policy store (provided): policy:{chain_id} is a Redis hash with the current definition of
- * a chain, its version and its approvers in order (comma-joined). defineChain is the policy admin's
- * path (a new definition replaces the old one); resolveApprovers answers the current definition.
- */
-object Policy {
-  final case class Chain(version: Long, approvers: Seq[String])
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Make (version, approvers) the current definition of chainId. */
-  def defineChain(chainId: String, version: Long, approvers: Seq[String]): Unit =
-    jedis.hset(s"policy:$chainId", Map("version" -> version.toString, "approvers" -> approvers.mkString(",")).asJava)
-
-  /** The current definition of chainId, or None for an unknown chain. */
-  def resolveApprovers(chainId: String): Option[Chain] = {
-    val raw = jedis.hgetAll(s"policy:$chainId").asScala
-    if (raw.isEmpty) None
-    else Some(Chain(raw("version").toLong, raw("approvers").split(",").toSeq.filter(_.nonEmpty)))
-  }
-}
-`,
-  [scalaPath('approvals', 'Store')]: `package approvals
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The request store (provided): request:{id} is a Redis hash with request_id, tenant, requester,
- * chain_id, chain_version, approvers (comma-joined), why and amount_cents. idem:{tenant}:{key} holds
- * the id of the request a submit with that Idempotency-Key stored; request:seq numbers the requests.
- */
-object Store {
-  final case class Request(
-      requestId: String,
-      tenant: String,
-      requester: String,
-      chainId: String,
-      chainVersion: Long,
-      approvers: Seq[String],
-      why: String,
-      amountCents: Long)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** A fresh request id: r-1, r-2, ... */
-  def newRequestId(): String = s"r-\${jedis.incr("request:seq")}"
-
-  /** Store the request; with a non-empty Idempotency-Key, index it under (tenant, key) too. */
-  def put(request: Request, idemKey: String): Unit = {
-    jedis.hset(
-      s"request:\${request.requestId}",
-      Map(
-        "request_id" -> request.requestId,
-        "tenant" -> request.tenant,
-        "requester" -> request.requester,
-        "chain_id" -> request.chainId,
-        "chain_version" -> request.chainVersion.toString,
-        "approvers" -> request.approvers.mkString(","),
-        "why" -> request.why,
-        "amount_cents" -> request.amountCents.toString).asJava)
-    if (idemKey.nonEmpty) jedis.set(s"idem:\${request.tenant}:$idemKey", request.requestId)
-  }
-
-  /** The stored request, if any. */
-  def load(requestId: String): Option[Request] = {
-    val raw = jedis.hgetAll(s"request:$requestId").asScala
-    if (raw.isEmpty) None
-    else
-      Some(
-        Request(raw("request_id"), raw("tenant"), raw("requester"), raw("chain_id"), raw("chain_version").toLong,
-          raw("approvers").split(",").toSeq.filter(_.nonEmpty), raw("why"), raw("amount_cents").toLong))
-  }
-
-  /** The request a submit with this (tenant, Idempotency-Key) stored, if any. */
-  def get(tenant: String, idemKey: String): Option[Request] =
-    Option(jedis.get(s"idem:$tenant:$idemKey")).flatMap(load)
-}
-`,
-  [scalaPath('approvals', 'Chain')]: `package approvals
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The approval state machine (provided; step 2 builds the same two functions). approval:{id}:state
- * is one Redis hash per request: step_index, step_count, status (pending, approved or rejected),
- * current_approver, approver:{i} per step, and decision:{i} and actor:{i} per decided step. It has
- * no TTL. advance runs one Lua script: it refuses a closed chain, a stale step_index, an actor who is
- * not the current approver and an unknown decision, records the decision, and moves exactly one step
- * (a rejection closes the chain).
- */
-object Chain {
-  final case class Outcome(advanced: Boolean, stepIndex: Long, status: String, reason: String)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  val AdvanceLua: String =
-    """${ADVANCE_LUA_SCALA}
-      |""".stripMargin
-
-  def stateKey(requestId: String): String = s"approval:$requestId:state"
-
-  /** Open the chain at step 0 with the pinned approvers. */
-  def startChain(requestId: String, approvers: Seq[String]): Unit = {
-    val fields = Map("step_index" -> "0", "step_count" -> approvers.size.toString, "status" -> "pending", "current_approver" -> approvers.head) ++
-      approvers.zipWithIndex.map { case (approver, i) => s"approver:$i" -> approver }
-    jedis.hset(stateKey(requestId), fields.asJava)
-  }
-
-  /** Record actor's decision ("approved" or "rejected") on step stepIndex, if it is still the current step and theirs. */
-  def advance(requestId: String, stepIndex: Long, actor: String, decision: String): Outcome = {
-    val reply = jedis
-      .eval(AdvanceLua, List(stateKey(requestId)).asJava, List(stepIndex.toString, actor, decision).asJava)
-      .asInstanceOf[java.util.List[String]]
-      .asScala
-    Outcome(reply(0) == "1", reply(1).toLong, reply(2), reply(3))
-  }
-}
-`,
-  [scalaPath('approvals', 'Outbox')]: `package approvals
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-/**
- * The outbox (provided): the Redis list outbox holds one JSON row {"topic", "key", "payload"} per event
- * the broker did not take; a relay republishes the rows in order.
- */
-object Outbox {
-  val jedis = new JedisPooled("redis", 6379)
-
-  def insert(topic: String, key: String, payload: JsObject): Unit =
-    jedis.rpush("outbox", JsObject("topic" -> JsString(topic), "key" -> JsString(key), "payload" -> payload).compactPrint)
-}
 `,
 };

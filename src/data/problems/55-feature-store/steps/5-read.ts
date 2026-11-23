@@ -57,12 +57,6 @@ hours reads as fresh because the backfill just touched its stats.
         python: {all: [/@app\.get\(\s*["']\/v1\/features\/\{name\}\/versions\/\{version\}\/stats["']/, /\b404\b/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/features\/:name\/versions\/:version\/stats['"]/, /\b404\b/]},
         go: {all: [/"GET \/v1\/features\/\{name\}\/versions\/\{version\}\/stats"/, /StatusNotFound|\b404\b/]},
-        scala: {
-          all: [
-            /path\(\s*"v1"\s*\/\s*"features"\s*\/\s*Segment\s*\/\s*"versions"\s*\/\s*LongNumber\s*\/\s*"stats"\s*\)/,
-            /NotFound/,
-          ],
-        },
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/features\//, /\b404\b/]},
       },
     },
@@ -75,7 +69,6 @@ hours reads as fresh because the backfill just touched its stats.
         python: {all: [/["']null_rate["']/, /-\s*sums\[["']nulls["']\]/]},
         typescript: {all: [/null_rate/, /-\s*sums\.nulls/]},
         go: {all: [/"null_rate"/, /-\s*sums\.Nulls/]},
-        scala: {all: [/"null_rate"/, /-\s*sums\.nulls/]},
         cpp: {all: [/"null_rate"/, /-\s*sums\.nulls/]},
       },
     },
@@ -88,7 +81,6 @@ hours reads as fresh because the backfill just touched its stats.
         python: {all: [/stats\.baseline_of\(/], none: [/version\s*-\s*1/]},
         typescript: {all: [/stats\.baselineOf\(/], none: [/version\s*-\s*1/]},
         go: {all: [/stats\.BaselineOf\(/], none: [/version\s*-\s*1/]},
-        scala: {all: [/Stats\.baselineOf\(/], none: [/version\s*-\s*1/]},
         cpp: {all: [/stats::baselineOf\(/], none: [/version\s*-\s*1/]},
       },
     },
@@ -101,7 +93,6 @@ hours reads as fresh because the backfill just touched its stats.
         python: {all: [/DRIFT_SIGMAS\s*=\s*3\b/, /abs\(/, /DRIFT_SIGMAS\s*\*/]},
         typescript: {all: [/DRIFT_SIGMAS\s*=\s*3\b/, /Math\.abs\(/, /DRIFT_SIGMAS\s*\*/]},
         go: {all: [/driftSigmas\s*=\s*3\b/, /math\.Abs\(/, /driftSigmas\s*\*/]},
-        scala: {all: [/DriftSigmas\s*=\s*3\b/, /math\.abs\(/, /DriftSigmas\s*\*/]},
         cpp: {all: [/kDriftSigmas\s*=\s*3\b/, /std::(?:abs|fabs)\(/, /kDriftSigmas\s*\*/]},
       },
     },
@@ -114,7 +105,6 @@ hours reads as fresh because the backfill just touched its stats.
         python: {all: [/newest_ts/], none: [/updated_at/]},
         typescript: {all: [/newest_ts/], none: [/updated_at/]},
         go: {all: [/NewestTs/], none: [/UpdatedAt/]},
-        scala: {all: [/newestTs/], none: [/updatedAt/]},
         cpp: {all: [/newest_ts/], none: [/updated_at/]},
       },
     },
@@ -431,89 +421,6 @@ func featureStats(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/features/{name}/versions/{version}/stats", featureStats)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import features.{Registry, Stats} // Stats.read, Stats.baselineOf; Registry.getDefinition
-
-object Read {
-  private def summarize(sums: Stats.Sums): JsObject = {
-    val count = sums.count.toDouble
-    val mean = if (count > 0) sums.sum / count else 0.0
-    val std = if (count > 0) math.sqrt(math.max(sums.sumsq / count - mean * mean, 0.0)) else 0.0
-    JsObject("count" -> JsNumber(sums.count), "mean" -> JsNumber(mean), "std" -> JsNumber(std))
-  }
-
-  private def number(summary: JsObject, field: String): Double = summary.fields(field).asInstanceOf[JsNumber].value.toDouble
-
-  val route: Route = path("v1" / "features" / Segment / "versions" / LongNumber / "stats") { (name, version) =>
-    get {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      Stats.read(name, version) match {
-        case None => complete(StatusCodes.NotFound -> s"no stats for $name v$version")
-        case Some(sums) =>
-          val current = summarize(sums)
-          val baselineVersion = version - 1
-          val baseline = Stats.read(name, baselineVersion).map(summarize)
-          val drift = baseline.exists(b => number(current, "mean") > number(b, "mean"))
-          val freshness = System.currentTimeMillis() / 1000 - sums.updatedAt
-          val stale = Registry.getDefinition(name, version).exists(d => freshness > d.freshnessSlo)
-          val body = JsObject(current.fields ++ Map(
-            "feature" -> JsString(name), "version" -> JsNumber(version), "baseline_version" -> JsNumber(baselineVersion),
-            "baseline" -> baseline.getOrElse(JsNull), "drift" -> JsBoolean(drift), "freshness_s" -> JsNumber(freshness), "stale" -> JsBoolean(stale)))
-          complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import features.{Registry, Stats} // Stats.read, Stats.baselineOf; Registry.getDefinition
-
-object Read {
-  val DriftSigmas = 3
-
-  /** Count and null rate over every row; mean and std over the values only. */
-  private def summarize(sums: Stats.Sums): JsObject = {
-    val present = (sums.count - sums.nulls).toDouble
-    val mean = if (present > 0) sums.sum / present else 0.0
-    val std = if (present > 0) math.sqrt(math.max(sums.sumsq / present - mean * mean, 0.0)) else 0.0
-    val nullRate = if (sums.count > 0) sums.nulls.toDouble / sums.count else 0.0
-    JsObject("count" -> JsNumber(sums.count), "null_rate" -> JsNumber(nullRate), "mean" -> JsNumber(mean), "std" -> JsNumber(std))
-  }
-
-  private def number(summary: JsObject, field: String): Double = summary.fields(field).asInstanceOf[JsNumber].value.toDouble
-
-  val route: Route = path("v1" / "features" / Segment / "versions" / LongNumber / "stats") { (name, version) =>
-    get {
-      Stats.read(name, version) match {
-        case None => complete(StatusCodes.NotFound -> s"no stats for $name v$version")
-        case Some(sums) =>
-          val current = summarize(sums)
-          // The pinned version, the same for every version compared with it.
-          val baselineVersion = Stats.baselineOf(name)
-          val baseline = baselineVersion.flatMap(v => Stats.read(name, v)).map(summarize)
-          val drift = baseline.exists(b => math.abs(number(current, "mean") - number(b, "mean")) > DriftSigmas * number(b, "std"))
-          // The newest value's own event time: when stats were last written only says the job ran.
-          val freshness = System.currentTimeMillis() / 1000 - sums.newestTs
-          val stale = Registry.getDefinition(name, version).exists(d => freshness > d.freshnessSlo)
-          val body = JsObject(current.fields ++ Map(
-            "feature" -> JsString(name), "version" -> JsNumber(version), "baseline_version" -> baselineVersion.map(JsNumber(_)).getOrElse(JsNull),
-            "baseline" -> baseline.getOrElse(JsNull), "drift" -> JsBoolean(drift), "freshness_s" -> JsNumber(freshness), "stale" -> JsBoolean(stale)))
-          complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-      }
-    }
-  }
 }
 `,
     },

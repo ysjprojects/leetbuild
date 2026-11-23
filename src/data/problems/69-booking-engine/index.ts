@@ -6,7 +6,7 @@ import {bookingStateStep} from './steps/2-state';
 import {bookingClientStep} from './steps/3-dependency';
 import {bookingEventsStep} from './steps/4-events';
 import {bookingReadStep} from './steps/5-read';
-import {supportModulesCpp, supportModulesGo, supportModulesPy, supportModulesScala, supportModulesTs} from './support';
+import {supportModulesCpp, supportModulesGo, supportModulesPy, supportModulesTs} from './support';
 
 /**
  * Booking engine: the debugging a booking path needs before two people are sold the same hour. A
@@ -101,6 +101,5 @@ notifications, multi-region replication of the slot map, and the calendaring UI 
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

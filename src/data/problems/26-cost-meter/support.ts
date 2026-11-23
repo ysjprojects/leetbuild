@@ -6,7 +6,6 @@
  * `pricing` the deterministic rate table the checks serve over gRPC in place of the pricing service.
  */
 import {CPP_IDS_H} from '../cpp-support';
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'meter/__init__.py': '',
@@ -497,109 +496,5 @@ inline const std::vector<Rate>& rates() {
 }
 
 }  // namespace pricing
-`,
-};
-
-/** The Scala twins: the same \`meter\` objects, compiled with the steps by \`yarn check:scala\`. */
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('meter', 'Config')]: `package meter
-
-/** Addresses, topics, keys and limits every step of meterd agrees on. */
-object Config {
-  /** The pricing service's gRPC address: a stand-in served by the checks. */
-  val Pricing = "pricing:9000"
-  /** One event per metered report, keyed by tenant, for the billing consumer. */
-  val Topic = "billing.usage"
-  /** Spend is metered per tenant per hour window; a window's key outlives the window by GraceSeconds. */
-  val WindowSeconds = 3600L
-  val GraceSeconds = 3600L
-  /** What a tenant may spend in one window, in micro-dollars (the budget limiter enforces it). */
-  val BudgetMicros = 5000000L
-
-  // A window is a hash: input_tokens, output_tokens, cost_micros (integer micro-dollars) and events.
-  // The budget limiter reads the same key.
-
-  /** The hour window a unix time (seconds) falls in. */
-  def bucketOf(unixSeconds: Long): Long = unixSeconds / WindowSeconds
-  def windowKey(tenant: String, bucket: Long): String = s"meter:$tenant:$bucket"
-}
-`,
-  [scalaPath('meter', 'Usage')]: `package meter
-
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-/** A stored usage report as the API answers it. */
-final case class UsageRow(usage_id: String, tenant: String, model: String, input_tokens: Long, output_tokens: Long)
-
-/** The usage store (provided): one row per (tenant, Idempotency-Key), kept for a day. */
-object Usage {
-  val TtlSeconds = 86400L
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private def encode(row: UsageRow): String = ujson.write(
-    ujson.Obj(
-      "usage_id" -> row.usage_id,
-      "tenant" -> row.tenant,
-      "model" -> row.model,
-      "input_tokens" -> row.input_tokens.toDouble,
-      "output_tokens" -> row.output_tokens.toDouble
-    )
-  )
-
-  private def decode(raw: String): UsageRow = {
-    val j = ujson.read(raw)
-    UsageRow(j("usage_id").str, j("tenant").str, j("model").str, j("input_tokens").num.toLong, j("output_tokens").num.toLong)
-  }
-
-  /** The row this tenant stored under idemKey, if any. */
-  def get(tenant: String, idemKey: String): Option[UsageRow] =
-    Option(jedis.get(s"usage:$tenant:$idemKey")).map(decode)
-
-  /** Store the row under (tenant, idemKey) for TtlSeconds. */
-  def put(tenant: String, idemKey: String, row: UsageRow): Unit = {
-    jedis.set(s"usage:$tenant:$idemKey", encode(row), SetParams.setParams().ex(TtlSeconds))
-    ()
-  }
-}
-`,
-  [scalaPath('meter', 'UsageRecord')]: `package meter
-
-/**
- * The usage record (provided): what the metering path hands to publishUsage once a report is
- * priced. The completion is tenant content: the meter has it, the topic and the logs must not.
- */
-final case class UsageRecord(
-    usage_id: String,
-    idempotency_key: String,
-    tenant_id: String,
-    model: String,
-    input_tokens: Long,
-    output_tokens: Long,
-    cost_micros: Long,
-    rate_version: String,
-    output_text: String
-)
-`,
-  [scalaPath('meter', 'Outbox')]: `package meter
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/** The outbox (provided): events the broker refused, kept for the relay to republish. */
-object Outbox {
-  val Key = "billing:outbox"
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Durably keep an event the broker refused (its JSON). */
-  def insertOutbox(eventJson: String): Unit = {
-    jedis.rpush(Key, eventJson)
-    ()
-  }
-
-  /** The kept events, decoded, oldest first. */
-  def rows(): List[ujson.Value] = jedis.lrange(Key, 0, -1).asScala.toList.map(ujson.read(_))
-}
 `,
 };

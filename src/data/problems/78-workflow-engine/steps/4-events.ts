@@ -47,7 +47,6 @@ lost acknowledgement or a leader failover.
         python: {all: [/key\s*=\s*(run_id|run\[["']run_id["']\])/], none: [/key\s*=\s*step\b/]},
         typescript: {all: [/key:\s*(runId|run\.run_id)/], none: [/key:\s*step\b/]},
         go: {all: [/Key:\s*\[\]byte\(\s*run\.RunID\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*run\.runId\s*,/]},
         cpp: {all: [/run\.run_id\.c_str\(\)\s*,\s*run\.run_id\.(size|length)\(\)/]},
       },
     },
@@ -60,7 +59,6 @@ lost acknowledgement or a leader failover.
         python: {all: [/OUTCOMES/, /"succeeded"/], none: [/["']done["']/]},
         typescript: {all: [/OUTCOMES/, /'succeeded'/], none: [/["']done["']/]},
         go: {all: [/\boutcomes\b/, /"succeeded"/], none: [/"done"/]},
-        scala: {all: [/Outcomes/, /"succeeded"/], none: [/"done"/]},
         cpp: {all: [/kOutcomes/, /"succeeded"/], none: [/"done"/]},
       },
     },
@@ -73,7 +71,6 @@ lost acknowledgement or a leader failover.
         python: {all: [/effect_id/], none: [/run\[["']input["']\]/]},
         typescript: {all: [/effect_id/], none: [/run\.input/]},
         go: {all: [/"effect_id"/], none: [/run\.Input/]},
-        scala: {all: [/"effect_id"/], none: [/run\.input/]},
         cpp: {all: [/"effect_id"/], none: [/run\.input/]},
       },
     },
@@ -86,7 +83,6 @@ lost acknowledgement or a leader failover.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -102,7 +98,6 @@ lost acknowledgement or a leader failover.
         },
         typescript: {all: [/outbox\.remove\(/, /catch/], order: [/outbox\.insert\(/, /producer\.send\(/]},
         go: {all: [/TopicPartition\.Error/, /outbox\.Remove\(/], order: [/outbox\.Insert\(/, /producer\.Produce\(/]},
-        scala: {all: [/Outbox\.remove\(/, /\.get\(\s*[^\n]*TimeUnit/], order: [/Outbox\.insert\(/, /producer\.send\(/]},
         cpp: {all: [/dr_cb/, /outbox::remove\(/], order: [/outbox::insert\(/, /producer->produce\(/]},
       },
     },
@@ -325,77 +320,6 @@ func publishStep(ctx context.Context, run *runs.Run, step, outcome string) (bool
 		return false, nil // the row stays for the relay
 	}
 	return true, outbox.Remove(ctx, eventID)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import workflow.{Outbox, Runs} // Outbox.insert(eventId, topic, key, payload), Outbox.remove(eventId) · Runs.Run
-
-object Events {
-  val Topic = "workflow.step"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Tell the audit consumers that step of the run reached outcome; true once the broker has the event. */
-  def publishStep(run: Runs.Run, step: String, outcome: String): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val event = JsObject(
-      "run_id" -> JsString(run.runId), "workflow" -> JsString(run.workflow), "step" -> JsString(step),
-      "outcome" -> JsString("done"), "input" -> run.input)
-    producer.send(new ProducerRecord[String, String](Topic, step, event.compactPrint))
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import workflow.{Outbox, Runs} // Outbox.insert(eventId, topic, key, payload), Outbox.remove(eventId) · Runs.Run
-
-object Events {
-  val Topic = "workflow.step"
-  val Outcomes: Set[String] = Set("started", "succeeded", "failed")
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the event before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Tell the audit consumers that step of the run reached outcome; true once the broker has the event. */
-  def publishStep(run: Runs.Run, step: String, outcome: String): Boolean = {
-    require(Outcomes.contains(outcome), s"unknown outcome $outcome, expected one of \${Outcomes.mkString(", ")}")
-    // Ids and names only: the run's input stays in the run store, off a topic retained for days.
-    val event = JsObject(
-      "run_id" -> JsString(run.runId), "workflow" -> JsString(run.workflow), "step" -> JsString(step),
-      "effect_id" -> JsString(s"\${run.runId}:$step"), "outcome" -> JsString(outcome))
-    val eventId = s"\${run.runId}:$step:$outcome"
-    // The row lands first: if the broker never takes the event, the relay publishes it later.
-    Outbox.insert(eventId, Topic, run.runId, event)
-    val acked = Try(producer.send(new ProducerRecord[String, String](Topic, run.runId, event.compactPrint)).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isSuccess) Outbox.remove(eventId)
-    acked.isSuccess
-  }
 }
 `,
     },

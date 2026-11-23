@@ -2,10 +2,9 @@
  * Hand-written support modules the moderation steps import but no step builds: the `moderation`
  * package. `moderation.store` is the case store in Redis (the content catalogue, report cases, the
  * persisted moderation actions, the outbox); `moderation.queue` is the review queue's intake
- * (`enqueue`), on the keys step 2 claims from. The five languages keep the same keys, so a harness
+ * (`enqueue`), on the keys step 2 claims from. The four languages keep the same keys, so a harness
  * reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 const STORE_DOC = `The case store (provided), in Redis. content:{content_id} is the content catalogue (tenant, text);
 case:{case_id} a report case (case_id, tenant, content_id, reporter_id, reason, detail, status,
@@ -542,112 +541,5 @@ inline bool enqueue(const std::string& case_id) {
 }
 
 }  // namespace queue
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('moderation', 'Store')]: `package moderation
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
-${comment(STORE_DOC, ' * ')}
- */
-object Store {
-  final case class Case(caseId: String, tenant: String, contentId: String, reporterId: String, reason: String, detail: String, status: String, reports: Long)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Register a piece of content and the tenant that owns it. */
-  def addContent(contentId: String, tenant: String, text: String = ""): Unit =
-    jedis.hset(s"content:$contentId", Map("tenant" -> tenant, "text" -> text).asJava)
-
-  /** The tenant that owns the content, or None for an unknown id. */
-  def contentTenant(contentId: String): Option[String] = Option(jedis.hget(s"content:$contentId", "tenant"))
-
-  /** The case, if it exists. */
-  def getCase(caseId: String): Option[Case] = {
-    val raw = jedis.hgetAll(s"case:$caseId").asScala.toMap
-    if (raw.isEmpty) None
-    else {
-      def text(name: String): String = raw.getOrElse(name, "")
-      Some(Case(text("case_id"), text("tenant"), text("content_id"), text("reporter_id"), text("reason"), text("detail"), text("status"), text("reports").toLongOption.getOrElse(0L)))
-    }
-  }
-
-  /** The reporter's case on this item, if any. */
-  def findCase(tenant: String, contentId: String, reporterId: String): Option[Case] =
-    Option(jedis.get(s"case:reporter:$tenant:$contentId:$reporterId")).flatMap(getCase)
-
-  /** A new open case with one report; returns it. */
-  def insertCase(tenant: String, contentId: String, reporterId: String, reason: String, detail: String): Case = {
-    val caseId = s"case-\${jedis.incr("case:seq")}"
-    jedis.hset(
-      s"case:$caseId",
-      Map("case_id" -> caseId, "tenant" -> tenant, "content_id" -> contentId, "reporter_id" -> reporterId, "reason" -> reason, "detail" -> detail, "status" -> "open", "reports" -> "1").asJava)
-    jedis.set(s"case:reporter:$tenant:$contentId:$reporterId", caseId)
-    getCase(caseId).get
-  }
-
-  /** Another report on the same case: the latest reason and detail, one more report; returns it. */
-  def updateCase(caseId: String, reason: String, detail: String): Case = {
-    jedis.hset(s"case:$caseId", Map("reason" -> reason, "detail" -> detail).asJava)
-    jedis.hincrBy(s"case:$caseId", "reports", 1L)
-    getCase(caseId).get
-  }
-
-  private def text(event: JsObject, name: String): String = event.fields.get(name) match {
-    case Some(JsString(s)) => s
-    case Some(other) => other.compactPrint
-    case None => ""
-  }
-
-  /** Persist one moderation action (an event with action_id and content_id); a replay is a no-op. Whether it was new. */
-  def putAction(event: JsObject): Boolean = {
-    val contentId = text(event, "content_id")
-    if (jedis.sadd(s"actions:$contentId:ids", text(event, "action_id")) == 0L) false
-    else {
-      jedis.rpush(s"actions:$contentId", event.compactPrint)
-      true
-    }
-  }
-
-  /** The persisted actions on the content, oldest first. */
-  def actionsOf(contentId: String): Seq[JsObject] =
-    jedis.lrange(s"actions:$contentId", 0, -1).asScala.toSeq.map(_.parseJson.asJsObject)
-
-  /** Keep a refused produce for the relay: the topic, the record key and the serialized event. */
-  def insertOutbox(topic: String, key: String, payload: String): Unit =
-    jedis.rpush("outbox", JsObject("topic" -> JsString(topic), "key" -> JsString(key), "payload" -> JsString(payload)).compactPrint)
-}
-`,
-  [scalaPath('moderation', 'Queue')]: `package moderation
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
-${comment(QUEUE_DOC, ' * ')}
- */
-object Queue {
-  val Pending = "moderation:pending"
-  val SeqKey = "moderation:seq"
-  val Counters = "moderation:counters"
-  val Owners = "moderation:owners"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  val EnqueueLua: String =
-    """${ENQUEUE_LUA.split('\n').join('\n      |')}
-      |""".stripMargin
-
-  /** Put the case in the review queue; false when it is already pending or claimed. */
-  def enqueue(caseId: String): Boolean =
-    jedis.eval(EnqueueLua, List(Pending, SeqKey, Counters, Owners).asJava, List(caseId).asJava).asInstanceOf[java.lang.Long] == 1L
-}
 `,
 };

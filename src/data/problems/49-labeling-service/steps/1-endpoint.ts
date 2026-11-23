@@ -54,7 +54,6 @@ queued under the spec is queued again, so annotators are paid twice for one answ
         python: {all: [/@app\.post\(\s*["']\/v1\/tasks["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/tasks['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/tasks"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"tasks"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/tasks"/]},
       },
     },
@@ -67,7 +66,6 @@ queued under the spec is queued again, so annotators are paid twice for one answ
         python: {all: [/spec_version\.strip\(\)|spec_version\.isspace\(\)/], none: [/["']latest["']/]},
         typescript: {all: [/spec_version\.trim\(\)/], none: [/['"]latest['"]/]},
         go: {all: [/strings\.TrimSpace\([^)\n]*SpecVersion/], none: [/"latest"/]},
-        scala: {all: [/\.trim\.isEmpty|\.isBlank/], none: [/"latest"/]},
         cpp: {all: [/find_first_not_of\(/], none: [/"latest"/]},
       },
     },
@@ -84,9 +82,6 @@ queued under the spec is queued again, so annotators are paid twice for one answ
           all: [/MAX_BATCH_ITEMS\s*=\s*200/, /MAX_OVERLAP\s*=\s*5/, /[<>]=?\s*MAX_BATCH_ITEMS/, /[<>]=?\s*MAX_OVERLAP/],
         },
         go: {all: [/maxBatchItems\s*=\s*200/, /maxOverlap\s*=\s*5/, /[<>]=?\s*maxBatchItems/, /[<>]=?\s*maxOverlap/]},
-        scala: {
-          all: [/MaxBatchItems\s*=\s*200/, /MaxOverlap\s*=\s*5/, /[<>]=?\s*MaxBatchItems/, /[<>]=?\s*MaxOverlap/],
-        },
         cpp: {
           all: [/kMaxBatchItems\s*=\s*200/, /kMaxOverlap\s*=\s*5/, /[<>]=?\s*kMaxBatchItems/, /[<>]=?\s*kMaxOverlap/],
         },
@@ -111,15 +106,6 @@ queued under the spec is queued again, so annotators are paid twice for one answ
             /StatusConflict|\b409\b/,
           ],
         },
-        scala: {
-          all: [
-            /MessageDigest\.getInstance\(\s*"SHA-256"\s*\)/,
-            /Store\.seenHashes\(/,
-            /Store\.addHashes\(/,
-            /no_new_items/,
-            /Conflict|\b409\b/,
-          ],
-        },
         cpp: {all: [/SHA256\(/, /store::seenHashes\(/, /store::addHashes\(/, /no_new_items/, /\b409\b/]},
       },
     },
@@ -140,10 +126,6 @@ queued under the spec is queued again, so annotators are paid twice for one answ
         go: {
           all: [/Idempotency-Key/i, /store\.CreateResult\(/, /store\.RecordCreate\(/],
           order: [/store\.CreateResult\(/, /store\.CreateTask\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Store\.createResult\(/, /Store\.recordCreate\(/],
-          order: [/Store\.createResult\(/, /Store\.createTask\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /store::createResult\(/, /store::recordCreate\(/],
@@ -494,107 +476,6 @@ func createTask(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/tasks", createTask)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import labeling.Store // Store.createTask, seenHashes, addHashes, createResult, recordCreate
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route =
-    path("v1" / "tasks") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            entity(as[String]) { raw =>
-              // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-              val fields = raw.parseJson.asJsObject.fields
-              val items = fields.get("items").collect { case JsArray(xs) => xs.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
-              val specVersion = fields.get("spec_version").collect { case JsString(s) if s.nonEmpty => s }.getOrElse("latest")
-              val overlap = fields.get("overlap").collect { case JsNumber(n) => n.toInt }.getOrElse(1)
-              val task = Store.createTask(tenant, specVersion, overlap, items)
-              complete(json(StatusCodes.Created, JsObject(
-                "task_id" -> JsString(task.taskId), "spec_version" -> JsString(task.specVersion), "overlap" -> JsNumber(task.overlap),
-                "accepted" -> JsNumber(items.size), "deduped" -> JsNumber(0))))
-            }
-        }
-      }
-    }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import labeling.Store // Store.createTask, seenHashes, addHashes, createResult, recordCreate
-
-object Api {
-  val MaxBatchItems = 200
-  val MaxOverlap = 5
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  def contentHash(item: String): String =
-    MessageDigest.getInstance("SHA-256").digest(item.getBytes(StandardCharsets.UTF_8)).map("%02x".format(_)).mkString
-
-  val route: Route =
-    path("v1" / "tasks") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            optionalHeaderValueByName("Idempotency-Key") {
-              case None | Some("") => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
-              case Some(key) =>
-                Store.createResult(tenant, key) match {
-                  case Some(recorded) => complete(json(StatusCodes.OK, recorded)) // a retry answers what the first attempt answered
-                  case None => entity(as[String])(raw => complete(create(tenant, key, raw)))
-                }
-            }
-        }
-      }
-    }
-
-  private def create(tenant: String, key: String, raw: String): HttpResponse = {
-    val fields = raw.parseJson.asJsObject.fields
-    val specVersion = fields.get("spec_version").collect { case JsString(s) => s }.getOrElse("")
-    val rawItems = fields.get("items").collect { case JsArray(xs) => xs }.getOrElse(Vector.empty)
-    val items = rawItems.collect { case JsString(s) if s.nonEmpty => s }
-    val overlap = fields.get("overlap").collect { case JsNumber(n) => n.toInt }.getOrElse(1)
-    if (specVersion.trim.isEmpty) json(StatusCodes.BadRequest, JsObject("error" -> JsString("spec_version is required")))
-    else if (rawItems.isEmpty || rawItems.size > MaxBatchItems || items.size != rawItems.size)
-      json(StatusCodes.BadRequest, JsObject("error" -> JsString(s"items must be 1..$MaxBatchItems non-empty strings")))
-    else if (overlap < 1 || overlap > MaxOverlap) json(StatusCodes.BadRequest, JsObject("error" -> JsString(s"overlap must be 1..$MaxOverlap")))
-    else {
-      // The bytes are the question: an item already queued under this spec, or repeated here, is dropped.
-      val seen = scala.collection.mutable.Set.from(Store.seenHashes(specVersion))
-      val fresh = items.map(item => item -> contentHash(item)).filter { case (_, digest) => seen.add(digest) }
-      if (fresh.isEmpty) json(StatusCodes.Conflict, JsObject("error" -> JsString("no_new_items")))
-      else {
-        val task = Store.createTask(tenant, specVersion, overlap, fresh.map(_._1))
-        Store.addHashes(specVersion, fresh.map(_._2))
-        val result = JsObject(
-          "task_id" -> JsString(task.taskId), "spec_version" -> JsString(task.specVersion), "overlap" -> JsNumber(task.overlap),
-          "accepted" -> JsNumber(fresh.size), "deduped" -> JsNumber(items.size - fresh.size))
-        Store.recordCreate(tenant, key, result)
-        json(StatusCodes.Created, result)
-      }
-    }
-  }
 }
 `,
     },

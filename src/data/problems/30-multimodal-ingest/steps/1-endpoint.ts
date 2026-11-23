@@ -54,7 +54,6 @@ image twice, so search returns it twice.
         python: {all: [/@app\.post\(\s*["']\/v1\/assets["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/assets['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/assets"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"assets"\s*\)/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/assets"/]},
       },
     },
@@ -67,10 +66,6 @@ image twice, so search returns it twice.
         python: {all: [/headers\.get\(\s*["']x-tenant-id["']/i, /\b401\b/], none: [/body\.tenant\b/]},
         typescript: {all: [/headers\[\s*['"]x-tenant-id['"]\s*\]/i, /\b401\b/], none: [/body\.tenant\b/]},
         go: {all: [/Header\.Get\(\s*"X-Tenant-Id"\s*\)/i, /StatusUnauthorized|\b401\b/], none: [/body\.Tenant\b/]},
-        scala: {
-          all: [/HeaderValueByName\(\s*"X-Tenant-Id"\s*\)/i, /Unauthorized|\b401\b/],
-          none: [/get\(\s*"tenant"\s*\)/],
-        },
         cpp: {all: [/get_header_value\(\s*"X-Tenant-Id"\s*\)/i, /\b401\b/], none: [/value\(\s*"tenant"/]},
       },
     },
@@ -83,7 +78,6 @@ image twice, so search returns it twice.
         python: {all: [/ALLOWED_MIME_TYPES/, /\b415\b/, /image\/avif/]},
         typescript: {all: [/ALLOWED_MIME_TYPES/, /\b415\b/, /image\/avif/]},
         go: {all: [/allowedMimeTypes/i, /StatusUnsupportedMediaType|\b415\b/, /image\/avif/]},
-        scala: {all: [/AllowedMimeTypes/i, /UnsupportedMediaType|\b415\b/, /image\/avif/]},
         cpp: {all: [/kAllowedMimeTypes/i, /\b415\b/, /image\/avif/]},
       },
     },
@@ -96,7 +90,6 @@ image twice, so search returns it twice.
         python: {all: [/20\s*<<\s*20/, /4\s*<<\s*10/, /\b413\b/, /\.encode\(/]},
         typescript: {all: [/20\s*<<\s*20/, /4\s*<<\s*10/, /\b413\b/, /TextEncoder|Buffer\.byteLength/]},
         go: {all: [/20\s*<<\s*20/, /4\s*<<\s*10/, /StatusRequestEntityTooLarge|\b413\b/], none: [/RuneCount/]},
-        scala: {all: [/20L?\s*<<\s*20/, /4\s*<<\s*10/, /PayloadTooLarge|RequestEntityTooLarge|\b413\b/, /getBytes\(/]},
         cpp: {all: [/20(?:LL|L)?\s*<<\s*20/, /4\s*<<\s*10/, /\b413\b/]},
       },
     },
@@ -109,7 +102,6 @@ image twice, so search returns it twice.
         python: {all: [/sha256:/, /\b400\b/], order: [/assets\.find\(/, /assets\.create\(/]},
         typescript: {all: [/sha256:/, /\b400\b/], order: [/\bfind\(/, /\bcreate\(/]},
         go: {all: [/sha256:/, /StatusBadRequest|\b400\b/], order: [/assets\.Find\(/, /assets\.Create\(/]},
-        scala: {all: [/sha256:/, /BadRequest|\b400\b/], order: [/Assets\.find\(/, /Assets\.create\(/]},
         cpp: {all: [/sha256:/, /\b400\b/], order: [/assets::find\(/, /assets::create\(/]},
       },
     },
@@ -383,94 +375,6 @@ func registerAsset(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/assets", registerAsset)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import ingest.Assets // Assets.find(tenant, checksum), Assets.create(tenant, checksum, mime, byteSize, caption)
-
-object Api {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(fields: Map[String, JsValue], name: String): Option[String] = fields.get(name).collect { case JsString(s) => s }
-
-  val route: Route = path("v1" / "assets") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { header =>
-        optionalHeaderValueByName("Idempotency-Key") { key =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            val body = raw.parseJson.asJsObject.fields
-            val tenant = body.get("tenant").collect { case JsString(t) => t }.orElse(header).getOrElse("")
-            val checksum = key.getOrElse("")
-            val byteSize = body.get("byte_size").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-            if (byteSize < 1) complete(StatusCodes.BadRequest -> "byte_size must be at least 1")
-            else {
-              val asset = Assets.create(tenant, checksum, text(body, "mime").getOrElse(""), byteSize, text(body, "caption"))
-              complete(json(StatusCodes.Created, Assets.toJson(asset)))
-            }
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import ingest.Assets // Assets.find(tenant, checksum), Assets.create(tenant, checksum, mime, byteSize, caption)
-
-object Api {
-  val AllowedMimeTypes: Set[String] = Set("image/png", "image/jpeg", "image/webp", "image/gif", "image/avif")
-  val MaxAssetBytes: Long = 20L << 20
-  val MaxCaptionBytes: Int = 4 << 10
-  private val ContentHash = "sha256:[0-9a-f]{64}".r
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(fields: Map[String, JsValue], name: String): Option[String] = fields.get(name).collect { case JsString(s) => s }
-
-  val route: Route = path("v1" / "assets") {
-    post {
-      // The tenant is who authenticated, not what the body claims.
-      optionalHeaderValueByName("X-Tenant-Id") { header =>
-        optionalHeaderValueByName("Idempotency-Key") { key =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject.fields
-            val tenant = header.getOrElse("")
-            val checksum = key.getOrElse("")
-            val mime = text(body, "mime").getOrElse("")
-            val byteSize = body.get("byte_size").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-            val caption = text(body, "caption")
-            if (tenant.isEmpty) complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-            else if (!ContentHash.matches(checksum)) complete(StatusCodes.BadRequest -> "Idempotency-Key must be the content hash, sha256:<64 hex>")
-            else if (!AllowedMimeTypes.contains(mime)) complete(StatusCodes.UnsupportedMediaType -> s"$mime is not an accepted image type")
-            else if (byteSize < 1) complete(StatusCodes.BadRequest -> "byte_size must be at least 1")
-            // The vision model's budget is bytes, so the caption is measured in UTF-8 bytes, not characters.
-            else if (byteSize > MaxAssetBytes || caption.exists(_.getBytes(UTF_8).length > MaxCaptionBytes))
-              complete(StatusCodes.PayloadTooLarge -> "the image is larger than 20 MiB or the caption longer than 4 KiB")
-            else
-              Assets.find(tenant, checksum) match {
-                case Some(existing) => complete(json(StatusCodes.OK, Assets.toJson(existing))) // the same upload again: the original asset
-                case None => complete(json(StatusCodes.Created, Assets.toJson(Assets.create(tenant, checksum, mime, byteSize, caption))))
-              }
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

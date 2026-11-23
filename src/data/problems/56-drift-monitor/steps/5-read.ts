@@ -51,7 +51,6 @@ the distance.
         python: {all: [/@app\.get\(\s*["']\/v1\/monitors\/\{monitor_id\}\/report["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/monitors\/:monitorId\/report['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/monitors\/\{id\}\/report"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"monitors"\s*\/\s*Segment\s*\/\s*"report"\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R?"\(?\/v1\/monitors\//]},
       },
     },
@@ -64,7 +63,6 @@ the distance.
         python: {all: [/store\.monitor_for\(\s*tenant/, /\b401\b/], none: [/store\.get_monitor\(/]},
         typescript: {all: [/monitorFor\(\s*tenant/, /\b401\b/], none: [/getMonitor\(/]},
         go: {all: [/store\.MonitorFor\(/, /StatusUnauthorized|\b401\b/], none: [/store\.GetMonitor\(/]},
-        scala: {all: [/Store\.monitorFor\(\s*tenant/, /Unauthorized|\b401\b/], none: [/Store\.getMonitor\(/]},
         cpp: {all: [/store::monitorFor\(\s*tenant/, /\b401\b/], none: [/store::getMonitor\(/]},
       },
     },
@@ -77,7 +75,6 @@ the distance.
         python: {all: [/["']sample_count["']/, /["']baseline_sample_count["']/, /["']window_end["']/]},
         typescript: {all: [/sample_count:/, /baseline_sample_count:/, /window_end:/]},
         go: {all: [/"sample_count"/, /"baseline_sample_count"/, /"window_end"/]},
-        scala: {all: [/"sample_count"/, /"baseline_sample_count"/, /"window_end"/]},
         cpp: {all: [/"sample_count"/, /"baseline_sample_count"/, /"window_end"/]},
       },
     },
@@ -90,7 +87,6 @@ the distance.
         python: {all: [/MIN_SAMPLES\s*=\s*200\b/, /insufficient_data/]},
         typescript: {all: [/MIN_SAMPLES\s*=\s*200\b/, /insufficient_data/]},
         go: {all: [/minSamples\s*=\s*200\b/, /insufficient_data/]},
-        scala: {all: [/MinSamples\s*=\s*200L?\b/, /insufficient_data/]},
         cpp: {all: [/kMinSamples\s*=\s*200\b/, /insufficient_data/]},
       },
     },
@@ -106,7 +102,6 @@ the distance.
         },
         typescript: {all: [/threshold_crossed:/, /distance\s*>=\s*monitor\.threshold/], none: [/significant:/]},
         go: {all: [/"threshold_crossed"/, /distance\s*>=\s*monitor\.Threshold/], none: [/"significant"/]},
-        scala: {all: [/"threshold_crossed"/, /distance\s*>=\s*monitor\.threshold/], none: [/"significant"/]},
         cpp: {all: [/"threshold_crossed"/, /distance\s*>=\s*monitor(->|\.)threshold/], none: [/"significant"/]},
       },
     },
@@ -333,86 +328,6 @@ func monitorReport(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/monitors/{id}/report", monitorReport)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import drift.{Sketch, Store} // Store.getMonitor, monitorFor; Sketch.windowStart, readLive, readBaseline, psi
-
-object Read {
-  private def json(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "monitors" / Segment / "report") { monitorId =>
-    get {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      Store.getMonitor(monitorId) match {
-        case None => complete(StatusCodes.NotFound -> "no such monitor")
-        case Some(monitor) =>
-          val window = Sketch.windowStart(System.currentTimeMillis() / 1000, monitor.windowS)
-          val live = Sketch.readLive(monitor.tenant, monitorId, window)
-          val baseline = Sketch.readBaseline(monitor.tenant, monitor.baseline)
-          complete(json(JsObject(
-            "monitor_id" -> JsString(monitorId),
-            "metric" -> JsString(monitor.metric),
-            "distance" -> JsNumber(Sketch.psi(live, baseline)),
-            "significant" -> JsBoolean(true))))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import drift.{Sketch, Store} // Store.getMonitor, monitorFor; Sketch.windowStart, readLive, readBaseline, psi
-
-object Read {
-  val MinSamples = 200L
-
-  private def json(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "monitors" / Segment / "report") { monitorId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          Store.monitorFor(tenant, monitorId) match {
-            case None => complete(StatusCodes.NotFound -> "no such monitor") // another tenant's monitor does not exist for this caller
-            case Some(monitor) =>
-              val window = Sketch.windowStart(System.currentTimeMillis() / 1000, monitor.windowS)
-              val live = Sketch.readLive(tenant, monitorId, window)
-              val baseline = Sketch.readBaseline(tenant, monitor.baseline)
-              val sampleCount = live.values.sum
-              val baselineSampleCount = baseline.values.sum
-              val distance = Sketch.psi(live, baseline)
-              val sufficient = sampleCount >= MinSamples && baselineSampleCount >= MinSamples
-              val crossed = sufficient && distance >= monitor.threshold
-              val state = if (crossed) "drifting" else if (sufficient) "ok" else "insufficient_data"
-              complete(json(JsObject(
-                "monitor_id" -> JsString(monitorId),
-                "metric" -> JsString(monitor.metric),
-                "state" -> JsString(state),
-                "distance" -> JsNumber(distance),
-                "threshold" -> JsNumber(monitor.threshold),
-                "threshold_crossed" -> JsBoolean(crossed),
-                "sample_count" -> JsNumber(sampleCount),
-                "baseline_sample_count" -> JsNumber(baselineSampleCount),
-                "window_start" -> JsNumber(window),
-                "window_end" -> JsNumber(window + monitor.windowS),
-                "baseline" -> JsString(monitor.baseline))))
-          }
-      }
-    }
-  }
 }
 `,
     },

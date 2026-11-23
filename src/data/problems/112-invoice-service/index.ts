@@ -6,7 +6,7 @@ import {invoiceStateStep} from './steps/2-state';
 import {invoiceDependencyStep} from './steps/3-dependency';
 import {invoiceEventsStep} from './steps/4-events';
 import {invoiceReadStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Invoice service: the course is not "POST an invoice and store it", it is the debugging you owe a
@@ -95,6 +95,5 @@ delivery, tax-rule authoring, and the ledger's own schema.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

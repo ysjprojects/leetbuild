@@ -7,7 +7,7 @@ import {classifyColumnsStep} from './steps/2-classify-columns';
 import {scanCacheStep} from './steps/3-scan-cache';
 import {verifyEndpointStep} from './steps/4-verify-endpoint';
 import {publishClassifiedStep} from './steps/5-publish-classified';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Grab's LLM-powered data classification (Gemini, later Metasense), rebuilt as the system around
@@ -127,6 +127,5 @@ enforcement and dynamic masking.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

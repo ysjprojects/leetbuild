@@ -53,7 +53,6 @@ commit and the increment drops an event from the rollup.
         python: {all: [/span_count/, /max_ms/], none: [/["']span["']\s*:/]},
         typescript: {all: [/span_count/, /max_ms/], none: [/\bspan\s*\}|\bspan:\s*span\b/]},
         go: {all: [/span_count/, /max_ms/], none: [/"span":\s*span/]},
-        scala: {all: [/span_count/, /max_ms/], none: [/"span"\s*->/]},
         cpp: {all: [/span_count/, /max_ms/], none: [/\{"span",|\["span"\]/]},
       },
     },
@@ -72,10 +71,6 @@ commit and the increment drops an event from the rollup.
           all: [/Key:\s*\[\]byte\(\s*(event\.|e\.)?Service\s*\)/],
           none: [/Key:\s*\[\]byte\(\s*trace\.TraceID\s*\)/],
         },
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(\s*Topic,\s*(event\.|e\.)?service\b/],
-          none: [/Topic,\s*trace\.traceId/],
-        },
         cpp: {all: [/service\.c_str\(\),\s*service\.(size|length)\(\)/], none: [/trace\.trace_id\.c_str\(\)/]},
       },
     },
@@ -88,7 +83,6 @@ commit and the increment drops an event from the rollup.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*(["']all["']|-1)/]},
         typescript: {all: [/idempotent:\s*true/], none: [/acks:\s*1\b/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/ENABLE_IDEMPOTENCE_CONFIG|"enable\.idempotence"/, /ACKS_CONFIG|"acks"/, /"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -101,7 +95,6 @@ commit and the increment drops an event from the rollup.
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
         go: {order: [/\.HIncrBy\(/, /\.CommitMessages\(/]},
-        scala: {order: [/\.hincrBy\(/, /\.commitSync\(/]},
         cpp: {order: [/\.hincrby\(/, /->commitSync\(/]},
       },
     },
@@ -451,135 +444,6 @@ func runRollup(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import traces.Assembly // Assembly.Trace
-
-object Events {
-  val Topic = "trace.completed"
-  val Group = "latency-rollup"
-
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  props.put(ProducerConfig.ACKS_CONFIG, "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"trace.completed not delivered: \${exception.getMessage}")
-  }
-
-  /** Tell the rollup a trace is complete; the events produced. */
-  def publishCompleted(trace: Assembly.Trace): Seq[JsObject] = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val events = trace.spans.map { span =>
-      JsObject("trace_id" -> JsString(trace.traceId), "service" -> JsString(span.service), "span_count" -> JsNumber(1), "max_ms" -> JsNumber(span.durationMs),
-        "span" -> Assembly.spanJson(span))
-    }
-    events.foreach(event => producer.send(new ProducerRecord[String, String](Topic, trace.traceId, event.compactPrint), onDelivery))
-    producer.flush()
-    events
-  }
-
-  def runRollup(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, Group)
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        consumer.commitSync()
-        val event = record.value().parseJson.asJsObject.fields
-        val service = event("service").convertTo[String](DefaultJsonProtocol.StringJsonFormat)
-        jedis.hincrBy(s"rollup:$service", "traces", 1)
-        jedis.hincrBy(s"rollup:$service", "spans", event("span_count").convertTo[Long](DefaultJsonProtocol.LongJsonFormat))
-      }
-    }
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import traces.Assembly // Assembly.Trace
-
-object Events {
-  val Topic = "trace.completed"
-  val Group = "latency-rollup"
-
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes the record once, on every replica.
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
-  props.put(ProducerConfig.ACKS_CONFIG, "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"trace.completed not delivered: \${exception.getMessage}")
-  }
-
-  /** One event per service: how many of its spans the trace has and the longest one; no span itself. */
-  def completedEvents(trace: Assembly.Trace): Seq[JsObject] =
-    trace.spans.groupBy(_.service).toSeq.sortBy(_._1).map { case (service, spans) =>
-      JsObject("trace_id" -> JsString(trace.traceId), "service" -> JsString(service), "span_count" -> JsNumber(spans.size), "max_ms" -> JsNumber(spans.map(_.durationMs).max))
-    }
-
-  /** Tell the rollup a trace is complete; the events produced. */
-  def publishCompleted(trace: Assembly.Trace): Seq[JsObject] = {
-    val events = completedEvents(trace)
-    events.foreach { event =>
-      val service = event.fields("service").convertTo[String](DefaultJsonProtocol.StringJsonFormat)
-      producer.send(new ProducerRecord[String, String](Topic, service, event.compactPrint), onDelivery)
-    }
-    producer.flush()
-    events
-  }
-
-  def runRollup(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, Group)
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val event = record.value().parseJson.asJsObject.fields
-        val service = event("service").convertTo[String](DefaultJsonProtocol.StringJsonFormat)
-        jedis.hincrBy(s"rollup:$service", "traces", 1)
-        jedis.hincrBy(s"rollup:$service", "spans", event("span_count").convertTo[Long](DefaultJsonProtocol.LongJsonFormat))
-        consumer.commitSync() // after the increments: a crash before this point redelivers
-      }
-    }
-  }
 }
 `,
     },

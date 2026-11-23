@@ -51,7 +51,6 @@ broker refuses is logged and gone.
         python: {all: [/key=region\b/], none: [/key=route_id/]},
         typescript: {all: [/key:\s*region\b/], none: [/key:\s*routeId/]},
         go: {all: [/Key:\s*\[\]byte\(region\)/], none: [/Key:\s*\[\]byte\(routeID\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*region/], none: [/\(Topic,\s*routeId/]},
         cpp: {all: [/region\.c_str\(\),\s*region\.size\(\)/], none: [/route_id\.c_str\(\),\s*route_id\.size\(\)/]},
       },
     },
@@ -64,7 +63,6 @@ broker refuses is logged and gone.
         python: {all: [/trip_cell\(origin, destination\)/], none: [/"origin":/, /"destination":/]},
         typescript: {all: [/tripCell\(origin, destination\)/], none: [/origin\.lat/, /destination\.lat/]},
         go: {all: [/geo\.TripCell\(origin, destination\)/], none: [/"origin":/, /"destination":/]},
-        scala: {all: [/Geo\.tripCell\(origin, destination\)/], none: [/"origin"\s*->/, /"destination"\s*->/]},
         cpp: {all: [/geo::tripCell\(origin, destination\)/], none: [/\{"origin",/, /\{"destination",/]},
       },
     },
@@ -77,7 +75,6 @@ broker refuses is logged and gone.
         python: {all: [/"distance_m":\s*route\["distance_m"\]/, /"epoch":\s*route\["epoch"\]/]},
         typescript: {all: [/distance_m:\s*route\.distance_m/, /epoch:\s*route\.epoch/]},
         go: {all: [/"distance_m":\s*route\.DistanceM/, /"epoch":\s*route\.Epoch/]},
-        scala: {all: [/"distance_m"\s*->\s*JsNumber\(route\.distanceM\)/, /"epoch"\s*->\s*JsNumber\(route\.epoch\)/]},
         cpp: {all: [/\{"distance_m",\s*route\.distance_m\}/, /\{"epoch",\s*route\.epoch\}/]},
       },
     },
@@ -97,7 +94,6 @@ broker refuses is logged and gone.
           all: [/routes\.AddOutbox\(ctx,\s*region/, /return false/],
           order: [/WriteMessages\(/, /routes\.AddOutbox\(/],
         },
-        scala: {all: [/Routes\.addOutbox\(\s*region/, /onCompletion/]},
         cpp: {
           all: [/routes::addOutbox\(\s*region/, /return false/],
           order: [/producer->flush\(/, /routes::addOutbox\(/],
@@ -357,98 +353,6 @@ func publishRouteComputed(ctx context.Context, routeID, region string, origin, d
 		return false
 	}
 	return true
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import mapsd.Geo // Geo.Point, Geo.Route
-
-object RouteEvents {
-  val Topic = "route.computed"
-
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes the record once, on every replica.
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** One route.computed event per computed route; false when the broker refused it. */
-  def publishRouteComputed(routeId: String, region: String, origin: Geo.Point, destination: Geo.Point, route: Geo.Route, latencyMs: Long): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val payload = JsObject(
-      "route_id" -> JsString(routeId),
-      "region" -> JsString(region),
-      "origin" -> JsObject("lat" -> JsNumber(origin.lat), "lng" -> JsNumber(origin.lng)),
-      "destination" -> JsObject("lat" -> JsNumber(destination.lat), "lng" -> JsNumber(destination.lng)),
-      "latency_ms" -> JsNumber(latencyMs),
-      "degraded" -> JsBoolean(route.degraded),
-    ).compactPrint
-    producer.send(
-      new ProducerRecord[String, String](Topic, routeId, payload),
-      new Callback {
-        override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-          if (exception != null) System.err.println(s"route event $routeId not delivered: \${exception.getMessage}")
-      },
-    )
-    producer.flush() // the callback has run once flush returns, delivered or refused
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.atomic.AtomicBoolean
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import mapsd.{Geo, Routes} // Geo.Point, Geo.Route, Geo.tripCell, Routes.addOutbox
-
-object RouteEvents {
-  val Topic = "route.computed"
-
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes the record once, on every replica.
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** One route.computed event per computed route; false when the broker refused it. */
-  def publishRouteComputed(routeId: String, region: String, origin: Geo.Point, destination: Geo.Point, route: Geo.Route, latencyMs: Long): Boolean = {
-    val payload = JsObject(
-      "route_id" -> JsString(routeId),
-      "region" -> JsString(region),
-      // Enough to group trips by area, not enough to say where anyone went.
-      "trip_cell" -> JsString(Geo.tripCell(origin, destination)),
-      "distance_m" -> JsNumber(route.distanceM),
-      "epoch" -> JsNumber(route.epoch),
-      "latency_ms" -> JsNumber(latencyMs),
-      "degraded" -> JsBoolean(route.degraded),
-    ).compactPrint
-    val refused = new AtomicBoolean(false)
-    // One region, one partition: the region rollups read its events in order.
-    producer.send(
-      new ProducerRecord[String, String](Topic, region, payload),
-      new Callback {
-        // The delivery report is the broker's answer: keep a refused event for the relay.
-        override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-          if (exception != null) {
-            refused.set(true)
-            Routes.addOutbox(region, payload)
-          }
-      },
-    )
-    producer.flush() // the callback has run once flush returns, delivered or refused
-    !refused.get
-  }
 }
 `,
     },

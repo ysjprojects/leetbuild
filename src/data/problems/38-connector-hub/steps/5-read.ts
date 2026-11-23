@@ -50,7 +50,6 @@ looks fine.
         python: {all: [/@app\.get\(\s*["']\/v1\/connectors\/\{\w+\}\/health["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/connectors\/:\w+\/health['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/connectors\/\{\w+\}\/health"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"connectors"\s*\/\s*Segment\s*\/\s*"health"\s*\)/, /\bget\b/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/connectors\//, /\/health\)"/]},
       },
     },
@@ -69,7 +68,6 @@ looks fine.
         },
         typescript: {all: [/x-tenant-id/i, /\.tenant\s*!==\s*tenant|tenant\s*!==\s*\w+\.tenant/, /code\(\s*401\s*\)/]},
         go: {all: [/X-Tenant-Id/i, /\.Tenant\s*!=\s*tenant|tenant\s*!=\s*\w+\.Tenant/, /StatusUnauthorized/]},
-        scala: {all: [/X-Tenant-Id/i, /\.tenant\s*[!=]=\s*tenant|tenant\s*[!=]=\s*\w+\.tenant/, /Unauthorized/]},
         cpp: {all: [/X-Tenant-Id/i, /->tenant\s*!=\s*tenant|tenant\s*!=\s*\w+->tenant/, /\b401\b/]},
       },
     },
@@ -91,10 +89,6 @@ looks fine.
           all: [/staleIntervals\s*=\s*2\b/, /last_success_at/, /SyncIntervalS/, /cursor_lag_s/],
           none: [/last_run_at/],
         },
-        scala: {
-          all: [/StaleIntervals\s*=\s*2L?\b/, /last_success_at/, /syncIntervalS/, /cursor_lag_s/],
-          none: [/last_run_at/],
-        },
         cpp: {
           all: [/kStaleIntervals\s*=\s*2\b/, /last_success_at/, /sync_interval_s/, /cursor_lag_s/],
           none: [/last_run_at/],
@@ -110,7 +104,6 @@ looks fine.
         python: {all: [/open_until/, /["']open["']/, /consecutive_failures/]},
         typescript: {all: [/open_until/, /['"]open['"]/, /consecutive_failures/]},
         go: {all: [/open_until/, /"open"/, /consecutive_failures/]},
-        scala: {all: [/open_until/, /"open"/, /consecutive_failures/]},
         cpp: {all: [/open_until/, /"open"/, /consecutive_failures/]},
       },
     },
@@ -123,7 +116,6 @@ looks fine.
         python: {all: [/["']disabled["']/, /disabled_reason/]},
         typescript: {all: [/['"]disabled['"]/, /disabled_reason/]},
         go: {all: [/"disabled"/, /disabled_reason/]},
-        scala: {all: [/"disabled"/, /disabled_reason/]},
         cpp: {all: [/"disabled"/, /disabled_reason/]},
       },
     },
@@ -377,94 +369,6 @@ func connectorHealth(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/connectors/{id}/health", connectorHealth)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import hub.Store // Store.get
-
-object Read {
-  val StaleAfterS = 3600L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  val route: Route = path("v1" / "connectors" / Segment / "health") { connectorId =>
-    get {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      Store.get(connectorId) match {
-        case None => complete(StatusCodes.NotFound -> "no such connector")
-        case Some(_) =>
-          val row = jedis.hgetAll(s"health:$connectorId").asScala.toMap
-          val lastRunAt = row.get("last_run_at").flatMap(_.toLongOption).getOrElse(0L)
-          val fresh = System.currentTimeMillis() / 1000 - lastRunAt < StaleAfterS
-          val body = JsObject(
-            "connector_id" -> JsString(connectorId),
-            "status" -> JsString(if (fresh) "healthy" else "unhealthy"),
-            "last_run_at" -> JsNumber(lastRunAt))
-          complete(HttpResponse(entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import hub.Store // Store.get
-
-object Read {
-  /** A connector is unhealthy once no page has landed in this many of its sync intervals. */
-  val StaleIntervals = 2L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def view(connector: Store.Connector): JsObject = {
-    val row = jedis.hgetAll(s"health:\${connector.connectorId}").asScala.toMap
-    def number(name: String): Option[Long] = row.get(name).flatMap(_.toLongOption)
-    val now = System.currentTimeMillis() / 1000
-    val lastSuccessAt = number("last_success_at")
-    val lagS = lastSuccessAt.map(now - _)
-    val status =
-      if (connector.status == "disabled") "disabled"
-      else if (lagS.forall(_ > StaleIntervals * connector.syncIntervalS)) "unhealthy"
-      else "healthy"
-    JsObject(
-      "connector_id" -> JsString(connector.connectorId),
-      "status" -> JsString(status),
-      "disabled_reason" -> JsString(connector.disabledReason),
-      "last_success_at" -> lastSuccessAt.map(JsNumber(_)).getOrElse(JsNull),
-      "cursor_lag_s" -> lagS.map(JsNumber(_)).getOrElse(JsNull),
-      "sync_interval_s" -> JsNumber(connector.syncIntervalS),
-      "consecutive_failures" -> JsNumber(number("consecutive_failures").getOrElse(0L)),
-      "breaker" -> JsString(if (now < number("open_until").getOrElse(0L)) "open" else "closed"))
-  }
-
-  val route: Route = path("v1" / "connectors" / Segment / "health") { connectorId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          // Another tenant's connector and a missing one answer the same, so ids cannot be probed.
-          Store.get(connectorId).filter(_.tenant == tenant) match {
-            case None => complete(StatusCodes.NotFound -> "no such connector")
-            case Some(connector) => complete(HttpResponse(entity = HttpEntity(ContentTypes.\`application/json\`, view(connector).compactPrint)))
-          }
-      }
-    }
-  }
 }
 `,
     },

@@ -62,7 +62,6 @@ a broker that lost an acknowledgement gets the event twice; and a delivery that 
         python: {all: [/producer\.produce\(\s*[^\n]*key\s*=\s*event\[["']service["']\]/]},
         typescript: {all: [/key:\s*event\.service\b/]},
         go: {all: [/Key:\s*\[\]byte\(\s*event\.Service\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*event\.service\s*,/]},
         cpp: {all: [/event\.service\.c_str\(\)\s*,\s*event\.service\.(size|length)\(\)/]},
       },
     },
@@ -75,7 +74,6 @@ a broker that lost an acknowledgement gets the event twice; and a delivery that 
         python: {all: [/['"]EXISTS['"]/, /['"]SREM['"]/], none: [/r\.ttl\(/]},
         typescript: {all: [/['"]EXISTS['"]/, /['"]SREM['"]/], none: [/redis\.ttl\(/]},
         go: {all: [/['"]EXISTS['"]/, /['"]SREM['"]/], none: [/rdb\.TTL\(/]},
-        scala: {all: [/['"]EXISTS['"]/, /['"]SREM['"]/], none: [/jedis\.ttl\(/]},
         cpp: {all: [/['"]EXISTS['"]/, /['"]SREM['"]/], none: [/redis\.ttl\(/]},
       },
     },
@@ -88,7 +86,6 @@ a broker that lost an acknowledgement gets the event twice; and a delivery that 
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -104,7 +101,6 @@ a broker that lost an acknowledgement gets the event twice; and a delivery that 
         },
         typescript: {all: [/outbox\.write\(/, /await producer\.send\(/, /catch/], none: [/void producer\.send\(/]},
         go: {all: [/outbox\.Write\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.write\(/, /\.get\(\s*[^\n]*TimeUnit/], none: [/case _: KafkaException/]},
         cpp: {all: [/outbox::write\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -475,125 +471,6 @@ func sweepExpired(ctx context.Context, service string) ([]string, error) {
 		expired = append(expired, id)
 	}
 	return expired, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import discovery.{Instances, Outbox} // Instances.members, recordKey, membersKey · Outbox.write(topic, key, payload)
-
-object Events {
-  val Topic = "discovery.event"
-  val ExpiryMarginS = 5L
-
-  final case class MembershipEvent(kind: String, service: String, instanceId: String, reason: String) {
-    def toJson: JsObject =
-      JsObject("kind" -> JsString(kind), "service" -> JsString(service), "instance_id" -> JsString(instanceId), "reason" -> JsString(reason))
-  }
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Produce one membership event; true when it is on its way. */
-  def publishEvent(event: MembershipEvent): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    try {
-      producer.send(new ProducerRecord[String, String](Topic, event.instanceId, event.toJson.compactPrint))
-      true
-    } catch {
-      case _: KafkaException =>
-        Outbox.write(Topic, event.instanceId, event.toJson)
-        false
-    }
-  }
-
-  /** Announce the members of service whose record has lapsed; returns their ids. */
-  def sweepExpired(service: String): Seq[String] =
-    Instances.members(service).filter { instanceId =>
-      val lapsing = jedis.ttl(Instances.recordKey(service, instanceId)) < ExpiryMarginS
-      if (lapsing) {
-        jedis.srem(Instances.membersKey(service), instanceId)
-        publishEvent(MembershipEvent("expired", service, instanceId, "heartbeat TTL lapsed"))
-      }
-      lapsing
-    }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import discovery.{Instances, Outbox} // Instances.members, recordKey, membersKey · Outbox.write(topic, key, payload)
-
-object Events {
-  val Topic = "discovery.event"
-  val AckTimeoutMs = 2000L
-
-  final case class MembershipEvent(kind: String, service: String, instanceId: String, reason: String) {
-    def toJson: JsObject =
-      JsObject("kind" -> JsString(kind), "service" -> JsString(service), "instance_id" -> JsString(instanceId), "reason" -> JsString(reason))
-  }
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /**
-   * KEYS[1] the record, KEYS[2] the members set, ARGV[1] the instance id. The expiry is claimed only
-   * while the record is gone, and only by the sweeper whose SREM removed the member.
-   */
-  val ClaimLua: String =
-    """if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
-      |return redis.call('SREM', KEYS[2], ARGV[1])
-      |""".stripMargin
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the event before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Produce one membership event; true once the broker acknowledged it. */
-  def publishEvent(event: MembershipEvent): Boolean = {
-    // Keyed by service: one service's changes share a partition, so caches apply them in order.
-    val record = new ProducerRecord[String, String](Topic, event.service, event.toJson.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay republishes the row, so the change is late, not lost.
-      Outbox.write(Topic, event.service, event.toJson)
-    }
-    acked.isSuccess
-  }
-
-  /** Announce the members of service whose record has lapsed; returns their ids. */
-  def sweepExpired(service: String): Seq[String] =
-    Instances.members(service).filter { instanceId =>
-      val keys = List(Instances.recordKey(service, instanceId), Instances.membersKey(service)).asJava
-      // Still alive, re-registered, or another sweeper announced it: the claim returns 0.
-      val claimed = jedis.eval(ClaimLua, keys, List(instanceId).asJava).asInstanceOf[java.lang.Long] == 1L
-      if (claimed) publishEvent(MembershipEvent("expired", service, instanceId, "heartbeat TTL lapsed"))
-      claimed
-    }
 }
 `,
     },

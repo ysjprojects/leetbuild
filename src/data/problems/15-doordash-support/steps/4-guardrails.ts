@@ -95,7 +95,6 @@ Implement \`answer_or_escalate(question, chunks, history)\` / \`answerOrEscalate
         python: {all: [/cited_ids\(/, /"ok":\s*False/]},
         typescript: {all: [/citedIds\(/, /ok:\s*false/]},
         go: {all: [/prompt\.CitedIds\(/, /OK:\s*false/]},
-        scala: {all: [/Prompt\.citedIds\(/, /ok = false/]},
         cpp: {all: [/assistant::cited_ids\(/, /Verdict\{false/]},
       },
     },
@@ -108,7 +107,6 @@ Implement \`answer_or_escalate(question, chunks, history)\` / \`answerOrEscalate
         python: {all: [/embed\.cosine\(|\bcosine\(/, /MIN_SIMILARITY/]},
         typescript: {all: [/\bcosine\(/, /MIN_SIMILARITY/]},
         go: {all: [/embed\.Cosine\(/, /config\.MinSimilarity/]},
-        scala: {all: [/Embed\.cosine\(/, /Config\.MinSimilarity/]},
         cpp: {all: [/assistant::cosine\(/, /config::kMinSimilarity/]},
       },
     },
@@ -123,7 +121,6 @@ Implement \`answer_or_escalate(question, chunks, history)\` / \`answerOrEscalate
         },
         typescript: {all: [/\.Evaluate\(/, /context_ids/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_S/, /\.pass\b/]},
         go: {all: [/\.Evaluate\(/, /ContextIds:/, /context\.WithTimeout\(/, /\.GetPass\(\)/]},
-        scala: {all: [/\.evaluate\(/, /contextIds\s*=/, /withDeadlineAfter\(/, /\.pass\b/]},
         cpp: {all: [/->Evaluate\(/, /add_context_ids\(/, /set_deadline\(/, /\.pass\(\)/]},
       },
     },
@@ -136,7 +133,6 @@ Implement \`answer_or_escalate(question, chunks, history)\` / \`answerOrEscalate
         python: {all: [/except grpc\.RpcError/], order: [/cosine\(/, /\.Evaluate\(/]},
         typescript: {all: [/catch/, /ServiceError|\.code\b/], order: [/cosine\(/, /\.Evaluate\(/]},
         go: {all: [/err != nil/], order: [/embed\.Cosine\(/, /\.Evaluate\(/]},
-        scala: {all: [/StatusRuntimeException/], order: [/Embed\.cosine\(/, /\.evaluate\(/]},
         cpp: {all: [/status\.ok\(\)/], order: [/assistant::cosine\(/, /->Evaluate\(/]},
       },
     },
@@ -152,7 +148,6 @@ Implement \`answer_or_escalate(question, chunks, history)\` / \`answerOrEscalate
           none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
         },
         go: {all: [/config\.HandoffText/, /Escalated:\s*true/, /for \w+ := 0; \w+ < 2; \w+\+\+/], none: [/for \{/]},
-        scala: {all: [/Config\.HandoffText/, /escalated = true/, /\w+ < 2\b/], none: [/while\s*\(\s*true\s*\)/]},
         cpp: {
           all: [/config::kHandoffText/, /\{\},\s*true,/, /for \(int \w+ = 0; \w+ < 2; (\+\+\w+|\w+\+\+)\)/],
           none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
@@ -650,117 +645,6 @@ func answerOrEscalate(ctx context.Context, question string, chunks []prompt.Chun
 		}
 	}
 	return Outcome{Answer: config.HandoffText, Sources: []string{}, Escalated: true, Model: model, Tokens: 0}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import assistant.{Config, Embed, Prompt} // Config.Judge, DeadlineS, MinSimilarity, HandoffText · Embed.embed, Embed.cosine · Prompt.citedIds, Prompt.Chunk, Prompt.Turn
-import support.support.{EvaluateRequest, JudgeGrpc}
-
-/** What check returns: tier 1's reasons, or the judge's. */
-final case class Verdict(ok: Boolean, groundedness: Double, reasons: Seq[String])
-
-/** What the Dasher may see: the answer or the handoff. */
-final case class Outcome(answer: String, sources: Seq[String], escalated: Boolean, model: String, tokens: Int)
-
-object Guardrail {
-  private val channel = ManagedChannelBuilder.forTarget(Config.Judge).usePlaintext().build()
-  private val judge = JudgeGrpc.blockingStub(channel)
-
-  /** The answer split on . ! ? — a "Based on [kb:…]:" prefix has no terminator, so it stays in the first one. */
-  def sentences(text: String): Seq[String] = text.split("[.!?]").map(_.trim).filter(_.nonEmpty).toSeq
-
-  /** Why the answer fails the cheap checks (empty when it passes). */
-  def tier1(answer: String, chunks: Seq[Prompt.Chunk]): Seq[String] = {
-    // TODO: every id in Prompt.citedIds(answer) must be a chunk id — a reason naming the stray id otherwise
-    // TODO: every sentence must have Embed.cosine >= Config.MinSimilarity with at least one chunk's text
-    ???
-  }
-
-  /** Tier 1 without an RPC, then the judge. */
-  def check(question: String, answer: String, chunks: Seq[Prompt.Chunk]): Verdict = {
-    // TODO: tier1 reasons → Verdict(false, 0, reasons) without calling the judge
-    // TODO: EvaluateRequest(question, answer, contextIds = the chunk ids) with a deadline of Config.DeadlineS
-    // TODO: ok = the judge's pass; a StatusRuntimeException is a failed check, not a throw
-    ???
-  }
-
-  /** The answer the Dasher may see. A rejected answer never leaves here. */
-  def answerOrEscalate(question: String, chunks: Seq[Prompt.Chunk], history: Seq[Prompt.Turn]): Outcome = {
-    // TODO: Generate.generate → check; one more generation on failure; then the handoff
-    // TODO: pass → sources = Prompt.citedIds(answer), escalated false; handoff → Config.HandoffText, no sources, escalated true
-    ???
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import assistant.{Config, Embed, Prompt} // Config.Judge, DeadlineS, MinSimilarity, HandoffText · Embed.embed, Embed.cosine · Prompt.citedIds, Prompt.Chunk, Prompt.Turn
-import support.support.{EvaluateRequest, JudgeGrpc}
-
-/** What check returns: tier 1's reasons, or the judge's. */
-final case class Verdict(ok: Boolean, groundedness: Double, reasons: Seq[String])
-
-/** What the Dasher may see: the answer or the handoff. */
-final case class Outcome(answer: String, sources: Seq[String], escalated: Boolean, model: String, tokens: Int)
-
-object Guardrail {
-  private val channel = ManagedChannelBuilder.forTarget(Config.Judge).usePlaintext().build()
-  private val judge = JudgeGrpc.blockingStub(channel)
-
-  /** The answer split on . ! ? — a "Based on [kb:…]:" prefix has no terminator, so it stays in the first one. */
-  def sentences(text: String): Seq[String] = text.split("[.!?]").map(_.trim).filter(_.nonEmpty).toSeq
-
-  /** Why the answer fails the cheap checks (empty when it passes). */
-  def tier1(answer: String, chunks: Seq[Prompt.Chunk]): Seq[String] = {
-    val ids = chunks.map(_.id).toSet
-    val stray = Prompt.citedIds(answer).filterNot(ids).map(id => s"cites [kb:$id], which was not retrieved")
-    val vectors = chunks.map(c => Embed.embed(c.text))
-    val unlike = sentences(answer).flatMap { sentence =>
-      val v = Embed.embed(sentence)
-      val best = vectors.map(w => Embed.cosine(v, w)).foldLeft(0.0)(math.max)
-      if (best < Config.MinSimilarity) Some(f"sentence unlike any retrieved chunk (cosine $best%.2f < \${Config.MinSimilarity}): $sentence") else None
-    }
-    stray ++ unlike
-  }
-
-  /** Tier 1 without an RPC, then the judge. */
-  def check(question: String, answer: String, chunks: Seq[Prompt.Chunk]): Verdict = {
-    val reasons = tier1(answer, chunks)
-    if (reasons.nonEmpty) return Verdict(ok = false, groundedness = 0.0, reasons = reasons)
-    try {
-      val scores = judge
-        .withDeadlineAfter((Config.DeadlineS * 1000).toLong, TimeUnit.MILLISECONDS)
-        .evaluate(EvaluateRequest(question = question, answer = answer, contextIds = chunks.map(_.id)))
-      val why =
-        if (scores.pass) Seq.empty
-        else Seq(f"judge: groundedness \${scores.groundedness}%.2f, coherence \${scores.coherence}%.2f, compliance \${scores.compliance}%.2f")
-      Verdict(ok = scores.pass, groundedness = scores.groundedness, reasons = why)
-    } catch {
-      // No verdict is a failed verdict: an answer nobody judged does not reach the Dasher.
-      case e: StatusRuntimeException => Verdict(ok = false, groundedness = 0.0, reasons = Seq("judge " + e.getStatus.getCode))
-    }
-  }
-
-  /** The answer the Dasher may see. A rejected answer never leaves here. */
-  def answerOrEscalate(question: String, chunks: Seq[Prompt.Chunk], history: Seq[Prompt.Turn]): Outcome = {
-    var model = ""
-    var attempt = 0
-    while (attempt < 2) {
-      val result = Generate.generate(question, chunks, history)
-      model = result.model
-      if (check(question, result.answer, chunks).ok)
-        return Outcome(result.answer, Prompt.citedIds(result.answer), escalated = false, model, result.tokens)
-      attempt += 1
-    }
-    Outcome(Config.HandoffText, Seq.empty, escalated = true, model, 0)
-  }
 }
 `,
     },

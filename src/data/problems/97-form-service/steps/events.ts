@@ -50,7 +50,6 @@ caller hears it went out.
         python: {all: [/producer\.produce\(\s*[^\n]*key\s*=\s*submission\[["']form_id["']\]/]},
         typescript: {all: [/key:\s*submission\.form_id/]},
         go: {all: [/Key:\s*\[\]byte\(\s*submission\.FormID\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*submission\.formId\s*,/]},
         cpp: {all: [/submission\.form_id\.c_str\(\)\s*,\s*submission\.form_id\.(size|length)\(\)/]},
       },
     },
@@ -63,7 +62,6 @@ caller hears it went out.
         python: {all: [/hashlib\.sha256\(/, /["']value_hash["']/, /["']field_names["']/]},
         typescript: {all: [/createHash\(\s*['"]sha256['"]\s*\)/, /value_hash:/, /field_names:/]},
         go: {all: [/sha256\.Sum256\(|sha256\.New\(/, /"value_hash"/, /"field_names"/]},
-        scala: {all: [/MessageDigest\.getInstance\(\s*"SHA-256"\s*\)/, /"value_hash"/, /"field_names"/]},
         cpp: {all: [/SHA256\(/, /"value_hash"/, /"field_names"/]},
       },
     },
@@ -76,7 +74,6 @@ caller hears it went out.
         python: {none: [/["']values["']\s*:/]},
         typescript: {none: [/\bvalues:\s*submission\.values/]},
         go: {none: [/"values":/]},
-        scala: {none: [/"values"\s*->/]},
         cpp: {none: [/\{\s*"values"\s*,/]},
       },
     },
@@ -89,7 +86,6 @@ caller hears it went out.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -105,7 +101,6 @@ caller hears it went out.
         },
         typescript: {all: [/outboxInsert\(/, /await producer\.send\(/], none: [/void producer\.send\(/]},
         go: {all: [/store\.OutboxInsert\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Store\.outboxInsert\(/, /\.get\(\s*[^\n]*TimeUnit/]},
         cpp: {all: [/store::outboxInsert\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -395,100 +390,6 @@ func publishSubmission(ctx context.Context, submission store.Submission) (bool, 
 		return false, store.OutboxInsert(ctx, topic, submission.FormID, payload)
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import forms.Store // Store.Submission, Store.outboxInsert
-
-object SubmissionEvents {
-  val Topic = "form.submission"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def eventPayload(submission: Store.Submission): JsObject =
-    JsObject(
-      "submission_id" -> JsString(submission.submissionId),
-      "form_id" -> JsString(submission.formId),
-      "values" -> JsObject(submission.values.map { case (k, v) => k -> JsString(v) })
-    )
-
-  /** Tell downstream consumers about a stored submission; true when the event went out. */
-  def publishSubmission(submission: Store.Submission): Boolean = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val payload = eventPayload(submission)
-    try {
-      producer.send(new ProducerRecord[String, String](Topic, submission.submissionId, payload.compactPrint))
-      true
-    } catch {
-      case _: KafkaException =>
-        Store.outboxInsert(Topic, submission.submissionId, payload)
-        false
-    }
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-import java.security.MessageDigest
-import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import forms.Store // Store.Submission, Store.outboxInsert
-
-object SubmissionEvents {
-  val Topic = "form.submission"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** SHA-256 of the name=value lines, sorted by name: equal submissions hash alike, and no value leaves. */
-  def valueHash(values: Map[String, String]): String = {
-    val canonical = values.keys.toSeq.sorted.map(name => s"$name=\${values(name)}").mkString("\\n")
-    MessageDigest.getInstance("SHA-256").digest(canonical.getBytes(UTF_8)).map(b => f"$b%02x").mkString
-  }
-
-  def eventPayload(submission: Store.Submission): JsObject =
-    JsObject(
-      "submission_id" -> JsString(submission.submissionId),
-      "form_id" -> JsString(submission.formId),
-      "field_names" -> JsArray(submission.values.keys.toSeq.sorted.map(JsString(_)).toVector),
-      "value_hash" -> JsString(valueHash(submission.values))
-    )
-
-  /** Tell downstream consumers about a stored submission; true once the broker acknowledged the event. */
-  def publishSubmission(submission: Store.Submission): Boolean = {
-    val payload = eventPayload(submission)
-    val record = new ProducerRecord[String, String](Topic, submission.formId, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so consumers hear late, not never.
-      Store.outboxInsert(Topic, submission.formId, payload)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

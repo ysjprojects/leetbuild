@@ -50,7 +50,6 @@ process restarts.
         python: {all: [/@app\.get\(\s*["']\/v1\/surfaces\/\{surface\}\/config["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/surfaces\/:surface\/config['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/surfaces\/\{surface\}\/config"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"surfaces"\s*\/\s*Segment\s*\/\s*"config"\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/surfaces\//]},
       },
     },
@@ -63,7 +62,6 @@ process restarts.
         python: {all: [/\["model_version"\]/], none: [/query_params/]},
         typescript: {all: [/model_version:\s*config\.model_version/], none: [/request\.query/]},
         go: {all: [/config\.ModelVersion/], none: [/URL\.Query\(\)/]},
-        scala: {all: [/config\.modelVersion/], none: [/parameter\(/]},
         cpp: {all: [/config->model_version|\.model_version/], none: [/get_param_value|has_param/]},
       },
     },
@@ -76,7 +74,6 @@ process restarts.
         python: {all: [/store\.is_promoted\(/, /\b404\b/]},
         typescript: {all: [/isPromoted\(/, /code\(\s*404\s*\)/]},
         go: {all: [/store\.IsPromoted\(/, /StatusNotFound/]},
-        scala: {all: [/Store\.isPromoted\(/, /NotFound/]},
         cpp: {all: [/store::isPromoted\(/, /\b404\b/]},
       },
     },
@@ -89,7 +86,6 @@ process restarts.
         python: {all: [/CONFIG_TTL_S\s*=\s*5\b/, /time\.(monotonic|time)\(\)/]},
         typescript: {all: [/CONFIG_TTL_MS\s*=\s*5000\b/, /Date\.now\(\)|performance\.now\(\)/]},
         go: {all: [/configTTL\s*=\s*5\s*\*\s*time\.Second/, /time\.Since\(|time\.Now\(\)/]},
-        scala: {all: [/ConfigTtlMs\s*=\s*5000L?\b/, /System\.currentTimeMillis\(\)|System\.nanoTime\(\)/]},
         cpp: {all: [/kConfigTtl\{5\}/, /steady_clock::now\(\)|system_clock::now\(\)/]},
       },
     },
@@ -331,88 +327,6 @@ func getSurfaceConfig(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/surfaces/{surface}/config", getSurfaceConfig)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import scala.collection.concurrent.TrieMap
-
-import recs.Store // Store.surfaceConfig(surface), Store.isPromoted(surface, modelVersion)
-
-object Read {
-  private val configs = TrieMap.empty[String, Store.Config] // surface -> its config, read once per process
-
-  private def json(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route =
-    path("v1" / "surfaces" / Segment / "config") { surface =>
-      get {
-        parameter("model_version".optional) { requested =>
-          // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-          configs.get(surface).orElse(Store.surfaceConfig(surface).map { loaded => configs.put(surface, loaded); loaded }) match {
-            case None => complete(StatusCodes.NotFound -> "unknown surface")
-            case Some(config) =>
-              complete(json(JsObject(
-                "surface" -> JsString(surface),
-                "model_version" -> JsString(requested.getOrElse(config.modelVersion)),
-                "fallback_policy" -> JsString(config.fallbackPolicy)
-              )))
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import scala.collection.concurrent.TrieMap
-
-import recs.Store // Store.surfaceConfig(surface), Store.isPromoted(surface, modelVersion)
-
-object Read {
-  val ConfigTtlMs = 5000L
-
-  private final case class Cached(at: Long, config: Store.Config)
-  private val configs = TrieMap.empty[String, Cached] // surface -> when it was read, its config
-
-  private def json(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** The surface's config, at most ConfigTtlMs old: a rollback reaches every reader within seconds. */
-  def activeConfig(surface: String): Option[Store.Config] = {
-    val now = System.currentTimeMillis()
-    configs.get(surface).filter(cached => now - cached.at < ConfigTtlMs).map(_.config).orElse {
-      val loaded = Store.surfaceConfig(surface)
-      loaded.foreach(config => configs.put(surface, Cached(now, config)))
-      loaded
-    }
-  }
-
-  val route: Route =
-    path("v1" / "surfaces" / Segment / "config") { surface =>
-      get {
-        activeConfig(surface) match {
-          case None => complete(StatusCodes.NotFound -> "unknown surface")
-          case Some(config) if !Store.isPromoted(surface, config.modelVersion) =>
-            complete(StatusCodes.NotFound -> s"model version \${config.modelVersion} was never promoted on $surface")
-          case Some(config) =>
-            complete(json(JsObject(
-              "surface" -> JsString(surface),
-              "model_version" -> JsString(config.modelVersion),
-              "fallback_policy" -> JsString(config.fallbackPolicy)
-            )))
-        }
-      }
-    }
 }
 `,
     },

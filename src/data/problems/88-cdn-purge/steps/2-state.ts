@@ -54,7 +54,6 @@ duplicates and they are never purged.
           none: [/redis\.exists\(/, /redis\.set\(/],
         },
         go: {all: [/redis\.call\(\s*'EXISTS'/, /redis\.NewScript\(|\.Eval\(/], none: [/rdb\.Exists\(/, /rdb\.Set\(/]},
-        scala: {all: [/redis\.call\(\s*'EXISTS'/, /jedis\.eval\(/], none: [/jedis\.exists\(/, /jedis\.set\(/]},
         cpp: {all: [/redis\.call\(\s*'EXISTS'/, /\.eval[<(]/], none: [/redis\.exists\(/, /redis\.set\(/]},
       },
     },
@@ -67,7 +66,6 @@ duplicates and they are never purged.
         python: {all: [/DEDUPE_TTL_S\s*=\s*600/, /'EX'/]},
         typescript: {all: [/DEDUPE_TTL_S\s*=\s*600/, /'EX'/]},
         go: {all: [/dedupeTTLS\s*=\s*600/, /'EX'/]},
-        scala: {all: [/DedupeTtlS\s*=\s*600/, /'EX'/]},
         cpp: {all: [/kDedupeTtlS\s*=\s*600/, /'EX'/]},
       },
     },
@@ -80,7 +78,6 @@ duplicates and they are never purged.
         python: {all: [/purge:budget:\{domain\}:\{window\}/, /'EXPIRE'/, /%\s*WINDOW_S/]},
         typescript: {all: [/purge:budget:\$\{domain\}:\$\{window\}/, /'EXPIRE'/, /%\s*WINDOW_S/]},
         go: {all: [/purge:budget:%s:%d/, /'EXPIRE'/, /%\s*windowS/]},
-        scala: {all: [/purge:budget:\$domain:\$window/, /'EXPIRE'/, /%\s*WindowS/]},
         cpp: {all: [/"purge:budget:"\s*\+\s*domain\s*\+\s*":"/, /'EXPIRE'/, /%\s*kWindowS/]},
       },
     },
@@ -93,7 +90,6 @@ duplicates and they are never purged.
         python: {order: [/redis\.call\(\s*'GET'/, /redis\.call\(\s*'INCRBY'/], none: [/\.incrby\(/]},
         typescript: {order: [/redis\.call\(\s*'GET'/, /redis\.call\(\s*'INCRBY'/], none: [/\.incrby\(/]},
         go: {order: [/redis\.call\(\s*'GET'/, /redis\.call\(\s*'INCRBY'/], none: [/\.IncrBy\(/]},
-        scala: {order: [/redis\.call\(\s*'GET'/, /redis\.call\(\s*'INCRBY'/], none: [/\.incrBy\(/]},
         cpp: {order: [/redis\.call\(\s*'GET'/, /redis\.call\(\s*'INCRBY'/], none: [/\.incrby\(/]},
       },
     },
@@ -440,101 +436,6 @@ func reserve(ctx context.Context, domain string, paths []string) (Reservation, e
 		res.RetryAfter = windowS - now%windowS // the seconds until the window resets
 	}
 	return res, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-/** Which paths are new, which were purged recently, and whether the budget allows the purge. */
-final case class Reservation(allowed: Boolean, newPaths: Seq[String], duplicates: Seq[String], remaining: Long, retryAfter: Long)
-
-object State {
-  val WindowS = 300L
-  val BudgetMax = 1000L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def seenKey(domain: String, path: String): String = s"purge:seen:$domain:$path"
-
-  /** Reserve the domain's paths for a purge. */
-  def reserve(domain: String, paths: Seq[String]): Reservation = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val budget = s"purge:budget:$domain"
-    val (duplicates, newPaths) = paths.partition(path => jedis.exists(seenKey(domain, path)))
-    val used = jedis.incrBy(budget, newPaths.size.toLong)
-    newPaths.foreach(path => jedis.set(seenKey(domain, path), "1"))
-    if (used > BudgetMax) Reservation(allowed = false, Seq.empty, duplicates, 0L, WindowS)
-    else Reservation(allowed = true, newPaths, duplicates, BudgetMax - used, 0L)
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/** Which paths are new, which were purged recently, and whether the budget allows the purge. */
-final case class Reservation(allowed: Boolean, newPaths: Seq[String], duplicates: Seq[String], remaining: Long, retryAfter: Long)
-
-object State {
-  val WindowS = 300L
-  val BudgetMax = 1000L
-  val DedupeTtlS = 600L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /**
-   * KEYS[1] the window's budget, KEYS[2..] one seen key per path; ARGV budget max, window, dedupe TTL.
-   * The reply: allowed, remaining, then "1" (new) or "0" (duplicate) per path. A refusal writes nothing.
-   */
-  val ReserveLua: String = """
-local budget_max, window_s, dedupe_ttl = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
-local reply = {'0', '0'}
-local fresh = 0
-for i = 2, #KEYS do
-  if redis.call('EXISTS', KEYS[i]) == 0 then
-    reply[i + 1] = '1'
-    fresh = fresh + 1
-  else
-    reply[i + 1] = '0'
-  end
-end
-local used = tonumber(redis.call('GET', KEYS[1]) or '0')
-if used + fresh > budget_max then
-  reply[2] = tostring(budget_max - used)
-  return reply
-end
-if fresh > 0 then
-  used = redis.call('INCRBY', KEYS[1], fresh)
-  if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], window_s) end
-end
-for i = 2, #KEYS do
-  if reply[i + 1] == '1' then redis.call('SET', KEYS[i], '1', 'EX', dedupe_ttl) end
-end
-reply[1] = '1'
-reply[2] = tostring(budget_max - used)
-return reply
-"""
-
-  def seenKey(domain: String, path: String): String = s"purge:seen:$domain:$path"
-
-  /** Reserve the domain's paths for a purge. */
-  def reserve(domain: String, paths: Seq[String]): Reservation = {
-    val now = System.currentTimeMillis() / 1000
-    val window = now / WindowS
-    val keys = s"purge:budget:$domain:$window" +: paths.map(seenKey(domain, _))
-    val args = Seq(BudgetMax, WindowS, DedupeTtlS).map(_.toString)
-    val reply = jedis.eval(ReserveLua, keys.asJava, args.asJava).asInstanceOf[java.util.List[AnyRef]].asScala.map(String.valueOf).toSeq
-    val allowed = reply.head == "1"
-    val flags = reply.drop(2)
-    Reservation(
-      allowed,
-      if (allowed) paths.zip(flags).collect { case (path, "1") => path } else Seq.empty,
-      paths.zip(flags).collect { case (path, "0") => path },
-      reply(1).toLong,
-      if (allowed) 0L else WindowS - now % WindowS // the seconds until the window resets
-    )
-  }
 }
 `,
     },

@@ -54,7 +54,6 @@ page shows none.
         python: {all: [/@app\.get\(\s*["']\/v1\/threads\/\{thread_id\}\/comments["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/threads\/:threadId\/comments['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/threads\/\{id\}\/comments"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"threads"\s*\/\s*Segment\s*\/\s*"comments"\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/threads\//]},
       },
     },
@@ -70,7 +69,6 @@ page shows none.
           none: [/\boffset\b/],
         },
         go: {all: [/ZRevRangeByScore\(/, /func encodeCursor/, /func decodeCursor/], none: [/\boffset\b/]},
-        scala: {all: [/zrevrangeByScore\(/, /def encodeCursor/, /def decodeCursor/], none: [/\boffset\b/]},
         cpp: {all: [/zrevrangebyscore\(/, /encodeCursor\(/, /decodeCursor\(/], none: [/\boffset\b/]},
       },
     },
@@ -83,7 +81,6 @@ page shows none.
         python: {all: [/def serialize_comment/, /if row\[["']deleted["']\]/]},
         typescript: {all: [/function serializeComment/, /if \(row\.deleted\)/]},
         go: {all: [/func serializeComment/, /if row\.Deleted/]},
-        scala: {all: [/def serializeComment/, /if \(row\.deleted\)/]},
         cpp: {all: [/serializeComment\(/, /if \(row\.deleted\)/]},
       },
     },
@@ -99,10 +96,6 @@ page shows none.
         },
         typescript: {all: [/threadCount\(/, /replyCounts\(/], none: [/comment_count:\s*rows\.length/]},
         go: {all: [/threads\.ThreadCount\(/, /threads\.ReplyCounts\(/], none: [/"comment_count":\s*len\(/]},
-        scala: {
-          all: [/Threads\.threadCount\(/, /Threads\.replyCounts\(/],
-          none: [/"comment_count"\s*->\s*JsNumber\(rows\.size\)/],
-        },
         cpp: {
           all: [/threads::threadCount\(/, /threads::replyCounts\(/],
           none: [/\{"comment_count",\s*rows\.size\(\)\}/],
@@ -467,117 +460,6 @@ func listComments(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/threads/{id}/comments", listComments)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import comments.{Store, Threads} // Store.Comment, indexKey, getMany; Threads.threadCount, replyCounts
-
-object Read {
-  val PageSize = 20
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  def serializeComment(row: Store.Comment, page: Seq[Store.Comment]): JsObject = JsObject(
-    "id" -> JsString(row.id), "parent_id" -> JsString(row.parentId), "author_id" -> JsString(row.authorId),
-    "text" -> JsString(row.text), "html" -> JsString(row.html), "created_at" -> JsNumber(row.createdAt),
-    "revision" -> JsNumber(row.revision), "deleted" -> JsBoolean(row.deleted),
-    "reply_count" -> JsNumber(page.count(_.parentId == row.id)))
-
-  val route: Route =
-    path("v1" / "threads" / Segment / "comments") { threadId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-          parameter("cursor".optional) { cursor =>
-            // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-            val tenant = tenantHeader.getOrElse("")
-            if (tenant.isEmpty) complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-            else {
-              val offset = cursor.flatMap(_.toLongOption).getOrElse(0L)
-              val ids = jedis.zrevrange(Store.indexKey(tenant, threadId), offset, offset + PageSize - 1).asScala.toSeq
-              val rows = Store.getMany(tenant, ids).flatten
-              complete(json(StatusCodes.OK, JsObject(
-                "comments" -> JsArray(rows.map(serializeComment(_, rows)).toVector),
-                "next_cursor" -> JsString((offset + PageSize).toString),
-                "comment_count" -> JsNumber(rows.size))))
-            }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-import java.util.Base64
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-
-import comments.{Store, Threads} // Store.Comment, indexKey, getMany; Threads.threadCount, replyCounts
-
-object Read {
-  val PageSize = 20
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** An opaque position: the page resumes strictly below this seq. */
-  def encodeCursor(seq: Long): String = Base64.getUrlEncoder.withoutPadding.encodeToString(s"seq:$seq".getBytes(UTF_8))
-
-  /** The seq a cursor resumes below, if it is one of ours. */
-  def decodeCursor(cursor: String): Option[Long] =
-    Try(new String(Base64.getUrlDecoder.decode(cursor), UTF_8)).toOption.filter(_.startsWith("seq:")).flatMap(_.drop(4).toLongOption)
-
-  def serializeComment(row: Store.Comment, replyCount: Long): JsObject = {
-    val item = JsObject(
-      "id" -> JsString(row.id), "parent_id" -> JsString(row.parentId), "created_at" -> JsNumber(row.createdAt),
-      "revision" -> JsNumber(row.revision), "reply_count" -> JsNumber(replyCount), "deleted" -> JsBoolean(row.deleted))
-    if (row.deleted) item // a tombstone keeps its place and its replies, not its words
-    else JsObject(item.fields ++ Map("author_id" -> JsString(row.authorId), "text" -> JsString(row.text), "html" -> JsString(row.html)))
-  }
-
-  val route: Route =
-    path("v1" / "threads" / Segment / "comments") { threadId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-          parameter("cursor".optional) { cursor =>
-            val tenant = tenantHeader.getOrElse("")
-            val below = cursor.filter(_.nonEmpty).map(decodeCursor)
-            if (tenant.isEmpty) complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-            else if (below.contains(None)) complete(json(StatusCodes.BadRequest, JsObject("error" -> JsString("unreadable cursor"))))
-            else {
-              val top = below.flatten.map(seq => s"($seq").getOrElse("+inf")
-              // A position, not a count: comments posted meanwhile land above it and shift nothing.
-              val ids = jedis.zrevrangeByScore(Store.indexKey(tenant, threadId), top, "-inf", 0, PageSize).asScala.toSeq
-              val rows = Store.getMany(tenant, ids).flatten
-              val counts = Threads.replyCounts(tenant, threadId, rows.map(_.id))
-              val next = if (rows.size == PageSize) JsString(encodeCursor(rows.last.seq)) else JsNull
-              complete(json(StatusCodes.OK, JsObject(
-                "comments" -> JsArray(rows.map(row => serializeComment(row, counts.getOrElse(row.id, 0L))).toVector),
-                "next_cursor" -> next,
-                "comment_count" -> JsNumber(Threads.threadCount(tenant, threadId)))))
-            }
-          }
-        }
-      }
-    }
 }
 `,
     },

@@ -84,7 +84,6 @@ Implement \`to_entries(event)\` and the consumer loop \`run()\` in group **\`led
           all: [/GroupID:\s*"ledger"/, /reader\.FetchMessage\(/, /reader\.CommitMessages\(/],
           none: [/ReadMessage\(/],
         },
-        scala: {all: [/"group\.id"\s*,\s*"ledger"/, /"enable\.auto\.commit"\s*,\s*"false"/, /commitSync\(/]},
         cpp: {all: [/"group\.id"\s*,\s*"ledger"/, /"enable\.auto\.commit"\s*,\s*"false"/, /commitSync\(/]},
       },
     },
@@ -111,9 +110,6 @@ Implement \`to_entries(event)\` and the consumer loop \`run()\` in group **\`led
           ],
         },
         go: {all: [/mapping\[/, /-amount\b|-\s*event\.Amount\b/, /(?<!func )writeTransaction\(/, /event\.OccurredAt/]},
-        scala: {
-          all: [/Mapping\.get\(/, /-amount\b|-\s*event\.amount\b/, /(?<!def )writeTransaction\(/, /\w+\.occurredAt/],
-        },
         cpp: {
           all: [
             /kMapping\.find\(/,
@@ -133,7 +129,6 @@ Implement \`to_entries(event)\` and the consumer loop \`run()\` in group **\`led
         python: {all: [/producer\.produce\(\s*DEAD_TOPIC/, /producer\.flush\(/, /reason/]},
         typescript: {all: [/\.send\(\s*\{\s*topic:\s*DEAD_TOPIC/, /reason/]},
         go: {all: [/deadWriter\.WriteMessages\(/, /reason/]},
-        scala: {all: [/new ProducerRecord\[[^\]]*\]\(\s*DeadTopic/, /\.get\(\)/, /reason/]},
         cpp: {all: [/producer->produce\(\s*kDeadTopic/, /producer->flush\(/, /reason/]},
       },
     },
@@ -162,9 +157,6 @@ Implement \`to_entries(event)\` and the consumer loop \`run()\` in group **\`led
             /(?<!func )writeTransaction\(/,
           ],
         },
-        scala: {
-          order: [/ProducerRecord\[[^\]]*\]\(\s*DeadTopic/, /commit\(\s*record\s*\)/, /(?<!def )writeTransaction\(/],
-        },
         cpp: {
           order: [/produce\(\s*kDeadTopic/, /consumer->commitSync\(/, /continue/, /(?<![\w>] )write_transaction\(/],
         },
@@ -179,7 +171,6 @@ Implement \`to_entries(event)\` and the consumer loop \`run()\` in group **\`led
         python: {order: [/await write_transaction\(/, /consumer\.commit\(/]},
         typescript: {order: [/await writeTransaction\(/, /await commit\(\)|\.commitOffsets\(/]},
         go: {order: [/(?<!func )writeTransaction\(/, /reader\.CommitMessages\(/]},
-        scala: {order: [/(?<!def )writeTransaction\(/, /commit\(\s*record\s*\)/]},
         cpp: {order: [/(?<![\w>] )write_transaction\(/, /consumer->commitSync\(/]},
       },
     },
@@ -662,159 +653,6 @@ func run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-import scala.jdk.CollectionConverters._
-
-// Entry is defined in step 1 (LedgerApi).
-final case class Event(eventId: String, \`type\`: String, amount: Long, currency: String, occurredAt: Long)
-
-object EventConsumer {
-  val Topic = "money-events"
-  val DeadTopic = "money-events.dead"
-
-  /** Event type → (debit account, credit account): the amount is debited from the first, credited to the second. */
-  val Mapping: Map[String, (String, String)] = Map(
-    "payment.captured" -> ("cash:acquirer", "clearing:payments"),
-    "payout.sent" -> ("clearing:payouts", "cash:bank"),
-    "refund.issued" -> ("clearing:payments", "cash:acquirer"))
-
-  /** Built in step 4 (LedgerWriter): insert-or-skip on the event id. */
-  def writeTransaction(entries: Seq[Entry], description: String, eventId: Option[String], postedAt: Long, settles: Option[String]): Option[String] = ???
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", "ledger")
-  consumerProps.put("auto.offset.reset", "earliest")
-  // TODO: disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Topic).asJava)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  producerProps.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  /** The event, or None when the value is not a well-formed event. */
-  def parse(raw: String): Option[Event] =
-    scala.util.Try {
-      val f = raw.parseJson.asJsObject.fields
-      Event(f("event_id").convertTo[String], f("type").convertTo[String], f("amount").convertTo[Long],
-            f("currency").convertTo[String], f("occurred_at").convertTo[Long])
-    }.toOption
-
-  /** The two balanced entries for an event, or None when its type has no mapping. */
-  def toEntries(event: Event): Option[Seq[Entry]] = {
-    // TODO: Mapping.get(type) → Seq(Entry(debit, currency, +amount), Entry(credit, currency, -amount))
-    None
-  }
-
-  /** Commits this record's offset synchronously. */
-  private def commit(record: ConsumerRecord[String, String]): Unit =
-    consumer.commitSync(
-      Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-
-  def run(): Unit =
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        // TODO: parse + toEntries; None → send the original key/value to DeadTopic with a reason header, .get() it, commit(record)
-        // TODO: writeTransaction(entries, event.type, Some(event.eventId), event.occurredAt, None), then commit(record)
-      }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-import scala.jdk.CollectionConverters._
-
-// Entry is defined in step 1 (LedgerApi).
-final case class Event(eventId: String, \`type\`: String, amount: Long, currency: String, occurredAt: Long)
-
-object EventConsumer {
-  val Topic = "money-events"
-  val DeadTopic = "money-events.dead"
-
-  /** Event type → (debit account, credit account): the amount is debited from the first, credited to the second. */
-  val Mapping: Map[String, (String, String)] = Map(
-    "payment.captured" -> ("cash:acquirer", "clearing:payments"),
-    "payout.sent" -> ("clearing:payouts", "cash:bank"),
-    "refund.issued" -> ("clearing:payments", "cash:acquirer"))
-
-  /** Built in step 4 (LedgerWriter): insert-or-skip on the event id. */
-  def writeTransaction(entries: Seq[Entry], description: String, eventId: Option[String], postedAt: Long, settles: Option[String]): Option[String] = ???
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", "ledger")
-  consumerProps.put("auto.offset.reset", "earliest")
-  consumerProps.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Topic).asJava)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  producerProps.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  /** The event, or None when the value is not a well-formed event. */
-  def parse(raw: String): Option[Event] =
-    scala.util.Try {
-      val f = raw.parseJson.asJsObject.fields
-      Event(f("event_id").convertTo[String], f("type").convertTo[String], f("amount").convertTo[Long],
-            f("currency").convertTo[String], f("occurred_at").convertTo[Long])
-    }.toOption
-
-  /** The two balanced entries for an event, or None when its type has no mapping. */
-  def toEntries(event: Event): Option[Seq[Entry]] =
-    Mapping.get(event.\`type\`).map { case (debit, credit) =>
-      Seq(Entry(debit, event.currency, event.amount), Entry(credit, event.currency, -event.amount))
-    }
-
-  /** Parks the original record where a human can look at it; .get() blocks until the broker acknowledged it. */
-  private def deadLetter(record: ConsumerRecord[String, String], reason: String): Unit = {
-    val parked = new ProducerRecord[String, String](DeadTopic, record.key, record.value)
-    parked.headers().add("reason", reason.getBytes("UTF-8"))
-    producer.send(parked).get()
-  }
-
-  /** Commits this record's offset synchronously. */
-  private def commit(record: ConsumerRecord[String, String]): Unit =
-    consumer.commitSync(
-      Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-
-  def run(): Unit =
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val event = parse(record.value)
-        event.flatMap(toEntries) match {
-          case None =>
-            deadLetter(record, event.fold("malformed event")(e => s"no mapping for event type \${e.\`type\`}"))
-            commit(record)
-          case Some(entries) =>
-            val e = event.get
-            writeTransaction(entries, e.\`type\`, Some(e.eventId), e.occurredAt, None) // throws → not committed, the record comes back
-            commit(record)
-        }
-      }
 }
 `,
     },

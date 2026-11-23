@@ -6,7 +6,7 @@ import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-dependency';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
-import {supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Fleet tracking: a position pipeline debugged before it drives a dispatch map. A batch endpoint
@@ -93,6 +93,5 @@ billing and the mobile SDK. The five pieces above decide whether the map is righ
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

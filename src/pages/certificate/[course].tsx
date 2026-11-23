@@ -18,7 +18,7 @@ import {
   linkedInAddCertificateUrl,
   linkedInPostUrl,
 } from '@/lib/social';
-import {type Language, type ProblemSummary, ALL_LANGUAGES} from '@/lib/types';
+import {type ProblemSummary, isCertificateLanguage} from '@/lib/types';
 
 /**
  * A certificate's own page: pre-rendered per course (so a LinkedIn link unfurls with the course's
@@ -48,7 +48,8 @@ const Certificate: FC<{course: ProblemSummary}> = memo(({course}) => {
     const name = one(q.n)?.trim();
     const completedAt = Number(one(q.d));
     const language = one(q.l);
-    if (!name || !Number.isFinite(completedAt) || !ALL_LANGUAGES.includes(language as Language)) return null;
+    // A language the site has since retired still verifies: the link was issued and may be shared.
+    if (!name || !Number.isFinite(completedAt) || !isCertificateLanguage(language)) return null;
     // The scale the certificate was earned on; links issued before `m` existed fall back to today's.
     const issuedMax = Number(one(q.m));
     const max =
@@ -59,7 +60,7 @@ const Certificate: FC<{course: ProblemSummary}> = memo(({course}) => {
       name,
       problem: course,
       completedAt,
-      language: language as Language,
+      language,
       score,
       max,
       time: Number.isFinite(time) && time > 0 ? time : null,

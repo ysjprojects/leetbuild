@@ -6,7 +6,7 @@ import {assignmentStateStep} from './steps/2-state';
 import {prelabelClientStep} from './steps/3-client';
 import {labelEventsStep} from './steps/4-events';
 import {progressReadStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Labeling service: the course is not "accept a label over HTTP", it is the debugging you owe a
@@ -94,6 +94,5 @@ item payloads.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

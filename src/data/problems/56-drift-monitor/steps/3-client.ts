@@ -56,12 +56,11 @@ service Alerting { rpc Raise(AlertRequest) returns (AlertReply); }  // UNAVAILAB
       id: 'deadline',
       title: 'Every attempt carries a one-second deadline',
       detail:
-        'Each `Raise` attempt is made with its own `DEADLINE_S` = 1 s (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`), not what is left of one shared deadline, and an attempt that runs out of time is retried like any failure; without a deadline a stalled alerting service holds the evaluator open.',
+        'Each `Raise` attempt is made with its own `DEADLINE_S` = 1 s (`timeout=`, `deadline:`, `context.WithTimeout`, `set_deadline`), not what is left of one shared deadline, and an attempt that runs out of time is retried like any failure; without a deadline a stalled alerting service holds the evaluator open.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*1(\.0)?\b/, /Raise\([^)]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*1000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*(1\s*\*\s*)?time\.Second/, /context\.WithTimeout\([^\n]*deadline\)/]},
-        scala: {all: [/DeadlineMs\s*=\s*1000L?\b/, /withDeadlineAfter\(\s*DeadlineMs/]},
         cpp: {all: [/kDeadlineMs\s*=\s*1000\b/, /set_deadline\([^\n]*kDeadlineMs/]},
       },
     },
@@ -74,7 +73,6 @@ service Alerting { rpc Raise(AlertRequest) returns (AlertReply); }  // UNAVAILAB
         python: {all: [/COOLDOWN_S\s*=\s*300\b/, /nx\s*=\s*True/, /ex\s*=\s*COOLDOWN_S/]},
         typescript: {all: [/COOLDOWN_S\s*=\s*300\b/, /['"]NX['"]/, /['"]EX['"],\s*COOLDOWN_S/]},
         go: {all: [/cooldown\s*=\s*300\s*\*\s*time\.Second/, /SetNX\([^\n]*cooldown\)/]},
-        scala: {all: [/CooldownS\s*=\s*300L?\b/, /\.nx\(\)/, /\.ex\(\s*CooldownS/]},
         cpp: {all: [/kCooldownS\s*=\s*300\b/, /UpdateType::NOT_EXIST/]},
       },
     },
@@ -87,7 +85,6 @@ service Alerting { rpc Raise(AlertRequest) returns (AlertReply); }  // UNAVAILAB
         python: {order: [/nx\s*=\s*True/, /alerting\.Raise\(/]},
         typescript: {order: [/['"]NX['"]/, /alerting\.Raise\(/]},
         go: {order: [/SetNX\(/, /alerting\.Raise\(/]},
-        scala: {order: [/\.nx\(\)/, /\.raise\(/]},
         cpp: {order: [/UpdateType::NOT_EXIST/, /alerting->Raise\(/]},
       },
     },
@@ -100,7 +97,6 @@ service Alerting { rpc Raise(AlertRequest) returns (AlertReply); }  // UNAVAILAB
         python: {all: [/threshold\s*=/, /window_end\s*=/, /baseline_sample_count\s*=/]},
         typescript: {all: [/threshold:/, /window_end:/, /baseline_sample_count:/]},
         go: {all: [/Threshold:/, /WindowEnd:/, /BaselineSampleCount:/]},
-        scala: {all: [/threshold\s*=/, /windowEnd\s*=/, /baselineSampleCount\s*=/]},
         cpp: {all: [/set_threshold\(/, /set_window_end\(/, /set_baseline_sample_count\(/]},
       },
     },
@@ -113,7 +109,6 @@ service Alerting { rpc Raise(AlertRequest) returns (AlertReply); }  // UNAVAILAB
         python: {all: [/MAX_ATTEMPTS/, /BACKOFF_S/, /time\.sleep\(/, /raise AlertUnavailable/]},
         typescript: {all: [/MAX_ATTEMPTS/, /BACKOFF_MS/, /setTimeout\(/, /throw new AlertUnavailable/]},
         go: {all: [/maxAttempts/, /\bbackoff\b/, /time\.Sleep\(/, /fmt\.Errorf\([^\n]*ErrAlertUnavailable/]},
-        scala: {all: [/MaxAttempts/, /BackoffMs/, /Thread\.sleep\(/, /throw new AlertUnavailable/]},
         cpp: {all: [/kMaxAttempts/, /kBackoffMs/, /sleep_for\(/, /throw AlertUnavailable/]},
       },
     },
@@ -416,84 +411,6 @@ func raiseAlert(ctx context.Context, monitor store.Monitor, window int64, distan
 	}
 	rdb.Del(ctx, key) // nobody was paged: release the claim so the next evaluation tries again
 	return false, fmt.Errorf("%w for %s: %v", ErrAlertUnavailable, key, err)
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import drift.Store // Store.Monitor
-import driftmon.drift_monitor.{AlertRequest, AlertingGrpc}
-
-/** Alerting did not take the page after every attempt: the next evaluation pages again. */
-final class AlertUnavailable(message: String) extends Exception(message)
-
-object Client {
-  private val alerting = AlertingGrpc.blockingStub(ManagedChannelBuilder.forAddress("alerting", 9000).usePlaintext().build())
-
-  /** Page for a window whose distance crossed the monitor's threshold; true when this call raised the page. */
-  def raiseAlert(monitor: Store.Monitor, window: Long, distance: Double, sampleCount: Long, baselineSampleCount: Long): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    try {
-      alerting.raise(AlertRequest(monitorId = monitor.monitorId, metric = monitor.metric, distance = distance))
-      true
-    } catch {
-      case e: StatusRuntimeException =>
-        System.err.println(s"alert failed monitor=\${monitor.monitorId}: \${e.getStatus.getCode}")
-        false
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import drift.Store // Store.Monitor
-import driftmon.drift_monitor.{AlertRequest, AlertingGrpc}
-
-/** Alerting did not take the page after every attempt: the next evaluation pages again. */
-final class AlertUnavailable(message: String) extends Exception(message)
-
-object Client {
-  val DeadlineMs = 1000L
-  val CooldownS = 300L
-  val MaxAttempts = 3
-  val BackoffMs = 200L
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val alerting = AlertingGrpc.blockingStub(ManagedChannelBuilder.forAddress("alerting", 9000).usePlaintext().build())
-
-  def alertKey(monitorId: String, window: Long): String = s"alert:$monitorId:$window"
-
-  /** Page for a window whose distance crossed the monitor's threshold; true when this call raised the page. */
-  def raiseAlert(monitor: Store.Monitor, window: Long, distance: Double, sampleCount: Long, baselineSampleCount: Long): Boolean = {
-    val key = alertKey(monitor.monitorId, window)
-    // The claim is the decision: whoever sets it pages, every other evaluation in the cooldown stays quiet.
-    if (jedis.set(key, "1", SetParams.setParams().nx().ex(CooldownS)) == null) return false
-    val request = AlertRequest(
-      monitorId = monitor.monitorId,
-      metric = monitor.metric,
-      distance = distance,
-      threshold = monitor.threshold,
-      windowStart = window,
-      windowEnd = window + monitor.windowS,
-      sampleCount = sampleCount,
-      baselineSampleCount = baselineSampleCount)
-    for (attempt <- 0 until MaxAttempts) {
-      if (attempt > 0) Thread.sleep(BackoffMs << (attempt - 1))
-      try {
-        alerting.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).raise(request)
-        return true
-      } catch {
-        case e: StatusRuntimeException => System.err.println(s"alert attempt \${attempt + 1} failed monitor=\${monitor.monitorId}: \${e.getStatus.getCode}")
-      }
-    }
-    jedis.del(key) // nobody was paged: release the claim so the next evaluation tries again
-    throw new AlertUnavailable(s"alerting did not take the page for $key")
-  }
 }
 `,
     },

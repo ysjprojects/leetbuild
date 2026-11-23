@@ -59,10 +59,6 @@ names, visible to \`SCAN\` and every dump. One bad week flags a conversation for
           all: [/"fh:policy:"\s*\+\s*version/, /policyTTL\s*=\s*(time\.Hour|3600\s*\*\s*time\.Second)/, /policyTTL\)/],
           none: [/Get\(ctx,\s*policyKey\)/],
         },
-        scala: {
-          all: [/s"fh:policy:\$version"/, /PolicyTtlSeconds\s*=\s*3600L?\b/, /setex\([^\n]*PolicyTtlSeconds/],
-          none: [/get\(PolicyKey\)/],
-        },
         cpp: {all: [/"fh:policy:"\s*\+\s*version/, /kPolicyTtl\{3600\}/, /kPolicyTtl\)/], none: [/get\(kPolicyKey\)/]},
       },
     },
@@ -78,7 +74,6 @@ names, visible to \`SCAN\` and every dump. One bad week flags a conversation for
         },
         typescript: {all: [/\.multi\(\)/, /\.exec\(\)/], order: [/savePolicy\(policy\)/, /\.set\(ACTIVE_KEY/]},
         go: {all: [/TxPipelined\(/], order: [/store\.SavePolicy\(/, /Set\(ctx,\s*activeKey/]},
-        scala: {all: [/\.multi\(\)/, /\.exec\(\)/], order: [/Store\.savePolicy\(/, /\.set\(ActiveKey/]},
         cpp: {all: [/\.transaction\(\)/, /\.exec\(\)/], order: [/store::savePolicy\(/, /\.set\(kActiveKey/]},
       },
     },
@@ -93,9 +88,6 @@ names, visible to \`SCAN\` and every dump. One bad week flags a conversation for
         go: {
           all: [/"fh:decision:"\s*\+\s*version\s*\+\s*":"/, /decisionTTL\s*=\s*24\s*\*\s*time\.Hour/, /decisionTTL\)/],
         },
-        scala: {
-          all: [/s"fh:decision:\$version:/, /DecisionTtlSeconds\s*=\s*86400L?\b/, /setex\([^\n]*DecisionTtlSeconds/],
-        },
         cpp: {all: [/"fh:decision:"\s*\+\s*version\s*\+\s*":"/, /kDecisionTtl\{86400\}/, /kDecisionTtl\)/]},
       },
     },
@@ -108,7 +100,6 @@ names, visible to \`SCAN\` and every dump. One bad week flags a conversation for
         python: {all: [/hashlib\.sha256\(/], none: [/fh:decision:\{text\}/]},
         typescript: {all: [/createHash\(\s*'sha256'\s*\)/], none: [/fh:decision:\$\{text\}/]},
         go: {all: [/sha256\.Sum256\(/], none: [/"fh:decision:"\s*\+\s*text\b/]},
-        scala: {all: [/MessageDigest\.getInstance\(\s*"SHA-256"\s*\)/], none: [/fh:decision:\$text\b/]},
         cpp: {all: [/sha256_hex\(/], none: [/"fh:decision:"\s*\+\s*text\b/]},
       },
     },
@@ -121,7 +112,6 @@ names, visible to \`SCAN\` and every dump. One bad week flags a conversation for
         python: {all: [/STRIKE_TTL_S\s*=\s*86_?400\b/, /\.expire\([^\n]*STRIKE_TTL_S/]},
         typescript: {all: [/STRIKE_TTL_S\s*=\s*86_?400\b/, /\.expire\([^\n]*STRIKE_TTL_S/]},
         go: {all: [/strikeTTL\s*=\s*24\s*\*\s*time\.Hour/, /\.Expire\([^\n]*strikeTTL/]},
-        scala: {all: [/StrikeTtlSeconds\s*=\s*86400L?\b/, /\.expire\([^\n]*StrikeTtlSeconds/]},
         cpp: {all: [/kStrikeTtl\{86400\}/, /\.expire\([^\n]*kStrikeTtl/]},
       },
     },
@@ -488,94 +478,6 @@ func recordStrike(ctx context.Context, conversationID string) (int64, error) {
 		rdb.Expire(ctx, key, strikeTTL) // the window starts at the first strike and does not slide
 	}
 	return strikes, nil
-}
-`,
-    },
-    scala: {
-      starter: `import spray.json._
-
-import fhguard.Store // Store.loadPolicy(version), Store.savePolicy(policy); Store.Policy, Store.Decision
-
-object PolicyCache {
-  private val jedis = Store.jedis
-
-  val PolicyKey = "fh:policy"
-  val ActiveKey = "fh:policy:active"
-
-  def getPolicy(version: String): Option[Store.Policy] = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    Option(jedis.get(PolicyKey)).map(raw => Store.policyFrom(raw.parseJson)).orElse {
-      val policy = Store.loadPolicy(version)
-      policy.foreach(p => jedis.set(PolicyKey, Store.policyJson(p).compactPrint))
-      policy
-    }
-  }
-
-  def activeVersion(): Option[String] = Option(jedis.get(ActiveKey))
-
-  def publish(policy: Store.Policy): Unit = {
-    jedis.set(ActiveKey, policy.version)
-    Store.savePolicy(policy)
-  }
-
-  def cachedDecision(version: String, text: String): Option[Store.Decision] =
-    Option(jedis.get(s"fh:decision:$text")).map(raw => Store.decisionFrom(raw.parseJson))
-
-  def cacheDecision(version: String, text: String, decision: Store.Decision): Unit =
-    jedis.set(s"fh:decision:$text", Store.decisionJson(decision).compactPrint)
-
-  def recordStrike(conversationId: String): Long = jedis.incr(s"fh:strikes:$conversationId")
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
-
-import spray.json._
-
-import fhguard.Store // Store.loadPolicy(version), Store.savePolicy(policy); Store.Policy, Store.Decision
-
-object PolicyCache {
-  private val jedis = Store.jedis
-
-  val PolicyTtlSeconds = 3600L
-  val DecisionTtlSeconds = 86400L
-  val StrikeTtlSeconds = 86400L
-  val ActiveKey = "fh:policy:active"
-
-  def getPolicy(version: String): Option[Store.Policy] =
-    Option(jedis.get(s"fh:policy:$version")).map(raw => Store.policyFrom(raw.parseJson)).orElse {
-      val policy = Store.loadPolicy(version)
-      policy.foreach(p => jedis.setex(s"fh:policy:$version", PolicyTtlSeconds, Store.policyJson(p).compactPrint))
-      policy
-    }
-
-  def activeVersion(): Option[String] = Option(jedis.get(ActiveKey))
-
-  def publish(policy: Store.Policy): Unit = {
-    Store.savePolicy(policy) // the version exists before anything points at it
-    val tx = jedis.multi()
-    tx.setex(s"fh:policy:\${policy.version}", PolicyTtlSeconds, Store.policyJson(policy).compactPrint)
-    tx.set(ActiveKey, policy.version)
-    tx.exec()
-  }
-
-  private def decisionKey(version: String, text: String): String = {
-    val digest = MessageDigest.getInstance("SHA-256").digest(text.getBytes(StandardCharsets.UTF_8))
-    s"fh:decision:$version:\${digest.map("%02x".format(_)).mkString}"
-  }
-
-  def cachedDecision(version: String, text: String): Option[Store.Decision] =
-    Option(jedis.get(decisionKey(version, text))).map(raw => Store.decisionFrom(raw.parseJson))
-
-  def cacheDecision(version: String, text: String, decision: Store.Decision): Unit =
-    jedis.setex(decisionKey(version, text), DecisionTtlSeconds, Store.decisionJson(decision).compactPrint)
-
-  def recordStrike(conversationId: String): Long = {
-    val key = s"fh:strikes:$conversationId"
-    val strikes = jedis.incr(key)
-    if (strikes == 1L) jedis.expire(key, StrikeTtlSeconds) // the window starts at the first strike and does not slide
-    strikes
-  }
 }
 `,
     },

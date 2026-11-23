@@ -57,7 +57,6 @@ counts do not add up.
         python: {all: [/@app\.get\(\s*["']\/v1\/loads\/\{load_id\}["']/, /store\.get_load\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/loads\/:loadId['"]/, /getLoad\(/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/loads\/\{id\}"/, /store\.GetLoad\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"loads"\s*\/\s*Segment\s*\)/, /Store\.getLoad\(/]},
         cpp: {all: [/svr\.Get\(/, /store::getLoad\(/]},
       },
     },
@@ -70,7 +69,6 @@ counts do not add up.
         python: {all: [/CountRows\(/], none: [/rows_planned/]},
         typescript: {all: [/CountRows\(/], none: [/rows_planned/]},
         go: {all: [/CountRows\(/], none: [/RowsPlanned/]},
-        scala: {all: [/countRows\(/], none: [/rowsPlanned/]},
         cpp: {all: [/CountRows\(/], none: [/rows_planned/]},
       },
     },
@@ -83,7 +81,6 @@ counts do not add up.
         python: {all: [/store\.rejections\(/, /rows_rejected/]},
         typescript: {all: [/\brejections\(/, /rows_rejected/]},
         go: {all: [/store\.Rejections\(/, /rows_rejected/]},
-        scala: {all: [/Store\.rejections\(/, /rows_rejected/]},
         cpp: {all: [/store::rejections\(/, /rows_rejected/]},
       },
     },
@@ -96,7 +93,6 @@ counts do not add up.
         python: {all: [/table_freshness\(/], none: [/source_freshness\(/]},
         typescript: {all: [/tableFreshness\(/], none: [/sourceFreshness\(/]},
         go: {all: [/TableFreshness\(/], none: [/SourceFreshness\(/]},
-        scala: {all: [/tableFreshness\(/], none: [/sourceFreshness\(/]},
         cpp: {all: [/tableFreshness\(/], none: [/sourceFreshness\(/]},
       },
     },
@@ -109,7 +105,6 @@ counts do not add up.
         python: {all: [/["']delta["']/, /["']flagged["']/]},
         typescript: {all: [/\bdelta\b/, /\bflagged\b/]},
         go: {all: [/json:"delta"/, /json:"flagged"/]},
-        scala: {all: [/"delta"/, /"flagged"/]},
         cpp: {all: [/"delta"/, /"flagged"/]},
       },
     },
@@ -380,87 +375,6 @@ func readLoad(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/loads/{id}", readLoad)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import loader.Store // Store.getLoad, rejections, tableFreshness, sourceFreshness
-
-object LoadReport {
-  private def freshnessJson(freshness: Option[Store.Freshness]): JsValue =
-    freshness.map(f => JsObject("committed_at" -> JsNumber(f.committedAt), "load_id" -> JsString(f.loadId))).getOrElse(JsNull)
-
-  val route: Route = path("v1" / "loads" / Segment) { loadId =>
-    get {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          Store.getLoad(tenant, loadId) match {
-            case None => complete(StatusCodes.NotFound -> "no such load")
-            case Some(load) =>
-              val body = JsObject(
-                "load_id" -> JsString(loadId), "status" -> JsString(load.status), "target" -> JsString(load.target),
-                "rows_read" -> JsNumber(load.rowsRead), "rows_written" -> JsNumber(load.rowsPlanned),
-                "freshness" -> freshnessJson(Store.sourceFreshness(load.dataset)))
-              complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.ManagedChannelBuilder
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import loader.Store // Store.getLoad, rejections, tableFreshness, sourceFreshness
-import whloader.warehouse_loader.{CountRequest, WarehouseGrpc}
-
-object LoadReport {
-  val DeadlineSeconds = 5L
-
-  private val warehouse = WarehouseGrpc.blockingStub(ManagedChannelBuilder.forAddress("warehouse", 9000).usePlaintext().build())
-
-  private def freshnessJson(freshness: Option[Store.Freshness]): JsValue =
-    freshness.map(f => JsObject("committed_at" -> JsNumber(f.committedAt), "load_id" -> JsString(f.loadId))).getOrElse(JsNull)
-
-  private def report(load: Store.Load): JsObject = {
-    // Each number from the system that owns it: written from the warehouse, rejected from the reject log.
-    val rowsWritten = warehouse.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).countRows(CountRequest(target = load.target, loadId = load.loadId)).rows
-    val rejections = Store.rejections(load.loadId)
-    val rowsRejected = rejections.map(_.rows).sum
-    val delta = load.rowsRead - rowsWritten - rowsRejected
-    JsObject(
-      "load_id" -> JsString(load.loadId), "status" -> JsString(load.status), "target" -> JsString(load.target),
-      "rows_read" -> JsNumber(load.rowsRead), "rows_written" -> JsNumber(rowsWritten), "rows_rejected" -> JsNumber(rowsRejected),
-      "rejections" -> JsArray(rejections.map(r => JsObject("partition_id" -> JsString(r.partitionId), "reason" -> JsString(r.reason), "rows" -> JsNumber(r.rows))).toVector),
-      "freshness" -> freshnessJson(Store.tableFreshness(load.target)),
-      "delta" -> JsNumber(delta),
-      "flagged" -> JsBoolean(delta != 0)) // read = written + rejected, or someone must look
-  }
-
-  val route: Route = path("v1" / "loads" / Segment) { loadId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          Store.getLoad(tenant, loadId) match {
-            case None => complete(StatusCodes.NotFound -> "no such load")
-            case Some(load) => complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, report(load).compactPrint)))
-          }
-      }
-    }
-  }
 }
 `,
     },

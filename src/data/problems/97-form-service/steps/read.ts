@@ -49,7 +49,6 @@ a name chooses where the export tool writes.
         python: {all: [/store\.owner_of\(/, /\b403\b/]},
         typescript: {all: [/\bownerOf\(/, /\b403\b/]},
         go: {all: [/store\.OwnerOf\(/, /StatusForbidden|\b403\b/]},
-        scala: {all: [/Store\.ownerOf\(/, /Forbidden/]},
         cpp: {all: [/store::ownerOf\(/, /\b403\b/]},
       },
     },
@@ -62,7 +61,6 @@ a name chooses where the export tool writes.
         python: {all: [/PII_FIELDS/, /\[redacted\]/]},
         typescript: {all: [/PII_FIELDS/, /\[redacted\]/]},
         go: {all: [/piiFields/, /\[redacted\]/]},
-        scala: {all: [/PiiFields/, /\[redacted\]/]},
         cpp: {all: [/kPiiFields/, /\[redacted\]/]},
       },
     },
@@ -75,7 +73,6 @@ a name chooses where the export tool writes.
         python: {all: [/store\.record_audit\(/]},
         typescript: {all: [/\brecordAudit\(/]},
         go: {all: [/store\.RecordAudit\(/]},
-        scala: {all: [/Store\.recordAudit\(/]},
         cpp: {all: [/store::recordAudit\(/]},
       },
     },
@@ -88,7 +85,6 @@ a name chooses where the export tool writes.
         python: {all: [/uuid4\(|token_hex\(|token_urlsafe\(/], none: [/file\s*=\s*[^\n]*\bvalues\b/]},
         typescript: {all: [/randomUUID\(|randomBytes\(/], none: [/file\s*=\s*[^\n]*\bvalues\b/]},
         go: {all: [/rand\.Read\(|rand\.Text\(/], none: [/file\s*:?=\s*[^\n]*Values/]},
-        scala: {all: [/UUID\.randomUUID\(/], none: [/file\s*=\s*[^\n]*values/]},
         cpp: {all: [/random_device/], none: [/file\s*=\s*[^\n]*values/]},
       },
     },
@@ -101,7 +97,6 @@ a name chooses where the export tool writes.
         python: {all: [/store\.page_before\(/, /next_cursor/], none: [/store\.page_by_offset\(/]},
         typescript: {all: [/\bpageBefore\(/, /next_cursor/], none: [/\bpageByOffset\(/]},
         go: {all: [/store\.PageBefore\(/, /next_cursor/], none: [/store\.PageByOffset\(/]},
-        scala: {all: [/Store\.pageBefore\(/, /next_cursor/], none: [/Store\.pageByOffset\(/]},
         cpp: {all: [/store::pageBefore\(/, /next_cursor/], none: [/store::pageByOffset\(/]},
       },
     },
@@ -467,113 +462,6 @@ func exportSubmissions(rw http.ResponseWriter, r *http.Request) {
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/forms/{id}/submissions", listSubmissions)
 	mux.HandleFunc("POST /v1/forms/{id}/exports", exportSubmissions)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import forms.Store // Store.ownerOf, pageByOffset, pageBefore, recordAudit
-
-object ReadApi {
-  val PageSize = 50
-  val ExportLimit = 1000
-
-  private def json(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def item(row: Store.Submission): JsObject =
-    JsObject("submission_id" -> JsString(row.submissionId), "values" -> JsObject(row.values.map { case (k, v) => k -> JsString(v) }))
-
-  val route: Route = concat(
-    path("v1" / "forms" / Segment / "submissions") { formId =>
-      get {
-        optionalHeaderValueByName("X-User-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-User-Id is required")
-          case Some(_) =>
-            parameters("offset".optional, "limit".optional) { (offsetParam, limitParam) =>
-              // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-              val offset = offsetParam.map(_.toInt).getOrElse(0)
-              val rows = Store.pageByOffset(formId, offset, limitParam.map(_.toInt).getOrElse(PageSize))
-              complete(json(JsObject("items" -> JsArray(rows.map(item).toVector), "next_offset" -> JsNumber(offset + rows.size))))
-            }
-        }
-      }
-    },
-    path("v1" / "forms" / Segment / "exports") { formId =>
-      post {
-        optionalHeaderValueByName("X-User-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-User-Id is required")
-          case Some(_) =>
-            val rows = Store.pageByOffset(formId, 0, ExportLimit)
-            val file = rows.headOption.map(newest => s"\${newest.submissionId}-\${newest.values.getOrElse("name", "")}.csv").getOrElse("empty.csv")
-            complete(json(JsObject("file" -> JsString(file), "rows" -> JsArray(rows.map(item).toVector))))
-        }
-      }
-    }
-  )
-}
-`,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.{Directive1, Route}
-import spray.json._
-
-import forms.Store // Store.ownerOf, pageByOffset, pageBefore, recordAudit
-
-object ReadApi {
-  val PageSize = 50
-  val ExportLimit = 1000
-  val PiiFields: Set[String] = Set("email", "phone")
-
-  private def json(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def item(row: Store.Submission, values: Map[String, String]): JsObject =
-    JsObject("submission_id" -> JsString(row.submissionId), "values" -> JsObject(values.map { case (k, v) => k -> JsString(v) }))
-
-  private def redacted(values: Map[String, String]): Map[String, String] =
-    values.map { case (name, value) => name -> (if (PiiFields.contains(name)) "[redacted]" else value) }
-
-  /** The caller, if they own the form. */
-  private def owner(formId: String): Directive1[String] =
-    optionalHeaderValueByName("X-User-Id").flatMap {
-      case None | Some("") => complete(StatusCodes.Unauthorized -> "X-User-Id is required")
-      case Some(user) if !Store.ownerOf(formId).contains(user) => complete(StatusCodes.Forbidden -> "only the form's owner reads its submissions")
-      case Some(user) => provide(user)
-    }
-
-  val route: Route = concat(
-    path("v1" / "forms" / Segment / "submissions") { formId =>
-      get {
-        owner(formId) { _ =>
-          parameters("cursor".optional, "limit".optional) { (cursorParam, limitParam) =>
-            val limit = limitParam.map(_.toInt).getOrElse(PageSize)
-            // A cursor is a position in the data, not in the list: new submissions cannot shift it.
-            val rows = Store.pageBefore(formId, cursorParam.map(_.toLong).getOrElse(0L), limit)
-            val next = if (rows.size == limit) JsString(rows.last.seq.toString) else JsNull
-            complete(json(JsObject("items" -> JsArray(rows.map(row => item(row, redacted(row.values))).toVector), "next_cursor" -> next)))
-          }
-        }
-      }
-    },
-    path("v1" / "forms" / Segment / "exports") { formId =>
-      post {
-        owner(formId) { user =>
-          val rows = Store.pageBefore(formId, 0L, ExportLimit)
-          // The name is ours, not the submitter's: no value can become a path.
-          val file = s"export-\${UUID.randomUUID()}.csv"
-          Store.recordAudit(user, formId, file)
-          complete(json(JsObject("file" -> JsString(file), "rows" -> JsArray(rows.map(row => item(row, row.values)).toVector))))
-        }
-      }
-    }
-  )
 }
 `,
     },

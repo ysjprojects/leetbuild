@@ -54,7 +54,6 @@ tells a shopper which product costs what; a malformed \`filters\` crashes the ha
         python: {all: [/@app\.get\(\s*["']\/v1\/search["']/, /run_query\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/search['"]/, /runQuery\(/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/search"/, /catalog\.RunQuery\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"search"\s*\)/, /Catalog\.runQuery\(/]},
         cpp: {all: [/svr\.Get\(\s*"\/v1\/search"/, /catalog::runQuery\(/]},
       },
     },
@@ -69,7 +68,6 @@ tells a shopper which product costs what; a malformed \`filters\` crashes the ha
           all: [/MAX_QUERY_BYTES\s*=\s*256/, /TextEncoder\(\)\.encode\(\s*q\s*\)\.length|Buffer\.byteLength\(\s*q/],
         },
         go: {all: [/maxQueryBytes\s*=\s*256/, /len\(\s*(\[\]byte\()?q\)?\s*\)\s*>\s*maxQueryBytes/]},
-        scala: {all: [/MaxQueryBytes\s*=\s*256/, /getBytes\(\s*"UTF-8"\s*\)\.length\s*>\s*MaxQueryBytes/]},
         cpp: {all: [/kMaxQueryBytes\s*=\s*256/, /q\.size\(\)\s*>\s*kMaxQueryBytes/]},
       },
     },
@@ -82,7 +80,6 @@ tells a shopper which product costs what; a malformed \`filters\` crashes the ha
         python: {all: [/MAX_PAGE_SIZE\s*=\s*100/, /page_size\s*(<=|>)\s*MAX_PAGE_SIZE/]},
         typescript: {all: [/MAX_PAGE_SIZE\s*=\s*100/, /pageSize\s*>\s*MAX_PAGE_SIZE/]},
         go: {all: [/maxPageSize\s*=\s*100/, /pageSize\s*>\s*maxPageSize/]},
-        scala: {all: [/MaxPageSize\s*=\s*100/, /(size|pageSize)\s*>\s*MaxPageSize|1 to MaxPageSize/]},
         cpp: {all: [/kMaxPageSize\s*=\s*100/, /page_size\s*>\s*kMaxPageSize/]},
       },
     },
@@ -102,7 +99,6 @@ tells a shopper which product costs what; a malformed \`filters\` crashes the ha
         typescript: {all: [/ALLOWED_FILTER_FIELDS\s*=/, /ALLOWED_FILTER_FIELDS\.(includes|has)\(/, /allowed:/]},
         go: {all: [/allowedFilterFields\s*=/, /range allowedFilterFields|allowedFilterFields\[/, /"allowed"/]},
         cpp: {all: [/kAllowedFilterFields\s*=/, /kAllowedFilterFields\.(begin|end|count)\(/, /"allowed"/]},
-        scala: {all: [/AllowedFilterFields(:[^=\n]*)?\s*=/, /AllowedFilterFields\.contains\(/, /"allowed"/]},
       },
     },
     {
@@ -120,7 +116,6 @@ tells a shopper which product costs what; a malformed \`filters\` crashes the ha
         },
         typescript: {all: [/catch\s*(\(\w*\))?\s*\{/, /Array\.isArray\(/, /typeof \w+ === 'string'/]},
         go: {all: [/if err := json\.Unmarshal\(/]},
-        scala: {all: [/Try\(|catch\s*\{/, /JsString\(/]},
         cpp: {all: [/json::parse\([^\n]*,\s*nullptr,\s*false\)/, /is_object\(\)/, /is_string\(\)/]},
       },
     },
@@ -381,96 +376,6 @@ func search(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/search", search)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import search.Catalog // Catalog.runQuery(tenant, q, filters, pageSize): Seq[JsObject]
-
-object SearchApi {
-  val DefaultPageSize = 20
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "search") {
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("missing X-Tenant-Id"))))
-        case Some(tenant) =>
-          parameters("q".optional, "page_size".optional, "filters".optional) { (q, pageSize, filters) =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            val size = pageSize.map(_.toInt).getOrElse(DefaultPageSize)
-            val requested = filters.getOrElse("{}").parseJson.asJsObject.fields.map { case (field, value) => field -> value.toString }
-            val results = Catalog.runQuery(tenant, q.getOrElse(""), requested, size)
-            complete(json(StatusCodes.OK, JsObject("results" -> JsArray(results.toVector), "page_size" -> JsNumber(size))))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import scala.util.Try
-
-import search.Catalog // Catalog.runQuery(tenant, q, filters, pageSize): Seq[JsObject]
-
-object SearchApi {
-  val DefaultPageSize = 20
-  val MaxQueryBytes = 256
-  val MaxPageSize = 100
-  // What a shopper may filter on: the engine filters on any stored field, cost_cents included.
-  val AllowedFilterFields: Seq[String] = Seq("brand", "category", "in_stock", "min_price", "max_price")
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def badRequest(error: String, extra: (String, JsValue)*): HttpResponse =
-    json(StatusCodes.BadRequest, JsObject((("error" -> JsString(error)) +: extra).toMap))
-
-  /** The filters as field → text, or None unless the value is a JSON object of strings. */
-  private def parseFilters(raw: String): Option[Map[String, String]] =
-    Try(raw.parseJson).toOption.collect { case JsObject(fields) => fields }.flatMap { fields =>
-      val strings = fields.collect { case (field, JsString(value)) => field -> value }
-      if (strings.size == fields.size) Some(strings) else None
-    }
-
-  val route: Route = path("v1" / "search") {
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("missing X-Tenant-Id"))))
-        case Some(tenant) =>
-          parameters("q".optional, "page_size".optional, "filters".optional) { (q, pageSize, filters) =>
-            val text = q.getOrElse("")
-            val size = pageSize.map(raw => raw.toIntOption.getOrElse(0)).getOrElse(DefaultPageSize)
-            if (text.trim.isEmpty || text.getBytes("UTF-8").length > MaxQueryBytes)
-              complete(badRequest(s"q must be 1 to $MaxQueryBytes bytes of UTF-8"))
-            else if (size < 1 || size > MaxPageSize)
-              complete(badRequest(s"page_size must be an integer from 1 to $MaxPageSize"))
-            else
-              parseFilters(filters.getOrElse("{}")) match {
-                case None => complete(badRequest("filters must be a JSON object of strings"))
-                case Some(requested) =>
-                  requested.keys.find(field => !AllowedFilterFields.contains(field)) match {
-                    case Some(field) => complete(badRequest(s"unknown filter field $field", "allowed" -> JsArray(AllowedFilterFields.map(JsString(_)).toVector)))
-                    case None =>
-                      val results = Catalog.runQuery(tenant, text, requested, size)
-                      complete(json(StatusCodes.OK, JsObject("results" -> JsArray(results.toVector), "page_size" -> JsNumber(size))))
-                  }
-              }
-          }
-      }
-    }
-  }
 }
 `,
     },

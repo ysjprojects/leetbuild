@@ -6,7 +6,7 @@ import {chatProxyStep} from './steps/1-chat-proxy';
 import {keyLimitsStep} from './steps/2-key-limits';
 import {promptDetectStep} from './steps/3-prompt-detect';
 import {firewallEventsStep} from './steps/4-firewall-events';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Cloudflare's Firewall for AI: the WAF-style layer in front of an LLM application, as one program
@@ -120,6 +120,5 @@ scanning and the rules control plane.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

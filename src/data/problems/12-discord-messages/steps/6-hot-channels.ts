@@ -59,7 +59,6 @@ are imported.
         python: {all: [/f"recent:\{/, /r\.lrange\(\s*\w+\s*,\s*0\s*,\s*limit\s*-\s*1\s*\)/]},
         typescript: {all: [/`recent:\$\{/, /redis\.lrange\(\s*\w+\s*,\s*0\s*,\s*limit\s*-\s*1\s*\)/]},
         go: {all: [/"recent:"\s*\+/, /rdb\.LRange\(\s*ctx\s*,\s*\w+\s*,\s*0\s*,\s*int64\(\s*limit\s*\)\s*-\s*1\s*\)/]},
-        scala: {all: [/s"recent:\$/, /jedis\.lrange\(\s*\w+\s*,\s*0L?\s*,\s*limit\s*-\s*1L?\s*\)/]},
         cpp: {all: [/"recent:"\s*\+/, /redis\.lrange\(\s*\w+\s*,\s*0\s*,\s*limit\s*-\s*1\s*,/]},
       },
     },
@@ -72,7 +71,6 @@ are imported.
         python: {all: [/before is None/, /len\(\s*cached\s*\)\s*>=\s*limit/]},
         typescript: {all: [/before\s*===?\s*undefined|before\s*==\s*null/, /cached\.length\s*>=\s*limit/]},
         go: {all: [/before\s*==\s*""/, /len\(\s*cached\s*\)\s*>=\s*limit/]},
-        scala: {all: [/before\.isEmpty/, /cached\.size\s*>=\s*limit/]},
         cpp: {
           all: [/!req\.has_param\(\s*"before"\s*\)/, /cached\.size\(\)\s*>=\s*static_cast<std::size_t>\(\s*limit\s*\)/],
         },
@@ -95,10 +93,6 @@ are imported.
         go: {
           all: [/fetchMessages\(\s*ctx\s*,\s*channelID\s*,/, /latestSnowflake\(\)/],
           none: [/func getMessages(?:(?!\n\})[\s\S])*?\.(LPush|RPush|Set)\(/],
-        },
-        scala: {
-          all: [/fetchMessages\(\s*channelId\s*,/, /latestSnowflake\(\)/],
-          none: [/\bget\s*\{(?:(?!\n {6}\})[\s\S])*?\.(lpush|rpush|set)\(/],
         },
         cpp: {
           all: [/fetch_messages\(\s*channel_id\s*,/, /latest_snowflake\(\)/],
@@ -136,14 +130,6 @@ are imported.
             /\.LTrim\(\s*ctx\s*,\s*\w+\s*,\s*0\s*,\s*recentN\s*-\s*1\s*\)/,
           ],
         },
-        scala: {
-          order: [
-            /storeMessage\(/,
-            /publish\(\s*message\s*\)/,
-            /\.lpush\(/,
-            /\.ltrim\(\s*\w+\s*,\s*0L?\s*,\s*RecentN\s*-\s*1L?\s*\)/,
-          ],
-        },
         cpp: {
           order: [
             /store_message\(/,
@@ -163,7 +149,6 @@ are imported.
         python: {all: [/\.expire\(\s*\w+\s*,\s*RECENT_TTL_S\s*\)/]},
         typescript: {all: [/\.expire\(\s*\w+\s*,\s*RECENT_TTL_S\s*\)/]},
         go: {all: [/\.Expire\(\s*ctx\s*,\s*\w+\s*,\s*recentTTL\s*\)/]},
-        scala: {all: [/\.expire\(\s*\w+\s*,\s*RecentTtlSeconds\s*\)/]},
         cpp: {all: [/\.expire\(\s*\w+\s*,\s*kRecentTtl\s*\)/]},
       },
     },
@@ -560,139 +545,6 @@ func main() {
 	mux.HandleFunc("GET /channels/{channel_id}/messages", getMessages)
 	mux.HandleFunc("POST /channels/{channel_id}/messages", postMessage)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import discord.Tls // Tls.serverContext — provided
-import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-// Built in step 1 (PostMessage: NewMessage, StoredMessage, validContent, storeMessage), step 2 (ReadMessages.latestSnowflake),
-// step 4 (ChannelRouting.fetchMessages) and step 5 (MessageEvents.publish).
-import ChannelRouting.fetchMessages
-import MessageEvents.publish
-import PostMessage.{newMessageFormat, storeMessage, storedFormat, validContent}
-import ReadMessages.latestSnowflake
-
-object HotChannels {
-  val DefaultLimit = 50
-  val MaxLimit = 100
-  val RecentN = 100
-  val RecentTtlSeconds = 300L
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def entry(id: String, authorId: String, content: String): JsObject =
-    JsObject("id" -> JsString(id), "author_id" -> JsString(authorId), "content" -> JsString(content))
-
-  val route: Route =
-    path("channels" / LongNumber / "messages") { channelId =>
-      get {
-        parameters("before".as[Long].optional, "limit".as[Int].withDefault(DefaultLimit)) { (before, limit) =>
-          // TODO: 400 unless 1 <= limit <= MaxLimit
-          // TODO: before.isEmpty → cached = LRANGE s"recent:$channelId" 0 limit-1; a full page (size >= limit) → answer it
-          // TODO: otherwise fetchMessages(channelId, before.getOrElse(latestSnowflake()), limit) → entries
-          complete(HttpResponse(StatusCodes.NotImplemented))
-        }
-      } ~
-        post {
-          entity(as[NewMessage]) { req =>
-            // TODO: 400 unless validContent; val message = storeMessage(...); publish(message)
-            // TODO: pipeline: LPUSH s"recent:$channelId" entry json; LTRIM 0 RecentN-1; EXPIRE RecentTtlSeconds
-            // TODO: 201 with the message
-            complete(HttpResponse(StatusCodes.NotImplemented))
-          }
-        }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("messages")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import discord.Tls // Tls.serverContext — provided
-import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-// Built in step 1 (PostMessage: NewMessage, StoredMessage, validContent, storeMessage), step 2 (ReadMessages.latestSnowflake),
-// step 4 (ChannelRouting.fetchMessages) and step 5 (MessageEvents.publish).
-import ChannelRouting.fetchMessages
-import MessageEvents.publish
-import PostMessage.{newMessageFormat, storeMessage, storedFormat, validContent}
-import ReadMessages.latestSnowflake
-
-object HotChannels {
-  val DefaultLimit = 50
-  val MaxLimit = 100
-  val RecentN = 100
-  val RecentTtlSeconds = 300L
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def entry(id: String, authorId: String, content: String): JsObject =
-    JsObject("id" -> JsString(id), "author_id" -> JsString(authorId), "content" -> JsString(content))
-
-  private def jsonArray(items: Seq[String]): HttpEntity.Strict =
-    HttpEntity(ContentTypes.\`application/json\`, items.mkString("[", ",", "]"))
-
-  val route: Route =
-    path("channels" / LongNumber / "messages") { channelId =>
-      get {
-        parameters("before".as[Long].optional, "limit".as[Int].withDefault(DefaultLimit)) { (before, limit) =>
-          if (limit < 1 || limit > MaxLimit)
-            complete(StatusCodes.BadRequest -> Map("error" -> "limit must be between 1 and 100"))
-          else {
-            val key = s"recent:$channelId"
-            val cached = if (before.isEmpty) jedis.lrange(key, 0, limit - 1).asScala.toVector else Vector.empty
-            if (before.isEmpty && cached.size >= limit) complete(jsonArray(cached)) // a shorter list is not a page
-            else {
-              val rows = fetchMessages(channelId, before.getOrElse(latestSnowflake()), limit)
-              complete(jsonArray(rows.map(m => entry(m.id.toString, m.authorId.toString, m.content).compactPrint)))
-            }
-          }
-        }
-      } ~
-        post {
-          entity(as[NewMessage]) { req =>
-            if (!validContent(req.content))
-              complete(StatusCodes.BadRequest -> Map("error" -> "content must be 1 to 2000 characters"))
-            else {
-              val message = storeMessage(channelId, req.authorId, req.content)
-              publish(message)
-              val key = s"recent:$channelId"
-              val pipe = jedis.pipelined()
-              pipe.lpush(key, entry(message.id, message.authorId, message.content).compactPrint)
-              pipe.ltrim(key, 0, RecentN - 1)
-              pipe.expire(key, RecentTtlSeconds)
-              pipe.sync()
-              complete(StatusCodes.Created -> message)
-            }
-          }
-        }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("messages")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

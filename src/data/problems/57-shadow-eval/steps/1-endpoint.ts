@@ -56,7 +56,6 @@ answers its next request with that key from a shadow config.
         python: {all: [/@app\.post\(\s*["']\/v1\/shadow\/configs["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/shadow\/configs['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/shadow\/configs"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"shadow"\s*\/\s*"configs"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/shadow\/configs"/]},
       },
     },
@@ -83,9 +82,6 @@ answers its next request with that key from a shadow config.
           ],
         },
         go: {all: [/minShare\s*=\s*1\b/, /maxShare\s*=\s*20\b/, /minShare[\s\S]*minShare/, /maxShare[\s\S]*maxShare/]},
-        scala: {
-          all: [/MinShare\s*=\s*1\b/, /MaxShare\s*=\s*20\b/, /MinShare[\s\S]*MinShare/, /MaxShare[\s\S]*MaxShare/],
-        },
         cpp: {
           all: [
             /kMinShare\s*=\s*1\b/,
@@ -105,7 +101,6 @@ answers its next request with that key from a shadow config.
         python: {all: [/x-tenant-id/i, /\b401\b/]},
         typescript: {all: [/x-tenant-id/i, /\b401\b/]},
         go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/X-Tenant-Id/i, /StatusCodes\.Unauthorized/]},
         cpp: {all: [/X-Tenant-Id/i, /\b401\b/]},
       },
     },
@@ -124,7 +119,6 @@ answers its next request with that key from a shadow config.
           all: [/(Recall|Remember)\([^\n]*store\.ShadowNS/],
           none: [/(Recall|Remember)\([^\n]*store\.IdempotencyNS/],
         },
-        scala: {all: [/(recall|remember)\(\s*Store\.ShadowNs/], none: [/(recall|remember)\(\s*Store\.IdempotencyNs/]},
         cpp: {all: [/(recall|remember)\(\s*store::kShadowNs/], none: [/(recall|remember)\(\s*store::kIdempotencyNs/]},
       },
     },
@@ -137,7 +131,6 @@ answers its next request with that key from a shadow config.
         python: {all: [/ALLOWED_METRICS\b[^\n]*=/, /ALLOWED_METRICS[\s\S]*ALLOWED_METRICS/, /\b400\b/]},
         typescript: {all: [/ALLOWED_METRICS\b[^\n]*=/, /ALLOWED_METRICS[\s\S]*ALLOWED_METRICS/, /\b400\b/]},
         go: {all: [/allowedMetrics\b[^\n]*=/, /allowedMetrics[\s\S]*allowedMetrics/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/AllowedMetrics\b[^\n]*=/, /AllowedMetrics[\s\S]*AllowedMetrics/, /StatusCodes\.BadRequest/]},
         cpp: {all: [/kAllowedMetrics\b[^\n]*=/, /kAllowedMetrics[\s\S]*kAllowedMetrics/, /\b400\b/]},
       },
     },
@@ -400,95 +393,6 @@ func createShadowConfig(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/shadow/configs", createShadowConfig)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import shadow.Store // Store.createConfig, getConfig, recall, remember, IdempotencyNs, ShadowNs
-
-object ShadowApi {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "shadow" / "configs") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-        optionalHeaderValueByName("Idempotency-Key") { keyHeader =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            val tenant = tenantHeader.getOrElse("")
-            val key = keyHeader.getOrElse("")
-            val body = raw.parseJson.asJsObject.fields
-            val candidateVersion = body.get("candidate_version").collect { case JsString(s) => s }.getOrElse("")
-            val share = body.get("share").collect { case JsNumber(n) => n.toInt }.getOrElse(0)
-            val metrics = body.get("metrics").collect { case JsArray(items) => items.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
-            val replayed = if (key.isEmpty) None else Store.recall(Store.IdempotencyNs, tenant, key)
-            replayed match {
-              case Some(configId) => complete(json(StatusCodes.OK, Store.getConfig(configId).map(_.toJson).getOrElse(JsNull)))
-              case None =>
-                val config = Store.createConfig(tenant, candidateVersion, share, metrics)
-                if (key.nonEmpty) Store.remember(Store.IdempotencyNs, tenant, key, config.configId)
-                complete(json(StatusCodes.Created, config.toJson))
-            }
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import shadow.Store // Store.createConfig, getConfig, recall, remember, IdempotencyNs, ShadowNs
-
-object ShadowApi {
-  val MinShare = 1
-  val MaxShare = 20
-  val AllowedMetrics: Set[String] = Set("latency", "cost", "quality")
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  val route: Route = path("v1" / "shadow" / "configs") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-        optionalHeaderValueByName("Idempotency-Key") { keyHeader =>
-          entity(as[String]) { raw =>
-            val tenant = tenantHeader.getOrElse("")
-            val key = keyHeader.getOrElse("")
-            val body = raw.parseJson.asJsObject.fields
-            val candidateVersion = body.get("candidate_version").collect { case JsString(s) => s }.getOrElse("")
-            val share = body.get("share").collect { case JsNumber(n) if n.isValidInt => n.toInt }
-            val metrics = body.get("metrics").collect { case JsArray(items) => items.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
-            if (tenant.isEmpty) complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-            else if (!share.exists(s => s >= MinShare && s <= MaxShare)) complete(error(StatusCodes.BadRequest, s"share must be $MinShare to $MaxShare percent"))
-            else if (metrics.isEmpty || !metrics.forall(AllowedMetrics.contains)) complete(error(StatusCodes.BadRequest, "metrics must be a non-empty subset of latency, cost, quality"))
-            else {
-              // The shadow's own namespace: production's idempotency records are neither read nor written here.
-              val replayed = if (key.isEmpty) None else Store.recall(Store.ShadowNs, tenant, key)
-              replayed match {
-                case Some(configId) => complete(json(StatusCodes.OK, Store.getConfig(configId).map(_.toJson).getOrElse(JsNull)))
-                case None =>
-                  val config = Store.createConfig(tenant, candidateVersion, share.get, metrics)
-                  if (key.nonEmpty) Store.remember(Store.ShadowNs, tenant, key, config.configId)
-                  complete(json(StatusCodes.Created, config.toJson))
-              }
-            }
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

@@ -63,7 +63,6 @@ tenant's taxonomy; and a label the model invented flows downstream as if the tax
         python: {all: [/@app\.post\(\s*["']\/v1\/classify["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/classify['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/classify"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"classify"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/classify"/]},
       },
     },
@@ -76,7 +75,6 @@ tenant's taxonomy; and a label the model invented flows downstream as if the tax
         python: {all: [/\.startswith\(\s*["']text\/["']\s*\)/, /\b415\b/]},
         typescript: {all: [/\.startsWith\(\s*['"]text\/['"]\s*\)/, /\b415\b/]},
         go: {all: [/strings\.HasPrefix\([^)]*"text\/"\s*\)/, /StatusUnsupportedMediaType|\b415\b/]},
-        scala: {all: [/\.startsWith\(\s*"text\/"\s*\)/, /UnsupportedMediaType|\b415\b/]},
         cpp: {all: [/rfind\(\s*"text\/",\s*0\s*\)|starts_with\(\s*"text\/"\s*\)/, /\b415\b/]},
       },
     },
@@ -89,7 +87,6 @@ tenant's taxonomy; and a label the model invented flows downstream as if the tax
         python: {all: [/MAX_TEXT_BYTES\s*=/, /\b413\b/, /\b400\b/, /\.strip\(\)/]},
         typescript: {all: [/MAX_TEXT_BYTES\s*=/, /\b413\b/, /\b400\b/, /\.trim\(\)/]},
         go: {all: [/maxTextBytes\s*=/, /StatusRequestEntityTooLarge|\b413\b/, /strings\.TrimSpace\(/]},
-        scala: {all: [/MaxTextBytes\b/, /RequestEntityTooLarge|\b413\b/, /\.trim\b/]},
         cpp: {all: [/kMaxTextBytes\s*=/, /\b413\b/, /find_first_not_of\(/]},
       },
     },
@@ -101,7 +98,6 @@ tenant's taxonomy; and a label the model invented flows downstream as if the tax
       match: {
         python: {all: [/taxonomies\.load\(\s*tenant/, /\b401\b/], none: [/taxonomies\.by_id\(/]},
         typescript: {all: [/taxonomies\.load\(\s*tenant/, /\b401\b/], none: [/taxonomies\.byId\(/]},
-        scala: {all: [/Taxonomies\.load\(\s*tenant/, /Unauthorized|\b401\b/], none: [/Taxonomies\.byId\(/]},
         cpp: {all: [/taxonomies::load\(\s*tenant/, /\b401\b/], none: [/taxonomies::byId\(/]},
         go: {
           all: [/taxonomies\.Load\(r\.Context\(\),\s*tenant/, /StatusUnauthorized|\b401\b/],
@@ -126,10 +122,6 @@ tenant's taxonomy; and a label the model invented flows downstream as if the tax
         go: {
           all: [/func bindLabels\(/, /config\.ReviewLabel/, /bindLabels\(\s*result\.Labels/],
           none: [/Labels:\s*result\.Labels/],
-        },
-        scala: {
-          all: [/def bindLabels\(/, /Config\.ReviewLabel/, /bindLabels\(\s*result\.labels/],
-          none: [/"labels"\s*->\s*strings\(result\.labels\)/],
         },
         cpp: {
           all: [/bind_labels\(/, /config::kReviewLabel/, /bind_labels\(\s*result\.labels/],
@@ -502,122 +494,6 @@ func classifyDocument(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/classify", classifyDocument)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import classifier.{Config, Inference, Taxonomies}
-
-object ClassifyApi {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def strings(values: Seq[String]): JsArray = JsArray(values.map(JsString(_)).toVector)
-
-  private def text(fields: Map[String, JsValue], name: String): String =
-    fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  val route: Route = path("v1" / "classify") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          val body = raw.parseJson.asJsObject.fields
-          Taxonomies.byId(text(body, "taxonomy_id")) match {
-            case None => complete(StatusCodes.NotFound -> "unknown taxonomy")
-            case Some(taxonomy) =>
-              val result = Inference.classify(text(body, "text"), taxonomy.taxonomyId, taxonomy.version)
-              System.err.println(s"classify tenant=\${tenant.getOrElse("")} taxonomy=\${taxonomy.taxonomyId} version=\${taxonomy.version}")
-              complete(
-                json(
-                  StatusCodes.OK,
-                  JsObject(
-                    "taxonomy_id" -> JsString(taxonomy.taxonomyId),
-                    "taxonomy_version" -> JsNumber(taxonomy.version),
-                    "labels" -> strings(result.labels),
-                    "unknown_labels" -> strings(Seq.empty),
-                    "provenance" -> JsString(result.provenance),
-                    "model_version" -> JsString(result.modelVersion)
-                  )
-                )
-              )
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import classifier.{Config, Inference, Taxonomies, Taxonomy}
-
-object ClassifyApi {
-  val MaxTextBytes: Int = 1 << 16
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def strings(values: Seq[String]): JsArray = JsArray(values.map(JsString(_)).toVector)
-
-  private def text(fields: Map[String, JsValue], name: String): String =
-    fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  /** Keep the labels the taxonomy version contains; an invented one is reported and routes to review. */
-  def bindLabels(raw: Seq[String], taxonomy: Taxonomy): (Seq[String], Seq[String]) = {
-    val known = raw.filter(taxonomy.labels.contains)
-    val unknown = raw.filterNot(label => taxonomy.labels.contains(label) || label == Config.ReviewLabel)
-    (if (unknown.nonEmpty || known.isEmpty) known :+ Config.ReviewLabel else known, unknown)
-  }
-
-  val route: Route = path("v1" / "classify") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "missing X-Tenant-Id")
-        case Some(tenant) =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject.fields
-            val document = text(body, "text").trim
-            val version = body.get("taxonomy_version").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-            // Every guard is cheaper than the model call it protects.
-            if (!text(body, "mime_type").startsWith("text/"))
-              complete(StatusCodes.UnsupportedMediaType -> "only text/* documents can be classified")
-            else if (document.isEmpty) complete(StatusCodes.BadRequest -> "text is empty")
-            else if (document.getBytes(UTF_8).length > MaxTextBytes) complete(StatusCodes.RequestEntityTooLarge -> "text exceeds 64 KiB")
-            else
-              Taxonomies.load(tenant, text(body, "taxonomy_id"), version) match {
-                case None => complete(StatusCodes.NotFound -> "unknown taxonomy")
-                case Some(taxonomy) =>
-                  val result = Inference.classify(document, taxonomy.taxonomyId, taxonomy.version)
-                  val (labels, unknown) = bindLabels(result.labels, taxonomy)
-                  complete(
-                    json(
-                      StatusCodes.OK,
-                      JsObject(
-                        "taxonomy_id" -> JsString(taxonomy.taxonomyId),
-                        "taxonomy_version" -> JsNumber(taxonomy.version),
-                        "labels" -> strings(labels),
-                        "unknown_labels" -> strings(unknown),
-                        "provenance" -> JsString(result.provenance),
-                        "model_version" -> JsString(result.modelVersion)
-                      )
-                    )
-                  )
-              }
-          }
-      }
-    }
-  }
 }
 `,
     },

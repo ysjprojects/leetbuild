@@ -55,7 +55,6 @@ service Ranker { rpc Rank(RankRequest) returns (RankResponse); }  // UNAVAILABLE
         python: {all: [/RANK_DEADLINE_S\s*=\s*0?\.5\b/, /\.Rank\([^)\n]*timeout\s*=\s*RANK_DEADLINE_S/]},
         typescript: {all: [/RANK_DEADLINE_MS\s*=\s*500\b/, /\.Rank\([^\n]*deadline:[^\n]*RANK_DEADLINE_MS/]},
         go: {all: [/rankDeadline\s*=\s*500\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*rankDeadline\)/]},
-        scala: {all: [/RankDeadlineMs\s*=\s*500L?\b/, /withDeadlineAfter\(\s*RankDeadlineMs/]},
         cpp: {all: [/kRankDeadline\{500\}/, /set_deadline\([^\n]*kRankDeadline\)/]},
       },
     },
@@ -68,7 +67,6 @@ service Ranker { rpc Rank(RankRequest) returns (RankResponse); }  // UNAVAILABLE
         python: {all: [/\.code\(\)[^\n]*StatusCode\.UNAVAILABLE/], none: [/except grpc\.RpcError:\s*\n\s*continue/]},
         typescript: {all: [/\.code[^\n]*grpc\.status\.UNAVAILABLE/], none: [/catch\s*\{\s*\}/]},
         go: {all: [/status\.Code\(err\)[^\n]*codes\.Unavailable/], none: [/if err != nil \{\s*\n\s*continue/]},
-        scala: {all: [/Status\.Code\.UNAVAILABLE/], none: [/case _: StatusRuntimeException => \(\)/]},
         cpp: {all: [/error_code\(\)[^\n]*StatusCode::UNAVAILABLE/], none: [/\.ok\(\)\)\s*continue;/]},
       },
     },
@@ -84,7 +82,6 @@ service Ranker { rpc Rank(RankRequest) returns (RankResponse); }  // UNAVAILABLE
           all: [/store\.PopularityOrder\(\s*ctx,\s*surface,\s*candidateIDs\s*\)/],
           none: [/return types\.Ranked\{\}/],
         },
-        scala: {all: [/Store\.popularityOrder\(\s*surface,\s*candidateIds\s*\)/], none: [/Ranked\(Seq\.empty/]},
         cpp: {all: [/store::popularityOrder\(\s*surface,\s*candidate_ids\s*\)/], none: [/return recs::Ranked\{\};/]},
       },
     },
@@ -97,7 +94,6 @@ service Ranker { rpc Rank(RankRequest) returns (RankResponse); }  // UNAVAILABLE
         python: {all: [/store\.POPULARITY_VERSION/, /"fallback":\s*True/]},
         typescript: {all: [/model_version:\s*POPULARITY_VERSION/, /fallback:\s*true/]},
         go: {all: [/ModelVersion:\s*store\.PopularityVersion/, /Fallback:\s*true/]},
-        scala: {all: [/Store\.PopularityVersion,\s*fallback\s*=\s*true/]},
         cpp: {all: [/store::kPopularityVersion,\s*true\}/]},
       },
     },
@@ -364,75 +360,6 @@ func rank(ctx context.Context, tenant, userID, surface string, candidateIDs []st
 	}
 	// The page still fills, and the stamp keeps the popularity order from counting as the model's.
 	return types.Ranked{Items: store.PopularityOrder(ctx, surface, candidateIDs), ModelVersion: store.PopularityVersion, Fallback: true}
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import recs.{Ranked, ScoredItem}
-import recsys.ranking.{RankRequest, RankResponse, RankerGrpc}
-
-object Client {
-  val MaxAttempts = 3
-
-  private val ranker = RankerGrpc.blockingStub(ManagedChannelBuilder.forAddress("ranker", 9000).usePlaintext().build())
-
-  private def rankedFrom(reply: RankResponse): Ranked =
-    Ranked(reply.items.map(item => ScoredItem(item.id, item.score)), reply.modelVersion, fallback = false)
-
-  /** The candidates ranked for the user: best first, stamped with the version that ordered them. */
-  def rank(tenant: String, userId: String, surface: String, candidateIds: Seq[String]): Ranked = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val features = State.loadFeatures(tenant, userId).map(_.values).getOrElse(Seq.empty)
-    val request = RankRequest(tenant, userId, surface, candidateIds, features)
-    var result: Option[Ranked] = None
-    var attempts = 0
-    while (result.isEmpty && attempts < MaxAttempts) {
-      attempts += 1
-      try result = Some(rankedFrom(ranker.rank(request)))
-      catch {
-        case _: StatusRuntimeException => () // the ranker is flaky: try again
-      }
-    }
-    result.getOrElse(Ranked(Seq.empty, "", fallback = false))
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import recs.{Ranked, ScoredItem, Store}
-import recsys.ranking.{RankRequest, RankResponse, RankerGrpc}
-
-object Client {
-  val MaxAttempts = 3
-  val RankDeadlineMs = 500L
-
-  private val ranker = RankerGrpc.blockingStub(ManagedChannelBuilder.forAddress("ranker", 9000).usePlaintext().build())
-
-  private def rankedFrom(reply: RankResponse): Ranked =
-    Ranked(reply.items.map(item => ScoredItem(item.id, item.score)), reply.modelVersion, fallback = false)
-
-  /** The candidates ranked for the user: best first, stamped with the version that ordered them. */
-  def rank(tenant: String, userId: String, surface: String, candidateIds: Seq[String]): Ranked = {
-    val features = State.loadFeatures(tenant, userId).map(_.values).getOrElse(Seq.empty)
-    val request = RankRequest(tenant, userId, surface, candidateIds, features)
-    var result: Option[Ranked] = None
-    var attempts = 0
-    var retryable = true
-    while (result.isEmpty && retryable && attempts < MaxAttempts) {
-      attempts += 1
-      try result = Some(rankedFrom(ranker.withDeadlineAfter(RankDeadlineMs, TimeUnit.MILLISECONDS).rank(request)))
-      catch {
-        // UNAVAILABLE: another replica may answer. A missed deadline or a refused request will not change.
-        case e: StatusRuntimeException => retryable = e.getStatus.getCode == Status.Code.UNAVAILABLE
-      }
-    }
-    // The page still fills, and the stamp keeps the popularity order from counting as the model's.
-    result.getOrElse(Ranked(Store.popularityOrder(surface, candidateIds), Store.PopularityVersion, fallback = true))
-  }
 }
 `,
     },

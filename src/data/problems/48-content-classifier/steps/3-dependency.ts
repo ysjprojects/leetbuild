@@ -49,12 +49,11 @@ message ClassifyReply { repeated string labels = 1; bool refused = 2; string mod
       id: 'deadline',
       title: 'Every model call carries a 700 ms deadline',
       detail:
-        'Each Classify call, a retry included, carries its own deadline of 0.7 s (`timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`), so a model that hangs costs three short attempts, not the hang. The starter sends no deadline.',
+        'Each Classify call, a retry included, carries its own deadline of 0.7 s (`timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `set_deadline`), so a model that hangs costs three short attempts, not the hang. The starter sends no deadline.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*0\.7\b/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*700\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*700\s*\*\s*time\.Millisecond/, /context\.WithTimeout\(/]},
-        scala: {all: [/DeadlineMs\s*=\s*700L?\b/, /withDeadlineAfter\(/]},
         cpp: {all: [/kDeadline\{700\}/, /set_deadline\(/]},
       },
     },
@@ -70,7 +69,6 @@ message ClassifyReply { repeated string labels = 1; bool refused = 2; string mod
         },
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /status\.UNAVAILABLE/, /reply\.refused/], none: [/MAX_WAIT_MS/]},
         go: {all: [/maxAttempts\s*=\s*3\b/, /codes\.Unavailable/, /GetRefused\(\)/], none: [/maxWait\b/]},
-        scala: {all: [/MaxAttempts\s*=\s*3\b/, /Status\.Code\.UNAVAILABLE/, /\.refused\b/], none: [/MaxWaitMs/]},
         cpp: {all: [/kMaxAttempts\s*=\s*3\b/, /grpc::StatusCode::UNAVAILABLE/, /\.refused\(\)/], none: [/kMaxWait\b/]},
       },
     },
@@ -83,7 +81,6 @@ message ClassifyReply { repeated string labels = 1; bool refused = 2; string mod
         python: {all: [/def rules_classify\(/, /KEYWORD_RULES/, /rules_classify\(\s*text\s*\)/]},
         typescript: {all: [/function rulesClassify\(/, /KEYWORD_RULES/, /rulesClassify\(\s*text\s*\)/]},
         go: {all: [/func rulesClassify\(/, /keywordRules/, /rulesClassify\(\s*text\s*\)/]},
-        scala: {all: [/def rulesClassify\(/, /KeywordRules/, /rulesClassify\(\s*text\s*\)/]},
         cpp: {all: [/rulesClassify\(const std::string& text\)/, /kKeywordRules/, /rulesClassify\(\s*text\s*\)/]},
       },
     },
@@ -96,7 +93,6 @@ message ClassifyReply { repeated string labels = 1; bool refused = 2; string mod
         python: {all: [/REVIEW_LABEL/], none: [/["']safe["']/]},
         typescript: {all: [/REVIEW_LABEL/], none: [/['"]safe['"]/]},
         go: {all: [/config\.ReviewLabel/], none: [/"safe"/]},
-        scala: {all: [/Config\.ReviewLabel/], none: [/"safe"/]},
         cpp: {all: [/config::kReviewLabel/], none: [/"safe"/]},
       },
     },
@@ -109,7 +105,6 @@ message ClassifyReply { repeated string labels = 1; bool refused = 2; string mod
         python: {all: [/["']fallback["']/, /["']rules["']/, /\.incr\(\s*FALLBACK_KEY\s*\)/]},
         typescript: {all: [/['"]fallback['"]/, /['"]rules['"]/, /\.incr\(\s*FALLBACK_KEY\s*\)/]},
         go: {all: [/"fallback"/, /"rules"/, /\.Incr\(ctx,\s*config\.FallbackKey\)/]},
-        scala: {all: [/"fallback"/, /"rules"/, /\.incr\(\s*Config\.FallbackKey\s*\)/]},
         cpp: {all: [/"fallback"/, /"rules"/, /\.incr\(\s*config::kFallbackKey\s*\)/]},
       },
     },
@@ -478,91 +473,6 @@ func classify(ctx context.Context, text, taxonomyID string, taxonomyVersion int)
 		return Result{}, err
 	}
 	return Result{Labels: rulesClassify(text), Provenance: "fallback", ModelVersion: "rules"}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import classifier.{Config, Result}
-import contentclassifier.content_classifier.{ClassifyRequest, ModelGrpc}
-
-object ModelClient {
-  val MaxWaitMs = 10000L
-  val BackoffMs = 100L
-
-  private val stub = ModelGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.Model).usePlaintext().build())
-
-  /** Labels for the text: ask the model until it answers. */
-  def classify(text: String, taxonomyId: String, taxonomyVersion: Long): Result = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val request = ClassifyRequest(text = text, taxonomyId = taxonomyId, taxonomyVersion = taxonomyVersion)
-    val until = System.currentTimeMillis() + MaxWaitMs
-    while (System.currentTimeMillis() < until) {
-      try {
-        val reply = stub.classify(request)
-        if (!reply.refused) return Result(reply.labels, "model", reply.modelVersion)
-        Thread.sleep(BackoffMs)
-      } catch {
-        case e: StatusRuntimeException =>
-          System.err.println(s"model call failed code=\${e.getStatus.getCode}")
-          Thread.sleep(BackoffMs)
-      }
-    }
-    Result(Seq("safe"), "model", "")
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-
-import classifier.{Config, Result}
-import contentclassifier.content_classifier.{ClassifyRequest, ModelGrpc}
-
-object ModelClient {
-  val DeadlineMs = 700L
-  val MaxAttempts = 3
-  val BackoffMs = 50L
-  private val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-  private val KeywordRules = Seq(
-    "billing" -> Seq("invoice", "refund", "charge"),
-    "support" -> Seq("broken", "error", "crash"),
-    "security" -> Seq("password", "breach", "phishing")
-  )
-
-  private val stub = ModelGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.Model).usePlaintext().build())
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Keyword evidence only: a text no rule matches goes to review, never to a safe label. */
-  def rulesClassify(text: String): Seq[String] = {
-    val lowered = text.toLowerCase
-    val labels = KeywordRules.collect { case (label, words) if words.exists(lowered.contains) => label }
-    if (labels.isEmpty) Seq(Config.ReviewLabel) else labels
-  }
-
-  /** Labels for the text from the model, or from the keyword rules when the model cannot answer. */
-  def classify(text: String, taxonomyId: String, taxonomyVersion: Long): Result = {
-    val request = ClassifyRequest(text = text, taxonomyId = taxonomyId, taxonomyVersion = taxonomyVersion)
-    var attempt = 1
-    while (attempt <= MaxAttempts) {
-      try {
-        val reply = stub.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).classify(request)
-        if (!reply.refused) return Result(reply.labels, "model", reply.modelVersion)
-        attempt = MaxAttempts + 1 // the model's decision: asking again gets the same answer
-      } catch {
-        case e: StatusRuntimeException if Retryable(e.getStatus.getCode) && attempt < MaxAttempts =>
-          Thread.sleep(BackoffMs * attempt)
-          attempt += 1
-        case e: StatusRuntimeException =>
-          System.err.println(s"model call failed attempt=$attempt code=\${e.getStatus.getCode}")
-          attempt = MaxAttempts + 1
-      }
-    }
-    jedis.incr(Config.FallbackKey)
-    Result(rulesClassify(text), "fallback", "rules")
-  }
 }
 `,
     },

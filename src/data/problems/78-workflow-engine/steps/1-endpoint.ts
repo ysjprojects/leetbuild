@@ -54,7 +54,6 @@ graph is accepted; a 70 KB input or a budget of 0 steps is stored.
         python: {all: [/definitions\.has_cycle\(/, /status_code\s*=\s*422/]},
         typescript: {all: [/definitions\.hasCycle\(/, /code\(\s*422\s*\)/]},
         go: {all: [/definitions\.HasCycle\(/, /StatusUnprocessableEntity/]},
-        scala: {all: [/Definitions\.hasCycle\(/, /StatusCodes\.UnprocessableEntity/]},
         cpp: {all: [/definitions::hasCycle\(/, /\b422\b/]},
       },
     },
@@ -67,7 +66,6 @@ graph is accepted; a 70 KB input or a budget of 0 steps is stored.
         python: {all: [/status_code\s*=\s*409/], order: [/definitions\.exists\(/, /definitions\.put\(/]},
         typescript: {all: [/code\(\s*409\s*\)/], order: [/definitions\.exists\(/, /definitions\.put\(/]},
         go: {all: [/StatusConflict/], order: [/definitions\.Exists\(/, /definitions\.Put\(/]},
-        scala: {all: [/StatusCodes\.Conflict/], order: [/Definitions\.exists\(/, /Definitions\.put\(/]},
         cpp: {all: [/\b409\b/], order: [/definitions::exists\(/, /definitions::put\(/]},
       },
     },
@@ -80,7 +78,6 @@ graph is accepted; a 70 KB input or a budget of 0 steps is stored.
         python: {all: [/definitions\.get\(/], none: [/definitions\.latest\(/]},
         typescript: {all: [/definitions\.get\(/], none: [/definitions\.latest\(/]},
         go: {all: [/definitions\.Get\(/], none: [/definitions\.Latest\(/]},
-        scala: {all: [/Definitions\.get\(/], none: [/Definitions\.latest\(/]},
         cpp: {all: [/definitions::get\(/], none: [/definitions::latest\(/]},
       },
     },
@@ -93,7 +90,6 @@ graph is accepted; a 70 KB input or a budget of 0 steps is stored.
         python: {all: [/MAX_INPUT_BYTES/, /\bMAX_STEPS\b/, /status_code\s*=\s*413/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_INPUT_BYTES/, /\bMAX_STEPS\b/, /code\(\s*413\s*\)/, /code\(\s*400\s*\)/]},
         go: {all: [/maxInputBytes/, /\bmaxSteps\b/, /StatusRequestEntityTooLarge/]},
-        scala: {all: [/MaxInputBytes/, /\bMaxSteps\b/, /StatusCodes\.PayloadTooLarge/, /StatusCodes\.BadRequest/]},
         cpp: {all: [/kMaxInputBytes/, /\bkMaxSteps\b/, /\b413\b/, /\b400\b/]},
       },
     },
@@ -485,128 +481,6 @@ func startRun(rw http.ResponseWriter, r *http.Request) {
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/workflows", publishWorkflow)
 	mux.HandleFunc("POST /v1/runs", startRun)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import workflow.{Definitions, Runs} // Definitions.hasCycle, exists, get, latest, put · Runs.create, get
-
-object Api {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def runView(run: Runs.Run): JsObject = JsObject(
-    "run_id" -> JsString(run.runId), "workflow" -> JsString(run.workflow), "definition_version" -> JsNumber(run.definitionVersion),
-    "pinned_steps" -> run.pinnedSteps.toJson, "max_steps" -> JsNumber(run.maxSteps))
-
-  val route: Route = concat(
-    path("v1" / "workflows") {
-      post {
-        entity(as[String]) { raw =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val body = raw.parseJson.asJsObject.fields
-          val name = body("name").convertTo[String]
-          val version = body("version").convertTo[Long]
-          val steps = body("steps").convertTo[Seq[String]]
-          val edges = body.get("edges").map(_.convertTo[Seq[Seq[String]]]).getOrElse(Seq.empty)
-          Definitions.put(name, version, steps, edges)
-          complete(json(StatusCodes.Created, JsObject("name" -> JsString(name), "version" -> JsNumber(version))))
-        }
-      }
-    },
-    path("v1" / "runs") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            entity(as[String]) { raw =>
-              val body = raw.parseJson.asJsObject.fields
-              val workflowName = body("workflow").convertTo[String]
-              val input = body.get("input").map(_.asJsObject).getOrElse(JsObject.empty)
-              val maxSteps = body.get("max_steps").map(_.convertTo[Int]).getOrElse(50)
-              Definitions.latest(workflowName) match {
-                case None => complete(StatusCodes.NotFound -> s"$workflowName is not published")
-                case Some(definition) =>
-                  val run = Runs.create(tenant, workflowName, definition.version, definition.steps, input, maxSteps)
-                  complete(json(StatusCodes.Accepted, runView(run)))
-              }
-            }
-        }
-      }
-    },
-  )
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import workflow.{Definitions, Runs} // Definitions.hasCycle, exists, get, latest, put · Runs.create, get
-
-object Api {
-  val MaxInputBytes: Int = 1 << 16
-  val MaxSteps = 500
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def runView(run: Runs.Run): JsObject = JsObject(
-    "run_id" -> JsString(run.runId), "workflow" -> JsString(run.workflow), "definition_version" -> JsNumber(run.definitionVersion),
-    "pinned_steps" -> run.pinnedSteps.toJson, "max_steps" -> JsNumber(run.maxSteps))
-
-  val route: Route = concat(
-    path("v1" / "workflows") {
-      post {
-        entity(as[String]) { raw =>
-          val body = raw.parseJson.asJsObject.fields
-          val name = body("name").convertTo[String]
-          val version = body("version").convertTo[Long]
-          val steps = body("steps").convertTo[Seq[String]]
-          val edges = body.get("edges").map(_.convertTo[Seq[Seq[String]]]).getOrElse(Seq.empty)
-          if (Definitions.hasCycle(steps, edges)) complete(StatusCodes.UnprocessableEntity -> "the step graph has a cycle")
-          // A published version never changes: runs are pinned to it.
-          else if (Definitions.exists(name, version)) complete(StatusCodes.Conflict -> s"$name v$version is already published")
-          else {
-            Definitions.put(name, version, steps, edges)
-            complete(json(StatusCodes.Created, JsObject("name" -> JsString(name), "version" -> JsNumber(version))))
-          }
-        }
-      }
-    },
-    path("v1" / "runs") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            entity(as[String]) { raw =>
-              val body = raw.parseJson.asJsObject.fields
-              val workflowName = body("workflow").convertTo[String]
-              val version = body("version").convertTo[Long]
-              val input = body.get("input").map(_.asJsObject).getOrElse(JsObject.empty)
-              val maxSteps = body.get("max_steps").map(_.convertTo[Int]).getOrElse(50)
-              if (input.compactPrint.getBytes("UTF-8").length > MaxInputBytes) complete(StatusCodes.PayloadTooLarge -> s"input is over $MaxInputBytes bytes")
-              else if (maxSteps < 1 || maxSteps > MaxSteps) complete(StatusCodes.BadRequest -> s"max_steps must be within 1..$MaxSteps")
-              else
-                // Resolved once: the run keeps this version's steps whatever is published later.
-                Definitions.get(workflowName, version) match {
-                  case None => complete(StatusCodes.NotFound -> s"$workflowName v$version is not published")
-                  case Some(definition) =>
-                    val run = Runs.create(tenant, workflowName, definition.version, definition.steps, input, maxSteps)
-                    complete(json(StatusCodes.Accepted, runView(run)))
-                }
-            }
-        }
-      }
-    },
-  )
 }
 `,
     },

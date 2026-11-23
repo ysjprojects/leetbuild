@@ -46,7 +46,6 @@ the rotation's writes leaves two live ids, and a rotated session starts its eigh
         python: {all: [/SLIDING_TTL_S/], order: [/def touch_session\(/, /\.expire\(/]},
         typescript: {all: [/SLIDING_TTL_S/], order: [/function touchSession\(/, /\.expire\(/]},
         go: {all: [/SlidingTTLSeconds/], order: [/func touchSession\(/, /\.Expire\(/]},
-        scala: {all: [/SlidingTtlS/], order: [/def touchSession\(/, /\.expire\(/]},
         cpp: {all: [/kSlidingTtlS/], order: [/touchSession\(const std::string/, /\.expire\(/]},
       },
     },
@@ -59,7 +58,6 @@ the rotation's writes leaves two live ids, and a rotated session starts its eigh
         python: {order: [/def touch_session\(/, /ABSOLUTE_TTL_S/]},
         typescript: {order: [/function touchSession\(/, /ABSOLUTE_TTL_S/]},
         go: {order: [/func touchSession\(/, /store\.AbsoluteTTLSeconds/]},
-        scala: {order: [/def touchSession\(/, /Store\.AbsoluteTtlS/]},
         cpp: {order: [/touchSession\(const std::string/, /store::kAbsoluteTtlS/]},
       },
     },
@@ -81,10 +79,6 @@ the rotation's writes leaves two live ids, and a rotated session starts its eigh
           all: [/redis\.NewScript\(|\.Eval\(|\.EvalSha\(|\.TxPipelined\(/],
           none: [/func rotateSession(?:(?!\n\})[\s\S])*?rdb\.(Del|HSet|SRem|SAdd)\(/],
         },
-        scala: {
-          all: [/jedis\.eval\(|\.multi\(/],
-          none: [/def rotateSession(?:(?!\n {2}def |\n {2}\/\*\*)[\s\S])*?jedis\.(del|hset|srem|sadd)\(/],
-        },
         cpp: {
           all: [/\.eval<|\.transaction\(/],
           none: [/rotateSession\(const std::string(?:(?!\n\})[\s\S])*?redis\(\)\.(del|hset|srem|sadd)\(/],
@@ -103,7 +97,6 @@ the rotation's writes leaves two live ids, and a rotated session starts its eigh
         },
         typescript: {all: [/f\['created_at'\]|record\.created_at/], none: [/created_at:\s*now\b/]},
         go: {all: [/f\['created_at'\]|record\.CreatedAt/], none: [/"created_at",\s*now\b/]},
-        scala: {all: [/f\['created_at'\]|record\.createdAt/], none: [/"created_at"\s*->\s*now\b/]},
         cpp: {all: [/f\['created_at'\]|record->created_at/], none: [/"created_at"\),\s*now\)/]},
       },
     },
@@ -417,96 +410,6 @@ func touchSession(ctx context.Context, sessionID string) (*store.Session, error)
 	}
 	record.LastSeen = now
 	return record, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import sessions.Store // Store.Session, sessionKey, userKey, newSessionId, readSession, retireSession, nowSeconds, SlidingTtlS, AbsoluteTtlS
-
-object SessionState {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Move a live session to a fresh id: same user, device and token hash; None when the old one is gone. */
-  def rotateSession(oldId: String): Option[String] = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    Store.readSession(oldId).map { record =>
-      val newId = Store.newSessionId()
-      val now = Store.nowSeconds().toString
-      val newKey = Store.sessionKey(newId)
-      jedis.hset(newKey, Map("user_id" -> record.userId, "device_class" -> record.deviceClass, "token_hash" -> record.tokenHash,
-        "created_at" -> now, "last_seen" -> now, "rotation" -> (record.rotation + 1).toString).asJava)
-      jedis.expire(newKey, Store.SlidingTtlS)
-      jedis.sadd(Store.userKey(record.userId), newId)
-      jedis.del(Store.sessionKey(oldId))
-      jedis.srem(Store.userKey(record.userId), oldId)
-      newId
-    }
-  }
-
-  /** One use of a session: its record with last_seen now, or None when it is gone. */
-  def touchSession(sessionId: String): Option[Store.Session] =
-    Store.readSession(sessionId).map { record =>
-      val now = Store.nowSeconds()
-      jedis.hset(Store.sessionKey(sessionId), "last_seen", now.toString)
-      record.copy(lastSeen = now)
-    }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import sessions.Store // Store.Session, sessionKey, userKey, newSessionId, readSession, retireSession, nowSeconds, SlidingTtlS, AbsoluteTtlS
-
-object SessionState {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** KEYS: old session, new session. ARGV: old id, new id, now, SlidingTtlS, AbsoluteTtlS. Every write of the rotation, or none of them. */
-  val RotateLua: String =
-    """local rec = redis.call('HGETALL', KEYS[1])
-      |if #rec == 0 then return 0 end
-      |local f = {}
-      |for i = 1, #rec, 2 do f[rec[i]] = rec[i + 1] end
-      |local users = 'user:' .. f['user_id'] .. ':sessions'
-      |local left = tonumber(f['created_at']) + tonumber(ARGV[5]) - tonumber(ARGV[3])
-      |redis.call('DEL', KEYS[1])
-      |redis.call('SREM', users, ARGV[1])
-      |if left <= 0 then return 0 end
-      |redis.call('HSET', KEYS[2], 'user_id', f['user_id'], 'device_class', f['device_class'], 'token_hash', f['token_hash'],
-      |  'created_at', f['created_at'], 'last_seen', ARGV[3], 'rotation', tonumber(f['rotation']) + 1)
-      |redis.call('EXPIRE', KEYS[2], math.min(tonumber(ARGV[4]), left))
-      |redis.call('SADD', users, ARGV[2])
-      |return 1
-      |""".stripMargin
-
-  /** Move a live session to a fresh id: same user, device, token hash and created_at; None when the old one is gone or past its cap. */
-  def rotateSession(oldId: String): Option[String] = {
-    val newId = Store.newSessionId()
-    val keys = List(Store.sessionKey(oldId), Store.sessionKey(newId)).asJava
-    val args = List(oldId, newId, Store.nowSeconds().toString, Store.SlidingTtlS.toString, Store.AbsoluteTtlS.toString).asJava
-    val moved = jedis.eval(RotateLua, keys, args).asInstanceOf[java.lang.Long]
-    if (moved == 1L) Some(newId) else None
-  }
-
-  /** One use of a session: its record with last_seen now, or None when it is gone or past its cap. */
-  def touchSession(sessionId: String): Option[Store.Session] =
-    Store.readSession(sessionId).flatMap { record =>
-      val now = Store.nowSeconds()
-      val left = record.createdAt + Store.AbsoluteTtlS - now
-      if (left <= 0) {
-        Store.retireSession(sessionId)
-        None
-      } else {
-        jedis.hset(Store.sessionKey(sessionId), "last_seen", now.toString)
-        // Slide the idle timeout, never past the cap: Redis deletes the session on time even if nobody calls again.
-        jedis.expire(Store.sessionKey(sessionId), math.min(Store.SlidingTtlS, left))
-        Some(record.copy(lastSeen = now))
-      }
-    }
 }
 `,
     },

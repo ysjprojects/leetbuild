@@ -66,7 +66,6 @@ team's window, with a window, a class or an amount the broker cannot enforce.
         python: {all: [/@app\.post\(\s*["']\/v1\/quotas\/\{team\}\/reserve["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/quotas\/:team\/reserve['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/quotas\/\{team\}\/reserve"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"quotas"\s*\/\s*Segment\s*\/\s*"reserve"\s*\)/]},
         cpp: {all: [/svr\.Post\([^\n]*\/v1\/quotas\/[^\n]*\/reserve/]},
       },
     },
@@ -79,7 +78,6 @@ team's window, with a window, a class or an amount the broker cannot enforce.
         python: {all: [/x-team-id/i, /\b401\b/, /\b403\b/]},
         typescript: {all: [/x-team-id/i, /code\(\s*401\s*\)/, /code\(\s*403\s*\)/]},
         go: {all: [/X-Team-Id/i, /StatusUnauthorized|\b401\b/, /StatusForbidden|\b403\b/]},
-        scala: {all: [/X-Team-Id/i, /Unauthorized/, /Forbidden/]},
         cpp: {all: [/X-Team-Id/i, /\b401\b/, /\b403\b/]},
       },
     },
@@ -92,7 +90,6 @@ team's window, with a window, a class or an amount the broker cannot enforce.
         python: {all: [/WINDOW_RE/, /MAX_RESERVE_AMOUNT/, /\b400\b/]},
         typescript: {all: [/WINDOW_RE/, /MAX_RESERVE_AMOUNT/, /code\(\s*400\s*\)/]},
         go: {all: [/windowPattern/, /maxReserveAmount/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/WindowPattern/, /MaxReserveAmount/, /BadRequest/]},
         cpp: {all: [/kWindowRe/, /kMaxReserveAmount/, /\b400\b/]},
       },
     },
@@ -105,7 +102,6 @@ team's window, with a window, a class or an amount the broker cannot enforce.
         python: {all: [/RESOURCE_CLASSES/, /\b400\b/]},
         typescript: {all: [/RESOURCE_CLASSES/, /code\(\s*400\s*\)/]},
         go: {all: [/resourceClasses/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/ResourceClasses/, /BadRequest/]},
         cpp: {all: [/kResourceClasses/, /\b400\b/]},
       },
     },
@@ -118,7 +114,6 @@ team's window, with a window, a class or an amount the broker cannot enforce.
         python: {all: [/ledger\.reserve\(/, /reservation_id/, /\b201\b/], none: [/["']status["']\s*:\s*["']ok["']/]},
         typescript: {all: [/\breserve\(/, /reservation_id/, /code\(\s*201\s*\)/], none: [/status:\s*['"]ok['"]/]},
         go: {all: [/ledger\.Reserve\(/, /"reservation_id"/, /StatusCreated|\b201\b/], none: [/"status":\s*"ok"/]},
-        scala: {all: [/Ledger\.reserve\(/, /reservation_id/, /Created/], none: [/"status"\s*->\s*JsString\("ok"\)/]},
         cpp: {all: [/ledger::reserve\(/, /"reservation_id"/, /\b201\b/], none: [/\{"status",\s*"ok"\}/]},
       },
     },
@@ -379,88 +374,6 @@ func reserve(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/quotas/{team}/reserve", reserve)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import quota.Ledger // Ledger.limitOf, reserve, release, consume
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route =
-    path("v1" / "quotas" / Segment / "reserve") { team =>
-      post {
-        entity(as[String]) { raw =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val body = raw.parseJson.asJsObject.fields
-          val amount = body.get("amount").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-          if (amount > Ledger.limitOf(team)) complete(json(StatusCodes.Conflict, JsObject("error" -> JsString("quota_exhausted"))))
-          else complete(json(StatusCodes.OK, JsObject("status" -> JsString("ok"), "team" -> JsString(team), "amount" -> JsNumber(amount))))
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import quota.Ledger // Ledger.limitOf, reserve, release, consume
-
-object Api {
-  val ResourceClasses: Set[String] = Set("gpu-a100", "gpu-h100", "tpu-v5")
-  val MaxReserveAmount = 64L
-  val WindowPattern = "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z$".r
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  val route: Route =
-    path("v1" / "quotas" / Segment / "reserve") { team =>
-      post {
-        optionalHeaderValueByName("X-Team-Id") { caller =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject.fields
-            val window = body.get("window").collect { case JsString(s) => s }.getOrElse("")
-            val resourceClass = body.get("resource_class").collect { case JsString(s) => s }.getOrElse("")
-            val amount = body.get("amount").collect { case JsNumber(n) if n.isValidLong => n.toLong }.getOrElse(0L)
-            if (caller.forall(_.isEmpty)) complete(error(StatusCodes.Unauthorized, "missing X-Team-Id"))
-            else if (!caller.contains(team)) complete(error(StatusCodes.Forbidden, "another team's quota"))
-            else if (WindowPattern.findFirstIn(window).isEmpty) complete(error(StatusCodes.BadRequest, "window must be YYYY-MM-DDTHH:MMZ"))
-            else if (!ResourceClasses.contains(resourceClass)) complete(error(StatusCodes.BadRequest, "unknown resource class"))
-            else if (amount < 1 || amount > MaxReserveAmount) complete(error(StatusCodes.BadRequest, s"amount must be 1..$MaxReserveAmount"))
-            else
-              // One call compares and takes inside Redis: no second request can land between the two.
-              Ledger.reserve(team, window, resourceClass, amount) match {
-                case None => complete(error(StatusCodes.Conflict, "quota_exhausted"))
-                case Some(reservationId) =>
-                  complete(
-                    json(
-                      StatusCodes.Created,
-                      JsObject(
-                        "reservation_id" -> JsString(reservationId),
-                        "team" -> JsString(team),
-                        "window" -> JsString(window),
-                        "resource_class" -> JsString(resourceClass),
-                        "amount" -> JsNumber(amount)
-                      )
-                    )
-                  )
-              }
-          }
-        }
-      }
-    }
 }
 `,
     },

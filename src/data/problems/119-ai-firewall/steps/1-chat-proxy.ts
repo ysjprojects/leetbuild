@@ -58,7 +58,6 @@ log sink.
         python: {all: [/@app\.post\(\s*["']\/v1\/chat["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/chat['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/chat"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"chat"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/chat"/]},
       },
     },
@@ -74,10 +73,6 @@ log sink.
           none: [/anonymous/],
         },
         go: {all: [/StatusUnauthorized|\b401\b/, /X-Request-Id/i, /uuid\.New(String)?\(\)/], none: [/anonymous/]},
-        scala: {
-          all: [/StatusCodes\.Unauthorized|\b401\b/, /X-Request-Id/i, /UUID\.randomUUID\(\)/],
-          none: [/anonymous/],
-        },
         cpp: {all: [/\b401\b/, /X-Request-Id/i, /new_uuid\(\)|uuid_generate/], none: [/anonymous/]},
       },
     },
@@ -114,15 +109,6 @@ log sink.
           ],
           none: [/\.Input\.Prompt\b/],
         },
-        scala: {
-          all: [
-            /PromptPath\s*=\s*"input\.prompt"/,
-            /MaxPromptBytes\s*=\s*(1\s*<<\s*16|65536)/,
-            /RequestEntityTooLarge|\b413\b/,
-            /BadRequest|\b400\b/,
-          ],
-          none: [/fields\(\s*"input"\s*\)/],
-        },
         cpp: {
           all: [/kPromptPath\s*=\s*"input\.prompt"/, /kMaxPromptBytes\s*=\s*(1\s*<<\s*16|65536)/, /\b413\b/, /\b400\b/],
           none: [/\[\s*"input"\s*\]\s*\[\s*"prompt"\s*\]/],
@@ -138,7 +124,6 @@ log sink.
         python: {all: [/\b403\b/, /\.action\s*(==\s*["']block["']|!=\s*["']allow["'])/]},
         typescript: {all: [/\b403\b/, /\.action\s*(===?\s*['"]block['"]|!==?\s*['"]allow['"])/]},
         go: {all: [/StatusForbidden|\b403\b/, /\.Action\s*(==\s*"block"|!=\s*"allow")/]},
-        scala: {all: [/StatusCodes\.Forbidden|\b403\b/, /\.action\s*(==\s*"block"|!=\s*"allow")/]},
         cpp: {all: [/\b403\b/, /\.action\s*(==\s*"block"|!=\s*"allow")/]},
       },
     },
@@ -151,7 +136,6 @@ log sink.
         python: {all: [/logger\.\w+\([^\n]*action/], none: [/logg?e?r?\.\w+\([^\n]*(?<![\w(.])prompt\s*[,)]/]},
         typescript: {all: [/log\.\w+\([^\n]*action/], none: [/log\.\w+\([^\n]*(?<![\w(.])prompt\s*[,}]/]},
         go: {all: [/log\.Printf\([^\n]*action/], none: [/log\.\w+\([^\n]*(?<![\w(.])prompt\s*[,)]/]},
-        scala: {all: [/log\.\w+\([^\n]*action/], none: [/log\.\w+\([^\n]*\$\{?prompt\b/]},
         cpp: {all: [/(cerr|clog|cout)[^;]*action/], none: [/(cerr|clog|cout)[^;]*<<\s*\*?prompt\b/]},
       },
     },
@@ -482,123 +466,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", rateLimit(mux)))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-object FirewallApi {
-  implicit val system: ActorSystem = ActorSystem("aifw")
-
-  /** The proxy every request to the LLM application passes through. */
-  val route: Route =
-    path("v1" / "chat") {
-      post {
-        optionalHeaderValueByName("X-Api-Key") { keyOpt =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val started = System.currentTimeMillis()
-            val apiKey = keyOpt.getOrElse("anonymous")
-            val body = raw.parseJson.asJsObject
-            val prompt = body.fields("input").asJsObject.fields("prompt").convertTo[String]
-            val decision = Detect.decide(prompt, "")
-            system.log.info(s"chat key=$apiKey action=\${decision.action} score=\${decision.score} prompt=$prompt")
-            val answer = aifw.Upstream.forward(prompt, "")
-            val output = Events.finish(apiKey, "", decision, answer, started)
-            complete(HttpEntity(ContentTypes.\`application/json\`, JsObject("output" -> JsString(output)).compactPrint))
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(RateLimit.rateLimited(route))
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets
-import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-object FirewallApi {
-  implicit val system: ActorSystem = ActorSystem("aifw")
-
-  val PromptPath = "input.prompt"
-  val MaxPromptBytes = 1 << 16
-
-  /** The string at a dotted path into the JSON body, or None when absent or not a string. */
-  def promptAt(body: JsValue, path: String): Option[String] = {
-    val node = path.split('.').foldLeft(Option(body)) { (acc, part) =>
-      acc.flatMap {
-        case obj: JsObject => obj.fields.get(part)
-        case _ => None
-      }
-    }
-    node.collect { case JsString(s) => s }
-  }
-
-  private def json(status: StatusCode, rid: String, body: JsObject): HttpResponse =
-    HttpResponse(
-      status,
-      headers = List(RawHeader("X-Request-Id", rid)),
-      entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)
-    )
-
-  /** The proxy every request to the LLM application passes through. */
-  val route: Route =
-    path("v1" / "chat") {
-      post {
-        optionalHeaderValueByName("X-Api-Key") { keyOpt =>
-          optionalHeaderValueByName("X-Request-Id") { ridOpt =>
-            entity(as[String]) { raw =>
-              val started = System.currentTimeMillis()
-              val rid = ridOpt.filter(_.nonEmpty).getOrElse(UUID.randomUUID().toString)
-              keyOpt.filter(_.nonEmpty) match {
-                case None =>
-                  complete(StatusCodes.Unauthorized, """{"error":"missing X-Api-Key"}""")
-                case Some(apiKey) =>
-                  promptAt(raw.parseJson, PromptPath).filter(_.nonEmpty) match {
-                    case None =>
-                      complete(json(StatusCodes.BadRequest, rid, JsObject("error" -> JsString(s"no prompt at $PromptPath"))))
-                    case Some(prompt) if prompt.getBytes(StandardCharsets.UTF_8).length > MaxPromptBytes =>
-                      complete(json(StatusCodes.RequestEntityTooLarge, rid, JsObject("error" -> JsString("prompt exceeds 64 KiB"))))
-                    case Some(prompt) =>
-                      val decision = Detect.decide(prompt, rid)
-                      system.log.info(s"chat rid=$rid action=\${decision.action} score=\${decision.score} tags=\${decision.tags}")
-                      if (decision.action == "block") {
-                        Events.finish(apiKey, rid, decision, "", started)
-                        complete(json(StatusCodes.Forbidden, rid, JsObject("error" -> JsString("blocked"), "request_id" -> JsString(rid))))
-                      } else {
-                        val answer = aifw.Upstream.forward(prompt, rid)
-                        val output = Events.finish(apiKey, rid, decision, answer, started)
-                        complete(json(StatusCodes.OK, rid, JsObject("output" -> JsString(output), "request_id" -> JsString(rid))))
-                      }
-                  }
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(RateLimit.rateLimited(route))
-  }
 }
 `,
     },

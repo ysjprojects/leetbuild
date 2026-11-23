@@ -2,10 +2,9 @@
  * Hand-written support modules the log-indexer steps import but no step builds: the `logindex`
  * package. `registry` is the tenant's service registry, `ledger` the hourly indexed counts the
  * completeness read reports on. `buffer` is step 2's Redis buffer and `shard` step 3's shard client
- * as the other steps use them. The five languages keep the same keys, so a harness reads one layout
+ * as the other steps use them. The four languages keep the same keys, so a harness reads one layout
  * whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 /** The buffer's Lua scripts, shared by the support module and step 2's solution. */
 export const APPEND_LUA = `local size = string.len(ARGV[1])
@@ -24,13 +23,6 @@ for _, record in ipairs(batch) do size = size + string.len(record) end
 redis.call('HINCRBY', KEYS[2], 'count', -#batch)
 redis.call('HINCRBY', KEYS[2], 'bytes', -size)
 return batch`;
-
-/** A script as the body of a Scala stripMargin literal. */
-export const scalaLua = (lua: string): string =>
-  lua
-    .split('\n')
-    .map((line, i) => (i === 0 ? line : `      |${line}`))
-    .join('\n');
 
 export const supportModules: Record<string, string> = {
   'logindex/__init__.py': '',
@@ -873,171 +865,5 @@ inline long long expectedPerHour(const std::string& tenant, const std::string& s
 }
 
 }  // namespace ledger
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('logindex', 'Registry')]: `package logindex
-
-import redis.clients.jedis.JedisPooled
-
-/**
- * The tenant service registry (provided): registry:{tenant} is the Redis set of the service ids the
- * tenant registered. The ingest route and the completeness read serve only those.
- */
-object Registry {
-  val jedis = new JedisPooled("redis", 6379)
-
-  def registryKey(tenant: String): String = s"registry:$tenant"
-
-  /** Whether the tenant registered the service. */
-  def isRegistered(tenant: String, service: String): Boolean = jedis.sismember(registryKey(tenant), service)
-
-  /** Register a service for a tenant (the onboarding flow calls this). */
-  def addService(tenant: String, service: String): Unit = jedis.sadd(registryKey(tenant), service)
-}
-`,
-  [scalaPath('logindex', 'Buffer')]: `package logindex
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The log buffer (provided; step 2 builds the same two functions): buffer:{tenant}:{service} is the
- * Redis list of one index's records (JSON) waiting for the shard, buffer:{tenant}:{service}:meta the
- * hash beside it with count (records buffered), bytes (their size) and offset (records ever
- * appended). appendRecord admits a record in one Lua script and returns its offset, or sheds it
- * (returns 0) when it would take the buffer past MaxBufferBytes; drainBatch takes at most BatchSize
- * records and settles count and bytes in the same script.
- */
-object Buffer {
-  /** One log record as the buffer and the shard carry it. */
-  final case class Record(service: String, timestamp: String, level: String, message: String)
-
-  implicit val recordFormat: RootJsonFormat[Record] = jsonFormat4(Record.apply)
-
-  val MaxBufferBytes: Long = 64L << 20
-  val BatchSize = 1000
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  val AppendLua: String =
-    """${scalaLua(APPEND_LUA)}
-      |""".stripMargin
-
-  val DrainLua: String =
-    """${scalaLua(DRAIN_LUA)}
-      |""".stripMargin
-
-  def bufferKey(tenant: String, service: String): String = s"buffer:$tenant:$service"
-  def metaKey(tenant: String, service: String): String = s"buffer:$tenant:$service:meta"
-
-  /** Buffer one record: its offset, or 0 when it was shed. */
-  def appendRecord(tenant: String, service: String, record: Record): Long = {
-    val keys = List(bufferKey(tenant, service), metaKey(tenant, service)).asJava
-    jedis.eval(AppendLua, keys, List(record.toJson.compactPrint, MaxBufferBytes.toString).asJava).asInstanceOf[java.lang.Long]
-  }
-
-  /** Take the oldest BatchSize records at most, oldest first. */
-  def drainBatch(tenant: String, service: String): Seq[Record] = {
-    val keys = List(bufferKey(tenant, service), metaKey(tenant, service)).asJava
-    val raw = jedis.eval(DrainLua, keys, List(BatchSize.toString).asJava).asInstanceOf[java.util.List[String]]
-    raw.asScala.toSeq.map(_.parseJson.convertTo[Record])
-  }
-}
-`,
-  [scalaPath('logindex', 'Shard')]: `package logindex
-
-import java.util.UUID
-import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import logshard.log_indexer.{BulkWriteRequest, IndexShardGrpc, LogRecord}
-
-/** The shard's mapping refuses the batch: terminal until the records or the mapping change. */
-final class MappingConflict(val field: String) extends Exception(s"mapping conflict on field $field")
-
-/** The shard did not take the batch: it refused it, or the retryable failures ran out of attempts. */
-final class ShardWriteFailed(message: String) extends Exception(message)
-
-/**
- * The index shard client (provided; step 3 builds the same bulkWrite): one BulkWrite per batch to
- * shard:9000 with a 3-second deadline per attempt, at most MaxAttempts attempts with a backoff for
- * UNAVAILABLE and DEADLINE_EXCEEDED only, and one batch id for every attempt (the shard indexes a
- * batch id once). A mapping conflict (FAILED_PRECONDITION, the field as the details) throws
- * MappingConflict; any other failure throws ShardWriteFailed.
- */
-object Shard {
-  /** What one batch write did: the batch id every attempt carried and the shard's reply. */
-  final case class WriteResult(batchId: String, indexed: Int, rejected: Int, indexSnapshot: String)
-
-  val DeadlineS = 3L
-  val MaxAttempts = 3
-  val BackoffMs = 200L
-
-  private val stub = IndexShardGrpc.blockingStub(ManagedChannelBuilder.forAddress("shard", 9000).usePlaintext().build())
-
-  def protos(records: Seq[Buffer.Record]): Seq[LogRecord] = records.map(r => LogRecord(r.service, r.timestamp, r.level, r.message))
-
-  /** Write one batch to the index. */
-  def bulkWrite(index: String, records: Seq[Buffer.Record]): WriteResult = {
-    val batchId = UUID.randomUUID().toString
-    var attempt = 1
-    var result: Option[WriteResult] = None
-    while (result.isEmpty) {
-      try {
-        val reply = stub.withDeadlineAfter(DeadlineS, TimeUnit.SECONDS).bulkWrite(BulkWriteRequest(index, batchId, attempt, protos(records)))
-        result = Some(WriteResult(batchId, reply.indexed, reply.rejected, reply.indexSnapshot))
-      } catch {
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.FAILED_PRECONDITION =>
-          throw new MappingConflict(Option(e.getStatus.getDescription).getOrElse(""))
-        case e: StatusRuntimeException =>
-          val code = e.getStatus.getCode
-          val retryable = code == Status.Code.UNAVAILABLE || code == Status.Code.DEADLINE_EXCEEDED
-          if (!retryable || attempt >= MaxAttempts) throw new ShardWriteFailed(s"$code after $attempt attempt(s)")
-          Thread.sleep(BackoffMs << (attempt - 1))
-          attempt += 1
-      }
-    }
-    result.get
-  }
-}
-`,
-  [scalaPath('logindex', 'Ledger')]: `package logindex
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The index ledger (provided): ledger:{tenant}:{service} is a Redis hash from an hour (its start, in
- * epoch seconds) to the number of the service's records indexed in that hour. The ledger service, a
- * consumer of log.indexed this course does not build, calls recordIndexed.
- */
-object Ledger {
-  val HourS = 3600L
-  val HistoryHours = 168
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def ledgerKey(tenant: String, service: String): String = s"ledger:$tenant:$service"
-
-  /** Add count records indexed in the hour starting at hour (epoch seconds). */
-  def recordIndexed(tenant: String, service: String, hour: Long, count: Long): Unit =
-    jedis.hincrBy(ledgerKey(tenant, service), hour.toString, count)
-
-  /** The indexed count of each hour (its start in epoch seconds), 0 for an hour with none. */
-  def hourlyCounts(tenant: String, service: String, hours: Seq[Long]): Seq[Long] =
-    if (hours.isEmpty) Seq.empty
-    else jedis.hmget(ledgerKey(tenant, service), hours.map(_.toString): _*).asScala.toSeq.map(v => Option(v).filter(_.nonEmpty).fold(0L)(_.toLong))
-
-  /** The service's own baseline: its mean count per hour over the HistoryHours hours before \`before\`, rounded down. */
-  def expectedPerHour(tenant: String, service: String, before: Long): Long =
-    hourlyCounts(tenant, service, (1 to HistoryHours).map(i => before - HourS * i)).sum / HistoryHours
-}
 `,
 };

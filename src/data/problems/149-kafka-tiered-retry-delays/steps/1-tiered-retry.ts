@@ -96,13 +96,6 @@ milliseconds, one per retry topic in that order; \`tasks.dlq\` is the end of the
             /SubscribeTopics\(\s*append\(\[\]string\{topic\},\s*retryTopics\.\.\.\)/,
           ],
         },
-        scala: {
-          all: [
-            /"group\.id"\s*,\s*(Group|"tasks-workers")/,
-            /"enable\.auto\.commit"\s*,\s*"false"/,
-            /subscribe\(\s*\(Topic \+: RetryTopics\)\.asJava\s*\)/,
-          ],
-        },
         cpp: {
           all: [
             /"group\.id"\s*,\s*(kGroup|"tasks-workers")/,
@@ -121,7 +114,6 @@ milliseconds, one per retry topic in that order; \`tasks.dlq\` is the end of the
         python: {all: [/producer\.produce\(/, /"attempt"/, /"not_before"/, /TIERS\[/, /DLQ_TOPIC/]},
         typescript: {all: [/producer\.send\(/, /attempt:\s*String\(/, /not_before/, /TIERS\[/, /DLQ_TOPIC/]},
         go: {all: [/producer\.Produce\(/, /Key:\s*"attempt"/, /Key:\s*"not_before"/, /tiers\[/, /dlqTopic/]},
-        scala: {all: [/producer\.send\(/, /"attempt"/, /"not_before"/, /Tiers\(/, /DlqTopic/]},
         cpp: {all: [/producer->produce\(/, /"attempt"/, /"not_before"/, /kTiers\[/, /kDlqTopic/]},
       },
     },
@@ -134,7 +126,6 @@ milliseconds, one per retry topic in that order; \`tasks.dlq\` is the end of the
         python: {all: [/consumer\.pause\(/, /consumer\.seek\(/]},
         typescript: {all: [/consumer\.pause\(/, /consumer\.seek\(/]},
         go: {all: [/consumer\.Pause\(/, /consumer\.Seek\(/]},
-        scala: {all: [/consumer\.pause\(/, /consumer\.seek\(/]},
         cpp: {all: [/consumer->pause\(/, /consumer->seek\(/]},
       },
     },
@@ -147,7 +138,6 @@ milliseconds, one per retry topic in that order; \`tasks.dlq\` is the end of the
         python: {all: [/consumer\.resume\(/], none: [/time\.sleep\(/]},
         typescript: {all: [/consumer\.resume\(/], none: [/new Promise\([^\n]*setTimeout/]},
         go: {all: [/consumer\.Resume\(/], none: [/time\.Sleep\(/]},
-        scala: {all: [/consumer\.resume\(/], none: [/Thread\.sleep\(/]},
         cpp: {all: [/consumer->resume\(/], none: [/sleep_for\(/]},
       },
     },
@@ -160,7 +150,6 @@ milliseconds, one per retry topic in that order; \`tasks.dlq\` is the end of the
         python: {order: [/producer\.produce\(/, /producer\.flush\(/, /consumer\.commit\(/]},
         typescript: {order: [/await producer\.send\(/, /consumer\.commitOffsets\(/]},
         go: {order: [/producer\.Produce\(/, /producer\.Flush\(/, /consumer\.CommitMessage\(/]},
-        scala: {order: [/producer\.send\([^\n]*\)\.get\(\)/, /consumer\.commitSync\(/]},
         cpp: {order: [/producer->produce\(/, /producer->flush\(/, /consumer->commitSync\(/]},
       },
     },
@@ -173,7 +162,6 @@ milliseconds, one per retry topic in that order; \`tasks.dlq\` is the end of the
         python: {order: [/(?<!def )handler\(/, /except Exception/, /(?<!def )forward\(/]},
         typescript: {order: [/await handler\(/, /catch/, /await forward\(/]},
         go: {order: [/:= handler\(/, /err != nil/, /(?<!func )forward\(/]},
-        scala: {order: [/try handler\(/, /case NonFatal\(/, /(?<!def )forward\(/]},
         cpp: {order: [/\bhandler\(/, /catch \(const std::exception/, /(?<!void )forward\(/]},
       },
     },
@@ -649,143 +637,6 @@ func run(handler Handler) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-import scala.util.control.NonFatal
-
-object TieredRetry {
-  val Topic = "tasks"
-  val Tiers = Seq(5000L, 30000L, 300000L) // ms, one per retry topic
-  val RetryTopics = Seq("tasks.retry.5s", "tasks.retry.30s", "tasks.retry.5m")
-  val DlqTopic = "tasks.dlq"
-  val Group = "tasks-workers"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", Group)
-  props.put("auto.offset.reset", "earliest")
-  // TODO: disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Topic).asJava) // TODO: the three retry topics too
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  producerProps.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  /** A header's value as text, None when absent. */
-  private def header(record: ConsumerRecord[String, String], name: String): Option[String] =
-    Option(record.headers().lastHeader(name)).map(h => new String(h.value()))
-
-  /** Hand the record to the next tier — or the DLQ after the last — and wait for the acknowledgement. */
-  def forward(record: ConsumerRecord[String, String], cause: Throwable): Unit = {
-    // TODO: attempt = header attempt + 1; attempt <= Tiers.size → RetryTopics(attempt - 1) with not_before = now + Tiers(attempt - 1), else DlqTopic
-    // TODO: a ProducerRecord with the same key and value, headers attempt / error (/ not_before); send(...).get() before returning
-  }
-
-  def run(handler: (String, String) => Unit): Unit = {
-    val waiting = mutable.Map.empty[TopicPartition, (Long, Long)] // partition -> (not_before, offset)
-    while (true) {
-      // TODO: resume (and seek back to the remembered offset) every paused partition whose not_before has passed
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val tp = new TopicPartition(record.topic(), record.partition())
-        // TODO: not_before in the future → pause(tp), seek(tp, record.offset()), remember when it is due; skip the rest of a paused partition's batch
-        // TODO: handler(key, value); NonFatal → forward(record, e); then commitSync this record's offset + 1
-        handler(record.key(), record.value())
-        consumer.commitSync(Map(tp -> new OffsetAndMetadata(record.offset() + 1)).asJava)
-      }
-    }
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-import scala.util.control.NonFatal
-
-object TieredRetry {
-  val Topic = "tasks"
-  val Tiers = Seq(5000L, 30000L, 300000L) // ms, one per retry topic
-  val RetryTopics = Seq("tasks.retry.5s", "tasks.retry.30s", "tasks.retry.5m")
-  val DlqTopic = "tasks.dlq"
-  val Group = "tasks-workers"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", Group)
-  props.put("auto.offset.reset", "earliest")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe((Topic +: RetryTopics).asJava)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  producerProps.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  /** A header's value as text, None when absent. */
-  private def header(record: ConsumerRecord[String, String], name: String): Option[String] =
-    Option(record.headers().lastHeader(name)).map(h => new String(h.value()))
-
-  /** Hand the record to the next tier — or the DLQ after the last — and wait for the acknowledgement. */
-  def forward(record: ConsumerRecord[String, String], cause: Throwable): Unit = {
-    val attempt = header(record, "attempt").map(_.toInt).getOrElse(0) + 1
-    val target = if (attempt <= Tiers.size) RetryTopics(attempt - 1) else DlqTopic
-    val out = new ProducerRecord[String, String](target, record.key(), record.value())
-    out.headers().add("attempt", attempt.toString.getBytes)
-    out.headers().add("error", String.valueOf(cause.getMessage).getBytes)
-    if (attempt <= Tiers.size)
-      out.headers().add("not_before", (System.currentTimeMillis() + Tiers(attempt - 1)).toString.getBytes)
-    producer.send(out).get() // acknowledged before the caller commits the source offset
-  }
-
-  def run(handler: (String, String) => Unit): Unit = {
-    val waiting = mutable.Map.empty[TopicPartition, (Long, Long)] // partition -> (not_before, offset)
-    while (true) {
-      val now = System.currentTimeMillis()
-      waiting.toList.foreach { case (tp, (due, offset)) =>
-        if (now >= due) {
-          consumer.resume(Set(tp).asJava)
-          consumer.seek(tp, offset) // the waiting record is read next
-          waiting.remove(tp)
-        }
-      }
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val tp = new TopicPartition(record.topic(), record.partition())
-        if (!waiting.contains(tp)) { // the rest of a paused partition's batch is dropped: the seek re-reads it
-          val notBefore = header(record, "not_before").map(_.toLong).getOrElse(0L)
-          if (notBefore > System.currentTimeMillis()) {
-            consumer.pause(Set(tp).asJava) // nothing more from this partition; every other one keeps flowing
-            consumer.seek(tp, record.offset()) // put the record back under the cursor
-            waiting(tp) = (notBefore, record.offset()) // not committed: it was never handled
-          } else {
-            try handler(record.key(), record.value())
-            catch { case NonFatal(e) => forward(record, e) }
-            consumer.commitSync(Map(tp -> new OffsetAndMetadata(record.offset() + 1)).asJava)
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

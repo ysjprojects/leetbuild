@@ -67,10 +67,6 @@ progress for a source nobody finishes stays in Redis forever.
           all: [/progressKey\(\s*tenant\s*,\s*sourceHash\s*\)/, /summary:progress:/],
           none: [/progressKey\(\s*tenant\s*,\s*sourceRef\s*\)/],
         },
-        scala: {
-          all: [/progressKey\(\s*tenant\s*,\s*sourceHash\s*\)/, /summary:progress:/],
-          none: [/progressKey\(\s*tenant\s*,\s*sourceRef\s*\)/],
-        },
         cpp: {
           all: [/progressKey\(\s*tenant\s*,\s*source_hash\s*\)/, /summary:progress:/],
           none: [/progressKey\(\s*tenant\s*,\s*source_ref\s*\)/],
@@ -95,10 +91,6 @@ progress for a source nobody finishes stays in Redis forever.
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]HSET['"]/, /chunks_done/],
           none: [/\.HIncrBy\(/, /rdb\.HSet\(/, /rdb\.HGet\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HSET['"]/, /chunks_done/],
-          none: [/jedis\.hincrBy\(/, /jedis\.hset\(/, /jedis\.hget\(/],
-        },
         cpp: {
           all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HSET['"]/, /chunks_done/],
           none: [/redis\.hincrby\(/, /redis\.hset\(/, /redis\.hget\(/],
@@ -113,7 +105,6 @@ progress for a source nobody finishes stays in Redis forever.
         python: {all: [/TTL_S\s*=\s*3600/, /redis\.call\(\s*['"]EXPIRE['"]/]},
         typescript: {all: [/TTL_S\s*=\s*3600/, /redis\.call\(\s*['"]EXPIRE['"]/]},
         go: {all: [/ttlSeconds\s*=\s*3600/, /redis\.call\(\s*['"]EXPIRE['"]/]},
-        scala: {all: [/TtlSeconds\s*=\s*3600/, /redis\.call\(\s*['"]EXPIRE['"]/]},
         cpp: {all: [/kTtlSeconds\s*=\s*3600/, /redis\.call\(\s*['"]EXPIRE['"]/]},
       },
     },
@@ -126,7 +117,6 @@ progress for a source nobody finishes stays in Redis forever.
         python: {all: [/HGET['"]\s*,\s*KEYS\[1\]\s*,\s*['"]chunks_done/, /tonumber\(\s*ARGV\[1\]\s*\)/]},
         typescript: {all: [/HGET['"]\s*,\s*KEYS\[1\]\s*,\s*['"]chunks_done/, /tonumber\(\s*ARGV\[1\]\s*\)/]},
         go: {all: [/HGET['"]\s*,\s*KEYS\[1\]\s*,\s*['"]chunks_done/, /tonumber\(\s*ARGV\[1\]\s*\)/]},
-        scala: {all: [/HGET['"]\s*,\s*KEYS\[1\]\s*,\s*['"]chunks_done/, /tonumber\(\s*ARGV\[1\]\s*\)/]},
         cpp: {all: [/HGET['"]\s*,\s*KEYS\[1\]\s*,\s*['"]chunks_done/, /tonumber\(\s*ARGV\[1\]\s*\)/]},
       },
     },
@@ -305,57 +295,6 @@ func applyChunk(ctx context.Context, tenant, sourceRef, sourceHash string, chunk
 	}
 	done, _ := strconv.Atoi(reply[1])
 	return Progress{Applied: reply[0] == "1", ChunksDone: done, Summary: reply[2]}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-final case class Progress(applied: Boolean, chunksDone: Int, summary: String)
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  def progressKey(tenant: String, sourceRef: String): String = s"summary:progress:$tenant:$sourceRef"
-
-  /** Fold one chunk's summary into the rolling summary of the source. */
-  def applyChunk(tenant: String, sourceRef: String, sourceHash: String, chunkIndex: Int, chunkSummary: String): Progress = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = progressKey(tenant, sourceRef)
-    val current = Option(jedis.hget(key, "summary")).getOrElse("")
-    val summary = s"$current $chunkSummary".trim
-    jedis.hset(key, "summary", summary)
-    jedis.hset(key, "source_hash", sourceHash)
-    val done = jedis.hincrBy(key, "chunks_done", 1)
-    Progress(applied = true, done.toInt, summary)
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-final case class Progress(applied: Boolean, chunksDone: Int, summary: String)
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val TtlSeconds = 3600
-
-  /** ${LUA_COMMENT} */
-  val CommitLua: String =
-    """${LUA.split('\n').join('\n      |')}
-      |""".stripMargin
-
-  def progressKey(tenant: String, sourceHash: String): String = s"summary:progress:$tenant:$sourceHash"
-
-  /** Fold one chunk's summary into the rolling summary of the source. */
-  def applyChunk(tenant: String, sourceRef: String, sourceHash: String, chunkIndex: Int, chunkSummary: String): Progress = {
-    // An edited source has another hash, so it starts a summary of its own.
-    val args = List(chunkIndex.toString, chunkSummary, TtlSeconds.toString, sourceRef).asJava
-    val reply = jedis.eval(CommitLua, List(progressKey(tenant, sourceHash)).asJava, args).asInstanceOf[java.util.List[String]].asScala
-    Progress(reply(0) == "1", reply(1).toInt, reply(2))
-  }
 }
 `,
     },

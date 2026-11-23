@@ -6,7 +6,6 @@
  * model server.
  */
 import {CPP_DIGEST_H} from '../cpp-support';
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'pcache/__init__.py': '',
@@ -333,52 +332,5 @@ inline Completion complete(const std::string& prefix, double temperature) {
 }
 
 }  // namespace llm
-`,
-};
-
-/** The Scala twins: the same \`pcache\` objects, compiled with the steps by \`yarn check:scala\`. */
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('pcache', 'Config')]: `package pcache
-
-/** Addresses, topics, keys and prices every step of the prompt cache agrees on. */
-object Config {
-  /** The model server's gRPC address: a stand-in served by the checks. */
-  val Model = "model:9000"
-  /** One event per cache decision (hit or miss), keyed by tenant, for the stats consumer. */
-  val Topic = "cache.result"
-  /** A cache entry lives as long as its prompt version is served: six hours from the fill. */
-  val VersionTtlSeconds: Long = 6L * 3600
-
-  /** What 1 000 completion tokens cost on the model each prompt version runs on (USD). */
-  val PricePer1kUsd: Map[Int, Double] = Map(7 -> 0.0020, 8 -> 0.0015)
-  /** The price of a version the table does not list. */
-  val DefaultPricePer1kUsd = 0.0020
-
-  def pricePer1k(version: Int): Double = PricePer1kUsd.getOrElse(version, DefaultPricePer1kUsd)
-
-  // Entries live under pc:{tenant}:{version}:{digest} (step 1 builds the key). The stats consumer keeps,
-  // per (tenant, prompt version), a hash of hits, misses, fill_ms (the summed latency of misses) and
-  // tokens_saved (completion tokens served from the cache), and per tenant the set of its versions.
-  def statsKey(tenant: String, version: Int): String = s"pc-stats:$tenant:$version"
-  def versionsKey(tenant: String): String = s"pc-versions:$tenant"
-}
-`,
-  [scalaPath('pcache', 'Record')]: `package pcache
-
-/** A cache entry: the JSON stored under pc:{tenant}:{version}:{digest}. tokens: what a hit saves. */
-final case class CacheRecord(tenant: String, version: Int, completion: String, tokens: Int)
-
-object CacheRecord {
-  def encode(r: CacheRecord): String =
-    ujson.write(ujson.Obj("tenant" -> r.tenant, "version" -> r.version, "completion" -> r.completion, "tokens" -> r.tokens))
-
-  def decode(raw: String): CacheRecord = {
-    val j = ujson.read(raw)
-    CacheRecord(j("tenant").str, j("version").num.toInt, j("completion").str, j("tokens").num.toInt)
-  }
-}
-
-/** What the miss path answers. status: cached (stored and served), uncached (served, not stored), refused, error. */
-final case class Miss(status: String, completion: String, tokens: Int)
 `,
 };

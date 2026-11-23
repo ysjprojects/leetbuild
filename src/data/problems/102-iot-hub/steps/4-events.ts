@@ -47,10 +47,6 @@ broker that refuses the record or does not answer drops the transition with nobo
         },
         typescript: {all: [/key:\s*command\.device_id/], none: [/key:\s*command\.command_id/]},
         go: {all: [/Key:\s*\[\]byte\(command\.DeviceID\)/], none: [/Key:\s*\[\]byte\(command\.CommandID\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(\s*Topic\s*,\s*command\.deviceId/],
-          none: [/Topic\s*,\s*command\.commandId/],
-        },
         cpp: {
           all: [/command\.device_id\.c_str\(\)\s*,\s*command\.device_id\.(size|length)\(\)/],
           none: [/command\.command_id\.c_str\(\)/],
@@ -66,7 +62,6 @@ broker that refuses the record or does not answer drops the transition with nobo
         python: {all: [/["']outcome["']/], none: [/def event_payload(?:(?!\ndef )[\s\S])*?params/]},
         typescript: {all: [/outcome/], none: [/function eventPayload(?:(?!\nexport |\nfunction )[\s\S])*?params/]},
         go: {all: [/"outcome"/], none: [/func eventPayload(?:(?!\n\})[\s\S])*?Params/]},
-        scala: {all: [/"outcome"/], none: [/def eventPayload(?:(?!\n {2}def |\n {2}\/\*\*)[\s\S])*?params/]},
         cpp: {all: [/"outcome"/], none: [/json eventPayload(?:(?!\n\})[\s\S])*?params/]},
       },
     },
@@ -79,7 +74,6 @@ broker that refuses the record or does not answer drops the transition with nobo
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -92,7 +86,6 @@ broker that refuses the record or does not answer drops the transition with nobo
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/outbox\.Insert\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.insert\(/, /\.get\(\s*[^\n]*TimeUnit/, /Failure|catch|isFailure/]},
         cpp: {all: [/outbox::insert\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -364,90 +357,6 @@ func publishTransition(ctx context.Context, command *commands.Command, outcome s
 		return false, outbox.Insert(ctx, topic, command.DeviceID, payload)
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import iothub.{Command, Outbox} // Outbox.insert(topic, key, payload)
-
-object CommandEvents {
-  val Topic = "iot.command"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def eventPayload(command: Command, outcome: String): JsObject =
-    JsObject(
-      "command_id" -> JsString(command.commandId),
-      "device_id" -> JsString(command.deviceId),
-      "action" -> JsString(command.action),
-      "params" -> JsObject(command.params.map { case (k, v) => k -> JsString(v) }),
-      "outcome" -> JsString(outcome),
-      "at_ms" -> JsNumber(System.currentTimeMillis()))
-
-  /** Tell the fleet audit what happened to a command; true once the broker has the event. */
-  def publishTransition(command: Command, outcome: String): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val payload = eventPayload(command, outcome)
-    producer.send(new ProducerRecord[String, String](Topic, command.commandId, payload.compactPrint))
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import iothub.{Command, Outbox} // Outbox.insert(topic, key, payload)
-
-object CommandEvents {
-  val Topic = "iot.command"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Ids and the outcome; the parameters (a PIN, a setpoint) stay in the command store. */
-  def eventPayload(command: Command, outcome: String): JsObject =
-    JsObject(
-      "command_id" -> JsString(command.commandId),
-      "device_id" -> JsString(command.deviceId),
-      "action" -> JsString(command.action),
-      "outcome" -> JsString(outcome),
-      "at_ms" -> JsNumber(System.currentTimeMillis()))
-
-  /** Tell the fleet audit what happened to a command; true once the broker has the event. */
-  def publishTransition(command: Command, outcome: String): Boolean = {
-    val payload = eventPayload(command, outcome)
-    // One device's transitions share a key, so the audit reads them in the order they happened.
-    val record = new ProducerRecord[String, String](Topic, command.deviceId, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so the audit is late, not wrong.
-      Outbox.insert(Topic, command.deviceId, payload)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

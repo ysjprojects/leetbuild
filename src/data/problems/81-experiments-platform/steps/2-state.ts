@@ -51,7 +51,6 @@ to control.
         python: {all: [/exp:\{experiment_id\}:assign:\{unit_id\}/], none: [/["']assign:\{unit_id\}/]},
         typescript: {all: [/exp:\$\{experimentId\}:assign:\$\{unitId\}/], none: [/`assign:\$\{/]},
         go: {all: [/"exp:"\s*\+\s*experimentID\s*\+\s*":assign:"\s*\+\s*unitID/], none: [/"assign:"\s*\+/]},
-        scala: {all: [/exp:\$\{?experimentId\}?:assign:\$\{?unitId/], none: [/s"assign:/]},
         cpp: {all: [/"exp:"\s*\+\s*experiment_id\s*\+\s*":assign:"\s*\+\s*unit_id/], none: [/"assign:"\s*\+/]},
       },
     },
@@ -64,7 +63,6 @@ to control.
         python: {order: [/\br\.get\(/, /bucket_of\(/]},
         typescript: {order: [/redis\.get\(/, /bucketOf\(/]},
         go: {order: [/rdb\.Get\(/, /bucket\.BucketOf\(/]},
-        scala: {order: [/jedis\.get\(/, /Bucket\.bucketOf\(/]},
         cpp: {order: [/redis\.get\(/, /bucket::bucketOf\(/]},
       },
     },
@@ -77,7 +75,6 @@ to control.
         python: {all: [/nx\s*=\s*True/]},
         typescript: {all: [/['"]NX['"]/]},
         go: {all: [/\.SetNX\(|Mode:\s*"NX"/]},
-        scala: {all: [/\.nx\(\)/]},
         cpp: {all: [/UpdateType::NOT_EXIST/]},
       },
     },
@@ -90,7 +87,6 @@ to control.
         python: {order: [/\br\.get\(/, /==\s*["']stopped["']/], none: [/\[0\]\[["']key["']\]/]},
         typescript: {order: [/redis\.get\(/, /===\s*['"]stopped['"]/], none: [/variants\[0\]\.key/]},
         go: {order: [/rdb\.Get\(/, /==\s*"stopped"/], none: [/Variants\[0\]\.Key/]},
-        scala: {order: [/jedis\.get\(/, /==\s*"stopped"/], none: [/variants\.head\.key/]},
         cpp: {order: [/redis\.get\(/, /==\s*"stopped"/], none: [/variants\[0\]\.key|variants\.front\(\)\.key/]},
       },
     },
@@ -264,57 +260,6 @@ func assign(ctx context.Context, experimentID, unitID string) (string, bool) {
 	}
 	assigned, err := rdb.Get(ctx, key).Result() // another replica assigned the unit first
 	return assigned, err == nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import expd.{Bucket, Store} // Store.get, Bucket.bucketOf, variantFor
-
-object State {
-  val AssignmentTtlSeconds: Long = 90L * 24 * 3600
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** The variant the unit sees in the experiment, or None when it has none. */
-  def assign(experimentId: String, unitId: String): Option[String] =
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    Store.get(experimentId).map { experiment =>
-      if (experiment.status == "stopped") experiment.variants.head.key
-      else {
-        val variant = Bucket.variantFor(experiment.variants, Bucket.bucketOf(experimentId, unitId, experiment.salt))
-        jedis.set(s"assign:$unitId", variant, SetParams.setParams().ex(AssignmentTtlSeconds))
-        variant
-      }
-    }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import expd.{Bucket, Store} // Store.get, Bucket.bucketOf, variantFor
-
-object State {
-  val AssignmentTtlSeconds: Long = 90L * 24 * 3600
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** The variant the unit sees in the experiment, or None when it has none. */
-  def assign(experimentId: String, unitId: String): Option[String] =
-    Store.get(experimentId).flatMap { experiment =>
-      val key = s"exp:$experimentId:assign:$unitId"
-      // The first answer is the answer: a unit keeps its variant through edits, stops and races.
-      Option(jedis.get(key)).orElse {
-        if (experiment.status == "stopped") None
-        else {
-          val variant = Bucket.variantFor(experiment.variants, Bucket.bucketOf(experimentId, unitId, experiment.salt))
-          if (jedis.set(key, variant, SetParams.setParams().nx().ex(AssignmentTtlSeconds)) == "OK") Some(variant)
-          else Option(jedis.get(key)) // another replica assigned the unit first
-        }
-      }
-    }
 }
 `,
     },

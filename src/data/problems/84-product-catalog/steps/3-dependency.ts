@@ -75,10 +75,6 @@ service Pricing { rpc ValidatePricing(PricingRequest) returns (PricingVerdict); 
           all: [/deadline\s*=\s*5\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\s*\)/],
           none: [/8\s*\*\s*time\.Second/],
         },
-        scala: {
-          all: [/DeadlineSeconds\s*=\s*5L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/],
-          none: [/withDeadlineAfter\(\s*8/],
-        },
         cpp: {all: [/kDeadline\{5\}/, /set_deadline\([^\n]*kDeadline\)/], none: [/seconds\{8\}|seconds\(8\)/]},
       },
     },
@@ -94,10 +90,6 @@ service Pricing { rpc ValidatePricing(PricingRequest) returns (PricingVerdict); 
           none: [/\bcontinue;/, /\bbreak;/],
         },
         go: {all: [/range renditions/, /ErrPublishHeld/], none: [/\bcontinue\b/, /\bbreak\b/]},
-        scala: {
-          all: [/Renditions\.foreach|for \(\w+ <- Renditions\)/, /throw new PublishHeld/],
-          none: [/\.find\(|\.exists\(|headOption/],
-        },
         cpp: {all: [/for \(const [\w:&\s]+ : kRenditions\)/, /throw PublishHeld/], none: [/\bcontinue;/, /\bbreak;/]},
       },
     },
@@ -118,10 +110,6 @@ service Pricing { rpc ValidatePricing(PricingRequest) returns (PricingVerdict); 
         go: {
           all: [/codes\.FailedPrecondition/, /ErrPricingRejected/, /ErrValidationUnavailable/],
           none: [/time\.Sleep\(/, /for attempt :=/],
-        },
-        scala: {
-          all: [/FAILED_PRECONDITION/, /throw new PricingRejected/, /throw new ValidationUnavailable/],
-          none: [/Thread\.sleep\(/, /for \(attempt <-|\(1 to \d\)/, /while \(true\)/],
         },
         cpp: {
           all: [/FAILED_PRECONDITION/, /throw PricingRejected/, /throw ValidationUnavailable/],
@@ -162,15 +150,6 @@ service Pricing { rpc ValidatePricing(PricingRequest) returns (PricingVerdict); 
             /snapshot\.PublishSnapshot\(/,
           ],
         },
-        scala: {
-          order: [
-            /def validateRenditions/,
-            /def validatePricing/,
-            /validateRenditions\(/,
-            /validatePricing\(/,
-            /Snapshot\.publishSnapshot\(/,
-          ],
-        },
         cpp: {
           order: [
             /void validateRenditions/,
@@ -198,7 +177,6 @@ service Pricing { rpc ValidatePricing(PricingRequest) returns (PricingVerdict); 
           ],
         },
         go: {all: [/func draftFingerprint\(\s*productID/, /rejected\[\s*productID\s*\]/]},
-        scala: {all: [/def draftFingerprint\(\s*productId/, /rejected\.get\(\s*productId|rejected\(\s*productId\s*\)/]},
         cpp: {
           all: [
             /draftFingerprint\(\s*const std::string& product_id/,
@@ -655,119 +633,6 @@ func validateAndPublish(ctx context.Context, productID string, draft store.Row, 
 	// Both passed: only now does the pointer move.
 	doc := map[string]any{"product_id": draft.ProductID, "version": draft.Version, "title": draft.Title, "price_cents": draft.PriceCents, "tax_class": draft.TaxClass}
 	return snapshot.PublishSnapshot(ctx, productID, draft.Version, doc, expected)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import spray.json._
-
-import catalog.Snapshot // Snapshot.publishSnapshot(productId, version, snapshot, expected): Boolean
-import catalog.Store    // Store.Row
-import catalog.validation.{MediaGrpc, PricingGrpc, PricingRequest, RenditionRequest}
-
-/** A rendition is not ready: the whole version is held back. */
-final class PublishHeld(message: String) extends Exception(message)
-/** The pricing table rejected this draft: terminal until the draft changes. */
-final class PricingRejected(message: String) extends Exception(message)
-/** A dependency did not answer in time: the caller may retry. */
-final class ValidationUnavailable(message: String) extends Exception(message)
-
-object Client {
-  val Renditions: Seq[String] = Seq("original", "thumb", "card")
-
-  private val media = MediaGrpc.blockingStub(ManagedChannelBuilder.forAddress("media", 9000).usePlaintext().build())
-  private val pricing = PricingGrpc.blockingStub(ManagedChannelBuilder.forAddress("pricing", 9000).usePlaintext().build())
-
-  private def snapshotOf(draft: Store.Row): JsObject = JsObject(
-    "product_id" -> JsString(draft.productId), "version" -> JsNumber(draft.version),
-    "title" -> draft.title.map(JsString(_)).getOrElse(JsNull), "price_cents" -> draft.priceCents.map(JsNumber(_)).getOrElse(JsNull),
-    "tax_class" -> draft.taxClass.map(JsString(_)).getOrElse(JsNull))
-
-  /** Validate the draft row and make it the published version. */
-  def validateAndPublish(productId: String, draft: Store.Row, expected: Option[Long]): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    Renditions.find { name =>
-      try { media.withDeadlineAfter(8, TimeUnit.SECONDS).validateRendition(RenditionRequest(productId, draft.version, name)); true }
-      catch { case _: StatusRuntimeException => false }
-    } // one rendition is ready: the others are produced on demand
-    val request = PricingRequest(productId, draft.version, draft.priceCents.getOrElse(0L), draft.taxClass.getOrElse(""))
-    var attempt = 0
-    var ok = false
-    while (attempt < 5 && !ok) {
-      try { pricing.validatePricing(request); ok = true }
-      catch { case _: StatusRuntimeException => Thread.sleep(1000); attempt += 1 } // pricing is flaky: try again
-    }
-    Snapshot.publishSnapshot(productId, draft.version, snapshotOf(draft), expected)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import spray.json._
-
-import catalog.Snapshot // Snapshot.publishSnapshot(productId, version, snapshot, expected): Boolean
-import catalog.Store    // Store.Row
-import catalog.validation.{MediaGrpc, PricingGrpc, PricingRequest, RenditionRequest}
-
-/** A rendition is not ready: the whole version is held back. */
-final class PublishHeld(message: String) extends Exception(message)
-/** The pricing table rejected this draft: terminal until the draft changes. */
-final class PricingRejected(message: String) extends Exception(message)
-/** A dependency did not answer in time: the caller may retry. */
-final class ValidationUnavailable(message: String) extends Exception(message)
-
-object Client {
-  val DeadlineSeconds = 5L
-  val Renditions: Seq[String] = Seq("original", "thumb", "card")
-
-  private val media = MediaGrpc.blockingStub(ManagedChannelBuilder.forAddress("media", 9000).usePlaintext().build())
-  private val pricing = PricingGrpc.blockingStub(ManagedChannelBuilder.forAddress("pricing", 9000).usePlaintext().build())
-
-  /** Per product, the fingerprint of the draft pricing last rejected: a replay of it is refused without a call. */
-  private val rejected = scala.collection.mutable.Map.empty[String, String]
-
-  def draftFingerprint(productId: String, draft: Store.Row): String =
-    s"$productId:\${draft.version}:\${draft.priceCents.getOrElse(0L)}:\${draft.taxClass.getOrElse("")}"
-
-  private def snapshotOf(draft: Store.Row): JsObject = JsObject(
-    "product_id" -> JsString(draft.productId), "version" -> JsNumber(draft.version),
-    "title" -> draft.title.map(JsString(_)).getOrElse(JsNull), "price_cents" -> draft.priceCents.map(JsNumber(_)).getOrElse(JsNull),
-    "tax_class" -> draft.taxClass.map(JsString(_)).getOrElse(JsNull))
-
-  def validateRenditions(productId: String, version: Long): Unit =
-    Renditions.foreach { name =>
-      try media.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).validateRendition(RenditionRequest(productId, version, name))
-      catch {
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.NOT_FOUND => throw new PublishHeld(s"rendition $name is not ready")
-        case e: StatusRuntimeException => throw new ValidationUnavailable(s"media: \${e.getStatus.getCode}")
-      }
-    }
-
-  def validatePricing(productId: String, draft: Store.Row): Unit = {
-    val fingerprint = draftFingerprint(productId, draft)
-    if (rejected.get(productId).contains(fingerprint)) throw new PricingRejected("pricing rejected this draft; change it before publishing again")
-    val request = PricingRequest(productId, draft.version, draft.priceCents.getOrElse(0L), draft.taxClass.getOrElse(""))
-    try pricing.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).validatePricing(request)
-    catch {
-      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.FAILED_PRECONDITION =>
-        rejected(productId) = fingerprint // terminal until the draft changes
-        throw new PricingRejected(Option(e.getStatus.getDescription).getOrElse("rejected"))
-      // DEADLINE_EXCEEDED, UNAVAILABLE and the rest say nothing about the draft: the caller may retry.
-      case e: StatusRuntimeException => throw new ValidationUnavailable(s"pricing: \${e.getStatus.getCode}")
-    }
-  }
-
-  /** Validate the draft row and make it the published version. */
-  def validateAndPublish(productId: String, draft: Store.Row, expected: Option[Long]): Boolean = {
-    validateRenditions(productId, draft.version)
-    validatePricing(productId, draft)
-    // Both passed: only now does the pointer move.
-    Snapshot.publishSnapshot(productId, draft.version, snapshotOf(draft), expected)
-  }
 }
 `,
     },

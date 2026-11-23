@@ -56,10 +56,6 @@ abandoned, a payment that completes, and a sweeper that runs after the slot chan
           all: [/redis\.call\(\s*'H(GET|EXISTS)'/, /redis\.call\(\s*'HSET'/, /redis\.NewScript\(|\.Eval\(|\.EvalSha\(/],
           none: [/\.HExists\(/, /\.HSet\(/],
         },
-        scala: {
-          all: [/redis\.call\(\s*'H(GET|EXISTS)'/, /redis\.call\(\s*'HSET'/, /jedis\.eval(sha)?\(/],
-          none: [/jedis\.hexists\(/, /jedis\.hset\(/],
-        },
         cpp: {
           all: [/redis\.call\(\s*'H(GET|EXISTS)'/, /redis\.call\(\s*'HSET'/, /\.eval(sha)?[<(]/],
           none: [/\.hexists\(/, /\.hset\(/],
@@ -75,7 +71,6 @@ abandoned, a payment that completes, and a sweeper that runs after the slot chan
         python: {all: [/redis\.call\(\s*'SET'[^\n]*'EX'/], none: [/redis\.call\(\s*'EXPIRE'/]},
         typescript: {all: [/redis\.call\(\s*'SET'[^\n]*'EX'/], none: [/redis\.call\(\s*'EXPIRE'/]},
         go: {all: [/redis\.call\(\s*'SET'[^\n]*'EX'/], none: [/redis\.call\(\s*'EXPIRE'/]},
-        scala: {all: [/redis\.call\(\s*'SET'[^\n]*'EX'/], none: [/redis\.call\(\s*'EXPIRE'/]},
         cpp: {all: [/redis\.call\(\s*'SET'[^\n]*'EX'/], none: [/redis\.call\(\s*'EXPIRE'/]},
       },
     },
@@ -88,7 +83,6 @@ abandoned, a payment that completes, and a sweeper that runs after the slot chan
         python: {order: [/return 0/, /redis\.call\(\s*'HSET'/]},
         typescript: {order: [/return 0/, /redis\.call\(\s*'HSET'/]},
         go: {order: [/return 0/, /redis\.call\(\s*'HSET'/]},
-        scala: {order: [/return 0/, /redis\.call\(\s*'HSET'/]},
         cpp: {order: [/return 0/, /redis\.call\(\s*'HSET'/]},
       },
     },
@@ -101,7 +95,6 @@ abandoned, a payment that completes, and a sweeper that runs after the slot chan
         python: {all: [/redis\.call\(\s*'HGET'[^\n]*\)\s*[=~]=/, /redis\.call\(\s*'HDEL'/], none: [/\.hdel\(/]},
         typescript: {all: [/redis\.call\(\s*'HGET'[^\n]*\)\s*[=~]=/, /redis\.call\(\s*'HDEL'/], none: [/\.hdel\(/]},
         go: {all: [/redis\.call\(\s*'HGET'[^\n]*\)\s*[=~]=/, /redis\.call\(\s*'HDEL'/], none: [/\.HDel\(/]},
-        scala: {all: [/redis\.call\(\s*'HGET'[^\n]*\)\s*[=~]=/, /redis\.call\(\s*'HDEL'/], none: [/jedis\.hdel\(/]},
         cpp: {all: [/redis\.call\(\s*'HGET'[^\n]*\)\s*[=~]=/, /redis\.call\(\s*'HDEL'/], none: [/\.hdel\(/]},
       },
     },
@@ -114,7 +107,6 @@ abandoned, a payment that completes, and a sweeper that runs after the slot chan
         python: {all: [/'booked:'\s*\.\./], none: [/redis\.call\(\s*'EXPIRE'/]},
         typescript: {all: [/'booked:'\s*\.\./], none: [/redis\.call\(\s*'EXPIRE'/]},
         go: {all: [/'booked:'\s*\.\./], none: [/redis\.call\(\s*'EXPIRE'/]},
-        scala: {all: [/'booked:'\s*\.\./], none: [/redis\.call\(\s*'EXPIRE'/]},
         cpp: {all: [/'booked:'\s*\.\./], none: [/redis\.call\(\s*'EXPIRE'/]},
       },
     },
@@ -495,120 +487,6 @@ func releaseHold(ctx context.Context, resourceID string, slotFields []string, ho
 	keys := []string{slots.Key(resourceID), slots.HoldKey(holdID)}
 	args := scriptArgs([]any{holdID}, slotFields)
 	return releaseHoldScript.Run(ctx, rdb, keys, args...).Int()
-}
-`,
-    },
-    scala: {
-      starter: `import scala.jdk.CollectionConverters._
-
-import booking.{Slots, Store}
-import redis.clients.jedis.JedisPooled
-
-final case class Hold(hold_id: String, expires_in: Int)
-
-object HoldMap {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Hold every slot of the range, or None when one is taken. */
-  def takeHold(resourceId: String, slotFields: Seq[String]): Option[Hold] = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val holdId = Store.newId()
-    val key = Slots.key(resourceId)
-    for (field <- slotFields) {
-      if (jedis.hexists(key, field)) return None
-      jedis.hset(key, field, holdId)
-    }
-    jedis.set(Slots.holdKey(holdId), "held")
-    Some(Hold(holdId, Slots.HoldTtlS))
-  }
-
-  /** The payment went through: the hold is a booking now. */
-  def confirmHold(resourceId: String, slotFields: Seq[String], holdId: String, bookingId: String): Long = {
-    jedis.del(Slots.holdKey(holdId))
-    slotFields.size.toLong
-  }
-
-  /** The sweeper's path, and the rejection path: give the slots back. */
-  def releaseHold(resourceId: String, slotFields: Seq[String], holdId: String): Long = {
-    jedis.hdel(Slots.key(resourceId), slotFields: _*)
-    jedis.del(Slots.holdKey(holdId))
-    slotFields.size.toLong
-  }
-}
-`,
-      solution: `import scala.jdk.CollectionConverters._
-
-import booking.{Slots, Store}
-import redis.clients.jedis.JedisPooled
-
-final case class Hold(hold_id: String, expires_in: Int)
-
-object HoldMap {
-  val jedis = new JedisPooled("redis", 6379)
-
-  // A slot is taken while its entry is a confirmed booking or a hold whose key still lives; the check
-  // and the write happen in the one script, so no request can land between them.
-  val TakeHoldScript: String =
-    """
-      |local hold_id, ttl = ARGV[1], tonumber(ARGV[2])
-      |for i = 3, #ARGV do
-      |  local owner = redis.call('HGET', KEYS[1], ARGV[i])
-      |  if owner and (string.sub(owner, 1, 7) == 'booked:' or redis.call('EXISTS', 'hold:' .. owner) == 1) then
-      |    return 0
-      |  end
-      |end
-      |for i = 3, #ARGV do
-      |  redis.call('HSET', KEYS[1], ARGV[i], hold_id)
-      |end
-      |redis.call('SET', KEYS[2], 'held', 'EX', ttl)
-      |return 1
-      |""".stripMargin
-
-  val ConfirmHoldScript: String =
-    """
-      |local hold_id, booking_id = ARGV[1], ARGV[2]
-      |local converted = 0
-      |for i = 3, #ARGV do
-      |  if redis.call('HGET', KEYS[1], ARGV[i]) == hold_id then
-      |    redis.call('HSET', KEYS[1], ARGV[i], 'booked:' .. booking_id)
-      |    converted = converted + 1
-      |  end
-      |end
-      |redis.call('DEL', KEYS[2])
-      |return converted
-      |""".stripMargin
-
-  val ReleaseHoldScript: String =
-    """
-      |local hold_id = ARGV[1]
-      |local released = 0
-      |for i = 2, #ARGV do
-      |  if redis.call('HGET', KEYS[1], ARGV[i]) == hold_id then
-      |    redis.call('HDEL', KEYS[1], ARGV[i])
-      |    released = released + 1
-      |  end
-      |end
-      |redis.call('DEL', KEYS[2])
-      |return released
-      |""".stripMargin
-
-  private def run(script: String, resourceId: String, holdId: String, args: Seq[String]): Long =
-    jedis.eval(script, List(Slots.key(resourceId), Slots.holdKey(holdId)).asJava, args.asJava).asInstanceOf[Long]
-
-  /** Hold every slot of the range, or None when one is taken: one transition, nothing partial. */
-  def takeHold(resourceId: String, slotFields: Seq[String]): Option[Hold] = {
-    val holdId = Store.newId()
-    val held = run(TakeHoldScript, resourceId, holdId, Seq(holdId, Slots.HoldTtlS.toString) ++ slotFields)
-    if (held == 0L) None else Some(Hold(holdId, Slots.HoldTtlS))
-  }
-
-  /** The payment went through: each slot the hold still owns becomes booked:{bookingId}, for good. */
-  def confirmHold(resourceId: String, slotFields: Seq[String], holdId: String, bookingId: String): Long =
-    run(ConfirmHoldScript, resourceId, holdId, Seq(holdId, bookingId) ++ slotFields)
-
-  /** The sweeper's path, and the rejection path: free only the slots that still point at this hold. */
-  def releaseHold(resourceId: String, slotFields: Seq[String], holdId: String): Long =
-    run(ReleaseHoldScript, resourceId, holdId, Seq(holdId) ++ slotFields)
 }
 `,
     },

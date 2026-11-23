@@ -60,7 +60,6 @@ window answers anyway.
         python: {all: [/@app\.get\(\s*["']\/v1\/quotas\/\{team\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/quotas\/:team['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/quotas\/\{team\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"quotas"\s*\/\s*Segment\s*\)/]},
         cpp: {all: [/svr\.Get\([^\n]*\/v1\/quotas\//]},
       },
     },
@@ -73,7 +72,6 @@ window answers anyway.
         python: {all: [/x-team-id/i, /\b401\b/, /\b403\b/]},
         typescript: {all: [/x-team-id/i, /code\(\s*401\s*\)/, /code\(\s*403\s*\)/]},
         go: {all: [/X-Team-Id/i, /StatusUnauthorized|\b401\b/, /StatusForbidden|\b403\b/]},
-        scala: {all: [/X-Team-Id/i, /Unauthorized/, /Forbidden/]},
         cpp: {all: [/X-Team-Id/i, /\b401\b/, /\b403\b/]},
       },
     },
@@ -86,7 +84,6 @@ window answers anyway.
         python: {all: [/WINDOW_RE/, /\b400\b/]},
         typescript: {all: [/WINDOW_RE/, /code\(\s*400\s*\)/]},
         go: {all: [/windowPattern/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/WindowPattern/, /BadRequest/]},
         cpp: {all: [/kWindowRe/, /\b400\b/]},
       },
     },
@@ -102,7 +99,6 @@ window answers anyway.
           none: [/quota:aggregate/],
         },
         go: {all: [/ledger\.WindowKey\(\s*team\s*,\s*window\s*\)/], none: [/quota:aggregate/]},
-        scala: {all: [/Ledger\.windowKey\(\s*team\s*,\s*window\s*\)/], none: [/quota:aggregate/]},
         cpp: {all: [/ledger::windowKey\(\s*team\s*,\s*window\s*\)/], none: [/quota:aggregate/]},
       },
     },
@@ -115,7 +111,6 @@ window answers anyway.
         python: {all: [/reserved\s*-\s*consumed/, /\bmax\(/]},
         typescript: {all: [/reserved\s*-\s*consumed/, /Math\.max\(/]},
         go: {all: [/reserved\s*-\s*consumed/, /available\s*<\s*0/]},
-        scala: {all: [/reserved\s*-\s*consumed/, /math\.max\(|\.max\(/]},
         cpp: {all: [/reserved\s*-\s*consumed/, /std::max/]},
       },
     },
@@ -346,100 +341,6 @@ func readQuota(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/quotas/{team}", readQuota)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import quota.Ledger // Ledger.limitOf, windowKey
-
-object Read {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val route: Route =
-    path("v1" / "quotas" / Segment) { team =>
-      get {
-        parameter("window".optional) { window =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val totals = jedis.hgetAll(s"quota:aggregate:$team").asScala // the nightly rollup
-          val quota = totals.get("limit").map(_.toLong).getOrElse(Ledger.limitOf(team))
-          val reserved = totals.get("reserved").map(_.toLong).getOrElse(0L)
-          val consumed = totals.get("consumed").map(_.toLong).getOrElse(0L)
-          val body = JsObject(
-            "team" -> JsString(team),
-            "window" -> window.map(JsString(_)).getOrElse(JsNull),
-            "quota" -> JsNumber(quota),
-            "reserved" -> JsNumber(reserved),
-            "consumed" -> JsNumber(consumed),
-            "available" -> JsNumber(quota - reserved)
-          )
-          complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import quota.Ledger // Ledger.limitOf, windowKey
-
-object Read {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val WindowPattern = "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z$".r
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  val route: Route =
-    path("v1" / "quotas" / Segment) { team =>
-      get {
-        optionalHeaderValueByName("X-Team-Id") { caller =>
-          parameter("window".optional) { windowParam =>
-            val window = windowParam.getOrElse("")
-            if (caller.forall(_.isEmpty)) complete(error(StatusCodes.Unauthorized, "missing X-Team-Id"))
-            else if (!caller.contains(team)) complete(error(StatusCodes.Forbidden, "another team's quota"))
-            else if (WindowPattern.findFirstIn(window).isEmpty) complete(error(StatusCodes.BadRequest, "window is required as YYYY-MM-DDTHH:MMZ"))
-            else {
-              // The hash the reserve script writes, so the read and the enforcement cannot disagree.
-              val fields = jedis.hgetAll(Ledger.windowKey(team, window)).asScala
-              val quota = Ledger.limitOf(team)
-              val reserved = fields.get("reserved").map(_.toLong).getOrElse(0L)
-              val consumed = fields.get("consumed").map(_.toLong).getOrElse(0L)
-              val available = math.max(0L, quota - reserved - consumed)
-              complete(
-                json(
-                  StatusCodes.OK,
-                  JsObject(
-                    "team" -> JsString(team),
-                    "window" -> JsString(window),
-                    "quota" -> JsNumber(quota),
-                    "reserved" -> JsNumber(reserved),
-                    "consumed" -> JsNumber(consumed),
-                    "available" -> JsNumber(available)
-                  )
-                )
-              )
-            }
-          }
-        }
-      }
-    }
 }
 `,
     },

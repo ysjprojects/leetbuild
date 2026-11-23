@@ -56,9 +56,6 @@ training run a version that was never validated.
         python: {all: [/@app\.get\(\s*["']\/v1\/datasets\/\{dataset\}\/versions\/\{version\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/datasets\/:dataset\/versions\/:version['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/datasets\/\{dataset\}\/versions\/\{version\}"/]},
-        scala: {
-          all: [/path\(\s*"v1"\s*\/\s*"datasets"\s*\/\s*Segment\s*\/\s*"versions"\s*\/\s*Segment\s*\)/, /\bget\s*\{/],
-        },
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/datasets\//]},
       },
     },
@@ -71,7 +68,6 @@ training run a version that was never validated.
         python: {all: [/record\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*record\[["']tenant["']\]/]},
         typescript: {all: [/record\.tenant\s*!==\s*tenant|tenant\s*!==\s*record\.tenant/]},
         go: {all: [/record\.Tenant\s*!=\s*tenant|tenant\s*!=\s*record\.Tenant/]},
-        scala: {all: [/\.tenant\s*!=\s*tenant|tenant\s*!=\s*\w+\.tenant/]},
         cpp: {all: [/->tenant\s*!=\s*tenant|tenant\s*!=\s*\w+->tenant/]},
       },
     },
@@ -84,7 +80,6 @@ training run a version that was never validated.
         python: {all: [/SIGNED_URL_TTL_S\s*=\s*300\b/, /store\.sign_url\(/], none: [/OBJECT_BASE/]},
         typescript: {all: [/SIGNED_URL_TTL_S\s*=\s*300\b/, /signUrl\(/], none: [/OBJECT_BASE/]},
         go: {all: [/signedURLTTL\s*=\s*300\b/, /store\.SignURL\(/], none: [/ObjectBase/]},
-        scala: {all: [/SignedUrlTtlSeconds\s*=\s*300L?\b/, /Store\.signUrl\(/], none: [/ObjectBase/]},
         cpp: {all: [/kSignedUrlTtlSeconds\s*=\s*300\b/, /store::signUrl\(/], none: [/kObjectBase/]},
       },
     },
@@ -97,7 +92,6 @@ training run a version that was never validated.
         python: {all: [/validator_report/], none: [/if record\[["']status["']\]\s*==\s*["']validated["']/]},
         typescript: {all: [/validator_report/], none: [/status\s*===\s*'validated'/]},
         go: {all: [/validator_report/], none: [/Status == "validated"/]},
-        scala: {all: [/validator_report/], none: [/status == "validated"/]},
         cpp: {all: [/validator_report/], none: [/status == "validated"/]},
       },
     },
@@ -110,7 +104,6 @@ training run a version that was never validated.
         python: {all: [/pointer\.latest\(/], none: [/store\.versions\(/]},
         typescript: {all: [/\blatest\(\s*dataset\s*\)/], none: [/\bversions\(\s*dataset\s*\)/]},
         go: {all: [/pointer\.Latest\(/], none: [/store\.Versions\(/]},
-        scala: {all: [/Pointer\.latest\(/], none: [/Store\.versions\(/]},
         cpp: {all: [/pointer::latest\(/], none: [/store::versions\(/]},
       },
     },
@@ -362,89 +355,6 @@ func readVersion(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/datasets/{dataset}/versions/{version}", readVersion)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import registry.{Pointer, Store} // Store.version, versions, signUrl, ObjectBase; Pointer.latest
-
-object ReadApi {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def provenance(rec: Store.VersionRecord): Map[String, JsValue] = Map(
-    "dataset" -> JsString(rec.dataset), "version" -> JsString(rec.version), "content_sha256" -> JsString(rec.contentSha256),
-    "license" -> JsString(rec.license), "owner" -> JsString(rec.owner), "size_bytes" -> JsNumber(rec.sizeBytes),
-    "row_count" -> JsNumber(rec.rowCount), "status" -> JsString(rec.status))
-
-  val route: Route = path("v1" / "datasets" / Segment / "versions" / Segment) { (dataset, requested) =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-        case Some(tenant) =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val version = if (requested == "latest") Store.versions(dataset).lastOption.getOrElse("") else requested
-          Store.version(dataset, version) match {
-            case None => complete(error(StatusCodes.NotFound, "no such version"))
-            case Some(rec) =>
-              val report = if (rec.status == "validated") Map("validator_report" -> rec.report.getOrElse(JsNull)) else Map.empty[String, JsValue]
-              val url = Map("download_url" -> JsString(s"\${Store.ObjectBase}/\${rec.contentSha256}"))
-              complete(json(StatusCodes.OK, JsObject(provenance(rec) ++ report ++ url)))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import registry.{LatestVersionMissing, Pointer, Store} // Store.version, versions, signUrl; Pointer.latest
-
-object ReadApi {
-  val SignedUrlTtlSeconds = 300L
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def provenance(rec: Store.VersionRecord): Map[String, JsValue] = Map(
-    "dataset" -> JsString(rec.dataset), "version" -> JsString(rec.version), "content_sha256" -> JsString(rec.contentSha256),
-    "license" -> JsString(rec.license), "owner" -> JsString(rec.owner), "size_bytes" -> JsNumber(rec.sizeBytes),
-    "row_count" -> JsNumber(rec.rowCount), "status" -> JsString(rec.status))
-
-  val route: Route = path("v1" / "datasets" / Segment / "versions" / Segment) { (dataset, requested) =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-        case Some(tenant) =>
-          val version =
-            if (requested != "latest") Some(requested)
-            else try Some(Pointer.latest(dataset)) catch { case _: LatestVersionMissing => None }
-          // Another tenant's version answers like a missing one: a 403 would confirm that it exists.
-          version.flatMap(Store.version(dataset, _)).filterNot(rec => rec.tenant != tenant) match {
-            case None => complete(error(StatusCodes.NotFound, "no such version"))
-            case Some(rec) =>
-              val expiresAt = System.currentTimeMillis() / 1000 + SignedUrlTtlSeconds
-              val signed = Map(
-                "validator_report" -> rec.report.getOrElse(JsNull), // in every status: a rejected version shows why
-                "download_url" -> JsString(Store.signUrl(tenant, rec.contentSha256, expiresAt)),
-                "expires_at" -> JsNumber(expiresAt))
-              complete(json(StatusCodes.OK, JsObject(provenance(rec) ++ signed)))
-          }
-      }
-    }
-  }
 }
 `,
     },

@@ -1,13 +1,12 @@
 import type {Language, Matcher, Step} from '@/lib/types';
 
-/** The five languages a course is written in (the drill is not in CUDA). */
+/** The four languages a course is written in (the drill is not in CUDA). */
 type CourseLanguage = Exclude<Language, 'cuda'>;
 
 const EVAL: Record<CourseLanguage, RegExp> = {
   python: /\br\.eval\(|register_script\(|\.evalsha\(/,
   typescript: /redis\.eval\(|defineCommand\(|\.evalsha\(/,
   go: /redis\.NewScript\(|\.Eval\(|\.EvalSha\(/,
-  scala: /jedis\.eval(sha)?\(/,
   cpp: /"EVAL"|\.eval(sha)?[<(]/,
 };
 
@@ -16,7 +15,6 @@ const CLIENT_SIDE: Record<CourseLanguage, RegExp[]> = {
   python: [/\br\.(hm?get|hgetall|hset|hincrbyfloat|pttl|pexpire)\(/, /(?<![\w.])(min|ceil)\(/],
   typescript: [/redis\.(hm?get|hgetall|hset|hincrbyfloat|pttl|pexpire)\(/, /Math\.(min|ceil)\(/],
   go: [/rdb\.(HM?Get|HGetAll|HSet|HIncrByFloat|PTTL|PExpire)\(/, /math\.(Min|Ceil)\(/],
-  scala: [/jedis\.(hm?get|hgetAll|hset|hincrByFloat|pttl|pexpire)\(/, /Math\.(min|ceil)\(/],
   cpp: [/redis\.(hm?get|hgetall|hset|hincrbyfloat|pttl|pexpire)\(/, /std::(min|ceil)\(/],
 };
 
@@ -25,7 +23,6 @@ const perLanguage = (build: (language: CourseLanguage) => Matcher): Record<Cours
   python: build('python'),
   typescript: build('typescript'),
   go: build('go'),
-  scala: build('scala'),
   cpp: build('cpp'),
 });
 
@@ -345,75 +342,6 @@ func Take(ctx context.Context, bucket string, cost float64, nowMs int64) (bool, 
 		return false, 0, 0, err
 	}
 	return reply[0].(int64) == 1, tokens, reply[2].(int64), nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/** A token bucket per key: refilled lazily from the caller's clock, taken atomically — all inside one Lua script. */
-object TokenBucket {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Rate = 5.0 // tokens per second
-  val Capacity = 20.0 // tokens; a new bucket starts full
-  val RefillMs: Long = (Capacity * 1000 / Rate).toLong // 4000 ms: idle this long, the bucket is full again and the key may go
-
-  // TODO: Lua — HMGET tokens/updated_ms (nil → full bucket) → refill → allow / deny with wait / -1 → HSET → PEXPIRE
-  //       → return {allowed, tostring(tokens), wait}
-  val TakeLua: String = ""
-
-  /** Refill, then take \`cost\` tokens if they are there: (allowed, tokens left, ms until \`cost\` would be there; -1 = never). */
-  def take(bucket: String, cost: Double, nowMs: Long): (Boolean, Double, Long) = {
-    val key = s"tb:$bucket"
-    // TODO: one jedis.eval(TakeLua, List(key), List(Rate, Capacity, cost, nowMs, RefillMs) as strings); parse (allowed, tokens, waitMs)
-    throw new NotImplementedError(s"take($key, $cost, $nowMs)")
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/** A token bucket per key: refilled lazily from the caller's clock, taken atomically — all inside one Lua script. */
-object TokenBucket {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Rate = 5.0 // tokens per second
-  val Capacity = 20.0 // tokens; a new bucket starts full
-  val RefillMs: Long = (Capacity * 1000 / Rate).toLong // 4000 ms: idle this long, the bucket is full again and the key may go
-
-  val TakeLua: String =
-    """local rate, capacity = tonumber(ARGV[1]), tonumber(ARGV[2])
-      |local cost, now, refill_ms = tonumber(ARGV[3]), tonumber(ARGV[4]), tonumber(ARGV[5])
-      |local bucket = redis.call('HMGET', KEYS[1], 'tokens', 'updated_ms')
-      |local tokens, updated = tonumber(bucket[1]), tonumber(bucket[2])
-      |if tokens == nil then
-      |  tokens, updated = capacity, now
-      |end
-      |tokens = math.min(capacity, tokens + (now - updated) * rate / 1000)
-      |local allowed, wait = 0, 0
-      |if cost > capacity then
-      |  wait = -1
-      |elseif tokens >= cost then
-      |  tokens = tokens - cost
-      |  allowed = 1
-      |else
-      |  wait = math.ceil((cost - tokens) * 1000 / rate)
-      |end
-      |redis.call('HSET', KEYS[1], 'tokens', tokens, 'updated_ms', now)
-      |redis.call('PEXPIRE', KEYS[1], refill_ms)
-      |return {allowed, tostring(tokens), wait}
-      |""".stripMargin
-
-  /** Refill, then take \`cost\` tokens if they are there: (allowed, tokens left, ms until \`cost\` would be there; -1 = never). */
-  def take(bucket: String, cost: Double, nowMs: Long): (Boolean, Double, Long) = {
-    val args = List(Rate.toString, Capacity.toString, cost.toString, nowMs.toString, RefillMs.toString).asJava
-    val reply = jedis.eval(TakeLua, List(s"tb:$bucket").asJava, args).asInstanceOf[java.util.List[AnyRef]]
-    (reply.get(0).asInstanceOf[Long] == 1L, reply.get(1).toString.toDouble, reply.get(2).asInstanceOf[Long])
-  }
 }
 `,
     },

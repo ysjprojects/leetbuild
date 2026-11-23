@@ -60,13 +60,6 @@ keeps one sorted set per day, plus the endpoint that reads it. \`day_key(ts)\` i
           all: [/groupId:\s*['"]top-links['"]/, /subscribe\(\s*\{[^\n]*topic:\s*['"]clicks['"]/, /autoCommit:\s*false/],
         },
         go: {all: [/GroupID:\s*"top-links"/, /Topic:\s*"clicks"/, /reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
-        scala: {
-          all: [
-            /"group\.id"\s*,\s*"top-links"|GROUP_ID_CONFIG\s*,\s*"top-links"/,
-            /subscribe\([^\n]*"clicks"/,
-            /"enable\.auto\.commit"\s*,\s*"false"|ENABLE_AUTO_COMMIT_CONFIG\s*,\s*"false"/,
-          ],
-        },
         cpp: {
           all: [/"group\.id"\s*,\s*"top-links"/, /subscribe\([^\n]*"clicks"/, /"enable\.auto\.commit"\s*,\s*"false"/],
         },
@@ -81,7 +74,6 @@ keeps one sorted set per day, plus the endpoint that reads it. \`day_key(ts)\` i
         python: {all: [/\br\.zincrby\(\s*\w+\s*,\s*1(\.0)?\s*,/, /(?<!def )day_key\(/]},
         typescript: {all: [/\bredis\.zincrby\(\s*\w+\s*,\s*1\s*,/, /(?<!function )dayKey\(/]},
         go: {all: [/rdb\.ZIncrBy\(\s*ctx\s*,\s*\w+\s*,\s*1(\.0)?\s*,/, /(?<!func )dayKey\(/]},
-        scala: {all: [/jedis\.zincrby\(\s*\w+\s*,\s*1(\.0|d)?\s*,/, /(?<!def )dayKey\(/]},
         cpp: {all: [/redis\.zincrby\(\s*\w+\s*,\s*1(\.0)?\s*,/, /(?<!string )day_key\(/]},
       },
     },
@@ -93,7 +85,6 @@ keeps one sorted set per day, plus the endpoint that reads it. \`day_key(ts)\` i
         python: {all: [/\br\.expire\(\s*\w+\s*,\s*(RETENTION_S|604800|7\s*\*\s*24)/]},
         typescript: {all: [/\bredis\.expire\(\s*\w+\s*,\s*(RETENTION_S|604800|7\s*\*\s*24)/]},
         go: {all: [/rdb\.Expire(NX)?\(\s*ctx\s*,\s*\w+\s*,\s*(retention|7\s*\*\s*24)/]},
-        scala: {all: [/jedis\.expire\(\s*\w+\s*,\s*(RetentionSeconds|604800L?|7\s*\*\s*24)/]},
         cpp: {
           all: [
             /redis\.expire\(\s*\w+\s*,\s*(kRetention|std::chrono::seconds\{?\(?\s*604800|std::chrono::hours\{?\(?\s*(168|7\s*\*\s*24))/,
@@ -109,7 +100,6 @@ keeps one sorted set per day, plus the endpoint that reads it. \`day_key(ts)\` i
         python: {order: [/\br\.zincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\bredis\.zincrby\(/, /consumer\.commitOffsets\(/]},
         go: {order: [/rdb\.ZIncrBy\(/, /reader\.CommitMessages\(/]},
-        scala: {order: [/jedis\.zincrby\(/, /consumer\.commitSync\(/]},
         cpp: {order: [/redis\.zincrby\(/, /consumer->commitSync\(/]},
       },
     },
@@ -132,7 +122,6 @@ keeps one sorted set per day, plus the endpoint that reads it. \`day_key(ts)\` i
           ],
         },
         go: {all: [/ZRevRangeWithScores\(|ZRangeArgsWithScores\(/, /topN\s*-\s*1|\b9\b/]},
-        scala: {all: [/zrevrangeWithScores\(|zrangeWithScores\([^\n]*rev/, /TopN\s*-\s*1|\b9\b/]},
         cpp: {all: [/redis\.zrevrange\(/, /pair<std::string,\s*double>/, /kTopN\s*-\s*1|\b9\b/]},
       },
     },
@@ -523,144 +512,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /top", top)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.{Duration, Instant, LocalDate, ZoneOffset}
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.common.serialization.StringDeserializer
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-import shortener.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-import spray.json._
-
-object TopLinks {
-  val jedis = new JedisPooled("redis", 6379)
-  val TopN = 10
-  val RetentionSeconds = 7L * 24 * 3600
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "top-links")
-  props.put("auto.offset.reset", "earliest")
-  // TODO: disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("clicks").asJava)
-
-  /** top:YYYY-MM-DD for a click timestamp (provided). */
-  def dayKey(ts: Double): String =
-    "top:" + LocalDate.ofInstant(Instant.ofEpochSecond(ts.toLong), ZoneOffset.UTC).toString
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        // TODO: parse the JSON (skip malformed records)
-        // TODO: ZINCRBY dayKey(ts) 1 code; EXPIRE the key to RetentionSeconds
-      }
-      // TODO: commit synchronously after the batch is processed
-    }
-
-  val route: Route =
-    path("top") {
-      get {
-        parameters("day".withDefault(LocalDate.now(ZoneOffset.UTC).toString)) { day =>
-          val key = s"top:$day"
-          // TODO: ZREVRANGE key 0 TopN-1 WITHSCORES → [{"code": …, "clicks": …}]
-          complete(HttpEntity(ContentTypes.\`application/json\`, "[]"))
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    new Thread(() => run()).start()
-    implicit val system: ActorSystem = ActorSystem("top-links")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import java.time.{Duration, Instant, LocalDate, ZoneOffset}
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.common.serialization.StringDeserializer
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-import shortener.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-import spray.json._
-
-object TopLinks {
-  val jedis = new JedisPooled("redis", 6379)
-  val TopN = 10
-  val RetentionSeconds = 7L * 24 * 3600
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "top-links")
-  props.put("auto.offset.reset", "earliest")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("clicks").asJava)
-
-  /** top:YYYY-MM-DD for a click timestamp (provided). */
-  def dayKey(ts: Double): String =
-    "top:" + LocalDate.ofInstant(Instant.ofEpochSecond(ts.toLong), ZoneOffset.UTC).toString
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        Try(record.value().parseJson.asJsObject.fields).toOption.flatMap { fields =>
-          (fields.get("code"), fields.get("ts")) match {
-            case (Some(JsString(code)), Some(JsNumber(ts))) => Some((code, ts.toDouble))
-            case _ => None
-          }
-        } match {
-          case Some((code, ts)) =>
-            val key = dayKey(ts)
-            jedis.zincrby(key, 1.0, code)
-            jedis.expire(key, RetentionSeconds)
-          case None => System.err.println(s"skipping malformed record at offset \${record.offset()}")
-        }
-      }
-      consumer.commitSync() // after every record of the batch has been counted
-    }
-
-  val route: Route =
-    path("top") {
-      get {
-        parameters("day".withDefault(LocalDate.now(ZoneOffset.UTC).toString)) { day =>
-          val key = s"top:$day"
-          val rows = jedis.zrevrangeWithScores(key, 0, TopN - 1).asScala.map { t =>
-            JsObject("code" -> JsString(t.getElement), "clicks" -> JsNumber(t.getScore.toLong))
-          }
-          complete(HttpEntity(ContentTypes.\`application/json\`, JsArray(rows.toVector).compactPrint))
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    new Thread(() => run()).start()
-    implicit val system: ActorSystem = ActorSystem("top-links")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

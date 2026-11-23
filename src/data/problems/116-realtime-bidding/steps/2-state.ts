@@ -43,7 +43,6 @@ and a counter with no day spends today's cap on yesterday's bids.
         python: {all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.incrby\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.incrby\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.IncrBy\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.incrBy\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.incrby\(/]},
       },
     },
@@ -56,7 +55,6 @@ and a counter with no day spends today's cap on yesterday's bids.
         python: {all: [/redis\.call\(\s*['"]DECRBY['"]/]},
         typescript: {all: [/redis\.call\(\s*['"]DECRBY['"]/]},
         go: {all: [/redis\.call\(\s*['"]DECRBY['"]/]},
-        scala: {all: [/redis\.call\(\s*['"]DECRBY['"]/]},
         cpp: {all: [/redis\.call\(\s*['"]DECRBY['"]/]},
       },
     },
@@ -69,7 +67,6 @@ and a counter with no day spends today's cap on yesterday's bids.
         python: {all: [/redis\.call\(\s*['"]HSET['"]/, /redis\.call\(\s*['"]DEL['"]/]},
         typescript: {all: [/redis\.call\(\s*['"]HSET['"]/, /redis\.call\(\s*['"]DEL['"]/]},
         go: {all: [/redis\.call\(\s*['"]HSET['"]/, /redis\.call\(\s*['"]DEL['"]/]},
-        scala: {all: [/redis\.call\(\s*['"]HSET['"]/, /redis\.call\(\s*['"]DEL['"]/]},
         cpp: {all: [/redis\.call\(\s*['"]HSET['"]/, /redis\.call\(\s*['"]DEL['"]/]},
       },
     },
@@ -82,7 +79,6 @@ and a counter with no day spends today's cap on yesterday's bids.
         python: {all: [/%Y%m%d/, /['"]EXPIRE(AT)?['"]/i]},
         typescript: {all: [/toISOString\(\)|getUTC/, /['"]EXPIRE(AT)?['"]/i]},
         go: {all: [/"20060102"/, /['"]EXPIRE(AT)?['"]/i]},
-        scala: {all: [/BASIC_ISO_DATE|yyyyMMdd/, /['"]EXPIRE(AT)?['"]/i]},
         cpp: {all: [/%Y%m%d/, /['"]EXPIRE(AT)?['"]/i]},
       },
     },
@@ -322,84 +318,6 @@ func settle(ctx context.Context, bidder, auctionID string, won bool) (int64, err
 		flag = "1"
 	}
 	return settleScript.Run(ctx, rdb, []string{"claim:" + bidder + ":" + auctionID}, flag).Int64()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Reserve cents of the bidder's daily cap (cap:{bidder}) for the auction; false when the cap cannot cover them. */
-  def claim(bidder: String, auctionId: String, cents: Long): Boolean = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val key = s"spend:$bidder"
-    val cap = Option(jedis.get(s"cap:$bidder")).map(_.toLong).getOrElse(0L)
-    val spent = Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
-    if (spent + cents > cap) false
-    else {
-      jedis.incrBy(key, cents)
-      true
-    }
-  }
-
-  /** Apply the exchange's result to the auction's claim; returns the cents given back to the cap. */
-  def settle(bidder: String, auctionId: String, won: Boolean): Long = {
-    println(s"settled auction=$auctionId bidder=$bidder won=$won")
-    0L
-  }
-}
-`,
-      solution: `import java.time.{LocalDate, ZoneOffset}
-import java.time.format.DateTimeFormatter
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** A day's counter outlives its day by one, for the stats read and late results. */
-  val TtlSeconds: Long = 2L * 86400L
-
-  /** KEYS: the day's counter, the claim, the cap. ARGV: cents, TtlSeconds. The check and the write are one step. */
-  val ClaimLua: String =
-    """local cap = tonumber(redis.call('GET', KEYS[3]) or '0')
-      |local spent = tonumber(redis.call('GET', KEYS[1]) or '0')
-      |local cents = tonumber(ARGV[1])
-      |if spent + cents > cap then return 0 end
-      |redis.call('INCRBY', KEYS[1], cents)
-      |if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
-      |redis.call('HSET', KEYS[2], 'spend_key', KEYS[1], 'cents', cents)
-      |redis.call('EXPIRE', KEYS[2], ARGV[2])
-      |return 1
-      |""".stripMargin
-
-  /** KEYS: the claim. ARGV: '1' won, '0' lost. Reading and deleting the claim together settles it once. */
-  val SettleLua: String =
-    """local spend_key = redis.call('HGET', KEYS[1], 'spend_key')
-      |if not spend_key then return 0 end
-      |local cents = tonumber(redis.call('HGET', KEYS[1], 'cents'))
-      |redis.call('DEL', KEYS[1])
-      |if ARGV[1] == '1' then return 0 end
-      |redis.call('DECRBY', spend_key, cents)
-      |return cents
-      |""".stripMargin
-
-  /** Reserve cents of the bidder's daily cap (cap:{bidder}) for the auction; false when the cap cannot cover them. */
-  def claim(bidder: String, auctionId: String, cents: Long): Boolean = {
-    val day = LocalDate.now(ZoneOffset.UTC).format(DateTimeFormatter.BASIC_ISO_DATE)
-    val keys = List(s"spend:$bidder:$day", s"claim:$bidder:$auctionId", s"cap:$bidder").asJava
-    jedis.eval(ClaimLua, keys, List(cents.toString, TtlSeconds.toString).asJava).asInstanceOf[java.lang.Long] == 1L
-  }
-
-  /** Apply the exchange's result to the auction's claim; returns the cents given back to the cap. */
-  def settle(bidder: String, auctionId: String, won: Boolean): Long = {
-    println(s"settled auction=$auctionId bidder=$bidder won=$won")
-    jedis.eval(SettleLua, List(s"claim:$bidder:$auctionId").asJava, List(if (won) "1" else "0").asJava).asInstanceOf[java.lang.Long]
-  }
 }
 `,
     },

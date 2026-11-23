@@ -54,7 +54,6 @@ steps): it authorizes, captures and records the order, and returns the response 
         python: {all: [/idempotency-key/i, /status_code\s*=\s*400|HTTP_400/]},
         typescript: {all: [/idempotency-key/i, /code\(\s*400\s*\)|status\(\s*400\s*\)|badRequest\(/]},
         go: {all: [/Idempotency-Key/i, /http\.StatusBadRequest|\b400\b/]},
-        scala: {all: [/Idempotency-Key/i, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/Idempotency-Key/i, /status\s*=\s*400/]},
       },
     },
@@ -79,9 +78,6 @@ steps): it authorizes, captures and records the order, and returns the response 
           ],
         },
         go: {all: [/"idem:"\s*\+/, /rdb\.SetNX\(\s*[\w.()]+\s*,\s*\w+\s*,\s*processing\s*,\s*idemTTL\s*\)/]},
-        scala: {
-          all: [/s"idem:\$/, /jedis\.set\(\s*\w+\s*,\s*Processing\s*,[^\n]*\.nx\(\)/, /\.ex\(\s*IdemTtlSeconds\s*\)/],
-        },
         cpp: {
           all: [
             /"idem:"\s*\+/,
@@ -99,7 +95,6 @@ steps): it authorizes, captures and records the order, and returns the response 
         python: {all: [/status_code\s*=\s*409|HTTP_409/, /[=!]=\s*PROCESSING/]},
         typescript: {all: [/code\(\s*409\s*\)|status\(\s*409\s*\)/, /[=!]==?\s*PROCESSING/]},
         go: {all: [/http\.StatusConflict|\b409\b/, /[=!]=\s*processing/]},
-        scala: {all: [/StatusCodes\.Conflict|\b409\b/, /[=!]=\s*Processing/]},
         cpp: {all: [/status\s*=\s*409/, /[=!]=\s*kProcessing/]},
       },
     },
@@ -112,7 +107,6 @@ steps): it authorizes, captures and records the order, and returns the response 
         python: {all: [/\br\.get\(/, /status_code\s*=\s*200/]},
         typescript: {all: [/\bredis\.get\(/, /code\(\s*200\s*\)|status\(\s*200\s*\)/]},
         go: {all: [/rdb\.Get\(/, /http\.StatusOK|\b200\b/]},
-        scala: {all: [/jedis\.get\(/, /StatusCodes\.OK|\b200\b/]},
         cpp: {all: [/redis\.get\(/, /status\s*=\s*200/]},
       },
     },
@@ -130,12 +124,6 @@ steps): it authorizes, captures and records the order, and returns the response 
           ],
         },
         go: {order: [/=\s*processCheckout\(/, /rdb\.Set\(\s*[\w.()]+\s*,\s*\w+\s*,\s*[^,\n]+,\s*idemTTL\s*\)/]},
-        scala: {
-          order: [
-            /processCheckout\(\s*\w+\s*\)/,
-            /jedis\.set\(\s*\w+\s*,\s*[^,\n]+,[^\n]*\.ex\(\s*IdemTtlSeconds\s*\)/,
-          ],
-        },
         cpp: {order: [/=\s*process_checkout\(/, /redis\.set\(\s*\w+\s*,\s*[^,\n]+,\s*kIdemTtl\s*\)/]},
       },
     },
@@ -412,99 +400,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /checkout", checkout)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import payments.Tls // Tls.serverContext(certPem, keyPem): the server's SSLContext
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-object CheckoutApi {
-  val jedis = new JedisPooled("redis", 6379)
-  val IdemTtlSeconds = 86400L
-  val Processing = "processing"
-
-  /** Authorize, capture and record the order (built in the next steps); returns the response JSON. */
-  def processCheckout(body: String): String = ???
-
-  val route: Route =
-    path("checkout") {
-      post {
-        entity(as[String]) { body =>
-          optionalHeaderValueByName("Idempotency-Key") { idemKey =>
-            // TODO: 400 when idemKey is None
-            // TODO: SET idem:{key} Processing NX EX IdemTtlSeconds; refused → replay the stored response (200) or 409 while processing
-            // TODO: processCheckout(body), SET the JSON response over the key with the same TTL, answer 201
-            complete(StatusCodes.NotImplemented)
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("checkout")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import payments.Tls // Tls.serverContext(certPem, keyPem): the server's SSLContext
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-object CheckoutApi {
-  val jedis = new JedisPooled("redis", 6379)
-  val IdemTtlSeconds = 86400L
-  val Processing = "processing"
-
-  /** Authorize, capture and record the order (built in the next steps); returns the response JSON. */
-  def processCheckout(body: String): String = ???
-
-  private def json(status: StatusCode, body: String) =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body))
-
-  val route: Route =
-    path("checkout") {
-      post {
-        entity(as[String]) { body =>
-          optionalHeaderValueByName("Idempotency-Key") {
-            case None => complete(StatusCodes.BadRequest -> "Idempotency-Key header is required")
-            case Some(idemKey) =>
-              val key = s"idem:$idemKey"
-              val won = jedis.set(key, Processing, SetParams.setParams().nx().ex(IdemTtlSeconds)) != null
-              if (!won) {
-                Option(jedis.get(key)) match {
-                  case Some(stored) if stored != Processing => complete(json(StatusCodes.OK, stored))
-                  case _ => complete(StatusCodes.Conflict -> "a request with this Idempotency-Key is in progress")
-                }
-              } else {
-                val encoded =
-                  try processCheckout(body)
-                  catch { case e: Exception => jedis.del(key); throw e } // let the client retry with the same key
-                jedis.set(key, encoded, SetParams.setParams().ex(IdemTtlSeconds))
-                complete(json(StatusCodes.Created, encoded))
-              }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("checkout")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

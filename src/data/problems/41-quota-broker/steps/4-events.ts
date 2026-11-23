@@ -58,10 +58,6 @@ the record, or never answers, loses the event while the caller hears \`True\`.
           all: [/Key:\s*\[\]byte\(\s*reservation\.Team\s*\)/],
           none: [/Key:\s*\[\]byte\(\s*reservation\.ResourceClass/],
         },
-        scala: {
-          all: [/new ProducerRecord(\[[^\]]*\])?\(\s*(Topic|"quota\.event")\s*,\s*reservation\.team\s*,/],
-          none: [/reservation\.resourceClass\s*,\s*payload/],
-        },
         cpp: {
           all: [/reservation\.team\.c_str\(\)\s*,\s*reservation\.team\.(size|length)\(\)/],
           none: [/reservation\.resource_class\.c_str\(\)/],
@@ -83,7 +79,6 @@ the record, or never answers, loses the event while the caller hears \`True\`.
           none: [/\.\.\.reservation\b/, /requested_by:\s*reservation/],
         },
         go: {all: [/"reservation_id":/, /"amount":/], none: [/"requested_by":/]},
-        scala: {all: [/"reservation_id"/, /"amount"/], none: [/reservation\.requestedBy/]},
         cpp: {all: [/"reservation_id"/, /"amount"/], none: [/reservation\.requested_by/]},
       },
     },
@@ -96,7 +91,6 @@ the record, or never answers, loses the event while the caller hears \`True\`.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -112,7 +106,6 @@ the record, or never answers, loses the event while the caller hears \`True\`.
         },
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/outbox\.Insert\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.insert\(/, /\.get\(\s*[^\n]*TimeUnit/, /Failure|catch|isFailure/]},
         cpp: {all: [/outbox::insert\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -394,93 +387,6 @@ func publishQuotaEvent(ctx context.Context, kind string, reservation Reservation
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import quota.Outbox // Outbox.insert(topic, key, payload)
-
-/** What the reserve path knows about a grant. */
-final case class Reservation(reservationId: String, team: String, window: String, resourceClass: String, amount: Long, requestedBy: String)
-
-object Events {
-  val Topic = "quota.event"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Tell the ledger consumers a reservation was reserved, released or consumed; true once the broker has the event. */
-  def publishQuotaEvent(kind: String, reservation: Reservation): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val payload = JsObject(
-      "kind" -> JsString(kind),
-      "reservation_id" -> JsString(reservation.reservationId),
-      "team" -> JsString(reservation.team),
-      "window" -> JsString(reservation.window),
-      "resource_class" -> JsString(reservation.resourceClass),
-      "amount" -> JsNumber(reservation.amount),
-      "requested_by" -> JsString(reservation.requestedBy)
-    )
-    producer.send(new ProducerRecord[String, String](Topic, reservation.resourceClass, payload.compactPrint))
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import quota.Outbox // Outbox.insert(topic, key, payload)
-
-/** What the reserve path knows about a grant. */
-final case class Reservation(reservationId: String, team: String, window: String, resourceClass: String, amount: Long, requestedBy: String)
-
-object Events {
-  val Topic = "quota.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Tell the ledger consumers a reservation was reserved, released or consumed; true once the broker has the event. */
-  def publishQuotaEvent(kind: String, reservation: Reservation): Boolean = {
-    // Amounts, not identities: the topic is retained and replicated, the requester stays in the request log.
-    val payload = JsObject(
-      "kind" -> JsString(kind),
-      "reservation_id" -> JsString(reservation.reservationId),
-      "team" -> JsString(reservation.team),
-      "window" -> JsString(reservation.window),
-      "resource_class" -> JsString(reservation.resourceClass),
-      "amount" -> JsNumber(reservation.amount)
-    )
-    val record = new ProducerRecord[String, String](Topic, reservation.team, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay produces the row later, so the ledger is late, not wrong.
-      Outbox.insert(Topic, reservation.team, payload)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

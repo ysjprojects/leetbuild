@@ -55,7 +55,6 @@ of its window a sku has spent.
         python: {all: [/@app\.get\(\s*["']\/v1\/prices\/\{sku\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/prices\/:sku['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/prices\/\{sku\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"prices"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R?"[^\n]*\/v1\/prices\//]},
       },
     },
@@ -68,7 +67,6 @@ of its window a sku has spent.
         python: {all: [/\b404\b/], order: [/store\.get_sku\(/, /store\.candidate_of\(/]},
         typescript: {all: [/\b404\b/], order: [/getSku\(/, /candidateOf\(/]},
         go: {all: [/StatusNotFound|\b404\b/], order: [/store\.GetSKU\(/, /store\.CandidateOf\(/]},
-        scala: {all: [/NotFound|\b404\b/], order: [/Store\.getSku\(/, /Store\.candidateOf\(/]},
         cpp: {all: [/\b404\b/], order: [/store::getSku\(/, /store::candidateOf\(/]},
       },
     },
@@ -81,7 +79,6 @@ of its window a sku has spent.
         python: {all: [/x-operator-scope/i, /PREVIEW_SCOPE\s*=/, /["']candidate["']/]},
         typescript: {all: [/x-operator-scope/i, /PREVIEW_SCOPE\s*=/, /candidate\s*[:=]|\.candidate\b/]},
         go: {all: [/X-Operator-Scope/i, /previewScope\s*=/, /"candidate"/]},
-        scala: {all: [/X-Operator-Scope/i, /PreviewScope\s*=/, /"candidate"/]},
         cpp: {all: [/X-Operator-Scope/i, /kPreviewScope\s*=/, /"candidate"/]},
       },
     },
@@ -94,7 +91,6 @@ of its window a sku has spent.
         python: {all: [/["']source["']/, /["']updated_at["']/, /["']stale["']/], none: [/MODEL_VERSION/]},
         typescript: {all: [/source:/, /updated_at:/, /stale:/], none: [/MODEL_VERSION/]},
         go: {all: [/"source"/, /"updated_at"/, /"stale"/], none: [/\bmodelVersion\b/]},
-        scala: {all: [/"source"/, /"updated_at"/, /"stale"/], none: [/\bModelVersion\b/]},
         cpp: {all: [/"source"/, /"updated_at"/, /"stale"/], none: [/\bkModelVersion\b/]},
       },
     },
@@ -107,7 +103,6 @@ of its window a sku has spent.
         python: {all: [/guard\.window_state\(/, /["']guardrail["']/]},
         typescript: {all: [/windowState\(/, /guardrail:/]},
         go: {all: [/guard\.WindowState\(/, /"guardrail"/]},
-        scala: {all: [/Guard\.windowState\(/, /"guardrail"/]},
         cpp: {all: [/guard::windowState\(/, /"guardrail"/]},
       },
     },
@@ -282,66 +277,6 @@ func readPrice(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/prices/{sku}", readPrice)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import pricing.{Guard, Store} // Guard.windowState; Store.getSku, candidateOf
-
-object Read {
-  val ModelVersion = "elasticity-v7"
-
-  val route: Route = path("v1" / "prices" / Segment) { sku =>
-    get {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      val price = Store.candidateOf(sku).map(_.priceCents).orElse(Store.getSku(sku).map(_.priceCents))
-      val body = JsObject("sku" -> JsString(sku), "price_cents" -> price.map(JsNumber(_)).getOrElse(JsNull), "model_version" -> JsString(ModelVersion))
-      complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import pricing.{Guard, Store} // Guard.windowState; Store.getSku, candidateOf
-
-object Read {
-  val PreviewScope = "preview"
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def guardrail(state: Guard.State): JsObject = JsObject(
-    "window" -> JsNumber(state.window), "moved_bp" -> JsNumber(state.movedBp),
-    "limit_bp" -> JsNumber(state.limitBp), "headroom_bp" -> JsNumber(state.headroomBp))
-
-  val route: Route = path("v1" / "prices" / Segment) { sku =>
-    get {
-      optionalHeaderValueByName("X-Operator-Scope") { scope =>
-        Store.getSku(sku) match {
-          case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString(s"unknown sku $sku"))))
-          case Some(row) =>
-            val published = Map[String, JsValue](
-              "sku" -> JsString(sku), "price_cents" -> JsNumber(row.priceCents), "source" -> JsString(row.source),
-              "updated_at" -> JsNumber(row.updatedAt), "stale" -> JsBoolean(row.stale), "guardrail" -> guardrail(Guard.windowState(sku)))
-            // The candidate rides beside the published price for the operators running the experiment.
-            val candidate =
-              if (scope.contains(PreviewScope))
-                Store.candidateOf(sku).map(c => "candidate" -> JsObject("price_cents" -> JsNumber(c.priceCents), "model_version" -> JsString(c.modelVersion)))
-              else None
-            complete(json(StatusCodes.OK, JsObject(published ++ candidate)))
-        }
-      }
-    }
-  }
 }
 `,
     },

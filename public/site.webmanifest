@@ -1,7 +1,7 @@
 {
   "name": "LeetBuild",
   "short_name": "LeetBuild",
-  "description": "Build systems step by step: HTTPS, gRPC, Kafka and Redis in Python, TypeScript, Go, Scala or C++.",
+  "description": "Build systems step by step: HTTPS, gRPC, Kafka and Redis in Python, TypeScript, Go or C++.",
   "start_url": "/",
   "background_color": "#121523",
   "theme_color": "#6c4cf1",

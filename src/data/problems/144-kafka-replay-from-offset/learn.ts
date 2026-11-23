@@ -32,7 +32,7 @@ The contract: \`replay(topic, from_offset, handler)\` hands every record of ever
 order, and returns how many it handled. It runs as group \`replay-tool\` with auto-commit off, commits
 nothing, and the live group \`orders\` finds its committed offsets exactly where it left them.
 
-- **Rewind** — \`assign\` (Python, Java) or \`subscribe\` + \`seek\` (kafkajs) puts every partition at
+- **Rewind** — \`assign\` (Python, C++) or \`subscribe\` + \`seek\` (kafkajs) puts every partition at
   \`from_offset\`; \`0\` is the beginning.
 - **Bounded** — the high watermark of each partition, read before the first fetch, is the stop line.
 - **Side-effect free** — a tool that commits would move someone else's bookmark.
@@ -109,7 +109,7 @@ Three things went wrong at once: the live service lost partitions for the durati
 at the group's bookmark instead of the offset it was given, and the tool's membership was a second
 live consumer, not a replay. The drill's tool avoids all of it by never joining the live group:
 
-- Python and Java: \`assign\` with \`TopicPartition(topic, p, from_offset)\` for \`p\` in \`0..2\` — no
+- Python and C++: \`assign\` with \`TopicPartition(topic, p, from_offset)\` for \`p\` in \`0..2\` — no
   \`subscribe\`, no coordinator involvement in the assignment.
 - kafkajs: \`subscribe({topic, fromBeginning: true})\`, then \`seek({topic, partition, offset})\` on each
   of the three partitions before the first fetch. kafkajs always goes through a group, so the tool gets

@@ -67,7 +67,6 @@ service DocumentStore { rpc GetCurrent(DocumentRef) returns (DocumentVersion); }
         python: {all: [/DEADLINE_S\s*=\s*1(\.0)?\b/, /GetCurrent\([\s\S]{0,160}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*1_?000\b/, /GetCurrent\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*(1\s*\*\s*)?time\.Second/, /context\.WithTimeout\([^\n]*deadline\)/]},
-        scala: {all: [/DeadlineMs\s*=\s*1000L?\b/, /withDeadlineAfter\(\s*DeadlineMs/]},
         cpp: {all: [/kDeadline\{1000\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -80,7 +79,6 @@ service DocumentStore { rpc GetCurrent(DocumentRef) returns (DocumentVersion); }
         python: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /\bin RETRYABLE\b/], none: [/range\(\s*5\s*\)/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /RETRYABLE\.(has|includes)\(/], none: [/attempt\s*<\s*5\b/]},
         go: {all: [/maxAttempts\s*=\s*3\b/, /retryable\[/], none: [/attempt\s*<\s*5\b/]},
-        scala: {all: [/MaxAttempts\s*=\s*3\b/, /Retryable\.contains\(/], none: [/1 to 5/]},
         cpp: {all: [/kMaxAttempts\s*=\s*3\b/, /kRetryable\.(count|contains|find)\(/], none: [/attempt\s*<\s*5\b/]},
       },
     },
@@ -93,7 +91,6 @@ service DocumentStore { rpc GetCurrent(DocumentRef) returns (DocumentVersion); }
         python: {all: [/["']document_gone["']/, /["']docstore_unavailable["']/], none: [/\bcontinue\b/]},
         typescript: {all: [/['"]document_gone['"]/, /['"]docstore_unavailable['"]/], none: [/\bcontinue;/]},
         go: {all: [/"document_gone"/, /"docstore_unavailable"/], none: [/\bcontinue\b/]},
-        scala: {all: [/"document_gone"/, /"docstore_unavailable"/], none: [/flatMap\(verify\)|\.flatten\b/]},
         cpp: {all: [/"document_gone"/, /"docstore_unavailable"/], none: [/\bcontinue;/]},
       },
     },
@@ -106,7 +103,6 @@ service DocumentStore { rpc GetCurrent(DocumentRef) returns (DocumentVersion); }
         python: {all: [/def reanchor\(/, /\.find\(/, /["']span_moved["']/]},
         typescript: {all: [/function reanchor\(/, /\.indexOf\(/, /['"]span_moved['"]/]},
         go: {all: [/func reanchor\(/, /strings\.Index\(/, /"span_moved"/]},
-        scala: {all: [/def reanchor\(/, /\.indexOf\(/, /"span_moved"/]},
         cpp: {all: [/reanchor\(/, /\.find\(/, /"span_moved"/]},
       },
     },
@@ -506,90 +502,6 @@ func verifyBatch(ctx context.Context, citations []store.Citation) []store.Citati
 		results = append(results, *verify(ctx, c))
 	}
 	return results
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import citations.Store // Store.Citation
-import citationstore.citation_store.{DocumentRef, DocumentStoreGrpc, DocumentVersion}
-
-object Client {
-  val StatusVerified = "verified"
-  val StatusPending = "pending"
-  val StatusBroken = "broken"
-
-  private val docstore = DocumentStoreGrpc.blockingStub(ManagedChannelBuilder.forAddress("docstore", 9000).usePlaintext().build())
-
-  /** The document's current version, if the document store gave it. */
-  def fetchCurrent(documentId: String): Option[DocumentVersion] = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    (1 to 5).iterator
-      .map { _ =>
-        try Some(docstore.getCurrent(DocumentRef(documentId)))
-        catch { case _: StatusRuntimeException => None } // the document store is flaky: ask again
-      }
-      .collectFirst { case Some(current) => current }
-  }
-
-  /** The citation checked against the document's current version, if it could be checked. */
-  def verify(c: Store.Citation): Option[Store.Citation] =
-    fetchCurrent(c.documentId).map { current =>
-      if (current.text.slice(c.start.toInt, c.end.toInt) == c.quote) c.copy(version = current.version, status = StatusVerified, reason = "")
-      else c.copy(status = StatusBroken, reason = "span_moved")
-    }
-
-  /** Every citation of an answer, checked. */
-  def verifyBatch(citations: Seq[Store.Citation]): Seq[Store.Citation] =
-    citations.flatMap(verify) // nothing to report for a citation the store could not resolve
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import citations.Store // Store.Citation
-import citationstore.citation_store.{DocumentRef, DocumentStoreGrpc, DocumentVersion}
-
-object Client {
-  val StatusVerified = "verified"
-  val StatusPending = "pending"
-  val StatusBroken = "broken"
-  val DeadlineMs = 1000L
-  val MaxAttempts = 3
-  val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val docstore = DocumentStoreGrpc.blockingStub(ManagedChannelBuilder.forAddress("docstore", 9000).usePlaintext().build())
-
-  /** The document's current version: retryable codes up to MaxAttempts calls, NOT_FOUND and the rest at once. */
-  def fetchCurrent(documentId: String, attempt: Int = 1): DocumentVersion =
-    try docstore.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).getCurrent(DocumentRef(documentId))
-    catch {
-      case e: StatusRuntimeException if Retryable.contains(e.getStatus.getCode) && attempt < MaxAttempts =>
-        fetchCurrent(documentId, attempt + 1)
-    }
-
-  /** The citation checked against a version's text: still at its offsets, found elsewhere, or gone. */
-  def reanchor(c: Store.Citation, version: Long, text: String): Store.Citation = {
-    val start = if (text.slice(c.start.toInt, c.end.toInt) == c.quote) c.start.toInt else text.indexOf(c.quote)
-    if (start < 0) c.copy(status = StatusBroken, reason = "span_moved")
-    else c.copy(version = version, start = start.toLong, end = start.toLong + c.quote.length, status = StatusVerified, reason = "")
-  }
-
-  /** The citation checked against the document's current version; one that cannot be checked says why. */
-  def verify(c: Store.Citation): Store.Citation =
-    try {
-      val current = fetchCurrent(c.documentId)
-      reanchor(c, current.version, current.text)
-    } catch {
-      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.NOT_FOUND => c.copy(status = StatusBroken, reason = "document_gone")
-      // The store did not answer: nothing is known about the span yet.
-      case _: StatusRuntimeException => c.copy(status = StatusPending, reason = "docstore_unavailable")
-    }
-
-  /** Every citation of an answer, checked, in order. */
-  def verifyBatch(citations: Seq[Store.Citation]): Seq[Store.Citation] = citations.map(verify)
 }
 `,
     },

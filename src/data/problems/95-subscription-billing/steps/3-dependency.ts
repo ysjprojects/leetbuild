@@ -78,7 +78,6 @@ service Processor {
           ],
         },
         go: {all: [/deadline\s*=\s*5\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*5L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/kDeadline\{5\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -91,7 +90,6 @@ service Processor {
         python: {all: [/idempotency_key\s*=\s*invoice\[["']invoice_id["']\]\s*[,)\n]/]},
         typescript: {all: [/idempotency_key:\s*invoice\.invoice_id\s*[,}\n]/]},
         go: {all: [/IdempotencyKey:\s*invoice\.InvoiceID\s*[,}\n]/]},
-        scala: {all: [/idempotencyKey\s*=\s*invoice\.invoiceId\s*[,)\n]/]},
         cpp: {all: [/set_idempotency_key\(\s*invoice\.invoice_id\s*\)/]},
       },
     },
@@ -107,7 +105,6 @@ service Processor {
           all: [/codes\.DeadlineExceeded/],
           order: [/processorClient\.Charge\(/, /lookupInvoice\([^)\n]*invoice\.InvoiceID/],
         },
-        scala: {all: [/DEADLINE_EXCEEDED/], order: [/\.charge\(/, /lookupInvoice\(\s*invoice\.invoiceId/]},
         cpp: {all: [/DEADLINE_EXCEEDED/], order: [/->Charge\(/, /lookupInvoice\(\s*invoice\.invoice_id/]},
       },
     },
@@ -120,7 +117,6 @@ service Processor {
         python: {all: [/["']declined["']/, /decline_code/]},
         typescript: {all: [/['"]declined['"]/, /decline_code/]},
         go: {all: [/"declined"/, /GetDeclineCode\(\)|DeclineCode/]},
-        scala: {all: [/"declined"/, /declineCode/]},
         cpp: {all: [/"declined"/, /decline_code\(\)/]},
       },
     },
@@ -457,88 +453,6 @@ func chargeInvoice(ctx context.Context, invoice *store.Invoice) store.Outcome {
 		return store.Outcome{State: "charged", Reference: result.GetReference()}
 	}
 	return store.Outcome{State: "failed", Reason: "processor_unavailable"}
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import billing.Store // Store.Invoice, Store.Outcome, Store.ProcessorInvoice
-import subbilling.subscription_billing.{ChargeRequest, GetInvoiceRequest, ProcessorGrpc}
-
-object Client {
-  val MaxAttempts = 3
-
-  private val stub = ProcessorGrpc.blockingStub(ManagedChannelBuilder.forAddress("processor", 9000).usePlaintext().build())
-
-  /** What the processor holds for the invoice, if anything. */
-  def lookupInvoice(invoiceId: String): Option[Store.ProcessorInvoice] =
-    try {
-      val found = stub.getInvoice(GetInvoiceRequest(invoiceId))
-      Some(Store.ProcessorInvoice(found.invoiceId, found.state, found.reference, found.totalCents))
-    } catch {
-      case _: StatusRuntimeException => None
-    }
-
-  /** Charge the invoice row and answer what came of it. */
-  def chargeInvoice(invoice: Store.Invoice): Store.Outcome = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    for (attempt <- 0 until MaxAttempts) {
-      val request = ChargeRequest(invoiceId = invoice.invoiceId, subscriptionId = invoice.subscriptionId,
-        amountCents = invoice.amountCents, idempotencyKey = s"\${invoice.invoiceId}-$attempt")
-      try {
-        val result = stub.charge(request)
-        if (result.status == "succeeded") return Store.Outcome("charged", result.reference, "")
-      } catch {
-        case _: StatusRuntimeException => ()
-      }
-    }
-    Store.Outcome("failed", "", "processor_unavailable")
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import billing.Store // Store.Invoice, Store.Outcome, Store.ProcessorInvoice
-import subbilling.subscription_billing.{ChargeRequest, GetInvoiceRequest, ProcessorGrpc}
-
-object Client {
-  val DeadlineSeconds = 5L
-  val MaxAttempts = 3
-
-  private val stub = ProcessorGrpc.blockingStub(ManagedChannelBuilder.forAddress("processor", 9000).usePlaintext().build())
-
-  /** What the processor holds for the invoice, if anything. */
-  def lookupInvoice(invoiceId: String): Option[Store.ProcessorInvoice] =
-    try {
-      val found = stub.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).getInvoice(GetInvoiceRequest(invoiceId))
-      Some(Store.ProcessorInvoice(found.invoiceId, found.state, found.reference, found.totalCents))
-    } catch {
-      case _: StatusRuntimeException => None
-    }
-
-  /** Charge the invoice row and answer what came of it. */
-  def chargeInvoice(invoice: Store.Invoice): Store.Outcome = {
-    // One key for every attempt: to the processor a retry is the same charge.
-    val request = ChargeRequest(invoiceId = invoice.invoiceId, subscriptionId = invoice.subscriptionId,
-      amountCents = invoice.amountCents, idempotencyKey = invoice.invoiceId)
-    for (_ <- 0 until MaxAttempts) {
-      try {
-        val result = stub.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).charge(request)
-        // A decline is final: the issuer said no.
-        return if (result.status == "declined") Store.Outcome("failed", "", result.declineCode) else Store.Outcome("charged", result.reference, "")
-      } catch {
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED =>
-          // Unknown outcome: the charge may have landed. Ask before charging again.
-          lookupInvoice(invoice.invoiceId).filter(_.state == "charged").foreach(found => return Store.Outcome("charged", found.reference, ""))
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.UNAVAILABLE => ()
-        case e: StatusRuntimeException => return Store.Outcome("failed", "", e.getStatus.getCode.toString.toLowerCase)
-      }
-    }
-    Store.Outcome("failed", "", "processor_unavailable")
-  }
 }
 `,
     },

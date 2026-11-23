@@ -65,10 +65,6 @@ tenant's events interleaved and no releases at all, so its picture of the node o
           all: [/config\.Topic/, /Key:\s*\[\]byte\(\s*nodeID\s*\)|publish\(ctx, nodeID,/],
           none: [/Key:\s*\[\]byte\(\s*tenant\s*\)/],
         },
-        scala: {
-          all: [/Topic/, /new ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*nodeId\s*,|publish\(nodeId,/],
-          none: [/ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*tenant\s*,/],
-        },
         cpp: {
           all: [/kTopic/, /node_id\.c_str\(\)\s*,\s*node_id\.(size|length)\(\)/],
           none: [/tenant\.c_str\(\)\s*,\s*tenant\.(size|length)\(\)/],
@@ -86,7 +82,6 @@ tenant's events interleaved and no releases at all, so its picture of the node o
         },
         typescript: {all: [/\btype:/, /placement_id:/, /gpu_count:/, /memory_gb:/, /node_id:/]},
         go: {all: [/json:"type"/, /json:"placement_id"/, /json:"gpu_count"/, /json:"memory_gb"/, /json:"node_id"/]},
-        scala: {all: [/"type"/, /"placement_id"/, /"gpu_count"/, /"memory_gb"/, /"node_id"/]},
         cpp: {all: [/"type"/, /"placement_id"/, /"gpu_count"/, /"memory_gb"/, /"node_id"/]},
       },
     },
@@ -99,7 +94,6 @@ tenant's events interleaved and no releases at all, so its picture of the node o
         python: {all: [/(=|if)\s*allocate\(/], none: [/producer\.produce\([\s\S]{0,400}?return allocate\(/]},
         typescript: {all: [/(=|if \()\s*await allocate\(/], none: [/producer\.send\([\s\S]{0,400}?return allocate\(/]},
         go: {all: [/(=|if)\s*allocate\(/], none: [/WriteMessages\([\s\S]{0,400}?return allocate\(/]},
-        scala: {all: [/(=|if \()\s*State\.allocate\(/], none: [/producer\.send\([^\n]*\n\s*State\.allocate\(/]},
         cpp: {all: [/(=|if \()\s*allocate\(/], none: [/producer->produce\([\s\S]{0,600}?return allocate\(/]},
       },
     },
@@ -112,7 +106,6 @@ tenant's events interleaved and no releases at all, so its picture of the node o
         python: {all: [/on_delivery\s*=/, /rpush\(\s*OUTBOX/, /def relay_outbox/], none: [/except KafkaException/]},
         typescript: {all: [/\bcatch\b/, /rpush\(\s*OUTBOX/, /relayOutbox/]},
         go: {all: [/err != nil/, /RPush\([^\n]*config\.Outbox/, /func relayOutbox/]},
-        scala: {all: [/Callback/, /rpush\(\s*Outbox/, /def relayOutbox/]},
         cpp: {all: [/dr_cb\(/, /rpush\(\s*gpusched::kOutbox|rpush\(\s*kOutbox/, /relay_outbox\(/]},
       },
     },
@@ -129,7 +122,6 @@ tenant's events interleaved and no releases at all, so its picture of the node o
           all: [/['"]release['"]/, /function releaseAndPublish(?:(?!\n\})[\s\S])*?(producer\.send\(|publish\()/],
         },
         go: {all: [/"release"/, /func releaseAndPublish(?:(?!\n\})[\s\S])*?(WriteMessages\(|publish\()/]},
-        scala: {all: [/"release"/, /def releaseAndPublish(?:(?!\n {2}def )[\s\S])*?(producer\.send\(|publish\()/]},
         cpp: {all: [/"release"/, /release_and_publish\((?:(?!\n\})[\s\S])*?(producer->produce\(|publish\()/]},
       },
     },
@@ -489,128 +481,6 @@ func relayOutbox(ctx context.Context) (int, error) {
 		}
 		sent++
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import gpusched.Config.{Outbox, Topic}
-
-object Events {
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-
-  /** Book the node and tell the stream: the ledger's answer. */
-  def allocateAndPublish(nodeId: String, placementId: String, tenant: String, count: Int, memoryGb: Double): String = {
-    val event = JsObject("id" -> JsString(placementId), "tenant" -> JsString(tenant), "gpus" -> JsNumber(count), "ts" -> JsNumber(System.currentTimeMillis() / 1000.0)).compactPrint
-    producer.send(new ProducerRecord[String, String](Topic, tenant, event))
-    State.allocate(nodeId, placementId, count)
-  }
-
-  /** Return the placement's GPUs; true when the counters moved. */
-  def releaseAndPublish(nodeId: String, placementId: String): Boolean = State.release(nodeId, placementId)
-
-  /** Produce every outbox row again; how many were sent. */
-  def relayOutbox(): Int = {
-    var sent = 0
-    var row = jedis.lpop(Outbox)
-    while (row != null) {
-      val fields = row.parseJson.asJsObject.fields
-      val key = fields("key").convertTo[String]
-      val value = fields("value").convertTo[String]
-      producer.send(new ProducerRecord[String, String](Topic, key, value))
-      sent += 1
-      row = jedis.lpop(Outbox)
-    }
-    sent
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import scala.jdk.CollectionConverters._
-
-import gpusched.Config.{Outbox, Topic}
-
-object Events {
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** One record to the stream; a delivery the broker refuses goes to the outbox for relayOutbox. */
-  private def publish(key: String, value: String): Unit =
-    producer.send(new ProducerRecord[String, String](Topic, key, value), new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) jedis.rpush(Outbox, JsObject("key" -> JsString(key), "value" -> JsString(value)).compactPrint)
-    })
-
-  private def event(kind: String, placementId: String, nodeId: String, tenant: String, count: Int, memoryGb: Double): String =
-    JsObject(
-      "type" -> JsString(kind),
-      "placement_id" -> JsString(placementId),
-      "node_id" -> JsString(nodeId),
-      "tenant" -> JsString(tenant),
-      "gpu_count" -> JsNumber(count),
-      "memory_gb" -> JsNumber(memoryGb),
-      "ts" -> JsNumber(System.currentTimeMillis() / 1000.0)
-    ).compactPrint
-
-  /** Book the node and tell the stream: the ledger's answer. */
-  def allocateAndPublish(nodeId: String, placementId: String, tenant: String, count: Int, memoryGb: Double): String = {
-    val result = State.allocate(nodeId, placementId, count)
-    if (result == "ALLOCATED") {
-      jedis.hset(s"placement:$placementId", Map("tenant" -> tenant, "memory_gb" -> memoryGb.toString).asJava)
-      publish(nodeId, event("allocation", placementId, nodeId, tenant, count, memoryGb))
-    }
-    result
-  }
-
-  /** Return the placement's GPUs; true when the counters moved, and then the stream hears of it. */
-  def releaseAndPublish(nodeId: String, placementId: String): Boolean = {
-    val record = jedis.hgetAll(s"placement:$placementId").asScala
-    val moved = State.release(nodeId, placementId)
-    if (moved) {
-      val count = record.get("count").map(_.toInt).getOrElse(0)
-      val memoryGb = record.get("memory_gb").map(_.toDouble).getOrElse(0.0)
-      publish(nodeId, event("release", placementId, nodeId, record.getOrElse("tenant", ""), count, memoryGb))
-    }
-    moved
-  }
-
-  /** Produce every outbox row again; how many were sent. */
-  def relayOutbox(): Int = {
-    var sent = 0
-    var row = jedis.lpop(Outbox)
-    while (row != null) {
-      val fields = row.parseJson.asJsObject.fields
-      publish(fields("key").convertTo[String], fields("value").convertTo[String])
-      sent += 1
-      row = jedis.lpop(Outbox)
-    }
-    sent
-  }
 }
 `,
     },
@@ -1389,5 +1259,5 @@ void CheckReleaseReconcile(harness::Ctx& ctx) {
 }
 `,
   },
-  debrief: `The order is ledger, then stream, because the ledger is the truth and the stream is its history: an event for a booking the ledger refused is a lie that every consumer will repeat. Keying by node id puts one node's allocations and releases on one partition in the order they happened, which is the only order in which folding them means anything. The outbox is the answer to a produce the broker refuses: the booking already happened, so the event must happen too, later. Reading the delivery report (the callback in librdkafka and the Java client, the rejected promise in kafkajs, the returned error in kafka-go) is what makes a refusal visible at all. Production systems write the outbox row in the same transaction as the booking and let a relay own every produce, so the request path never talks to Kafka.`,
+  debrief: `The order is ledger, then stream, because the ledger is the truth and the stream is its history: an event for a booking the ledger refused is a lie that every consumer will repeat. Keying by node id puts one node's allocations and releases on one partition in the order they happened, which is the only order in which folding them means anything. The outbox is the answer to a produce the broker refuses: the booking already happened, so the event must happen too, later. Reading the delivery report (the callback in librdkafka, the rejected promise in kafkajs, the returned error in kafka-go) is what makes a refusal visible at all. Production systems write the outbox row in the same transaction as the booking and let a relay own every produce, so the request path never talks to Kafka.`,
 };

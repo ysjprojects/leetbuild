@@ -49,7 +49,6 @@ rules are explained as "in rollout"; and a shared cache hands one user's explana
         python: {all: [/@app\.get\(\s*["']\/v1\/flags\/\{flag_key\}\/evaluation["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/flags\/:flagKey\/evaluation['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/flags\/\{key\}\/evaluation"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"flags"\s*\/\s*Segment\s*\/\s*"evaluation"\s*\)/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/flags\/[^"]*\/evaluation\)"/]},
       },
     },
@@ -62,7 +61,6 @@ rules are explained as "in rollout"; and a shared cache hands one user's explana
         python: {all: [/x-user-id/i, /\b403\b/, /\b401\b/]},
         typescript: {all: [/x-user-id/i, /\b403\b/, /\b401\b/]},
         go: {all: [/X-User-Id/i, /StatusForbidden|\b403\b/, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/X-User-Id/i, /Forbidden|\b403\b/, /Unauthorized|\b401\b/]},
         cpp: {all: [/X-User-Id/i, /\b403\b/, /\b401\b/]},
       },
     },
@@ -75,7 +73,6 @@ rules are explained as "in rollout"; and a shared cache hands one user's explana
         python: {all: [/engine\.evaluate\(/], none: [/engine\.bucket\(/]},
         typescript: {all: [/\bevaluate\(/], none: [/\bbucket\(/]},
         go: {all: [/engine\.Evaluate\(/], none: [/engine\.Bucket\(/]},
-        scala: {all: [/Engine\.evaluate\(/], none: [/Engine\.bucket\(/]},
         cpp: {all: [/engine::evaluate\(/], none: [/engine::bucket\(/]},
       },
     },
@@ -88,7 +85,6 @@ rules are explained as "in rollout"; and a shared cache hands one user's explana
         python: {all: [/private,\s*no-store/], none: [/public/]},
         typescript: {all: [/private,\s*no-store/], none: [/public/]},
         go: {all: [/private,\s*no-store/], none: [/public/]},
-        scala: {all: [/private,\s*no-store/], none: [/public/]},
         cpp: {all: [/private,\s*no-store/], none: [/public/]},
       },
     },
@@ -305,86 +301,6 @@ func explain(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/flags/{key}/evaluation", explain)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import flags.{Engine, Registry} // Engine.evaluate, readSnapshot, bucket; Registry.Attributes
-
-object Read {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, headers = List(RawHeader("Cache-Control", "public, max-age=60")), entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route =
-    path("v1" / "flags" / Segment / "evaluation") { flagKey =>
-      get {
-        optionalHeaderValueByName("X-User-Id") { header =>
-          parameterMap { query =>
-            // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-            val userId = query.get("user_id").orElse(header).getOrElse("")
-            val found = Engine.readSnapshot().flatMap(snapshot => snapshot.fields("flags").asJsObject.fields.get(flagKey).map(flag => (snapshot, flag.asJsObject.fields)))
-            found match {
-              case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("unknown flag"))))
-              case Some((snapshot, flag)) =>
-                val salt = flag.get("salt").collect { case JsString(s) => s }.getOrElse(flagKey)
-                val rollout = flag.get("rollout").collect { case JsNumber(n) => n.toInt }.getOrElse(0)
-                val b = Engine.bucket(flagKey, userId, salt)
-                val inRollout = b < rollout
-                complete(json(StatusCodes.OK, JsObject(
-                  "flag_key" -> JsString(flagKey),
-                  "user_id" -> JsString(userId),
-                  "value" -> (if (inRollout) JsTrue else flag.getOrElse("default", JsFalse)),
-                  "reason" -> JsString(if (inRollout) "in-rollout" else "out-of-rollout"),
-                  "bucket" -> JsNumber(b),
-                  "version" -> snapshot.fields("version"))))
-            }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import flags.{Engine, Registry} // Engine.evaluate, readSnapshot, bucket; Registry.Attributes
-
-object Read {
-  // One user's explanation: no shared cache may keep it.
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, headers = List(RawHeader("Cache-Control", "private, no-store")), entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  val route: Route =
-    path("v1" / "flags" / Segment / "evaluation") { flagKey =>
-      get {
-        optionalHeaderValueByName("X-User-Id") { header =>
-          parameterMap { query =>
-            header.filter(_.nonEmpty) match {
-              case None => complete(error(StatusCodes.Unauthorized, "X-User-Id is required"))
-              case Some(userId) if query.get("user_id").exists(_ != userId) => complete(error(StatusCodes.Forbidden, "an explanation covers the caller only"))
-              case Some(userId) =>
-                val attrs = query.filter { case (name, _) => name != "user_id" && Registry.Attributes.contains(name) } + ("user_id" -> userId)
-                // The decision served, not a second opinion.
-                Engine.evaluate(flagKey, attrs) match {
-                  case None => complete(error(StatusCodes.NotFound, "unknown flag"))
-                  case Some(decision) => complete(json(StatusCodes.OK, JsObject(decision.fields + ("user_id" -> JsString(userId)))))
-                }
-            }
-          }
-        }
-      }
-    }
 }
 `,
     },

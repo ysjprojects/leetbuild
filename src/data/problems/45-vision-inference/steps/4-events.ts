@@ -30,7 +30,7 @@ Requirements:
 - The producer is idempotent with \`acks=all\` (Go uses confluent-kafka-go, which has an idempotent
   producer; kafka-go does not).
 - A refused produce writes the event to the provided \`outbox\` from the **delivery report**
-  (\`on_delivery\`, a rejected \`send\`, the delivery event, \`dr_cb\`, a \`Callback\`); \`publish\`
+  (\`on_delivery\`, a rejected \`send\`, the delivery event, \`dr_cb\`); \`publish\`
   does not raise.`,
   sequence: {
     participants: ['Worker', 'vision.inference', 'outbox', 'Quality pipeline'],
@@ -61,10 +61,6 @@ Requirements:
         python: {all: [/key\s*=\s*\w+\.model_version/], none: [/key\s*=\s*\w+\.tenant/]},
         typescript: {all: [/key:\s*\w+\.model_version/], none: [/key:\s*\w+\.tenant/]},
         go: {all: [/Key:\s*\[\]byte\(\s*\w+\.ModelVersion\s*\)/], none: [/Key:\s*\[\]byte\(\s*\w+\.Tenant\s*\)/]},
-        scala: {
-          all: [/ProducerRecord(\[[^\]]*\])?\(\s*[\w.]+\s*,\s*\w+\.model_version\s*,/],
-          none: [/ProducerRecord(\[[^\]]*\])?\(\s*[\w.]+\s*,\s*\w+\.tenant\s*,/],
-        },
         cpp: {
           all: [/produce\([\s\S]{0,400}?model_version\.(c_str|data)\(\)/],
           none: [/produce\([\s\S]{0,400}?tenant\.(c_str|data)\(\)/],
@@ -80,7 +76,6 @@ Requirements:
         python: {none: [/image_key|image_url/]},
         typescript: {none: [/image_key|image_url/]},
         go: {none: [/ImageKey|ImageURL/]},
-        scala: {none: [/image_key|image_url/]},
         cpp: {none: [/image_key|image_url/]},
       },
     },
@@ -93,7 +88,6 @@ Requirements:
         python: {all: [/["']model_version["']/, /["']downgraded["']/, /["']content_hash["']/]},
         typescript: {all: [/model_version:/, /downgraded:/, /content_hash:/]},
         go: {all: [/"model_version"/, /"downgraded"/, /"content_hash"/]},
-        scala: {all: [/"model_version"/, /"downgraded"/, /"content_hash"/]},
         cpp: {all: [/"model_version"/, /"downgraded"/, /"content_hash"/]},
       },
     },
@@ -106,7 +100,6 @@ Requirements:
         python: {all: [/enable\.idempotence/]},
         typescript: {all: [/idempotent:\s*true/]},
         go: {all: [/enable\.idempotence/]},
-        scala: {all: [/enable\.idempotence/]},
         cpp: {all: [/enable\.idempotence/]},
       },
     },
@@ -119,7 +112,6 @@ Requirements:
         python: {all: [/on_delivery\s*=|callback\s*=/, /outbox\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/outbox\.insertOutbox\(/, /\.catch\(|catch\s*\(/]},
         go: {all: [/outbox\.Insert\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.insertOutbox\(/, /exception != null/]},
         cpp: {all: [/outbox::insert_outbox\(/, /dr_cb/]},
       },
     },
@@ -359,80 +351,6 @@ func publish(ctx context.Context, record results.InferenceRecord) error {
 	}
 	log.Printf("vision.inference %s version=%s", record.InferenceID, record.ModelVersion)
 	return nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import vision.{Config, InferenceRecord}
-
-object InferenceEvents {
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** Tell the quality pipeline about one finished inference. */
-  def publish(record: InferenceRecord): Unit = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val event = ujson.write(
-      ujson.Obj(
-        "inference_id" -> record.inference_id,
-        "tenant" -> record.tenant,
-        "task" -> record.task,
-        "label" -> record.label,
-        "confidence" -> record.confidence,
-        "latency_ms" -> record.latency_ms,
-        "image_key" -> record.image_key,
-        "image_url" -> record.image_url
-      )
-    )
-    producer.send(new ProducerRecord[String, String](Config.Topic, record.tenant, event))
-    System.err.println(s"vision.inference \${record.inference_id} tenant=\${record.tenant}")
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import vision.{Config, InferenceRecord, Outbox}
-
-object InferenceEvents {
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** Tell the quality pipeline about one finished inference. */
-  def publish(record: InferenceRecord): Unit = {
-    val event = ujson.write(
-      ujson.Obj(
-        "inference_id" -> record.inference_id,
-        "tenant" -> record.tenant,
-        "task" -> record.task,
-        "model_version" -> record.model_version,
-        "downgraded" -> record.downgraded,
-        "confidence" -> record.confidence,
-        "latency_ms" -> record.latency_ms,
-        "content_hash" -> record.content_hash
-      )
-    )
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) {
-          Outbox.insertOutbox(event) // the broker said no: the relay republishes it later
-          System.err.println(s"vision.inference produce failed inference=\${record.inference_id}: \${exception.getMessage}")
-        }
-    }
-    producer.send(new ProducerRecord[String, String](Config.Topic, record.model_version, event), onDelivery)
-    System.err.println(s"vision.inference \${record.inference_id} version=\${record.model_version}")
-  }
 }
 `,
     },

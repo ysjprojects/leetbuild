@@ -7,7 +7,7 @@ import {decisionCacheStep} from './steps/2-decision-cache';
 import {agentChainStep} from './steps/3-agent-chain';
 import {runGuardStep} from './steps/4-run-guard';
 import {feedbackEvalStep} from './steps/5-feedback-eval';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Uber's QueryGPT: not "ask a model for SQL", but the service around the agents that makes the
@@ -120,6 +120,5 @@ LLM judge.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

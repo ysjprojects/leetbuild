@@ -26,7 +26,7 @@ for good.
 - The event is \`{ticket_id, tenant, queue, priority, confidence, fallback_reason, received_at}\`:
   no text, nothing else from the ticket.
 - Write the outbox row, that same event, where the broker answers: the delivery report
-  (\`on_delivery\`, a rejected \`send\`, kafka-go's \`Completion\`, \`dr_cb\`, a producer \`Callback\`).
+  (\`on_delivery\`, a rejected \`send\`, kafka-go's \`Completion\`, \`dr_cb\`).
 - \`run()\` records the routing, then commits; a routing it could not record is not committed.`,
   sequence: {
     participants: ['triage-api', 'triage.decided', 'outbox', 'Routing consumer', 'routing store'],
@@ -54,7 +54,6 @@ for good.
         python: {all: [/key\s*=\s*ticket\[\s*["']tenant["']\s*\]/]},
         typescript: {all: [/key:\s*ticket\.tenant/]},
         go: {all: [/Key:\s*\[\]byte\(ticket\.Tenant\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*ticket\.tenant/]},
         cpp: {all: [/ticket\.tenant\.c_str\(\)/]},
       },
     },
@@ -67,7 +66,6 @@ for good.
         python: {none: [/ticket\[\s*["']text["']\s*\]/]},
         typescript: {none: [/ticket\.text/]},
         go: {none: [/ticket\.Text/]},
-        scala: {none: [/ticket\.text/]},
         cpp: {none: [/ticket\.text/]},
       },
     },
@@ -80,7 +78,6 @@ for good.
         python: {all: [/on_delivery\s*=|callback\s*=/, /store\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/\.catch\(|await\s+producer\.send\(/, /insertOutbox\(/]},
         go: {all: [/store\.InsertOutbox\(/], none: [/Async:\s*true(?![\s\S]*Completion:)/]},
-        scala: {all: [/new Callback|onCompletion/, /Store\.insertOutbox\(/]},
         cpp: {all: [/dr_cb/, /store::insertOutbox\(/]},
       },
     },
@@ -93,7 +90,6 @@ for good.
         python: {order: [/store\.record_routing\(/, /\.commit\(/]},
         typescript: {order: [/await recordRouting\(/, /commitOffsets\(/]},
         go: {order: [/store\.RecordRouting\(/, /CommitMessages\(/]},
-        scala: {order: [/Store\.recordRouting\(/, /commitSync\(/]},
         cpp: {order: [/store::recordRouting\(/, /commitSync\(/]},
       },
     },
@@ -432,113 +428,6 @@ func run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import spray.json._
-
-import triage.{Rules, Store} // Rules.Decision; Store.insertOutbox(eventJson), Store.recordRouting(event)
-
-/** What the triage service knows about a routed ticket. */
-final case class Ticket(ticketId: String, tenant: String, text: String, receivedAt: Long)
-
-object TriageEvents {
-  val Topic = "triage.decided"
-
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
-  props.put(ProducerConfig.ACKS_CONFIG, "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** Announce a routed ticket. */
-  def publishDecision(ticket: Ticket, decision: Rules.Decision): Unit = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val event = JsObject(
-      "ticket_id" -> JsString(ticket.ticketId), "tenant" -> JsString(ticket.tenant), "text" -> JsString(ticket.text),
-      "queue" -> JsString(decision.queue), "priority" -> JsString(decision.priority), "confidence" -> JsNumber(decision.confidence),
-      "fallback_reason" -> JsString(decision.fallbackReason), "received_at" -> JsNumber(ticket.receivedAt)).compactPrint
-    try producer.send(new ProducerRecord[String, String](Topic, decision.queue, event))
-    catch { case _: Exception => Store.insertOutbox(event) }
-  }
-
-  /** The routing consumer: records every routed ticket in its queue. */
-  def run(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, "routing")
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(java.util.List.of(Topic))
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).forEach { record =>
-        consumer.commitSync()
-        Store.recordRouting(record.value().parseJson.asJsObject)
-      }
-    }
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import spray.json._
-
-import triage.{Rules, Store} // Rules.Decision; Store.insertOutbox(eventJson), Store.recordRouting(event)
-
-/** What the triage service knows about a routed ticket. */
-final case class Ticket(ticketId: String, tenant: String, text: String, receivedAt: Long)
-
-object TriageEvents {
-  val Topic = "triage.decided"
-
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
-  props.put(ProducerConfig.ACKS_CONFIG, "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** Announce a routed ticket. */
-  def publishDecision(ticket: Ticket, decision: Rules.Decision): Unit = {
-    // Ids and scores only: the topic is retained and replicated, the ticket's words stay in the ticket.
-    val event = JsObject(
-      "ticket_id" -> JsString(ticket.ticketId), "tenant" -> JsString(ticket.tenant),
-      "queue" -> JsString(decision.queue), "priority" -> JsString(decision.priority), "confidence" -> JsNumber(decision.confidence),
-      "fallback_reason" -> JsString(decision.fallbackReason), "received_at" -> JsNumber(ticket.receivedAt)).compactPrint
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) Store.insertOutbox(event) // the broker said no: the relay republishes it later
-    }
-    producer.send(new ProducerRecord[String, String](Topic, ticket.tenant, event), onDelivery)
-  }
-
-  /** The routing consumer: records every routed ticket in its queue. */
-  def run(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, "routing")
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(java.util.List.of(Topic))
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).forEach { record =>
-        Store.recordRouting(record.value().parseJson.asJsObject)
-        consumer.commitSync() // after the record: a crash before this line redelivers
-      }
-    }
-  }
 }
 `,
     },

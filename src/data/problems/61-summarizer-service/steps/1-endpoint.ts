@@ -46,7 +46,6 @@ timeout gets a second summary and a second bill.
         python: {all: [/@app\.post\(\s*["']\/v1\/summaries["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/summaries['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/summaries"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"summaries"\s*\)/, /\bpost\b/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/summaries"/]},
       },
     },
@@ -79,14 +78,6 @@ timeout gets a second summary and a second bill.
             /chunk_bytes/,
           ],
         },
-        scala: {
-          all: [
-            /MaxSourceBytes[^=\n]*=\s*(1\s*<<\s*20|1048576|1024\s*\*\s*1024)/,
-            /PayloadTooLarge|RequestEntityTooLarge|\b413\b/,
-            /chunk_bytes/,
-            /getBytes\(/,
-          ],
-        },
         cpp: {all: [/kMaxSourceBytes\s*=\s*(1\s*<<\s*20|1048576|1024\s*\*\s*1024)/, /\b413\b/, /chunk_bytes/]},
       },
     },
@@ -99,7 +90,6 @@ timeout gets a second summary and a second bill.
         python: {all: [/BAND_TARGETS/, /status_code\s*=\s*400/], none: [/detect_band\(/, /BAND_TARGETS\.get\(/]},
         typescript: {all: [/BAND_TARGETS/, /code\(\s*400\s*\)/], none: [/detectBand\(/, /\?\?\s*250/]},
         go: {all: [/bandTargets\[/, /StatusBadRequest|\b400\b/], none: [/detectBand\(/]},
-        scala: {all: [/BandTargets/, /BadRequest/], none: [/detectBand\(/, /getOrElse\(\s*band\s*,\s*250/]},
         cpp: {all: [/kBandTargets/, /\b400\b/], none: [/detectBand\(/]},
       },
     },
@@ -117,10 +107,6 @@ timeout gets a second summary and a second bill.
         go: {
           all: [/Idempotency-Key/i, /store\.Replay\(/, /store\.Remember\(/],
           order: [/store\.Replay\(/, /store\.CreateSummary\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Store\.replay\(/, /Store\.remember\(/],
-          order: [/Store\.replay\(/, /Store\.createSummary\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /store::replay\(/, /store::remember\(/],
@@ -431,117 +417,6 @@ func submit(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/summaries", submit)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import summarizer.Store // Store.createSummary, replay, remember
-
-object Api {
-  val BandTargets: Map[String, Int] = Map("short" -> 100, "medium" -> 250, "long" -> 600)
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def field(body: Map[String, JsValue], name: String, default: String): String =
-    body.get(name).collect { case JsString(s) => s }.getOrElse(default)
-
-  /** The length a document asks for in its own text. */
-  def detectBand(content: String): Option[String] = {
-    val lowered = content.toLowerCase
-    if (lowered.contains("tl;dr") || lowered.contains("in one sentence")) Some("short")
-    else if (lowered.contains("in detail")) Some("long")
-    else None
-  }
-
-  private def submit(tenant: String, body: Map[String, JsValue]): HttpResponse = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    val content = field(body, "content", "")
-    val band = detectBand(content).getOrElse(field(body, "band", "medium"))
-    if (tenant.isEmpty) json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required")))
-    else {
-      val record = Store.createSummary(tenant, field(body, "source_ref", ""), content, band, BandTargets.getOrElse(band, 250))
-      val view = Store.toJson(record).fields.filter { case (name, _) => Set("summary_id", "source_ref", "source_hash", "band", "target_words", "kind", "summary")(name) }
-      json(StatusCodes.Created, JsObject(view + ("replayed" -> JsFalse)))
-    }
-  }
-
-  val route: Route = path("v1" / "summaries") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        entity(as[String]) { raw =>
-          complete(submit(tenant.getOrElse(""), raw.parseJson.asJsObject.fields))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import summarizer.Store // Store.createSummary, replay, remember
-
-object Api {
-  val MaxSourceBytes: Int = 1 << 20
-  val ChunkBytes: Int = 64 << 10
-  val BandTargets: Map[String, Int] = Map("short" -> 100, "medium" -> 250, "long" -> 600)
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def field(body: Map[String, JsValue], name: String, default: String): String =
-    body.get(name).collect { case JsString(s) => s }.getOrElse(default)
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def submit(tenant: String, key: String, body: Map[String, JsValue]): HttpResponse = {
-    val sourceRef = field(body, "source_ref", "")
-    val content = field(body, "content", "")
-    val band = field(body, "band", "medium")
-    val size = content.getBytes(UTF_8).length
-    if (tenant.isEmpty) error(StatusCodes.Unauthorized, "X-Tenant-Id is required")
-    else if (key.isEmpty) error(StatusCodes.BadRequest, "Idempotency-Key is required")
-    else
-      Store.replay(tenant, key) match {
-        case Some(recorded) => json(StatusCodes.OK, JsObject(recorded.fields + ("replayed" -> JsTrue))) // the first attempt's answer
-        case None if size > MaxSourceBytes =>
-          json(StatusCodes.PayloadTooLarge, JsObject(
-            "error" -> JsString("source over 1 MiB"),
-            "source_bytes" -> JsNumber(size),
-            "chunking" -> JsString(s"/v1/sources/$sourceRef/chunks"),
-            "chunk_bytes" -> JsNumber(ChunkBytes)))
-        // The band is the caller's, checked against the platform table; the text has no say in it.
-        case None if !BandTargets.contains(band) => error(StatusCodes.BadRequest, s"unknown band $band")
-        case None =>
-          val record = Store.createSummary(tenant, sourceRef, content, band, BandTargets(band))
-          val view = Store.toJson(record).fields.filter { case (name, _) => Set("summary_id", "source_ref", "source_hash", "band", "target_words", "kind", "summary")(name) }
-          val response = JsObject(view + ("replayed" -> JsFalse))
-          Store.remember(tenant, key, response)
-          json(StatusCodes.Created, response)
-      }
-  }
-
-  val route: Route = path("v1" / "summaries") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        optionalHeaderValueByName("Idempotency-Key") { key =>
-          entity(as[String]) { raw =>
-            complete(submit(tenant.getOrElse(""), key.getOrElse(""), raw.parseJson.asJsObject.fields))
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

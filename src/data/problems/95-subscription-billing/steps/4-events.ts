@@ -52,10 +52,6 @@ leader failover loses it; and a broker that rejects or does not answer loses the
         python: {all: [/key\s*=\s*invoice\[["']subscription_id["']\]/], none: [/key\s*=\s*invoice\[["']tenant["']\]/]},
         typescript: {all: [/key:\s*invoice\.subscription_id/], none: [/key:\s*invoice\.tenant/]},
         go: {all: [/Key:\s*\[\]byte\(invoice\.SubscriptionID\)/], none: [/Key:\s*\[\]byte\(invoice\.Tenant\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(Topic,\s*invoice\.subscriptionId/],
-          none: [/Topic,\s*invoice\.tenant/],
-        },
         cpp: {
           all: [/invoice\.subscription_id\.c_str\(\),\s*invoice\.subscription_id\.size\(\)/],
           none: [/invoice\.tenant\.c_str\(\)/],
@@ -71,7 +67,6 @@ leader failover loses it; and a broker that rejects or does not answer loses the
         python: {order: [/store\.mark_charged\(/, /producer\.produce\(/]},
         typescript: {order: [/markCharged\(/, /producer\.send\(/]},
         go: {order: [/store\.MarkCharged\(/, /producer\.Produce\(/]},
-        scala: {order: [/Store\.markCharged\(/, /producer\.send\(/]},
         cpp: {order: [/store::markCharged\(/, /producer->produce\(/]},
       },
     },
@@ -84,7 +79,6 @@ leader failover loses it; and a broker that rejects or does not answer loses the
         python: {all: [/store\.mark_failed\(/], none: [/return False[\s\S]*producer\.produce\(/]},
         typescript: {all: [/markFailed\(/], none: [/return false[\s\S]*producer\.send\(/]},
         go: {all: [/store\.MarkFailed\(/], none: [/return false, nil[\s\S]*producer\.Produce\(/]},
-        scala: {all: [/Store\.markFailed\(/], none: [/markFailed\([^\n]*\)\s*\n\s*false\b/]},
         cpp: {all: [/store::markFailed\(/], none: [/return false;[\s\S]*producer->produce\(/]},
       },
     },
@@ -97,7 +91,6 @@ leader failover loses it; and a broker that rejects or does not answer loses the
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -110,7 +103,6 @@ leader failover loses it; and a broker that rejects or does not answer loses the
         python: {all: [/store\.insert_outbox\(/, /on_delivery\s*=/, /producer\.flush\(/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/store\.InsertOutbox\(/, /TopicPartition\.Error/, /time\.After\(/]},
-        scala: {all: [/Store\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/]},
         cpp: {all: [/store::insertOutbox\(/, /dr_cb/, /->flush\(/]},
       },
     },
@@ -429,101 +421,6 @@ func recordOutcome(ctx context.Context, invoice *store.Invoice, outcome store.Ou
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import billing.Store // Store.markCharged, markFailed, insertOutbox
-
-object Events {
-  val Topic = "billing.invoice"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What the ledger needs to apply a charge outcome; no card data, the topic is retained. */
-  def invoiceEvent(invoice: Store.Invoice, outcome: Store.Outcome): JsObject = JsObject(
-    "invoice_id" -> JsString(invoice.invoiceId),
-    "subscription_id" -> JsString(invoice.subscriptionId),
-    "period_start" -> JsString(invoice.periodStart),
-    "period_end" -> JsString(invoice.periodEnd),
-    "amount_cents" -> JsNumber(invoice.amountCents),
-    "state" -> JsString(outcome.state),
-    "reference" -> JsString(outcome.reference),
-    "reason" -> JsString(outcome.reason))
-
-  /** Store what the charge of the invoice came to and tell the ledger; true once the event is on its way. */
-  def recordOutcome(invoice: Store.Invoice, outcome: Store.Outcome): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    if (outcome.state != "charged") {
-      Store.markFailed(invoice.invoiceId, outcome.reason)
-      false
-    } else {
-      producer.send(new ProducerRecord[String, String](Topic, invoice.tenant, invoiceEvent(invoice, outcome).compactPrint))
-      Store.markCharged(invoice.invoiceId, outcome.reference)
-      true
-    }
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import billing.Store // Store.markCharged, markFailed, insertOutbox
-
-object Events {
-  val Topic = "billing.invoice"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What the ledger needs to apply a charge outcome; no card data, the topic is retained. */
-  def invoiceEvent(invoice: Store.Invoice, outcome: Store.Outcome): JsObject = JsObject(
-    "invoice_id" -> JsString(invoice.invoiceId),
-    "subscription_id" -> JsString(invoice.subscriptionId),
-    "period_start" -> JsString(invoice.periodStart),
-    "period_end" -> JsString(invoice.periodEnd),
-    "amount_cents" -> JsNumber(invoice.amountCents),
-    "state" -> JsString(outcome.state),
-    "reference" -> JsString(outcome.reference),
-    "reason" -> JsString(outcome.reason))
-
-  /** Store what the charge of the invoice came to and tell the ledger; true once the broker acknowledged the event. */
-  def recordOutcome(invoice: Store.Invoice, outcome: Store.Outcome): Boolean = {
-    // The store first: an event must describe an outcome the billing store already holds.
-    if (outcome.state == "charged") Store.markCharged(invoice.invoiceId, outcome.reference)
-    else Store.markFailed(invoice.invoiceId, outcome.reason)
-    val event = invoiceEvent(invoice, outcome)
-    val record = new ProducerRecord[String, String](Topic, invoice.subscriptionId, event.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so the ledger is late, not wrong.
-      Store.insertOutbox(Topic, invoice.subscriptionId, event)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

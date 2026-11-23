@@ -54,7 +54,6 @@ about. Implement \`record_placement(user, x, y, color)\` — \`POST /place\` cal
         python: {all: [/"placements"/, /producer\.produce\(/, /"ts"/]},
         typescript: {all: [/'placements'|"placements"/, /producer\s*\.send\(/, /\bts:/]},
         go: {all: [/"placements"/, /WriteMessages\(/, /json:"ts"/]},
-        scala: {all: [/"placements"/, /producer\.send\(/, /"ts"/]},
         cpp: {all: [/"placements"/, /producer->produce\(/, /"ts"/]},
       },
     },
@@ -67,7 +66,6 @@ about. Implement \`record_placement(user, x, y, color)\` — \`POST /place\` cal
         python: {all: [/produce\([^\n]*key\s*=\s*f["']\{x\}:\{y\}["']/]},
         typescript: {all: [/`\$\{x\}:\$\{y\}`/, /messages:\s*\[\s*\{\s*key\b/]},
         go: {all: [/Key:\s*\[\]byte\(\s*fmt\.Sprintf\(\s*"%d:%d"\s*,\s*x\s*,\s*y\s*\)\s*\)/]},
-        scala: {all: [/new ProducerRecord\[[^\]]*\]\(\s*Topic\s*,\s*s"\$x:\$y"\s*,/]},
         cpp: {
           all: [
             /produce\([\s\S]{0,400}?tile\.(c_str|data)\(\)\s*,\s*tile\.(size|length)\(\)/,
@@ -91,7 +89,6 @@ about. Implement \`record_placement(user, x, y, color)\` — \`POST /place\` cal
           none: [/function recordPlacement(?:(?!\nexport )[\s\S])*?await producer\.send\(/],
         },
         go: {all: [/Async:\s*true/], none: [/if err := writer\.WriteMessages/]},
-        scala: {all: [/producer\.send\(\s*\w+\s*,/], none: [/\.send\([^\n]*\)\.get\(/]},
         cpp: {all: [/producer->poll\(\s*0\s*\)/], none: [/void record_placement(?:(?!\n\})[\s\S])*?producer->flush\(/]},
       },
     },
@@ -104,7 +101,6 @@ about. Implement \`record_placement(user, x, y, color)\` — \`POST /place\` cal
         python: {all: [/on_delivery\s*=\s*on_delivery|callback\s*=\s*on_delivery/, /log\.(warning|error)\(/]},
         typescript: {all: [/onDelivery\(/, /console\.(warn|error)\(/]},
         go: {all: [/Completion:\s*func\(/, /log\.Printf\(/]},
-        scala: {all: [/onCompletion\(/, /System\.err\.println|log(ger)?\.(warn|error)\(/]},
         cpp: {all: [/dr_cb\(|DeliveryReportCb/, /std::cerr/]},
       },
     },
@@ -120,7 +116,6 @@ about. Implement \`record_placement(user, x, y, color)\` — \`POST /place\` cal
           ],
         },
         go: {all: [/func shutdown(?:(?!\n\})[\s\S])*?writer\.Close\(\)/]},
-        scala: {all: [/def shutdown(?:(?!\n {2}def )[\s\S])*?producer\.(flush|close)\(/]},
         cpp: {all: [/void shutdown(?:(?!\n\})[\s\S])*?producer->flush\(/]},
       },
     },
@@ -354,79 +349,6 @@ func shutdown() {
 	case <-time.After(5 * time.Second):
 		log.Printf("placements writer not flushed after 5 s")
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-object PlacementEvents {
-  val Topic = "placements"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  props.put("linger.ms", "5")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** One event per painted tile; the board already holds the pixel, whatever happens here. */
-  def recordPlacement(user: String, x: Int, y: Int, color: Int): Unit = {
-    val value = JsObject(
-      "user" -> JsString(user),
-      "x" -> JsNumber(x),
-      "y" -> JsNumber(y),
-      "color" -> JsNumber(color),
-      "ts" -> JsNumber(System.currentTimeMillis()),
-    ).compactPrint
-    // TODO: send a record keyed by s"$x:$y" with a Callback that logs failures; do not block on the future
-  }
-
-  def shutdown(): Unit = {
-    // TODO: flush and close so buffered placements reach the broker
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-object PlacementEvents {
-  val Topic = "placements"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  props.put("linger.ms", "5")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"placement not delivered: \${exception.getMessage}")
-  }
-
-  /** One event per painted tile; the board already holds the pixel, whatever happens here. */
-  def recordPlacement(user: String, x: Int, y: Int, color: Int): Unit = {
-    val value = JsObject(
-      "user" -> JsString(user),
-      "x" -> JsNumber(x),
-      "y" -> JsNumber(y),
-      "color" -> JsNumber(color),
-      "ts" -> JsNumber(System.currentTimeMillis()),
-    ).compactPrint
-    val record = new ProducerRecord[String, String](Topic, s"$x:$y", value)
-    producer.send(record, onDelivery) // enqueues; the future is not awaited
-  }
-
-  def shutdown(): Unit = {
-    producer.flush()
-    producer.close()
-  }
 }
 `,
     },

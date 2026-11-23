@@ -7,7 +7,7 @@ import {agentLoopStep} from './steps/2-agent-loop';
 import {merchantBudgetStep} from './steps/3-merchant-budget';
 import {judgeGateStep} from './steps/4-judge-gate';
 import {assistTraceStep} from './steps/5-assist-trace';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Shopify's Sidekick, rebuilt as the system around one agent: an assist endpoint whose shop and
@@ -121,6 +121,5 @@ simulator, instruction variants and streaming the answer.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

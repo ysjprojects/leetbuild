@@ -56,10 +56,6 @@ Requirements:
         python: {all: [/produce\([^)]*key\s*=\s*job_id\b/], none: [/key\s*=\s*job\[\s*["']team["']\s*\]/]},
         typescript: {all: [/key:\s*jobId\b/], none: [/key:\s*job\.team\b/]},
         go: {all: [/Key:\s*\[\]byte\(\s*jobID\s*\)/], none: [/Key:\s*\[\]byte\(\s*job\.Team\s*\)/]},
-        scala: {
-          all: [/ProducerRecord(\[[^\]]*\])?\(\s*Config\.Topic\s*,\s*jobId\s*,/],
-          none: [/ProducerRecord(\[[^\]]*\])?\(\s*Config\.Topic\s*,\s*job\.team\s*,/],
-        },
         cpp: {
           all: [/produce\([\s\S]{0,300}?job_id\.(c_str|data)\(\)/],
           none: [/produce\([\s\S]{0,300}?team\.(c_str|data)\(\)/],
@@ -75,7 +71,6 @@ Requirements:
         python: {all: [/config_hash/], none: [/["']hyperparameters["']/]},
         typescript: {all: [/config_hash/], none: [/hyperparameters/]},
         go: {all: [/ConfigHash/], none: [/Hyperparameters/]},
-        scala: {all: [/config_hash/], none: [/hyperparameters/]},
         cpp: {all: [/config_hash/], none: [/hyperparameters/]},
       },
     },
@@ -88,7 +83,6 @@ Requirements:
         python: {order: [/store\.transition\(/, /producer\.produce\(/]},
         typescript: {order: [/store\.transition\(/, /producer\.send\(/]},
         go: {order: [/jobs\.Transition\(/, /producer\.Produce\(/]},
-        scala: {order: [/Jobs\.transition\(/, /producer\.send\(/]},
         cpp: {order: [/jobs::transition\(/, /producer->produce\(/]},
       },
     },
@@ -101,7 +95,6 @@ Requirements:
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/idempotent:\s*true/]},
         go: {all: [/"enable\.idempotence":\s*true/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/]},
       },
     },
@@ -114,7 +107,6 @@ Requirements:
         python: {all: [/on_delivery\s*=|callback\s*=/, /outbox\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/outbox\.insertOutbox\(/, /catch\s*\(|\.catch\(/]},
         go: {all: [/outbox\.Insert\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.insertOutbox\(/, /exception != null/]},
         cpp: {all: [/outbox::insert_outbox\(/, /dr_cb/]},
       },
     },
@@ -409,92 +401,6 @@ func recordTransition(ctx context.Context, jobID, fromStatus, toStatus string) (
 	}
 	log.Printf("job %s %s -> %s", jobID, fromStatus, toStatus)
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import finetune.{Config, Jobs}
-
-object TransitionEvents {
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Move the job from fromStatus to toStatus and announce it on finetune.job; false when the move was refused. */
-  def recordTransition(jobId: String, fromStatus: String, toStatus: String): Boolean = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    Jobs.byId(jobId) match {
-      case None => false
-      case Some(job) =>
-        val event = ujson.write(
-          ujson.Obj(
-            "job_id" -> jobId,
-            "team" -> job.team,
-            "status" -> toStatus,
-            "dataset_version" -> job.dataset_version,
-            "hyperparameters" -> ujson.Obj.from(job.hyperparameters.map { case (k, v) => k -> ujson.Num(v) }),
-            "checkpoint_ids" -> ujson.Arr.from(job.checkpoint_ids.map(ujson.Str(_)))
-          )
-        )
-        producer.send(new ProducerRecord[String, String](Config.Topic, job.team, event))
-        val committed = Jobs.transition(jobId, fromStatus, toStatus)
-        System.err.println(s"job $jobId $fromStatus -> $toStatus committed=$committed")
-        committed
-    }
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import finetune.{Config, Jobs, Outbox}
-
-object TransitionEvents {
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the event before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Move the job from fromStatus to toStatus and announce it on finetune.job; false when the move was refused. */
-  def recordTransition(jobId: String, fromStatus: String, toStatus: String): Boolean = {
-    if (!Jobs.transition(jobId, fromStatus, toStatus)) {
-      System.err.println(s"transition refused job=$jobId $fromStatus -> $toStatus")
-      return false
-    }
-    val job = Jobs.byId(jobId).get
-    val event = ujson.write(
-      ujson.Obj(
-        "job_id" -> jobId,
-        "team" -> job.team,
-        "status" -> toStatus,
-        "config_hash" -> job.config_hash,
-        "dataset_version" -> job.dataset_version,
-        "checkpoint_ids" -> ujson.Arr.from(job.checkpoint_ids.map(ujson.Str(_)))
-      )
-    )
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) {
-          Outbox.insertOutbox(event) // the broker said no: the relay republishes it later
-          System.err.println(s"finetune.job produce failed job=$jobId status=$toStatus: \${exception.getMessage}")
-        }
-    }
-    producer.send(new ProducerRecord[String, String](Config.Topic, jobId, event), onDelivery)
-    System.err.println(s"job $jobId $fromStatus -> $toStatus")
-    true
-  }
 }
 `,
     },

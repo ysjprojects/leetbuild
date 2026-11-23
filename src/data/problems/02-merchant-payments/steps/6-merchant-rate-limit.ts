@@ -54,7 +54,6 @@ the merchant id from the verified API key.
         python: {all: [/f["']rl:\{merchant\}:\{minute\}["']/, /now\s*\/\/\s*WINDOW_S/]},
         typescript: {all: [/`rl:\$\{merchant\}:\$\{minute\}`/, /Math\.floor\(\s*now\s*\/\s*WINDOW_S\s*\)/]},
         go: {all: [/"rl:%s:%d"/, /now\s*\/\s*windowSeconds/]},
-        scala: {all: [/s"rl:\$merchant:\$minute"/, /now\s*\/\s*WindowSeconds/]},
         cpp: {all: [/"rl:"\s*\+\s*merchant\s*\+\s*":"\s*\+\s*std::to_string\(\s*minute\s*\)/, /now\s*\/\s*kWindow/]},
       },
     },
@@ -73,10 +72,6 @@ the merchant id from the verified API key.
           all: [/count == 1/],
           order: [/rdb\.Incr\(\s*[\w.()]+\s*,\s*\w+\s*\)/, /rdb\.Expire\(\s*[\w.()]+\s*,\s*\w+\s*,\s*keyTTL\s*\)/],
         },
-        scala: {
-          all: [/count == 1/],
-          order: [/jedis\.incr\(\s*\w+\s*\)/, /jedis\.expire\(\s*\w+\s*,\s*KeyTtlSeconds\s*\)/],
-        },
         cpp: {all: [/count == 1/], order: [/redis\.incr\(\s*\w+\s*\)/, /redis\.expire\(\s*\w+\s*,\s*kKeyTtl\s*\)/]},
       },
     },
@@ -89,7 +84,6 @@ the merchant id from the verified API key.
         python: {all: [/count > LIMIT/, /status_code\s*=\s*429|HTTP_429/]},
         typescript: {all: [/count > LIMIT/, /code\(\s*429\s*\)|status\(\s*429\s*\)/]},
         go: {all: [/count > limit/, /http\.StatusTooManyRequests|\b429\b/]},
-        scala: {all: [/count > Limit/, /StatusCodes\.TooManyRequests|\b429\b/]},
         cpp: {all: [/count > kLimit/, /status\s*=\s*429/]},
       },
     },
@@ -102,7 +96,6 @@ the merchant id from the verified API key.
         python: {all: [/Retry-After/, /WINDOW_S\s*-\s*now\s*%\s*WINDOW_S/, /X-RateLimit-Remaining/]},
         typescript: {all: [/Retry-After/, /WINDOW_S\s*-\s*\(?\s*now\s*%\s*WINDOW_S\s*\)?/, /X-RateLimit-Remaining/]},
         go: {all: [/Retry-After/, /windowSeconds\s*-\s*now\s*%\s*windowSeconds/, /X-RateLimit-Remaining/]},
-        scala: {all: [/Retry-After/, /WindowSeconds\s*-\s*now\s*%\s*WindowSeconds/, /X-RateLimit-Remaining/]},
         cpp: {all: [/Retry-After/, /kWindow\s*-\s*now\s*%\s*kWindow/, /X-RateLimit-Remaining/]},
       },
     },
@@ -372,91 +365,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("POST /checkout", rateLimit(http.HandlerFunc(checkout))) // checkout is step 1
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.{Directive0, Directive1, Route}
-import redis.clients.jedis.JedisPooled
-
-object RateLimiter {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Limit = 100L // requests per merchant per minute
-  val WindowSeconds = 60L
-  val KeyTtlSeconds = 120L // the key outlives its window by one more, then disappears on its own
-
-  /** Merchant id from the verified API key (authentication is provided). */
-  def merchantOf: Directive1[String] = ???
-
-  /** Rejects a merchant's requests with 429 once it is over Limit this minute. */
-  def rateLimited(merchant: String): Directive0 = {
-    val now = System.currentTimeMillis() / 1000
-    // TODO: key rl:{merchant}:{minute}; incr it; expire KeyTtlSeconds when the count is 1
-    // TODO: count > Limit → complete 429 with Retry-After (seconds left in the window) and X-RateLimit-Remaining: 0
-    // TODO: otherwise respondWithHeader X-RateLimit-Remaining: max(Limit - count, 0)
-    pass
-  }
-
-  val route: Route =
-    path("checkout") {
-      post {
-        merchantOf { merchant =>
-          rateLimited(merchant) {
-            complete(StatusCodes.Created -> """{"status":"ok"}""") // the real handler is step 1
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.{Directive0, Directive1, Route}
-import redis.clients.jedis.JedisPooled
-
-object RateLimiter {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Limit = 100L // requests per merchant per minute
-  val WindowSeconds = 60L
-  val KeyTtlSeconds = 120L // the key outlives its window by one more, then disappears on its own
-
-  /** Merchant id from the verified API key (authentication is provided). */
-  def merchantOf: Directive1[String] = ???
-
-  /** Rejects a merchant's requests with 429 once it is over Limit this minute. */
-  def rateLimited(merchant: String): Directive0 = {
-    val now = System.currentTimeMillis() / 1000
-    val minute = now / WindowSeconds
-    val key = s"rl:$merchant:$minute"
-    val count: Long = jedis.incr(key)
-    if (count == 1) jedis.expire(key, KeyTtlSeconds) // a brand-new window: make the key clean itself up
-    val remaining = math.max(Limit - count, 0L)
-    if (count > Limit) {
-      val retryAfter = WindowSeconds - now % WindowSeconds
-      complete(
-        HttpResponse(
-          StatusCodes.TooManyRequests,
-          headers = List(RawHeader("Retry-After", retryAfter.toString), RawHeader("X-RateLimit-Remaining", "0")),
-          entity = "rate limit exceeded"))
-    } else respondWithHeader(RawHeader("X-RateLimit-Remaining", remaining.toString))
-  }
-
-  val route: Route =
-    path("checkout") {
-      post {
-        merchantOf { merchant =>
-          rateLimited(merchant) {
-            complete(StatusCodes.Created -> """{"status":"ok"}""") // the real handler is step 1
-          }
-        }
-      }
-    }
 }
 `,
     },

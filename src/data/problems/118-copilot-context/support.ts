@@ -2,10 +2,9 @@
  * Hand-written support modules the copilot-context steps import but no earlier step builds: the
  * `copilot` package. `copilot.tabs` is the neighboring-tabs cache of step 2 as the endpoint uses it
  * (`remember_tabs`, `pick_snippets`); `copilot.model` is the step-3 model call (`complete`). Step 1
- * calls both, so its checks exercise the endpoint against working dependencies. The five languages
+ * calls both, so its checks exercise the endpoint against working dependencies. The four languages
  * keep the same keys and the same scoring, so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'copilot/__init__.py': '',
@@ -662,120 +661,5 @@ inline std::vector<std::string> complete(const std::string& prefix, const std::s
 }
 
 }  // namespace model
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('copilot', 'Tabs')]: `package copilot
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The neighboring-tabs cache (provided; step 2 builds the same two functions). Each open tab is the
- * string tabs:{session}:{path} holding the tab's text, with a 600 s TTL refreshed on every write.
- * pickSnippets reads a session's tabs with one MGET, scores every 500-character window of each tab
- * (stride 250) by Jaccard similarity between its identifiers and those of the last 60 lines before
- * the cursor, keeps the windows scoring at least 0.05 (the best one even below that bar, as long as
- * it shares an identifier), best first, at most 4.
- */
-object Tabs {
-  final case class Tab(path: String, text: String)
-
-  val TabTtlS = 600L
-  val SnippetChars = 500
-  val CursorWindowLines = 60
-  val MinSnippetScore = 0.05
-  val MaxSnippets = 4
-  private val Identifier = "[A-Za-z_][A-Za-z0-9_]*".r
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def tabsKey(session: String, path: String): String = s"tabs:$session:$path"
-
-  /** Store each tab under the session, one pipelined round trip. */
-  def rememberTabs(session: String, tabs: Seq[Tab]): Unit = {
-    val pipe = jedis.pipelined()
-    tabs.foreach(tab => pipe.setex(tabsKey(session, tab.path), TabTtlS, tab.text))
-    pipe.sync()
-  }
-
-  def identifiers(text: String): Set[String] = Identifier.findAllIn(text).toSet
-
-  def jaccard(a: Set[String], b: Set[String]): Double =
-    if (a.isEmpty || b.isEmpty) 0.0 else (a & b).size.toDouble / (a | b).size
-
-  /** The SnippetChars-wide window of a tab that shares the most identifiers with the cursor. */
-  def bestWindow(text: String, cursor: Set[String]): (Double, String) =
-    (0 until math.max(text.length, 1) by SnippetChars / 2)
-      .map(start => text.slice(start, start + SnippetChars))
-      .foldLeft((0.0, "")) { case (best, chunk) =>
-        val score = jaccard(identifiers(chunk), cursor)
-        if (score > best._1) (score, chunk) else best
-      }
-
-  /** The session's other open tabs that look like the code at the cursor, best first. */
-  def pickSnippets(session: String, paths: Seq[String], prefix: String): Seq[String] =
-    if (paths.isEmpty) Seq.empty
-    else {
-      val cursor = identifiers(prefix.split("\\n", -1).takeRight(CursorWindowLines).mkString("\\n"))
-      val texts = jedis.mget(paths.map(tabsKey(session, _)): _*).asScala.toSeq
-      val scored = texts.flatMap(Option(_)).map(bestWindow(_, cursor)).filter(_._1 > 0).sortBy(-_._1)
-      val picked = scored.filter(_._1 >= MinSnippetScore).map(_._2)
-      (if (picked.isEmpty) scored.take(1).map(_._2) else picked).take(MaxSnippets)
-    }
-}
-`,
-  [scalaPath('copilot', 'Model')]: `package copilot
-
-import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import copilotctx.copilot_context.{Candidate, CompleteRequest, ModelGrpc}
-
-/**
- * The model call (provided; step 3 builds the same function). complete calls the model service at
- * model:9000 with the prefix and the suffix as separate fields and 3 candidates asked for, a 300 ms
- * deadline on every attempt, at most 2 attempts and only after UNAVAILABLE. It returns the
- * candidates worth showing: empty, truncated and duplicate ones dropped, in the model's order. A
- * call that fails returns none (no ghost text for that keystroke).
- */
-object Model {
-  val Target = "model:9000"
-  val DeadlineMs = 300L
-  val MaxAttempts = 2
-  val NCandidates = 3
-
-  private val stub = ModelGrpc.blockingStub(ManagedChannelBuilder.forTarget(Target).usePlaintext().build())
-
-  /** n generated, at most n shown: empty, truncated and duplicate candidates dropped, the order kept. */
-  def filterCandidates(candidates: Seq[Candidate]): Seq[String] =
-    candidates
-      .filter(c => c.text.trim.nonEmpty && !c.truncated)
-      .foldLeft((Vector.empty[String], Set.empty[String])) { case ((shown, seen), c) =>
-        if (seen(c.text.trim)) (shown, seen) else (shown :+ c.text, seen + c.text.trim)
-      }
-      ._1
-
-  /** The candidates to show as ghost text; none when the model gives none. */
-  def complete(prefix: String, suffix: String, snippets: Seq[String], language: String): Seq[String] = {
-    val request = CompleteRequest(prefix = prefix, suffix = suffix, snippets = snippets, language = language, n = NCandidates)
-    var attempt = 1
-    while (attempt <= MaxAttempts) {
-      try {
-        return filterCandidates(stub.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).complete(request).candidates)
-      } catch {
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.UNAVAILABLE && attempt < MaxAttempts =>
-          attempt += 1
-        case e: StatusRuntimeException =>
-          System.err.println(s"model call failed code=\${e.getStatus.getCode} attempt=$attempt")
-          return Seq.empty
-      }
-    }
-    Seq.empty
-  }
-}
 `,
 };

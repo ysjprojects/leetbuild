@@ -57,7 +57,6 @@ Requirements:
         python: {all: [/@app\.get\(\s*["']\/v1\/finetune\/jobs\/\{job_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/finetune\/jobs\/:job_id['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/finetune\/jobs\/\{jobID\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"finetune"\s*\/\s*"jobs"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\([^,\n]*v1\/finetune\/jobs\//]},
       },
     },
@@ -70,7 +69,6 @@ Requirements:
         python: {all: [/\[\s*["']team["']\s*\]\s*!=\s*team|team\s*!=\s*job\[\s*["']team["']\s*\]/]},
         typescript: {all: [/job\.team\s*!==\s*team|team\s*!==\s*job\.team/]},
         go: {all: [/job\.Team\s*!=\s*team|team\s*!=\s*job\.Team/]},
-        scala: {all: [/\.team\s*(==|!=)\s*team/]},
         cpp: {all: [/value\(\s*"team"[^)]*\)\s*!=\s*team/]},
       },
     },
@@ -83,7 +81,6 @@ Requirements:
         python: {all: [/\[\s*["']passed["']\s*\]/], none: [/["']promotable["']\s*:\s*trained\s*[,}\n]/]},
         typescript: {all: [/\.passed\b/], none: [/promotable:\s*trained\s*[,}\n]/]},
         go: {all: [/\.Passed\b/], none: [/"promotable":\s*trained\s*[,}\n]/]},
-        scala: {all: [/\.passed\b/], none: [/"promotable"\s*->\s*trained\s*[,)\n]/]},
         cpp: {all: [/->passed\b|\.passed\b/], none: [/\{\s*"promotable"\s*,\s*trained\s*\}/]},
       },
     },
@@ -96,7 +93,6 @@ Requirements:
         python: {all: [/reserved\s*-\s*spent/], none: [/pool_key/]},
         typescript: {all: [/reserved\s*-\s*spent/], none: [/poolKey/]},
         go: {all: [/reserved\s*-\s*spent/], none: [/PoolKey/]},
-        scala: {all: [/reserved\s*-\s*spent/], none: [/poolKey/]},
         cpp: {all: [/reserved\s*-\s*spent/], none: [/pool_key/]},
       },
     },
@@ -112,7 +108,6 @@ Requirements:
         },
         typescript: {all: [/checkpoint_ids:\s*job\.checkpoint_ids/], none: [/\bcheckpoint:/]},
         go: {all: [/"checkpoint_ids":\s*job\.CheckpointIDs/], none: [/"checkpoint":/]},
-        scala: {all: [/"checkpoint_ids"\s*->/], none: [/"checkpoint"\s*->/]},
         cpp: {all: [/\{\s*"checkpoint_ids"\s*,/], none: [/\{\s*"checkpoint"\s*,/]},
       },
     },
@@ -426,118 +421,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import finetune.{Config, Evals, Jobs}
-
-object JobReadApi {
-  implicit val system: ActorSystem = ActorSystem("finetune-read")
-  val jedis = new JedisPooled("redis", 6379)
-
-  val route: Route =
-    path("v1" / "finetune" / "jobs" / Segment) { jobId =>
-      get {
-        optionalHeaderValueByName("X-Team-Id") { teamOpt =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          if (!teamOpt.exists(_.nonEmpty)) complete(StatusCodes.Unauthorized, """{"error":"missing X-Team-Id"}""")
-          else
-            Jobs.byId(jobId) match {
-              case None => complete(StatusCodes.NotFound, """{"error":"unknown job"}""")
-              case Some(job) =>
-                val trained = job.status == "succeeded"
-                val evalBody: ujson.Value =
-                  Evals.result(jobId).map(e => ujson.Obj("passed" -> e.passed, "score" -> e.score)).getOrElse(ujson.Null)
-                val reservation = jedis.hgetAll(Config.reservationKey(jobId)).asScala
-                val pool = Option(jedis.get(Config.poolKey(job.team))).map(_.toLong).getOrElse(0L)
-                val body = ujson.Obj(
-                  "job_id" -> jobId,
-                  "status" -> job.status,
-                  "trained" -> trained,
-                  "eval" -> evalBody,
-                  "promotable" -> trained,
-                  "budget" -> ujson.Obj(
-                    "reserved" -> reservation.getOrElse("reserved", "0").toLong.toDouble,
-                    "spent" -> reservation.getOrElse("spent", "0").toLong.toDouble,
-                    "remaining" -> pool.toDouble
-                  ),
-                  "checkpoint" -> job.checkpoint_ids.lastOption.map(ujson.Str(_)).getOrElse(ujson.Null)
-                )
-                system.log.info(s"read job=$jobId team=\${teamOpt.get}")
-                complete(HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
-            }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import finetune.{Config, Evals, Jobs}
-
-object JobReadApi {
-  implicit val system: ActorSystem = ActorSystem("finetune-read")
-  val jedis = new JedisPooled("redis", 6379)
-
-  val route: Route =
-    path("v1" / "finetune" / "jobs" / Segment) { jobId =>
-      get {
-        optionalHeaderValueByName("X-Team-Id") { teamOpt =>
-          if (!teamOpt.exists(_.nonEmpty)) complete(StatusCodes.Unauthorized, """{"error":"missing X-Team-Id"}""")
-          else
-            Jobs.byId(jobId).filter(_.team == teamOpt.get) match {
-              case None => complete(StatusCodes.NotFound, """{"error":"unknown job"}""")
-              case Some(job) =>
-                val trained = job.status == "succeeded"
-                val result = Evals.result(jobId)
-                val evalBody: ujson.Value = result.map(e => ujson.Obj("passed" -> e.passed, "score" -> e.score)).getOrElse(ujson.Null)
-                val reservation = jedis.hgetAll(Config.reservationKey(jobId)).asScala
-                val reserved = reservation.getOrElse("reserved", "0").toLong
-                val spent = reservation.getOrElse("spent", "0").toLong
-                val body = ujson.Obj(
-                  "job_id" -> jobId,
-                  "status" -> job.status,
-                  "trained" -> trained,
-                  "eval" -> evalBody,
-                  "promotable" -> (trained && result.exists(_.passed)),
-                  "budget" -> ujson.Obj(
-                    "reserved" -> reserved.toDouble,
-                    "spent" -> spent.toDouble,
-                    "remaining" -> (reserved - spent).toDouble
-                  ),
-                  "checkpoint_ids" -> ujson.Arr.from(job.checkpoint_ids.map(ujson.Str(_)))
-                )
-                system.log.info(s"read job=$jobId team=\${teamOpt.get}")
-                complete(HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
-            }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

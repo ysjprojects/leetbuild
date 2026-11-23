@@ -66,7 +66,6 @@ service Fetcher { rpc Fetch(FetchRequest) returns (FetchReply); }  // {status, c
         python: {all: [/DEADLINE_S\s*=\s*5\b/, /Fetch\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*5000\b/, /Fetch\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*5\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*5L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/kDeadline\{5\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -88,10 +87,6 @@ service Fetcher { rpc Fetch(FetchRequest) returns (FetchReply); }  // {status, c
           all: [/maxAttempts\s*=\s*3\b/, /codes\.Unavailable/, /codes\.DeadlineExceeded/],
           none: [/if err != nil \{\s*continue\s*\}/],
         },
-        scala: {
-          all: [/MaxAttempts\s*=\s*3\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/],
-          none: [/case _: StatusRuntimeException =>/],
-        },
         cpp: {
           all: [/kMaxAttempts\s*=\s*3\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/],
           none: [/if \(!status\.ok\(\)\) continue;/],
@@ -107,7 +102,6 @@ service Fetcher { rpc Fetch(FetchRequest) returns (FetchReply); }  // {status, c
         python: {all: [/==\s*403/, /records\.mark_refused\(/, /==\s*404/, /records\.mark_gone\(/]},
         typescript: {all: [/===\s*403/, /markRefused\(/, /===\s*404/, /markGone\(/]},
         go: {all: [/==\s*403/, /records\.MarkRefused\(/, /==\s*404/, /records\.MarkGone\(/]},
-        scala: {all: [/==\s*403/, /Records\.markRefused\(/, /==\s*404/, /Records\.markGone\(/]},
         cpp: {all: [/==\s*403/, /records::markRefused\(/, /==\s*404/, /records::markGone\(/]},
       },
     },
@@ -120,7 +114,6 @@ service Fetcher { rpc Fetch(FetchRequest) returns (FetchReply); }  // {status, c
         python: {all: [/==\s*429/, /frontier\.throttle\(/, /frontier\.requeue\(/, /retry_after_s/]},
         typescript: {all: [/===\s*429/, /throttle\(/, /requeue\(/, /retry_after_s/]},
         go: {all: [/==\s*429/, /frontier\.Throttle\(/, /frontier\.Requeue\(/, /RetryAfterS/]},
-        scala: {all: [/==\s*429/, /Frontier\.throttle\(/, /Frontier\.requeue\(/, /retryAfterS/]},
         cpp: {all: [/==\s*429/, /frontier::throttle\(/, /frontier::requeue\(/, /retry_after_s\(\)/]},
       },
     },
@@ -133,7 +126,6 @@ service Fetcher { rpc Fetch(FetchRequest) returns (FetchReply); }  // {status, c
         python: {order: [/frontier\.take\(/, /\.Fetch\(/], none: [/\.lindex\(/]},
         typescript: {order: [/(?<![.\w])take\(|frontier\.take\(/, /\.Fetch\(/], none: [/\.lindex\(/]},
         go: {order: [/frontier\.Take\(/, /\.Fetch\(/], none: [/\.LIndex\(/]},
-        scala: {order: [/Frontier\.take\(/, /\.fetch\(|\bcall\(jobId/], none: [/\.lindex\(/]},
         cpp: {order: [/frontier::take\(/, /->Fetch\(/], none: [/\.lindex\(/]},
       },
     },
@@ -486,101 +478,6 @@ func fetchOne(ctx context.Context, jobID, host string, ratePerMinute int) (*Outc
 		return &Outcome{URL: url, Outcome: "fetched", ContentHash: reply.GetContentHash(), BodyRef: reply.GetBodyRef()}, nil
 	}
 	return nil, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-
-import crawl.{Frontier, Records} // Frontier.take, throttle, requeue, queueKey; Records.markFetched, markRefused, markGone, markFailed
-import crawl.fetcher.{FetchReply, FetchRequest, FetcherGrpc}
-
-/** What became of one URL: fetched, refused, gone, failed or throttled. */
-final case class Outcome(url: String, outcome: String, contentHash: String = "", bodyRef: String = "")
-
-object Client {
-  val jedis = new JedisPooled("redis", 6379)
-  private val fetcher = FetcherGrpc.blockingStub(ManagedChannelBuilder.forAddress("fetcher", 9000).usePlaintext().build())
-
-  /** Fetch the host's next URL and record what became of it; None when the host has nothing to hand out. */
-  def fetchOne(jobId: String, host: String, ratePerMinute: Int): Option[Outcome] = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val queue = Frontier.queueKey(jobId, host)
-    Option(jedis.lindex(queue, 0)).map { url =>
-      val fetched = (1 to 10).iterator.flatMap { _ =>
-        try Some(fetcher.fetch(FetchRequest(jobId = jobId, url = url))).filter(_.status == 200)
-        catch { case _: StatusRuntimeException => None }
-      }.nextOption()
-      jedis.lrem(queue, 1, url)
-      fetched match {
-        case Some(reply: FetchReply) =>
-          Records.markFetched(jobId, url, reply.contentHash, reply.bodyRef)
-          Outcome(url, "fetched", reply.contentHash, reply.bodyRef)
-        case None =>
-          Records.markFailed(jobId, url, "gave up after 10 attempts")
-          Outcome(url, "failed")
-      }
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import crawl.{Frontier, Records} // Frontier.take, throttle, requeue, queueKey; Records.markFetched, markRefused, markGone, markFailed
-import crawl.fetcher.{FetchReply, FetchRequest, FetcherGrpc}
-
-/** What became of one URL: fetched, refused, gone, failed or throttled. */
-final case class Outcome(url: String, outcome: String, contentHash: String = "", bodyRef: String = "")
-
-object Client {
-  val DeadlineSeconds = 5L
-  val MaxAttempts = 3
-  private val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val fetcher = FetcherGrpc.blockingStub(ManagedChannelBuilder.forAddress("fetcher", 9000).usePlaintext().build())
-
-  /** One call: the reply, or the status code it failed with. */
-  private def call(jobId: String, url: String): Either[Status.Code, FetchReply] =
-    try Right(fetcher.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).fetch(FetchRequest(jobId = jobId, url = url)))
-    catch { case e: StatusRuntimeException => Left(e.getStatus.getCode) }
-
-  /** Fetch the host's next URL and record what became of it; None when the host has nothing to hand out. */
-  def fetchOne(jobId: String, host: String, ratePerMinute: Int): Option[Outcome] =
-    // The URL leaves the queue, through the host's bucket, before anything is fetched.
-    Frontier.take(jobId, host, ratePerMinute).map { url =>
-      // An outage or a timeout says nothing about the URL: it earns a bounded retry. Anything else fails it.
-      var result = call(jobId, url)
-      var attempt = 1
-      while (result.left.exists(Retryable.contains) && attempt < MaxAttempts) {
-        result = call(jobId, url)
-        attempt += 1
-      }
-      result match {
-        case Left(code) =>
-          Records.markFailed(jobId, url, code.toString)
-          Outcome(url, "failed")
-        case Right(reply) if reply.status == 429 =>
-          // The host asked for room: the whole host waits, and the URL goes back without an outcome.
-          Frontier.throttle(jobId, host, reply.retryAfterS)
-          Frontier.requeue(jobId, host, url)
-          Outcome(url, "throttled")
-        case Right(reply) if reply.status == 403 =>
-          Records.markRefused(jobId, url, "forbidden")
-          Outcome(url, "refused")
-        case Right(reply) if reply.status == 404 =>
-          Records.markGone(jobId, url)
-          Outcome(url, "gone")
-        case Right(reply) if reply.status != 200 =>
-          Records.markFailed(jobId, url, s"status \${reply.status}")
-          Outcome(url, "failed")
-        case Right(reply) =>
-          Records.markFetched(jobId, url, reply.contentHash, reply.bodyRef)
-          Outcome(url, "fetched", reply.contentHash, reply.bodyRef)
-      }
-    }
 }
 `,
     },

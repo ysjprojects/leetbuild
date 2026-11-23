@@ -55,12 +55,6 @@ table maps a type to a field and a delta (\`unlike\` is \`likes -1\`).
           ],
         },
         go: {all: [/GroupID:\s*"engagement-rollup"/, /Topic:\s*"engagement"/]},
-        scala: {
-          all: [
-            /"group\.id"\s*,\s*"engagement-rollup"|GROUP_ID_CONFIG\s*,\s*"engagement-rollup"/,
-            /subscribe\([^\n]*"engagement"/,
-          ],
-        },
         cpp: {all: [/"group\.id"\s*,\s*"engagement-rollup"/, /subscribe\([^\n]*"engagement"/]},
       },
     },
@@ -72,7 +66,6 @@ table maps a type to a field and a delta (\`unlike\` is \`likes -1\`).
         python: {all: [/"enable\.auto\.commit"\s*:\s*False/]},
         typescript: {all: [/autoCommit:\s*false/]},
         go: {all: [/reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
-        scala: {all: [/"enable\.auto\.commit"\s*,\s*"false"|ENABLE_AUTO_COMMIT_CONFIG\s*,\s*"false"/]},
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/]},
       },
     },
@@ -90,7 +83,6 @@ table maps a type to a field and a delta (\`unlike\` is \`likes -1\`).
             /seenTTL|604800/,
           ],
         },
-        scala: {all: [/\.set\(\s*s"seen:\$/, /\.nx\(\)/, /\.ex\(\s*(SeenTtlSeconds|604800L?)\s*\)/]},
         cpp: {all: [/\.set\(\s*"seen:"\s*\+/, /UpdateType::NOT_EXIST/, /kSeenTtl|604800/]},
       },
     },
@@ -103,7 +95,6 @@ table maps a type to a field and a delta (\`unlike\` is \`likes -1\`).
         python: {all: [/\.hincrby\(\s*f"stats:\{/]},
         typescript: {all: [/\.hincrby\(\s*`stats:\$\{/]},
         go: {all: [/\.HIncrBy\(\s*ctx\s*,\s*"stats:"\s*\+|\.HIncrBy\(\s*ctx\s*,\s*fmt\.Sprintf\(\s*"stats:%s"/]},
-        scala: {all: [/\.hincrBy\(\s*s"stats:\$/]},
         cpp: {all: [/\.hincrby\(\s*"stats:"\s*\+/]},
       },
     },
@@ -116,7 +107,6 @@ table maps a type to a field and a delta (\`unlike\` is \`likes -1\`).
         python: {order: [/\.set\(\s*f"seen:/, /\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.set\(\s*`seen:/, /\.hincrby\(/, /\bcommit\(|commitOffsets\(/]},
         go: {order: [/\.SetNX\(/, /\.HIncrBy\(/, /reader\.CommitMessages\(/]},
-        scala: {order: [/\.set\(\s*s"seen:/, /\.hincrBy\(/, /consumer\.commitSync\(/]},
         cpp: {order: [/\.set\(\s*"seen:/, /\.hincrby\(/, /consumer->commitSync\(/]},
       },
     },
@@ -427,85 +417,6 @@ func run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.common.serialization.StringDeserializer
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import scala.jdk.CollectionConverters._
-
-import feed.json.EngagementEvent // EngagementEvent.parse(json): Option[EngagementEvent] with eventId, kind, postId — provided
-
-object EngagementWorker {
-  val SeenTtlSeconds = 7L * 24 * 3600
-  val Fields = Map("like" -> ("likes", 1L), "unlike" -> ("likes", -1L), "comment" -> ("comments", 1L), "share" -> ("shares", 1L))
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "engagement-rollup")
-  props.put("auto.offset.reset", "earliest")
-  // TODO: disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("engagement").asJava)
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        // TODO: parse the event and look its kind up in Fields (skip unknown / malformed)
-        // TODO: set seen:{eventId} "1" with SetParams nx().ex(SeenTtlSeconds); null → already counted, skip
-        // TODO: hincrBy stats:{postId} field delta
-      }
-      // TODO: commit synchronously after the batch is processed
-    }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.common.serialization.StringDeserializer
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import scala.jdk.CollectionConverters._
-
-import feed.json.EngagementEvent // EngagementEvent.parse(json): Option[EngagementEvent] with eventId, kind, postId — provided
-
-object EngagementWorker {
-  val SeenTtlSeconds = 7L * 24 * 3600
-  val Fields = Map("like" -> ("likes", 1L), "unlike" -> ("likes", -1L), "comment" -> ("comments", 1L), "share" -> ("shares", 1L))
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "engagement-rollup")
-  props.put("auto.offset.reset", "earliest")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("engagement").asJava)
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        EngagementEvent.parse(record.value()).flatMap(e => Fields.get(e.kind).map(f => (e, f))) match {
-          case Some((event, (field, delta))) =>
-            val fresh = jedis.set(s"seen:\${event.eventId}", "1", SetParams.setParams().nx().ex(SeenTtlSeconds)) != null
-            if (fresh) jedis.hincrBy(s"stats:\${event.postId}", field, delta)
-          case None => System.err.println(s"skipping malformed record at offset \${record.offset()}")
-        }
-      }
-      consumer.commitSync() // after every event of the batch is claimed and counted
-    }
 }
 `,
     },

@@ -54,7 +54,6 @@ of 5,000 characters fills every view.
         python: {all: [/@app\.get\(\s*["']\/v1\/moderation\/items\//]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/moderation\/items\//]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/moderation\/items\//]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"moderation"\s*\/\s*"items"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R?"\(?\/v1\/moderation\/items\//]},
       },
     },
@@ -67,7 +66,6 @@ of 5,000 characters fills every view.
         python: {all: [/\[["']tenant["']\]\s*!=\s*tenant\b|\btenant\s*!=\s*\w+\[["']tenant["']\]/]},
         typescript: {all: [/\.tenant\s*!==?\s*tenant\b|\btenant\s*!==?\s*\w+\.tenant\b/]},
         go: {all: [/\.Tenant\s*!=\s*tenant\b|\btenant\s*!=\s*\w+\.Tenant\b/]},
-        scala: {all: [/\.tenant\s*!=\s*tenant\b|\.tenant\s*==\s*tenant\b/]},
         cpp: {all: [/(->|\.)tenant\s*!=\s*tenant\b|\btenant\s*!=\s*\w+(->|\.)tenant\b/]},
       },
     },
@@ -80,7 +78,6 @@ of 5,000 characters fills every view.
         python: {all: [/SURVEYOR_ROLE\s*=\s*["']surveyor["']/, /==\s*SURVEYOR_ROLE|SURVEYOR_ROLE\s*==/]},
         typescript: {all: [/SURVEYOR_ROLE\s*=\s*['"]surveyor['"]/, /===?\s*SURVEYOR_ROLE|SURVEYOR_ROLE\s*===?/]},
         go: {all: [/surveyorRole\s*=\s*"surveyor"/, /==\s*surveyorRole|surveyorRole\s*==/]},
-        scala: {all: [/SurveyorRole\s*=\s*"surveyor"/, /==\s*SurveyorRole|SurveyorRole\s*==|contains\(SurveyorRole\)/]},
         cpp: {all: [/kSurveyorRole\s*=\s*"surveyor"/, /==\s*kSurveyorRole|kSurveyorRole\s*==/]},
       },
     },
@@ -93,7 +90,6 @@ of 5,000 characters fills every view.
         python: {all: [/html\.escape\(/]},
         typescript: {all: [/&lt;/]},
         go: {all: [/html\.EscapeString\(/]},
-        scala: {all: [/&lt;/]},
         cpp: {all: [/&lt;/]},
       },
     },
@@ -112,13 +108,6 @@ of 5,000 characters fills every view.
           none: [/escapeHtml\([^()\n]*\)\.slice\(/],
         },
         go: {all: [/maxDetailChars\s*=\s*280\b/, /\[:maxDetailChars\]/], none: [/EscapeString\([^)\n]*\)\[:/]},
-        scala: {
-          all: [
-            /MaxDetailChars\s*=\s*280\b/,
-            /\(\s*\w+\([^()\n]*,\s*MaxDetailChars\s*\)\s*\)|take\(MaxDetailChars\)|limit\(MaxDetailChars/,
-          ],
-          none: [/escapeHtml\([^)\n]*\)\.take\(/],
-        },
         cpp: {all: [/kMaxDetailChars\s*=\s*280\b/, /\(\s*\w+\([^()\n]*,\s*kMaxDetailChars\s*\)\s*\)/]},
       },
     },
@@ -356,115 +345,6 @@ func readCase(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/moderation/items/{id}", readCase)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import moderation.Store // Store.getCase, actionsOf
-
-object Read {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def caseFile(tenant: String, caseId: String): HttpResponse = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    Store.getCase(caseId) match {
-      case None => error(StatusCodes.NotFound, "no such case")
-      case Some(found) =>
-        json(
-          StatusCodes.OK,
-          JsObject(
-            "case_id" -> JsString(found.caseId),
-            "content_id" -> JsString(found.contentId),
-            "status" -> JsString(found.status),
-            "reason" -> JsString(found.reason),
-            "reports" -> JsNumber(found.reports),
-            "actions" -> JsArray(Store.actionsOf(found.contentId).toVector),
-            "links" -> JsObject("content" -> JsString(s"/v1/content/\${found.contentId}")),
-            "reporter_id" -> JsString(found.reporterId),
-            "detail" -> JsString(found.detail)))
-    }
-  }
-
-  val route: Route = path("v1" / "moderation" / "items" / Segment) { caseId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case Some(tenant) if tenant.nonEmpty => complete(caseFile(tenant, caseId))
-        case _ => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import moderation.Store // Store.getCase, actionsOf
-
-object Read {
-  val SurveyorRole = "surveyor"
-  val MaxDetailChars = 280
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def escapeHtml(text: String): String = text.flatMap {
-    case '&' => "&amp;"
-    case '<' => "&lt;"
-    case '>' => "&gt;"
-    case '"' => "&quot;"
-    case '\\'' => "&#x27;"
-    case c => c.toString
-  }
-
-  /** The first n characters (code points, not UTF-16 units) of the text. */
-  private def firstChars(text: String, n: Int): String = {
-    val points = text.codePoints().limit(n.toLong).toArray
-    new String(points, 0, points.length)
-  }
-
-  private def caseFile(tenant: String, role: Option[String], caseId: String): HttpResponse =
-    // Another tenant's case answers exactly as a missing one: a case id is a name, not a permission.
-    Store.getCase(caseId).filter(_.tenant == tenant) match {
-      case None => error(StatusCodes.NotFound, "no such case")
-      case Some(found) =>
-        val fields = Map(
-          "case_id" -> JsString(found.caseId),
-          "content_id" -> JsString(found.contentId),
-          "status" -> JsString(found.status),
-          "reason" -> JsString(found.reason),
-          "reports" -> JsNumber(found.reports),
-          "actions" -> JsArray(Store.actionsOf(found.contentId).toVector),
-          "links" -> JsObject("content" -> JsString(s"/v1/content/\${found.contentId}")),
-          // Cut first, then escape: the cut never lands inside an entity.
-          "detail" -> JsString(escapeHtml(firstChars(found.detail, MaxDetailChars))))
-        val reporter = if (role.contains(SurveyorRole)) Map("reporter_id" -> JsString(found.reporterId)) else Map.empty[String, JsValue]
-        json(StatusCodes.OK, JsObject(fields ++ reporter))
-    }
-
-  val route: Route = path("v1" / "moderation" / "items" / Segment) { caseId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        optionalHeaderValueByName("X-Reviewer-Role") { role =>
-          tenant.filter(_.nonEmpty) match {
-            case Some(t) => complete(caseFile(t, role, caseId))
-            case None => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

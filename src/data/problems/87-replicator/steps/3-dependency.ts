@@ -69,12 +69,11 @@ service TargetRegion { rpc ApplyChange(ApplyChangeRequest) returns (ApplyChangeR
       id: 'deadline',
       title: 'Every attempt carries a 3-second deadline',
       detail:
-        'Each `ApplyChange` attempt is made with its own `DEADLINE_S` (3 s) counted from that attempt: `timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter` or `set_deadline`. Without one, a target that stops answering holds the worker; with one deadline shared by all attempts, the retries after a timeout start already expired.',
+        'Each `ApplyChange` attempt is made with its own `DEADLINE_S` (3 s) counted from that attempt: `timeout=`, `deadline:`, `context.WithTimeout` or `set_deadline`. Without one, a target that stops answering holds the worker; with one deadline shared by all attempts, the retries after a timeout start already expired.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*3\b/, /ApplyChange\([^\n]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*3000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/applyDeadline\s*=\s*3\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*applyDeadline\)/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*3L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/kApplyDeadline\{3\}/, /set_deadline\([^\n]*kApplyDeadline\)/]},
       },
     },
@@ -87,7 +86,6 @@ service TargetRegion { rpc ApplyChange(ApplyChangeRequest) returns (ApplyChangeR
         python: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /range\(MAX_ATTEMPTS\)/, /RESOURCE_EXHAUSTED/], none: [/range\(8\)/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /<\s*MAX_ATTEMPTS/, /RESOURCE_EXHAUSTED/], none: [/<\s*8\b/]},
         go: {all: [/maxAttempts\s*=\s*3\b/, /<\s*maxAttempts/, /codes\.ResourceExhausted/], none: [/<\s*8\b/]},
-        scala: {all: [/MaxAttempts\s*=\s*3\b/, /MaxAttempts/, /RESOURCE_EXHAUSTED/], none: [/<\s*8\b/]},
         cpp: {all: [/kMaxAttempts\s*=\s*3\b/, /<\s*kMaxAttempts/, /RESOURCE_EXHAUSTED/], none: [/<\s*8\b/]},
       },
     },
@@ -112,11 +110,6 @@ service TargetRegion { rpc ApplyChange(ApplyChangeRequest) returns (ApplyChangeR
           order: [/ChangeId:\s*change\.ChangeID/, /for attempt :=/],
           none: [/uuid\./],
         },
-        scala: {
-          all: [/changeId\s*=\s*change\.changeId/],
-          order: [/changeId\s*=\s*change\.changeId/, /while \(/],
-          none: [/UUID/],
-        },
         cpp: {
           all: [/set_change_id\(change\.change_id\)/],
           order: [/set_change_id\(change\.change_id\)/, /for \(int attempt/],
@@ -133,7 +126,6 @@ service TargetRegion { rpc ApplyChange(ApplyChangeRequest) returns (ApplyChangeR
         python: {all: [/StatusCode\.FAILED_PRECONDITION/, /raise SchemaMismatch\(/]},
         typescript: {all: [/status\.FAILED_PRECONDITION/, /throw new SchemaMismatch\(/]},
         go: {all: [/codes\.FailedPrecondition/, /ErrSchemaMismatch/]},
-        scala: {all: [/Status\.Code\.FAILED_PRECONDITION/, /throw new SchemaMismatch\(/]},
         cpp: {all: [/StatusCode::FAILED_PRECONDITION/, /throw SchemaMismatch\(/]},
       },
     },
@@ -146,7 +138,6 @@ service TargetRegion { rpc ApplyChange(ApplyChangeRequest) returns (ApplyChangeR
         python: {order: [/\.ApplyChange\(/, /advance_offset\(/]},
         typescript: {order: [/\.ApplyChange\(/, /advanceOffset\(/]},
         go: {order: [/\.ApplyChange\(/, /offsets\.AdvanceOffset\(/]},
-        scala: {order: [/\.applyChange\(/, /Offsets\.advanceOffset\(/]},
         cpp: {order: [/->ApplyChange\(/, /offsets::advanceOffset\(/]},
       },
     },
@@ -482,93 +473,6 @@ func replicateChange(ctx context.Context, replicationID string, shard int, chang
 	}
 	// Confirmed: only now does the shard's offset move past the change.
 	return offsets.AdvanceOffset(ctx, replicationID, shard, change.Offset)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import replication.Offsets // Offsets.advanceOffset(replicationId, shard, offset): Long
-import replicatord.replicator.{ApplyChangeRequest, TargetRegionGrpc}
-
-/** One change of a shard as the source's change log holds it. */
-final case class Change(changeId: String, offset: Long, key: String, value: String)
-
-/** The target's schema lacks the change's shape: the shard halts until the schema is migrated. */
-final class SchemaMismatch(message: String) extends Exception(message)
-/** The target did not confirm the change: the shard retries it later from its confirmed offset. */
-final class ApplyFailed(message: String) extends Exception(message)
-
-object Client {
-  private val target = TargetRegionGrpc.blockingStub(ManagedChannelBuilder.forAddress("target-region", 9000).usePlaintext().build())
-
-  /** Apply one change at the target; returns the shard's offset afterwards. */
-  def replicateChange(replicationId: String, shard: Int, change: Change): Long = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val confirmed = Offsets.advanceOffset(replicationId, shard, change.offset)
-    var attempt = 0
-    while (attempt < 8) {
-      val request = ApplyChangeRequest(replicationId, shard, UUID.randomUUID().toString, change.offset, change.key, change.value)
-      try {
-        target.applyChange(request)
-        return confirmed
-      } catch {
-        case _: StatusRuntimeException =>
-          Thread.sleep(500L << attempt)
-          attempt += 1
-      }
-    }
-    throw new ApplyFailed(s"change \${change.changeId} not applied after 8 attempts")
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import replication.Offsets // Offsets.advanceOffset(replicationId, shard, offset): Long
-import replicatord.replicator.{ApplyChangeRequest, TargetRegionGrpc}
-
-/** One change of a shard as the source's change log holds it. */
-final case class Change(changeId: String, offset: Long, key: String, value: String)
-
-/** The target's schema lacks the change's shape: the shard halts until the schema is migrated. */
-final class SchemaMismatch(message: String) extends Exception(message)
-/** The target did not confirm the change: the shard retries it later from its confirmed offset. */
-final class ApplyFailed(message: String) extends Exception(message)
-
-object Client {
-  val DeadlineSeconds = 3L
-  val MaxAttempts = 3
-  private val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED, Status.Code.RESOURCE_EXHAUSTED)
-
-  private val target = TargetRegionGrpc.blockingStub(ManagedChannelBuilder.forAddress("target-region", 9000).usePlaintext().build())
-
-  /** Apply one change at the target; returns the shard's offset afterwards. */
-  def replicateChange(replicationId: String, shard: Int, change: Change): Long = {
-    // One request for every attempt: the target dedupes a retry of a call whose reply was lost by its change_id.
-    val request = ApplyChangeRequest(replicationId, shard, changeId = change.changeId, offset = change.offset, key = change.key, value = change.value)
-    var attempt = 0
-    var confirmed = false
-    while (!confirmed) {
-      try {
-        target.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).applyChange(request)
-        confirmed = true
-      } catch {
-        case e: StatusRuntimeException =>
-          val code = e.getStatus.getCode
-          // Retrying cannot change the target's schema.
-          if (code == Status.Code.FAILED_PRECONDITION) throw new SchemaMismatch(Option(e.getStatus.getDescription).getOrElse("schema mismatch"))
-          if (!Retryable.contains(code) || attempt == MaxAttempts - 1) throw new ApplyFailed(s"change \${change.changeId}: $code")
-          Thread.sleep(200L << attempt)
-          attempt += 1
-      }
-    }
-    // Confirmed: only now does the shard's offset move past the change.
-    Offsets.advanceOffset(replicationId, shard, change.offset)
-  }
 }
 `,
     },

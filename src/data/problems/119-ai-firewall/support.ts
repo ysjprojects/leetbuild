@@ -5,7 +5,6 @@
  * that call with the request id, so the application's logs can be joined with the firewall's.
  */
 import {CPP_IDS_H} from '../cpp-support';
-import {scalaPath} from '../scala-support';
 
 /** Python: `from aifw.upstream import forward`. */
 export const supportModules: Record<string, string> = {
@@ -142,33 +141,5 @@ inline std::optional<std::string> forward(const std::string& prompt, const std::
 }
 
 }  // namespace aifw
-`,
-};
-
-/** Scala: `aifw.Upstream.forward(prompt, requestId)`. */
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('aifw', 'Upstream')]: `package aifw
-
-import java.util.concurrent.TimeUnit
-
-import io.grpc.ManagedChannelBuilder
-import firewall.firewall.{AssistantGrpc, ChatRequest}
-
-/** The LLM application the firewall fronts (provided): one gRPC call, Assistant.Chat at llm-app:9001. */
-object Upstream {
-  val Target = "llm-app:9001"
-  val DeadlineMs = 30000L
-
-  private val assistant = AssistantGrpc.blockingStub(
-    ManagedChannelBuilder.forAddress("llm-app", 9001).usePlaintext().build()
-  )
-
-  /** The application's answer to an allowed prompt; the request id travels with it. */
-  def forward(prompt: String, requestId: String): String =
-    assistant
-      .withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS)
-      .chat(ChatRequest(prompt = prompt, requestId = requestId))
-      .text
-}
 `,
 };

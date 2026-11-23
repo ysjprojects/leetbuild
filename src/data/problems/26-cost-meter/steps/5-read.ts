@@ -47,7 +47,6 @@ Requirements:
         python: {all: [/X-Tenant-Id/, /status_code\s*=\s*403/]},
         typescript: {all: [/x-tenant-id/, /code\(\s*403\s*\)/]},
         go: {all: [/X-Tenant-Id/, /StatusForbidden/]},
-        scala: {all: [/X-Tenant-Id/, /StatusCodes\.Forbidden/]},
         cpp: {all: [/X-Tenant-Id/, /\b403\b/]},
       },
     },
@@ -60,7 +59,6 @@ Requirements:
         python: {all: [/bucket_of\(/, /window_key\(/], none: [/\.keys\(|\.scan(_iter)?\(/]},
         typescript: {all: [/bucketOf\(/, /windowKey\(/], none: [/\.keys\(|\.scan(Stream)?\(/]},
         go: {all: [/config\.BucketOf\(/, /config\.WindowKey\(/], none: [/\.Keys\(|\.Scan\(/]},
-        scala: {all: [/Config\.bucketOf\(/, /Config\.windowKey\(/], none: [/\.keys\(|\.scan\(/]},
         cpp: {all: [/config::bucket_of\(/, /config::window_key\(/], none: [/\.keys\(|\.scan\(/]},
       },
     },
@@ -73,7 +71,6 @@ Requirements:
         python: {all: [/["']cost_micros["']/], none: [/BLENDED_RATE/]},
         typescript: {all: [/cost_micros/], none: [/BLENDED_RATE/]},
         go: {all: [/"cost_micros"/], none: [/blendedRate/]},
-        scala: {all: [/"cost_micros"/], none: [/BlendedRate/]},
         cpp: {all: [/"cost_micros"/], none: [/kBlendedRate/]},
       },
     },
@@ -86,7 +83,6 @@ Requirements:
         python: {all: [/\.hgetall\(|\.hmget\(/], none: [/\.hget\(/]},
         typescript: {all: [/\.hgetall\(|\.hmget\(/], none: [/\.hget\(/]},
         go: {all: [/\.HGetAll\(|\.HMGet\(/], none: [/\.HGet\(/]},
-        scala: {all: [/\.hgetAll\(|\.hmget\(/], none: [/\.hget\(/]},
         cpp: {all: [/\.hgetall\(|\.hmget\(/], none: [/\.hget\(/]},
       },
     },
@@ -99,7 +95,6 @@ Requirements:
         python: {all: [/max\(\s*0\s*,|max\([^)]*,\s*0\s*\)/]},
         typescript: {all: [/Math\.max\(\s*0\s*,|Math\.max\([^)]*,\s*0\s*\)/]},
         go: {all: [/max\(\s*0\s*,|max\([^)]*,\s*0\s*\)/]},
-        scala: {all: [/math\.max\(\s*0L?\s*,|math\.max\([^)]*,\s*0L?\s*\)/]},
         cpp: {all: [/std::max(<long long>)?\(\s*0(LL)?\s*,|std::max(<long long>)?\([^)]*,\s*0(LL)?\s*\)/]},
       },
     },
@@ -364,108 +359,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import meter.Config
-
-object SpendApi {
-  implicit val system: ActorSystem = ActorSystem("cost-meter")
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** micro-dollars per 1 000 tokens, input and output alike */
-  val BlendedRate = 5000L
-
-  private def field(key: String, name: String): Long = Option(jedis.hget(key, name)).map(_.toLong).getOrElse(0L)
-
-  val route: Route =
-    path("v1" / "tenants" / Segment / "spend") { tenant =>
-      get {
-        // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-        val keys = jedis.keys(s"meter:$tenant:*").asScala.toList
-        val inputTokens = keys.map(field(_, "input_tokens")).sum
-        val outputTokens = keys.map(field(_, "output_tokens")).sum
-        val events = keys.map(field(_, "events")).sum
-        val spend = (inputTokens + outputTokens) * BlendedRate / 1000
-        val body = ujson.Obj(
-          "tenant" -> tenant,
-          "input_tokens" -> inputTokens.toDouble,
-          "output_tokens" -> outputTokens.toDouble,
-          "events" -> events.toDouble,
-          "spend_micros" -> spend.toDouble,
-          "budget_micros" -> Config.BudgetMicros.toDouble,
-          "remaining_micros" -> (Config.BudgetMicros - spend).toDouble
-        )
-        complete(HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import meter.Config
-
-object SpendApi {
-  implicit val system: ActorSystem = ActorSystem("cost-meter")
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private def json(status: StatusCode, body: ujson.Value) =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body))))
-
-  val route: Route =
-    path("v1" / "tenants" / Segment / "spend") { tenant =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => json(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing X-Tenant-Id"))
-          case Some(caller) if caller != tenant =>
-            json(StatusCodes.Forbidden, ujson.Obj("error" -> "a tenant reads its own spend"))
-          case Some(_) =>
-            val bucket = Config.bucketOf(System.currentTimeMillis() / 1000)
-            // One command: the limiter's own counters, all from one instant.
-            val window = jedis.hgetAll(Config.windowKey(tenant, bucket)).asScala
-            def field(name: String): Long = window.get(name).map(_.toLong).getOrElse(0L)
-            val spend = field("cost_micros")
-            json(
-              StatusCodes.OK,
-              ujson.Obj(
-                "tenant" -> tenant,
-                "bucket" -> bucket.toDouble,
-                "input_tokens" -> field("input_tokens").toDouble,
-                "output_tokens" -> field("output_tokens").toDouble,
-                "events" -> field("events").toDouble,
-                "spend_micros" -> spend.toDouble,
-                "budget_micros" -> Config.BudgetMicros.toDouble,
-                "remaining_micros" -> math.max(0L, Config.BudgetMicros - spend).toDouble
-              )
-            )
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

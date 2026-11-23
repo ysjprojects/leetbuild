@@ -61,10 +61,6 @@ second sweep hands the same bytes back again.
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]GET['"]/, /redis\.call\(\s*['"]INCRBY['"]/],
           none: [/rdb\.IncrBy\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]GET['"]/, /redis\.call\(\s*['"]INCRBY['"]/],
-          none: [/jedis\.incrBy\(/],
-        },
         cpp: {
           all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]GET['"]/, /redis\.call\(\s*['"]INCRBY['"]/],
           none: [/redis\.incrby\(/],
@@ -80,7 +76,6 @@ second sweep hands the same bytes back again.
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /SESSION_TTL_S\s*=\s*86400/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /SESSION_TTL_S\s*=\s*86400/]},
         go: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /sessionTTL\s*=\s*24\s*\*\s*time\.Hour/]},
-        scala: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /SessionTtlSeconds\s*=\s*86400L?/]},
         cpp: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /kSessionTtl\{86400\}/]},
       },
     },
@@ -96,7 +91,6 @@ second sweep hands the same bytes back again.
           none: [/redis\.hincrby\(/],
         },
         go: {all: [/redis\.call\(\s*['"]HSETNX['"]/, /redis\.call\(\s*['"]HINCRBY['"]/], none: [/rdb\.HIncrBy\(/]},
-        scala: {all: [/redis\.call\(\s*['"]HSETNX['"]/, /redis\.call\(\s*['"]HINCRBY['"]/], none: [/jedis\.hincrBy\(/]},
         cpp: {all: [/redis\.call\(\s*['"]HSETNX['"]/, /redis\.call\(\s*['"]HINCRBY['"]/], none: [/redis\.hincrby\(/]},
       },
     },
@@ -109,7 +103,6 @@ second sweep hands the same bytes back again.
         python: {order: [/def sweep/, /\.zrem\(/, /\.decrby\(/]},
         typescript: {order: [/function sweep/, /\.zrem\(/, /\.decrby\(/]},
         go: {order: [/func sweep/, /\.ZRem\(/, /\.DecrBy\(/]},
-        scala: {order: [/def sweep/, /\.zrem\(/, /\.decrBy\(/]},
         cpp: {order: [/long long sweep/, /\.zrem\(/, /\.decrby\(/]},
       },
     },
@@ -585,131 +578,6 @@ func sweep(ctx context.Context, tenant string) (int64, error) {
 		}
 	}
 	return released, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import files.Sessions // Sessions.Session
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val SessionTtlSeconds = 86400L
-  val DefaultQuotaBytes: Long = 1L << 30
-
-  /** Reserve declaredSize against the tenant's quota and open the session; its upload id, or None over quota. */
-  def openSession(tenant: String, declaredSize: Long, mime: String, name: String): Option[String] = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val uploadId = s"up-\${jedis.incr("upload:seq")}"
-    val used = Option(jedis.get(s"quota:used:$tenant")).map(_.toLong).getOrElse(0L)
-    val limit = Option(jedis.get(s"quota:limit:$tenant")).map(_.toLong).getOrElse(DefaultQuotaBytes)
-    if (used + declaredSize > limit) None
-    else {
-      jedis.incrBy(s"quota:used:$tenant", declaredSize)
-      jedis.zadd(s"quota:reservations:$tenant", declaredSize.toDouble, uploadId)
-      jedis.hset(s"session:$uploadId", Map("tenant" -> tenant, "declared_size" -> declaredSize.toString, "mime" -> mime, "name" -> name, "actual_bytes" -> "0").asJava)
-      Some(uploadId)
-    }
-  }
-
-  /** Count part n once; the upload's actual bytes after it, or -1 when the session is gone. */
-  def ackPart(uploadId: String, n: Int, size: Long): Long =
-    if (!jedis.exists(s"session:$uploadId")) -1L
-    else {
-      jedis.hset(s"session:$uploadId", s"part:$n", size.toString)
-      jedis.hincrBy(s"session:$uploadId", "actual_bytes", size)
-    }
-
-  /** The session, if it is open. */
-  def findSession(uploadId: String): Option[Sessions.Session] = {
-    val raw = jedis.hgetAll(s"session:$uploadId").asScala.toMap
-    if (raw.isEmpty) None
-    else {
-      val parts = raw.collect { case (field, value) if field.startsWith("part:") => field.drop(5).toInt -> value.toLong }
-      Some(Sessions.Session(uploadId, raw("tenant"), raw("declared_size").toLong, raw("actual_bytes").toLong, raw("mime"), raw.getOrElse("name", ""), parts))
-    }
-  }
-
-  /** Release the reservations whose session expired without a commit; the bytes released. */
-  def sweep(tenant: String): Long =
-    jedis.zrangeWithScores(s"quota:reservations:$tenant", 0, -1).asScala.toSeq.map { entry =>
-      if (jedis.exists(s"session:\${entry.getElement}")) 0L
-      else {
-        jedis.decrBy(s"quota:used:$tenant", entry.getScore.toLong)
-        entry.getScore.toLong
-      }
-    }.sum
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import files.Sessions // Sessions.Session
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val SessionTtlSeconds = 86400L
-  val DefaultQuotaBytes: Long = 1L << 30
-
-  /** The check and every write of the reservation in one script: no other upload can land in between. */
-  val OpenLua: String =
-    """local used = tonumber(redis.call('GET', KEYS[1]) or '0')
-      |local limit = tonumber(redis.call('GET', KEYS[2]) or ARGV[7])
-      |if used + tonumber(ARGV[1]) > limit then return 0 end
-      |redis.call('INCRBY', KEYS[1], ARGV[1])
-      |redis.call('ZADD', KEYS[3], ARGV[1], ARGV[2])
-      |redis.call('HSET', KEYS[4], 'tenant', ARGV[3], 'declared_size', ARGV[1], 'mime', ARGV[4], 'name', ARGV[5], 'actual_bytes', 0)
-      |redis.call('EXPIRE', KEYS[4], ARGV[6])
-      |return 1
-      |""".stripMargin
-
-  /** A part is counted only the first time its field is written. */
-  val AckLua: String =
-    """if redis.call('EXISTS', KEYS[1]) == 0 then return -1 end
-      |if redis.call('HSETNX', KEYS[1], 'part:' .. ARGV[1], ARGV[2]) == 1 then
-      |  redis.call('HINCRBY', KEYS[1], 'actual_bytes', ARGV[2])
-      |end
-      |return tonumber(redis.call('HGET', KEYS[1], 'actual_bytes'))
-      |""".stripMargin
-
-  /** Reserve declaredSize against the tenant's quota and open the session; its upload id, or None over quota. */
-  def openSession(tenant: String, declaredSize: Long, mime: String, name: String): Option[String] = {
-    val uploadId = s"up-\${jedis.incr("upload:seq")}"
-    val keys = List(s"quota:used:$tenant", s"quota:limit:$tenant", s"quota:reservations:$tenant", s"session:$uploadId").asJava
-    val args = List(declaredSize.toString, uploadId, tenant, mime, name, SessionTtlSeconds.toString, DefaultQuotaBytes.toString).asJava
-    if (jedis.eval(OpenLua, keys, args).asInstanceOf[java.lang.Long] == 1L) Some(uploadId) else None
-  }
-
-  /** Count part n once; the upload's actual bytes after it, or -1 when the session is gone. */
-  def ackPart(uploadId: String, n: Int, size: Long): Long =
-    jedis.eval(AckLua, List(s"session:$uploadId").asJava, List(n.toString, size.toString).asJava).asInstanceOf[java.lang.Long]
-
-  /** The session, if it is open. */
-  def findSession(uploadId: String): Option[Sessions.Session] = {
-    val raw = jedis.hgetAll(s"session:$uploadId").asScala.toMap
-    if (raw.isEmpty) None
-    else {
-      val parts = raw.collect { case (field, value) if field.startsWith("part:") => field.drop(5).toInt -> value.toLong }
-      Some(Sessions.Session(uploadId, raw("tenant"), raw("declared_size").toLong, raw("actual_bytes").toLong, raw("mime"), raw.getOrElse("name", ""), parts))
-    }
-  }
-
-  /** Release the reservations whose session expired without a commit; the bytes released. */
-  def sweep(tenant: String): Long =
-    jedis.zrangeWithScores(s"quota:reservations:$tenant", 0, -1).asScala.toSeq.map { entry =>
-      val uploadId = entry.getElement
-      // Only the sweeper that removed the reservation releases it.
-      if (!jedis.exists(s"session:$uploadId") && jedis.zrem(s"quota:reservations:$tenant", uploadId) == 1L) {
-        jedis.decrBy(s"quota:used:$tenant", entry.getScore.toLong)
-        entry.getScore.toLong
-      } else 0L
-    }.sum
 }
 `,
     },

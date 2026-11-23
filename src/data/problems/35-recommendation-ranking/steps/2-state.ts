@@ -55,7 +55,6 @@ no features at all.
         python: {all: [/f"features:\{tenant\}:\{user_id\}"/], none: [/f"features:\{user_id\}"/]},
         typescript: {all: [/`features:\$\{tenant\}:\$\{userId\}`/], none: [/`features:\$\{userId\}`/]},
         go: {all: [/"features:"\s*\+\s*tenant\s*\+\s*":"\s*\+\s*userID/], none: [/"features:"\s*\+\s*userID/]},
-        scala: {all: [/s"features:\$tenant:\$userId"/], none: [/s"features:\$userId"/]},
         cpp: {all: [/"features:"\s*\+\s*tenant\s*\+\s*":"\s*\+\s*user_id/], none: [/"features:"\s*\+\s*user_id/]},
       },
     },
@@ -68,7 +67,6 @@ no features at all.
         python: {all: [/FEATURES_TTL_S\s*=\s*300\b/, /ex=FEATURES_TTL_S/]},
         typescript: {all: [/FEATURES_TTL_S\s*=\s*300\b/, /'EX',\s*FEATURES_TTL_S/]},
         go: {all: [/featuresTTL\s*=\s*300\s*\*\s*time\.Second/, /\.Set\([^\n]*featuresTTL\)/]},
-        scala: {all: [/FeaturesTtlSeconds\s*=\s*300L?\b/, /\.ex\(\s*FeaturesTtlSeconds\s*\)/]},
         cpp: {all: [/kFeaturesTtl\{300\}/, /\.set\([^\n]*kFeaturesTtl\)/]},
       },
     },
@@ -90,10 +88,6 @@ no features at all.
           all: [/lock:features:/, /\.SetNX\(/, /defer rdb\.Del\(/],
           order: [/\.SetNX\(/, /\.UserFeatures\(/],
         },
-        scala: {
-          all: [/lock:features:/, /\.nx\(\)/, /finally/, /\.del\(\s*lock/],
-          order: [/\.nx\(\)/, /\.userFeatures\(/],
-        },
         cpp: {
           all: [/lock:features:/, /UpdateType::NOT_EXIST/, /~\w+\(\)\s*\{[^}]*\.del\(/],
           order: [/UpdateType::NOT_EXIST/, /->UserFeatures\(/],
@@ -109,9 +103,6 @@ no features at all.
         python: {all: [/features:stale:/, /ex=STALE_TTL_S/, /except grpc\.RpcError/, /"stale":\s*True/]},
         typescript: {all: [/features:stale:/, /'EX',\s*STALE_TTL_S/, /catch/, /stale:\s*true/]},
         go: {all: [/features:stale:/, /staleTTL\)/, /Stale:\s*true/]},
-        scala: {
-          all: [/features:stale:/, /\.ex\(\s*StaleTtlSeconds\s*\)/, /StatusRuntimeException/, /stale\s*=\s*true/],
-        },
         cpp: {all: [/features:stale:/, /kStaleTtl\)/, /\.ok\(\)/, /\btrue\}/]},
       },
     },
@@ -376,87 +367,6 @@ func loadFeatures(ctx context.Context, tenant, userID string) *types.Features {
 	rdb.Set(ctx, key, raw, featuresTTL)
 	rdb.Set(ctx, "features:stale:"+tenant+":"+userID, raw, staleTTL)
 	return &types.Features{Values: vector.GetValues()}
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.ManagedChannelBuilder
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import recs.Features
-import recsys.ranking.{FeatureServiceGrpc, FeaturesRequest}
-
-object State {
-  val FeaturesDeadlineMs = 300L
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val featureService = FeatureServiceGrpc.blockingStub(ManagedChannelBuilder.forAddress("features", 9000).usePlaintext().build())
-
-  /** The user's feature vector for ranking, or None when there is none to give. */
-  def loadFeatures(tenant: String, userId: String): Option[Features] = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = s"features:$userId"
-    Option(jedis.get(key)) match {
-      case Some(cached) => Some(Features(cached.parseJson.convertTo[Vector[Double]], stale = false))
-      case None =>
-        val vector = featureService.withDeadlineAfter(FeaturesDeadlineMs, TimeUnit.MILLISECONDS).userFeatures(FeaturesRequest(tenant, userId))
-        jedis.set(key, vector.values.toVector.toJson.compactPrint)
-        Some(Features(vector.values, stale = false))
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import recs.Features
-import recsys.ranking.{FeatureServiceGrpc, FeaturesRequest}
-
-object State {
-  val FeaturesDeadlineMs = 300L
-  val FeaturesTtlSeconds = 300L
-  val StaleTtlSeconds = 86400L
-  val LockTtlSeconds = 5L
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val featureService = FeatureServiceGrpc.blockingStub(ManagedChannelBuilder.forAddress("features", 9000).usePlaintext().build())
-
-  /** The vector the last good refresh kept, marked stale, if any. */
-  def staleCopy(tenant: String, userId: String): Option[Features] =
-    Option(jedis.get(s"features:stale:$tenant:$userId")).map(raw => Features(raw.parseJson.convertTo[Vector[Double]], stale = true))
-
-  /** The user's feature vector for ranking, or None when there is none to give. */
-  def loadFeatures(tenant: String, userId: String): Option[Features] = {
-    val key = s"features:$tenant:$userId"
-    Option(jedis.get(key)) match {
-      case Some(cached) => Some(Features(cached.parseJson.convertTo[Vector[Double]], stale = false))
-      case None =>
-        val lock = s"lock:features:$tenant:$userId"
-        // Another request is refreshing: one miss, one call.
-        if (jedis.set(lock, "1", SetParams.setParams().nx().ex(LockTtlSeconds)) == null) staleCopy(tenant, userId)
-        else
-          try {
-            val vector = featureService.withDeadlineAfter(FeaturesDeadlineMs, TimeUnit.MILLISECONDS).userFeatures(FeaturesRequest(tenant, userId))
-            val raw = vector.values.toVector.toJson.compactPrint
-            jedis.set(key, raw, SetParams.setParams().ex(FeaturesTtlSeconds))
-            jedis.set(s"features:stale:$tenant:$userId", raw, SetParams.setParams().ex(StaleTtlSeconds))
-            Some(Features(vector.values, stale = false))
-          } catch {
-            case _: StatusRuntimeException => staleCopy(tenant, userId)
-          } finally {
-            jedis.del(lock) // on the failure path too, or nobody refreshes this user for LockTtlSeconds
-          }
-    }
-  }
 }
 `,
     },

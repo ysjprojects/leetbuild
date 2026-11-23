@@ -6,7 +6,7 @@ import {endpointStep} from './steps/endpoint';
 import {eventsStep} from './steps/events';
 import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
-import {supportModulesCpp, supportModulesGo, supportModulesPy, supportModulesScala, supportModulesTs} from './support';
+import {supportModulesCpp, supportModulesGo, supportModulesPy, supportModulesTs} from './support';
 
 /**
  * Cron scheduler: the debugging a scheduler fleet needs before it owns other teams' jobs. A schedule
@@ -105,6 +105,5 @@ semantics.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

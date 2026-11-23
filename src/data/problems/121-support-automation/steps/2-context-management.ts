@@ -57,7 +57,6 @@ every turn pays for the same search again and again.
         python: {all: [/context_key\(/], none: [/["']ctx:history["']/]},
         typescript: {all: [/contextKey\(/], none: [/['"]ctx:history['"]/]},
         go: {all: [/config\.ContextKey\(/], none: [/"ctx:history"/]},
-        scala: {all: [/Config\.contextKey\(/], none: [/"ctx:history"/]},
         cpp: {all: [/config::context_key\(/], none: [/"ctx:history"/]},
       },
     },
@@ -70,7 +69,6 @@ every turn pays for the same search again and again.
         python: {all: [/MAX_CONTEXT_ITEMS/, /\.ltrim\(/, /pipeline\(|\.multi\(/]},
         typescript: {all: [/MAX_CONTEXT_ITEMS/, /\.ltrim\(/, /\.multi\(\)/]},
         go: {all: [/maxContextItems/, /\.LTrim\(/, /TxPipelined/]},
-        scala: {all: [/MaxContextItems/, /\.ltrim\(/, /\.multi\(\)/]},
         cpp: {all: [/kMaxContextItems/, /\.ltrim\(/, /transaction\(\)/]},
       },
     },
@@ -83,7 +81,6 @@ every turn pays for the same search again and again.
         python: {all: [/CONTEXT_TTL_S/, /\.expire\(/]},
         typescript: {all: [/CONTEXT_TTL_S/, /\.expire\(/]},
         go: {all: [/contextTTL/, /\.Expire\(/]},
-        scala: {all: [/ContextTtlSeconds/, /\.expire\(/]},
         cpp: {all: [/kContextTtl/, /\.expire\(/]},
       },
     },
@@ -96,7 +93,6 @@ every turn pays for the same search again and again.
         python: {all: [/\.hmget\(/, /STATIC_CONTEXT/], none: [/\.hgetall\(/]},
         typescript: {all: [/\.hmget\(/, /STATIC_CONTEXT/], none: [/\.hgetall\(/]},
         go: {all: [/\.HMGet\(/, /staticContext/], none: [/\.HGetAll\(/]},
-        scala: {all: [/\.hmget\(/, /StaticContext/], none: [/\.hgetAll\(/]},
         cpp: {all: [/\.hmget\(/, /kStaticContext/], none: [/\.hgetall\(/]},
       },
     },
@@ -109,7 +105,6 @@ every turn pays for the same search again and again.
         python: {all: [/RETRIEVER_TTL_S/, /retriever_key\(/]},
         typescript: {all: [/RETRIEVER_TTL_S/, /retrieverKey\(/]},
         go: {all: [/retrieverTTL/, /config\.RetrieverKey\(/]},
-        scala: {all: [/RetrieverTtlSeconds/, /Config\.retrieverKey\(/]},
         cpp: {all: [/kRetrieverTtl/, /config::retriever_key\(/]},
       },
     },
@@ -491,109 +486,6 @@ func assemble(ctx context.Context, tenant, conversation, user, question string) 
 		articles = append(articles, items...)
 	}
 	return model.Context{History: history, Profile: profile, Articles: articles}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import scala.jdk.CollectionConverters._
-
-import io.grpc.ManagedChannelBuilder
-import redis.clients.jedis.JedisPooled
-
-import apv2.{Config, Context, ContextStore, Item}
-import apv2rpc.support_automation.{ContextRetrieverGrpc, RetrieveRequest}
-
-object ContextManager extends ContextStore {
-  val StaticContext = Seq("customer_name", "user_role", "current_trip")
-  val DynamicRetrievers = Seq("help_articles")
-  val RetrieveDeadlineMs = 1000L
-  private val HistoryKey = "ctx:history"
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val retriever = ContextRetrieverGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.Retriever).usePlaintext().build())
-
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  /** Add one item ({kind, text}) to the conversation's runtime context. */
-  def appendItem(tenant: String, conversation: String, item: Item): Unit = {
-    jedis.rpush(HistoryKey, ujson.write(ujson.Obj("tenant" -> tenant, "conversation" -> conversation, "kind" -> item.kind, "text" -> item.text)))
-    ()
-  }
-
-  /** What the next LLM call sees: the history, the user's profile, the retrieved articles. */
-  def assemble(tenant: String, conversation: String, user: String, question: String): Context = {
-    val history = jedis.lrange(HistoryKey, 0, -1).asScala.toSeq.map(ujson.read(_)).collect {
-      case entry if entry("tenant").str == tenant && entry("conversation").str == conversation => Item(entry("kind").str, entry("text").str)
-    }
-    val profile = jedis.hgetAll(Config.profileKey(tenant, user)).asScala.toMap
-    val articles = DynamicRetrievers.flatMap { name =>
-      retriever
-        .withDeadlineAfter(RetrieveDeadlineMs, TimeUnit.MILLISECONDS)
-        .retrieve(RetrieveRequest(tenant = tenant, retriever = name, question = question))
-        .items
-    }
-    Context(history, profile, articles)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import scala.jdk.CollectionConverters._
-
-import io.grpc.ManagedChannelBuilder
-import redis.clients.jedis.JedisPooled
-
-import apv2.{Config, Context, ContextStore, Item}
-import apv2rpc.support_automation.{ContextRetrieverGrpc, RetrieveRequest}
-
-object ContextManager extends ContextStore {
-  val MaxContextItems = 40
-  val ContextTtlSeconds = 86400L
-  val RetrieverTtlSeconds = 300L
-  val StaticContext = Seq("customer_name", "user_role", "current_trip")
-  val DynamicRetrievers = Seq("help_articles")
-  val RetrieveDeadlineMs = 1000L
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val retriever = ContextRetrieverGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.Retriever).usePlaintext().build())
-
-  /** Add one item ({kind, text}) to the conversation's runtime context. */
-  def appendItem(tenant: String, conversation: String, item: Item): Unit = {
-    val key = Config.contextKey(tenant, conversation)
-    val tx = jedis.multi() // MULTI … EXEC: no reader sees an untrimmed or immortal list
-    tx.rpush(key, ujson.write(ujson.Obj("kind" -> item.kind, "text" -> item.text)))
-    tx.ltrim(key, -MaxContextItems, -1)
-    tx.expire(key, ContextTtlSeconds)
-    tx.exec()
-    ()
-  }
-
-  private def retrieve(tenant: String, name: String, question: String): Seq[String] = {
-    val key = Config.retrieverKey(tenant, name, question)
-    Option(jedis.get(key)) match {
-      case Some(cached) => ujson.read(cached).arr.map(_.str).toSeq
-      case None =>
-        val items = retriever
-          .withDeadlineAfter(RetrieveDeadlineMs, TimeUnit.MILLISECONDS)
-          .retrieve(RetrieveRequest(tenant = tenant, retriever = name, question = question))
-          .items
-        jedis.setex(key, RetrieverTtlSeconds, ujson.write(ujson.Arr.from(items.map(ujson.Str(_)))))
-        items
-    }
-  }
-
-  /** What the next LLM call sees: the history, the user's profile, the retrieved articles. */
-  def assemble(tenant: String, conversation: String, user: String, question: String): Context = {
-    val history = jedis.lrange(Config.contextKey(tenant, conversation), 0, -1).asScala.toSeq.map { raw =>
-      val j = ujson.read(raw)
-      Item(j("kind").str, j("text").str)
-    }
-    val values = jedis.hmget(Config.profileKey(tenant, user), StaticContext: _*).asScala
-    val profile = StaticContext.zip(values).collect { case (field, value) if value != null => field -> value }.toMap
-    val articles = DynamicRetrievers.flatMap(retrieve(tenant, _, question))
-    Context(history, profile, articles)
-  }
 }
 `,
     },

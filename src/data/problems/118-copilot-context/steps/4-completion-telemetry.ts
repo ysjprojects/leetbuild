@@ -66,7 +66,6 @@ whenever the consumer dies between the commit and the write.
         python: {all: [/key\s*=\s*session/, /ALLOWED_EVENTS/, /\b401\b/]},
         typescript: {all: [/key:\s*session\b/, /ALLOWED_EVENTS/, /code\(\s*401\s*\)/]},
         go: {all: [/Key:\s*\[\]byte\(session\)/, /allowedEvents/, /StatusUnauthorized/]},
-        scala: {all: [/ProducerRecord\[String,\s*String\]\([^,]+,\s*session,/, /AllowedEvents/, /Unauthorized/]},
         cpp: {all: [/session\.data\(\),\s*session\.size\(\)/, /kAllowedEvents/, /\b401\b/]},
       },
     },
@@ -79,7 +78,6 @@ whenever the consumer dies between the commit and the write.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/put\("enable\.idempotence",\s*"true"\)/, /put\("acks",\s*"all"\)/]},
         cpp: {all: [/set\("enable\.idempotence",\s*"true"/, /set\("acks",\s*"all"/]},
       },
     },
@@ -92,7 +90,6 @@ whenever the consumer dies between the commit and the write.
         python: {all: [/["']candidate_len["']\s*:/], none: [/\btext\b/]},
         typescript: {all: [/candidate_len\s*:/], none: [/\btext\b/]},
         go: {all: [/"candidate_len"/], none: [/\bText\b|"text"/]},
-        scala: {all: [/"candidate_len"/], none: [/"text"|\.text\b/]},
         cpp: {all: [/"candidate_len"/], none: [/"text"/]},
       },
     },
@@ -105,7 +102,6 @@ whenever the consumer dies between the commit and the write.
         python: {order: [/r\.hincrby\(/, /consumer\.commit\(/], all: [/["']enable\.auto\.commit["']\s*:\s*False/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/], all: [/autoCommit:\s*false/]},
         go: {order: [/\.HIncrBy\(/, /\.CommitMessage\(/], all: [/"enable\.auto\.commit":\s*false/]},
-        scala: {order: [/\.hincrBy\(/, /commitSync\(/], all: [/put\("enable\.auto\.commit",\s*"false"\)/]},
         cpp: {order: [/\.hincrby\(/, /commitSync\(/], all: [/set\("enable\.auto\.commit",\s*"false"/]},
       },
     },
@@ -592,160 +588,6 @@ func consume(ctx context.Context) error {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/telemetry", telemetry)
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-object Telemetry {
-  val Topics: List[String] = List("completion.shown", "completion.accepted")
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "telemetry") {
-    post {
-      optionalHeaderValueByName("X-Session-Id") { header =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val session = header.getOrElse("")
-          val body = raw.parseJson.asJsObject.fields
-          def field(name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
-          val event = field("event")
-          System.err.println(s"telemetry session=$session event=$event text=\${field("text")}")
-          val payload = JsObject(
-            "request_id" -> JsString(field("request_id")),
-            "session" -> JsString(session),
-            "language" -> JsString(field("language")),
-            "text" -> JsString(field("text")),
-            "latency_ms" -> body.getOrElse("latency_ms", JsNumber(0))
-          )
-          producer.send(new ProducerRecord[String, String](s"completion.$event", field("request_id"), payload.compactPrint)).get(2, TimeUnit.SECONDS)
-          complete(json(StatusCodes.Accepted, JsObject("accepted" -> JsBoolean(true))))
-        }
-      }
-    }
-  }
-
-  /** Count every shown and accepted event into acceptance:{language}. */
-  def consume(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", "acceptance")
-    props.put("auto.offset.reset", "earliest")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(Topics.asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        consumer.commitSync(Map(new TopicPartition(record.topic(), record.partition()) -> new OffsetAndMetadata(record.offset() + 1)).asJava)
-        val language = record.value().parseJson.asJsObject.fields.get("language").collect { case JsString(s) => s }.getOrElse("")
-        jedis.hincrBy(s"acceptance:$language", record.topic().stripPrefix("completion."), 1)
-      }
-    }
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-object Telemetry {
-  val AllowedEvents: Set[String] = Set("shown", "accepted")
-  val Topics: List[String] = List("completion.shown", "completion.accepted")
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("enable.idempotence", "true") // a retry after a lost acknowledgement writes the event once
-    props.put("acks", "all")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "telemetry") {
-    post {
-      optionalHeaderValueByName("X-Session-Id") {
-        case None | Some("") =>
-          complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Session-Id is required"))))
-        case Some(session) =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject.fields
-            def field(name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
-            val event = field("event")
-            if (!AllowedEvents(event)) complete(json(StatusCodes.BadRequest, JsObject("error" -> JsString("event must be shown or accepted"))))
-            else {
-              val candidateLen = body.getOrElse("candidate_len", JsNumber(0))
-              val payload = JsObject(
-                "request_id" -> JsString(field("request_id")),
-                "session" -> JsString(session),
-                "language" -> JsString(field("language")),
-                "candidate_len" -> candidateLen,
-                "latency_ms" -> body.getOrElse("latency_ms", JsNumber(0))
-              )
-              producer.send(new ProducerRecord[String, String](s"completion.$event", session, payload.compactPrint)).get(2, TimeUnit.SECONDS)
-              System.err.println(s"telemetry session=$session event=$event request_id=\${field("request_id")} candidate_len=$candidateLen")
-              complete(json(StatusCodes.Accepted, JsObject("accepted" -> JsBoolean(true))))
-            }
-          }
-      }
-    }
-  }
-
-  /** Count every shown and accepted event into acceptance:{language}, committing each record after its count. */
-  def consume(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", "acceptance")
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(Topics.asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val language = record.value().parseJson.asJsObject.fields.get("language").collect { case JsString(s) => s }.getOrElse("")
-        jedis.hincrBy(s"acceptance:$language", record.topic().stripPrefix("completion."), 1)
-        // A crash before this line replays the record.
-        consumer.commitSync(Map(new TopicPartition(record.topic(), record.partition()) -> new OffsetAndMetadata(record.offset() + 1)).asJava)
-      }
-    }
-  }
 }
 `,
     },

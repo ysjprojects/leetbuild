@@ -57,7 +57,6 @@ service Classifier { rpc Classify(ClassifyRequest) returns (ClassifyReply); }  /
         python: {all: [/timeout\s*=/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+/]},
         go: {all: [/context\.WithTimeout\(/]},
-        scala: {all: [/withDeadline(After)?\(/]},
         cpp: {all: [/set_deadline\(/]},
       },
     },
@@ -70,7 +69,6 @@ service Classifier { rpc Classify(ClassifyRequest) returns (ClassifyReply); }  /
         python: {all: [/range\(\s*MAX_ATTEMPTS\s*\)/, /in RETRYABLE/]},
         typescript: {all: [/<\s*MAX_ATTEMPTS/, /RETRYABLE\.includes\(/]},
         go: {all: [/<\s*maxAttempts/, /retryable\[/]},
-        scala: {all: [/<\s*MaxAttempts/, /Retryable\.contains\(/]},
         cpp: {all: [/<\s*kMaxAttempts/, /retryable\(/]},
       },
     },
@@ -83,7 +81,6 @@ service Classifier { rpc Classify(ClassifyRequest) returns (ClassifyReply); }  /
         python: {all: [/rules\.rule_decision\(/, /fallback_reason/], none: [/CATCH_ALL/]},
         typescript: {all: [/ruleDecision\(/, /fallback_reason/], none: [/CATCH_ALL/]},
         go: {all: [/rules\.RuleDecision\(/, /FallbackReason/], none: [/catchAll/]},
-        scala: {all: [/Rules\.ruleDecision\(/, /fallbackReason/], none: [/CatchAll/]},
         cpp: {all: [/rules::ruleDecision\(/, /fallback_reason/], none: [/kCatchAll/]},
       },
     },
@@ -96,7 +93,6 @@ service Classifier { rpc Classify(ClassifyRequest) returns (ClassifyReply); }  /
         python: {all: [/BREAKER_COOLDOWN_S/, /BREAKER_THRESHOLD/], none: [/FAILURE_TTL_S/]},
         typescript: {all: [/BREAKER_COOLDOWN_MS/, /BREAKER_THRESHOLD/], none: [/FAILURE_TTL_MS/]},
         go: {all: [/breakerCooldown/, /breakerThreshold/], none: [/failureTTL/]},
-        scala: {all: [/BreakerCooldownMillis/, /BreakerThreshold/], none: [/FailureTtlMillis/]},
         cpp: {all: [/kBreakerCooldown/, /kBreakerThreshold/], none: [/kFailureTtl/]},
       },
     },
@@ -402,91 +398,6 @@ func classify(ctx context.Context, tenant, text string) rules.Decision {
 		reason = "classifier_unavailable"
 	}
 	return fallback(text, reason)
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import triage.Rules // Rules.ruleDecision(text): Rules.Decision
-import triage.classifier.{ClassifierGrpc, ClassifyRequest}
-
-object ClassifierClient {
-  val FailureTtlMillis = 3600000L
-  val CatchAll: Rules.Decision = Rules.Decision("triage", "normal", 0.0, "", "")
-
-  private val classifier = ClassifierGrpc.blockingStub(ManagedChannelBuilder.forAddress("classifier", 9000).usePlaintext().build())
-
-  private var failedAt: Option[Long] = None // when every try of a call last failed
-
-  /** Where the ticket goes; fallbackReason is "" when the classifier decided. */
-  def classify(tenant: String, text: String): Rules.Decision = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    if (failedAt.exists(at => System.currentTimeMillis() - at < FailureTtlMillis)) return CatchAll
-    var attempt = 0
-    while (attempt < 5) {
-      attempt += 1
-      try {
-        val reply = classifier.classify(ClassifyRequest(tenant, text))
-        return Rules.Decision(reply.queue, reply.priority, reply.confidence, "", "")
-      } catch {
-        case _: StatusRuntimeException => Thread.sleep(200)
-      }
-    }
-    failedAt = Some(System.currentTimeMillis())
-    CatchAll
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import triage.Rules // Rules.ruleDecision(text): Rules.Decision
-import triage.classifier.{ClassifierGrpc, ClassifyRequest}
-
-object ClassifierClient {
-  val DeadlineMillis = 1000L
-  val MaxAttempts = 3
-  val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-  val BreakerThreshold = 5
-  val BreakerCooldownMillis = 30000L
-
-  private val classifier = ClassifierGrpc.blockingStub(ManagedChannelBuilder.forAddress("classifier", 9000).usePlaintext().build())
-
-  /** Calls in a row that ended on a retryable status, and when the breaker lets the next one through. */
-  private var failures = 0
-  private var openUntil = 0L
-
-  private def fallback(text: String, reason: String): Rules.Decision = Rules.ruleDecision(text).copy(fallbackReason = reason)
-
-  /** Where the ticket goes; fallbackReason is "" when the classifier decided. */
-  def classify(tenant: String, text: String): Rules.Decision = {
-    if (System.currentTimeMillis() < openUntil) return fallback(text, "breaker_open")
-    var code = Status.Code.UNAVAILABLE
-    var attempt = 0
-    while (attempt < MaxAttempts) {
-      attempt += 1
-      try {
-        val reply = classifier.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).classify(ClassifyRequest(tenant, text))
-        failures = 0
-        return Rules.Decision(reply.queue, reply.priority, reply.confidence, "", "")
-      } catch {
-        case e: StatusRuntimeException =>
-          code = e.getStatus.getCode
-          if (!Retryable.contains(code)) attempt = MaxAttempts // a refusal is about this ticket: asking again gets the same answer
-      }
-    }
-    if (Retryable.contains(code)) {
-      failures += 1
-      if (failures >= BreakerThreshold) openUntil = System.currentTimeMillis() + BreakerCooldownMillis // then one call probes
-    }
-    fallback(text, code match {
-      case Status.Code.DEADLINE_EXCEEDED => "classifier_timeout"
-      case Status.Code.INVALID_ARGUMENT => "classifier_refused"
-      case _ => "classifier_unavailable"
-    })
-  }
 }
 `,
     },

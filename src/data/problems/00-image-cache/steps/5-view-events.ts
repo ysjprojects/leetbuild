@@ -43,7 +43,6 @@ so every request produces one record on the **\`image-views\`** topic:
         python: {all: [/image-views/, /producer\.produce\(/]},
         typescript: {all: [/image-views/, /producer\.send\(/]},
         go: {all: [/image-views/, /WriteMessages\(/]},
-        scala: {all: [/image-views/, /producer\.send\(/]},
         cpp: {all: [/image-views/, /producer->produce\(/]},
       },
     },
@@ -55,7 +54,6 @@ so every request produces one record on the **\`image-views\`** topic:
         python: {all: [/produce\([^\n]*key\s*=\s*image_id/]},
         typescript: {all: [/messages:\s*\[\s*\{[^\n]*key:\s*imageId/]},
         go: {all: [/Key:\s*\[\]byte\(\s*id\s*\)/]},
-        scala: {all: [/new ProducerRecord\[[^\]]*\]\(\s*Topic\s*,\s*id\s*,/]},
         cpp: {all: [/produce\([\s\S]{0,400}?id\.c_str\(\)\s*,\s*id\.size\(\)/]},
       },
     },
@@ -71,7 +69,6 @@ so every request produces one record on the **\`image-views\`** topic:
           none: [/function emitView(?:(?!\nexport )[\s\S])*?await\s+producer\.send\(/],
         },
         go: {all: [/Async:\s*true/], none: [/if err := writer\.WriteMessages/]},
-        scala: {all: [/producer\.send\(\s*record\s*,/], none: [/\.send\([^\n]*\)\.get\(/]},
         cpp: {all: [/producer->poll\(\s*0\s*\)/], none: [/void emit_view(?:(?!\n\})[\s\S])*?producer->flush\(/]},
       },
     },
@@ -83,7 +80,6 @@ so every request produces one record on the **\`image-views\`** topic:
         python: {all: [/on_delivery\s*=\s*on_delivery|callback\s*=\s*on_delivery/]},
         typescript: {all: [/\bonDelivery\b/, /\.catch\(|\.then\([^\n]*,/]},
         go: {all: [/Completion:\s*func\(/]},
-        scala: {all: [/onCompletion\(/]},
         cpp: {all: [/dr_cb\(|DeliveryReportCb/]},
       },
     },
@@ -95,7 +91,6 @@ so every request produces one record on the **\`image-views\`** topic:
         python: {all: [/def shutdown(?:(?!\ndef )[\s\S])*?producer\.flush\(/]},
         typescript: {all: [/function shutdown(?:(?!\nexport )[\s\S])*?await Promise\.all\(/]},
         go: {all: [/func shutdown(?:(?!\n\})[\s\S])*?writer\.Close\(\)/]},
-        scala: {all: [/def shutdown(?:(?!\n {2}def )[\s\S])*?producer\.(flush|close)\(/]},
         cpp: {all: [/void shutdown(?:(?!\n\})[\s\S])*?producer->flush\(/]},
       },
     },
@@ -302,63 +297,6 @@ func shutdown() {
 	if err := writer.Close(); err != nil {
 		log.Printf("closing view writer: %v", err)
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-
-object ViewEvents {
-  val Topic = "image-views"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  props.put("linger.ms", "5")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  def emitView(id: String, width: Int, hit: Boolean): Unit = {
-    val value = s"""{"id":"$id","w":$width,"hit":$hit,"ts":\${System.currentTimeMillis() / 1000.0}}"""
-    // TODO: send a record keyed by id with a Callback that logs failures; do not block on the future
-  }
-
-  def shutdown(): Unit = {
-    // TODO: flush and close so buffered events reach the broker
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-
-object ViewEvents {
-  val Topic = "image-views"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  props.put("linger.ms", "5")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"view event not delivered: \${exception.getMessage}")
-  }
-
-  def emitView(id: String, width: Int, hit: Boolean): Unit = {
-    val value = s"""{"id":"$id","w":$width,"hit":$hit,"ts":\${System.currentTimeMillis() / 1000.0}}"""
-    val record = new ProducerRecord[String, String](Topic, id, value)
-    producer.send(record, onDelivery) // enqueues; the future is not awaited
-  }
-
-  def shutdown(): Unit = {
-    producer.flush()
-    producer.close()
-  }
 }
 `,
     },

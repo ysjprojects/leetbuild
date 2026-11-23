@@ -61,7 +61,7 @@ Do the gates in the handlers through one shared helper: this runtime does not ru
   },
   hints: [
     'Write one helper, `authorize(context, scope)`, and make it the first line of both handlers. Only after it passes does the handler read `request.id`.',
-    'Read the header from the call: Python `dict(context.invocation_metadata()).get("authorization", "")`, TypeScript `call.metadata.get(\'authorization\')[0]`, Go `metadata.FromIncomingContext(ctx)`, C++ `context->client_metadata().find("authorization")`, Scala a `ServerInterceptor` that copies the `Metadata.Key` into a `Context.Key`.',
+    'Read the header from the call: Python `dict(context.invocation_metadata()).get("authorization", "")`, TypeScript `call.metadata.get(\'authorization\')[0]`, Go `metadata.FromIncomingContext(ctx)` and C++ `context->client_metadata().find("authorization")`.',
     'Check the prefix before the lookup: `"Bearer "` exactly, then the rest is the token. A bare `reader-7f3a`, `Basic reader-7f3a` or the right value under another key are all UNAUTHENTICATED.',
   ],
   checks: [
@@ -74,7 +74,6 @@ Do the gates in the handlers through one shared helper: this runtime does not ru
         python: {all: [/class \w+\(\s*notes_pb2_grpc\.NotesServicer\s*\)/, /notes_pb2\.Note\(/, /NOTES\.get\(/]},
         typescript: {all: [/addService\(\s*[\w.]*Notes\.service\s*,/, /NOTES\.get\(/]},
         go: {all: [/pb\.UnimplementedNotesServer/, /&pb\.Note\{/]},
-        scala: {all: [/NotesGrpc\.Notes\b/, /Future\.successful\(\s*Note\(/]},
         cpp: {all: [/notes::v1::Notes::Service/, /reply->set_text\(/]},
       },
     },
@@ -91,7 +90,6 @@ Do the gates in the handlers through one shared helper: this runtime does not ru
           all: [/metadata\.get\(\s*['"]authorization['"]\s*\)/, /['"]Bearer ['"]/, /status\.UNAUTHENTICATED/],
         },
         go: {all: [/metadata\.FromIncomingContext\(/, /"authorization"/, /"Bearer "/, /codes\.Unauthenticated/]},
-        scala: {all: [/Metadata\.Key\.of\(\s*"authorization"/, /"Bearer "/, /Status\.UNAUTHENTICATED/]},
         cpp: {all: [/client_metadata\(\)/, /"authorization"/, /"Bearer "/, /StatusCode::UNAUTHENTICATED/]},
       },
     },
@@ -104,7 +102,6 @@ Do the gates in the handlers through one shared helper: this runtime does not ru
         python: {all: [/StatusCode\.PERMISSION_DENIED/, /["']notes\.write["']/]},
         typescript: {all: [/status\.PERMISSION_DENIED/, /['"]notes\.write['"]/]},
         go: {all: [/codes\.PermissionDenied/, /"notes\.write"/]},
-        scala: {all: [/Status\.PERMISSION_DENIED/, /"notes\.write"/]},
         cpp: {all: [/StatusCode::PERMISSION_DENIED/, /"notes\.write"/]},
       },
     },
@@ -117,7 +114,6 @@ Do the gates in the handlers through one shared helper: this runtime does not ru
         python: {order: [/StatusCode\.UNAUTHENTICATED/, /StatusCode\.INVALID_ARGUMENT/, /StatusCode\.NOT_FOUND/]},
         typescript: {order: [/status\.UNAUTHENTICATED/, /status\.INVALID_ARGUMENT/, /status\.NOT_FOUND/]},
         go: {order: [/codes\.Unauthenticated/, /codes\.InvalidArgument/, /codes\.NotFound/]},
-        scala: {order: [/Status\.UNAUTHENTICATED/, /Status\.INVALID_ARGUMENT/, /Status\.NOT_FOUND/]},
         cpp: {
           order: [/StatusCode::UNAUTHENTICATED/, /StatusCode::INVALID_ARGUMENT/, /StatusCode::NOT_FOUND/],
         },
@@ -132,7 +128,6 @@ Do the gates in the handlers through one shared helper: this runtime does not ru
         python: {all: [/NOTES\.pop\(|del NOTES\[/, /DeleteNoteResponse\(\s*deleted\s*=\s*True/]},
         typescript: {all: [/NOTES\.delete\(/, /deleted:\s*true/]},
         go: {all: [/delete\(\s*(s\.)?notes\s*,/, /&pb\.DeleteNoteResponse\{\s*Deleted:\s*true/]},
-        scala: {all: [/Notes\.remove\(/, /DeleteNoteResponse\(\s*(deleted\s*=\s*)?true/]},
         cpp: {all: [/notes_\.erase\(/, /set_deleted\(\s*true/]},
       },
     },
@@ -509,111 +504,6 @@ func main() {
 	srv := grpc.NewServer()
 	pb.RegisterNotesServer(srv, &notesServer{notes: map[string]string{}})
 	log.Fatal(srv.Serve(lis))
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ServerBuilder, Status}
-import notes.v1.notes.{DeleteNoteRequest, DeleteNoteResponse, GetNoteRequest, Note, NotesGrpc}
-import scala.collection.concurrent.TrieMap
-import scala.concurrent.{ExecutionContext, Future}
-
-object NotesServer extends NotesGrpc.Notes {
-  /** id -> text, seeded by whoever runs the server. */
-  val Notes = TrieMap.empty[String, String]
-
-  /** Bearer token -> the scopes it grants. */
-  val Tokens: Map[String, Set[String]] =
-    Map("reader-7f3a" -> Set("notes.read"), "admin-91c2" -> Set("notes.read", "notes.write"))
-
-  override def getNote(req: GetNoteRequest): Future[Note] = {
-    // TODO: a ServerInterceptor copies the authorization header into a Context.Key for the handlers
-    // TODO: it must be "Bearer <known token>", else Status.UNAUTHENTICATED; notes.read, else Status.PERMISSION_DENIED
-    // TODO: empty id -> Status.INVALID_ARGUMENT; unknown id -> Status.NOT_FOUND; else Note(id, text)
-    Future.failed(Status.UNIMPLEMENTED.asRuntimeException())
-  }
-
-  override def deleteNote(req: DeleteNoteRequest): Future[DeleteNoteResponse] = {
-    // TODO: the same authentication; the token needs notes.write
-    // TODO: empty id -> Status.INVALID_ARGUMENT; unknown id -> Status.NOT_FOUND; else remove it, deleted = true
-    Future.failed(Status.UNIMPLEMENTED.asRuntimeException())
-  }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder
-      .forPort(50051)
-      .addService(NotesGrpc.bindService(this, ExecutionContext.global))
-      .build()
-      .start()
-      .awaitTermination()
-}
-`,
-      solution: `import io.grpc.{Context, Contexts, Metadata, ServerBuilder, ServerCall, ServerCallHandler, ServerInterceptor, ServerInterceptors, Status}
-import notes.v1.notes.{DeleteNoteRequest, DeleteNoteResponse, GetNoteRequest, Note, NotesGrpc}
-import scala.collection.concurrent.TrieMap
-import scala.concurrent.{ExecutionContext, Future}
-
-object NotesServer extends NotesGrpc.Notes {
-  /** id -> text, seeded by whoever runs the server. */
-  val Notes = TrieMap.empty[String, String]
-
-  /** Bearer token -> the scopes it grants. */
-  val Tokens: Map[String, Set[String]] =
-    Map("reader-7f3a" -> Set("notes.read"), "admin-91c2" -> Set("notes.read", "notes.write"))
-
-  val Bearer = "Bearer "
-  val AuthorizationHeader: Metadata.Key[String] = Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER)
-  val Authorization: Context.Key[String] = Context.key("authorization")
-
-  /** ScalaPB handlers never see metadata: copy the header into the call's Context, where they read it. */
-  object CaptureAuthorization extends ServerInterceptor {
-    override def interceptCall[Req, Resp](
-        call: ServerCall[Req, Resp],
-        headers: Metadata,
-        next: ServerCallHandler[Req, Resp]): ServerCall.Listener[Req] =
-      Contexts.interceptCall(Context.current().withValue(Authorization, headers.get(AuthorizationHeader)), call, headers, next)
-  }
-
-  /** None when the caller holds \`scope\`; otherwise UNAUTHENTICATED or PERMISSION_DENIED. */
-  private def authorize(scope: String): Option[Status] = {
-    val header = Option(Authorization.get()).getOrElse("")
-    val scopes = if (header.startsWith(Bearer)) Tokens.get(header.stripPrefix(Bearer)) else None
-    scopes match {
-      case None => Some(Status.UNAUTHENTICATED.withDescription("missing or unknown bearer token"))
-      case Some(granted) if !granted.contains(scope) => Some(Status.PERMISSION_DENIED.withDescription(s"token lacks $scope"))
-      case Some(_) => None
-    }
-  }
-
-  override def getNote(req: GetNoteRequest): Future[Note] =
-    authorize("notes.read") match {
-      case Some(denied) => Future.failed(denied.asRuntimeException())
-      case None if req.id.isEmpty => Future.failed(Status.INVALID_ARGUMENT.withDescription("id is required").asRuntimeException())
-      case None =>
-        Notes.get(req.id) match {
-          case Some(text) => Future.successful(Note(id = req.id, text = text))
-          case None => Future.failed(Status.NOT_FOUND.withDescription(s"no note \${req.id}").asRuntimeException())
-        }
-    }
-
-  override def deleteNote(req: DeleteNoteRequest): Future[DeleteNoteResponse] =
-    authorize("notes.write") match {
-      case Some(denied) => Future.failed(denied.asRuntimeException())
-      case None if req.id.isEmpty => Future.failed(Status.INVALID_ARGUMENT.withDescription("id is required").asRuntimeException())
-      case None =>
-        Notes.remove(req.id) match {
-          case Some(_) => Future.successful(DeleteNoteResponse(deleted = true))
-          case None => Future.failed(Status.NOT_FOUND.withDescription(s"no note \${req.id}").asRuntimeException())
-        }
-    }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder
-      .forPort(50051)
-      .addService(ServerInterceptors.intercept(NotesGrpc.bindService(this, ExecutionContext.global), CaptureAuthorization))
-      .build()
-      .start()
-      .awaitTermination()
 }
 `,
     },

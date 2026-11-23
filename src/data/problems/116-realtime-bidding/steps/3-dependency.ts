@@ -52,7 +52,6 @@ as the service takes, an identity lookup is retried inside a 100 ms auction, the
         python: {all: [/timeout\s*=/, /\bmin\(/, /remaining_ms\(\)/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+/, /Math\.min\(/, /remainingMs\(\)/]},
         go: {all: [/context\.WithTimeout\(/, /RemainingMs\(\)/]},
-        scala: {all: [/withDeadlineAfter\(/, /\bmin\(/, /remainingMs/]},
         cpp: {all: [/set_deadline\(/, /remainingMs\(\)/]},
       },
     },
@@ -65,7 +64,6 @@ as the service takes, an identity lookup is retried inside a 100 ms auction, the
         python: {all: [/remaining_ms\(\)\s*<\s*MODEL_MIN_MS/]},
         typescript: {all: [/remainingMs\(\)\s*<\s*MODEL_MIN_MS/]},
         go: {all: [/RemainingMs\(\)\s*<\s*modelMinMs/]},
-        scala: {all: [/remainingMs\s*<\s*ModelMinMs/]},
         cpp: {all: [/remainingMs\(\)\s*<\s*kModelMinMs/]},
       },
     },
@@ -78,7 +76,6 @@ as the service takes, an identity lookup is retried inside a 100 ms auction, the
         python: {none: [/range\(\s*\d+\s*\)/, /\battempts?\b/]},
         typescript: {none: [/\battempts?\b/]},
         go: {none: [/\battempts?\b/]},
-        scala: {none: [/\battempts?\b/]},
         cpp: {none: [/\battempts?\b/]},
       },
     },
@@ -91,7 +88,6 @@ as the service takes, an identity lookup is retried inside a 100 ms auction, the
         python: {all: [/Quote\(\s*floor_cents\s*,\s*True/]},
         typescript: {all: [/bid_cents:\s*floorCents,\s*degraded:\s*true/]},
         go: {all: [/Quote\{\s*floorCents,\s*true/]},
-        scala: {all: [/Quote\(\s*floorCents\s*,\s*degraded\s*=\s*true/]},
         cpp: {all: [/\{\s*floor_cents\s*,\s*true/]},
       },
     },
@@ -450,87 +446,6 @@ func quoteBid(ctx context.Context, userHash, auctionID string, floorCents int64,
 		return Quote{floorCents, true, "model_unavailable"}
 	}
 	return Quote{score.GetValueCents(), false, ""}
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import rtb.Deadline // Deadline.start(budgetMs), deadline.remainingMs
-import rtbfeatures.realtime_bidding.{ContextFeatures, ContextRequest, FeaturesGrpc, IdentityFeatures, IdentityRequest, ScoreRequest, ScorerGrpc}
-
-object Client {
-  val IdentityMs = 30L
-  val ContextMs = 50L
-  val ModelMinMs = 20L
-
-  final case class Quote(bidCents: Long, degraded: Boolean, reason: String)
-
-  private val features = FeaturesGrpc.blockingStub(ManagedChannelBuilder.forAddress("features", 9000).usePlaintext().build())
-  private val scorer = ScorerGrpc.blockingStub(ManagedChannelBuilder.forAddress("scorer", 9000).usePlaintext().build())
-
-  /** The price to bid for this impression, inside what is left of the auction's budget. */
-  def quoteBid(userHash: String, auctionId: String, floorCents: Long, deadline: Deadline): Quote = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    var identity = IdentityFeatures()
-    var attempt = 0
-    while (attempt < 2) {
-      try {
-        identity = features.identity(IdentityRequest(userHash))
-        attempt = 2
-      } catch { case _: StatusRuntimeException => attempt += 1 }
-    }
-    val context =
-      try features.contextual(ContextRequest(auctionId))
-      catch { case _: StatusRuntimeException => ContextFeatures() }
-    val score = scorer.score(ScoreRequest(userHash, auctionId, identity.segment, context.category))
-    Quote(score.valueCents, degraded = false, "")
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import rtb.Deadline // Deadline.start(budgetMs), deadline.remainingMs
-import rtbfeatures.realtime_bidding.{ContextRequest, FeaturesGrpc, IdentityRequest, ScoreRequest, ScorerGrpc}
-
-object Client {
-  val IdentityMs = 30L
-  val ContextMs = 50L
-  val ModelMinMs = 20L
-
-  final case class Quote(bidCents: Long, degraded: Boolean, reason: String)
-
-  private val features = FeaturesGrpc.blockingStub(ManagedChannelBuilder.forAddress("features", 9000).usePlaintext().build())
-  private val scorer = ScorerGrpc.blockingStub(ManagedChannelBuilder.forAddress("scorer", 9000).usePlaintext().build())
-
-  /** A tier's budget: its own slice, or what is left of the auction when that is less. */
-  def tierMs(deadline: Deadline, sliceMs: Long): Long = math.min(sliceMs, deadline.remainingMs)
-
-  /** One call inside budgetMs, or None: no time left, a failure or a deadline. Never retried. */
-  private def ask[T](budgetMs: Long)(call: Long => T): Option[T] =
-    if (budgetMs <= 0) None
-    else
-      try Some(call(budgetMs))
-      catch { case _: StatusRuntimeException => None }
-
-  /** The price to bid for this impression, inside what is left of the auction's budget. */
-  def quoteBid(userHash: String, auctionId: String, floorCents: Long, deadline: Deadline): Quote =
-    ask(tierMs(deadline, IdentityMs))(ms => features.withDeadlineAfter(ms, TimeUnit.MILLISECONDS).identity(IdentityRequest(userHash))) match {
-      case None => Quote(floorCents, degraded = true, "identity_unavailable")
-      case Some(identity) =>
-        ask(tierMs(deadline, ContextMs))(ms => features.withDeadlineAfter(ms, TimeUnit.MILLISECONDS).contextual(ContextRequest(auctionId))) match {
-          case None => Quote(floorCents, degraded = true, "context_unavailable")
-          case Some(_) if deadline.remainingMs < ModelMinMs => Quote(floorCents, degraded = true, "model_skipped")
-          case Some(context) =>
-            val request = ScoreRequest(userHash, auctionId, identity.segment, context.category)
-            ask(deadline.remainingMs)(ms => scorer.withDeadlineAfter(ms, TimeUnit.MILLISECONDS).score(request)) match {
-              case None => Quote(floorCents, degraded = true, "model_unavailable")
-              case Some(score) => Quote(score.valueCents, degraded = false, "")
-            }
-        }
-    }
 }
 `,
     },

@@ -50,7 +50,6 @@ a client retry that pays the model server twice.
         python: {all: [/@app\.post\(\s*["']\/v1\/embeddings["']/, /embed\(text/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/embeddings['"]/, /embed\(text/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/embeddings"/, /embed\(r\.Context\(\)/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"embeddings"\s*\)/, /ModelClient\.embed\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/embeddings"/, /embed\(text/]},
       },
     },
@@ -62,7 +61,6 @@ a client retry that pays the model server twice.
         python: {all: [/x-tenant-id/i, /\b401\b/]},
         typescript: {all: [/x-tenant-id/i, /code\(\s*401\s*\)/]},
         go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/X-Tenant-Id/i, /StatusCodes\.Unauthorized/]},
         cpp: {all: [/X-Tenant-Id/i, /\b401\b/]},
       },
     },
@@ -75,7 +73,6 @@ a client retry that pays the model server twice.
         python: {all: [/MAX_BATCH_INPUTS\s*=\s*256\b/, /\b400\b/]},
         typescript: {all: [/MAX_BATCH_INPUTS\s*=\s*256\b/, /code\(\s*400\s*\)/]},
         go: {all: [/maxBatchInputs\s*=\s*256\b/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/MaxBatchInputs\s*=\s*256\b/, /StatusCodes\.BadRequest/]},
         cpp: {all: [/kMaxBatchInputs\s*=\s*256\b/, /\b400\b/]},
       },
     },
@@ -91,7 +88,6 @@ a client retry that pays the model server twice.
           none: [/slice\(\s*0\s*,\s*MAX_INPUT_BYTES\s*\)/],
         },
         go: {all: [/StatusRequestEntityTooLarge|\b413\b/], none: [/\[\s*:\s*maxInputBytes\s*\]/]},
-        scala: {all: [/PayloadTooLarge|RequestEntityTooLarge/, /getBytes\(/], none: [/\.take\(\s*MaxInputBytes\s*\)/]},
         cpp: {all: [/\b413\b/], none: [/substr\(\s*0\s*,\s*kMaxInputBytes\s*\)/]},
       },
     },
@@ -104,7 +100,6 @@ a client retry that pays the model server twice.
         python: {all: [/idempotency-key/i, /replays\.put\(/], order: [/replays\.get\(/, /embed\(text/]},
         typescript: {all: [/idempotency-key/i, /replays\.put\(/], order: [/replays\.get\(/, /embed\(text/]},
         go: {all: [/Idempotency-Key/i, /replays\.Put\(/], order: [/replays\.Get\(/, /embed\(r\.Context\(\)/]},
-        scala: {all: [/Idempotency-Key/i, /Replays\.put\(/], order: [/Replays\.get\(/, /ModelClient\.embed\(/]},
         cpp: {all: [/Idempotency-Key/i, /replays::put\(/], order: [/replays::get\(/, /embed\(text/]},
       },
     },
@@ -414,101 +409,6 @@ func createEmbeddings(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/embeddings", createEmbeddings)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import embedding.Config // Config.ModelVersion, contentHash — provided
-
-object EmbeddingsApi {
-  val MaxInputBytes = 8192
-
-  private def vectorJson(vector: Seq[Float]): ujson.Value = ujson.Arr.from(vector.map(v => ujson.Num(v.toDouble)))
-
-  def handle(tenant: String, raw: String): HttpResponse = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val inputs = ujson.read(raw)("inputs").arr.map(_.str.take(MaxInputBytes)).toSeq
-    val vectors = inputs.map(text => ModelClient.embed(text, Config.ModelVersion))
-    System.err.println(s"embedded tenant=$tenant model=\${Config.ModelVersion} inputs=\${inputs.size}")
-    val body = ujson.Obj(
-      "model_version" -> Config.ModelVersion,
-      "dimension" -> (if (vectors.isEmpty) 0 else vectors.head.size),
-      "content_hashes" -> ujson.Arr.from(inputs.map(Config.contentHash)),
-      "vectors" -> ujson.Arr.from(vectors.map(vectorJson))
-    )
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
-  }
-
-  val route: Route = path("v1" / "embeddings") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        entity(as[String]) { raw =>
-          complete(handle(tenant.getOrElse(""), raw))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import embedding.{Config, Replays} // Config.ModelVersion, contentHash; Replays.get, put — provided
-
-object EmbeddingsApi {
-  val MaxBatchInputs = 256
-  val MaxInputBytes = 8192
-
-  private def json(status: StatusCode, body: String): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body))
-
-  private def vectorJson(vector: Seq[Float]): ujson.Value = ujson.Arr.from(vector.map(v => ujson.Num(v.toDouble)))
-
-  def handle(tenant: String, idemKey: String, raw: String): HttpResponse = {
-    if (tenant.isEmpty) return json(StatusCodes.Unauthorized, ujson.write(ujson.Obj("error" -> "missing_tenant")))
-    if (idemKey.isEmpty) return json(StatusCodes.BadRequest, ujson.write(ujson.Obj("error" -> "missing_idempotency_key")))
-    val inputs = ujson.read(raw)("inputs").arr.map(_.str).toSeq
-    if (inputs.isEmpty || inputs.size > MaxBatchInputs)
-      return json(StatusCodes.BadRequest, ujson.write(ujson.Obj("error" -> "batch_size", "max" -> MaxBatchInputs)))
-    val tooLarge = inputs.indexWhere(_.getBytes(UTF_8).length > MaxInputBytes)
-    if (tooLarge >= 0)
-      return json(StatusCodes.PayloadTooLarge, ujson.write(ujson.Obj("error" -> "input_too_large", "index" -> tooLarge, "max_bytes" -> MaxInputBytes)))
-    Replays.get(tenant, idemKey) match {
-      case Some(recorded) => json(StatusCodes.OK, recorded) // a retry gets what the first attempt got, at no model cost
-      case None =>
-        val vectors = inputs.map(text => ModelClient.embed(text, Config.ModelVersion))
-        val body = ujson.write(
-          ujson.Obj(
-            "model_version" -> Config.ModelVersion,
-            "dimension" -> vectors.head.size,
-            "content_hashes" -> ujson.Arr.from(inputs.map(Config.contentHash)),
-            "vectors" -> ujson.Arr.from(vectors.map(vectorJson))
-          )
-        )
-        Replays.put(tenant, idemKey, body)
-        System.err.println(s"embedded tenant=$tenant model=\${Config.ModelVersion} inputs=\${inputs.size}")
-        json(StatusCodes.OK, body)
-    }
-  }
-
-  val route: Route = path("v1" / "embeddings") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        optionalHeaderValueByName("Idempotency-Key") { idemKey =>
-          entity(as[String]) { raw =>
-            complete(handle(tenant.getOrElse(""), idemKey.getOrElse(""), raw))
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

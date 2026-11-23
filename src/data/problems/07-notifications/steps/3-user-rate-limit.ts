@@ -54,7 +54,6 @@ set, that the delivery worker consults before sending.
             /\.ZAdd\(\s*ctx\s*,\s*\w+\s*,\s*redis\.Z\{\s*Score:\s*float64\(\s*nowMs\s*\)\s*,\s*Member:\s*notificationID\s*\}\s*\)/,
           ],
         },
-        scala: {all: [/s"rl:\$/, /\.zadd\(\s*\w+\s*,\s*nowMs(\.toDouble)?\s*,\s*notificationId\s*\)/]},
         cpp: {all: [/"rl:"\s*\+/, /\.zadd\(\s*\w+\s*,\s*notification_id\s*,\s*[^,\n]*now_ms[^,\n]*\)/]},
       },
     },
@@ -71,9 +70,6 @@ set, that the delivery worker consults before sending.
           all: [/\.zremrangebyscore\(\s*\w+\s*,\s*['"]-inf['"]\s*,\s*nowMs\s*-\s*(WINDOW_MS|3_?600_?000)\s*\)/],
         },
         go: {all: [/\.ZRemRangeByScore\(\s*ctx\s*,\s*\w+\s*,\s*"-inf"\s*,[^\n]*nowMs\s*-\s*windowMs/]},
-        scala: {
-          all: [/\.zremrangeByScore\(\s*\w+\s*,\s*("-inf"|Double\.NegativeInfinity)\s*,[^\n]*nowMs\s*-\s*WindowMs/],
-        },
         cpp: {all: [/\.zremrangebyscore\(\s*\w+\s*,[^\n]*RightBoundedInterval<double>\(\s*now_ms\s*-\s*kWindowMs/]},
       },
     },
@@ -106,14 +102,6 @@ set, that the delivery worker consults before sending.
             /\.Expire\(\s*ctx\s*,\s*\w+\s*,\s*(window|time\.Hour)\s*\)/,
           ],
         },
-        scala: {
-          all: [
-            /jedis\.(pipelined|multi)\(\)/,
-            /\.zcard\(\s*\w+\s*\)/,
-            /\.expire\(\s*\w+\s*,\s*(WindowSeconds|3600L?)\s*\)/,
-            /\.(sync|exec)\(\)/,
-          ],
-        },
         cpp: {
           all: [
             /redis\.(transaction|pipeline)\(/,
@@ -142,7 +130,6 @@ set, that the delivery worker consults before sending.
             /return false/,
           ],
         },
-        scala: {all: [/[\w.()]+\s*>\s*(Limit|20)\b/, /\.incr\(\s*s"dropped:\$/, /\bfalse\b/]},
         cpp: {all: [/[\w.()]+\s*>\s*(kLimit|20)\b/, /\.incr\(\s*"dropped:"\s*\+/, /return false/]},
       },
     },
@@ -308,53 +295,6 @@ func allowed(ctx context.Context, userID, notificationID string) (bool, error) {
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-object RateLimit {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Limit = 20 // notifications per user per hour
-  val WindowMs = 3600000L
-  val WindowSeconds = 3600L
-
-  /** True when this notification fits the user's hourly budget; false → the worker skips delivery. */
-  def allowed(userId: String, notificationId: String): Boolean = {
-    val nowMs = System.currentTimeMillis()
-    val key = s"rl:$userId"
-    // TODO: one pipeline: zadd key nowMs notificationId · zremrangeByScore key "-inf" nowMs-WindowMs · zcard key · expire key WindowSeconds
-    // TODO: count > Limit → incr dropped:{user}, false
-    ???
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-object RateLimit {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Limit = 20 // notifications per user per hour
-  val WindowMs = 3600000L
-  val WindowSeconds = 3600L
-
-  /** True when this notification fits the user's hourly budget; false → the worker skips delivery. */
-  def allowed(userId: String, notificationId: String): Boolean = {
-    val nowMs = System.currentTimeMillis()
-    val key = s"rl:$userId"
-    val pipe = jedis.pipelined()
-    pipe.zadd(key, nowMs.toDouble, notificationId)
-    pipe.zremrangeByScore(key, "-inf", (nowMs - WindowMs).toString)
-    val count = pipe.zcard(key)
-    pipe.expire(key, WindowSeconds)
-    pipe.sync()
-    if (count.get() > Limit) {
-      jedis.incr(s"dropped:$userId")
-      false
-    } else true
-  }
 }
 `,
     },

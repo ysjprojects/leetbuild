@@ -61,7 +61,6 @@ with no lines is issued with a number and a total of 0; a client that retries it
         python: {all: [/@app\.post\(\s*["']\/v1\/invoices["']/, /@app\.patch\(/, /\/finalize["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/invoices['"]/, /app\.patch\(/, /\/finalize['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/invoices"/, /"PATCH \/v1\/invoices\/\{/, /\/finalize"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"invoices"\s*\)/, /\bpatch\s*\{/, /"finalize"/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/invoices"/, /svr\.Patch\(/, /\/finalize/]},
       },
     },
@@ -74,7 +73,6 @@ with no lines is issued with a number and a total of 0; a client that retries it
         python: {all: [/def edit_invoice\((?:(?!\n@app)[\s\S])*?\b409\b/]},
         typescript: {all: [/app\.patch\((?:(?!\napp\.)[\s\S])*?\b409\b/]},
         go: {all: [/func editInvoice\((?:(?!\n\}\n)[\s\S])*?(?:StatusConflict|\b409\b)/]},
-        scala: {all: [/\bpatch\s*\{(?:(?!\bpost\s*\{)[\s\S])*?(?:Conflict|\b409\b)/]},
         cpp: {all: [/void edit_invoice\((?:(?!\n\}\n)[\s\S])*?\b409\b/]},
       },
     },
@@ -87,7 +85,6 @@ with no lines is issued with a number and a total of 0; a client that retries it
         python: {order: [/\b422\b/, /sequence\.claim_number\(/]},
         typescript: {order: [/\b422\b/, /claimNumber\(/]},
         go: {order: [/StatusUnprocessableEntity|\b422\b/, /sequence\.ClaimNumber\(/]},
-        scala: {order: [/UnprocessableEntity|\b422\b/, /Sequence\.claimNumber\(/]},
         cpp: {order: [/\b422\b/, /sequence::claimNumber\(/]},
       },
     },
@@ -109,10 +106,6 @@ with no lines is issued with a number and a total of 0; a client that retries it
           all: [/Idempotency-Key/i, /store\.FinalizeResult\(/, /store\.RecordFinalize\(/, /StatusBadRequest|\b400\b/],
           order: [/store\.FinalizeResult\(/, /sequence\.ClaimNumber\(/],
         },
-        scala: {
-          all: [/Idempotency-Key/i, /Store\.finalizeResult\(/, /Store\.recordFinalize\(/, /BadRequest|\b400\b/],
-          order: [/Store\.finalizeResult\(/, /Sequence\.claimNumber\(/],
-        },
         cpp: {
           all: [/Idempotency-Key/i, /store::finalizeResult\(/, /store::recordFinalize\(/, /\b400\b/],
           order: [/store::finalizeResult\(/, /sequence::claimNumber\(/],
@@ -128,7 +121,6 @@ with no lines is issued with a number and a total of 0; a client that retries it
         python: {all: [/CURRENCIES/, /MAX_LINES/, /MAX_QUANTITY/, /MAX_UNIT_PRICE_CENTS/, /\b400\b/]},
         typescript: {all: [/CURRENCIES/, /MAX_LINES/, /MAX_QUANTITY/, /MAX_UNIT_PRICE_CENTS/, /\b400\b/]},
         go: {all: [/currencies/, /maxLines/, /maxQuantity/, /maxUnitPriceCents/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/Currencies/, /MaxLines/, /MaxQuantity/, /MaxUnitPriceCents/, /BadRequest|\b400\b/]},
         cpp: {all: [/kCurrencies/, /kMaxLines/, /kMaxQuantity/, /kMaxUnitPriceCents/, /\b400\b/]},
       },
     },
@@ -698,178 +690,6 @@ func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/invoices", createInvoice)
 	mux.HandleFunc("PATCH /v1/invoices/{id}", editInvoice)
 	mux.HandleFunc("POST /v1/invoices/{id}/finalize", finalizeInvoice)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import invoice.{Sequence, Store} // Store.create, get, replaceLines, finalizeResult, recordFinalize; Sequence.claimNumber
-
-object Api {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def summary(invoice: Store.Invoice): JsObject = JsObject(
-    "id" -> JsString(invoice.id),
-    "status" -> JsString(invoice.status),
-    "number" -> invoice.number.map(JsNumber(_)).getOrElse(JsNull),
-    "currency" -> JsString(invoice.currency),
-    "subtotal_cents" -> JsNumber(invoice.subtotalCents))
-
-  private def text(body: JsObject, name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  private def lines(body: JsObject): Seq[Store.Line] =
-    body.fields.get("line_items").collect { case JsArray(items) => items.map(Store.lineOf) }.getOrElse(Seq.empty)
-
-  val route: Route = optionalHeaderValueByName("X-Tenant-Id") {
-    case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-    case Some(tenant) =>
-      concat(
-        path("v1" / "invoices") {
-          post {
-            entity(as[String]) { raw =>
-              // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-              val body = raw.parseJson.asJsObject
-              val created = Store.create(tenant, text(body, "currency"), lines(body), text(body, "customer_id"), text(body, "jurisdiction"), text(body, "internal_notes"))
-              complete(json(StatusCodes.Created, summary(created)))
-            }
-          }
-        },
-        path("v1" / "invoices" / Segment) { invoiceId =>
-          patch {
-            entity(as[String]) { raw =>
-              Store.get(invoiceId).filter(_.tenantId == tenant) match {
-                case None => complete(error(StatusCodes.NotFound, "no such invoice"))
-                case Some(_) => complete(json(StatusCodes.OK, summary(Store.replaceLines(invoiceId, lines(raw.parseJson.asJsObject)))))
-              }
-            }
-          }
-        },
-        path("v1" / "invoices" / Segment / "finalize") { invoiceId =>
-          post {
-            Store.get(invoiceId).filter(_.tenantId == tenant) match {
-              case None => complete(error(StatusCodes.NotFound, "no such invoice"))
-              case Some(found) if found.status != "draft" || Sequence.claimNumber(tenant, invoiceId).isEmpty =>
-                complete(error(StatusCodes.Conflict, "the invoice is already finalized"))
-              case Some(_) => complete(json(StatusCodes.OK, summary(Store.get(invoiceId).get)))
-            }
-          }
-        },
-      )
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import invoice.{Sequence, Store} // Store.create, get, replaceLines, finalizeResult, recordFinalize; Sequence.claimNumber
-
-object Api {
-  val Currencies: Set[String] = Set("usd", "eur", "gbp")
-  val MaxLines = 100
-  val MaxDescription = 120
-  val MaxQuantity = 1000L
-  val MaxUnitPriceCents = 10000000L
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def summary(invoice: Store.Invoice): JsObject = JsObject(
-    "id" -> JsString(invoice.id),
-    "status" -> JsString(invoice.status),
-    "number" -> invoice.number.map(JsNumber(_)).getOrElse(JsNull),
-    "currency" -> JsString(invoice.currency),
-    "subtotal_cents" -> JsNumber(invoice.subtotalCents))
-
-  private def text(body: JsObject, name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  private def lines(body: JsObject): Seq[Store.Line] =
-    body.fields.get("line_items").collect { case JsArray(items) => items.map(Store.lineOf) }.getOrElse(Seq.empty)
-
-  /** Why the line items are refused, if they are. */
-  private def invalidLines(lines: Seq[Store.Line]): Option[String] =
-    if (lines.size > MaxLines) Some(s"at most $MaxLines line items")
-    else
-      lines.collectFirst {
-        case line if line.description.isEmpty || line.description.codePointCount(0, line.description.length) > MaxDescription =>
-          s"a description is 1 to $MaxDescription characters"
-        case line if line.quantity < 1 || line.quantity > MaxQuantity => s"quantity must be 1 to $MaxQuantity"
-        case line if line.unitPriceCents < 0 || line.unitPriceCents > MaxUnitPriceCents => s"unit_price_cents must be 0 to $MaxUnitPriceCents"
-      }
-
-  private def finalize(tenant: String, invoiceId: String, key: String): HttpResponse =
-    Store.finalizeResult(tenant, key) match {
-      case Some(recorded) => json(StatusCodes.OK, recorded) // a replay answers what the first attempt answered
-      case None =>
-        Store.get(invoiceId).filter(_.tenantId == tenant) match {
-          case None => error(StatusCodes.NotFound, "no such invoice")
-          case Some(found) if found.status != "draft" => error(StatusCodes.Conflict, "the invoice is already finalized")
-          case Some(found) if found.lineItems.isEmpty => error(StatusCodes.UnprocessableEntity, "an invoice with no line items cannot be finalized")
-          case Some(_) =>
-            Sequence.claimNumber(tenant, invoiceId) match {
-              case None => error(StatusCodes.Conflict, "the invoice is already finalized")
-              case Some(_) =>
-                val result = summary(Store.get(invoiceId).get)
-                Store.recordFinalize(tenant, key, result)
-                json(StatusCodes.OK, result)
-            }
-        }
-    }
-
-  val route: Route = optionalHeaderValueByName("X-Tenant-Id") {
-    case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-    case Some(tenant) =>
-      concat(
-        path("v1" / "invoices") {
-          post {
-            entity(as[String]) { raw =>
-              val body = raw.parseJson.asJsObject
-              val items = lines(body)
-              if (!Currencies.contains(text(body, "currency"))) complete(error(StatusCodes.BadRequest, "currency must be one of usd, eur, gbp"))
-              else
-                invalidLines(items) match {
-                  case Some(invalid) => complete(error(StatusCodes.BadRequest, invalid))
-                  case None =>
-                    val created = Store.create(tenant, text(body, "currency"), items, text(body, "customer_id"), text(body, "jurisdiction"), text(body, "internal_notes"))
-                    complete(json(StatusCodes.Created, summary(created)))
-                }
-            }
-          }
-        },
-        path("v1" / "invoices" / Segment) { invoiceId =>
-          patch {
-            entity(as[String]) { raw =>
-              val items = lines(raw.parseJson.asJsObject)
-              Store.get(invoiceId).filter(_.tenantId == tenant) match {
-                case None => complete(error(StatusCodes.NotFound, "no such invoice"))
-                case Some(_) if invalidLines(items).isDefined => complete(error(StatusCodes.BadRequest, invalidLines(items).get))
-                // The store writes whatever the status: an issued document is refused here.
-                case Some(found) if found.status != "draft" => complete(error(StatusCodes.Conflict, "a finalized invoice cannot be edited"))
-                case Some(_) => complete(json(StatusCodes.OK, summary(Store.replaceLines(invoiceId, items))))
-              }
-            }
-          }
-        },
-        path("v1" / "invoices" / Segment / "finalize") { invoiceId =>
-          post {
-            optionalHeaderValueByName("Idempotency-Key") {
-              case None | Some("") => complete(error(StatusCodes.BadRequest, "Idempotency-Key is required"))
-              case Some(key) => complete(finalize(tenant, invoiceId, key))
-            }
-          }
-        },
-      )
-  }
 }
 `,
     },

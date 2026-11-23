@@ -2,7 +2,7 @@
   "name": "leetbuild",
   "version": "1.0.0",
   "private": true,
-  "description": "LeetCode for systems: build an image cache, a match engine, a news feed… step by step in Python, TypeScript, Go, Scala or C++ across HTTPS, gRPC, Kafka and Redis.",
+  "description": "LeetCode for systems: build an image cache, a match engine, a news feed… step by step in Python, TypeScript, Go or C++ across HTTPS, gRPC, Kafka and Redis.",
   "engines": {
     "node": ">=24"
   },
@@ -14,7 +14,6 @@
     "format": "prettier --write './src/**/*.{ts,tsx,scss}' './scripts/**/*.ts' && eslint './src/**/*.{ts,tsx}' './scripts/**/*.ts' --fix --max-warnings=0",
     "lint": "prettier --check './src/**/*.{ts,tsx,scss}' './scripts/**/*.ts' && eslint './src/**/*.{ts,tsx}' './scripts/**/*.ts' --max-warnings=0",
     "verify": "tsx scripts/verify.ts",
-    "check:scala": "tsx scripts/check-scala.ts",
     "protogen": "tsx scripts/protogen.ts",
     "build:runtime": "tsx scripts/build-runtime.ts",
     "build:go": "tsx scripts/build-go.ts",

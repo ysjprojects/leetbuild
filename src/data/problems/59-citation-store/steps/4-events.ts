@@ -59,10 +59,6 @@ leader failover loses one; a broker that rejects or ignores the produce drops th
         python: {all: [/key\s*=\s*result\[["']document_id["']\]/], none: [/key\s*=\s*result\[["']answer_id["']\]/]},
         typescript: {all: [/key:\s*result\.document_id/], none: [/key:\s*result\.answer_id/]},
         go: {all: [/Key:\s*\[\]byte\(\s*result\.DocumentID\s*\)/], none: [/Key:\s*\[\]byte\(\s*result\.AnswerID\s*\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(\s*Topic\s*,\s*result\.documentId/],
-          none: [/Topic\s*,\s*result\.answerId/],
-        },
         cpp: {
           all: [/result\.document_id\.c_str\(\)\s*,\s*result\.document_id\.(size|length)\(\)/],
           none: [/result\.answer_id\.c_str\(\)/],
@@ -78,7 +74,6 @@ leader failover loses one; a broker that rejects or ignores the produce drops th
         python: {all: [/["']status["']\s*:\s*result\[["']status["']\]/], none: [/result\[["']status["']\]\s*!=/]},
         typescript: {all: [/status:\s*result\.status/], none: [/result\.status\s*!==?/]},
         go: {all: [/"status":\s*result\.Status/], none: [/result\.Status\s*!=/]},
-        scala: {all: [/"status"\s*->\s*JsString\(result\.status\)/], none: [/result\.status\s*!=/]},
         cpp: {all: [/\{"status",\s*result\.status\}/], none: [/result\.status\s*!=/]},
       },
     },
@@ -91,7 +86,6 @@ leader failover loses one; a broker that rejects or ignores the produce drops th
         python: {order: [/store\.set_verification\(/, /producer\.produce\(/]},
         typescript: {order: [/await setVerification\(/, /producer\.send\(/]},
         go: {order: [/store\.SetVerification\(/, /producer\.Produce\(/]},
-        scala: {order: [/Store\.setVerification\(/, /producer\.send\(/]},
         cpp: {order: [/store::setVerification\(/, /producer->produce\(/]},
       },
     },
@@ -104,7 +98,6 @@ leader failover loses one; a broker that rejects or ignores the produce drops th
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -117,7 +110,6 @@ leader failover loses one; a broker that rejects or ignores the produce drops th
         python: {all: [/store\.insert_outbox\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/store\.InsertOutbox\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Store\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/, /Failure|catch|isFailure/]},
         cpp: {all: [/store::insertOutbox\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -422,100 +414,6 @@ func publishVerification(ctx context.Context, result store.Citation) (bool, erro
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import citations.Store // Store.setVerification, Store.insertOutbox
-
-object Events {
-  val Topic = "citation.event"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What the lineage consumer needs: which citation, where it points now, and what the verifier found. */
-  def eventPayload(result: Store.Citation): JsObject =
-    JsObject(
-      "citation_id" -> JsString(result.id),
-      "tenant" -> JsString(result.tenant),
-      "document_id" -> JsString(result.documentId),
-      "version" -> JsNumber(result.version),
-      "start" -> JsNumber(result.start),
-      "end" -> JsNumber(result.end),
-      "status" -> JsString(result.status),
-      "reason" -> JsString(result.reason)
-    )
-
-  /** Record what the verifier found and tell the lineage consumer; true when the event is on its way. */
-  def publishVerification(result: Store.Citation): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    if (result.status != "verified") return true // only verified citations are news for the lineage
-    producer.send(new ProducerRecord[String, String](Topic, result.answerId, eventPayload(result).compactPrint))
-    Store.setVerification(result)
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import citations.Store // Store.setVerification, Store.insertOutbox
-
-object Events {
-  val Topic = "citation.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What the lineage consumer needs: which citation, where it points now, and what the verifier found. */
-  def eventPayload(result: Store.Citation): JsObject =
-    JsObject(
-      "citation_id" -> JsString(result.id),
-      "tenant" -> JsString(result.tenant),
-      "document_id" -> JsString(result.documentId),
-      "version" -> JsNumber(result.version),
-      "start" -> JsNumber(result.start),
-      "end" -> JsNumber(result.end),
-      "status" -> JsString(result.status),
-      "reason" -> JsString(result.reason)
-    )
-
-  /** Commit what the verifier found, then tell the lineage consumer; true once the broker acknowledged the event. */
-  def publishVerification(result: Store.Citation): Boolean = {
-    // The store holds the status before any event announces it.
-    Store.setVerification(result)
-    val payload = eventPayload(result)
-    val record = new ProducerRecord[String, String](Topic, result.documentId, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so the lineage is late, not wrong.
-      Store.insertOutbox(Topic, result.documentId, payload)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

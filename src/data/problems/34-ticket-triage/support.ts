@@ -3,10 +3,9 @@
  * package. `triage.rules` is the versioned keyword ruleset (step 1's decision, step 3's fallback);
  * `triage.store` is the routing store in Redis: ticket ids, the answers recorded per
  * Idempotency-Key, the routing records the consumer writes and the summary reads, the queue
- * registry and the outbox. The five languages keep the same keys, so a harness reads one layout
+ * registry and the outbox. The four languages keep the same keys, so a harness reads one layout
  * whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 const STORE_DOC = `The routing store (provided), in Redis. ticket:seq numbers tickets (t-1, t-2, ...);
 idem:{tenant}:{key} holds the routing a POST answered for an Idempotency-Key (kept a day);
@@ -630,113 +629,5 @@ inline std::optional<Queue> queue(const std::string& queue_id) {
 inline void insertOutbox(const std::string& event) { redis().rpush(kOutbox, event); }
 
 }  // namespace store
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('triage', 'Rules')]: `package triage
-
-/**
-${block(RULES_DOC, ' * ')}
- */
-object Rules {
-  /** Where a ticket goes and why: fallbackReason is "" unless the rules stood in for the classifier, rulesetVersion "" when the classifier decided. */
-  final case class Decision(queue: String, priority: String, confidence: Double, fallbackReason: String, rulesetVersion: String)
-
-  val RulesetVersion = "v3"
-  val RuleConfidence = 0.5
-  val Queues: Seq[String] = Seq("billing", "delivery", "account", "general")
-
-  private val Keywords: Seq[(String, Seq[String])] = Seq(
-    "billing" -> Seq("invoice", "refund", "charge", "payment"),
-    "delivery" -> Seq("shipment", "delivery", "tracking", "parcel"),
-    "account" -> Seq("password", "login", "locked", "sign-in"),
-  )
-  private val Urgent = Seq("outage", "breach", "data loss")
-
-  /** The ruleset's decision for a ticket. */
-  def ruleDecision(text: String): Decision = {
-    val lowered = text.toLowerCase
-    val queue = Keywords.collectFirst { case (name, words) if words.exists(lowered.contains) => name }.getOrElse("general")
-    val priority = if (Urgent.exists(lowered.contains)) "urgent" else "normal"
-    Decision(queue, priority, RuleConfidence, "", RulesetVersion)
-  }
-}
-`,
-  [scalaPath('triage', 'Store')]: `package triage
-
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
-${block(STORE_DOC, ' * ')}
- */
-object Store {
-  /** A routed ticket's record. */
-  final case class Routing(ticketId: String, tenant: String, queue: String, priority: String, confidence: Double, fallbackReason: String, receivedAt: Long, status: String)
-  /** A tenant's queue. */
-  final case class Queue(queueId: String, tenant: String, name: String)
-
-  val Outbox = "outbox:triage.decided"
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** A fresh ticket id: t-1, t-2, ... */
-  def newTicketId(): String = s"t-\${jedis.incr("ticket:seq")}"
-
-  /** The routing a POST answered for (tenant, Idempotency-Key), if any. */
-  def decisionForKey(tenant: String, key: String): Option[JsObject] =
-    Option(jedis.get(s"idem:$tenant:$key")).map(_.parseJson.asJsObject)
-
-  /** Record what a POST answered for (tenant, Idempotency-Key), for its replays. */
-  def saveDecision(tenant: String, key: String, routing: JsObject): Unit =
-    jedis.set(s"idem:$tenant:$key", routing.compactPrint, SetParams.setParams().ex(86400L))
-
-  private def text(v: JsValue): String = v match {
-    case JsString(s) => s
-    case other => other.compactPrint
-  }
-
-  /** Record a routed ticket (a triage.decided event) in its queue; a redelivery rewrites the same record and leaves its status alone. */
-  def recordRouting(event: JsObject): Unit = {
-    val f = event.fields
-    val tenant = text(f("tenant"))
-    val ticketId = text(f("ticket_id"))
-    val key = s"routing:$tenant:$ticketId"
-    val names = Seq("ticket_id", "tenant", "queue", "priority", "confidence", "fallback_reason", "received_at")
-    jedis.hset(key, names.map(name => name -> text(f(name))).toMap.asJava)
-    jedis.hsetnx(key, "status", "open")
-    jedis.sadd(s"routing:$tenant:queue:\${text(f("queue"))}", ticketId)
-  }
-
-  /** Every routing record of the tenant's queue, open and closed, oldest first. */
-  def routingRecords(tenant: String, queue: String): Seq[Routing] =
-    jedis.smembers(s"routing:$tenant:queue:$queue").asScala.toSeq.map { id =>
-      val raw = jedis.hgetAll(s"routing:$tenant:$id").asScala
-      Routing(raw("ticket_id"), raw("tenant"), raw("queue"), raw("priority"), raw("confidence").toDouble,
-        raw.getOrElse("fallback_reason", ""), raw("received_at").toDouble.toLong, raw.getOrElse("status", "open"))
-    }.sortBy(r => (r.receivedAt, r.ticketId))
-
-  /** An agent resolved the ticket: its record stays, closed. */
-  def closeTicket(tenant: String, ticketId: String): Unit = jedis.hset(s"routing:$tenant:$ticketId", "status", "closed")
-
-  /** Register the tenant's queue name; returns its id (q-1, q-2, ...). */
-  def createQueue(tenant: String, name: String): String = {
-    val queueId = s"q-\${jedis.incr("queue:seq")}"
-    jedis.hset(s"queue:$queueId", Map("queue_id" -> queueId, "tenant" -> tenant, "name" -> name).asJava)
-    queueId
-  }
-
-  /** The queue with that id, if any. */
-  def queue(queueId: String): Option[Queue] = {
-    val raw = jedis.hgetAll(s"queue:$queueId").asScala
-    if (raw.isEmpty) None else Some(Queue(raw("queue_id"), raw("tenant"), raw("name")))
-  }
-
-  /** Keep an event the broker refused (its JSON), for the relay to republish. */
-  def insertOutbox(event: String): Unit = jedis.rpush(Outbox, event)
-}
 `,
 };

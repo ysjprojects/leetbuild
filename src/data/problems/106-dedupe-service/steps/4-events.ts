@@ -49,7 +49,6 @@ does not acknowledge the event drops it with the call reporting success.
         python: {all: [/dedupe\.event/, /producer\.produce\(/]},
         typescript: {all: [/dedupe\.event/, /producer\.send\(/]},
         go: {all: [/dedupe\.event/, /producer\.Produce\(/]},
-        scala: {all: [/dedupe\.event/, /producer\.send\(/]},
         cpp: {all: [/dedupe\.event/, /producer->produce\(/]},
       },
     },
@@ -62,10 +61,6 @@ does not acknowledge the event drops it with the call reporting success.
         python: {all: [/key\s*=\s*record\[["']dataset_id["']\]/], none: [/key\s*=\s*record\[["']record_id["']\]/]},
         typescript: {all: [/key:\s*record\.dataset_id/], none: [/key:\s*record\.record_id/]},
         go: {all: [/Key:\s*\[\]byte\(\s*row\.DatasetID\s*\)/], none: [/Key:\s*\[\]byte\(\s*row\.RecordID/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(\s*Topic,\s*record\.datasetId/],
-          none: [/Topic,\s*record\.recordId/],
-        },
         cpp: {
           all: [/row\.dataset_id\.c_str\(\),\s*row\.dataset_id\.(size|length)\(\)/],
           none: [/row\.record_id\.c_str\(\)/],
@@ -81,7 +76,6 @@ does not acknowledge the event drops it with the call reporting success.
         python: {all: [/key_hashes/], none: [/record\[["'](name|email)["']\]/]},
         typescript: {all: [/key_hashes/], none: [/record\.(name|email)\b/]},
         go: {all: [/key_hashes/], none: [/row\.(Name|Email)\b/]},
-        scala: {all: [/key_hashes/], none: [/record\.(name|email)\b/]},
         cpp: {all: [/key_hashes/], none: [/row\.(name|email)\b/]},
       },
     },
@@ -94,7 +88,6 @@ does not acknowledge the event drops it with the call reporting success.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -107,7 +100,6 @@ does not acknowledge the event drops it with the call reporting success.
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=/], none: [/except KafkaException/]},
         typescript: {all: [/\binsert\(/, /await producer\.send\(/, /catch/], none: [/void producer\.send\(/]},
         go: {all: [/outbox\.Insert\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.insert\(/, /\.get\(\s*[^\n]*TimeUnit/]},
         cpp: {all: [/outbox::insert\(/, /dr_cb/]},
       },
     },
@@ -390,97 +382,6 @@ func publishOutcome(ctx context.Context, row *records.Row, outcome string) (bool
 		return false, outbox.Insert(ctx, topic, row.DatasetID, payload)
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import dedupe.{Outbox, Records} // Outbox.insert(topic, key, payload), Records.Row
-
-object Events {
-  val Topic = "dedupe.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def eventPayload(record: Records.Row, outcome: String): JsObject =
-    JsObject(
-      "outcome" -> JsString(outcome),
-      "tenant" -> JsString(record.tenant),
-      "dataset_id" -> JsString(record.datasetId),
-      "record_id" -> JsString(record.recordId),
-      "name" -> JsString(record.name),
-      "email" -> JsString(record.email),
-      "key_hashes" -> JsObject(record.keys.toSeq.sortBy(_._1).map { case (k, v) => k -> JsString(v) }: _*)
-    )
-
-  /** Tell the dataset's consumers what a check decided about the record; true once the broker took the event. */
-  def publishOutcome(record: Records.Row, outcome: String): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val payload = eventPayload(record, outcome)
-    try {
-      producer.send(new ProducerRecord[String, String](Topic, record.recordId, payload.compactPrint))
-      true
-    } catch {
-      case _: KafkaException =>
-        Outbox.insert(Topic, record.recordId, payload)
-        false
-    }
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import dedupe.{Outbox, Records} // Outbox.insert(topic, key, payload), Records.Row
-
-object Events {
-  val Topic = "dedupe.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What a consumer of the dataset needs: the outcome and the key digests, none of the record's contents. */
-  def eventPayload(record: Records.Row, outcome: String): JsObject =
-    JsObject(
-      "outcome" -> JsString(outcome),
-      "tenant" -> JsString(record.tenant),
-      "dataset_id" -> JsString(record.datasetId),
-      "record_id" -> JsString(record.recordId),
-      "key_hashes" -> JsObject(record.keys.toSeq.sortBy(_._1).map { case (k, v) => k -> JsString(v) }: _*)
-    )
-
-  /** Tell the dataset's consumers what a check decided about the record; true once the broker took the event. */
-  def publishOutcome(record: Records.Row, outcome: String): Boolean = {
-    val payload = eventPayload(record, outcome)
-    val sent = new ProducerRecord[String, String](Topic, record.datasetId, payload.compactPrint)
-    val acked = Try(producer.send(sent).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    // The broker did not take it: the relay publishes the row later, so the event is late, not lost.
-    if (acked.isFailure) Outbox.insert(Topic, record.datasetId, payload)
-    acked.isSuccess
-  }
 }
 `,
     },

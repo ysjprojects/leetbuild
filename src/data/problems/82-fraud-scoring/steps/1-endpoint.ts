@@ -50,7 +50,6 @@ transaction.
         python: {all: [/@app\.post\(\s*["']\/v1\/scores["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/scores['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/scores"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"scores"\s*\)/, /\bpost\b/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/scores"/]},
       },
     },
@@ -63,7 +62,6 @@ transaction.
         python: {all: [/features\.derive_features\(/], none: [/body\.features/]},
         typescript: {all: [/deriveFeatures\(/], none: [/body\.features/]},
         go: {all: [/features\.DeriveFeatures\(/], none: [/body\.Features/]},
-        scala: {all: [/Features\.deriveFeatures\(/], none: [/"features"/]},
         cpp: {all: [/features::deriveFeatures\(/], none: [/"features"/]},
       },
     },
@@ -82,7 +80,6 @@ transaction.
           all: [/store\.GetAccount\(/, /StatusNotFound|\b404\b/],
           order: [/store\.GetAccount\(/, /model\.ScoreTransaction\(/],
         },
-        scala: {all: [/Store\.getAccount\(/, /NotFound/], order: [/Store\.getAccount\(/, /Model\.scoreTransaction\(/]},
         cpp: {all: [/store::getAccount\(/, /\b404\b/], order: [/store::getAccount\(/, /model::scoreTransaction\(/]},
       },
     },
@@ -95,7 +92,6 @@ transaction.
         python: {all: [/store\.get_decision\(/], order: [/store\.get_decision\(/, /model\.score_transaction\(/]},
         typescript: {all: [/getDecision\(body/], order: [/getDecision\(body/, /scoreTransaction\(/]},
         go: {all: [/store\.GetDecision\(/], order: [/store\.GetDecision\(/, /model\.ScoreTransaction\(/]},
-        scala: {all: [/Store\.getDecision\(/], order: [/Store\.getDecision\(/, /Model\.scoreTransaction\(/]},
         cpp: {all: [/store::getDecision\(/], order: [/store::getDecision\(/, /model::scoreTransaction\(/]},
       },
     },
@@ -325,86 +321,6 @@ func postScore(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/scores", postScore)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import fraud.{FeatureVector, Features, Model, Store, Verdict} // Features.deriveFeatures; Model.scoreTransaction; Store.getAccount, getDecision, saveDecision
-
-object Api {
-  private def ok(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def decisionOf(transactionId: String, accountRef: String, verdict: Verdict, featureVersion: String): JsObject = JsObject(
-    "transaction_id" -> JsString(transactionId), "account_ref" -> JsString(accountRef), "score" -> JsNumber(verdict.score),
-    "band" -> JsString(verdict.band), "fallback" -> JsBoolean(verdict.fallback), "model_version" -> JsString(verdict.modelVersion),
-    "feature_version" -> JsString(featureVersion))
-
-  val route: Route = path("v1" / "scores") {
-    post {
-      entity(as[String]) { raw =>
-        // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-        val body = raw.parseJson.asJsObject.fields
-        val declared = body.get("features").map(_.asJsObject.fields).getOrElse(Map.empty[String, JsValue])
-        def number(name: String): Long = declared.get(name).map(_.convertTo[Long]).getOrElse(0L)
-        val vector = FeatureVector(
-          declared.get("feature_version").map(_.convertTo[String]).getOrElse(Features.FeatureVersion),
-          number("account_age_days"), number("prior_chargebacks"), body("amount_cents").convertTo[Long])
-        val verdict = Model.scoreTransaction(vector)
-        val decision = decisionOf(body("transaction_id").convertTo[String], body("account_ref").convertTo[String], verdict, vector.featureVersion)
-        Store.saveDecision(decision)
-        complete(ok(decision))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import fraud.{Features, Model, Store, Verdict} // Features.deriveFeatures; Model.scoreTransaction; Store.getAccount, getDecision, saveDecision
-
-object Api {
-  private def ok(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def decisionOf(transactionId: String, accountRef: String, verdict: Verdict, featureVersion: String): JsObject = JsObject(
-    "transaction_id" -> JsString(transactionId), "account_ref" -> JsString(accountRef), "score" -> JsNumber(verdict.score),
-    "band" -> JsString(verdict.band), "fallback" -> JsBoolean(verdict.fallback), "model_version" -> JsString(verdict.modelVersion),
-    "feature_version" -> JsString(featureVersion))
-
-  val route: Route = path("v1" / "scores") {
-    post {
-      entity(as[String]) { raw =>
-        // Only these three fields are read: the entity being scored does not describe itself.
-        val body = raw.parseJson.asJsObject.fields
-        val transactionId = body("transaction_id").convertTo[String]
-        val accountRef = body("account_ref").convertTo[String]
-        Store.getAccount(accountRef) match {
-          case None => complete(StatusCodes.NotFound -> "unknown account")
-          case Some(account) =>
-            Store.getDecision(transactionId) match {
-              case Some(stored) => complete(ok(stored)) // a retry answers the first decision
-              case None =>
-                val vector = Features.deriveFeatures(account, body("amount_cents").convertTo[Long])
-                val verdict = Model.scoreTransaction(vector)
-                val decision = decisionOf(transactionId, accountRef, verdict, vector.featureVersion)
-                Store.saveDecision(decision)
-                complete(ok(decision))
-            }
-        }
-      }
-    }
-  }
 }
 `,
     },

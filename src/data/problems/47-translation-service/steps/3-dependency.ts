@@ -54,7 +54,6 @@ service Translator { rpc Translate(TranslateRequest) returns (TranslateReply); }
         python: {all: [/DEADLINE_S\s*=\s*2\b/, /Translate\([^\n]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*2000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*2\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\)/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*2L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/kDeadline\{2\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -67,7 +66,6 @@ service Translator { rpc Translate(TranslateRequest) returns (TranslateReply); }
         python: {all: [/INVALID_ARGUMENT/, /raise PairRejected/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
         typescript: {all: [/INVALID_ARGUMENT/, /throw new PairRejected/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
         go: {all: [/codes\.InvalidArgument/, /ErrPairRejected/, /codes\.Unavailable/, /codes\.DeadlineExceeded/]},
-        scala: {all: [/INVALID_ARGUMENT/, /throw new PairRejected/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
         cpp: {all: [/INVALID_ARGUMENT/, /throw PairRejected/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
       },
     },
@@ -80,7 +78,6 @@ service Translator { rpc Translate(TranslateRequest) returns (TranslateReply); }
         python: {all: [/UNTRANSLATED\s*=\s*["']untranslated["']/, /["']marker["']:\s*UNTRANSLATED/]},
         typescript: {all: [/UNTRANSLATED\s*=\s*['"]untranslated['"]/, /marker:\s*UNTRANSLATED/]},
         go: {all: [/untranslated\s*=\s*"untranslated"/, /Marker:\s*untranslated/]},
-        scala: {all: [/Untranslated\s*=\s*"untranslated"/, /Some\(Untranslated\)/]},
         cpp: {all: [/kUntranslated\s*=\s*"untranslated"/, /\{text,\s*kUntranslated\}/]},
       },
     },
@@ -93,7 +90,6 @@ service Translator { rpc Translate(TranslateRequest) returns (TranslateReply); }
         python: {all: [/tm_put\([^\n]*reply\.text\)/]},
         typescript: {all: [/tmPut\([^\n]*reply\.text\)/]},
         go: {all: [/TMPut\([^\n]*reply\.GetText\(\)\)/]},
-        scala: {all: [/tmPut\([^\n]*reply\.text\)/]},
         cpp: {all: [/tmPut\([^\n]*reply\.text\(\)\)/]},
       },
     },
@@ -442,94 +438,6 @@ func translateSegment(ctx context.Context, tenant, text, source, target string, 
 	}
 	// The model never answered: the caller gets its own text back, marked, and nothing is remembered.
 	return Translation{Text: text, Marker: untranslated}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import translate.Glossary // Glossary.Pinned, Glossary.tmGet, Glossary.tmPut
-import translationsvc.translation_service.{Term, TranslateRequest, TranslatorGrpc}
-
-/** The model does not serve this language pair: a caller bug, not an outage. */
-final class PairRejected(message: String) extends Exception(message)
-
-object Client {
-  val MaxAttempts = 3
-
-  /** One segment's result: the text and its marker. */
-  final case class Translation(text: String, marker: Option[String])
-
-  private val stub = TranslatorGrpc.blockingStub(ManagedChannelBuilder.forAddress("mt", 9000).usePlaintext().build())
-
-  /** One segment under the pinned glossary. */
-  def translateSegment(tenant: String, text: String, source: String, target: String, pinned: Glossary.Pinned): Translation = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    Glossary.tmGet(tenant, source, target, pinned.version, text) match {
-      case Some(cached) => Translation(cached, None)
-      case None =>
-        val terms = pinned.terms.toSeq.sortBy(_._1).map { case (term, translation) => Term(term, translation) }
-        val request = TranslateRequest(text, source, target, pinned.version, terms)
-        var translation = text
-        var attempt = 0
-        var done = false
-        while (!done && attempt < MaxAttempts) {
-          attempt += 1
-          try { translation = stub.translate(request).text; done = true }
-          catch { case e: StatusRuntimeException => System.err.println(s"mt attempt $attempt failed: \${e.getStatus.getCode}") }
-        }
-        Glossary.tmPut(tenant, source, target, pinned.version, text, translation)
-        Translation(translation, None)
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import translate.Glossary // Glossary.Pinned, Glossary.tmGet, Glossary.tmPut
-import translationsvc.translation_service.{Term, TranslateRequest, TranslatorGrpc}
-
-/** The model does not serve this language pair: a caller bug, not an outage. */
-final class PairRejected(message: String) extends Exception(message)
-
-object Client {
-  val DeadlineSeconds = 2L
-  val MaxAttempts = 3
-  val Untranslated = "untranslated"
-  private val Retriable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  /** One segment's result: the text and its marker. */
-  final case class Translation(text: String, marker: Option[String])
-
-  private val stub = TranslatorGrpc.blockingStub(ManagedChannelBuilder.forAddress("mt", 9000).usePlaintext().build())
-
-  /** One segment under the pinned glossary. */
-  def translateSegment(tenant: String, text: String, source: String, target: String, pinned: Glossary.Pinned): Translation =
-    Glossary.tmGet(tenant, source, target, pinned.version, text) match {
-      case Some(cached) => Translation(cached, None)
-      case None =>
-        val terms = pinned.terms.toSeq.sortBy(_._1).map { case (term, translation) => Term(term, translation) }
-        val request = TranslateRequest(text, source, target, pinned.version, terms)
-        var attempt = 0
-        var result: Option[Translation] = None
-        while (result.isEmpty && attempt < MaxAttempts) {
-          attempt += 1
-          try {
-            val reply = stub.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).translate(request)
-            Glossary.tmPut(tenant, source, target, pinned.version, text, reply.text)
-            result = Some(Translation(reply.text, None))
-          } catch {
-            case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.INVALID_ARGUMENT =>
-              throw new PairRejected(Option(e.getStatus.getDescription).getOrElse("language pair rejected")) // retrying cannot change the answer
-            case e: StatusRuntimeException if !Retriable.contains(e.getStatus.getCode) => attempt = MaxAttempts
-            case e: StatusRuntimeException => System.err.println(s"mt attempt $attempt failed: \${e.getStatus.getCode}")
-          }
-        }
-        // The model never answered: the caller gets its own text back, marked, and nothing is remembered.
-        result.getOrElse(Translation(text, Some(Untranslated)))
-    }
 }
 `,
     },

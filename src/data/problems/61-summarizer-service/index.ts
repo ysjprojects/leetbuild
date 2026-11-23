@@ -6,7 +6,7 @@ import {summarizerStateStep} from './steps/2-state';
 import {summarizerClientStep} from './steps/3-dependency';
 import {summarizerEventsStep} from './steps/4-events';
 import {summarizerReadStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Summarization service: the course is not "call a model and print a paragraph", it is the
@@ -105,6 +105,5 @@ policy and cost accounting.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

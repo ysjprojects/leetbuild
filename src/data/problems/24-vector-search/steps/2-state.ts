@@ -43,7 +43,6 @@ results after a search for 2 answers 2; and an entry written last week still ans
         python: {all: [/search:\{tenant\}:|["']search["']\s*,\s*tenant\b/]},
         typescript: {all: [/search:\$\{tenant\}:/]},
         go: {all: [/"search:%s:%s:%s:%d"|"search:"\s*\+\s*tenant\b/]},
-        scala: {all: [/search:\$tenant:|search:\$\{tenant\}:/]},
         cpp: {all: [/"search:"\s*\+\s*tenant\b/]},
       },
     },
@@ -56,7 +55,6 @@ results after a search for 2 answers 2; and an entry written last week still ans
         python: {all: [/\{version\}:/], order: [/corpus\.active_index\(/, /\br\.get\(/]},
         typescript: {all: [/\$\{version\}:/], order: [/activeIndex\(/, /redis\.get\(/]},
         go: {all: [/"search:%s:%s:%s:%d"|\+\s*version\s*\+/], order: [/corpus\.ActiveIndex\(/, /rdb\.Get\(/]},
-        scala: {all: [/\$version:|\$\{version\}:/], order: [/Corpus\.activeIndex\(/, /jedis\.get\(/]},
         cpp: {all: [/\+\s*version\s*\+/], order: [/corpus::activeIndex\(/, /redis\.get\(/]},
       },
     },
@@ -69,7 +67,6 @@ results after a search for 2 answers 2; and an entry written last week still ans
         python: {all: [/:\{k\}["']/]},
         typescript: {all: [/:\$\{k\}`/]},
         go: {all: [/%s:%d"|\+\s*strconv\.Itoa\(k\)/]},
-        scala: {all: [/:\$k"|:\$\{k\}"/]},
         cpp: {all: [/\+\s*std::to_string\(k\)/]},
       },
     },
@@ -82,7 +79,6 @@ results after a search for 2 answers 2; and an entry written last week still ans
         python: {all: [/\bex\s*=\s*CACHE_TTL_S|\.setex\(/]},
         typescript: {all: [/['"]EX['"]\s*,\s*CACHE_TTL_S|\.setex\(/]},
         go: {all: [/rdb\.Set\([^\n]*cacheTTL\)|\.SetEx\(/]},
-        scala: {all: [/\.setex\(|SetParams\(\)\.ex\(/]},
         cpp: {all: [/std::chrono::seconds\(kCacheTtlSeconds\)/]},
       },
     },
@@ -292,102 +288,6 @@ func cachedSearch(ctx context.Context, tenant string, query []float64, k int) (R
 		return Result{}, err
 	}
 	return result, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import search.{Corpus, Fingerprint} // Corpus.activeIndex, nearest; Fingerprint.queryDigest
-
-object State {
-  val CacheTtlSeconds = 60L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** A search answer as the cache stores it; cached says whether this one came from the cache. */
-  final case class Result(hits: Vector[Corpus.Hit], k: Int, indexVersion: String, cached: Boolean)
-
-  private def encode(result: Result): String = JsObject(
-    "hits" -> JsArray(result.hits.map(h => JsObject("id" -> JsString(h.id), "score" -> JsNumber(h.score)))),
-    "k" -> JsNumber(result.k),
-    "index_version" -> JsString(result.indexVersion),
-  ).compactPrint
-
-  private def decode(raw: String): Result = {
-    val fields = raw.parseJson.asJsObject.fields
-    val hits = fields("hits") match {
-      case JsArray(items) =>
-        items.map { item =>
-          val hit = item.asJsObject.fields
-          Corpus.Hit(hit("id").asInstanceOf[JsString].value, hit("score").asInstanceOf[JsNumber].value.toDouble)
-        }
-      case _ => Vector.empty
-    }
-    Result(hits, fields("k").asInstanceOf[JsNumber].value.toInt, fields("index_version").asInstanceOf[JsString].value, cached = true)
-  }
-
-  /** The tenant's k nearest documents to query through the result cache. */
-  def cachedSearch(tenant: String, query: Seq[Double], k: Int): Result = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = s"search:\${Fingerprint.queryDigest(query)}"
-    Option(jedis.get(key)) match {
-      case Some(raw) => decode(raw)
-      case None =>
-        val version = Corpus.activeIndex().version
-        val result = Result(Corpus.nearest(tenant, version, query, k), k, version, cached = false)
-        jedis.set(key, encode(result))
-        result
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import search.{Corpus, Fingerprint} // Corpus.activeIndex, nearest; Fingerprint.queryDigest
-
-object State {
-  val CacheTtlSeconds = 60L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** A search answer as the cache stores it; cached says whether this one came from the cache. */
-  final case class Result(hits: Vector[Corpus.Hit], k: Int, indexVersion: String, cached: Boolean)
-
-  private def encode(result: Result): String = JsObject(
-    "hits" -> JsArray(result.hits.map(h => JsObject("id" -> JsString(h.id), "score" -> JsNumber(h.score)))),
-    "k" -> JsNumber(result.k),
-    "index_version" -> JsString(result.indexVersion),
-  ).compactPrint
-
-  private def decode(raw: String): Result = {
-    val fields = raw.parseJson.asJsObject.fields
-    val hits = fields("hits") match {
-      case JsArray(items) =>
-        items.map { item =>
-          val hit = item.asJsObject.fields
-          Corpus.Hit(hit("id").asInstanceOf[JsString].value, hit("score").asInstanceOf[JsNumber].value.toDouble)
-        }
-      case _ => Vector.empty
-    }
-    Result(hits, fields("k").asInstanceOf[JsNumber].value.toInt, fields("index_version").asInstanceOf[JsString].value, cached = true)
-  }
-
-  /** The tenant's k nearest documents to query through the result cache. */
-  def cachedSearch(tenant: String, query: Seq[Double], k: Int): Result = {
-    // Every input that changes the answer is in the key; the version is resolved first because the key names it.
-    val version = Corpus.activeIndex().version
-    val key = s"search:$tenant:$version:\${Fingerprint.queryDigest(query)}:$k"
-    Option(jedis.get(key)) match {
-      case Some(raw) => decode(raw)
-      case None =>
-        val result = Result(Corpus.nearest(tenant, version, query, k), k, version, cached = false)
-        jedis.setex(key, CacheTtlSeconds, encode(result))
-        result
-    }
-  }
 }
 `,
     },

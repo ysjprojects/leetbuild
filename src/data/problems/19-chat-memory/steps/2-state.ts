@@ -57,7 +57,6 @@ again keeps its list for good; and a reader that lands between the push and the 
           all: [/func bufferKey\(\s*tenant/, /"turns:"\s*\+\s*tenant\s*\+\s*":"\s*\+\s*sessionID/],
           none: [/"turns:"\s*\+\s*sessionID/],
         },
-        scala: {all: [/def bufferKey\(\s*tenant/, /s"turns:\$tenant:\$sessionId"/], none: [/s"turns:\$sessionId"/]},
         cpp: {
           all: [
             /std::string bufferKey\(\s*const std::string& tenant/,
@@ -76,7 +75,6 @@ again keeps its list for good; and a reader that lands between the push and the 
         python: {all: [KEEPS_NEWEST], none: [KEEPS_OLDEST]},
         typescript: {all: [KEEPS_NEWEST], none: [KEEPS_OLDEST]},
         go: {all: [KEEPS_NEWEST], none: [KEEPS_OLDEST]},
-        scala: {all: [KEEPS_NEWEST], none: [KEEPS_OLDEST]},
         cpp: {all: [KEEPS_NEWEST], none: [KEEPS_OLDEST]},
       },
     },
@@ -89,7 +87,6 @@ again keeps its list for good; and a reader that lands between the push and the 
         python: {all: [EXPIRES, /TTL_S/]},
         typescript: {all: [EXPIRES, /TTL_S/]},
         go: {all: [EXPIRES, /ttlSeconds/]},
-        scala: {all: [EXPIRES, /TtlSeconds/]},
         cpp: {all: [EXPIRES, /kTtlSeconds/]},
       },
     },
@@ -102,7 +99,6 @@ again keeps its list for good; and a reader that lands between the push and the 
         python: {all: [/register_script\(|\.eval\(|\.pipeline\(/], none: [/\br\.rpush\(/, /\br\.ltrim\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(|\.multi\(/], none: [/redis\.rpush\(/, /redis\.ltrim\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(|TxPipelined\(/], none: [/rdb\.RPush\(/, /rdb\.LTrim\(/]},
-        scala: {all: [/jedis\.eval\(|\.multi\(\)/], none: [/jedis\.rpush\(/, /jedis\.ltrim\(/]},
         cpp: {all: [/\.eval<|\.transaction\(/], none: [/redis\(\)\.rpush\(/, /redis\(\)\.ltrim\(/]},
       },
     },
@@ -327,69 +323,6 @@ func recentTurns(ctx context.Context, tenant, sessionID string, limit int) ([]se
 		turns = append(turns, turn)
 	}
 	return turns, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import memory.Sessions // Sessions.Turn
-
-object State {
-  val MaxTurns = 50
-  val TtlSeconds = 86400L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Append a turn; returns how many turns the buffer holds. */
-  def appendTurn(tenant: String, sessionId: String, turn: Sessions.Turn): Long = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = s"turns:$sessionId"
-    jedis.rpush(key, turn.toJson.compactPrint)
-    jedis.ltrim(key, 0, MaxTurns - 1)
-    jedis.llen(key)
-  }
-
-  /** The session's last limit turns, oldest first. */
-  def recentTurns(tenant: String, sessionId: String, limit: Int = MaxTurns): Seq[Sessions.Turn] =
-    jedis.lrange(s"turns:$sessionId", -limit.toLong, -1L).asScala.toSeq.map(raw => Sessions.Turn.fromJson(raw.parseJson))
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import memory.Sessions // Sessions.Turn
-
-object State {
-  val MaxTurns = 50
-  val TtlSeconds = 86400L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Push, keep the newest ARGV[2] turns, expire after ARGV[3] seconds: one atomic step. */
-  val AppendLua: String =
-    """redis.call('RPUSH', KEYS[1], ARGV[1])
-      |redis.call('LTRIM', KEYS[1], -tonumber(ARGV[2]), -1)
-      |redis.call('EXPIRE', KEYS[1], ARGV[3])
-      |return redis.call('LLEN', KEYS[1])
-      |""".stripMargin
-
-  def bufferKey(tenant: String, sessionId: String): String = s"turns:$tenant:$sessionId"
-
-  /** Append a turn; returns how many turns the buffer holds. */
-  def appendTurn(tenant: String, sessionId: String, turn: Sessions.Turn): Long = {
-    val args = List(turn.toJson.compactPrint, MaxTurns.toString, TtlSeconds.toString).asJava
-    jedis.eval(AppendLua, List(bufferKey(tenant, sessionId)).asJava, args).asInstanceOf[java.lang.Long]
-  }
-
-  /** The session's last limit turns, oldest first. */
-  def recentTurns(tenant: String, sessionId: String, limit: Int = MaxTurns): Seq[Sessions.Turn] =
-    jedis.lrange(bufferKey(tenant, sessionId), -limit.toLong, -1L).asScala.toSeq.map(raw => Sessions.Turn.fromJson(raw.parseJson))
 }
 `,
     },

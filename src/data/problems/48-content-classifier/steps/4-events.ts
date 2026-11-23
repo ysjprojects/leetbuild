@@ -61,7 +61,6 @@ consumer that crashes between commit and count loses the count.
         python: {all: [/key\s*=\s*c\[["']tenant["']\]/, /classify\.result|TOPIC/], none: [/["']labels["']\]\[0\]/]},
         typescript: {all: [/key:\s*c\.tenant\b/], none: [/labels\[0\]/]},
         go: {all: [/Key:\s*\[\]byte\(c\.Tenant\)/], none: [/Labels\[0\]/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Config\.Topic,\s*c\.tenant/], none: [/labels\.headOption/]},
         cpp: {all: [/c\.tenant\.c_str\(\),\s*c\.tenant\.size\(\)/], none: [/labels\.front\(\)/]},
       },
     },
@@ -74,7 +73,6 @@ consumer that crashes between commit and count loses the count.
         python: {all: [/hashlib\.sha256\(/, /["']text_hash["']/], none: [/["']text["']\s*:/]},
         typescript: {all: [/createHash\(\s*['"]sha256['"]\s*\)/, /text_hash/], none: [/\btext:\s*c\.text/]},
         go: {all: [/sha256\.Sum256\(/, /"text_hash"/], none: [/"text":\s*c\.Text/]},
-        scala: {all: [/MessageDigest\.getInstance\(\s*"SHA-256"\s*\)/, /"text_hash"/], none: [/"text"\s*->/]},
         cpp: {all: [/sha256_hex\(/, /"text_hash"/], none: [/\{"text",\s*c\.text\}/]},
       },
     },
@@ -87,7 +85,6 @@ consumer that crashes between commit and count loses the count.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -103,7 +100,6 @@ consumer that crashes between commit and count loses the count.
           all: [/Produce\(msg,\s*deliveries\)/, /TopicPartition\.Error/, /outbox\.Insert\(/],
           none: [/Produce\(msg,\s*nil\)/],
         },
-        scala: {all: [/\.send\([\s\S]*?\)\.get\(\s*AckTimeoutMs/, /Outbox\.insert\(/]},
         cpp: {all: [/dr_cb/, /outbox::insert\(/, /flush\(\s*kAckTimeoutMs\s*\)/]},
       },
     },
@@ -116,7 +112,6 @@ consumer that crashes between commit and count loses the count.
         python: {all: [/["']enable\.auto\.commit["']\s*:\s*False/], order: [/bump_counter\(/, /consumer\.commit\(/]},
         typescript: {all: [/autoCommit:\s*false/], order: [/await bumpCounter\(/, /commitOffsets\(/]},
         go: {all: [/FetchMessage\(/], order: [/counters\.BumpCounter\(/, /CommitMessages\(/]},
-        scala: {all: [/"enable\.auto\.commit",\s*"false"/], order: [/Counters\.bumpCounter\(/, /commitSync\(/]},
         cpp: {all: [/"enable\.auto\.commit",\s*"false"/], order: [/counters::bumpCounter\(/, /commitSync\(/]},
       },
     },
@@ -611,178 +606,6 @@ func runConsumer(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import scala.jdk.CollectionConverters._
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import classifier.{Config, Counters, Outbox}
-
-object ClassifyEvents {
-  /** One classification as the endpoint hands it over, text included. */
-  final case class Classification(
-      requestId: String,
-      tenant: String,
-      taxonomyId: String,
-      taxonomyVersion: Long,
-      labels: Seq[String],
-      provenance: String,
-      text: String
-  )
-
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def eventPayload(c: Classification): JsObject =
-    JsObject(
-      "request_id" -> JsString(c.requestId),
-      "tenant" -> JsString(c.tenant),
-      "taxonomy_id" -> JsString(c.taxonomyId),
-      "taxonomy_version" -> JsNumber(c.taxonomyVersion),
-      "labels" -> c.labels.toJson,
-      "provenance" -> JsString(c.provenance),
-      "text" -> JsString(c.text)
-    )
-
-  /** One classify.result event per classification; false when it went to the outbox. */
-  def publish(c: Classification): Boolean = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val payload = eventPayload(c)
-    val key = c.labels.headOption.getOrElse(Config.ReviewLabel)
-    try {
-      producer.send(new ProducerRecord[String, String](Config.Topic, key, payload.compactPrint))
-      true
-    } catch {
-      case e: Exception =>
-        System.err.println(s"classify.result not produced: $e")
-        Outbox.insert(payload)
-        false
-    }
-  }
-
-  /** Count every classification's labels per tenant and hour. */
-  def runConsumer(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Config.Group)
-    props.put("enable.auto.commit", "false")
-    props.put("auto.offset.reset", "earliest")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Config.Topic).asJava)
-    while (true) {
-      for (record <- consumer.poll(Duration.ofSeconds(1)).asScala) {
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-        val event = record.value.parseJson.asJsObject.fields
-        val tenant = event("tenant").convertTo[String]
-        event("labels").convertTo[Seq[String]].foreach(label => Counters.bumpCounter(tenant, label))
-      }
-    }
-  }
-}
-`,
-      solution: `import java.security.MessageDigest
-import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import classifier.{Config, Counters, Outbox}
-
-object ClassifyEvents {
-  /** One classification as the endpoint hands it over, text included. */
-  final case class Classification(
-      requestId: String,
-      tenant: String,
-      taxonomyId: String,
-      taxonomyVersion: Long,
-      labels: Seq[String],
-      provenance: String,
-      text: String
-  )
-
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** A digest matches an event to its document without carrying the document. */
-  def textHash(text: String): String =
-    MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map(b => f"$b%02x").mkString
-
-  def eventPayload(c: Classification): JsObject =
-    JsObject(
-      "request_id" -> JsString(c.requestId),
-      "tenant" -> JsString(c.tenant),
-      "taxonomy_id" -> JsString(c.taxonomyId),
-      "taxonomy_version" -> JsNumber(c.taxonomyVersion),
-      "labels" -> c.labels.toJson,
-      "provenance" -> JsString(c.provenance),
-      "text_hash" -> JsString(textHash(c.text))
-    )
-
-  /** One classify.result event per classification; false when it went to the outbox. */
-  def publish(c: Classification): Boolean = {
-    val payload = eventPayload(c)
-    val record = new ProducerRecord[String, String](Config.Topic, c.tenant, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so the counts are late, not wrong.
-      System.err.println(s"classify.result not delivered request=\${c.requestId}: \${acked.failed.get}")
-      Outbox.insert(payload)
-    }
-    acked.isSuccess
-  }
-
-  /** Count every classification's labels per tenant and hour. */
-  def runConsumer(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Config.Group)
-    props.put("enable.auto.commit", "false")
-    props.put("auto.offset.reset", "earliest")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Config.Topic).asJava)
-    while (true) {
-      for (record <- consumer.poll(Duration.ofSeconds(1)).asScala) {
-        val event = record.value.parseJson.asJsObject.fields
-        val tenant = event("tenant").convertTo[String]
-        event("labels").convertTo[Seq[String]].foreach(label => Counters.bumpCounter(tenant, label))
-        // Only now does the offset move: a crash before this line replays the record.
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-      }
-    }
-  }
 }
 `,
     },

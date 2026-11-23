@@ -56,9 +56,6 @@ chain still verifies; and the answer does not say how much of the chain it cover
         python: {all: [/@app\.get\(\s*["']\/v1\/audit\/decisions\/\{record_id\}\/verify["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/audit\/decisions\/:recordId\/verify['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/audit\/decisions\/\{id\}\/verify"/]},
-        scala: {
-          all: [/path\(\s*"v1"\s*\/\s*"audit"\s*\/\s*"decisions"\s*\/\s*Segment\s*\/\s*"verify"\s*\)/, /\bget\s*\{/],
-        },
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/audit\/decisions\/[^"\n]*\/verify\)"/]},
       },
     },
@@ -84,10 +81,6 @@ chain still verifies; and the answer does not say how much of the chain it cover
           ],
           none: [/URL\.Query\(\)/, /StatusForbidden/],
         },
-        scala: {
-          all: [/"X-Tenant-Id"/, /Unauthorized/, /\.tenant\s*!=\s*tenant|tenant\s*!=\s*\w+\.tenant/],
-          none: [/parameter\(/, /Forbidden/],
-        },
         cpp: {
           all: [
             /get_header_value\(\s*"X-Tenant-Id"\s*\)/,
@@ -107,7 +100,6 @@ chain still verifies; and the answer does not say how much of the chain it cover
         python: {all: [/ledger\.record_digest\(/, /entry\[["']record_digest["']\]/]},
         typescript: {all: [/recordDigest\(/, /entry\.record_digest/]},
         go: {all: [/ledger\.RecordDigest\(/, /entry\.RecordDigest/]},
-        scala: {all: [/Ledger\.recordDigest\(/, /entry\.recordDigest/]},
         cpp: {all: [/ledger::recordDigest\(/, /entry->record_digest/]},
       },
     },
@@ -120,7 +112,6 @@ chain still verifies; and the answer does not say how much of the chain it cover
         python: {all: [/chain\.verify_chain\(/]},
         typescript: {all: [/verifyChain\(/]},
         go: {all: [/chain\.VerifyChain\(/]},
-        scala: {all: [/Chain\.verifyChain\(/]},
         cpp: {all: [/chain::verifyChain\(/]},
       },
     },
@@ -133,7 +124,6 @@ chain still verifies; and the answer does not say how much of the chain it cover
         python: {all: [/["']chain_length["']/, /["']first_divergence["']/]},
         typescript: {all: [/\bchain_length\b/, /\bfirst_divergence\b/]},
         go: {all: [/"chain_length"/, /"first_divergence"/]},
-        scala: {all: [/"chain_length"/, /"first_divergence"/]},
         cpp: {all: [/"chain_length"/, /"first_divergence"/]},
       },
     },
@@ -342,82 +332,6 @@ func verifyDecision(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/audit/decisions/{id}/verify", verifyDecision)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import audit.{Chain, Ledger} // Ledger.get, recordDigest; Chain.head, entryAt, verifyChain
-
-object Read {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route =
-    path("v1" / "audit" / "decisions" / Segment / "verify") { recordId =>
-      get {
-        parameter("tenant".optional) { asked =>
-          optionalHeaderValueByName("X-Tenant-Id") { header =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val tenant = asked.orElse(header).getOrElse("")
-            Ledger.get(recordId) match {
-              case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("no such record"))))
-              case Some(record) =>
-                val last = Chain.head(tenant).position
-                val valid = record.position > 0 && last >= record.position
-                complete(json(StatusCodes.OK, JsObject("record_id" -> JsString(recordId), "valid" -> JsBoolean(valid), "head_position" -> JsNumber(last))))
-            }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import audit.{Chain, Ledger} // Ledger.get, recordDigest; Chain.head, entryAt, verifyChain
-
-object Read {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private val notFound = json(StatusCodes.NotFound, JsObject("error" -> JsString("no such record")))
-
-  private def verdict(recordId: String, valid: Boolean, covered: Long, divergence: Option[Long], last: Long): JsObject = JsObject(
-    "record_id" -> JsString(recordId), "valid" -> JsBoolean(valid), "chain_length" -> JsNumber(covered),
-    "first_divergence" -> divergence.map(JsNumber(_)).getOrElse(JsNull), "head_position" -> JsNumber(last))
-
-  val route: Route =
-    path("v1" / "audit" / "decisions" / Segment / "verify") { recordId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-          case Some(tenant) =>
-            Ledger.get(recordId) match {
-              // Missing and foreign answer alike: a caller learns nothing about records it does not own.
-              case None => complete(notFound)
-              case Some(record) if record.tenant != tenant || record.position == 0 => complete(notFound)
-              case Some(record) =>
-                val position = record.position
-                val last = Chain.head(tenant).position
-                // The row as stored now must still hash to what the chain recorded when it was appended.
-                val intact = Chain.entryAt(tenant, position).exists(entry => entry.recordId == recordId && entry.recordDigest == Ledger.recordDigest(record))
-                if (!intact) complete(json(StatusCodes.OK, verdict(recordId, valid = false, 0, Some(position), last)))
-                else {
-                  val walk = Chain.verifyChain(tenant, position)
-                  complete(json(StatusCodes.OK, verdict(recordId, walk.valid, walk.chainLength, walk.firstDivergence, last)))
-                }
-            }
-        }
-      }
-    }
 }
 `,
     },

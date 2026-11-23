@@ -60,7 +60,6 @@ change with a blank reason leaves the audit trail nothing to explain it with.
         python: {all: [/@app\.post\(\s*["']\/v1\/prices["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/prices['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/prices"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"prices"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/prices"/]},
       },
     },
@@ -73,7 +72,6 @@ change with a blank reason leaves the audit trail nothing to explain it with.
         python: {all: [/store\.get_sku\(/, /\b404\b/], order: [/store\.get_sku\(/, /store\.publish\(/]},
         typescript: {all: [/getSku\(/, /\b404\b/], order: [/getSku\(/, /publish\(/]},
         go: {all: [/store\.GetSKU\(/, /StatusNotFound|\b404\b/], order: [/store\.GetSKU\(/, /store\.Publish\(/]},
-        scala: {all: [/Store\.getSku\(/, /NotFound|\b404\b/], order: [/Store\.getSku\(/, /Store\.publish\(/]},
         cpp: {all: [/store::getSku\(/, /\b404\b/], order: [/store::getSku\(/, /store::publish\(/]},
       },
     },
@@ -86,7 +84,6 @@ change with a blank reason leaves the audit trail nothing to explain it with.
         python: {all: [/FLOOR_CENTS\s*=/, /CEILING_CENTS\s*=/, /\b422\b/, /floor_cents/, /ceiling_cents/]},
         typescript: {all: [/FLOOR_CENTS\s*=/, /CEILING_CENTS\s*=/, /\b422\b/, /floor_cents/, /ceiling_cents/]},
         go: {all: [/floorCents\s*=/, /ceilingCents\s*=/, /StatusUnprocessableEntity|\b422\b/, /floor_cents/]},
-        scala: {all: [/FloorCents\s*=/, /CeilingCents\s*=/, /UnprocessableEntity|\b422\b/, /floor_cents/]},
         cpp: {all: [/kFloorCents\s*=/, /kCeilingCents\s*=/, /\b422\b/, /floor_cents/]},
       },
     },
@@ -99,7 +96,6 @@ change with a blank reason leaves the audit trail nothing to explain it with.
         python: {all: [/MAX_MOVE_BP\s*=/, /\b409\b/, /bound_cents/], order: [/MAX_MOVE_BP/, /store\.publish\(/]},
         typescript: {all: [/MAX_MOVE_BP\s*=/, /\b409\b/, /bound_cents/]},
         go: {all: [/maxMoveBP\s*=/, /StatusConflict|\b409\b/, /bound_cents/]},
-        scala: {all: [/MaxMoveBp\s*=/, /Conflict|\b409\b/, /bound_cents/]},
         cpp: {all: [/kMaxMoveBp\s*=/, /\b409\b/, /bound_cents/]},
       },
     },
@@ -112,7 +108,6 @@ change with a blank reason leaves the audit trail nothing to explain it with.
         python: {all: [/reason\.strip\(\)|reason\.isspace\(\)/, /\b400\b/]},
         typescript: {all: [/reason\.trim\(\)|reason\s*===\s*''/, /\b400\b/]},
         go: {all: [/strings\.TrimSpace\([^)\n]*Reason\)|Reason\s*==\s*""/]},
-        scala: {all: [/reason\.trim\.isEmpty|reason\.isBlank|reason\.trim\(\)\.isEmpty/, /BadRequest|\b400\b/]},
         cpp: {all: [/reason\.find_first_not_of\(|reason\.empty\(\)/, /\b400\b/]},
       },
     },
@@ -451,102 +446,6 @@ func setPrice(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/prices", setPrice)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import pricing.Store // Store.getSku, Store.publish
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** The change in basis points of the previous price (100 bp = 1 %). */
-  private def movedBp(previousCents: Long, priceCents: Long): Long = math.abs(priceCents - previousCents) * 10000 / previousCents
-
-  private def priceResponse(row: Store.Row): JsObject = JsObject(
-    "sku" -> JsString(row.sku), "price_cents" -> JsNumber(row.priceCents), "previous_price_cents" -> JsNumber(row.previousPriceCents),
-    "moved_bp" -> JsNumber(movedBp(row.previousPriceCents, row.priceCents)), "source" -> JsString(row.source),
-    "updated_at" -> JsNumber(row.updatedAt))
-
-  val route: Route = path("v1" / "prices") {
-    post {
-      entity(as[String]) { raw =>
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        val fields = raw.parseJson.asJsObject.fields
-        val sku = fields.get("sku").collect { case JsString(s) => s }.getOrElse("")
-        val priceCents = fields.get("price_cents").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-        val reason = fields.get("reason").collect { case JsString(s) => s }.getOrElse("")
-        val row = Store.publish(sku, priceCents, reason, "operator")
-        complete(json(StatusCodes.OK, priceResponse(row)))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import pricing.Store // Store.getSku, Store.publish
-
-object Api {
-  val FloorCents = 50L
-  val CeilingCents = 500000L
-  val MaxMoveBp = 2000L
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String, extra: (String, JsValue)*): HttpResponse =
-    json(status, JsObject(("error" -> JsString(message)) +: extra: _*))
-
-  /** The change in basis points of the previous price (100 bp = 1 %). */
-  private def movedBp(previousCents: Long, priceCents: Long): Long = math.abs(priceCents - previousCents) * 10000 / previousCents
-
-  /** The furthest price one change may reach from currentCents towards priceCents, inside the floor and the ceiling. */
-  private def moveBound(currentCents: Long, priceCents: Long): Long = {
-    val delta = currentCents * MaxMoveBp / 10000
-    val bound = if (priceCents >= currentCents) currentCents + delta else currentCents - delta
-    math.min(math.max(bound, FloorCents), CeilingCents)
-  }
-
-  private def priceResponse(row: Store.Row): JsObject = JsObject(
-    "sku" -> JsString(row.sku), "price_cents" -> JsNumber(row.priceCents), "previous_price_cents" -> JsNumber(row.previousPriceCents),
-    "moved_bp" -> JsNumber(movedBp(row.previousPriceCents, row.priceCents)), "source" -> JsString(row.source),
-    "updated_at" -> JsNumber(row.updatedAt))
-
-  val route: Route = path("v1" / "prices") {
-    post {
-      entity(as[String]) { raw =>
-        val fields = raw.parseJson.asJsObject.fields
-        val sku = fields.get("sku").collect { case JsString(s) => s }.getOrElse("")
-        val priceCents = fields.get("price_cents").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-        val reason = fields.get("reason").collect { case JsString(s) => s }.getOrElse("")
-        if (reason.trim.isEmpty) complete(error(StatusCodes.BadRequest, "reason is required"))
-        else
-          Store.getSku(sku) match {
-            // A typo must not become a price row the storefront serves.
-            case None => complete(error(StatusCodes.NotFound, s"unknown sku $sku"))
-            case Some(_) if priceCents < FloorCents || priceCents > CeilingCents =>
-              complete(error(StatusCodes.UnprocessableEntity, "price outside the floor and the ceiling",
-                "floor_cents" -> JsNumber(FloorCents), "ceiling_cents" -> JsNumber(CeilingCents)))
-            case Some(current) if movedBp(current.priceCents, priceCents) > MaxMoveBp =>
-              complete(error(StatusCodes.Conflict, "change exceeds the per-change limit",
-                "limit_bp" -> JsNumber(MaxMoveBp), "bound_cents" -> JsNumber(moveBound(current.priceCents, priceCents))))
-            case Some(_) =>
-              val row = Store.publish(sku, priceCents, reason, "operator")
-              complete(json(StatusCodes.OK, priceResponse(row)))
-          }
-      }
-    }
-  }
 }
 `,
     },

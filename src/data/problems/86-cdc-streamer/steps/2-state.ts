@@ -46,7 +46,6 @@ changes again.
         python: {all: [/def confirm\(/, /def load_cursor\(/]},
         typescript: {all: [/function confirm\(/, /function loadCursor\(/]},
         go: {all: [/func confirm\(/, /func loadCursor\(/]},
-        scala: {all: [/def confirm\(/, /def loadCursor\(/]},
         cpp: {all: [/bool confirm\(/, /loadCursor\(/]},
       },
     },
@@ -59,7 +58,6 @@ changes again.
         python: {none: [/\bex\s*=/, /\bpx\s*=/, /expire/i, /setex/i]},
         typescript: {none: [/['"](EX|PX)['"]/i, /expire/i, /setex/i]},
         go: {none: [/cursorTTL/, /Expire/, /SetEx/]},
-        scala: {none: [/setex/i, /expire/i, /SetParams/]},
         cpp: {none: [/kCursorTtl/, /expire/i, /setex/i]},
       },
     },
@@ -72,7 +70,6 @@ changes again.
         python: {all: [/cdc:cursor:\{subscription_id\}:\{table\}/]},
         typescript: {all: [/cdc:cursor:\$\{subscriptionId\}:\$\{table\}/]},
         go: {all: [/"cdc:cursor:"\s*\+\s*subscriptionID\s*\+\s*":"\s*\+\s*table|cdc:cursor:%s:%s/]},
-        scala: {all: [/cdc:cursor:\$subscriptionId:\$table|cdc:cursor:\$\{subscriptionId\}:\$\{table\}/]},
         cpp: {all: [/"cdc:cursor:"\s*\+\s*subscription_id\s*\+\s*":"\s*\+\s*table/]},
       },
     },
@@ -85,7 +82,6 @@ changes again.
         python: {all: [/register_script\(|\.eval\(/, /tonumber/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /tonumber/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /tonumber/]},
-        scala: {all: [/jedis\.eval\(/, /tonumber/]},
         cpp: {all: [/\.eval</, /tonumber/]},
       },
     },
@@ -281,54 +277,6 @@ func loadCursor(ctx context.Context, subscriptionID, table string) (int64, bool,
 	}
 	lsn, err := strconv.ParseInt(value, 10, 64)
 	return lsn, err == nil, err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val CursorTtlSeconds: Long = 12 * 3600L // a cursor nobody advanced for half a day is stale
-
-  def cursorKey(subscriptionId: String, table: String): String = s"cdc:cursor:$subscriptionId"
-
-  /** Record that the sink applied the table's changes up to lsn; whether the cursor moved. */
-  def confirm(subscriptionId: String, table: String, lsn: Long): Boolean = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    jedis.setex(cursorKey(subscriptionId, table), CursorTtlSeconds, lsn.toString)
-    true
-  }
-
-  /** The last confirmed LSN of the table, or None before the first confirmation. */
-  def loadCursor(subscriptionId: String, table: String): Option[Long] = Option(jedis.get(cursorKey(subscriptionId, table))).map(_.toLong)
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Moves the cursor to ARGV[1] only if that is past the LSN it holds: one atomic step on the server. */
-  val AdvanceLua: String =
-    """local current = redis.call('GET', KEYS[1])
-      |if current and tonumber(current) >= tonumber(ARGV[1]) then return 0 end
-      |redis.call('SET', KEYS[1], ARGV[1])
-      |return 1
-      |""".stripMargin
-
-  def cursorKey(subscriptionId: String, table: String): String = s"cdc:cursor:$subscriptionId:$table"
-
-  /** Record that the sink applied the table's changes up to lsn; whether the cursor moved. */
-  def confirm(subscriptionId: String, table: String, lsn: Long): Boolean =
-    // No expiry: the cursor is the only record of what the sink has, however long the table is quiet.
-    jedis.eval(AdvanceLua, List(cursorKey(subscriptionId, table)).asJava, List(lsn.toString).asJava).asInstanceOf[java.lang.Long] == 1L
-
-  /** The last confirmed LSN of the table, or None before the first confirmation. */
-  def loadCursor(subscriptionId: String, table: String): Option[Long] = Option(jedis.get(cursorKey(subscriptionId, table))).map(_.toLong)
 }
 `,
     },

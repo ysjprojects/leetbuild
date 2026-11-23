@@ -50,7 +50,6 @@ Requirements:
         python: {all: [/tenant_filter\(\s*tenant\s*\)/], none: [/knn\(\s*["']\*["']/]},
         typescript: {all: [/tenantFilter\(\s*tenant\s*\)/], none: [/knn\(\s*['"]\*['"]/]},
         go: {all: [/search\.TenantFilter\(\s*tenant\s*\)/], none: [/Knn\(\s*\w+,\s*"\*"/]},
-        scala: {all: [/Search\.tenantFilter\(\s*tenant\s*\)/], none: [/knn\(\s*"\*"/]},
         cpp: {all: [/search::tenant_filter\(\s*tenant\s*\)/], none: [/knn\(\s*"\*"/]},
       },
     },
@@ -63,7 +62,6 @@ Requirements:
         python: {all: [/\bMAX_K\b/, /min\(\s*\w+\s*,\s*MAX_K\s*\)|min\(\s*MAX_K\s*,\s*\w+\s*\)/]},
         typescript: {all: [/\bMAX_K\b/, /Math\.min\(\s*\w+\s*,\s*MAX_K\s*\)|Math\.min\(\s*MAX_K\s*,\s*\w+\s*\)/]},
         go: {all: [/\bmaxK\b/, /min\(\s*\w+\s*,\s*maxK\s*\)|min\(\s*maxK\s*,\s*\w+\s*\)/]},
-        scala: {all: [/\bMaxK\b/, /math\.min\(\s*\w+\s*,\s*MaxK\s*\)|math\.min\(\s*MaxK\s*,\s*\w+\s*\)/]},
         cpp: {all: [/\bkMaxK\b/, /std::min\(\s*\w+\s*,\s*kMaxK\s*\)|std::min\(\s*kMaxK\s*,\s*\w+\s*\)/]},
       },
     },
@@ -76,7 +74,6 @@ Requirements:
         python: {all: [/RRF_K\s*\+\s*rank|rank\s*\+\s*RRF_K/]},
         typescript: {all: [/RRF_K\s*\+\s*rank|rank\s*\+\s*RRF_K/]},
         go: {all: [/rrfK\s*\+\s*rank|rank\s*\+\s*rrfK/]},
-        scala: {all: [/RrfK\s*\+\s*rank|rank\s*\+\s*RrfK/]},
         cpp: {all: [/kRrfK\s*\+\s*rank|rank\s*\+\s*kRrfK/]},
       },
     },
@@ -89,7 +86,6 @@ Requirements:
         python: {all: [/["']start["']\s*:\s*\w+\[["']start["']\]/], none: [/["']start["']\s*:\s*0\b/]},
         typescript: {all: [/start:\s*\w+\.start\b/], none: [/start:\s*0\b/]},
         go: {all: [/Start:\s*\w+\.Start\b/], none: [/Start:\s*0\b/]},
-        scala: {all: [/start\s*=\s*\w+\.start\b/], none: [/start\s*=\s*0\b/]},
         cpp: {all: [/\.start\s*=\s*\w+->start\b/], none: [/\.start\s*=\s*0\b/]},
       },
     },
@@ -102,7 +98,6 @@ Requirements:
         python: {all: [/ex\s*=\s*CACHE_TTL_S/, /rag:q:\{tenant\}/]},
         typescript: {all: [/['"]EX['"],\s*CACHE_TTL_S/, /rag:q:\$\{tenant\}/]},
         go: {all: [/\bcacheTTL\b/, /"rag:q:"\s*\+\s*tenant/]},
-        scala: {all: [/\bCacheTtlSeconds\b/, /rag:q:\$tenant/]},
         cpp: {all: [/\bkCacheTtl\b/, /"rag:q:"\s*\+\s*tenant/]},
       },
     },
@@ -416,100 +411,6 @@ func retrieve(ctx context.Context, tenant, query string, k int) ([]search.Hit, e
 		return nil, err
 	}
 	return hits, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.security.MessageDigest
-
-import redis.clients.jedis.JedisPooled
-
-import rag.{Embed, Hit, Search}
-
-object Retriever {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private def sha256Hex(text: String): String =
-    MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString
-
-  private def encode(hits: Seq[Hit]): String = ujson.write(ujson.Arr.from(hits.map { h =>
-    ujson.Obj("chunk_id" -> h.chunk_id, "doc_id" -> h.doc_id, "version" -> h.version, "start" -> h.start, "end" -> h.end, "text" -> h.text, "score" -> h.score)
-  }))
-
-  private def decode(raw: String): Seq[Hit] = ujson.read(raw).arr.toSeq.map { h =>
-    Hit(h("chunk_id").str, h("doc_id").str, h("version").num.toInt, h("start").num.toInt, h("end").num.toInt, h("text").str, h("score").num)
-  }
-
-  /** The best chunks for the query. */
-  def retrieve(tenant: String, query: String, k: Int): Seq[Hit] = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val key = "rag:q:" + sha256Hex(query)
-    Option(jedis.get(key)) match {
-      case Some(cached) => decode(cached)
-      case None =>
-        val lexical = Search.lexical(tenant, query, k)
-        val nearest = Search.knn("*", Embed.vector(query), k)
-        val merged = lexical ++ nearest.filterNot(lexical.contains)
-        val hits = merged.take(k).zipWithIndex.flatMap { case (cid, i) =>
-          Search.getChunk(cid).map { c =>
-            Hit(chunk_id = cid, doc_id = c.doc_id, version = c.version, start = 0, end = c.text.length, text = c.text, score = 1.0 / (i + 1))
-          }
-        }
-        jedis.set(key, encode(hits))
-        hits
-    }
-  }
-}
-`,
-      solution: `import java.security.MessageDigest
-
-import redis.clients.jedis.JedisPooled
-
-import rag.{Embed, Hit, Search}
-
-object Retriever {
-  val MaxK = 20
-  val Candidates = 50
-  val RrfK = 60
-  val CacheTtlSeconds = 60L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private def sha256Hex(text: String): String =
-    MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString
-
-  private def encode(hits: Seq[Hit]): String = ujson.write(ujson.Arr.from(hits.map { h =>
-    ujson.Obj("chunk_id" -> h.chunk_id, "doc_id" -> h.doc_id, "version" -> h.version, "start" -> h.start, "end" -> h.end, "text" -> h.text, "score" -> h.score)
-  }))
-
-  private def decode(raw: String): Seq[Hit] = ujson.read(raw).arr.toSeq.map { h =>
-    Hit(h("chunk_id").str, h("doc_id").str, h("version").num.toInt, h("start").num.toInt, h("end").num.toInt, h("text").str, h("score").num)
-  }
-
-  /** The best chunks for the query. */
-  def retrieve(tenant: String, query: String, requested: Int): Seq[Hit] = {
-    val k = math.max(1, math.min(requested, MaxK))
-    val key = s"rag:q:$tenant:$k:\${sha256Hex(query)}"
-    Option(jedis.get(key)) match {
-      case Some(cached) => decode(cached)
-      case None =>
-        val lexical = Search.lexical(tenant, query, Candidates)
-        val nearest = Search.knn(Search.tenantFilter(tenant), Embed.vector(query), Candidates)
-        val score = scala.collection.mutable.Map.empty[String, Double].withDefaultValue(0.0)
-        for (ranked <- Seq(lexical, nearest); (cid, i) <- ranked.zipWithIndex) {
-          val rank = i + 1
-          score(cid) += 1.0 / (RrfK + rank)
-        }
-        val order = score.toSeq.sortBy { case (cid, s) => (-s, cid) }.map(_._1).take(k)
-        val hits = order.flatMap { cid =>
-          Search.getChunk(cid).map { c =>
-            Hit(chunk_id = cid, doc_id = c.doc_id, version = c.version, start = c.start, end = c.end, text = c.text, score = score(cid))
-          }
-        }
-        jedis.setex(key, CacheTtlSeconds, encode(hits))
-        hits
-    }
-  }
 }
 `,
     },

@@ -76,15 +76,6 @@ runs is counted out again.
           ],
           none: [/store\.Insert\(/],
         },
-        scala: {
-          all: [
-            /redis\.call\(\s*['"]SET['"]/,
-            /redis\.call\(\s*['"]ZADD['"]/,
-            /redis\.call\(\s*['"]INCR['"]/,
-            /jedis\.eval(sha)?\(/,
-          ],
-          none: [/Store\.insert\(/],
-        },
         cpp: {
           all: [
             /redis\.call\(\s*['"]SET['"]/,
@@ -111,10 +102,6 @@ runs is counted out again.
           none: [/hot:threads/],
         },
         go: {all: [/"thread:"\s*\+\s*tenant/, /":count"/, /":replies"/, /"hot:"\s*\+\s*tenant/], none: [/hot:threads/]},
-        scala: {
-          all: [/thread:\$tenant:\$\w+:count/, /thread:\$tenant:\$\w+:replies/, /hot:\$tenant/],
-          none: [/hot:threads/],
-        },
         cpp: {
           all: [/"thread:"\s*\+\s*tenant/, /":count"/, /":replies"/, /"hot:"\s*\+\s*tenant/],
           none: [/hot:threads/],
@@ -130,7 +117,6 @@ runs is counted out again.
         python: {all: [/HOT_TTL_S\s*=\s*3600/, /['"]EXPIRE['"]/, /HOT_PAGE_SIZE\s*-\s*1/]},
         typescript: {all: [/HOT_TTL_S\s*=\s*3600/, /['"]EXPIRE['"]/, /HOT_PAGE_SIZE\s*-\s*1/]},
         go: {all: [/hotTTLSeconds\s*=\s*3600/, /['"]EXPIRE['"]/, /hotPageSize\s*-\s*1/]},
-        scala: {all: [/HotTtlSeconds\s*=\s*3600/, /['"]EXPIRE['"]/, /HotPageSize\s*-\s*1/]},
         cpp: {all: [/kHotTtlSeconds\s*=\s*3600/, /['"]EXPIRE['"]/, /kHotPageSize\s*-\s*1/]},
       },
     },
@@ -143,7 +129,6 @@ runs is counted out again.
         python: {all: [/redis\.call\(\s*['"]ZCARD['"]/, /def recount_thread/], none: [/store\.indexed_count\(/]},
         typescript: {all: [/redis\.call\(\s*['"]ZCARD['"]/, /function recountThread/], none: [/\bindexedCount\(/]},
         go: {all: [/redis\.call\(\s*['"]ZCARD['"]/, /func recountThread/], none: [/store\.IndexedCount\(/]},
-        scala: {all: [/redis\.call\(\s*['"]ZCARD['"]/, /def recountThread/], none: [/Store\.indexedCount\(/]},
         cpp: {all: [/redis\.call\(\s*['"]ZCARD['"]/, /recountThread\(/], none: [/store::indexedCount\(/]},
       },
     },
@@ -509,105 +494,6 @@ func replyCounts(ctx context.Context, tenant, threadID string, ids []string) map
 // hotThreads is the tenant's hot threads, most comments first.
 func hotThreads(ctx context.Context, tenant string) ([]string, error) {
 	return rdb.ZRevRange(ctx, hotKey(tenant), 0, hotPageSize-1).Result()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import comments.Store // Store.Comment, insert, indexedCount, rowKey, indexKey
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Store the comment and count it: the thread's comments, the parent's replies, the tenant's hot threads. Returns the thread's count. */
-  def commitComment(tenant: String, comment: Store.Comment): Long = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    Store.insert(tenant, comment)
-    val count = jedis.incr(s"thread:\${comment.threadId}:count")
-    if (comment.parentId.nonEmpty) jedis.hincrBy(s"thread:\${comment.threadId}:replies", comment.parentId, 1L)
-    jedis.zincrby("hot:threads", 1.0, comment.threadId)
-    count
-  }
-
-  /** Reset the thread's counter from its index, the repair after a crash; returns the count. */
-  def recountThread(tenant: String, threadId: String): Long = {
-    val n = Store.indexedCount(tenant, threadId)
-    jedis.set(s"thread:$threadId:count", n.toString)
-    n
-  }
-
-  def threadCount(tenant: String, threadId: String): Long =
-    Option(jedis.get(s"thread:$threadId:count")).map(_.toLong).getOrElse(0L)
-
-  /** Each id's reply count (0 when it has none). */
-  def replyCounts(tenant: String, threadId: String, ids: Seq[String]): Map[String, Long] =
-    if (ids.isEmpty) Map.empty
-    else ids.zip(jedis.hmget(s"thread:$threadId:replies", ids: _*).asScala).map { case (id, n) => id -> Option(n).map(_.toLong).getOrElse(0L) }.toMap
-
-  /** The tenant's hot threads, most comments first. */
-  def hotThreads(tenant: String): Seq[String] = jedis.zrevrange("hot:threads", 0, -1).asScala.toSeq
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import comments.Store // Store.Comment, insert, indexedCount, rowKey, indexKey
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val HotTtlSeconds = 3600L
-  val HotPageSize = 10
-
-  /** The comment, its index entry and every counter: Redis runs the script with nothing in between. */
-  val CommitLua: String =
-    """redis.call('SET', KEYS[1], ARGV[1])
-      |redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3])
-      |local count = redis.call('INCR', KEYS[3])
-      |if ARGV[4] ~= '' then
-      |  redis.call('HINCRBY', KEYS[4], ARGV[4], 1)
-      |end
-      |redis.call('ZINCRBY', KEYS[5], 1, ARGV[5])
-      |redis.call('EXPIRE', KEYS[5], ARGV[6])
-      |return count
-      |""".stripMargin
-
-  val RecountLua: String =
-    """local n = redis.call('ZCARD', KEYS[1])
-      |redis.call('SET', KEYS[2], n)
-      |return n
-      |""".stripMargin
-
-  def countKey(tenant: String, threadId: String): String = s"thread:$tenant:$threadId:count"
-  def repliesKey(tenant: String, threadId: String): String = s"thread:$tenant:$threadId:replies"
-  def hotKey(tenant: String): String = s"hot:$tenant"
-
-  /** Store the comment and count it: the thread's comments, the parent's replies, the tenant's hot threads. Returns the thread's count. */
-  def commitComment(tenant: String, comment: Store.Comment): Long = {
-    val threadId = comment.threadId
-    val keys = List(Store.rowKey(tenant, comment.id), Store.indexKey(tenant, threadId), countKey(tenant, threadId), repliesKey(tenant, threadId), hotKey(tenant))
-    val args = List(Store.toJson(comment).compactPrint, comment.seq.toString, comment.id, comment.parentId, threadId, HotTtlSeconds.toString)
-    jedis.eval(CommitLua, keys.asJava, args.asJava).asInstanceOf[java.lang.Long]
-  }
-
-  /** Reset the thread's counter from its index, the repair after a crash; returns the count. */
-  def recountThread(tenant: String, threadId: String): Long =
-    jedis.eval(RecountLua, List(Store.indexKey(tenant, threadId), countKey(tenant, threadId)).asJava, List.empty[String].asJava).asInstanceOf[java.lang.Long]
-
-  def threadCount(tenant: String, threadId: String): Long =
-    Option(jedis.get(countKey(tenant, threadId))).map(_.toLong).getOrElse(0L)
-
-  /** Each id's reply count (0 when it has none). */
-  def replyCounts(tenant: String, threadId: String, ids: Seq[String]): Map[String, Long] =
-    if (ids.isEmpty) Map.empty
-    else ids.zip(jedis.hmget(repliesKey(tenant, threadId), ids: _*).asScala).map { case (id, n) => id -> Option(n).map(_.toLong).getOrElse(0L) }.toMap
-
-  /** The tenant's hot threads, most comments first. */
-  def hotThreads(tenant: String): Seq[String] = jedis.zrevrange(hotKey(tenant), 0, HotPageSize - 1).asScala.toSeq
 }
 `,
     },

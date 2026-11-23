@@ -59,7 +59,6 @@ millisecond share one id, so the second overwrites the first.
         python: {all: [/@app\.post\(\s*["']\/v1\/training\/runs["']/, /queue\.enqueue\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/training\/runs['"]/, /enqueue\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/training\/runs"/, /queue\.Enqueue\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"training"\s*\/\s*"runs"\s*\)/, /\bpost\s*\{/, /Queue\.enqueue\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/training\/runs"/, /queue::enqueue\(/]},
       },
     },
@@ -74,7 +73,6 @@ millisecond share one id, so the second overwrites the first.
           all: [/Math\.min\([^\n]*PRIORITY_MAX|>\s*PRIORITY_MAX/, /Math\.max\([^\n]*PRIORITY_MIN|<\s*PRIORITY_MIN/],
         },
         go: {all: [/min\([^\n]*priorityMax|>\s*priorityMax/, /max\([^\n]*priorityMin|<\s*priorityMin/]},
-        scala: {all: [/min\([^\n]*PriorityMax|>\s*PriorityMax/, /max\([^\n]*PriorityMin|<\s*PriorityMin/]},
         cpp: {
           all: [
             /clamp\([^\n]*kPriorityMax|min\([^\n]*kPriorityMax|>\s*kPriorityMax/,
@@ -92,10 +90,6 @@ millisecond share one id, so the second overwrites the first.
         python: {all: [/not in KNOWN_RECIPES/, /\b400\b/], order: [/not in KNOWN_RECIPES/, /queue\.enqueue\(/]},
         typescript: {all: [/KNOWN_RECIPES\.has\(/, /\b400\b/], order: [/KNOWN_RECIPES\.has\(/, /enqueue\(run/]},
         go: {all: [/knownRecipes\[/, /StatusBadRequest|\b400\b/], order: [/knownRecipes\[/, /queue\.Enqueue\(/]},
-        scala: {
-          all: [/KnownRecipes\.contains\(/, /BadRequest/],
-          order: [/KnownRecipes\.contains\(/, /Queue\.enqueue\(/],
-        },
         cpp: {
           all: [/kKnownRecipes\.(count|find|contains)\(/, /\b400\b/],
           order: [/kKnownRecipes\.(count|find|contains)\(/, /queue::enqueue\(/],
@@ -117,10 +111,6 @@ millisecond share one id, so the second overwrites the first.
           all: [/Idempotency-Key/i, /runs\.RunForKey\(/, /runs\.BindKey\(/],
           order: [/runs\.RunForKey\(/, /queue\.Enqueue\(/],
         },
-        scala: {
-          all: [/Idempotency-Key/i, /Runs\.runForKey\(/, /Runs\.bindKey\(/],
-          order: [/Runs\.runForKey\(/, /Queue\.enqueue\(/],
-        },
         cpp: {
           all: [/Idempotency-Key/i, /runs::runForKey\(/, /runs::bindKey\(/],
           order: [/runs::runForKey\(/, /queue::enqueue\(/],
@@ -136,7 +126,6 @@ millisecond share one id, so the second overwrites the first.
         python: {all: [/runs\.new_run_id\(\)/], none: [/f["']run-\{/]},
         typescript: {all: [/newRunId\(\)/], none: [/`run-\$\{/]},
         go: {all: [/runs\.NewRunID\(/], none: [/"run-%d"|"run-"\s*\+/]},
-        scala: {all: [/Runs\.newRunId\(\)/], none: [/s"run-\$/]},
         cpp: {all: [/runs::newRunId\(\)/], none: [/"run-"\s*\+/]},
       },
     },
@@ -492,108 +481,6 @@ func submit(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/training/runs", submit)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import trainsched.{Queue, Runs} // Runs.newRunId, put, get, runForKey, bindKey; Queue.enqueue
-
-object Submit {
-  val PriorityMin = 0
-  val PriorityMax = 8
-  val BandWidth = 3 // band 0: priorities 6-8, band 1: 3-5, band 2: 0-2
-  val KnownRecipes: Set[String] = Set("llama-ft-v3", "vit-pretrain-v1", "embed-distill-v2")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def view(run: Runs.Run): JsObject =
-    JsObject("run_id" -> JsString(run.runId), "state" -> JsString(run.state), "priority" -> JsNumber(run.priority), "band" -> JsNumber(run.band))
-
-  private def text(body: JsObject, name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  val route: Route =
-    path("v1" / "training" / "runs") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            tenant.filter(_.nonEmpty) match {
-              case None => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-              case Some(t) =>
-                val body = raw.parseJson.asJsObject
-                val priority = body.fields.get("priority").collect { case JsNumber(n) => n.toInt }.getOrElse(4)
-                val nowMs = System.currentTimeMillis()
-                val run = Runs.Run(s"run-$nowMs", t, text(body, "recipe_version"), text(body, "dataset_version"), priority, (PriorityMax - priority) / BandWidth, "queued", nowMs)
-                Runs.put(run)
-                Queue.enqueue(run.runId, run.band, run.enqueuedAtMs)
-                complete(json(StatusCodes.Created, view(run)))
-            }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import trainsched.{Queue, Runs} // Runs.newRunId, put, get, runForKey, bindKey; Queue.enqueue
-
-object Submit {
-  val PriorityMin = 0
-  val PriorityMax = 8
-  val BandWidth = 3 // band 0: priorities 6-8, band 1: 3-5, band 2: 0-2
-  val KnownRecipes: Set[String] = Set("llama-ft-v3", "vit-pretrain-v1", "embed-distill-v2")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def view(run: Runs.Run): JsObject =
-    JsObject("run_id" -> JsString(run.runId), "state" -> JsString(run.state), "priority" -> JsNumber(run.priority), "band" -> JsNumber(run.band))
-
-  private def text(body: JsObject, name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  val route: Route =
-    path("v1" / "training" / "runs") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-          optionalHeaderValueByName("Idempotency-Key") { key =>
-            entity(as[String]) { raw =>
-              (tenant.filter(_.nonEmpty), key.filter(_.nonEmpty)) match {
-                case (None, _) => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-                case (_, None) => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
-                case (Some(t), Some(k)) =>
-                  Runs.runForKey(t, k).flatMap(Runs.get) match {
-                    case Some(replayed) => complete(json(StatusCodes.OK, view(replayed))) // a retry answers the run it created
-                    case None =>
-                      val body = raw.parseJson.asJsObject
-                      val recipe = text(body, "recipe_version")
-                      if (!KnownRecipes.contains(recipe)) complete(StatusCodes.BadRequest -> s"unknown recipe_version $recipe")
-                      else {
-                        // Clamp first: the band is computed from a priority the scheduler supports.
-                        val requested = body.fields.get("priority").collect { case JsNumber(n) => n.toInt }.getOrElse(4)
-                        val priority = math.min(math.max(requested, PriorityMin), PriorityMax)
-                        val run = Runs.Run(Runs.newRunId(), t, recipe, text(body, "dataset_version"), priority, (PriorityMax - priority) / BandWidth, "queued", System.currentTimeMillis())
-                        Runs.put(run)
-                        Runs.bindKey(t, k, run.runId)
-                        Queue.enqueue(run.runId, run.band, run.enqueuedAtMs)
-                        complete(json(StatusCodes.Created, view(run)))
-                      }
-                  }
-              }
-            }
-          }
-        }
-      }
-    }
 }
 `,
     },

@@ -46,12 +46,11 @@ leader failover loses one; and a delivery that fails after \`produce\` returned 
       id: 'tenant-key',
       title: 'Keys suggest.event by tenant',
       detail:
-        "The record key is the tenant (`key=tenant`, `key: tenant`, `[]byte(tenant)`, `ProducerRecord(Topic, tenant, …)`), so one tenant's impressions and selections share a partition and stay in order; keyed by prefix they scatter.",
+        "The record key is the tenant (`key=tenant`, `key: tenant`, `[]byte(tenant)`), so one tenant's impressions and selections share a partition and stay in order; keyed by prefix they scatter.",
       match: {
         python: {all: [/key\s*=\s*tenant\b/], none: [/key\s*=\s*prefix\b/]},
         typescript: {all: [/key:\s*tenant\b/], none: [/key:\s*prefix\b/]},
         go: {all: [/Key:\s*\[\]byte\(tenant\)/], none: [/Key:\s*\[\]byte\(prefix\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*tenant\b/], none: [/\(Topic,\s*prefix\b/]},
         cpp: {all: [/tenant\.c_str\(\),\s*tenant\.(size|length)\(\)/], none: [/prefix\.c_str\(\)/]},
       },
     },
@@ -64,7 +63,6 @@ leader failover loses one; and a delivery that fails after \`produce\` returned 
         python: {all: [/prefix_hash\(\s*tenant/, /["']prefix_hash["']/], none: [/["']prefix["']\s*:\s*prefix\b/]},
         typescript: {all: [/prefixHash\(\s*tenant/, /prefix_hash/], none: [/\bprefix:\s*prefix\b|\{[^}\n]*\bprefix,/]},
         go: {all: [/privacy\.PrefixHash\(\s*tenant/, /"prefix_hash"/], none: [/"prefix":\s*prefix\b/]},
-        scala: {all: [/Privacy\.prefixHash\(\s*tenant/, /"prefix_hash"/], none: [/"prefix"\s*->/]},
         cpp: {all: [/privacy::prefixHash\(\s*tenant/, /"prefix_hash"/], none: [/\{"prefix",\s*prefix\}/]},
       },
     },
@@ -77,7 +75,6 @@ leader failover loses one; and a delivery that fails after \`produce\` returned 
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -93,10 +90,6 @@ leader failover loses one; and a delivery that fails after \`produce\` returned 
         },
         typescript: {all: [/insert\(/, /await producer\.send\(/], none: [/void producer\.send\(/]},
         go: {all: [/outbox\.Insert\(/, /TopicPartition\.Error/], none: [/Produce\([^\n]*,\s*nil\)/]},
-        scala: {
-          all: [/Outbox\.insert\(/, /\.get\(\s*[^\n]*TimeUnit|onCompletion/],
-          none: [/case\s+\w+:\s*KafkaException/],
-        },
         cpp: {all: [/outbox::insert\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -307,91 +300,6 @@ func publishEvent(ctx context.Context, tenant, kind, prefix string, position, la
 		return false, outbox.Insert(ctx, topic, tenant, payload)
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import suggest.{Outbox, Privacy} // Outbox.insert, Privacy.prefixHash
-
-object Events {
-  val Topic = "suggest.event"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** One impression or selection on suggest.event; true when the event is on its way. */
-  def publishEvent(tenant: String, kind: String, prefix: String, position: Int, latencyMs: Int): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val payload = JsObject(
-      "type" -> JsString(kind),
-      "tenant" -> JsString(tenant),
-      "prefix" -> JsString(prefix),
-      "position" -> JsNumber(position),
-      "latency_ms" -> JsNumber(latencyMs)
-    )
-    try {
-      producer.send(new ProducerRecord[String, String](Topic, prefix, payload.compactPrint))
-      true
-    } catch {
-      case _: KafkaException =>
-        Outbox.insert(Topic, prefix, payload)
-        false
-    }
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import suggest.{Outbox, Privacy} // Outbox.insert, Privacy.prefixHash
-
-object Events {
-  val Topic = "suggest.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** One impression or selection on suggest.event; true once the broker acknowledged it. */
-  def publishEvent(tenant: String, kind: String, prefix: String, position: Int, latencyMs: Int): Boolean = {
-    // The hash joins equal prefixes of one tenant; the text stays in the service.
-    val payload = JsObject(
-      "type" -> JsString(kind),
-      "tenant" -> JsString(tenant),
-      "prefix_hash" -> JsString(Privacy.prefixHash(tenant, prefix)),
-      "position" -> JsNumber(position),
-      "latency_ms" -> JsNumber(latencyMs)
-    )
-    val record = new ProducerRecord[String, String](Topic, tenant, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so the count is late, not wrong.
-      Outbox.insert(Topic, tenant, payload)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

@@ -48,10 +48,6 @@ reported as sent and lost.
         python: {all: [/key\s*=\s*dataset\b/], none: [/key\s*=\s*record\[["']owner/]},
         typescript: {all: [/key:\s*dataset\b/], none: [/key:\s*record\.owner/]},
         go: {all: [/Key:\s*\[\]byte\(dataset\)/], none: [/\[\]byte\(record\.Owner\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(EventTopic,\s*dataset\b/],
-          none: [/EventTopic,\s*record\.owner/],
-        },
         cpp: {all: [/dataset\.c_str\(\),\s*dataset\.size\(\)/], none: [/owner\.c_str\(\)/]},
       },
     },
@@ -64,7 +60,6 @@ reported as sent and lost.
         python: {all: [/dataset\.promoted/], none: [/\bsample\b/, /read_object\(/]},
         typescript: {all: [/dataset\.promoted/], none: [/\bsample\b/, /readObject\(/]},
         go: {all: [/dataset\.promoted/], none: [/\bsample\b/, /ReadObject\(/]},
-        scala: {all: [/dataset\.promoted/], none: [/\bsample\b/, /readObject\(/]},
         cpp: {all: [/dataset\.promoted/], none: [/\bsample\b/, /readObject\(/]},
       },
     },
@@ -77,7 +72,6 @@ reported as sent and lost.
         python: {order: [/def publish_promotion/, /pointer\.promote\(/, /producer\.produce\(/]},
         typescript: {order: [/function publishPromotion/, /\bpromote\(/, /producer\.send\(/]},
         go: {order: [/func publishPromotion/, /pointer\.Promote\(/, /writer\.WriteMessages\(/]},
-        scala: {order: [/def publishPromotion/, /Pointer\.promote\(/, /producer\.send\(/]},
         cpp: {order: [/bool publishPromotion/, /pointer::promote\(/, /producer->produce\(/]},
       },
     },
@@ -93,7 +87,6 @@ reported as sent and lost.
         },
         typescript: {all: [/await producer\.send\(/, /addOutbox\(/], none: [/void producer\.send\(/]},
         go: {all: [/store\.AddOutbox\(/], none: [/log\.Printf/]},
-        scala: {all: [/\.get\(\s*[^\n]*TimeUnit/, /Store\.addOutbox\(/]},
         cpp: {all: [/dr_cb/, /->flush\(/, /store::addOutbox\(/], none: [/producer->poll\(\s*0\s*\)/]},
       },
     },
@@ -376,91 +369,6 @@ func publishPromotion(ctx context.Context, dataset, version, actor string) (bool
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import registry.{Pointer, Store} // Pointer.promote, Store.version, Store.readObject, Store.addOutbox
-
-object Events {
-  val EventTopic = "dataset.event"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def eventPayload(record: Store.VersionRecord, actor: String): JsObject = {
-    val rows = Store.readObject(record.contentSha256).getOrElse("").split("\\n").take(3)
-    JsObject(
-      "type" -> JsString("dataset.promoted"), "dataset" -> JsString(record.dataset), "version" -> JsString(record.version),
-      "content_sha256" -> JsString(record.contentSha256), "license" -> JsString(record.license),
-      "row_count" -> JsNumber(record.rowCount), "actor" -> JsString(actor),
-      "sample" -> JsArray(rows.map(JsString(_)).toVector)) // consumers preview the rows without a download
-  }
-
-  /** Promote a version and tell the consumers; true once the broker has the event. */
-  def publishPromotion(dataset: String, version: String, actor: String): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val record = Store.version(dataset, version).getOrElse(throw new IllegalArgumentException(s"$dataset@$version is not registered"))
-    val payload = eventPayload(record, actor)
-    try producer.send(new ProducerRecord[String, String](EventTopic, record.owner, payload.compactPrint))
-    catch {
-      case _: KafkaException =>
-        Store.addOutbox(EventTopic, record.owner, payload)
-        return false
-    }
-    Pointer.promote(dataset, version, actor)
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import registry.{Pointer, Store} // Pointer.promote, Store.version, Store.readObject, Store.addOutbox
-
-object Events {
-  val EventTopic = "dataset.event"
-  val DeliveryTimeoutMs = 5000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Identity and outcome only: the rows stay behind the registry's access rules. */
-  def eventPayload(record: Store.VersionRecord, actor: String): JsObject = JsObject(
-    "type" -> JsString("dataset.promoted"), "dataset" -> JsString(record.dataset), "version" -> JsString(record.version),
-    "content_sha256" -> JsString(record.contentSha256), "license" -> JsString(record.license),
-    "row_count" -> JsNumber(record.rowCount), "actor" -> JsString(actor))
-
-  /** Promote a version and tell the consumers; true once the broker has the event. */
-  def publishPromotion(dataset: String, version: String, actor: String): Boolean = {
-    val record = Store.version(dataset, version).getOrElse(throw new IllegalArgumentException(s"$dataset@$version is not registered"))
-    // Commit first: an event may lag the pointer, it never leads it.
-    Pointer.promote(dataset, version, actor)
-    val payload = eventPayload(record, actor)
-    val acked = Try(producer.send(new ProducerRecord[String, String](EventTopic, dataset, payload.compactPrint)).get(DeliveryTimeoutMs, TimeUnit.MILLISECONDS))
-    // The broker did not take it: a relay produces the row later, so consumers are late, not wrong.
-    if (acked.isFailure) Store.addOutbox(EventTopic, dataset, payload)
-    acked.isSuccess
-  }
 }
 `,
     },

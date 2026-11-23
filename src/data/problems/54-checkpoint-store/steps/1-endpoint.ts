@@ -68,7 +68,6 @@ carrying different bytes is accepted. Each one resumes as wrong weights.
           ],
         },
         go: {all: [/"POST \/v1\/checkpoints"/, /"PUT \/v1\/checkpoints\/\{id\}\/chunks\/\{index\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"checkpoints"\s*\)/, /"chunks"\s*\/\s*LongNumber/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/checkpoints"/, /svr\.Put\(\s*R"\(\/v1\/checkpoints\//]},
       },
     },
@@ -81,7 +80,6 @@ carrying different bytes is accepted. Each one resumes as wrong weights.
         python: {all: [/store\.put_chunk\(\s*upload_id,\s*index\b/], none: [/put_chunk\(\s*upload_id,\s*slot\b/]},
         typescript: {all: [/putChunk\(\s*uploadId,\s*index\b/], none: [/putChunk\(\s*uploadId,\s*slot\b/]},
         go: {all: [/store\.PutChunk\(\s*ctx,\s*uploadID,\s*index\b/], none: [/PutChunk\(\s*ctx,\s*uploadID,\s*slot\b/]},
-        scala: {all: [/Store\.putChunk\(\s*uploadId,\s*index\b/], none: [/putChunk\(\s*uploadId,\s*slot\b/]},
         cpp: {all: [/store::putChunk\(\s*upload_id,\s*index\b/], none: [/putChunk\(\s*upload_id,\s*slot\b/]},
       },
     },
@@ -99,10 +97,6 @@ carrying different bytes is accepted. Each one resumes as wrong weights.
         go: {
           all: [/StatusConflict|\b409\b/],
           order: [/store\.StoredCount\(/, /index\s*>\s*\w+|\w+\s*<\s*index/, /store\.PutChunk\(/],
-        },
-        scala: {
-          all: [/Conflict|\b409\b/],
-          order: [/Store\.storedCount\(/, /index\s*>\s*\w+|\w+\s*<\s*index/, /Store\.putChunk\(/],
         },
         cpp: {
           all: [/\b409\b/],
@@ -122,7 +116,6 @@ carrying different bytes is accepted. Each one resumes as wrong weights.
           all: [/StatusConflict|\b409\b/],
           order: [/store\.ChunkDigest\(\s*ctx,\s*uploadID,\s*index/, /store\.PutChunk\(/],
         },
-        scala: {all: [/Conflict|\b409\b/], order: [/Store\.chunkDigest\(\s*uploadId,\s*index/, /Store\.putChunk\(/]},
         cpp: {all: [/\b409\b/], order: [/store::chunkDigest\(\s*upload_id,\s*index/, /store::putChunk\(/]},
       },
     },
@@ -450,147 +443,6 @@ func putChunk(rw http.ResponseWriter, r *http.Request) {
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/checkpoints", openCheckpoint)
 	mux.HandleFunc("PUT /v1/checkpoints/{id}/chunks/{index}", putChunk)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import checkpoint.Store // Store.runTenant, openUpload, upload, decode, digest, storedCount, chunkDigest, putChunk
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def text(body: Map[String, JsValue], name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
-  private def number(body: Map[String, JsValue], name: String): Long = body.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-
-  private def uploadJson(u: Store.Upload): JsObject =
-    JsObject("upload_id" -> JsString(u.uploadId), "run_id" -> JsString(u.runId), "step" -> JsNumber(u.step), "chunks" -> JsNumber(u.chunks))
-
-  private def staged(uploadId: String, index: Long, received: Long): JsObject =
-    JsObject("upload_id" -> JsString(uploadId), "index" -> JsNumber(index), "received" -> JsNumber(received))
-
-  val route: Route = concat(
-    path("v1" / "checkpoints") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-          case Some(tenant) =>
-            entity(as[String]) { raw =>
-              val body = raw.parseJson.asJsObject.fields
-              val runId = text(body, "run_id")
-              if (!Store.runTenant(runId).contains(tenant)) complete(error(StatusCodes.NotFound, "no such run"))
-              else complete(json(StatusCodes.Created, uploadJson(Store.openUpload(runId, tenant, number(body, "step"), number(body, "chunks")))))
-            }
-        }
-      }
-    },
-    path("v1" / "checkpoints" / Segment / "chunks" / LongNumber) { (uploadId, index) =>
-      put {
-        // TODO: this starter has 3 flaws. The task says where to look; the checks say what must change.
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-          case Some(tenant) =>
-            entity(as[String]) { raw =>
-              Store.upload(uploadId).filter(_.tenant == tenant) match {
-                case None => complete(error(StatusCodes.NotFound, "no such upload"))
-                case Some(_) =>
-                  Store.decode(text(raw.parseJson.asJsObject.fields, "data")) match {
-                    case None => complete(error(StatusCodes.BadRequest, "data must be base64"))
-                    case Some(payload) =>
-                      val slot = Store.storedCount(uploadId) // chunks arrive in order: each one takes the next slot
-                      Store.putChunk(uploadId, slot, payload, Store.digest(payload))
-                      complete(json(StatusCodes.OK, staged(uploadId, slot, slot + 1)))
-                  }
-              }
-            }
-        }
-      }
-    },
-  )
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import checkpoint.Store // Store.runTenant, openUpload, upload, decode, digest, storedCount, chunkDigest, putChunk
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def text(body: Map[String, JsValue], name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
-  private def number(body: Map[String, JsValue], name: String): Long = body.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-
-  private def uploadJson(u: Store.Upload): JsObject =
-    JsObject("upload_id" -> JsString(u.uploadId), "run_id" -> JsString(u.runId), "step" -> JsNumber(u.step), "chunks" -> JsNumber(u.chunks))
-
-  private def staged(uploadId: String, index: Long, received: Long): JsObject =
-    JsObject("upload_id" -> JsString(uploadId), "index" -> JsNumber(index), "received" -> JsNumber(received))
-
-  /** Stage the chunk at its own index: a gap or a replay with different bytes is a conflict. */
-  private def stage(upload: Store.Upload, index: Long, payload: Array[Byte]): HttpResponse = {
-    val uploadId = upload.uploadId
-    val stored = Store.storedCount(uploadId)
-    // A gap: staging it now would leave a hole the commit can never fill in order.
-    if (index >= upload.chunks || index > stored) error(StatusCodes.Conflict, s"chunk out of order, expected $stored")
-    else {
-      val chunkSha = Store.digest(payload)
-      if (index < stored) {
-        // A redelivery: the same bytes are already staged, different bytes are a conflict.
-        if (!Store.chunkDigest(uploadId, index).contains(chunkSha)) error(StatusCodes.Conflict, "chunk differs from the staged one")
-        else json(StatusCodes.OK, staged(uploadId, index, stored))
-      } else {
-        Store.putChunk(uploadId, index, payload, chunkSha)
-        json(StatusCodes.OK, staged(uploadId, index, stored + 1))
-      }
-    }
-  }
-
-  val route: Route = concat(
-    path("v1" / "checkpoints") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-          case Some(tenant) =>
-            entity(as[String]) { raw =>
-              val body = raw.parseJson.asJsObject.fields
-              val runId = text(body, "run_id")
-              if (!Store.runTenant(runId).contains(tenant)) complete(error(StatusCodes.NotFound, "no such run"))
-              else complete(json(StatusCodes.Created, uploadJson(Store.openUpload(runId, tenant, number(body, "step"), number(body, "chunks")))))
-            }
-        }
-      }
-    },
-    path("v1" / "checkpoints" / Segment / "chunks" / LongNumber) { (uploadId, index) =>
-      put {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-          case Some(tenant) =>
-            entity(as[String]) { raw =>
-              Store.upload(uploadId).filter(_.tenant == tenant) match {
-                case None => complete(error(StatusCodes.NotFound, "no such upload"))
-                case Some(upload) =>
-                  Store.decode(text(raw.parseJson.asJsObject.fields, "data")) match {
-                    case None => complete(error(StatusCodes.BadRequest, "data must be base64"))
-                    case Some(payload) => complete(stage(upload, index, payload))
-                  }
-              }
-            }
-        }
-      }
-    },
-  )
 }
 `,
     },

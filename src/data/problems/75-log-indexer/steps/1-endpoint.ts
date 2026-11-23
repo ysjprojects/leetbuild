@@ -55,7 +55,6 @@ record with an unknown level or a clock an hour off lands in the index.
         python: {all: [/@app\.post\(\s*["']\/v1\/logs["']/, /append_record\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/logs['"]/, /appendRecord\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/logs"/, /buffer\.AppendRecord\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"logs"\s*\)/, /Buffer\.appendRecord\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/logs"/, /buffer::appendRecord\(/]},
       },
     },
@@ -68,7 +67,6 @@ record with an unknown level or a clock an hour off lands in the index.
         python: {all: [/\b401\b/, /registry\.is_registered\(/, /\b400\b/]},
         typescript: {all: [/code\(\s*401\s*\)/, /isRegistered\(/, /code\(\s*400\s*\)/]},
         go: {all: [/StatusUnauthorized/, /registry\.IsRegistered\(/, /StatusBadRequest/]},
-        scala: {all: [/StatusCodes\.Unauthorized/, /Registry\.isRegistered\(/, /StatusCodes\.BadRequest/]},
         cpp: {all: [/\b401\b/, /registry::isRegistered\(/, /\b400\b/]},
       },
     },
@@ -81,7 +79,6 @@ record with an unknown level or a clock an hour off lands in the index.
         python: {all: [/MAX_RECORD_BYTES\s*=\s*1\s*<<\s*20/, /\b413\b/], order: [/\b413\b/, /json\.loads\(/]},
         typescript: {all: [/MAX_RECORD_BYTES\s*=\s*1\s*<<\s*20/, /bodyLimit:\s*MAX_RECORD_BYTES/]},
         go: {all: [/maxRecordBytes\s*=\s*1\s*<<\s*20/, /MaxBytesReader\(/, /StatusRequestEntityTooLarge/]},
-        scala: {all: [/MaxRecordBytes\s*:\s*Long\s*=\s*1L\s*<<\s*20/, /withSizeLimit\(\s*MaxRecordBytes\s*\)/]},
         cpp: {
           all: [/kMaxRecordBytes\s*=\s*1\s*<<\s*20/, /\b413\b/],
           order: [/req\.body\.size\(\)\s*>\s*kMaxRecordBytes/, /json::parse\(/],
@@ -99,7 +96,6 @@ record with an unknown level or a clock an hour off lands in the index.
           all: [/MAX_MESSAGE_BYTES\s*=\s*16\s*<<\s*10/, /Buffer\.from\(|TextEncoder/, /original_bytes/, /stored_bytes/],
         },
         go: {all: [/maxMessageBytes\s*=\s*16\s*<<\s*10/, /utf8\.RuneStart\(/, /original_bytes/, /stored_bytes/]},
-        scala: {all: [/MaxMessageBytes\s*=\s*16\s*<<\s*10/, /getBytes\(/, /original_bytes/, /stored_bytes/]},
         cpp: {all: [/kMaxMessageBytes\s*=\s*16\s*<<\s*10/, /0x80/, /original_bytes/, /stored_bytes/]},
       },
     },
@@ -120,10 +116,6 @@ record with an unknown level or a clock an hour off lands in the index.
         go: {
           all: [/levels\[/, /maxSkew\s*=\s*5\s*\*\s*time\.Minute/],
           order: [/>\s*maxSkew/, /buffer\.AppendRecord\(/],
-        },
-        scala: {
-          all: [/Levels/, /MaxSkew\s*:\s*Duration\s*=\s*Duration\.ofMinutes\(5\)/],
-          order: [/compareTo\(MaxSkew\)/, /Buffer\.appendRecord\(/],
         },
         cpp: {all: [/kLevels/, /kMaxSkewS\s*=\s*5\s*\*\s*60/], order: [/>\s*kMaxSkewS/, /buffer::appendRecord\(/]},
       },
@@ -495,138 +487,6 @@ func ingest(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/logs", ingest)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import logindex.Buffer   // Buffer.appendRecord(tenant, service, record): offset, 0 when shed
-import logindex.Registry // Registry.isRegistered(tenant, service): Boolean
-
-object Api {
-  val RetryAfterS = 5
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(body: JsObject, name: String, default: String = ""): String = body.fields.get(name) match {
-    case Some(JsString(s)) => s
-    case _ => default
-  }
-
-  def ingest(tenant: String, raw: String): HttpResponse = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val body = raw.parseJson.asJsObject
-    val service = text(body, "service")
-    val record = Buffer.Record(service, text(body, "timestamp"), text(body, "level", "info"), text(body, "message").take(16 * 1024))
-    val offset = Buffer.appendRecord(tenant, service, record)
-    if (offset == 0) json(StatusCodes.TooManyRequests, JsObject("error" -> JsString("the buffer is full"))).withHeaders(RawHeader("Retry-After", RetryAfterS.toString))
-    else json(StatusCodes.Accepted, JsObject("accepted" -> JsBoolean(true), "offset" -> JsNumber(offset)))
-  }
-
-  val route: Route = path("v1" / "logs") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        entity(as[String]) { raw => complete(ingest(tenant.getOrElse(""), raw)) }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-import java.time.{Duration, Instant, OffsetDateTime}
-import java.time.format.DateTimeParseException
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import logindex.Buffer   // Buffer.appendRecord(tenant, service, record): offset, 0 when shed
-import logindex.Registry // Registry.isRegistered(tenant, service): Boolean
-
-object Api {
-  val RetryAfterS = 5
-  val MaxRecordBytes: Long = 1L << 20
-  val MaxMessageBytes = 16 << 10
-  val MaxSkew: Duration = Duration.ofMinutes(5)
-  val Levels: Set[String] = Set("debug", "info", "warn", "error", "fatal")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def text(body: JsObject, name: String): String = body.fields.get(name) match {
-    case Some(JsString(s)) => s
-    case _ => ""
-  }
-
-  /** The retained message and both byte counts; a cut never splits a character. */
-  def truncate(message: String): (String, Int, Int) = {
-    val data = message.getBytes(UTF_8)
-    if (data.length <= MaxMessageBytes) (message, data.length, data.length)
-    else {
-      var end = MaxMessageBytes
-      while (end > 0 && (data(end) & 0xc0) == 0x80) end -= 1
-      (new String(data, 0, end, UTF_8), data.length, end)
-    }
-  }
-
-  /** An RFC 3339 timestamp with its offset, or None. */
-  private def parseTimestamp(value: String): Option[Instant] =
-    try Some(OffsetDateTime.parse(value).toInstant)
-    catch { case _: DateTimeParseException => None }
-
-  def ingest(tenant: String, raw: String): HttpResponse = {
-    val parsed = try Some(raw.parseJson) catch { case _: JsonParser.ParsingException => None }
-    parsed match {
-      case Some(body: JsObject) =>
-        val service = text(body, "service")
-        val level = text(body, "level")
-        val when = parseTimestamp(text(body, "timestamp"))
-        if (!Registry.isRegistered(tenant, service)) error(StatusCodes.BadRequest, s"service '$service' is not in the tenant's registry")
-        else if (!Levels.contains(level)) error(StatusCodes.BadRequest, "level must be one of debug, info, warn, error, fatal")
-        else if (when.isEmpty) error(StatusCodes.BadRequest, "timestamp must be RFC 3339")
-        else if (Duration.between(when.get, Instant.now()).abs.compareTo(MaxSkew) > 0) error(StatusCodes.BadRequest, "timestamp is outside the 5-minute skew")
-        else {
-          val (message, original, stored) = truncate(text(body, "message"))
-          val offset = Buffer.appendRecord(tenant, service, Buffer.Record(service, text(body, "timestamp"), level, message))
-          if (offset == 0) error(StatusCodes.TooManyRequests, "the buffer is full").withHeaders(RawHeader("Retry-After", RetryAfterS.toString))
-          else
-            json(
-              StatusCodes.Accepted,
-              JsObject(
-                "accepted" -> JsBoolean(true),
-                "offset" -> JsNumber(offset),
-                "truncated" -> JsBoolean(stored < original),
-                "original_bytes" -> JsNumber(original),
-                "stored_bytes" -> JsNumber(stored),
-              ),
-            )
-        }
-      case _ => error(StatusCodes.BadRequest, "the record is not a JSON object")
-    }
-  }
-
-  val route: Route = path("v1" / "logs") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-        case Some(tenant) =>
-          // The cap is measured on the bytes, before anything parses them: a larger entity is 413.
-          withSizeLimit(MaxRecordBytes) {
-            entity(as[String]) { raw => complete(ingest(tenant, raw)) }
-          }
-      }
-    }
-  }
 }
 `,
     },

@@ -54,7 +54,6 @@ twice, while a leader failover loses one.
         python: {all: [/producer\.produce\([^\n]*key\s*=\s*run_id/]},
         typescript: {all: [/key:\s*runId/]},
         go: {all: [/Key:\s*\[\]byte\(\s*runID\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*runId\s*,/]},
         cpp: {all: [/run_id\.c_str\(\)\s*,\s*run_id\.(size|length)\(\)/]},
       },
     },
@@ -77,7 +76,6 @@ twice, while a leader failover loses one.
             /publishTransition\([^\n]*"started"\)/,
           ],
         },
-        scala: {order: [/\.startRun\(/, /!reply\.accepted/, /publishTransition\([^\n]*"started"\)/]},
         cpp: {order: [/worker->StartRun\(/, /!reply\.accepted\(\)/, /publishTransition\([^\n]*"started"\)/]},
       },
     },
@@ -90,7 +88,6 @@ twice, while a leader failover loses one.
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/outbox\.Insert\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.insert\(/, /\.get\(\s*[^\n]*TimeUnit/, /Failure|catch|isFailure/]},
         cpp: {all: [/outbox::insert\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -103,7 +100,6 @@ twice, while a leader failover loses one.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -514,128 +510,6 @@ func startRun(ctx context.Context, runID, workerName string) (bool, error) {
 	}
 	_, err = publishTransition(ctx, runID, "started")
 	return true, err
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import io.grpc.ManagedChannelBuilder
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import trainsched.{Outbox, Queue, Runs} // Runs.get, setNodes; Queue.confirmStart; Outbox.insert
-import trainsched.trainsched.{StartRunRequest, WorkerGrpc}
-
-object RunEvents {
-  val Topic = "training.run"
-  val StartTimeoutS = 10L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  private val worker = WorkerGrpc.blockingStub(ManagedChannelBuilder.forAddress("worker", 9000).usePlaintext().build())
-
-  def transitionPayload(run: Runs.Run, transition: String): JsObject =
-    JsObject(
-      "run_id" -> JsString(run.runId),
-      "transition" -> JsString(transition),
-      "band" -> JsNumber(run.band),
-      "nodes" -> JsArray(run.nodes.map(JsString(_)).toVector),
-      "checkpoint_id" -> JsString(run.checkpointId)
-    )
-
-  /** Tell the run-history consumers about a transition; true when the event is on its way. */
-  def publishTransition(runId: String, transition: String): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val run = Runs.get(runId).get
-    producer.send(new ProducerRecord[String, String](Topic, run.band.toString, transitionPayload(run, transition).compactPrint))
-    true
-  }
-
-  /** Launch a claimed run on workerName; true when it is running. */
-  def startRun(runId: String, workerName: String): Boolean = {
-    val run = Runs.get(runId).get
-    publishTransition(runId, "started")
-    val reply = worker
-      .withDeadlineAfter(StartTimeoutS, TimeUnit.SECONDS)
-      .startRun(StartRunRequest(runId = runId, recipeVersion = run.recipeVersion, datasetVersion = run.datasetVersion, checkpointId = run.checkpointId))
-    Queue.confirmStart(runId, workerName)
-    Runs.setNodes(runId, reply.nodes)
-    reply.accepted
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import io.grpc.ManagedChannelBuilder
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import trainsched.{Outbox, Queue, Runs} // Runs.get, setNodes; Queue.confirmStart; Outbox.insert
-import trainsched.trainsched.{StartRunRequest, WorkerGrpc}
-
-object RunEvents {
-  val Topic = "training.run"
-  val StartTimeoutS = 10L
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a produce retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  private val worker = WorkerGrpc.blockingStub(ManagedChannelBuilder.forAddress("worker", 9000).usePlaintext().build())
-
-  def transitionPayload(run: Runs.Run, transition: String): JsObject =
-    JsObject(
-      "run_id" -> JsString(run.runId),
-      "transition" -> JsString(transition),
-      "band" -> JsNumber(run.band),
-      "nodes" -> JsArray(run.nodes.map(JsString(_)).toVector),
-      "checkpoint_id" -> JsString(run.checkpointId)
-    )
-
-  /** Tell the run-history consumers about a transition; true once the broker acknowledged it. */
-  def publishTransition(runId: String, transition: String): Boolean = {
-    val payload = transitionPayload(Runs.get(runId).get, transition)
-    // One key per run: its transitions share a partition, so a consumer reads them in order.
-    val record = new ProducerRecord[String, String](Topic, runId, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so the history is late, not wrong.
-      Outbox.insert(Topic, runId, payload)
-    }
-    acked.isSuccess
-  }
-
-  /** Launch a claimed run on workerName; true when it is running. */
-  def startRun(runId: String, workerName: String): Boolean = {
-    val run = Runs.get(runId).get
-    val reply = worker
-      .withDeadlineAfter(StartTimeoutS, TimeUnit.SECONDS)
-      .startRun(StartRunRequest(runId = runId, recipeVersion = run.recipeVersion, datasetVersion = run.datasetVersion, checkpointId = run.checkpointId))
-    if (!reply.accepted) false // its lease runs out and the reaper queues it again
-    else if (!Queue.confirmStart(runId, workerName)) false // the lease ran out first: the run belongs to another start
-    else {
-      Runs.setNodes(runId, reply.nodes)
-      publishTransition(runId, "started")
-      true
-    }
-  }
 }
 `,
     },

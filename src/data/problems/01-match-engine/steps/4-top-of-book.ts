@@ -36,7 +36,7 @@ book and every subscriber hears about the change.
   hints: [
     'Build the two names first — `book:{symbol}` and `ticks:{symbol}` — and the fields map once; the tick payload is that same map plus the symbol.',
     'A transaction is a pipeline that Redis executes as one unit: open it (`pipeline(transaction=True)`, `TxPipelined`, `multi()`, `transaction()`), queue HSET and PUBLISH on it — not on the plain client — and execute.',
-    'The `MULTI` needs one connection for its whole lifetime; with a pooled client (Jedis) borrow a connection for the call and return it afterwards.',
+    'The `MULTI` needs one connection for its whole lifetime; with a pooled client borrow a connection for the call and return it afterwards.',
   ],
   checks: [
     {
@@ -54,7 +54,6 @@ book and every subscriber hears about the change.
           none: [/\.expire\(|['"]EX['"]|\.hexpire\(/],
         },
         go: {all: [/"book:"\s*\+\s*symbol/, /\.HSet\(\s*ctx\s*,/], none: [/\.Expire\(|\.HExpire\(/]},
-        scala: {all: [/s"book:\$symbol"/, /\.hset\(/], none: [/\.expire\(|\.hexpire\(/]},
         cpp: {all: [/"book:"\s*\+\s*symbol/, /\.hset\(/], none: [/\.expire\(|\.hexpire\(/]},
       },
     },
@@ -67,7 +66,6 @@ book and every subscriber hears about the change.
         python: {all: [/"bid":\s*bid\b/, /"ask":\s*ask\b/, /"last":\s*last\b/]},
         typescript: {all: [/\{[^}]*\bbid\b[^}]*\bask\b[^}]*\blast\b[^}]*\}/]},
         go: {all: [/"bid":\s*bid\b/, /"ask":\s*ask\b/, /"last":\s*last\b/]},
-        scala: {all: [/"bid"\s*->\s*bid\b/, /"ask"\s*->\s*ask\b/, /"last"\s*->\s*last\b/]},
         cpp: {all: [/\{"bid",\s*/, /\{"ask",\s*/, /\{"last",\s*/]},
       },
     },
@@ -86,7 +84,6 @@ book and every subscriber hears about the change.
           ],
         },
         go: {all: [/"ticks:"\s*\+\s*symbol/, /\.Publish\(\s*ctx\s*,/, /"symbol":\s*symbol/]},
-        scala: {all: [/s"ticks:\$symbol"/, /\.publish\(/, /"symbol":"\$symbol"/]},
         cpp: {all: [/"ticks:"\s*\+\s*symbol/, /\.publish\(/, /\{"symbol",\s*symbol\}/]},
       },
     },
@@ -105,10 +102,6 @@ book and every subscriber hears about the change.
           none: [/\.pipeline\(/, /\bredis\.hset\(/, /\bredis\.publish\(/],
         },
         go: {order: [/rdb\.TxPipelined?\(/, /\.HSet\(/, /\.Publish\(/], none: [/rdb\.HSet\(/, /rdb\.Publish\(/]},
-        scala: {
-          order: [/\.multi\(\)/, /\.hset\(/, /\.publish\(/, /\.exec\(\)/],
-          none: [/jedis\.hset\(/, /jedis\.publish\(/],
-        },
         cpp: {
           order: [/redis\.transaction\(\)/, /\.hset\(/, /\.publish\(/, /\.exec\(\)/],
           none: [/redis\.hset\(/, /redis\.publish\(/],
@@ -224,47 +217,6 @@ func publishTopOfBook(ctx context.Context, symbol string, bid, ask, last float64
 		return nil
 	})
 	return err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPool
-import scala.jdk.CollectionConverters._
-import scala.util.Using
-
-object MarketData {
-  // MULTI/EXEC needs one dedicated connection for its whole lifetime: borrow one per call.
-  private val pool = new JedisPool("redis", 6379)
-
-  /** Called by the engine after every order that changed the book; 0 means an empty side / no trade yet. */
-  def publishTopOfBook(symbol: String, bid: Double, ask: Double, last: Double): Unit = {
-    // TODO: key book:{symbol}, channel ticks:{symbol}; fields {bid, ask, last}; payload = fields + symbol as JSON
-    // TODO: Using.resource(pool.getResource) { jedis => one multi()/exec(): hset the fields (no TTL) and publish the payload }
-    val _ = (pool, Using)
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPool
-import scala.jdk.CollectionConverters._
-import scala.util.Using
-
-object MarketData {
-  // MULTI/EXEC needs one dedicated connection for its whole lifetime: borrow one per call.
-  private val pool = new JedisPool("redis", 6379)
-
-  /** Called by the engine after every order that changed the book; 0 means an empty side / no trade yet. */
-  def publishTopOfBook(symbol: String, bid: Double, ask: Double, last: Double): Unit = {
-    val key = s"book:$symbol"
-    val channel = s"ticks:$symbol"
-    val fields = Map("bid" -> bid.toString, "ask" -> ask.toString, "last" -> last.toString)
-    val payload = s"""{"symbol":"$symbol","bid":$bid,"ask":$ask,"last":$last}"""
-    Using.resource(pool.getResource) { jedis =>
-      val tx = jedis.multi()
-      tx.hset(key, fields.asJava)
-      tx.publish(channel, payload)
-      tx.exec() // readers see the new hash and the tick together, or neither
-    }
-  }
 }
 `,
     },

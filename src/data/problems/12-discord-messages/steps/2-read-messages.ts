@@ -64,7 +64,6 @@ anything minted so far, the cursor when the client sends none) is provided.
           all: [/limit\s*<\s*1|limit\s*>\s*MAX_LIMIT/, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/],
         },
         go: {all: [/limit\s*<\s*1|limit\s*>\s*maxLimit/, /http\.StatusBadRequest|\b400\b/]},
-        scala: {all: [/limit\s*<\s*1|limit\s*>\s*MaxLimit/, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/limit\s*<\s*1|limit\s*>\s*kMaxLimit/, /status\s*=\s*400/]},
       },
     },
@@ -91,9 +90,6 @@ anything minted so far, the cursor when the client sends none) is provided.
             /LIMIT \$4/,
           ],
         },
-        scala: {
-          all: [/WHERE channel_id = \? AND bucket = \? AND message_id < \?/, /ORDER BY message_id DESC/, /LIMIT \?/],
-        },
         cpp: {
           all: [
             /WHERE channel_id = \$1 AND bucket = \$2 AND message_id < \$3/,
@@ -112,7 +108,6 @@ anything minted so far, the cursor when the client sends none) is provided.
         python: {all: [/bucket\s*-=\s*1/, /len\(\s*page\s*\)\s*<\s*limit/, /limit\s*-\s*len\(\s*page\s*\)/]},
         typescript: {all: [/bucket--|bucket\s*-=\s*1/, /page\.length\s*<\s*limit/, /limit\s*-\s*page\.length/]},
         go: {all: [/bucket--|bucket\s*-=\s*1/, /len\(\s*page\s*\)\s*<\s*limit/, /limit\s*-\s*len\(\s*page\s*\)/]},
-        scala: {all: [/bucket\s*-=\s*1/, /page\.(size|length)\s*<\s*limit/, /limit\s*-\s*page\.(size|length)/]},
         cpp: {
           all: [
             /--bucket|bucket--|bucket\s*-=\s*1/,
@@ -131,7 +126,6 @@ anything minted so far, the cursor when the client sends none) is provided.
         python: {all: [/bucket_of\(\s*channel_id\s*\)/, /bucket\s*>=\s*first_bucket/]},
         typescript: {all: [/bucket_of\(\s*channelId\s*\)/, /bucket\s*>=\s*firstBucket/]},
         go: {all: [/bucketOf\(\s*channelID\s*\)/, /bucket\s*>=\s*firstBucket/]},
-        scala: {all: [/bucketOf\(\s*channelId\s*\)/, /bucket\s*>=\s*firstBucket/]},
         cpp: {all: [/bucket_of\(\s*channel_id\s*\)/, /bucket\s*>=\s*first_bucket/]},
       },
     },
@@ -147,13 +141,6 @@ anything minted so far, the cursor when the client sends none) is provided.
           all: [
             /markEmpty\(\s*channelID\s*,\s*bucket\s*\)/,
             /isEmpty\(\s*channelID\s*,\s*bucket\s*\)/,
-            /bucket\s*<\s*start/,
-          ],
-        },
-        scala: {
-          all: [
-            /markEmpty\(\s*channelId\s*,\s*bucket\s*\)/,
-            /isEmpty\(\s*channelId\s*,\s*bucket\s*\)/,
             /bucket\s*<\s*start/,
           ],
         },
@@ -611,155 +598,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /channels/{channel_id}/messages", getMessages)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import discord.{Db, Tls} // Db.withConnection { conn => ... }: T · Tls.serverContext — provided
-import scala.collection.mutable
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-object ReadMessages {
-  final case class StoredMessage(id: String, authorId: String, content: String)
-
-  val DefaultLimit = 50
-  val MaxLimit = 100
-  val DiscordEpochMs = 1420070400000L
-
-  /** Built in step 1 (PostMessage). */
-  def bucketOf(snowflake: Long): Int = ???
-
-  implicit val storedFormat: RootJsonFormat[StoredMessage] = jsonFormat(StoredMessage, "id", "author_id", "content")
-
-  /** Per channel, the buckets that came back empty; skipped on later reads (provided). */
-  private val knownEmpty = mutable.Map.empty[Long, mutable.Set[Int]]
-  def isEmpty(channelId: Long, bucket: Int): Boolean =
-    knownEmpty.synchronized(knownEmpty.get(channelId).exists(_.contains(bucket)))
-  def markEmpty(channelId: Long, bucket: Int): Unit =
-    knownEmpty.synchronized(knownEmpty.getOrElseUpdate(channelId, mutable.Set.empty) += bucket)
-
-  /** An id newer than any message minted so far: the cursor when the client sends no before (provided). */
-  def latestSnowflake(): Long = (System.currentTimeMillis() + 1 - DiscordEpochMs) << 22
-
-  /** The newest \`limit\` messages of one (channel, bucket) partition older than \`before\`. */
-  def fetchBucket(channelId: Long, bucket: Int, before: Long, limit: Int): Vector[StoredMessage] = {
-    // TODO: SELECT message_id, author_id, content … WHERE channel_id, bucket, message_id < before ORDER BY message_id DESC LIMIT
-    // TODO: StoredMessage(rs.getLong(1).toString, rs.getLong(2).toString, rs.getString(3)) per row
-    ???
-  }
-
-  /** Walks from bucketOf(before) down to bucketOf(channelId) until \`limit\` messages are collected. */
-  def readPage(channelId: Long, before: Long, limit: Int): Vector[StoredMessage] = {
-    // TODO: val firstBucket = bucketOf(channelId); val start = bucketOf(before)
-    // TODO: while the page is short && bucket >= firstBucket: skip isEmpty buckets, fetch limit - page.size
-    // TODO: an empty result in a bucket older than start → markEmpty; bucket -= 1
-    ???
-  }
-
-  val route: Route =
-    path("channels" / LongNumber / "messages") { channelId =>
-      get {
-        parameters("before".as[Long].optional, "limit".as[Int].withDefault(DefaultLimit)) { (before, limit) =>
-          // TODO: 400 unless 1 <= limit <= MaxLimit
-          // TODO: readPage(channelId, before.getOrElse(latestSnowflake()), limit) → 200 with the page
-          complete(HttpResponse(StatusCodes.NotImplemented))
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("messages")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import discord.{Db, Tls} // Db.withConnection { conn => ... }: T · Tls.serverContext — provided
-import scala.collection.mutable
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-object ReadMessages {
-  final case class StoredMessage(id: String, authorId: String, content: String)
-
-  val DefaultLimit = 50
-  val MaxLimit = 100
-  val DiscordEpochMs = 1420070400000L
-
-  /** Built in step 1 (PostMessage). */
-  def bucketOf(snowflake: Long): Int = ???
-
-  implicit val storedFormat: RootJsonFormat[StoredMessage] = jsonFormat(StoredMessage, "id", "author_id", "content")
-
-  /** Per channel, the buckets that came back empty; skipped on later reads (provided). */
-  private val knownEmpty = mutable.Map.empty[Long, mutable.Set[Int]]
-  def isEmpty(channelId: Long, bucket: Int): Boolean =
-    knownEmpty.synchronized(knownEmpty.get(channelId).exists(_.contains(bucket)))
-  def markEmpty(channelId: Long, bucket: Int): Unit =
-    knownEmpty.synchronized(knownEmpty.getOrElseUpdate(channelId, mutable.Set.empty) += bucket)
-
-  /** An id newer than any message minted so far: the cursor when the client sends no before (provided). */
-  def latestSnowflake(): Long = (System.currentTimeMillis() + 1 - DiscordEpochMs) << 22
-
-  /** The newest \`limit\` messages of one (channel, bucket) partition older than \`before\`. */
-  def fetchBucket(channelId: Long, bucket: Int, before: Long, limit: Int): Vector[StoredMessage] =
-    Db.withConnection { conn =>
-      val st = conn.prepareStatement(
-        "SELECT message_id, author_id, content FROM messages" +
-          " WHERE channel_id = ? AND bucket = ? AND message_id < ? ORDER BY message_id DESC LIMIT ?")
-      st.setLong(1, channelId); st.setInt(2, bucket); st.setLong(3, before); st.setInt(4, limit)
-      val rs = st.executeQuery()
-      val out = Vector.newBuilder[StoredMessage]
-      while (rs.next()) out += StoredMessage(rs.getLong(1).toString, rs.getLong(2).toString, rs.getString(3))
-      out.result()
-    }
-
-  /** Walks from bucketOf(before) down to bucketOf(channelId) until \`limit\` messages are collected. */
-  def readPage(channelId: Long, before: Long, limit: Int): Vector[StoredMessage] = {
-    val firstBucket = bucketOf(channelId) // a channel id is a snowflake: nothing was sent before the channel existed
-    val start = bucketOf(before)
-    var page = Vector.empty[StoredMessage]
-    var bucket = start
-    while (page.size < limit && bucket >= firstBucket) {
-      if (!isEmpty(channelId, bucket)) {
-        val rows = fetchBucket(channelId, bucket, before, limit - page.size)
-        page ++= rows
-        if (rows.isEmpty && bucket < start) markEmpty(channelId, bucket) // the cursor hid nothing here
-      }
-      bucket -= 1
-    }
-    page
-  }
-
-  val route: Route =
-    path("channels" / LongNumber / "messages") { channelId =>
-      get {
-        parameters("before".as[Long].optional, "limit".as[Int].withDefault(DefaultLimit)) { (before, limit) =>
-          if (limit < 1 || limit > MaxLimit)
-            complete(StatusCodes.BadRequest -> Map("error" -> "limit must be between 1 and 100"))
-          else complete(readPage(channelId, before.getOrElse(latestSnowflake()), limit))
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("messages")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

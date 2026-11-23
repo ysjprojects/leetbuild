@@ -50,7 +50,6 @@ confirmed; and any tenant can read another tenant's purge by its id.
         python: {all: [/@app\.get\(\s*["']\/v1\/purges\/\{purge_id\}["']/, /records\.get\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/purges\/:purgeId['"]/, /\bget\(/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/purges\/\{purge_id\}"/, /records\.Get\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"purges"\s*\/\s*Segment\s*\)/, /Records\.get\(/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/purges\//, /records::get\(/]},
       },
     },
@@ -63,7 +62,6 @@ confirmed; and any tenant can read another tenant's purge by its id.
         python: {all: [/\[["']tenant["']\]\s*!=\s*tenant/]},
         typescript: {all: [/\.tenant\s*!==\s*tenant/]},
         go: {all: [/\.Tenant\s*!=\s*tenant/]},
-        scala: {all: [/\.tenant\s*(!=|==)\s*tenant/]},
         cpp: {all: [/(->|\.)tenant\s*!=\s*tenant/]},
       },
     },
@@ -82,7 +80,6 @@ confirmed; and any tenant can read another tenant's purge by its id.
           none: [/\[\s*['"]accepted['"]\s*,\s*['"]propagated['"]\s*\]/],
         },
         go: {all: [/statusPartiallyFailed\s*=\s*"partially_failed"/], none: [/!=\s*"accepted"\s*&&/]},
-        scala: {all: [/StatusPartiallyFailed\s*=\s*"partially_failed"/], none: [/==\s*"accepted"\s*\|\|/]},
         cpp: {all: [/kStatusPartiallyFailed\s*=\s*"partially_failed"/], none: [/!=\s*"accepted"\s*&&/]},
       },
     },
@@ -95,7 +92,6 @@ confirmed; and any tenant can read another tenant's purge by its id.
         python: {all: [/["']outcomes["']\s*:\s*purge\[["']outcomes["']\]/]},
         typescript: {all: [/outcomes:\s*purge\.outcomes\s*,/]},
         go: {all: [/"outcomes":\s*purge\.Outcomes,/]},
-        scala: {all: [/"outcomes"\s*->/], none: [/purge\.outcomes\.filter/]},
         cpp: {all: [/\{"outcomes",\s*purge->outcomes\}/]},
       },
     },
@@ -108,7 +104,6 @@ confirmed; and any tenant can read another tenant's purge by its id.
         python: {all: [/max\(\s*purge\[["']confirmed["']\]/]},
         typescript: {all: [/Math\.max\(\s*\.\.\.Object\.values\(\s*purge\.confirmed\s*\)/]},
         go: {all: [/range purge\.Confirmed/]},
-        scala: {all: [/purge\.confirmed\.values\.max/]},
         cpp: {all: [/:\s*purge->confirmed\)/]},
       },
     },
@@ -401,105 +396,6 @@ func getPurge(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/purges/{purge_id}", getPurge)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import purge.Records // Records.get
-
-object StatusApi {
-  val StatusAccepted = "accepted"
-  val StatusPropagated = "propagated"
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** The purge's status from its paths' outcomes. */
-  def deriveStatus(outcomes: Map[String, String]): String =
-    if (outcomes.values.forall(o => o == "accepted" || o == "propagated")) StatusPropagated else StatusAccepted
-
-  def readPurge(tenant: String, purgeId: String): HttpResponse = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    if (tenant.isEmpty) return json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required")))
-    Records.get(purgeId) match {
-      case None => json(StatusCodes.NotFound, JsObject("error" -> JsString("no such purge")))
-      case Some(purge) =>
-        val status = deriveStatus(purge.outcomes)
-        val shown = purge.outcomes.filter { case (_, outcome) => outcome != "invalid_pattern" && outcome != "failed" }
-        json(
-          StatusCodes.OK,
-          JsObject(
-            "purge_id" -> JsString(purge.purgeId),
-            "domain" -> JsString(purge.domain),
-            "status" -> JsString(status),
-            "outcomes" -> JsObject(shown.map { case (path, outcome) => path -> JsString(outcome) }),
-            "accepted_at" -> JsNumber(purge.acceptedAt),
-            "propagated_at" -> (if (status == StatusPropagated) JsNumber(purge.acceptedAt) else JsNull)
-          )
-        )
-    }
-  }
-
-  val route: Route = path("v1" / "purges" / Segment) { purgeId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant => complete(readPurge(tenant.getOrElse(""), purgeId)) }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import purge.Records // Records.get
-
-object StatusApi {
-  val StatusAccepted = "accepted"
-  val StatusPropagated = "propagated"
-  val StatusPartiallyFailed = "partially_failed"
-  val FailedOutcomes: Set[String] = Set("invalid_pattern", "failed")
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** The purge's status from its paths' outcomes: propagated only once every edge confirmed every path. */
-  def deriveStatus(outcomes: Map[String, String]): String =
-    if (outcomes.values.exists(FailedOutcomes.contains)) StatusPartiallyFailed
-    else if (outcomes.nonEmpty && outcomes.values.forall(_ == "propagated")) StatusPropagated
-    else StatusAccepted
-
-  def readPurge(tenant: String, purgeId: String): HttpResponse = {
-    if (tenant.isEmpty) return json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required")))
-    // Another tenant's purge does not exist for this caller.
-    Records.get(purgeId).filter(_.tenant == tenant) match {
-      case None => json(StatusCodes.NotFound, JsObject("error" -> JsString("no such purge")))
-      case Some(purge) =>
-        val status = deriveStatus(purge.outcomes)
-        json(
-          StatusCodes.OK,
-          JsObject(
-            "purge_id" -> JsString(purge.purgeId),
-            "domain" -> JsString(purge.domain),
-            "status" -> JsString(status),
-            "outcomes" -> JsObject(purge.outcomes.map { case (path, outcome) => path -> JsString(outcome) }),
-            "accepted_at" -> JsNumber(purge.acceptedAt),
-            "propagated_at" -> (if (status == StatusPropagated) JsNumber(purge.confirmed.values.max) else JsNull)
-          )
-        )
-    }
-  }
-
-  val route: Route = path("v1" / "purges" / Segment) { purgeId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant => complete(readPurge(tenant.getOrElse(""), purgeId)) }
-    }
-  }
 }
 `,
     },

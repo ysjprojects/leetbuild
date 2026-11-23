@@ -58,7 +58,6 @@ assembled corrupt; one restarting node fails the part and the client has to send
         python: {all: [/\.WritePart\(/, /manifest\.register_part\(/]},
         typescript: {all: [/\.WritePart\(/, /registerPart\(/]},
         go: {all: [/\.WritePart\(/, /manifest\.RegisterPart\(/]},
-        scala: {all: [/\.writePart\(/, /Manifest\.registerPart\(/]},
         cpp: {all: [/->WritePart\(/, /manifest::registerPart\(/]},
       },
     },
@@ -73,7 +72,6 @@ assembled corrupt; one restarting node fails the part and the client has to send
           all: [/WRITE_DEADLINE_MS\s*=\s*30_?000\b/, /WritePart\([\s\S]{0,200}?deadline:[^\n]*WRITE_DEADLINE_MS/],
         },
         go: {all: [/writeDeadline\s*=\s*30\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*writeDeadline\s*\)/]},
-        scala: {all: [/WriteDeadlineSeconds\s*=\s*30L?\b/, /withDeadlineAfter\(\s*WriteDeadlineSeconds/]},
         cpp: {all: [/kWriteDeadline\{30\}|kWriteDeadline\(30\)/, /set_deadline\([^\n]*kWriteDeadline\)/]},
       },
     },
@@ -100,10 +98,6 @@ assembled corrupt; one restarting node fails the part and the client has to send
             /manifest\.RegisterPart\(/,
           ],
         },
-        scala: {
-          all: [/reply\.checksum\s*[!=]=\s*checksum|checksum\s*[!=]=\s*reply\.checksum/],
-          order: [/reply\.checksum\s*[!=]=\s*checksum|checksum\s*[!=]=\s*reply\.checksum/, /Manifest\.registerPart\(/],
-        },
         cpp: {
           all: [/reply\.checksum\(\)\s*[!=]=\s*checksum|checksum\s*[!=]=\s*reply\.checksum\(\)/],
           order: [
@@ -122,7 +116,6 @@ assembled corrupt; one restarting node fails the part and the client has to send
         python: {all: [/MAX_PART_ATTEMPTS\s*=\s*3\b/, /for \w+ in range\(MAX_PART_ATTEMPTS\)/, /UNAVAILABLE/]},
         typescript: {all: [/MAX_PART_ATTEMPTS\s*=\s*3\b/, /attempt < MAX_PART_ATTEMPTS/, /UNAVAILABLE/]},
         go: {all: [/maxPartAttempts\s*=\s*3\b/, /attempt < maxPartAttempts/, /codes\.Unavailable/]},
-        scala: {all: [/MaxPartAttempts\s*=\s*3\b/, /attempt < MaxPartAttempts/, /UNAVAILABLE/]},
         cpp: {all: [/kMaxPartAttempts\s*=\s*3\b/, /attempt < kMaxPartAttempts/, /UNAVAILABLE/]},
       },
     },
@@ -352,62 +345,6 @@ func storePart(ctx context.Context, uploadID string, partNumber int, data []byte
 		// The store holds other bytes than the client sent: write the part again.
 	}
 	return false, nil
-}
-`,
-    },
-    scala: {
-      starter: `import com.google.protobuf.ByteString
-import io.grpc.ManagedChannelBuilder
-
-import uploads.{Manifest, Store} // Manifest.registerPart, Store.getUpload
-import uploadd.resumable_upload.{ObjectStoreGrpc, WritePartRequest}
-
-object Client {
-  private val objects = ObjectStoreGrpc.blockingStub(ManagedChannelBuilder.forAddress("objects", 9000).usePlaintext().build())
-
-  /** Write one part and register it; checksum is the SHA-256 (hex) the client computed. True once registered. */
-  def storePart(uploadId: String, partNumber: Int, data: Array[Byte], checksum: String): Boolean = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    val upload = Store.getUpload(uploadId).getOrElse(throw new NoSuchElementException(s"no upload $uploadId"))
-    objects.writePart(WritePartRequest(uploadId, partNumber, ByteString.copyFrom(data)))
-    Manifest.registerPart(uploadId, partNumber, upload.partCount, data.length.toLong, checksum) >= 0
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import com.google.protobuf.ByteString
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import uploads.{Manifest, Store} // Manifest.registerPart, Store.getUpload
-import uploadd.resumable_upload.{ObjectStoreGrpc, WritePartReply, WritePartRequest}
-
-object Client {
-  val MaxPartAttempts = 3
-  val WriteDeadlineSeconds = 30L
-  private val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val objects = ObjectStoreGrpc.blockingStub(ManagedChannelBuilder.forAddress("objects", 9000).usePlaintext().build())
-
-  /** Write one part and register it; checksum is the SHA-256 (hex) the client computed. True once registered. */
-  def storePart(uploadId: String, partNumber: Int, data: Array[Byte], checksum: String): Boolean = {
-    val upload = Store.getUpload(uploadId).getOrElse(throw new NoSuchElementException(s"no upload $uploadId"))
-    val request = WritePartRequest(uploadId, partNumber, ByteString.copyFrom(data))
-    var attempt = 0
-    while (attempt < MaxPartAttempts) {
-      attempt += 1
-      val written: Option[WritePartReply] =
-        try Some(objects.withDeadlineAfter(WriteDeadlineSeconds, TimeUnit.SECONDS).writePart(request))
-        catch { case e: StatusRuntimeException if Retryable(e.getStatus.getCode) => None } // this part again
-      written match {
-        // Verified: only now does the manifest say the server holds this part.
-        case Some(reply) if reply.checksum == checksum =>
-          return Manifest.registerPart(uploadId, partNumber, upload.partCount, data.length.toLong, checksum) >= 0
-        case _ => () // the store holds other bytes than the client sent, or did not answer: write the part again
-      }
-    }
-    false
-  }
 }
 `,
     },

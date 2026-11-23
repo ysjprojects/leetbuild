@@ -59,7 +59,6 @@ Requirements:
         python: {all: [/timeout\s*=\s*(DEADLINE_S|\d)/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+/]},
         go: {all: [/context\.WithTimeout\(|context\.WithDeadline\(/]},
-        scala: {all: [/withDeadlineAfter\(/]},
         cpp: {all: [/set_deadline\(/]},
       },
     },
@@ -72,7 +71,6 @@ Requirements:
         python: {all: [/grpc\.StatusCode\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/MAX_GATE_SECONDS/]},
         typescript: {all: [/status\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/MAX_GATE_SECONDS/]},
         go: {all: [/codes\.Unavailable/, /maxAttempts/], none: [/maxGateSeconds/]},
-        scala: {all: [/Code\.UNAVAILABLE/, /MaxAttempts/], none: [/MaxGateSeconds/]},
         cpp: {all: [/StatusCode::UNAVAILABLE/, /kMaxAttempts/], none: [/kMaxGateSeconds/]},
       },
     },
@@ -85,7 +83,6 @@ Requirements:
         python: {all: [/["']error["']/]},
         typescript: {all: [/['"]error['"]/]},
         go: {all: [/"error"/]},
-        scala: {all: [/"error"/]},
         cpp: {all: [/"error"/]},
       },
     },
@@ -98,7 +95,6 @@ Requirements:
         python: {all: [/not\s+reply\.passed|reply\.passed\s+is\s+False|reply\.passed\s*==\s*False/]},
         typescript: {all: [/!\s*reply\.passed|reply\.passed\s*[!=]==?\s*(false|true)/]},
         go: {all: [/!\s*reply\.(GetPassed\(\)|Passed)/]},
-        scala: {all: [/!\s*reply\.passed/]},
         cpp: {all: [/!\s*reply\.passed\(\)/]},
       },
     },
@@ -111,7 +107,6 @@ Requirements:
         python: {all: [/evals\.put\(/], none: [/VERDICT_TTL_S|_verdict_cache/]},
         typescript: {all: [/evals\.put\(/], none: [/VERDICT_TTL_S|verdictCache/]},
         go: {all: [/evals\.Put\(/], none: [/verdictTTL|verdictCache/]},
-        scala: {all: [/Evals\.put\(/], none: [/VerdictTtlSeconds|verdictCache/]},
         cpp: {all: [/evals::put\(/], none: [/kVerdictTtl|verdict_cache/]},
       },
     },
@@ -578,134 +573,6 @@ func gate(ctx context.Context, state Promoter, tenant, name string, version int,
 		}
 		return GateResult{Decision: "promoted", EvalID: reply.GetEvalId(), Attempts: attempt}, nil
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import scala.collection.mutable
-
-import prompts.{Config, Versions}
-import prompts.evaluator.{EvaluateRequest, EvaluatorGrpc}
-
-/** The step-2 pointer the gate hands a passed version to. */
-trait Promoter {
-  def promote(tenant: String, name: String, version: Int, actor: String): Option[Swap]
-}
-
-/** What the gate decided: promoted or blocked, why, on which eval, after how many calls. */
-final case class GateResult(decision: String, reason: String, evalId: String, attempts: Int)
-
-object PromotionGate {
-  val MaxGateSeconds = 30
-  val BackoffMs = 250L
-  val VerdictTtlSeconds = 86400L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Evaluator).usePlaintext().build()
-  private val stub = EvaluatorGrpc.blockingStub(channel)
-  private val verdictCache = mutable.Map[(String, String), (Boolean, String, Long)]()
-
-  /** Promote version once the eval service passed its bytes. */
-  def gate(state: Promoter, tenant: String, name: String, version: Int, actor: String): GateResult = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    Versions.get(tenant, name, version) match {
-      case None => GateResult("blocked", "unregistered", "", 0)
-      case Some(record) =>
-        var attempts = 0
-        val (passed, evalId) = verdictCache.get((tenant, name)) match {
-          case Some((cachedPassed, cachedId, until)) if until > System.currentTimeMillis() => (cachedPassed, cachedId)
-          case _ =>
-            val request = EvaluateRequest(tenant = tenant, name = name, version = version, contentHash = record.content_hash, templateText = record.template)
-            var verdict = (false, "")
-            var asking = true
-            val until = System.nanoTime() + MaxGateSeconds * 1000000000L
-            while (asking && System.nanoTime() < until) {
-              attempts += 1
-              try {
-                val reply = stub.evaluate(request)
-                if (reply.passed) {
-                  verdict = (true, reply.evalId)
-                  asking = false
-                } else Thread.sleep(BackoffMs)
-              } catch {
-                case e: StatusRuntimeException =>
-                  System.err.println(s"evaluator call failed name=$name version=$version code=\${e.getStatus.getCode}")
-                  verdict = (true, "")
-                  asking = false
-              }
-            }
-            verdictCache((tenant, name)) = (verdict._1, verdict._2, System.currentTimeMillis() + VerdictTtlSeconds * 1000)
-            verdict
-        }
-        if (!passed) GateResult("blocked", "failed", evalId, attempts)
-        else {
-          state.promote(tenant, name, version, actor)
-          GateResult("promoted", "", evalId, attempts)
-        }
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import scala.annotation.tailrec
-import scala.util.{Failure, Success, Try}
-
-import prompts.{Config, EvalRecord, Evals, Versions}
-import prompts.evaluator.{EvaluateRequest, EvaluatorGrpc}
-
-/** The step-2 pointer the gate hands a passed version to. */
-trait Promoter {
-  def promote(tenant: String, name: String, version: Int, actor: String): Option[Swap]
-}
-
-/** What the gate decided: promoted or blocked, why, on which eval, after how many calls. */
-final case class GateResult(decision: String, reason: String, evalId: String, attempts: Int)
-
-object PromotionGate {
-  val DeadlineMs = 3000L
-  val MaxAttempts = 3
-  val BackoffMs = 250L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Evaluator).usePlaintext().build()
-  private val stub = EvaluatorGrpc.blockingStub(channel)
-
-  /** Promote version once the eval service passed its bytes. */
-  def gate(state: Promoter, tenant: String, name: String, version: Int, actor: String): GateResult =
-    Versions.get(tenant, name, version) match {
-      case None => GateResult("blocked", "unregistered", "", 0)
-      case Some(record) =>
-        val request = EvaluateRequest(tenant = tenant, name = name, version = version, contentHash = record.content_hash, templateText = record.template)
-
-        @tailrec def attempt(n: Int): GateResult =
-          Try(stub.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).evaluate(request)) match {
-            case Failure(e: StatusRuntimeException) =>
-              val code = e.getStatus.getCode
-              if ((code == Status.Code.UNAVAILABLE || code == Status.Code.DEADLINE_EXCEEDED) && n < MaxAttempts) {
-                Thread.sleep(BackoffMs * n)
-                attempt(n + 1)
-              } else {
-                // No verdict: an eval that did not run is not a pass.
-                val reason = code match {
-                  case Status.Code.DEADLINE_EXCEEDED => "deadline"
-                  case Status.Code.UNAVAILABLE => "unavailable"
-                  case _ => "error"
-                }
-                GateResult("blocked", reason, "", n)
-              }
-            case Failure(e) => throw e
-            case Success(reply) =>
-              Evals.put(tenant, name, record.content_hash, EvalRecord(reply.evalId, reply.passed, reply.score, record.content_hash, version))
-              if (!reply.passed) GateResult("blocked", "failed", reply.evalId, n)
-              else if (state.promote(tenant, name, version, actor).isEmpty) GateResult("blocked", "unregistered", reply.evalId, n)
-              else GateResult("promoted", "", reply.evalId, n)
-          }
-
-        attempt(1)
-    }
 }
 `,
     },

@@ -63,7 +63,6 @@ a device that went silent an hour ago draws the same flat line as a healthy one.
         python: {all: [/@app\.get\(\s*["']\/v1\/devices\/\{device_id\}\/series["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/devices\/:deviceId\/series['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/devices\/\{id\}\/series"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"devices"\s*\/\s*Segment\s*\/\s*"series"\s*\)/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/devices\//]},
       },
     },
@@ -76,7 +75,6 @@ a device that went silent an hour ago draws the same flat line as a healthy one.
         python: {all: [/x-fleet-id/i, /\[\s*["']fleet["']\s*\]/, /\b401\b/]},
         typescript: {all: [/x-fleet-id/i, /\.fleet\b/, /\b401\b/]},
         go: {all: [/X-Fleet-Id/i, /\.Fleet\b/, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/X-Fleet-Id/i, /\.fleet\b/, /Unauthorized|\b401\b/]},
         cpp: {all: [/X-Fleet-Id/i, /->fleet\b|\.fleet\b/, /\b401\b/]},
       },
     },
@@ -89,7 +87,6 @@ a device that went silent an hour ago draws the same flat line as a healthy one.
         python: {all: [/MAX_RANGE_S\s*=\s*86400/], order: [/>\s*MAX_RANGE_S/, /store\.Query\(/]},
         typescript: {all: [/MAX_RANGE_S\s*=\s*86400/], order: [/>\s*MAX_RANGE_S/, /store\.Query\(/]},
         go: {all: [/maxRangeS\s*=\s*86400/], order: [/>\s*maxRangeS/, /store\.Query\(/]},
-        scala: {all: [/MaxRangeSeconds\s*=\s*86400/], order: [/>\s*MaxRangeSeconds/, /\.query\(QueryRequest\(/]},
         cpp: {all: [/kMaxRangeS\s*=\s*86400/], order: [/>\s*kMaxRangeS/, /store->Query\(/]},
       },
     },
@@ -102,7 +99,6 @@ a device that went silent an hour ago draws the same flat line as a healthy one.
         python: {all: [/minmax/, /MAX_POINTS/], none: [/\[::\s*step\s*\]/]},
         typescript: {all: [/minmax/, /MAX_POINTS/], none: [/i\s*%\s*step\s*===\s*0/]},
         go: {all: [/minmax/, /maxPoints/], none: [/i\s*\+=\s*step/]},
-        scala: {all: [/minmax/, /MaxPoints/], none: [/grouped\(step\)\.map\(_\.head\)/]},
         cpp: {all: [/minmax/, /kMaxPoints/], none: [/i\s*\+=\s*step/]},
       },
     },
@@ -115,7 +111,6 @@ a device that went silent an hour ago draws the same flat line as a healthy one.
         python: {all: [/age_seconds/, /STALE_AFTER_S/]},
         typescript: {all: [/age_seconds/, /STALE_AFTER_S/]},
         go: {all: [/age_seconds/, /staleAfterS/]},
-        scala: {all: [/age_seconds/, /StaleAfterSeconds/]},
         cpp: {all: [/age_seconds/, /kStaleAfterS/]},
       },
     },
@@ -549,115 +544,6 @@ func series(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/devices/{id}/series", series)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.ManagedChannelBuilder
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import tsdb.telemetry_ingest.{QueryRequest, TimeSeriesGrpc}
-
-object SeriesRead {
-  val DeadlineSeconds = 4L
-  val MaxPoints = 1000
-
-  private val store = TimeSeriesGrpc.blockingStub(ManagedChannelBuilder.forAddress("tsdb", 9000).usePlaintext().build())
-
-  val route: Route = path("v1" / "devices" / Segment / "series") { deviceId =>
-    get {
-      parameters("metric".optional, "from".optional, "to".optional) { (metric, from, to) =>
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        val request = QueryRequest(deviceId = deviceId, metric = metric.getOrElse(""), fromTs = from.map(_.toLong).getOrElse(0L),
-          toTs = to.map(_.toLong).getOrElse(System.currentTimeMillis() / 1000))
-        val raw = store.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).query(request).points
-        val step = math.max(1, math.ceil(raw.size.toDouble / MaxPoints).toInt)
-        val points = if (raw.size > MaxPoints) raw.grouped(step).map(_.head).toSeq else raw // thin the series to what a chart can draw
-        val body = JsObject(
-          "device_id" -> JsString(deviceId),
-          "metric" -> JsString(metric.getOrElse("")),
-          "points" -> JsArray(points.map(p => JsObject("ts" -> JsNumber(p.ts), "value" -> JsNumber(p.value))).toVector))
-        complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-      }
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import io.grpc.ManagedChannelBuilder
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import ingestd.Registry // Registry.lookup
-import tsdb.telemetry_ingest.{Point, QueryRequest, TimeSeriesGrpc}
-
-object SeriesRead {
-  val DeadlineSeconds = 4L
-  val MaxPoints = 1000
-  val MaxRangeSeconds = 86400L
-  val StaleAfterSeconds = 300L
-
-  private val store = TimeSeriesGrpc.blockingStub(ManagedChannelBuilder.forAddress("tsdb", 9000).usePlaintext().build())
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def fail(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  /** At most MaxPoints: each of MaxPoints / 2 buckets keeps its lowest and its highest point, in time order. */
-  def downsample(points: Seq[Point]): Seq[Point] =
-    if (points.size <= MaxPoints) points
-    else {
-      val size = math.ceil(points.size.toDouble / (MaxPoints / 2)).toInt
-      points.grouped(size).toSeq.flatMap { bucket =>
-        val low = bucket.minBy(_.value)
-        val high = bucket.maxBy(_.value)
-        if (low eq high) Seq(low) else Seq(low, high).sortBy(_.ts)
-      }
-    }
-
-  val route: Route = path("v1" / "devices" / Segment / "series") { deviceId =>
-    get {
-      optionalHeaderValueByName("X-Fleet-Id") { fleetHeader =>
-        parameters("metric".optional, "from".optional, "to".optional) { (metric, from, to) =>
-          val fleet = fleetHeader.getOrElse("")
-          val range = for (f <- from.flatMap(s => Try(s.toLong).toOption); t <- to.flatMap(s => Try(s.toLong).toOption)) yield (f, t)
-          if (fleet.isEmpty) complete(fail(StatusCodes.Unauthorized, "X-Fleet-Id is required"))
-          // The cap is decided here, before the store sees the request.
-          else if (metric.forall(_.isEmpty) || range.forall { case (f, t) => t <= f || t - f > MaxRangeSeconds })
-            complete(fail(StatusCodes.BadRequest, s"metric, from and to are required and the range must be 1 to $MaxRangeSeconds seconds"))
-          else
-            Registry.lookup(deviceId).filter(_.fleet == fleet) match {
-              // Another fleet's device is as unknown as a missing one: the answer must not confirm it exists.
-              case None => complete(fail(StatusCodes.NotFound, "unknown device"))
-              case Some(device) =>
-                val (fromTs, toTs) = range.get
-                val raw = store.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS)
-                  .query(QueryRequest(deviceId = device.id, metric = metric.get, fromTs = fromTs, toTs = toTs)).points
-                val points = downsample(raw)
-                val age = if (raw.isEmpty) None else Some(System.currentTimeMillis() / 1000 - raw.map(_.ts).max)
-                complete(json(StatusCodes.OK, JsObject(
-                  "device_id" -> JsString(device.id),
-                  "metric" -> JsString(metric.get),
-                  "points" -> JsArray(points.map(p => JsObject("ts" -> JsNumber(p.ts), "value" -> JsNumber(p.value))).toVector),
-                  "downsample" -> (if (points.size < raw.size) JsObject("method" -> JsString("minmax"), "points" -> JsNumber(points.size)) else JsNull),
-                  "age_seconds" -> age.map(JsNumber(_)).getOrElse(JsNull),
-                  "stale" -> JsBoolean(age.forall(_ > StaleAfterSeconds)))))
-            }
-        }
-      }
-    }
-  }
 }
 `,
     },

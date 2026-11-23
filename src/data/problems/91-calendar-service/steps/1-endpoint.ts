@@ -52,7 +52,6 @@ Rules, in this order, before anything is stored:
         python: {all: [/@app\.post\(\s*["']\/v1\/events["']/, /bump_generation\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/events['"]/, /bumpGeneration\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/events"/, /bumpGeneration\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"events"\s*\)/, /\bpost\s*\{/, /bumpGeneration\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/events"/, /bumpGeneration\(/]},
       },
     },
@@ -65,7 +64,6 @@ Rules, in this order, before anything is stored:
         python: {all: [/unsupported_rrule_part/, /not in SUPPORTED_PARTS/, /not in FREQUENCIES/]},
         typescript: {all: [/unsupported_rrule_part/, /SUPPORTED_PARTS\.includes\(/, /FREQUENCIES/]},
         go: {all: [/unsupported_rrule_part/, /rrule\.SupportedParts/, /rrule\.Frequencies/]},
-        scala: {all: [/unsupported_rrule_part/, /SupportedParts\.contains/, /Frequencies\.contains/]},
         cpp: {all: [/unsupported_rrule_part/, /kSupportedParts/, /kFrequencies/]},
       },
     },
@@ -78,7 +76,6 @@ Rules, in this order, before anything is stored:
         python: {all: [/rule_not_terminating/, /MAX_COUNT/]},
         typescript: {all: [/rule_not_terminating/, /MAX_COUNT/]},
         go: {all: [/rule_not_terminating/, /rrule\.MaxCount/]},
-        scala: {all: [/rule_not_terminating/, /Rrule\.MaxCount/]},
         cpp: {all: [/rule_not_terminating/, /kMaxCount/]},
       },
     },
@@ -91,7 +88,6 @@ Rules, in this order, before anything is stored:
         python: {all: [/parse_instant\(\s*parts\[["']UNTIL["']\]\s*\)/], none: [/\+\s*["']Z["']/]},
         typescript: {all: [/parseInstant\(\s*parts\.UNTIL\s*\)/], none: [/\+\s*['"]Z['"]/]},
         go: {all: [/rrule\.ParseInstant\(\s*parts\["UNTIL"\]\s*\)/], none: [/\+\s*"Z"/]},
-        scala: {all: [/parts\.get\("UNTIL"\)[^\n]*parseInstant/], none: [/\+\s*"Z"/]},
         cpp: {all: [/ParseInstant\(\s*parts\.at\("UNTIL"\)\s*\)/], none: [/\+\s*"Z"/]},
       },
     },
@@ -104,7 +100,6 @@ Rules, in this order, before anything is stored:
         python: {all: [/invalid_range/, /\bend\s*<=\s*start\b|\bstart\s*>=\s*end\b/]},
         typescript: {all: [/invalid_range/, /\bend\s*<=\s*start\b|\bstart\s*>=\s*end\b/]},
         go: {all: [/invalid_range/, /\bend\s*<=\s*start\b|\bstart\s*>=\s*end\b/]},
-        scala: {all: [/invalid_range/, /\bend\s*<=\s*start\b|\bstart\s*>=\s*end\b/]},
         cpp: {all: [/invalid_range/, /\*?end\s*<=\s*\*?start\b|\*?start\s*>=\s*\*?end\b/]},
       },
     },
@@ -573,167 +568,6 @@ func createEvent(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/events", createEvent)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import calendard.{Event, Rrule, Store}
-
-final case class EventRequest(
-    calendar_id: String,
-    title: String,
-    rrule: Option[String],
-    dtstart: String,
-    dtend: String,
-    attendees: Option[Seq[String]]
-)
-
-object CalendarApi {
-  implicit val system: ActorSystem = ActorSystem("calendar")
-  implicit val requestFormat: RootJsonFormat[EventRequest] = jsonFormat6(EventRequest)
-
-  private def error(status: StatusCode, code: String): Route =
-    complete(status, HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$code"}"""))
-
-  /** An instant written without an offset is read as UTC. */
-  def assumeUtc(text: String): String =
-    if (text.endsWith("Z") || text.matches(".*[+-]\\\\d{2}:\\\\d{2}$")) text else text + "Z"
-
-  val route: Route =
-    path("v1" / "events") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[EventRequest]) { body =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            val tenant = tenantOpt.getOrElse("")
-            if (tenant.isEmpty) error(StatusCodes.Unauthorized, "missing_tenant")
-            else {
-              val parts = Rrule.ruleParts(body.rrule.getOrElse(""))
-              (Rrule.parseInstant(assumeUtc(body.dtstart)), Rrule.parseInstant(assumeUtc(body.dtend))) match {
-                case (Some(start), Some(end)) =>
-                  val event = Event(
-                    Store.newId(),
-                    body.calendar_id,
-                    tenant,
-                    body.title,
-                    Rrule.formatRule(parts),
-                    Rrule.formatInstant(start),
-                    Rrule.formatInstant(end),
-                    1L,
-                    body.attendees.getOrElse(Seq.empty)
-                  )
-                  Store.putEvent(event)
-                  ExpansionCache.bumpGeneration(body.calendar_id) // step 2
-                  system.log.info(s"event=\${event.event_id} calendar=\${body.calendar_id} tenant=$tenant")
-                  complete(StatusCodes.Created, event)
-                case _ => error(StatusCodes.UnprocessableEntity, "invalid_instant")
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import calendard.{Event, Rrule, Store}
-
-final case class EventRequest(
-    calendar_id: String,
-    title: String,
-    rrule: Option[String],
-    dtstart: String,
-    dtend: String,
-    attendees: Option[Seq[String]]
-)
-
-object CalendarApi {
-  implicit val system: ActorSystem = ActorSystem("calendar")
-  implicit val requestFormat: RootJsonFormat[EventRequest] = jsonFormat6(EventRequest)
-
-  private def error(status: StatusCode, code: String): Route =
-    complete(status, HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$code"}"""))
-
-  private def positive(text: String): Long = text.toLongOption.filter(_ >= 1).getOrElse(0L)
-
-  /** Why the rule cannot be stored, or None. Refused, never trimmed: the stored rule is the rule the user wrote. */
-  def ruleError(parts: Map[String, String]): Option[String] =
-    if (parts.exists { case (key, value) => !Rrule.SupportedParts.contains(key) || value.isEmpty }) Some("unsupported_rrule_part")
-    else if (parts.isEmpty) None // one occurrence
-    else if (!Rrule.Frequencies.contains(parts.getOrElse("FREQ", ""))) Some("unsupported_rrule_part")
-    // The expander walks the rule until it ends: it must end, and each step must move forward.
-    else if (parts.get("INTERVAL").exists(positive(_) == 0)) Some("rule_not_terminating")
-    else if (!parts.contains("COUNT") && !parts.contains("UNTIL")) Some("rule_not_terminating")
-    else if (parts.get("COUNT").exists(c => positive(c) == 0 || positive(c) > Rrule.MaxCount)) Some("rule_not_terminating")
-    else None
-
-  val route: Route =
-    path("v1" / "events") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[EventRequest]) { body =>
-            val tenant = tenantOpt.getOrElse("")
-            if (tenant.isEmpty) error(StatusCodes.Unauthorized, "missing_tenant")
-            else {
-              val parts = Rrule.ruleParts(body.rrule.getOrElse(""))
-              // An instant without an offset names no instant: refuse it rather than guess a zone.
-              val untilKnown = parts.get("UNTIL").forall(until => Rrule.parseInstant(until).isDefined)
-              ruleError(parts) match {
-                case Some(problem) => error(StatusCodes.UnprocessableEntity, problem)
-                case None =>
-                  (Rrule.parseInstant(body.dtstart), Rrule.parseInstant(body.dtend)) match {
-                    case (Some(start), Some(end)) if untilKnown =>
-                      if (end <= start) error(StatusCodes.UnprocessableEntity, "invalid_range")
-                      else {
-                        val event = Event(
-                          Store.newId(),
-                          body.calendar_id,
-                          tenant,
-                          body.title,
-                          Rrule.formatRule(parts),
-                          Rrule.formatInstant(start),
-                          Rrule.formatInstant(end),
-                          1L,
-                          body.attendees.getOrElse(Seq.empty)
-                        )
-                        Store.putEvent(event)
-                        ExpansionCache.bumpGeneration(body.calendar_id) // step 2
-                        system.log.info(s"event=\${event.event_id} calendar=\${body.calendar_id} tenant=$tenant")
-                        complete(StatusCodes.Created, event)
-                      }
-                    case _ => error(StatusCodes.UnprocessableEntity, "invalid_instant")
-                  }
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

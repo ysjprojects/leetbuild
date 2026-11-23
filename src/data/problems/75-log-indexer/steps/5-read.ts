@@ -54,7 +54,6 @@ own.
         python: {all: [/@app\.get\(\s*["']\/v1\/services\/\{service\}\/completeness["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/services\/:service\/completeness['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/services\/\{service\}\/completeness"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"services"\s*\/\s*Segment\s*\/\s*"completeness"\s*\)/]},
         cpp: {all: [/svr\.Get\([^;]*completeness/]},
       },
     },
@@ -67,7 +66,6 @@ own.
         python: {all: [/registry\.is_registered\(/, /\b404\b/]},
         typescript: {all: [/isRegistered\(/, /code\(\s*404\s*\)/]},
         go: {all: [/registry\.IsRegistered\(/, /StatusNotFound/]},
-        scala: {all: [/Registry\.isRegistered\(/, /StatusCodes\.NotFound/]},
         cpp: {all: [/registry::isRegistered\(/, /\b404\b/]},
       },
     },
@@ -80,7 +78,6 @@ own.
         python: {all: [/"hours"/, /"hour"/], none: [/sum\(ledger\.hourly_counts/]},
         typescript: {all: [/hours:/, /hour,/], none: [/\.reduce\(/]},
         go: {all: [/"hours"/, /json:"hour"/], none: [/total \+=/]},
-        scala: {all: [/"hours"/, /"hour"/], none: [/\.sum\b/]},
         cpp: {all: [/"hours"/, /"hour"/], none: [/total \+=/]},
       },
     },
@@ -93,7 +90,6 @@ own.
         python: {all: [/ledger\.expected_per_hour\(tenant,\s*service/], none: [/EXPECTED_PER_HOUR/]},
         typescript: {all: [/expectedPerHour\(tenant,\s*service/], none: [/EXPECTED_PER_HOUR/]},
         go: {all: [/ledger\.ExpectedPerHour\(r\.Context\(\),\s*tenant,\s*service/], none: [/expectedPerHour\s*=/]},
-        scala: {all: [/Ledger\.expectedPerHour\(tenant,\s*service/], none: [/ExpectedPerHour\s*=/]},
         cpp: {all: [/ledger::expectedPerHour\(tenant,\s*service/], none: [/kExpectedPerHour/]},
       },
     },
@@ -106,7 +102,6 @@ own.
         python: {all: [/GAP_THRESHOLD\s*=\s*0\.5/, /"gap"/, /"gaps"/]},
         typescript: {all: [/GAP_THRESHOLD\s*=\s*0\.5/, /gap:/, /gaps:/]},
         go: {all: [/gapThreshold\s*=\s*0\.5/, /json:"gap"/, /"gaps"/]},
-        scala: {all: [/GapThreshold\s*=\s*0\.5/, /"gap"/, /"gaps"/]},
         cpp: {all: [/kGapThreshold\s*=\s*0\.5/, /"gap"/, /"gaps"/]},
       },
     },
@@ -355,89 +350,6 @@ func completeness(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/services/{service}/completeness", completeness)
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Instant
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import logindex.Ledger   // Ledger.hourlyCounts(tenant, service, hours), Ledger.expectedPerHour(tenant, service, before)
-import logindex.Registry // Registry.isRegistered(tenant, service): Boolean
-
-object Read {
-  val HourS = 3600L
-  val WindowHours = 24
-  val ExpectedPerHour = 1000L
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  def completeness(tenant: String, service: String): HttpResponse = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val current = Instant.now().getEpochSecond / HourS * HourS
-    val hours = (0 until WindowHours).map(i => current - HourS * (WindowHours - i))
-    val indexed = Ledger.hourlyCounts(tenant, service, hours).sum
-    val expected = ExpectedPerHour * WindowHours
-    json(StatusCodes.OK, JsObject("service" -> JsString(service), "indexed" -> JsNumber(indexed), "expected" -> JsNumber(expected), "complete" -> JsBoolean(indexed >= expected)))
-  }
-
-  val route: Route = path("v1" / "services" / Segment / "completeness") { service =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-        case Some(tenant) => complete(completeness(tenant, service))
-      }
-    }
-  }
-}
-`,
-      solution: `import java.time.Instant
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import logindex.Ledger   // Ledger.hourlyCounts(tenant, service, hours), Ledger.expectedPerHour(tenant, service, before)
-import logindex.Registry // Registry.isRegistered(tenant, service): Boolean
-
-object Read {
-  val HourS = 3600L
-  val WindowHours = 24
-  val GapThreshold = 0.5
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  def completeness(tenant: String, service: String): HttpResponse =
-    // Another tenant's service is as absent as one that never existed.
-    if (!Registry.isRegistered(tenant, service)) json(StatusCodes.NotFound, JsObject("error" -> JsString("no such service in the tenant's registry")))
-    else {
-      val current = Instant.now().getEpochSecond / HourS * HourS
-      // The complete hours before the current one, oldest first: a partial hour would always look short.
-      val hours = (0 until WindowHours).map(i => current - HourS * (WindowHours - i))
-      val counts = Ledger.hourlyCounts(tenant, service, hours)
-      val expected = Ledger.expectedPerHour(tenant, service, hours.head)
-      val buckets = hours.zip(counts).map { case (hour, count) =>
-        JsObject("hour" -> JsNumber(hour), "indexed" -> JsNumber(count), "expected" -> JsNumber(expected), "gap" -> JsBoolean(count < expected * (1 - GapThreshold)))
-      }
-      val gaps = buckets.count(_.fields("gap") == JsTrue)
-      json(StatusCodes.OK, JsObject("service" -> JsString(service), "hours" -> JsArray(buckets.toVector), "gaps" -> JsNumber(gaps), "threshold" -> JsNumber(GapThreshold)))
-    }
-
-  val route: Route = path("v1" / "services" / Segment / "completeness") { service =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-        case Some(tenant) => complete(completeness(tenant, service))
-      }
-    }
-  }
 }
 `,
     },

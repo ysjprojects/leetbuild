@@ -59,7 +59,6 @@ service JobRunner {
         go: {
           all: [/context\.WithTimeout\([^\n]*(triggerDeadline|3\s*\*\s*time\.Second|3000\s*\*\s*time\.Millisecond)/],
         },
-        scala: {all: [/withDeadlineAfter\(\s*(DeadlineMs|3000L?|3L?\s*,\s*TimeUnit\.SECONDS)/]},
         cpp: {
           all: [
             /set_deadline\([^\n]*(kTriggerDeadline|std::chrono::seconds[({]\s*3\s*[)}]|std::chrono::milliseconds[({]\s*3000\s*[)}])/,
@@ -76,7 +75,6 @@ service JobRunner {
         python: {all: [/stub\.Trigger\(/], none: [/while\s+True/]},
         typescript: {all: [/\.Trigger\(/], none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/]},
         go: {all: [/stub\.Trigger\(/], none: [/for\s*\{/]},
-        scala: {all: [/\.trigger\(/], none: [/while\s*\(\s*true\s*\)/]},
         cpp: {all: [/->Trigger\(/], none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/]},
       },
     },
@@ -89,7 +87,6 @@ service JobRunner {
         python: {all: [/["']policy_skip["']/]},
         typescript: {all: [/['"]policy_skip['"]/]},
         go: {all: [/"policy_skip"/]},
-        scala: {all: [/"policy_skip"/]},
         cpp: {all: [/"policy_skip"/]},
       },
     },
@@ -102,7 +99,6 @@ service JobRunner {
         python: {all: [/["']fire_once_now["']/, /["']coalesced["']/]},
         typescript: {all: [/['"]fire_once_now['"]/, /['"]coalesced['"]/]},
         go: {all: [/"fire_once_now"/, /"coalesced"/]},
-        scala: {all: [/"fire_once_now"/, /"coalesced"/]},
         cpp: {all: [/"fire_once_now"/, /"coalesced"/]},
       },
     },
@@ -115,7 +111,6 @@ service JobRunner {
         python: {all: [/MAX_CATCH_UP/]},
         typescript: {all: [/MAX_CATCH_UP/]},
         go: {all: [/maxCatchUp/]},
-        scala: {all: [/MaxCatchUp/]},
         cpp: {all: [/kMaxCatchUp/]},
       },
     },
@@ -414,77 +409,6 @@ func runMissed(ctx context.Context, s *store.Schedule, windows []int64, owner st
 		outcomes[w] = outcome
 	}
 	return outcomes, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import cronjobs.cron_scheduler.{JobRunnerGrpc, TriggerRequest}
-import cronsched.{Cron, Schedule}
-
-object JobTrigger {
-  private val stub = JobRunnerGrpc.blockingStub(ManagedChannelBuilder.forAddress("jobs", 9000).usePlaintext().build())
-
-  /** Run the schedule's job for one window; throws when it fails. */
-  def triggerJob(schedule: Schedule, window: Long): Unit = {
-    val request = TriggerRequest(scheduleId = schedule.id, jobRef = schedule.job_ref, window = Cron.formatInstant(window))
-    while (true) {
-      try {
-        stub.trigger(request)
-        return
-      } catch {
-        case _: StatusRuntimeException => ()
-      }
-    }
-  }
-
-  /** Settle the windows a pause missed; returns each window's outcome. */
-  def runMissed(schedule: Schedule, windows: Seq[Long], owner: String): Map[Long, String] = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    windows.sorted.map(w => w -> Leases.fireWindow(schedule.id, w, owner, (_, window) => triggerJob(schedule, window))).toMap // step 2
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.ManagedChannelBuilder
-
-import cronjobs.cron_scheduler.{JobRunnerGrpc, TriggerRequest}
-import cronsched.{Cron, Schedule, Store}
-
-object JobTrigger {
-  val DeadlineMs = 3000L
-  val MaxCatchUp = 5
-
-  private val stub = JobRunnerGrpc.blockingStub(ManagedChannelBuilder.forAddress("jobs", 9000).usePlaintext().build())
-
-  /**
-   * Run the schedule's job for one window; throws when it fails. One attempt: the job service runs
-   * every Trigger it gets, so a retry after a timeout can run the job twice. fireWindow records the
-   * failure and the next pass decides.
-   */
-  def triggerJob(schedule: Schedule, window: Long): Unit = {
-    val request = TriggerRequest(scheduleId = schedule.id, jobRef = schedule.job_ref, window = Cron.formatInstant(window))
-    stub.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).trigger(request)
-    ()
-  }
-
-  /** Settle the windows a pause missed, as the schedule's misfire policy says; returns each window's outcome. */
-  def runMissed(schedule: Schedule, windows: Seq[Long], owner: String): Map[Long, String] = {
-    val missed = windows.sorted
-    val (fire, skipped, reason) = schedule.misfire_policy match {
-      case "skip" => (Seq.empty[Long], missed, "policy_skip")
-      case "fire_once_now" => (missed.takeRight(1), missed.dropRight(1), "coalesced")
-      case _ => (missed.take(MaxCatchUp), Seq.empty[Long], "") // catch_up: the oldest first; the rest stay owed
-    }
-    val skippedOutcomes = skipped.map { w =>
-      Store.recordRun(schedule.id, w, "skipped", reason)
-      w -> "skipped"
-    }
-    val fired = fire.map(w => w -> Leases.fireWindow(schedule.id, w, owner, (_, window) => triggerJob(schedule, window))) // step 2
-    (skippedOutcomes ++ fired).toMap
-  }
 }
 `,
     },

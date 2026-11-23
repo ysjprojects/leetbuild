@@ -21,8 +21,7 @@ Security wants every request on record. Implement \`audit(api_key, path, status,
 :::widget kafka-partitions {"partitions": 6}
 
 > Every client library has a "queue full" signal: confluent-kafka raises \`BufferError\`, kafka-go lets you
-> put a bounded channel in front of the writer, the Java producer throws \`BufferExhaustedException\` when
-> \`max.block.ms=0\`, librdkafka returns \`ERR__QUEUE_FULL\`. The gateway's job is to *handle* it, not to wait.`,
+> put a bounded channel in front of the writer, librdkafka returns \`ERR__QUEUE_FULL\`. The gateway's job is to *handle* it, not to wait.`,
   sequence: {
     participants: ['gateway', 'Producer', 'Kafka'],
     messages: [
@@ -36,7 +35,7 @@ Security wants every request on record. Implement \`audit(api_key, path, status,
   },
   hints: [
     'Two things are bounded here: how long `audit` may take (zero network) and how much memory the producer may hold (the queue). Configure the second, then handle what happens when it is hit.',
-    'Bound the queue in the producer config (`queue.buffering.max.messages`, `buffer.memory` + `max.block.ms=0`) or with a buffered channel of fixed size in front of the writer; the full-queue outcome then becomes an exception, an error code, or a `select` `default` branch.',
+    'Bound the queue in the producer config (`queue.buffering.max.messages`) or with a buffered channel of fixed size in front of the writer; the full-queue outcome then becomes an exception, an error code, or a `select` `default` branch.',
     'The drop path is one line: catch/inspect the full-queue signal, `dropped += 1`, move on. Keep serving delivery callbacks with `poll(0)` (or a background goroutine draining the channel) so acknowledged records leave the queue.',
   ],
   checks: [
@@ -51,7 +50,6 @@ Security wants every request on record. Implement \`audit(api_key, path, status,
         },
         typescript: {all: [/gateway-audit/, /\.send\(\s*\{[\s\S]{0,200}?key:\s*apiKey/]},
         go: {all: [/gateway-audit/, /Key:\s*\[\]byte\(\s*apiKey\s*\)/]},
-        scala: {all: [/gateway-audit/, /new ProducerRecord(\[[^\]]*\])?\(\s*(Topic|"gateway-audit")\s*,\s*apiKey\s*,/]},
         cpp: {
           all: [
             /gateway-audit/,
@@ -69,7 +67,6 @@ Security wants every request on record. Implement \`audit(api_key, path, status,
         python: {all: [/["']queue\.buffering\.max\.messages["']\s*:/]},
         typescript: {all: [/QUEUE_MAX/, /inflight\s*>=\s*QUEUE_MAX|QUEUE_MAX\s*<=\s*inflight/]},
         go: {all: [/make\(\s*chan kafka\.Message\s*,\s*(queueSize|\d+)\s*\)/]},
-        scala: {all: [/"max\.block\.ms"\s*,\s*"0"/]},
         cpp: {all: [/"queue\.buffering\.max\.messages"/]},
       },
     },
@@ -82,7 +79,6 @@ Security wants every request on record. Implement \`audit(api_key, path, status,
         python: {all: [/except BufferError/, /dropped\s*\+=\s*1/]},
         typescript: {all: [/dropped\s*(\+=\s*1|\+\+)/, /inflight\s*-=\s*1|inflight--/]},
         go: {all: [/select\s*\{[\s\S]{0,300}?default:/, /dropped\.Add\(\s*1\s*\)/]},
-        scala: {all: [/case _: (BufferExhaustedException|TimeoutException)/, /dropped\.incrementAndGet\(\)/]},
         cpp: {all: [/ERR__QUEUE_FULL/, /\+\+dropped|dropped\+\+|dropped\.fetch_add\(/]},
       },
     },
@@ -95,7 +91,6 @@ Security wants every request on record. Implement \`audit(api_key, path, status,
         python: {all: [/producer\.poll\(\s*0\s*\)/], none: [/def audit(?:(?!\ndef )[\s\S])*?producer\.flush\(/]},
         typescript: {all: [/producer\s*\.send\(/], none: [/await\s+producer\s*\.send\(/]},
         go: {all: [/case queue <- /], none: [/func audit(?:(?!\n\})[\s\S])*?WriteMessages\(/]},
-        scala: {all: [/producer\.send\([\s\S]{0,200}?onDelivery\s*\)/], none: [/\.send\([^\n]*\)\.get\(/]},
         cpp: {all: [/producer->poll\(\s*0\s*\)/], none: [/void audit(?:(?!\n\})[\s\S])*?producer->flush\(/]},
       },
     },
@@ -352,78 +347,6 @@ func pump(ctx context.Context) {
 			log.Printf("%d audit records not delivered: %v", len(batch), err)
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-import java.util.concurrent.atomic.AtomicLong
-
-import org.apache.kafka.clients.producer.{BufferExhaustedException, Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.errors.TimeoutException
-import org.apache.kafka.common.serialization.StringSerializer
-
-object AuditLog {
-  val Topic = "gateway-audit"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  props.put("linger.ms", "20")
-  props.put("buffer.memory", "8388608")
-  // TODO: max.block.ms = 0 so a full buffer throws instead of parking the request thread
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  val dropped = new AtomicLong() // exported as gateway_audit_dropped_total
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"audit record not delivered: \${exception.getMessage}")
-  }
-
-  /** Called after the response is written; must never slow down or fail the request. */
-  def audit(apiKey: String, path: String, status: Int, latencyMs: Double): Unit = {
-    val value = s"""{"api_key":"$apiKey","path":"$path","status":$status,"latency_ms":$latencyMs,"ts":\${System.currentTimeMillis() / 1000.0}}"""
-    // TODO: send a record keyed by apiKey with onDelivery; BufferExhausted/Timeout → dropped.incrementAndGet(); never block
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.atomic.AtomicLong
-
-import org.apache.kafka.clients.producer.{BufferExhaustedException, Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.errors.TimeoutException
-import org.apache.kafka.common.serialization.StringSerializer
-
-object AuditLog {
-  val Topic = "gateway-audit"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  props.put("linger.ms", "20")
-  props.put("buffer.memory", "8388608")
-  props.put("max.block.ms", "0") // a full buffer throws instead of parking the request thread
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  val dropped = new AtomicLong() // exported as gateway_audit_dropped_total
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"audit record not delivered: \${exception.getMessage}")
-  }
-
-  /** Called after the response is written; must never slow down or fail the request. */
-  def audit(apiKey: String, path: String, status: Int, latencyMs: Double): Unit = {
-    val value = s"""{"api_key":"$apiKey","path":"$path","status":$status,"latency_ms":$latencyMs,"ts":\${System.currentTimeMillis() / 1000.0}}"""
-    val record = new ProducerRecord[String, String](Topic, apiKey, value)
-    try producer.send(record, onDelivery) // enqueues; the future is not awaited
-    catch {
-      // BufferExhaustedException extends TimeoutException: the buffer is full (or metadata is not
-      // there yet within max.block.ms = 0). Lose one audit line, not the request.
-      case _: BufferExhaustedException | _: TimeoutException => dropped.incrementAndGet()
-    }
-  }
 }
 `,
     },

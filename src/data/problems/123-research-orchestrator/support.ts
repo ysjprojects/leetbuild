@@ -4,10 +4,9 @@
  * research:{job_id} (tenant, effort, query, status, the budget and the service version that started
  * it); research:idem:{tenant}:{key} maps a client's Idempotency-Key to the job it started;
  * research:queue is the list the lead agent workers take job ids from. The plan's unit, a Task, and
- * the Budget live here too, so every step and every language share one shape. The five languages
+ * the Budget live here too, so every step and every language share one shape. The four languages
  * keep the same keys, so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'research/__init__.py': '',
@@ -383,72 +382,5 @@ inline std::string rememberKey(const std::string& tenant, const std::string& key
 inline void enqueue(const std::string& job_id) { redis().rpush("research:queue", job_id); }
 
 }  // namespace jobs
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('research', 'Jobs')]: `package research
-
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The job store (provided). A research job is the Redis hash research:{job_id} with tenant, effort,
- * query, status, the budget (max_subagents, max_tool_calls, token_budget) and version, the service
- * version that started it; research:idem:{tenant}:{key} holds the job a client's Idempotency-Key
- * started; research:queue is the list the lead agent workers take job ids from. Keys expire
- * JobTtlS after they are written. The query stays in Redis for the lead agent.
- */
-object Jobs {
-  val ServiceVersion = "2.3.0"
-  val JobTtlS = 86400L
-
-  /** What one job may spend. */
-  final case class Budget(maxSubagents: Int, maxToolCalls: Int, tokenBudget: Long)
-
-  /** A research job as the store keeps it. */
-  final case class Job(jobId: String, tenant: String, effort: String, status: String, budget: Budget, version: String)
-
-  /** One task of a plan: what a subagent is asked to find, in what shape, with which tools, and where to stop. */
-  final case class Task(id: String, objective: String, outputFormat: String, tools: Seq[String], boundaries: String)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def jobKey(jobId: String): String = s"research:$jobId"
-  private def idemKey(tenant: String, key: String): String = s"research:idem:$tenant:$key"
-
-  /** Store a new queued job with this budget, pinned to ServiceVersion; returns the job. */
-  def createJob(tenant: String, query: String, effort: String, budget: Budget): Job = {
-    val jobId = s"job-\${jedis.incr("research:seq")}"
-    val fields = Map(
-      "tenant" -> tenant, "effort" -> effort, "query" -> query, "status" -> "queued", "version" -> ServiceVersion,
-      "max_subagents" -> budget.maxSubagents.toString, "max_tool_calls" -> budget.maxToolCalls.toString,
-      "token_budget" -> budget.tokenBudget.toString)
-    jedis.hset(jobKey(jobId), fields.asJava)
-    jedis.expire(jobKey(jobId), JobTtlS)
-    getJob(jobId).get
-  }
-
-  /** The job with this id, if it exists. */
-  def getJob(jobId: String): Option[Job] = {
-    val raw = jedis.hgetAll(jobKey(jobId)).asScala.toMap
-    if (raw.isEmpty) None
-    else Some(Job(jobId, raw("tenant"), raw("effort"), raw("status"),
-      Budget(raw("max_subagents").toInt, raw("max_tool_calls").toInt, raw("token_budget").toLong), raw("version")))
-  }
-
-  /** The id of the job the tenant's Idempotency-Key started, if any. */
-  def jobForKey(tenant: String, key: String): Option[String] = Option(jedis.get(idemKey(tenant, key)))
-
-  /** Record that the tenant's Idempotency-Key started jobId, unless a concurrent request recorded its own job first (SET NX); returns the job the key belongs to. */
-  def rememberKey(tenant: String, key: String, jobId: String): String =
-    if (jedis.set(idemKey(tenant, key), jobId, SetParams.setParams().nx().ex(JobTtlS)) != null) jobId
-    else jedis.get(idemKey(tenant, key))
-
-  /** Hand the job to the lead agent workers; returns at once. */
-  def enqueue(jobId: String): Unit = jedis.rpush("research:queue", jobId)
-}
 `,
 };

@@ -7,7 +7,6 @@
  * and `models` the deterministic stand-in the checks serve over gRPC in place of the two models.
  */
 import {CPP_DIGEST_H, CPP_IDS_H} from '../cpp-support';
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'vision/__init__.py': '',
@@ -645,115 +644,5 @@ inline Answer answer(const std::string& task, const std::string& model_version) 
 }
 
 }  // namespace models
-`,
-};
-
-/** The Scala twins: the same \`vision\` objects, compiled with the steps by \`yarn check:scala\`. */
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('vision', 'Config')]: `package vision
-
-/** Addresses, topics, keys and limits every step of visiond agrees on. */
-object Config {
-  /** The two model deployments (Predictor.Predict): stand-ins served by the checks. */
-  val LargeModel = "vision-large:9000"
-  val SmallModel = "vision-small:9000"
-  /** One event per finished inference, keyed by model version, for the quality pipeline. */
-  val Topic = "vision.inference"
-  /** GPU slots a tenant may hold at once, and how long a slot is leased before it frees itself. */
-  val GpuTokens = 10L
-  val LeaseSeconds = 300L
-  /** A prediction is served for 30 days; the record that it was made is kept for a year. */
-  val ResultTtlSeconds: Long = 30L * 86400
-  val MetadataTtlSeconds: Long = 365L * 86400
-
-  /** The tenant's GPU pool: a sorted set of ticket -> lease expiry (unix seconds). */
-  def gpuKey(tenant: String): String = s"vision:gpu:$tenant"
-}
-`,
-  [scalaPath('vision', 'Inferences')]: `package vision
-
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-/**
- * The inference store (provided): rows in Redis, keyed by id and by (tenant, Idempotency-Key). A row
- * is the inference's JSON plus its tenant: inference_id, tenant, status ("pending" until the worker
- * writes the result, then "complete"), task, image, content_hash, created_at (unix seconds), and once
- * complete label, confidence, model_version, downgraded. Rows live MetadataTtlSeconds.
- */
-object Inferences {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** The inference this tenant started under idemKey, if any. */
-  def get(tenant: String, idemKey: String): Option[ujson.Obj] =
-    Option(jedis.get(s"vision:idem:$tenant:$idemKey")).flatMap(byId)
-
-  /** Store the inference under its id and under (tenant, idemKey); the row carries the tenant. */
-  def put(tenant: String, idemKey: String, inference: ujson.Obj): Unit = {
-    val row = ujson.Obj.from(inference.value)
-    row("tenant") = tenant
-    val id = inference("inference_id").str
-    jedis.set(s"vision:inference:$id", ujson.write(row), SetParams.setParams().ex(Config.MetadataTtlSeconds))
-    jedis.set(s"vision:idem:$tenant:$idemKey", id, SetParams.setParams().ex(Config.MetadataTtlSeconds))
-    ()
-  }
-
-  /** The row, None when there is none. */
-  def byId(inferenceId: String): Option[ujson.Obj] =
-    Option(jedis.get(s"vision:inference:$inferenceId")).map(raw => ujson.read(raw).obj).map(ujson.Obj.from(_))
-}
-`,
-  [scalaPath('vision', 'Objects')]: `package vision
-
-import redis.clients.jedis.JedisPooled
-
-/** The object store stand-in (provided): image bytes by storage key, as a bucket would answer them. */
-object Objects {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** The bytes stored under key, None when there is no such object. */
-  def fetchObject(key: String): Option[Array[Byte]] = Option(jedis.get(s"vision:object:$key".getBytes("UTF-8")))
-}
-`,
-  [scalaPath('vision', 'InferenceRecord')]: `package vision
-
-/**
- * The finished inference (provided): what the worker hands to publish. image_key and image_url (a
- * presigned URL to the image) are tenant content the worker holds, not the topic.
- */
-final case class InferenceRecord(
-    inference_id: String,
-    tenant: String,
-    task: String,
-    model_version: String,
-    label: String,
-    confidence: Double,
-    downgraded: Boolean,
-    latency_ms: Int,
-    content_hash: String,
-    image_key: String,
-    image_url: String
-)
-`,
-  [scalaPath('vision', 'Outbox')]: `package vision
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/** The outbox (provided): events the broker refused, kept for the relay to republish. */
-object Outbox {
-  val Key = "vision:outbox"
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Durably keep an event the broker refused (its JSON). */
-  def insertOutbox(eventJson: String): Unit = {
-    jedis.rpush(Key, eventJson)
-    ()
-  }
-
-  /** The kept events, decoded, oldest first. */
-  def rows(): List[ujson.Value] = jedis.lrange(Key, 0, -1).asScala.toList.map(ujson.read(_))
-}
 `,
 };

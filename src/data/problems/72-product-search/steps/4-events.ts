@@ -52,7 +52,6 @@ trace, so a dashboard cannot tell a quiet hour from a broken pipe.
         python: {all: [/key\s*=\s*tenant\b/], none: [/key\s*=\s*q\b/]},
         typescript: {all: [/key:\s*tenant\b/], none: [/key:\s*q\b/]},
         go: {all: [/Key:\s*\[\]byte\(tenant\)/], none: [/Key:\s*\[\]byte\(q\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(EventTopic,\s*tenant\b/], none: [/EventTopic,\s*q\b/]},
         cpp: {all: [/tenant\.c_str\(\),\s*tenant\.size\(\)/], none: [/q\.c_str\(\)/]},
       },
     },
@@ -74,10 +73,6 @@ trace, so a dashboard cannot tell a quiet hour from a broken pipe.
           all: [/catalog\.Digest\(\s*catalog\.NormalizeQuery\(\s*q\s*\)\s*\)/, /sort\.Strings\(/],
           none: [/"q":\s*q\b/, /"filters":\s*filters\b/],
         },
-        scala: {
-          all: [/Catalog\.digest\(\s*Catalog\.normalizeQuery\(\s*q\s*\)\s*\)/, /filters\.keys\.toSeq\.sorted/],
-          none: [/"q"\s*->\s*JsString\(\s*q\s*\)/],
-        },
         cpp: {
           all: [/catalog::digest\(\s*catalog::normalizeQuery\(\s*q\s*\)\s*\)/, /"filter_fields"/],
           none: [/\{"q",\s*q\}/, /\{"filters",\s*filters\}/],
@@ -93,7 +88,6 @@ trace, so a dashboard cannot tell a quiet hour from a broken pipe.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -106,7 +100,6 @@ trace, so a dashboard cannot tell a quiet hour from a broken pipe.
         python: {all: [/incr\(\s*f["']telemetry:dropped:\{tenant\}/]},
         typescript: {all: [/incr\(\s*`telemetry:dropped:\$\{tenant\}`/]},
         go: {all: [/Incr\(\s*ctx,\s*"telemetry:dropped:"\s*\+\s*tenant/]},
-        scala: {all: [/incr\(\s*s"telemetry:dropped:\$tenant"/]},
         cpp: {all: [/incr\(\s*"telemetry:dropped:"/]},
       },
     },
@@ -404,94 +397,6 @@ func recordSearch(ctx context.Context, tenant, q string, filters map[string]stri
 		log.Printf("search event not delivered: %v", err)
 	}
 	return payload
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import search.Catalog // normalizeQuery, digest
-
-object Telemetry {
-  val EventTopic = "search.event"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** One search.event for an answered search; returns the payload. */
-  def recordSearch(tenant: String, q: String, filters: Map[String, String], resultCount: Int, partial: Boolean, latencyMs: Long): JsObject = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val payload = JsObject(
-      "type" -> JsString("search.query"),
-      "tenant" -> JsString(tenant),
-      "q" -> JsString(q),
-      "filters" -> JsObject(filters.map { case (field, value) => field -> JsString(value) }),
-      "result_count" -> JsNumber(resultCount),
-      "partial" -> JsBoolean(partial),
-      "latency_ms" -> JsNumber(latencyMs))
-    producer.send(new ProducerRecord[String, String](EventTopic, q, payload.compactPrint), new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) System.err.println(s"search event not delivered: $exception")
-    })
-    producer.flush()
-    payload
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import search.Catalog // normalizeQuery, digest
-
-object Telemetry {
-  val EventTopic = "search.event"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the event before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** One search.event for an answered search; returns the payload. */
-  def recordSearch(tenant: String, q: String, filters: Map[String, String], resultCount: Int, partial: Boolean, latencyMs: Long): JsObject = {
-    // The topic is retained and replicated: a digest of the query and the names of the filters, never what was typed.
-    val payload = JsObject(
-      "type" -> JsString("search.query"),
-      "tenant" -> JsString(tenant),
-      "query_hash" -> JsString(Catalog.digest(Catalog.normalizeQuery(q))),
-      "filter_fields" -> JsArray(filters.keys.toSeq.sorted.map(JsString(_)).toVector),
-      "result_count" -> JsNumber(resultCount),
-      "partial" -> JsBoolean(partial),
-      "latency_ms" -> JsNumber(latencyMs))
-    producer.send(new ProducerRecord[String, String](EventTopic, tenant, payload.compactPrint), new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) {
-          jedis.incr(s"telemetry:dropped:$tenant") // the dashboard's counts are a lower bound, and it knows by how much
-          System.err.println(s"search event not delivered: $exception")
-        }
-    })
-    producer.flush()
-    payload
-  }
 }
 `,
     },

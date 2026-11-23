@@ -55,7 +55,6 @@ and the response says what the state did with each update.
         python: {all: [/@app\.post\(\s*["']\/v1\/vehicles\/positions["']/, /record_position\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/vehicles\/positions['"]/, /recordPosition\(/]},
         go: {all: [/"POST \/v1\/vehicles\/positions"/, /recordPosition\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"vehicles"\s*\/\s*"positions"\s*\)/, /recordPosition\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/vehicles\/positions"/, /record_position\(/]},
       },
     },
@@ -68,7 +67,6 @@ and the response says what the state did with each update.
         python: {all: [/status_code\s*=\s*401/], none: [/headers\.get\(\s*["']x-tenant-id["']\s*,\s*["']["']\s*\)/i]},
         typescript: {all: [/code\(\s*401\s*\)/], none: [/\?\?\s*['"]['"]/]},
         go: {all: [/http\.StatusUnauthorized|\b401\b/]},
-        scala: {all: [/StatusCodes\.Unauthorized|\b401\b/], none: [/tenant\s*=\s*header\.getOrElse\(\s*""\s*\)/]},
         cpp: {all: [/status\s*=\s*401/]},
       },
     },
@@ -90,10 +88,6 @@ and the response says what the state did with each update.
           all: [/\b400\b|StatusBadRequest/, /recordPosition\(/],
           none: [/return\s*\n\s*\}\s*\n\s*(if )?(_|applied), err :?= recordPosition\(/],
         },
-        scala: {
-          all: [/BadRequest|\b400\b/, /recordPosition\(/],
-          none: [/if \(error\.isEmpty\)\s*Events\.recordPosition\(/],
-        },
         cpp: {all: [/\b400\b/, /record_position\(/], none: [/return;\s*\n\s*\}\s*\n\s*(if \()?record_position\(/]},
       },
     },
@@ -106,7 +100,6 @@ and the response says what the state did with each update.
         python: {all: [/MAX_SKEW_MS\s*=\s*300_?000/, /abs\(/, /MAX_SKEW_MS/]},
         typescript: {all: [/MAX_SKEW_MS\s*=\s*300_?000/, /Math\.abs\(/, /MAX_SKEW_MS/]},
         go: {all: [/maxSkewMs\s*=\s*300_?000/, /math\.Abs\(|Abs\(/, /maxSkewMs/]},
-        scala: {all: [/MaxSkewMs\s*=\s*300_?000L?/, /math\.abs\(/, /MaxSkewMs/]},
         cpp: {all: [/kMaxSkewMs\s*=\s*300_?000/, /llabs\(|std::abs\(/, /kMaxSkewMs/]},
       },
     },
@@ -122,7 +115,6 @@ and the response says what the state did with each update.
         },
         typescript: {all: [/duplicate\s*(\+=\s*1|\+\+)/], none: [/accepted:\s*updates\.length/]},
         go: {all: [/duplicate(\+\+|\s*\+=\s*1)/], none: [/"accepted":\s*len\(/]},
-        scala: {all: [/count\(identity\)|duplicate\s*\+=\s*1/], none: [/Result\(\s*batch\.updates\.size\s*,\s*0\s*\)/]},
         cpp: {
           all: [/duplicate(\+\+|\s*\+=\s*1)|: duplicate\)\+\+/],
           none: [/\{"accepted",\s*accepted\},\s*\{"duplicate",\s*0\}/],
@@ -482,116 +474,6 @@ func postPositions(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/vehicles/positions", postPositions)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model.StatusCodes
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import fleet.Position
-
-object Api {
-  final case class Batch(batchId: Option[String], updates: List[Position])
-  implicit val batchFormat: RootJsonFormat[Batch] = jsonFormat(Batch.apply _, "batch_id", "updates")
-  final case class Result(accepted: Int, duplicate: Int)
-  implicit val resultFormat: RootJsonFormat[Result] = jsonFormat2(Result.apply)
-
-  /** Why the update is not a position, or None. */
-  def validate(p: Position): Option[String] =
-    if (p.vehicleId.isEmpty) Some("vehicle_id must be a non-empty string")
-    else if (p.deviceTimestampMs <= 0) Some("device_timestamp_ms must be a positive integer")
-    else if (p.sequence < 0) Some("sequence must be a non-negative integer")
-    else if (p.lat < -90 || p.lat > 90) Some("lat must be within [-90, 90]")
-    else if (p.lon < -180 || p.lon > 180) Some("lon must be within [-180, 180]")
-    else None
-
-  val route: Route =
-    path("v1" / "vehicles" / "positions") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { header =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          val tenant = header.getOrElse("")
-          entity(as[Batch]) { batch =>
-            if (batch.updates.isEmpty) complete(StatusCodes.BadRequest -> "updates must be a non-empty list")
-            else {
-              var error: Option[String] = None
-              val it = batch.updates.iterator
-              while (error.isEmpty && it.hasNext) {
-                val u = it.next()
-                error = validate(u)
-                if (error.isEmpty) Events.recordPosition(u.vehicleId, u) // built in step 4
-              }
-              error match {
-                case Some(message) => complete(StatusCodes.BadRequest -> message)
-                case None =>
-                  println(s"positions tenant=$tenant batch=\${batch.batchId.getOrElse("")} accepted=\${batch.updates.size}")
-                  complete(Result(batch.updates.size, 0))
-              }
-            }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model.StatusCodes
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import fleet.Position
-
-object Api {
-  val MaxSkewMs = 300000L // five minutes
-
-  final case class Batch(batchId: Option[String], updates: List[Position])
-  implicit val batchFormat: RootJsonFormat[Batch] = jsonFormat(Batch.apply _, "batch_id", "updates")
-  final case class Result(accepted: Int, duplicate: Int)
-  implicit val resultFormat: RootJsonFormat[Result] = jsonFormat2(Result.apply)
-
-  /** Why the update is not a position, or None. */
-  def validate(p: Position): Option[String] =
-    if (p.vehicleId.isEmpty) Some("vehicle_id must be a non-empty string")
-    else if (p.deviceTimestampMs <= 0) Some("device_timestamp_ms must be a positive integer")
-    else if (p.sequence < 0) Some("sequence must be a non-negative integer")
-    else if (p.lat < -90 || p.lat > 90) Some("lat must be within [-90, 90]")
-    else if (p.lon < -180 || p.lon > 180) Some("lon must be within [-180, 180]")
-    else None
-
-  val route: Route =
-    path("v1" / "vehicles" / "positions") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "missing X-Tenant-Id")
-          case Some(tenant) =>
-            entity(as[Batch]) { batch =>
-              val nowMs = System.currentTimeMillis()
-              // the whole batch is checked before anything is written
-              val error = batch.updates.iterator.flatMap { u =>
-                validate(u).orElse {
-                  if (math.abs(nowMs - u.deviceTimestampMs) > MaxSkewMs) Some("device_timestamp_ms outside the accepted skew") else None
-                }
-              }.nextOption()
-              if (batch.updates.isEmpty) complete(StatusCodes.BadRequest -> "updates must be a non-empty list")
-              else error match {
-                case Some(message) => complete(StatusCodes.BadRequest -> message)
-                case None =>
-                  val applied = batch.updates.map(u => Events.recordPosition(u.vehicleId, u)) // built in step 4
-                  val accepted = applied.count(identity)
-                  println(s"positions tenant=$tenant batch=\${batch.batchId.getOrElse("")} accepted=$accepted duplicate=\${applied.size - accepted}")
-                  complete(Result(accepted, applied.size - accepted))
-              }
-            }
-        }
-      }
-    }
 }
 `,
     },

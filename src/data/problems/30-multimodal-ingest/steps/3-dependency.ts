@@ -25,7 +25,7 @@ service Vision { rpc Caption(CaptionRequest) returns (CaptionReply); }  // PERMI
 \`\`\`
 
 - Every \`Caption\` call carries a 3-second deadline: \`VISION_DEADLINE_S\` = 3 (\`VISION_DEADLINE_MS\`,
-  \`visionDeadline\`, \`VisionDeadlineSeconds\`, \`kVisionDeadline\`).
+  \`visionDeadline\`, \`kVisionDeadline\`).
 - \`PERMISSION_DENIED\` raises \`ContentPolicyError\` (Go: \`ErrContentPolicy\`) after one call.
 - Any other failure, a deadline or \`UNAVAILABLE\`, answers at once with caption null,
   \`caption_source: "none"\` and \`degraded: true\`: the image is indexed without a caption.
@@ -65,7 +65,6 @@ service Vision { rpc Caption(CaptionRequest) returns (CaptionReply); }  // PERMI
         python: {all: [/["']user["']/, /\.Caption\(/]},
         typescript: {all: [/['"]user['"]/, /\.Caption\(/]},
         go: {all: [/"user"/, /\.Caption\(/]},
-        scala: {all: [/"user"/, /\.caption\(/]},
         cpp: {all: [/"user"/, /->Caption\(/]},
       },
     },
@@ -78,7 +77,6 @@ service Vision { rpc Caption(CaptionRequest) returns (CaptionReply); }  // PERMI
         python: {all: [/VISION_DEADLINE_S\s*=\s*3\b/, /Caption\([^)]*\)?[^\n]*timeout\s*=\s*VISION_DEADLINE_S/]},
         typescript: {all: [/VISION_DEADLINE_MS\s*=\s*3000\b/, /deadline:[^\n]*VISION_DEADLINE_MS/]},
         go: {all: [/visionDeadline\s*=\s*3\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*visionDeadline\s*\)/]},
-        scala: {all: [/VisionDeadlineSeconds\s*=\s*3L?\b/, /withDeadlineAfter\(\s*VisionDeadlineSeconds/]},
         cpp: {all: [/kVisionDeadline\{3\}/, /set_deadline\([^\n]*kVisionDeadline\)/]},
       },
     },
@@ -94,7 +92,6 @@ service Vision { rpc Caption(CaptionRequest) returns (CaptionReply); }  // PERMI
           none: [/setTimeout\(/, /for \(let attempt/],
         },
         go: {all: [/codes\.PermissionDenied/, /%w[^\n]*ErrContentPolicy/], none: [/time\.Sleep\(/, /for attempt :=/]},
-        scala: {all: [/PERMISSION_DENIED/, /throw new ContentPolicyError/], none: [/Thread\.sleep\(/, /\(1 to /]},
         cpp: {all: [/PERMISSION_DENIED/, /throw ContentPolicyError/], none: [/sleep_for\(/, /for \(int attempt/]},
       },
     },
@@ -107,7 +104,6 @@ service Vision { rpc Caption(CaptionRequest) returns (CaptionReply); }  // PERMI
         python: {all: [/["']none["']/, /["']degraded["']\s*:\s*True/], none: [/an image/]},
         typescript: {all: [/['"]none['"]/, /degraded:\s*true/], none: [/an image/]},
         go: {all: [/"none"/, /Degraded:\s*true/], none: [/an image/]},
-        scala: {all: [/"none"/, /degraded\s*=\s*true/], none: [/an image/]},
         cpp: {all: [/"none"/, /\btrue\}/], none: [/an image/]},
       },
     },
@@ -120,7 +116,6 @@ service Vision { rpc Caption(CaptionRequest) returns (CaptionReply); }  // PERMI
         python: {all: [/assets\.queue_backfill\(/]},
         typescript: {all: [/queueBackfill\(/]},
         go: {all: [/assets\.QueueBackfill\(/]},
-        scala: {all: [/Assets\.queueBackfill\(/]},
         cpp: {all: [/assets::queueBackfill\(/]},
       },
     },
@@ -363,78 +358,6 @@ func captionAsset(ctx context.Context, a assets.Asset) (assets.Captioned, error)
 		return assets.Captioned{}, err
 	}
 	return assets.Captioned{Source: "none", Degraded: true}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import ingest.Assets // Assets.Asset, Assets.Captioned, Assets.queueBackfill(assetId)
-import ingest.vision.{CaptionRequest, VisionGrpc}
-
-/** The vision service refused the image under the content policy: the asset fails, with the reason. */
-final class ContentPolicyError(message: String) extends Exception(message)
-
-object Captioner {
-  val VisionAttempts = 3
-
-  private val vision = VisionGrpc.blockingStub(ManagedChannelBuilder.forAddress("vision", 9000).usePlaintext().build())
-
-  /** The caption ingest indexes for the asset. */
-  def captionAsset(asset: Assets.Asset): Assets.Captioned = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    asset.caption match {
-      case Some(caption) => Assets.Captioned(Some(caption), "user", degraded = false)
-      case None =>
-        val request = CaptionRequest(asset.assetId, asset.tenant, asset.checksum, asset.mime)
-        (1 to VisionAttempts).iterator
-          .map { _ =>
-            try Some(vision.caption(request))
-            catch {
-              case _: StatusRuntimeException =>
-                Thread.sleep(1000) // the vision service is flaky: try again
-                None
-            }
-          }
-          .collectFirst { case Some(reply) => Assets.Captioned(Some(reply.caption), "vision", degraded = false) }
-          .getOrElse(Assets.Captioned(Some("an image"), "vision", degraded = false))
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import ingest.Assets // Assets.Asset, Assets.Captioned, Assets.queueBackfill(assetId)
-import ingest.vision.{CaptionRequest, VisionGrpc}
-
-/** The vision service refused the image under the content policy: the asset fails, with the reason. */
-final class ContentPolicyError(message: String) extends Exception(message)
-
-object Captioner {
-  val VisionDeadlineSeconds = 3L
-
-  private val vision = VisionGrpc.blockingStub(ManagedChannelBuilder.forAddress("vision", 9000).usePlaintext().build())
-
-  /** The caption ingest indexes for the asset. */
-  def captionAsset(asset: Assets.Asset): Assets.Captioned = asset.caption match {
-    case Some(caption) => Assets.Captioned(Some(caption), "user", degraded = false)
-    case None =>
-      val request = CaptionRequest(asset.assetId, asset.tenant, asset.checksum, asset.mime)
-      try {
-        val reply = vision.withDeadlineAfter(VisionDeadlineSeconds, TimeUnit.SECONDS).caption(request)
-        Assets.Captioned(Some(reply.caption), "vision", degraded = false)
-      } catch {
-        // A verdict about the image: no retry can change it.
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.PERMISSION_DENIED =>
-          throw new ContentPolicyError(Option(e.getStatus.getDescription).getOrElse("refused by the content policy"))
-        // A deadline or an outage says nothing about the image: index it without a caption now, caption it later.
-        case _: StatusRuntimeException =>
-          Assets.queueBackfill(asset.assetId)
-          Assets.Captioned(None, "none", degraded = true)
-      }
-  }
 }
 `,
     },

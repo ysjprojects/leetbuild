@@ -56,7 +56,6 @@ today's value and replaces it; a value whose freshness SLO passed hours ago is s
           none: [/`feature:\$\{name\}:\$\{entity\}`/],
         },
         go: {all: [/"feature:%s:%d:%s"/], none: [/"feature:%s:%s"/]},
-        scala: {all: [/s"feature:\$name:\$version:\$entity"/], none: [/s"feature:\$name:\$entity"/]},
         cpp: {
           all: [/std::to_string\(version\)\s*\+\s*":"\s*\+\s*entity/],
           none: [/"feature:"\s*\+\s*name\s*\+\s*":"\s*\+\s*entity/],
@@ -78,7 +77,6 @@ today's value and replaces it; a value whose freshness SLO passed hours ago is s
           none: [/redis\.hset\(/],
         },
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]HGET['"]/, /tonumber\(/], none: [/rdb\.HSet\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HGET['"]/, /tonumber\(/], none: [/jedis\.hset\(/]},
         cpp: {all: [/\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HGET['"]/, /tonumber\(/], none: [/redis\(\)\.hset\(/]},
       },
     },
@@ -91,7 +89,6 @@ today's value and replaces it; a value whose freshness SLO passed hours ago is s
         python: {all: [/EXPIREAT/, /registry\.get_definition\(/, /freshness_slo/], none: [/TTL_S/, /\.expire\(/]},
         typescript: {all: [/EXPIREAT/, /getDefinition\(/, /freshness_slo/], none: [/TTL_S/, /\.expire\(/]},
         go: {all: [/EXPIREAT/, /registry\.GetDefinition\(/, /FreshnessSLO/], none: [/\bttl\b/, /\.Expire\(/]},
-        scala: {all: [/EXPIREAT/, /Registry\.getDefinition\(/, /freshnessSlo/], none: [/TtlSeconds/, /\.expire\(/]},
         cpp: {all: [/EXPIREAT/, /registry::getDefinition\(/, /freshness_slo/], none: [/kTtl/, /\.expire\(/]},
       },
     },
@@ -342,71 +339,6 @@ func readValue(ctx context.Context, name string, version int, entity string) (*V
 	value, _ := strconv.ParseFloat(raw["value"], 64)
 	eventTs, _ := strconv.ParseInt(raw["event_ts"], 10, 64)
 	return &Value{Value: value, EventTs: eventTs, AgeS: time.Now().Unix() - eventTs}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  final case class Value(value: Double, eventTs: Long, ageS: Long)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  val TtlSeconds: Long = 24L * 3600
-
-  /** Store the entity's value of the feature version; whether it stored. */
-  def writeValue(name: String, version: Long, entity: String, value: Double, eventTs: Long): Boolean = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    val key = s"feature:$name:$entity"
-    jedis.hset(key, Map("value" -> value.toString, "event_ts" -> eventTs.toString).asJava)
-    jedis.expire(key, TtlSeconds)
-    true
-  }
-
-  /** The entity's value with its event_ts and age_s, if any. */
-  def readValue(name: String, version: Long, entity: String): Option[Value] = {
-    val raw = jedis.hgetAll(s"feature:$name:$entity").asScala
-    raw.get("event_ts").map(ts => Value(raw("value").toDouble, ts.toLong, System.currentTimeMillis() / 1000 - ts.toLong))
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import features.Registry // Registry.getDefinition(name, version): Option[Registry.Definition]
-
-object State {
-  final case class Value(value: Double, eventTs: Long, ageS: Long)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Newer wins: an older or equal event_ts is refused; a stored value expires when it goes stale. */
-  val WriteLua: String =
-    """local stored = redis.call('HGET', KEYS[1], 'event_ts')
-      |if stored and tonumber(stored) >= tonumber(ARGV[2]) then return 0 end
-      |redis.call('HSET', KEYS[1], 'value', ARGV[1], 'event_ts', ARGV[2])
-      |redis.call('EXPIREAT', KEYS[1], ARGV[3])
-      |return 1
-      |""".stripMargin
-
-  def valueKey(name: String, version: Long, entity: String): String = s"feature:$name:$version:$entity"
-
-  /** Store the entity's value of the feature version; whether it stored. */
-  def writeValue(name: String, version: Long, entity: String, value: Double, eventTs: Long): Boolean = {
-    val definition = Registry.getDefinition(name, version).getOrElse(throw new NoSuchElementException(s"no definition $name v$version"))
-    val args = List(value.toString, eventTs.toString, (eventTs + definition.freshnessSlo).toString).asJava
-    jedis.eval(WriteLua, List(valueKey(name, version, entity)).asJava, args).asInstanceOf[java.lang.Long] == 1L
-  }
-
-  /** The entity's value with its event_ts and age_s, if any. */
-  def readValue(name: String, version: Long, entity: String): Option[Value] = {
-    val raw = jedis.hgetAll(valueKey(name, version, entity)).asScala
-    raw.get("event_ts").map(ts => Value(raw("value").toDouble, ts.toLong, System.currentTimeMillis() / 1000 - ts.toLong))
-  }
 }
 `,
     },

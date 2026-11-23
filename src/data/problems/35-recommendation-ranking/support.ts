@@ -2,11 +2,10 @@
  * Hand-written support modules the recommendation-ranking steps import but no step builds: the
  * `recs` package. `recs.store` is the service's shared Redis state: the popularity order the ranking
  * client falls back to, the surface configs with their promotion record, and the outbox a relay
- * produces from later. `recs.types` (TypeScript, Go, C++, Scala) holds the shapes the steps pass
- * each other: a scored item, a ranked list, a feature vector. The five languages keep the same keys,
+ * produces from later. `recs.types` (TypeScript, Go, C++) holds the shapes the steps pass
+ * each other: a scored item, a ranked list, a feature vector. The four languages keep the same keys,
  * so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'recs/__init__.py': '',
@@ -342,67 +341,5 @@ inline void outboxInsert(const std::string& topic, const std::string& key, const
 }
 
 }  // namespace store
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('recs', 'Types')]: `package recs
-
-/** One candidate with the score that placed it. */
-final case class ScoredItem(id: String, score: Double)
-
-/** A ranked list, best first, stamped with the version that ordered it; fallback marks the popularity order. */
-final case class Ranked(items: Seq[ScoredItem], modelVersion: String, fallback: Boolean)
-
-/** One user's feature vector; stale marks the copy kept for when the feature service is down. */
-final case class Features(values: Seq[Double], stale: Boolean)
-`,
-  [scalaPath('recs', 'Store')]: `package recs
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The recommendation service's shared Redis state (provided).
- *
- * popularity:{surface}        sorted set: item id -> engagements on the surface (the fallback order)
- * surface:{surface}           hash: model_version, fallback_policy (the surface's active config)
- * surface:{surface}:promoted  set: every model version ever promoted on the surface
- * outbox                      list of JSON rows {topic, key, payload} that a relay produces later
- */
-object Store {
-  final case class Config(modelVersion: String, fallbackPolicy: String)
-
-  val PopularityVersion = "popularity-v1"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** The candidates most engaged first; an id with no engagements scores 0 and keeps its place. */
-  def popularityOrder(surface: String, candidateIds: Seq[String]): Seq[ScoredItem] = {
-    val scores = jedis.zrevrangeWithScores(s"popularity:$surface", 0, -1).asScala.map(t => t.getElement -> t.getScore).toMap
-    candidateIds.map(id => ScoredItem(id, scores.getOrElse(id, 0.0))).sortBy(-_.score)
-  }
-
-  /** Make modelVersion the surface's active version and record the promotion (a rollback promotes an earlier one again). */
-  def promote(surface: String, modelVersion: String, fallbackPolicy: String = "popularity"): Unit = {
-    jedis.sadd(s"surface:$surface:promoted", modelVersion)
-    jedis.hset(s"surface:$surface", Map("model_version" -> modelVersion, "fallback_policy" -> fallbackPolicy).asJava)
-  }
-
-  /** The surface's active config, or None for a surface that does not exist. */
-  def surfaceConfig(surface: String): Option[Config] = {
-    val raw = jedis.hgetAll(s"surface:$surface").asScala
-    if (raw.isEmpty) None else Some(Config(raw.getOrElse("model_version", ""), raw.getOrElse("fallback_policy", "")))
-  }
-
-  /** Whether modelVersion was ever promoted on the surface. */
-  def isPromoted(surface: String, modelVersion: String): Boolean = jedis.sismember(s"surface:$surface:promoted", modelVersion)
-
-  /** Keep a record the broker did not take: the relay produces it later, under the same key. */
-  def outboxInsert(topic: String, key: String, payload: JsObject): Unit =
-    jedis.rpush("outbox", JsObject("topic" -> JsString(topic), "key" -> JsString(key), "payload" -> payload).compactPrint)
-}
 `,
 };

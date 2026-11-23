@@ -58,7 +58,6 @@ service Eligibility { rpc CheckEligibility(EligibilityRequest) returns (Eligibil
         python: {all: [/CheckEligibility\(/, /timeout\s*=/]},
         typescript: {all: [/CheckEligibility\(/, /deadline:/]},
         go: {all: [/CheckEligibility\(/, /context\.WithTimeout\(/]},
-        scala: {all: [/checkEligibility\(/, /withDeadlineAfter\(/]},
         cpp: {all: [/CheckEligibility\(/, /set_deadline\(/]},
       },
     },
@@ -71,7 +70,6 @@ service Eligibility { rpc CheckEligibility(EligibilityRequest) returns (Eligibil
         python: {all: [/eligibility_unverified/, /MAX_ATTEMPTS/], none: [/eligibility_unavailable/]},
         typescript: {all: [/eligibility_unverified/, /MAX_ATTEMPTS/], none: [/eligibility_unavailable/]},
         go: {all: [/eligibility_unverified/, /maxAttempts/], none: [/eligibility_unavailable/]},
-        scala: {all: [/eligibility_unverified/, /MaxAttempts/], none: [/eligibility_unavailable/]},
         cpp: {all: [/eligibility_unverified/, /kMaxAttempts/], none: [/eligibility_unavailable/]},
       },
     },
@@ -83,7 +81,6 @@ service Eligibility { rpc CheckEligibility(EligibilityRequest) returns (Eligibil
         python: {all: [/reply\.active/, /approver_departed/]},
         typescript: {all: [/reply\.active/, /approver_departed/]},
         go: {all: [/reply\.(Get)?Active\b/, /approver_departed/]},
-        scala: {all: [/reply\.active/, /approver_departed/]},
         cpp: {all: [/reply\.active\(\)/, /approver_departed/]},
       },
     },
@@ -96,7 +93,6 @@ service Eligibility { rpc CheckEligibility(EligibilityRequest) returns (Eligibil
         python: {all: [/reply\.delegated_to/, /delegation_mismatch/]},
         typescript: {all: [/reply\.delegated_to/, /delegation_mismatch/]},
         go: {all: [/reply\.(Get)?DelegatedTo\b/, /delegation_mismatch/]},
-        scala: {all: [/reply\.delegatedTo/, /delegation_mismatch/]},
         cpp: {all: [/reply\.delegated_to\(\)/, /delegation_mismatch/]},
       },
     },
@@ -109,7 +105,6 @@ service Eligibility { rpc CheckEligibility(EligibilityRequest) returns (Eligibil
         python: {order: [/=\s*verify_eligibility\(/, /chain\.advance\(/]},
         typescript: {order: [/=\s*(await\s+)?verifyEligibility\(/, /chain\.advance\(/]},
         go: {order: [/=\s*verifyEligibility\(/, /chain\.Advance\(/]},
-        scala: {order: [/=\s*verifyEligibility\(/, /Chain\.advance\(/]},
         cpp: {order: [/=\s*verifyEligibility\(/, /chain::advance\(/]},
       },
     },
@@ -403,83 +398,6 @@ func decide(ctx context.Context, requestID string, stepIndex int, actor, decisio
 		return chain.Outcome{StepIndex: stepIndex, Status: "denied", Reason: reason}, nil
 	}
 	return chain.Advance(ctx, requestID, stepIndex, actor, decision)
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import approvals.Chain // Chain.advance(requestId, stepIndex, actor, decision): Chain.Outcome
-import approvalwf.approval_workflow.{EligibilityGrpc, EligibilityReply, EligibilityRequest}
-
-object Client {
-  val MaxAttempts = 2
-
-  private val eligibility = EligibilityGrpc.blockingStub(ManagedChannelBuilder.forAddress("eligibility", 9000).usePlaintext().build())
-
-  /** Whether actor may decide requestId, and the reason when not. */
-  def verifyEligibility(actor: String, requestId: String): (Boolean, String) = {
-    for (_ <- 0 until MaxAttempts) {
-      val reply: Option[EligibilityReply] =
-        try Some(eligibility.checkEligibility(EligibilityRequest(actor, requestId)))
-        catch { case _: StatusRuntimeException => None }
-      reply.foreach { r =>
-        return if (!r.eligible) (false, "approver_ineligible") else (true, "")
-      }
-    }
-    (true, "eligibility_unavailable") // a directory outage should not hold up spend
-  }
-
-  /** Record actor's decision on step stepIndex once eligibility allows it. */
-  def decide(requestId: String, stepIndex: Long, actor: String, decision: String): Chain.Outcome = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val outcome = Chain.advance(requestId, stepIndex, actor, decision)
-    val (allowed, reason) = verifyEligibility(actor, requestId)
-    if (!allowed) Chain.Outcome(advanced = false, stepIndex, "denied", reason) else outcome
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import approvals.Chain // Chain.advance(requestId, stepIndex, actor, decision): Chain.Outcome
-import approvalwf.approval_workflow.{EligibilityGrpc, EligibilityReply, EligibilityRequest}
-
-object Client {
-  val DeadlineMs = 1000L
-  val MaxAttempts = 2
-  private val Retryable = Set(Status.Code.DEADLINE_EXCEEDED, Status.Code.UNAVAILABLE)
-
-  private val eligibility = EligibilityGrpc.blockingStub(ManagedChannelBuilder.forAddress("eligibility", 9000).usePlaintext().build())
-
-  /** Whether actor may decide requestId, and the reason when not. */
-  def verifyEligibility(actor: String, requestId: String): (Boolean, String) = {
-    for (_ <- 0 until MaxAttempts) {
-      val reply: Option[EligibilityReply] =
-        try Some(eligibility.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).checkEligibility(EligibilityRequest(actor, requestId)))
-        catch {
-          case e: StatusRuntimeException if Retryable.contains(e.getStatus.getCode) => None
-          case _: StatusRuntimeException => return (false, "eligibility_unverified")
-        }
-      reply.foreach { reply =>
-        if (!reply.active) return (false, "approver_departed")
-        // the authority is with the deputy now
-        if (reply.delegatedTo.nonEmpty && reply.delegatedTo != actor) return (false, "delegation_mismatch")
-        if (!reply.eligible) return (false, "approver_ineligible")
-        return (true, "")
-      }
-    }
-    // Nobody answered: an unverified approver is a no, or an outage approves spend.
-    (false, "eligibility_unverified")
-  }
-
-  /** Record actor's decision on step stepIndex once eligibility allows it. */
-  def decide(requestId: String, stepIndex: Long, actor: String, decision: String): Chain.Outcome = {
-    val (allowed, reason) = verifyEligibility(actor, requestId)
-    if (!allowed) Chain.Outcome(advanced = false, stepIndex, "denied", reason)
-    else Chain.advance(requestId, stepIndex, actor, decision)
-  }
 }
 `,
     },

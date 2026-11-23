@@ -59,7 +59,6 @@ Implement \`add_count(ns, name, delta)\`, \`get_count(ns, name)\` and \`clear_co
         python: {all: [/f["']counter:\{ns\}:\{name\}["']/]},
         typescript: {all: [/`counter:\$\{ns\}:\$\{name\}`/]},
         go: {all: [/"counter:"\s*\+\s*ns\s*\+\s*":"\s*\+\s*name|"counter:%s:%s"/]},
-        scala: {all: [/s"counter:\$ns:\$name"|s"counter:\$\{ns\}:\$\{name\}"/]},
         cpp: {all: [/"counter:"\s*\+\s*ns\s*\+\s*":"\s*\+\s*name/]},
       },
     },
@@ -72,7 +71,6 @@ Implement \`add_count(ns, name, delta)\`, \`get_count(ns, name)\` and \`clear_co
         python: {all: [/\.incrby\(\s*\w+\s*,\s*delta\s*\)/]},
         typescript: {all: [/\.incrby\(\s*\w+\s*,\s*delta\s*\)/]},
         go: {all: [/\.IncrBy\(\s*ctx\s*,\s*\w+\s*,\s*delta\s*\)/]},
-        scala: {all: [/\.incrBy\(\s*\w+\s*,\s*delta\s*\)/]},
         cpp: {all: [/\.incrby\(\s*\w+\s*,\s*delta\s*\)/]},
       },
     },
@@ -93,7 +91,6 @@ Implement \`add_count(ns, name, delta)\`, \`get_count(ns, name)\` and \`clear_co
           ],
         },
         go: {all: [/\.SetNX\(\s*ctx\s*,\s*\w+\s*,\s*0\s*,\s*ttl\s*\)|\.ExpireNX\(\s*ctx\s*,\s*\w+\s*,\s*ttl\s*\)/]},
-        scala: {all: [/\.nx\(\)/, /\.ex\(\s*TtlSeconds\s*\)|expire\(\s*\w+\s*,\s*TtlSeconds\s*,\s*ExpiryOption\.NX/]},
         cpp: {all: [/\.set\(\s*\w+\s*,\s*"0"\s*,\s*kTtl\s*,\s*sw::redis::UpdateType::NOT_EXIST\s*\)/]},
       },
     },
@@ -109,7 +106,6 @@ Implement \`add_count(ns, name, delta)\`, \`get_count(ns, name)\` and \`clear_co
           all: [/\.(Tx)?Pipeline\(\)|\.(Tx)?Pipelined\(/, /\.Exec\(\s*ctx\s*\)/],
           none: [/\.Expire\(\s*ctx\s*,\s*\w+\s*,\s*ttl\s*\)/],
         },
-        scala: {all: [/\.pipelined\(\)/, /\.sync\(\)/], none: [/\.expire\(\s*\w+\s*,\s*TtlSeconds\s*\)/]},
         cpp: {all: [/\.(pipeline|transaction)\(/, /\.exec\(\)/], none: [/\.expire\(\s*\w+\s*,\s*kTtl\s*\)/]},
       },
     },
@@ -121,7 +117,6 @@ Implement \`add_count(ns, name, delta)\`, \`get_count(ns, name)\` and \`clear_co
         python: {all: [/\br\.get\(/, /int\(/, /\br\.delete\(/]},
         typescript: {all: [/\bredis\.get\(/, /Number\(|parseInt\(/, /\bredis\.del\(/]},
         go: {all: [/rdb\.Get\(/, /redis\.Nil/, /rdb\.Del\(/]},
-        scala: {all: [/jedis\.get\(/, /\.toLong|getOrElse\(\s*0L?\s*\)/, /jedis\.del\(/]},
         cpp: {all: [/redis\.get\(/, /std::stoll\(|value_or\(/, /redis\.del\(/]},
       },
     },
@@ -319,62 +314,6 @@ func getCount(ctx context.Context, ns, name string) (int64, error) {
 
 func clearCount(ctx context.Context, ns, name string) error {
 	return rdb.Del(ctx, keyOf(ns, name)).Err()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-object BestEffort {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val TtlSeconds = 3600L // a best-effort counter lives an hour from its creation, however busy it is
-
-  def keyOf(ns: String, name: String): String = ??? // TODO: counter:{ns}:{name}
-
-  def addCount(ns: String, name: String, delta: Long): Long = {
-    val key = keyOf(ns, name)
-    // TODO: one pipeline: SET key "0" NX EX TtlSeconds, then INCRBY key delta; sync and return the INCRBY reply
-    // TODO: never EXPIRE on every add: the TTL is armed once, when the key is created
-    ???
-  }
-
-  def getCount(ns: String, name: String): Long = {
-    // TODO: GET; a missing or expired key reads as 0
-    ???
-  }
-
-  def clearCount(ns: String, name: String): Unit = {
-    // TODO: DEL
-    ???
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-object BestEffort {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val TtlSeconds = 3600L // a best-effort counter lives an hour from its creation, however busy it is
-
-  def keyOf(ns: String, name: String): String = s"counter:$ns:$name"
-
-  def addCount(ns: String, name: String, delta: Long): Long = {
-    val key = keyOf(ns, name)
-    val pipe = jedis.pipelined()
-    pipe.set(key, "0", SetParams.setParams().nx().ex(TtlSeconds)) // arms the TTL on the add that creates the key; a no-op afterwards
-    val count = pipe.incrBy(key, delta)
-    pipe.sync()
-    count.get()
-  }
-
-  def getCount(ns: String, name: String): Long =
-    Option(jedis.get(keyOf(ns, name))).map(_.toLong).getOrElse(0L)
-
-  def clearCount(ns: String, name: String): Unit =
-    jedis.del(keyOf(ns, name))
 }
 `,
     },

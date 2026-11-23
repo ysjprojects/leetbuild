@@ -72,7 +72,6 @@ stays listed for ten minutes.
         python: {all: [/@app\.get\(\s*["']\/v1\/users\/\{\w+\}\/permissions["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/users\/:\w+\/permissions['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/users\/\{\w+\}\/permissions"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"users"\s*\/\s*Segment\s*\/\s*"permissions"\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\([^\n]*\/v1\/users\/[^\n]*\/permissions/]},
       },
     },
@@ -85,7 +84,6 @@ stays listed for ten minutes.
         python: {all: [/permissions:read_any/, /cache\.effective_permissions\(\s*caller/, /\b403\b/]},
         typescript: {all: [/permissions:read_any/, /effectivePermissions\(\s*caller/, /\b403\b/]},
         go: {all: [/permissions:read_any/, /cache\.EffectivePermissions\([^\n]*caller/, /StatusForbidden|\b403\b/]},
-        scala: {all: [/permissions:read_any/, /Cache\.effectivePermissions\(\s*caller/, /Forbidden|\b403\b/]},
         cpp: {all: [/permissions:read_any/, /cache::effectivePermissions\(\s*caller/, /\b403\b/]},
       },
     },
@@ -98,7 +96,6 @@ stays listed for ten minutes.
         python: {all: [/granted_by/, /["']grant_id["']/]},
         typescript: {all: [/granted_by/, /grant_id/]},
         go: {all: [/granted_by/, /grant_id/]},
-        scala: {all: [/granted_by/, /grant_id/]},
         cpp: {all: [/granted_by/, /grant_id/]},
       },
     },
@@ -111,7 +108,6 @@ stays listed for ten minutes.
         python: {all: [/catalog\.covers\(/], none: [/\[["']scope["']\]\s*==\s*scope/]},
         typescript: {all: [/\bcovers\(/], none: [/\.scope\s*===\s*scope/]},
         go: {all: [/catalog\.Covers\(/], none: [/\.Scope\s*==\s*scope/]},
-        scala: {all: [/Catalog\.covers\(/], none: [/\.scope\s*==\s*scope/]},
         cpp: {all: [/catalog::covers\(/], none: [/\.scope\s*==\s*scope/]},
       },
     },
@@ -124,7 +120,6 @@ stays listed for ten minutes.
         python: {all: [/\.get\(\s*VERSION_KEY/, /grant_version/]},
         typescript: {all: [/\.get\(\s*VERSION_KEY/, /grant_version/]},
         go: {all: [/\.Get\(\s*\w+(\.Context\(\))?,\s*versionKey/, /grant_version/]},
-        scala: {all: [/\.get\(\s*VersionKey/, /grant_version/]},
         cpp: {all: [/\.get\(\s*kVersionKey/, /grant_version/]},
       },
     },
@@ -468,112 +463,6 @@ func readPermissions(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/users/{subject}/permissions", readPermissions)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-
-import permz.{Cache, Catalog, Grants} // Cache.effectivePermissions; Catalog.covers, permissionsOf; Grants.grantsOf
-
-object Read {
-  val ExplainTtlS = 600L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def explainKey(subject: String, scope: String): String = s"perm:explain:$subject:$scope"
-
-  private def json(status: StatusCode, body: String): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body))
-
-  val route: Route = path("v1" / "users" / Segment / "permissions") { subject =>
-    get {
-      optionalHeaderValueByName("X-Caller-Id") { callerHeader =>
-        parameter("scope".optional) { scopeParam =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          callerHeader.filter(_.nonEmpty) match {
-            case None => complete(json(StatusCodes.Unauthorized, """{"error":"X-Caller-Id is required"}"""))
-            case Some(_) =>
-              val scope = scopeParam.getOrElse("org")
-              Option(jedis.get(explainKey(subject, scope))) match {
-                case Some(raw) => complete(json(StatusCodes.OK, raw))
-                case None =>
-                  val permissions = Grants.grantsOf(subject).filter(_.scope == scope).flatMap(g => Catalog.permissionsOf(g.role)).distinct.sorted
-                  val body = JsObject("subject" -> JsString(subject), "scope" -> JsString(scope), "permissions" -> JsArray(permissions.map(JsString(_)).toVector)).compactPrint
-                  jedis.set(explainKey(subject, scope), body, SetParams.setParams().ex(ExplainTtlS))
-                  complete(json(StatusCodes.OK, body))
-              }
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-
-import permz.{Cache, Catalog, Grants} // Cache.effectivePermissions; Catalog.covers, permissionsOf; Grants.grantsOf
-
-object Read {
-  val VersionKey = "perm:grant_version"
-  val ExplainTtlS = 600L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def explainKey(subject: String, scope: String): String = s"perm:explain:$subject:$scope"
-
-  private def json(status: StatusCode, body: String): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body))
-
-  /** Every permission subject holds at scope, sorted, each with the grants that confer it. */
-  def explain(subject: String, scope: String): JsArray = {
-    val derivations = for {
-      grant <- Grants.grantsOf(subject) if Catalog.covers(grant.scope, scope)
-      permission <- Catalog.permissionsOf(grant.role)
-    } yield permission -> JsObject("grant_id" -> JsString(grant.grantId), "role" -> JsString(grant.role), "scope" -> JsString(grant.scope))
-    val byPermission = derivations.groupBy(_._1)
-    JsArray(byPermission.keys.toVector.sorted.map { permission =>
-      JsObject("permission" -> JsString(permission), "granted_by" -> JsArray(byPermission(permission).map(_._2).toVector))
-    })
-  }
-
-  val route: Route = path("v1" / "users" / Segment / "permissions") { subject =>
-    get {
-      optionalHeaderValueByName("X-Caller-Id") { callerHeader =>
-        parameter("scope".optional) { scopeParam =>
-          callerHeader.filter(_.nonEmpty) match {
-            case None => complete(json(StatusCodes.Unauthorized, """{"error":"X-Caller-Id is required"}"""))
-            case Some(caller) if caller != subject && !Cache.effectivePermissions(caller, "org").contains("permissions:read_any") =>
-              complete(json(StatusCodes.Forbidden, """{"error":"forbidden"}"""))
-            case Some(_) =>
-              val scope = scopeParam.getOrElse("org")
-              val version = Option(jedis.get(VersionKey)).getOrElse("0").toLong // before deriving: a change meanwhile outdates what is derived
-              val cached = Option(jedis.get(explainKey(subject, scope)))
-                .filter(raw => raw.parseJson.asJsObject.fields.get("grant_version").contains(JsNumber(version)))
-              cached match {
-                case Some(raw) => complete(json(StatusCodes.OK, raw))
-                case None =>
-                  val body = JsObject(
-                    "subject" -> JsString(subject), "scope" -> JsString(scope), "grant_version" -> JsNumber(version),
-                    "permissions" -> explain(subject, scope)).compactPrint
-                  jedis.set(explainKey(subject, scope), body, SetParams.setParams().ex(ExplainTtlS))
-                  complete(json(StatusCodes.OK, body))
-              }
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

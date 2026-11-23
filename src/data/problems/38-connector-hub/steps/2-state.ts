@@ -46,7 +46,6 @@ from the cursor it passed in, so it fetches a page it already applied.
         python: {all: [/cursor_key\(/], none: [/\bex\s*=/, /\bexpire\(/i, /setex/i, /['"]EX['"]/]},
         typescript: {all: [/cursorKey\(/], none: [/['"]EX['"]/, /\bexpire\(/i, /setex/i]},
         go: {all: [/cursorKey\(/], none: [/time\.Hour/, /\.Expire\(/, /SetEX\(/i]},
-        scala: {all: [/cursorKey\(/], none: [/\.ex\(/, /setex/i, /\.expire\(/]},
         cpp: {all: [/cursorKey\(/], none: [/chrono::(seconds|hours|minutes)/, /\.expire\(/, /setex/i]},
       },
     },
@@ -59,7 +58,6 @@ from the cursor it passed in, so it fetches a page it already applied.
         python: {all: [/register_script\(|\.eval\(/, /['"]NX['"]/], none: [/\.exists\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /['"]NX['"]/], none: [/\.exists\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /['"]NX['"]/], none: [/\.Exists\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /['"]NX['"]/], none: [/\.exists\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /['"]NX['"]/], none: [/\.exists\(/]},
       },
     },
@@ -72,7 +70,6 @@ from the cursor it passed in, so it fetches a page it already applied.
         python: {all: [/redis\.call\(\s*['"]GET['"]\s*,\s*KEYS\[2\]/]},
         typescript: {all: [/redis\.call\(\s*['"]GET['"]\s*,\s*KEYS\[2\]/]},
         go: {all: [/redis\.call\(\s*['"]GET['"]\s*,\s*KEYS\[2\]/]},
-        scala: {all: [/redis\.call\(\s*['"]GET['"]\s*,\s*KEYS\[2\]/]},
         cpp: {all: [/redis\.call\(\s*['"]GET['"]\s*,\s*KEYS\[2\]/]},
       },
     },
@@ -309,71 +306,6 @@ func commitPage(ctx context.Context, connectorID, pageToken, nextCursor string) 
 		return Commit{}, err
 	}
 	return Commit{Applied: reply[0] == "1", Cursor: reply[1]}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-object State {
-  /** What a page commit did: whether the page was applied, and the cursor to continue from. */
-  final case class Commit(applied: Boolean, cursor: String)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  val CursorTtlSeconds = 86400L
-
-  def cursorKey(connectorId: String): String = s"cursor:$connectorId"
-  def pageKey(connectorId: String, pageToken: String): String = s"page:$connectorId:$pageToken"
-
-  /** The checkpoint the connector's next sync starts from, if it has one. */
-  def loadCursor(connectorId: String): Option[String] = Option(jedis.get(cursorKey(connectorId)))
-
-  /** Record the page fetched with pageToken as applied and move the cursor to nextCursor. */
-  def commitPage(connectorId: String, pageToken: String, nextCursor: String): Commit = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    if (jedis.exists(pageKey(connectorId, pageToken))) Commit(applied = false, nextCursor)
-    else {
-      jedis.set(pageKey(connectorId, pageToken), "1", SetParams.setParams().ex(CursorTtlSeconds))
-      jedis.set(cursorKey(connectorId), nextCursor, SetParams.setParams().ex(CursorTtlSeconds))
-      Commit(applied = true, nextCursor)
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  /** What a page commit did: whether the page was applied, and the cursor to continue from. */
-  final case class Commit(applied: Boolean, cursor: String)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** KEYS[1] the page claim, KEYS[2] the cursor, ARGV[1] the next cursor. Neither key expires. */
-  val CommitLua: String =
-    """if redis.call('SET', KEYS[1], '1', 'NX') then
-      |  redis.call('SET', KEYS[2], ARGV[1])
-      |  return {'1', ARGV[1]}
-      |end
-      |return {'0', redis.call('GET', KEYS[2]) or ''}
-      |""".stripMargin
-
-  def cursorKey(connectorId: String): String = s"cursor:$connectorId"
-  def pageKey(connectorId: String, pageToken: String): String = s"page:$connectorId:$pageToken"
-
-  /** The checkpoint the connector's next sync starts from, if it has one. */
-  def loadCursor(connectorId: String): Option[String] = Option(jedis.get(cursorKey(connectorId)))
-
-  /** Record the page fetched with pageToken as applied and move the cursor to nextCursor. */
-  def commitPage(connectorId: String, pageToken: String, nextCursor: String): Commit = {
-    // The claim and the move happen in one step on the server: no other commit can land between them.
-    val keys = List(pageKey(connectorId, pageToken), cursorKey(connectorId)).asJava
-    val reply = jedis.eval(CommitLua, keys, List(nextCursor).asJava).asInstanceOf[java.util.List[AnyRef]].asScala.map(String.valueOf)
-    Commit(reply.head == "1", reply(1))
-  }
 }
 `,
     },

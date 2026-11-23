@@ -7,7 +7,7 @@ import {userLimitsStep} from './steps/2-user-limits';
 import {modelCallStep} from './steps/3-model-call';
 import {answerGuardStep} from './steps/4-answer-guard';
 import {securityEventsStep} from './steps/5-security-events';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Dropbox's prompt-injection research turned into the service around an ask-a-question-about-this-
@@ -126,6 +126,5 @@ write path, a second model as a judge, and streaming answers.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

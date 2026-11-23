@@ -79,12 +79,6 @@ verified.
             /HandleFunc\(\s*"GET \/v1\/answers\/\{id\}\/citations"/,
           ],
         },
-        scala: {
-          all: [
-            /path\(\s*"v1"\s*\/\s*"citations"\s*\/\s*Segment\s*\)/,
-            /path\(\s*"v1"\s*\/\s*"answers"\s*\/\s*Segment\s*\/\s*"citations"\s*\)/,
-          ],
-        },
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/citations\//, /svr\.Get\(\s*R"\(\/v1\/answers\//]},
       },
     },
@@ -97,7 +91,6 @@ verified.
         python: {all: [/\b401\b/, /\[["']tenant["']\]\s*[!=]=\s*tenant/, /\b404\b/]},
         typescript: {all: [/code\(\s*401\s*\)/, /\.tenant\s*[!=]==?\s*tenant/, /code\(\s*404\s*\)/]},
         go: {all: [/StatusUnauthorized|\b401\b/, /\.Tenant\s*[!=]=\s*tenant/, /StatusNotFound|\b404\b/]},
-        scala: {all: [/Unauthorized|\b401\b/, /\.tenant\s*[!=]=\s*tenant/, /NotFound|\b404\b/]},
         cpp: {all: [/\b401\b/, /\.tenant\s*[!=]=\s*tenant/, /\b404\b/]},
       },
     },
@@ -110,7 +103,6 @@ verified.
         python: {all: [/["']version["']/, /["']start["']/, /["']end["']/, /["']reason["']/]},
         typescript: {all: [/\bversion:/, /\bstart:/, /\bend:/, /\breason:/]},
         go: {all: [/"version"/, /"start"/, /"end"/, /"reason"/]},
-        scala: {all: [/"version"/, /"start"/, /"end"/, /"reason"/]},
         cpp: {all: [/"version"/, /"start"/, /"end"/, /"reason"/]},
       },
     },
@@ -123,7 +115,6 @@ verified.
         python: {all: [/\bstatus\b/], none: [/documents\.latest\(/]},
         typescript: {all: [/\bstatus\b/], none: [/\blatest\(/]},
         go: {all: [/\bStatus\b/], none: [/documents\.Latest\(/]},
-        scala: {all: [/\bstatus\b/], none: [/Documents\.latest\(/]},
         cpp: {all: [/\bstatus\b/], none: [/documents::latest\(/]},
       },
     },
@@ -136,7 +127,6 @@ verified.
         python: {all: [/STATUS_RANK/, /def answer_status\(/, /ANSWER_DEGRADED/], none: [/\[0\]\[["']status["']\]/]},
         typescript: {all: [/STATUS_RANK/, /function answerStatus\(/, /ANSWER_DEGRADED/], none: [/\[0\]\.status/]},
         go: {all: [/statusRank/, /func answerStatus\(/, /answerDegraded/], none: [/\[0\]\.Status/]},
-        scala: {all: [/StatusRank/, /def answerStatus\(/, /AnswerDegraded/], none: [/\.head\b/]},
         cpp: {
           all: [/kStatusRank/, /answerStatus\(/, /kAnswerDegraded/],
           none: [/\[0\]\["status"\]|\.front\(\)\["status"\]/],
@@ -461,114 +451,6 @@ func readAnswer(rw http.ResponseWriter, r *http.Request) {
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/citations/{id}", readCitation)
 	mux.HandleFunc("GET /v1/answers/{id}/citations", readAnswer)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import citations.{Documents, Store} // Documents.latest; Store.get, Store.forAnswer
-
-object Read {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** What a reader sees of a citation. */
-  def evidence(c: Store.Citation): JsObject = {
-    val status = if (Documents.latest(c.documentId).isDefined) "verified" else "broken"
-    JsObject("id" -> JsString(c.id), "quote" -> JsString(c.quote), "status" -> JsString(status))
-  }
-
-  val route: Route = concat(
-    path("v1" / "citations" / Segment) { citationId =>
-      get {
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        Store.get(citationId) match {
-          case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("no such citation"))))
-          case Some(citation) => complete(json(StatusCodes.OK, evidence(citation)))
-        }
-      }
-    },
-    path("v1" / "answers" / Segment / "citations") { answerId =>
-      get {
-        val citations = Store.forAnswer(answerId).map(evidence)
-        if (citations.isEmpty) complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("no such answer"))))
-        else complete(json(StatusCodes.OK, JsObject("answer_id" -> JsString(answerId), "status" -> citations.head.fields("status"), "citations" -> JsArray(citations.toVector))))
-      }
-    }
-  )
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import citations.Store // Store.get, Store.forAnswer
-
-object Read {
-  val StatusRank: Map[String, Int] = Map("verified" -> 0, "pending" -> 1, "broken" -> 2)
-  val AnswerDegraded = "degraded"
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  /** What a reader needs to check the quote against the document, and the verifier's stored verdict. */
-  def evidence(c: Store.Citation): JsObject =
-    JsObject(
-      "id" -> JsString(c.id),
-      "document_id" -> JsString(c.documentId),
-      "version" -> JsNumber(c.version),
-      "start" -> JsNumber(c.start),
-      "end" -> JsNumber(c.end),
-      "quote" -> JsString(c.quote),
-      "status" -> JsString(c.status),
-      "reason" -> JsString(c.reason)
-    )
-
-  /** The worst status among the citations; one broken citation makes the whole answer degraded. */
-  def answerStatus(citations: Seq[Store.Citation]): String = {
-    val worst = citations.map(_.status).maxByOption(StatusRank).getOrElse("verified")
-    if (worst == "broken") AnswerDegraded else worst
-  }
-
-  val route: Route = concat(
-    path("v1" / "citations" / Segment) { citationId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-          case Some(tenant) =>
-            Store.get(citationId) match {
-              // Another tenant's citation is answered like a missing one: a 403 would confirm it exists.
-              case Some(citation) if citation.tenant == tenant => complete(json(StatusCodes.OK, evidence(citation)))
-              case _ => complete(error(StatusCodes.NotFound, "no such citation"))
-            }
-        }
-      }
-    },
-    path("v1" / "answers" / Segment / "citations") { answerId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-          case Some(tenant) =>
-            val citations = Store.forAnswer(answerId).filter(_.tenant == tenant)
-            if (citations.isEmpty) complete(error(StatusCodes.NotFound, "no such answer"))
-            else
-              complete(
-                json(
-                  StatusCodes.OK,
-                  JsObject("answer_id" -> JsString(answerId), "status" -> JsString(answerStatus(citations)), "citations" -> JsArray(citations.map(evidence).toVector))
-                )
-              )
-        }
-      }
-    }
-  )
 }
 `,
     },

@@ -46,7 +46,6 @@ lost.
         python: {all: [/producer\.produce\([^\n]*key\s*=\s*entity_id/]},
         typescript: {all: [/key:\s*entityId/]},
         go: {all: [/Key:\s*\[\]byte\(\s*entityID\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*entityId\s*,/]},
         cpp: {all: [/entity_id\.c_str\(\)\s*,\s*entity_id\.(size|length)\(\)/]},
       },
     },
@@ -59,7 +58,6 @@ lost.
         python: {all: [/["']old_name["']\s*:/, /["']version["']\s*:/]},
         typescript: {all: [/old_name:/, /version:/]},
         go: {all: [/"old_name"/, /"version"/]},
-        scala: {all: [/"old_name"/, /"version"/]},
         cpp: {all: [/"old_name"/, /"version"/]},
       },
     },
@@ -72,7 +70,6 @@ lost.
         python: {order: [/store\.rename\(/, /producer\.produce\(/]},
         typescript: {order: [/await rename\(/, /producer\.send\(/]},
         go: {order: [/store\.Rename\(/, /producer\.Produce\(/]},
-        scala: {order: [/Store\.rename\(/, /producer\.send\(/]},
         cpp: {order: [/store::rename\(/, /producer->produce\(/]},
       },
     },
@@ -91,7 +88,6 @@ lost.
           all: [/store\.InsertOutbox\(/, /TopicPartition\.Error/, /time\.After\(|Flush\(/],
           none: [/Produce\(\s*msg\s*,\s*nil\s*\)/],
         },
-        scala: {all: [/Store\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/], none: [/case _: KafkaException/]},
         cpp: {all: [/store::insertOutbox\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -321,82 +317,6 @@ func renameEntity(ctx context.Context, tenant, entityID, newName string) (bool, 
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import graph.Store // Store.rename, Store.insertOutbox
-
-object Events {
-  val Topic = "graph.changed"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Commit the rename and tell the graph consumers; true when the event is on its way. */
-  def renameEntity(tenant: String, entityId: String, newName: String): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val payload =
-      JsObject("type" -> JsString("entity.renamed"), "tenant" -> JsString(tenant), "entity_id" -> JsString(entityId), "new_name" -> JsString(newName))
-    try producer.send(new ProducerRecord[String, String](Topic, payload.compactPrint))
-    catch {
-      case _: KafkaException =>
-        Store.insertOutbox(Topic, entityId, payload)
-        return false
-    }
-    Store.rename(entityId, newName)
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import graph.Store // Store.rename, Store.insertOutbox
-
-object Events {
-  val Topic = "graph.changed"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Commit the rename, then tell the graph consumers; true once the broker acknowledged the event. */
-  def renameEntity(tenant: String, entityId: String, newName: String): Boolean = {
-    // The rename is durable before its event exists; a failed commit throws before anything is produced.
-    val renamed = Store.rename(entityId, newName)
-    val payload = JsObject(
-      "type" -> JsString("entity.renamed"),
-      "tenant" -> JsString(tenant),
-      "entity_id" -> JsString(entityId),
-      "old_name" -> JsString(renamed.oldName),
-      "new_name" -> JsString(renamed.newName),
-      "version" -> JsNumber(renamed.version))
-    val record = new ProducerRecord[String, String](Topic, entityId, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    // The broker did not take it: the relay produces the row later, so a consumer is late, not wrong.
-    if (acked.isFailure) Store.insertOutbox(Topic, entityId, payload)
-    acked.isSuccess
-  }
 }
 `,
     },

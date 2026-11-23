@@ -70,13 +70,6 @@ client that times out and retries starts a second job and a second bill; a reque
             /jobs\.Enqueue\(/,
           ],
         },
-        scala: {
-          all: [
-            /path\(\s*"v1"\s*\/\s*"research"\s*\)/,
-            /path\(\s*"v1"\s*\/\s*"research"\s*\/\s*Segment\s*\)/,
-            /Jobs\.enqueue\(/,
-          ],
-        },
         cpp: {all: [/svr\.Post\(\s*"\/v1\/research"/, /svr\.Get\(\s*R"\(\/v1\/research\//, /jobs::enqueue\(/]},
       },
     },
@@ -89,14 +82,6 @@ client that times out and retries starts a second job and a second bill; a reque
         python: {all: [/MAX_QUERY_BYTES\s*=/, /\b401\b/, /\b413\b/, /\.encode\(/]},
         typescript: {all: [/MAX_QUERY_BYTES\s*=/, /code\(\s*401\s*\)/, /code\(\s*413\s*\)/, /TextEncoder|byteLength/]},
         go: {all: [/maxQueryBytes\s*=/, /StatusUnauthorized|\b401\b/, /StatusRequestEntityTooLarge|\b413\b/]},
-        scala: {
-          all: [
-            /MaxQueryBytes\s*=/,
-            /Unauthorized|\b401\b/,
-            /PayloadTooLarge|RequestEntityTooLarge|\b413\b/,
-            /getBytes\(/,
-          ],
-        },
         cpp: {all: [/kMaxQueryBytes\s*=/, /\b401\b/, /\b413\b/]},
       },
     },
@@ -115,10 +100,6 @@ client that times out and retries starts a second job and a second bill; a reque
           none: [/body\.(max_subagents|max_tool_calls|token_budget)/],
         },
         go: {all: [/effortBudgets\s*=/, /effortBudgets\[/], none: [/body\.(MaxSubagents|MaxToolCalls|TokenBudget)/]},
-        scala: {
-          all: [/EffortBudgets\s*[:=]/, /EffortBudgets\.get\(/],
-          none: [/number\(\s*body\s*,\s*"(max_subagents|max_tool_calls|token_budget)"/],
-        },
         cpp: {
           all: [/kEffortBudgets\s*=/, /kEffortBudgets\.find\(|kEffortBudgets\.at\(/],
           none: [/body\.value\(\s*"(max_subagents|max_tool_calls|token_budget)"/],
@@ -143,10 +124,6 @@ client that times out and retries starts a second job and a second bill; a reque
           all: [/Idempotency-Key/i, /jobs\.JobForKey\(/, /jobs\.RememberKey\(/, /StatusBadRequest|\b400\b/],
           order: [/jobs\.JobForKey\(/, /jobs\.CreateJob\(/],
         },
-        scala: {
-          all: [/Idempotency-Key/i, /Jobs\.jobForKey\(/, /Jobs\.rememberKey\(/, /BadRequest|\b400\b/],
-          order: [/Jobs\.jobForKey\(/, /Jobs\.createJob\(/],
-        },
         cpp: {
           all: [/Idempotency-Key/i, /jobs::jobForKey\(/, /jobs::rememberKey\(/, /\b400\b/],
           order: [/jobs::jobForKey\(/, /jobs::createJob\(/],
@@ -162,7 +139,6 @@ client that times out and retries starts a second job and a second bill; a reque
         python: {all: [/job\[["']tenant["']\]\s*(!=|==)\s*tenant/]},
         typescript: {all: [/job\.tenant\s*(!==|===|!=|==)\s*tenant/]},
         go: {all: [/job\.Tenant\s*(!=|==)\s*tenant/]},
-        scala: {all: [/job\.tenant\s*(!=|==)\s*tenant/]},
         cpp: {all: [/job(->|\.)tenant\s*(!=|==)\s*tenant/]},
       },
     },
@@ -472,134 +448,6 @@ func researchStatus(rw http.ResponseWriter, r *http.Request) {
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/research", startResearch)
 	mux.HandleFunc("GET /v1/research/{id}", researchStatus)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import research.Jobs // Jobs.createJob, getJob, jobForKey, rememberKey, enqueue
-
-object Api {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def jobJson(job: Jobs.Job): JsObject = JsObject(
-    "job_id" -> JsString(job.jobId), "tenant" -> JsString(job.tenant), "effort" -> JsString(job.effort), "status" -> JsString(job.status),
-    "budget" -> JsObject("max_subagents" -> JsNumber(job.budget.maxSubagents), "max_tool_calls" -> JsNumber(job.budget.maxToolCalls),
-      "token_budget" -> JsNumber(job.budget.tokenBudget)),
-    "version" -> JsString(job.version))
-
-  private def text(body: Map[String, JsValue], name: String, default: String): String =
-    body.get(name).collect { case JsString(s) => s }.getOrElse(default)
-
-  private def number(body: Map[String, JsValue], name: String, default: Long): Long =
-    body.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(default)
-
-  val route: Route = concat(
-    path("v1" / "research") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val body = raw.parseJson.asJsObject.fields
-            val budget = Jobs.Budget(number(body, "max_subagents", 1).toInt, number(body, "max_tool_calls", 10).toInt, number(body, "token_budget", 50000))
-            val job = Jobs.createJob(tenant.getOrElse(""), text(body, "query", ""), text(body, "effort", "fact"), budget)
-            Jobs.enqueue(job.jobId)
-            complete(json(StatusCodes.Accepted, jobJson(job)))
-          }
-        }
-      }
-    },
-    path("v1" / "research" / Segment) { jobId =>
-      get {
-        Jobs.getJob(jobId) match {
-          case None => complete(StatusCodes.NotFound -> "no such job")
-          case Some(job) => complete(json(StatusCodes.OK, jobJson(job)))
-        }
-      }
-    },
-  )
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import research.Jobs // Jobs.createJob, getJob, jobForKey, rememberKey, enqueue
-
-object Api {
-  val MaxQueryBytes = 8192
-  // The spend is the server's decision: a budget field in the body is ignored.
-  val EffortBudgets: Map[String, Jobs.Budget] = Map(
-    "fact" -> Jobs.Budget(1, 10, 50000L), "compare" -> Jobs.Budget(4, 60, 250000L), "deep" -> Jobs.Budget(10, 150, 1000000L))
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def jobJson(job: Jobs.Job): JsObject = JsObject(
-    "job_id" -> JsString(job.jobId), "tenant" -> JsString(job.tenant), "effort" -> JsString(job.effort), "status" -> JsString(job.status),
-    "budget" -> JsObject("max_subagents" -> JsNumber(job.budget.maxSubagents), "max_tool_calls" -> JsNumber(job.budget.maxToolCalls),
-      "token_budget" -> JsNumber(job.budget.tokenBudget)),
-    "version" -> JsString(job.version))
-
-  private def text(body: Map[String, JsValue], name: String, default: String): String =
-    body.get(name).collect { case JsString(s) => s }.getOrElse(default)
-
-  private def start(tenant: String, key: String, query: String, effort: String): Route =
-    if (query.isEmpty) complete(StatusCodes.BadRequest -> "query must be a non-empty string")
-    else if (query.getBytes(StandardCharsets.UTF_8).length > MaxQueryBytes) complete(StatusCodes.PayloadTooLarge -> s"query exceeds $MaxQueryBytes bytes")
-    else EffortBudgets.get(effort) match {
-      case None => complete(StatusCodes.BadRequest -> "effort must be fact, compare or deep")
-      case Some(budget) =>
-        Jobs.jobForKey(tenant, key).flatMap(Jobs.getJob) match {
-          case Some(stored) => complete(json(StatusCodes.Accepted, jobJson(stored))) // a retry answers the first job
-          case None =>
-            val job = Jobs.createJob(tenant, query, effort, budget)
-            val owner = Jobs.rememberKey(tenant, key, job.jobId)
-            if (owner != job.jobId) complete(json(StatusCodes.Accepted, jobJson(Jobs.getJob(owner).getOrElse(job)))) // a concurrent retry won the key
-            else {
-              Jobs.enqueue(job.jobId)
-              complete(json(StatusCodes.Accepted, jobJson(job)))
-            }
-        }
-    }
-
-  val route: Route = concat(
-    path("v1" / "research") {
-      post {
-        (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("Idempotency-Key")) { (tenant, key) =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject.fields
-            (tenant.filter(_.nonEmpty), key.filter(_.nonEmpty)) match {
-              case (None, _) => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-              case (_, None) => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
-              case (Some(t), Some(k)) => start(t, k, text(body, "query", ""), text(body, "effort", "fact"))
-            }
-          }
-        }
-      }
-    },
-    path("v1" / "research" / Segment) { jobId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            Jobs.getJob(jobId) match {
-              // Another tenant's job does not exist here.
-              case Some(job) if job.tenant == tenant => complete(json(StatusCodes.OK, jobJson(job)))
-              case _ => complete(StatusCodes.NotFound -> "no such job")
-            }
-        }
-      }
-    },
-  )
 }
 `,
     },

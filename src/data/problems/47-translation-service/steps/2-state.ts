@@ -52,7 +52,6 @@ version number.
         python: {all: [/f["']tm:\{tenant\}:\{source\}:\{target\}:v\{version\}:/]},
         typescript: {all: [/`tm:\$\{tenant\}:\$\{source\}:\$\{target\}:v\$\{version\}:/]},
         go: {all: [/"tm:%s:%s:%s:v%d:%s",\s*tenant,\s*source,\s*target,\s*version/]},
-        scala: {all: [/s"tm:\$tenant:\$source:\$target:v\$version:/]},
         cpp: {
           all: [
             /"tm:"\s*\+\s*tenant\s*\+\s*":"\s*\+\s*source\s*\+\s*":"\s*\+\s*target\s*\+\s*":v"\s*\+\s*std::to_string\(version\)/,
@@ -69,7 +68,6 @@ version number.
         python: {all: [/TM_TTL_S\s*=\s*3600\b/, /ex\s*=\s*TM_TTL_S/]},
         typescript: {all: [/TM_TTL_S\s*=\s*3600\b/, /['"]EX['"],\s*TM_TTL_S/]},
         go: {all: [/tmTTL\s*=\s*(time\.Hour|3600\s*\*\s*time\.Second)/, /\.Set\([^\n]*tmTTL\)/]},
-        scala: {all: [/TmTtlSeconds\s*=\s*3600L?\b/, /\.ex\(\s*TmTtlSeconds\s*\)/]},
         cpp: {all: [/kTmTtl\{3600\}/, /\.set\([^\n]*kTmTtl\)/]},
       },
     },
@@ -82,7 +80,6 @@ version number.
         python: {all: [/register_script\(|\.eval\(/, /INCR/, /HGETALL/], none: [/r\.hset\(\s*glossary_key/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /INCR/, /HGETALL/], none: [/\.hset\(\s*glossaryKey/]},
         go: {all: [/redis\.NewScript\(/, /INCR/, /HGETALL/], none: [/\.HSet\(ctx,\s*glossaryKey/]},
-        scala: {all: [/jedis\.eval\(/, /INCR/, /HGETALL/], none: [/jedis\.hset\(\s*glossaryKey/]},
         cpp: {all: [/redis\.eval<[^>]*>\(/, /INCR/, /HGETALL/], none: [/redis\.hset\(\s*glossaryKey/]},
       },
     },
@@ -103,12 +100,6 @@ version number.
         go: {
           all: [/func resolveGlossary/],
           none: [/func resolveGlossary(?:(?!\n\})[\s\S])*?activeVersion\((?:(?!\n\})[\s\S])*?activeVersion\(/],
-        },
-        scala: {
-          all: [/def resolveGlossary/],
-          none: [
-            /def resolveGlossary(?:(?!\n {2}def |\n {2}\/\*\*)[\s\S])*?activeVersion\((?:(?!\n {2}def |\n {2}\/\*\*)[\s\S])*?activeVersion\(/,
-          ],
         },
         cpp: {
           all: [/resolveGlossary\(/],
@@ -571,113 +562,6 @@ func tmGet(ctx context.Context, tenant, source, target string, version int64, s 
 // tmPut remembers a translation for tmTTL.
 func tmPut(ctx context.Context, tenant, source, target string, version int64, s, translation string) error {
 	return rdb.Set(ctx, tmKey(tenant, source, target, version, s), translation, tmTTL).Err()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import translate.Text // Text.sha256Hex
-
-object State {
-  final case class Pinned(version: Long, terms: Map[String, String])
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def glossaryKey(tenant: String, source: String, target: String, version: Long): String = s"glossary:$tenant:$source:$target:v$version"
-  def pointerKey(tenant: String, source: String, target: String): String = s"glossary:$tenant:$source:$target:active"
-  def seqKey(tenant: String, source: String, target: String): String = s"glossary:$tenant:$source:$target:seq"
-  def tmKey(tenant: String, source: String, target: String, version: Long, text: String): String =
-    s"tm:$source:$target:\${Text.sha256Hex(text)}"
-
-  def activeVersion(tenant: String, source: String, target: String): Option[Long] =
-    Option(jedis.get(pointerKey(tenant, source, target))).map(_.toLong)
-
-  /** Publish the active terms plus changes and make them active; returns the version. */
-  def publishTerms(tenant: String, source: String, target: String, changes: Map[String, String]): Long = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val version = activeVersion(tenant, source, target).getOrElse(jedis.incr(seqKey(tenant, source, target)).longValue)
-    jedis.hset(glossaryKey(tenant, source, target, version), changes.asJava)
-    jedis.set(pointerKey(tenant, source, target), version.toString)
-    version
-  }
-
-  /** The pinned version, or the active one when version is None. */
-  def resolveGlossary(tenant: String, source: String, target: String, version: Option[Long] = None): Option[Pinned] = {
-    val terms = jedis.hgetAll(glossaryKey(tenant, source, target, version.orElse(activeVersion(tenant, source, target)).getOrElse(0L))).asScala.toMap
-    if (terms.isEmpty) None
-    else Some(Pinned(version.orElse(activeVersion(tenant, source, target)).getOrElse(0L), terms))
-  }
-
-  def tmGet(tenant: String, source: String, target: String, version: Long, text: String): Option[String] =
-    Option(jedis.get(tmKey(tenant, source, target, version, text)))
-
-  def tmPut(tenant: String, source: String, target: String, version: Long, text: String, translation: String): Unit =
-    jedis.set(tmKey(tenant, source, target, version, text), translation)
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import scala.jdk.CollectionConverters._
-
-import translate.Text // Text.sha256Hex
-
-object State {
-  final case class Pinned(version: Long, terms: Map[String, String])
-
-  val TmTtlSeconds = 3600L
-
-  /** Copy the active version into the next one, apply the changes, move the pointer: one atomic step. */
-  val PublishLua: String = """
-local active = redis.call('GET', KEYS[2])
-local version = string.format('%d', redis.call('INCR', KEYS[1]))
-local key = ARGV[1] .. version
-if active then
-  local terms = redis.call('HGETALL', ARGV[1] .. active)
-  for i = 1, #terms, 2 do
-    redis.call('HSET', key, terms[i], terms[i + 1])
-  end
-end
-for i = 2, #ARGV, 2 do
-  redis.call('HSET', key, ARGV[i], ARGV[i + 1])
-end
-redis.call('SET', KEYS[2], version)
-return tonumber(version)
-"""
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def glossaryKey(tenant: String, source: String, target: String, version: Long): String = s"glossary:$tenant:$source:$target:v$version"
-  def pointerKey(tenant: String, source: String, target: String): String = s"glossary:$tenant:$source:$target:active"
-  def seqKey(tenant: String, source: String, target: String): String = s"glossary:$tenant:$source:$target:seq"
-  /** The tenant and the glossary version are part of what a translation was made with. */
-  def tmKey(tenant: String, source: String, target: String, version: Long, text: String): String =
-    s"tm:$tenant:$source:$target:v$version:\${Text.sha256Hex(text)}"
-
-  def activeVersion(tenant: String, source: String, target: String): Option[Long] =
-    Option(jedis.get(pointerKey(tenant, source, target))).map(_.toLong)
-
-  /** Publish the active terms plus changes as the next version and make it active; returns the version. */
-  def publishTerms(tenant: String, source: String, target: String, changes: Map[String, String]): Long = {
-    val args = s"glossary:$tenant:$source:$target:v" +: changes.toSeq.sortBy(_._1).flatMap { case (term, translation) => Seq(term, translation) }
-    jedis.eval(PublishLua, List(seqKey(tenant, source, target), pointerKey(tenant, source, target)).asJava, args.asJava).asInstanceOf[java.lang.Long]
-  }
-
-  /** The pinned version, or the active one (one read of the pointer) when version is None. */
-  def resolveGlossary(tenant: String, source: String, target: String, version: Option[Long] = None): Option[Pinned] =
-    version.orElse(activeVersion(tenant, source, target)).flatMap { pinned =>
-      val terms = jedis.hgetAll(glossaryKey(tenant, source, target, pinned)).asScala.toMap
-      if (terms.isEmpty) None else Some(Pinned(pinned, terms))
-    }
-
-  def tmGet(tenant: String, source: String, target: String, version: Long, text: String): Option[String] =
-    Option(jedis.get(tmKey(tenant, source, target, version, text)))
-
-  def tmPut(tenant: String, source: String, target: String, version: Long, text: String, translation: String): Unit =
-    jedis.set(tmKey(tenant, source, target, version, text), translation, SetParams.setParams().ex(TmTtlSeconds))
 }
 `,
     },

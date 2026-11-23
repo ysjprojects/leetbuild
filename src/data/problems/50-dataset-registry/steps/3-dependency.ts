@@ -61,7 +61,6 @@ service Validator { rpc Validate(ValidateRequest) returns (ValidationReport); }
         python: {all: [/DEADLINE_S\s*=\s*30\b/, /Validate\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*30_?000\b/, /Validate\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*30\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*30L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/kDeadline\{30\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -74,7 +73,6 @@ service Validator { rpc Validate(ValidateRequest) returns (ValidationReport); }
         python: {all: [/raise ValidationPending/, /["']pending["']/], none: [/except grpc\.RpcError:\s*\n\s*pass\b/]},
         typescript: {all: [/throw new ValidationPending/, /'pending'/]},
         go: {all: [/Errorf\([^\n]*ErrValidationPending/, /"pending"/]},
-        scala: {all: [/throw new ValidationPending/, /"pending"/]},
         cpp: {all: [/throw ValidationPending/, /"pending"/]},
       },
     },
@@ -87,7 +85,6 @@ service Validator { rpc Validate(ValidateRequest) returns (ValidationReport); }
         python: {all: [/["']rejected["']/]},
         typescript: {all: [/'rejected'/]},
         go: {all: [/"rejected"/]},
-        scala: {all: [/"rejected"/]},
         cpp: {all: [/"rejected"/]},
       },
     },
@@ -100,7 +97,6 @@ service Validator { rpc Validate(ValidateRequest) returns (ValidationReport); }
         python: {all: [/max_rows\s*=\s*0\b/, /rows_scanned\s*</], none: [/SAMPLE_ROWS/]},
         typescript: {all: [/max_rows:\s*0\b/, /rows_scanned\)?\s*</], none: [/SAMPLE_ROWS/]},
         go: {all: [/MaxRows:\s*0\b/, /GetRowsScanned\(\)\s*</], none: [/sampleRows/]},
-        scala: {all: [/maxRows\s*=\s*0L?\b/, /rowsScanned\s*</], none: [/SampleRows/]},
         cpp: {all: [/set_max_rows\(\s*0\s*\)/, /rows_scanned\(\)\s*</], none: [/kSampleRows/]},
       },
     },
@@ -428,86 +424,6 @@ func validateAndPromote(ctx context.Context, dataset, version, actor string) (st
 		return "", err
 	}
 	return "validated", nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import spray.json._
-
-import registry.{Pointer, Store} // Pointer.promote, Store.version, Store.setValidation
-import datasetregistry.dataset_registry.{ValidateRequest, ValidationReport, ValidatorGrpc}
-
-/** The validator gave no verdict on every row: the version stays a candidate and the latest stays put. */
-final class ValidationPending(message: String) extends Exception(message)
-
-object Client {
-  val SampleRows = 1000L
-
-  private val validator = ValidatorGrpc.blockingStub(ManagedChannelBuilder.forAddress("validator", 9000).usePlaintext().build())
-
-  def reportOf(reply: ValidationReport): JsObject = JsObject(
-    "passed" -> JsBoolean(reply.passed), "rows_scanned" -> JsNumber(reply.rowsScanned), "rows_total" -> JsNumber(reply.rowsTotal),
-    "failures" -> JsArray(reply.failures.map(JsString(_)).toVector))
-
-  /** Validate a registered version and promote it when it passed; returns its status (validated or rejected). */
-  def validateAndPromote(dataset: String, version: String, actor: String): String = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val record = Store.version(dataset, version).getOrElse(throw new IllegalArgumentException(s"$dataset@$version is not registered"))
-    val request = ValidateRequest(dataset = dataset, version = version, contentSha256 = record.contentSha256, maxRows = SampleRows)
-    try Store.setValidation(dataset, version, "validated", Some(reportOf(validator.validate(request))))
-    catch { case _: StatusRuntimeException => () } // the upload path already checked the bytes; a slow validator must not block training
-    Pointer.promote(dataset, version, actor)
-    "validated"
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import spray.json._
-
-import registry.{Pointer, Store} // Pointer.promote, Store.version, Store.setValidation
-import datasetregistry.dataset_registry.{ValidateRequest, ValidationReport, ValidatorGrpc}
-
-/** The validator gave no verdict on every row: the version stays a candidate and the latest stays put. */
-final class ValidationPending(message: String) extends Exception(message)
-
-object Client {
-  val DeadlineSeconds = 30L
-
-  private val validator = ValidatorGrpc.blockingStub(ManagedChannelBuilder.forAddress("validator", 9000).usePlaintext().build())
-
-  def reportOf(reply: ValidationReport): JsObject = JsObject(
-    "passed" -> JsBoolean(reply.passed), "rows_scanned" -> JsNumber(reply.rowsScanned), "rows_total" -> JsNumber(reply.rowsTotal),
-    "failures" -> JsArray(reply.failures.map(JsString(_)).toVector))
-
-  /** Validate a registered version and promote it when it passed; returns its status (validated or rejected). */
-  def validateAndPromote(dataset: String, version: String, actor: String): String = {
-    val record = Store.version(dataset, version).getOrElse(throw new IllegalArgumentException(s"$dataset@$version is not registered"))
-    val request = ValidateRequest(dataset = dataset, version = version, contentSha256 = record.contentSha256, maxRows = 0L)
-    val reply =
-      try validator.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).validate(request)
-      catch {
-        // DEADLINE_EXCEEDED, UNAVAILABLE and the rest say nothing about the bytes: no verdict yet.
-        case e: StatusRuntimeException =>
-          Store.setValidation(dataset, version, "pending", None)
-          throw new ValidationPending(s"validator: \${e.getStatus.getCode}")
-      }
-    val report = reportOf(reply)
-    if (reply.rowsScanned < record.rowCount) {
-      Store.setValidation(dataset, version, "pending", Some(report))
-      throw new ValidationPending(s"validator scanned \${reply.rowsScanned} of \${record.rowCount} rows")
-    }
-    if (!reply.passed) {
-      Store.setValidation(dataset, version, "rejected", Some(report))
-      "rejected"
-    } else {
-      Store.setValidation(dataset, version, "validated", Some(report))
-      Pointer.promote(dataset, version, actor)
-      "validated"
-    }
-  }
 }
 `,
     },

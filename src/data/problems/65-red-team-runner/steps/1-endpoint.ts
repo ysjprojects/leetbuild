@@ -49,7 +49,6 @@ Requirements:
         python: {all: [/@app\.post\(\s*["']\/v1\/redteam\/runs["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/redteam\/runs['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/redteam\/runs"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"redteam"\s*\/\s*"runs"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/redteam\/runs"/]},
       },
     },
@@ -62,7 +61,6 @@ Requirements:
         python: {all: [/targets\.resolve\(/], none: [/["']endpoint["']\s*:\s*body\.target/]},
         typescript: {all: [/targets\.resolve\(/], none: [/endpoint:\s*body\.target/]},
         go: {all: [/targets\.Resolve\(/], none: [/Endpoint:\s*body\.Target/]},
-        scala: {all: [/Targets\.resolve\(/], none: [/body\.target\s*,\s*body\.target/]},
         cpp: {all: [/targets::resolve\(/], none: [/\{"endpoint",\s*body/]},
       },
     },
@@ -75,7 +73,6 @@ Requirements:
         python: {all: [/targets\.PRODUCTION/, /status_code\s*=\s*403/]},
         typescript: {all: [/targets\.PRODUCTION/, /code\(\s*403\s*\)/]},
         go: {all: [/targets\.Production/, /StatusForbidden/]},
-        scala: {all: [/Targets\.Production/, /StatusCodes\.Forbidden/]},
         cpp: {all: [/targets::kProduction/, /\b403\b/]},
       },
     },
@@ -88,7 +85,6 @@ Requirements:
         python: {all: [/Idempotency-Key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
         typescript: {all: [/idempotency-key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
         go: {all: [/Idempotency-Key/, /runs\.Get\(/, /runs\.Put\(\s*[\w.()]+,\s*tenant\s*,\s*idem/]},
-        scala: {all: [/Idempotency-Key/, /Runs\.get\(\s*tenant\s*,/, /Runs\.put\(\s*tenant\s*,\s*idem/]},
         cpp: {all: [/Idempotency-Key/, /runs::get\(\s*tenant\s*,/, /runs::put\(\s*tenant\s*,\s*idem/]},
       },
     },
@@ -101,7 +97,6 @@ Requirements:
         python: {all: [/catalog\.plan\(/], none: [/plan\(\s*["']baseline["']\s*\)/]},
         typescript: {all: [/catalog\.plan\(/], none: [/plan\(\s*["']baseline["']\s*\)/]},
         go: {all: [/catalog\.Plan\(/], none: [/Plan\(\s*"baseline"\s*\)/]},
-        scala: {all: [/Catalog\.plan\(/], none: [/plan\(\s*"baseline"\s*\)/]},
         cpp: {all: [/catalog::plan\(/], none: [/plan\(\s*"baseline"\s*\)/]},
       },
     },
@@ -457,123 +452,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import redteam.{Catalog, Planned, Run, Runs}
-
-final case class RunRequest(target: String, probe_set: String)
-
-object RedTeamApi {
-  implicit val system: ActorSystem = ActorSystem("red-team-runner")
-  implicit val requestFormat: RootJsonFormat[RunRequest] = jsonFormat2(RunRequest)
-  implicit val plannedFormat: RootJsonFormat[Planned] = jsonFormat2(Planned)
-  implicit val runFormat: RootJsonFormat[Run] = jsonFormat7(Run)
-
-  val route: Route =
-    path("v1" / "redteam" / "runs") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[RunRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else {
-              val tenant = tenantOpt.get
-              val plan = Catalog.plan(body.probe_set).orElse(Catalog.plan("baseline")).getOrElse(Nil)
-              val run = Run(UUID.randomUUID().toString, "queued", body.target, body.target, body.probe_set, plan, plan.map(_.probes).sum)
-              Runs.put(tenant, run.run_id, run)
-              system.log.info(s"redteam run=\${run.run_id} target=\${run.target} probes=\${run.probes}")
-              complete(StatusCodes.Created, run)
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import redteam.{Catalog, Planned, Run, Runs, Targets}
-
-final case class RunRequest(target: String, probe_set: String)
-
-object RedTeamApi {
-  implicit val system: ActorSystem = ActorSystem("red-team-runner")
-  implicit val requestFormat: RootJsonFormat[RunRequest] = jsonFormat2(RunRequest)
-  implicit val plannedFormat: RootJsonFormat[Planned] = jsonFormat2(Planned)
-  implicit val runFormat: RootJsonFormat[Run] = jsonFormat7(Run)
-
-  def startRun(tenant: String, idemKey: String, body: RunRequest): Route =
-    Targets.resolve(body.target) match {
-      case None =>
-        complete(StatusCodes.BadRequest, """{"error":"target is not registered"}""")
-      case Some(target) if target.environment == Targets.Production =>
-        complete(StatusCodes.Forbidden, """{"error":"production targets are refused"}""")
-      case Some(target) =>
-        Catalog.plan(body.probe_set) match {
-          case None =>
-            complete(StatusCodes.BadRequest, """{"error":"probe_set is not in the catalog"}""")
-          case Some(plan) =>
-            Runs.get(tenant, idemKey) match {
-              case Some(stored) =>
-                complete(StatusCodes.OK, stored.run)
-              case None =>
-                val run = Run(UUID.randomUUID().toString, "queued", target.name, target.endpoint, body.probe_set, plan, plan.map(_.probes).sum)
-                Runs.put(tenant, idemKey, run)
-                system.log.info(s"redteam run=\${run.run_id} target=\${run.target} probes=\${run.probes}")
-                complete(StatusCodes.Created, run)
-            }
-        }
-    }
-
-  val route: Route =
-    path("v1" / "redteam" / "runs") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[RunRequest]) { body =>
-              if (!tenantOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              } else if (!idemOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-              } else {
-                startRun(tenantOpt.get, idemOpt.get, body)
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

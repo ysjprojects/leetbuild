@@ -64,7 +64,6 @@ Implement \`authorize(amount_cents, currency, card_token, idempotency_key)\` on 
         python: {all: [/stub\.Authorize\([^\n]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/context\.WithTimeout\(\s*ctx\s*,\s*deadline\s*\)/]},
-        scala: {all: [/withDeadlineAfter\(\s*DeadlineMillis/]},
         cpp: {all: [/set_deadline\([^\n]*kDeadline/]},
       },
     },
@@ -77,7 +76,6 @@ Implement \`authorize(amount_cents, currency, card_token, idempotency_key)\` on 
         python: {all: [/AuthorizeRequest\([^)]*idempotency_key\s*=\s*idempotency_key/]},
         typescript: {all: [/idempotency_key:\s*idempotencyKey/]},
         go: {all: [/IdempotencyKey:\s*idempotencyKey/]},
-        scala: {all: [/idempotencyKey\s*=\s*idempotencyKey/]},
         cpp: {all: [/set_idempotency_key\(\s*idempotency_key\s*\)/]},
       },
     },
@@ -93,10 +91,6 @@ Implement \`authorize(amount_cents, currency, card_token, idempotency_key)\` on 
           none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
         },
         go: {all: [/codes\.Unavailable/, /for \w+ := \d+; \w+ <=? maxAttempts; \w+\+\+/], none: [/for \{/]},
-        scala: {
-          all: [/Code\.UNAVAILABLE/, /\w+ < MaxAttempts|\w+ <- \d+ (until|to) MaxAttempts/],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
         cpp: {
           all: [/StatusCode::UNAVAILABLE/, /for \(int \w+ = \d+; \w+ <=? kMaxAttempts; (\+\+\w+|\w+\+\+)\)/],
           none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
@@ -124,13 +118,6 @@ Implement \`authorize(amount_cents, currency, card_token, idempotency_key)\` on 
           ],
         },
         go: {all: [/baseBackoff\s*(<<|\*)|\*\s*baseBackoff/, /rand\.(N|Int64N|IntN|Float64)\(/, /time\.Sleep\(/]},
-        scala: {
-          all: [
-            /BaseBackoffMillis\s*(<<|\*)|\*\s*BaseBackoffMillis/,
-            /Random\.next(Long|Int|Double)\(/,
-            /Thread\.sleep\(/,
-          ],
-        },
         cpp: {
           all: [
             /kBaseBackoff\s*(<<|\*)|\*\s*kBaseBackoff/,
@@ -163,7 +150,6 @@ Implement \`authorize(amount_cents, currency, card_token, idempotency_key)\` on 
           ],
         },
         go: {all: [/codes\.DeadlineExceeded/, /Status:\s*Pending/, /codes\.InvalidArgument/, /Status:\s*Declined/]},
-        scala: {all: [/Code\.DEADLINE_EXCEEDED/, /Pending\(/, /Code\.INVALID_ARGUMENT/, /Declined\(/]},
         cpp: {
           all: [
             /StatusCode::DEADLINE_EXCEEDED/,
@@ -489,86 +475,6 @@ func authorize(ctx context.Context, amountCents int64, currency, cardToken, idem
 		}
 	}
 	return AuthResult{}, fmt.Errorf("provider unavailable after %d attempts", maxAttempts)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import payments.provider.{AuthorizeRequest, PaymentProviderGrpc}
-import scala.util.Random
-
-object ProviderClient {
-  val DeadlineMillis = 3000L
-  val MaxAttempts = 3
-  val BaseBackoffMillis = 200L
-
-  sealed trait AuthResult
-  final case class Approved(authorizationId: String) extends AuthResult
-  final case class Declined(reason: String) extends AuthResult
-  final case class Pending(reason: String) extends AuthResult
-
-  final class ProviderUnavailable(message: String) extends RuntimeException(message)
-
-  private val channel = ManagedChannelBuilder.forAddress("provider", 9443).useTransportSecurity().build()
-  private val stub = PaymentProviderGrpc.blockingStub(channel)
-
-  def authorize(amountCents: Long, currency: String, cardToken: String, idempotencyKey: String): AuthResult = {
-    val request = AuthorizeRequest(amountCents = amountCents, currency = currency, cardToken = cardToken)
-    // TODO: put idempotencyKey in the request so the provider dedupes retries
-    // TODO: call authorize with a deadline of DeadlineMillis; up to MaxAttempts attempts on UNAVAILABLE only
-    // TODO: sleep BaseBackoffMillis doubled per attempt, plus random jitter, before each retry
-    // TODO: DEADLINE_EXCEEDED → Pending (the charge may have happened); INVALID_ARGUMENT → Declined; else rethrow
-    throw new ProviderUnavailable("not implemented")
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import payments.provider.{AuthorizeRequest, PaymentProviderGrpc}
-import scala.util.Random
-
-object ProviderClient {
-  val DeadlineMillis = 3000L
-  val MaxAttempts = 3
-  val BaseBackoffMillis = 200L
-
-  sealed trait AuthResult
-  final case class Approved(authorizationId: String) extends AuthResult
-  final case class Declined(reason: String) extends AuthResult
-  final case class Pending(reason: String) extends AuthResult
-
-  final class ProviderUnavailable(message: String) extends RuntimeException(message)
-
-  private val channel = ManagedChannelBuilder.forAddress("provider", 9443).useTransportSecurity().build()
-  private val stub = PaymentProviderGrpc.blockingStub(channel)
-
-  def authorize(amountCents: Long, currency: String, cardToken: String, idempotencyKey: String): AuthResult = {
-    val request =
-      AuthorizeRequest(amountCents = amountCents, currency = currency, cardToken = cardToken, idempotencyKey = idempotencyKey)
-    var attempt = 0
-    while (attempt < MaxAttempts) {
-      if (attempt > 0) {
-        val backoff = BaseBackoffMillis << (attempt - 1)
-        Thread.sleep(backoff + Random.nextLong(backoff)) // jitter: spread retries across servers
-      }
-      try {
-        val reply = stub.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).authorize(request)
-        return Approved(reply.authorizationId)
-      } catch {
-        case e: StatusRuntimeException =>
-          e.getStatus.getCode match {
-            case Status.Code.DEADLINE_EXCEEDED => return Pending("no answer within the deadline; the charge may exist")
-            case Status.Code.INVALID_ARGUMENT => return Declined(e.getStatus.getDescription)
-            case Status.Code.UNAVAILABLE => attempt += 1
-            case _ => throw e
-          }
-      }
-    }
-    throw new ProviderUnavailable(s"provider unavailable after $MaxAttempts attempts")
-  }
 }
 `,
     },

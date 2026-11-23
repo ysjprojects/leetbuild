@@ -53,7 +53,6 @@ its turn.
         python: {all: [/@app\.post\(\s*["']\/v1\/sessions\/\{session_id\}\/turns["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/sessions\/:sessionId\/turns['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/sessions\/\{id\}\/turns"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"sessions"\s*\/\s*Segment\s*\/\s*"turns"\s*\)/]},
         cpp: {all: [/svr\.Post\([^\n]*\/v1\/sessions\/[^\n]*\/turns/]},
       },
     },
@@ -66,7 +65,6 @@ its turn.
         python: {all: [/sessions\.tenant_for_key\(/, /\b401\b/], none: [/x-tenant-id/i]},
         typescript: {all: [/tenantForKey\(/, /\b401\b/], none: [/x-tenant-id/i]},
         go: {all: [/sessions\.TenantForKey\(/, /StatusUnauthorized|\b401\b/], none: [/X-Tenant-Id/i]},
-        scala: {all: [/Sessions\.tenantForKey\(/, /Unauthorized|\b401\b/], none: [/X-Tenant-Id/i]},
         cpp: {all: [/sessions::tenantForKey\(/, /\b401\b/], none: [/X-Tenant-Id/i]},
       },
     },
@@ -79,10 +77,6 @@ its turn.
         python: {all: [/VALID_ROLES\s*=/, /\b400\b/], order: [/in VALID_ROLES/, /buffer\.append_turn\(/]},
         typescript: {all: [/VALID_ROLES\s*=/, /\b400\b/], order: [/VALID_ROLES\.includes\(/, /appendTurn\(/]},
         go: {all: [/validRoles\s*=/, /StatusBadRequest|\b400\b/], order: [/validRoles\[/, /buffer\.AppendTurn\(/]},
-        scala: {
-          all: [/ValidRoles\s*[:=]/, /BadRequest|\b400\b/],
-          order: [/ValidRoles\.contains\(/, /Buffer\.appendTurn\(/],
-        },
         cpp: {all: [/kValidRoles\s*=/, /\b400\b/], order: [/kValidRoles\.(begin|end)\(\)/, /buffer::appendTurn\(/]},
       },
     },
@@ -106,11 +100,6 @@ its turn.
           all: [/len\(body\.Content\)\s*>\s*maxContentBytes/, /StatusRequestEntityTooLarge|\b413\b/],
           none: [/RuneCount/],
           order: [/StatusRequestEntityTooLarge|\b413\b/, /sessions\.NextTurnID\(/],
-        },
-        scala: {
-          all: [/getBytes\(\s*(StandardCharsets\.)?UTF_8\s*\)/, /PayloadTooLarge|\b413\b/],
-          none: [/content\.length\s*>/],
-          order: [/PayloadTooLarge|\b413\b/, /Sessions\.nextTurnId\(/],
         },
         cpp: {
           all: [/content\.size\(\)\s*>\s*kMaxContentBytes/, /\b413\b/],
@@ -136,10 +125,6 @@ its turn.
         go: {
           all: [/Idempotency-Key/i, /sessions\.ReplayedTurn\(/, /sessions\.RecordTurn\(/],
           order: [/sessions\.ReplayedTurn\(/, /buffer\.AppendTurn\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Sessions\.replayedTurn\(/, /Sessions\.recordTurn\(/],
-          order: [/Sessions\.replayedTurn\(/, /Buffer\.appendTurn\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /sessions::replayedTurn\(/, /sessions::recordTurn\(/],
@@ -413,100 +398,6 @@ func postTurn(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/sessions/{id}/turns", postTurn)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import memory.{Buffer, Sessions} // Buffer.appendTurn; Sessions.tenantForKey, nextTurnId, countTokens, replayedTurn, recordTurn
-
-object Api {
-  val MaxContentBytes: Int = 32 * 1024
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(body: JsObject, name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  private def created(sessionId: String, turn: Sessions.Turn): JsObject =
-    JsObject("session_id" -> JsString(sessionId), "turn_id" -> JsString(turn.turnId), "role" -> JsString(turn.role), "tokens" -> JsNumber(turn.tokens))
-
-  val route: Route =
-    path("v1" / "sessions" / Segment / "turns") { sessionId =>
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { claimed =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            val body = raw.parseJson.asJsObject
-            val (role, content) = (text(body, "role"), text(body, "content"))
-            val tenant = claimed.getOrElse("")
-            if (content.length > MaxContentBytes) complete(StatusCodes.PayloadTooLarge -> "content too large")
-            else {
-              val turn = Sessions.Turn(Sessions.nextTurnId(tenant, sessionId), role, content, Sessions.countTokens(content))
-              Buffer.appendTurn(tenant, sessionId, turn)
-              complete(json(StatusCodes.Created, created(sessionId, turn)))
-            }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import memory.{Buffer, Sessions} // Buffer.appendTurn; Sessions.tenantForKey, nextTurnId, countTokens, replayedTurn, recordTurn
-
-object Api {
-  val MaxContentBytes: Int = 32 * 1024
-  val ValidRoles: Set[String] = Set("user", "assistant")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(body: JsObject, name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  private def created(sessionId: String, turn: Sessions.Turn): JsObject =
-    JsObject("session_id" -> JsString(sessionId), "turn_id" -> JsString(turn.turnId), "role" -> JsString(turn.role), "tokens" -> JsNumber(turn.tokens))
-
-  val route: Route =
-    path("v1" / "sessions" / Segment / "turns") { sessionId =>
-      post {
-        (optionalHeaderValueByName("Authorization") & optionalHeaderValueByName("Idempotency-Key")) { (authorization, idempotencyKey) =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject
-            val (role, content) = (text(body, "role"), text(body, "content"))
-            // The tenant is whoever the API key authenticates; a header the client sets proves nothing.
-            Sessions.tenantForKey(authorization.getOrElse("").stripPrefix("Bearer ")) match {
-              case None => complete(StatusCodes.Unauthorized -> "a valid API key is required")
-              case Some(_) if !ValidRoles.contains(role) => complete(StatusCodes.BadRequest -> "role must be user or assistant")
-              case Some(_) if content.getBytes(UTF_8).length > MaxContentBytes =>
-                complete(StatusCodes.PayloadTooLarge -> "content is over 32 KiB of UTF-8")
-              case Some(tenant) =>
-                val key = idempotencyKey.getOrElse("")
-                val replay = if (key.isEmpty) None else Sessions.replayedTurn(tenant, key)
-                replay match {
-                  case Some(recorded) => complete(json(StatusCodes.OK, recorded)) // a retry answers what the first attempt answered
-                  case None =>
-                    val turn = Sessions.Turn(Sessions.nextTurnId(tenant, sessionId), role, content, Sessions.countTokens(content))
-                    Buffer.appendTurn(tenant, sessionId, turn)
-                    val result = created(sessionId, turn)
-                    if (key.nonEmpty) Sessions.recordTurn(tenant, key, result)
-                    complete(json(StatusCodes.Created, result))
-                }
-            }
-          }
-        }
-      }
-    }
 }
 `,
     },

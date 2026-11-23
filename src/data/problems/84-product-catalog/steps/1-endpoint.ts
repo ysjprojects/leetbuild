@@ -50,7 +50,6 @@ and retries its publish mints a second version.
         python: {all: [/@app\.post\(\s*["']\/v1\/products["']/, /@app\.patch\(/, /\/publish["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/products['"]/, /app\.patch\(/, /\/publish['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/products"/, /"PATCH \/v1\/products\/\{/, /\/publish"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"products"\s*\)/, /\bpatch\s*\{/, /"publish"/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/products"/, /svr\.Patch\(/, /\/publish/]},
       },
     },
@@ -63,7 +62,6 @@ and retries its publish mints a second version.
         python: {all: [/store\.write_draft\(/, /store\.draft_of\(/], none: [/\bupsert\(/]},
         typescript: {all: [/writeDraft\(/, /draftOf\(/], none: [/\bupsert\(/]},
         go: {all: [/store\.WriteDraft\(/, /store\.DraftOf\(/], none: [/\bUpsert\(/]},
-        scala: {all: [/Store\.writeDraft\(/, /Store\.draftOf\(/], none: [/\bupsert\(/]},
         cpp: {all: [/store::writeDraft\(/, /store::draftOf\(/], none: [/\bupsert\(/]},
       },
     },
@@ -76,7 +74,6 @@ and retries its publish mints a second version.
         python: {all: [/REQUIRED_FIELDS/, /\b422\b/, /missing/]},
         typescript: {all: [/REQUIRED_FIELDS/, /\b422\b/, /missing/]},
         go: {all: [/requiredFields/, /StatusUnprocessableEntity|\b422\b/, /missing/]},
-        scala: {all: [/RequiredFields/, /UnprocessableEntity|\b422\b/, /missing/]},
         cpp: {all: [/kRequiredFields/, /\b422\b/, /missing/]},
       },
     },
@@ -97,10 +94,6 @@ and retries its publish mints a second version.
         go: {
           all: [/Idempotency-Key/i, /store\.PublishResult\(/, /store\.RecordPublish\(/, /StatusBadRequest|\b400\b/],
           order: [/store\.PublishResult\(/, /store\.Promote\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Store\.publishResult\(/, /Store\.recordPublish\(/, /BadRequest|\b400\b/],
-          order: [/Store\.publishResult\(/, /Store\.promote\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /store::publishResult\(/, /store::recordPublish\(/, /\b400\b/],
@@ -417,133 +410,6 @@ func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/products", createProduct)
 	mux.HandleFunc("PATCH /v1/products/{id}", editProduct)
 	mux.HandleFunc("POST /v1/products/{id}/publish", publishProduct)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import catalog.Store // Store.create, latest, draftOf, writeDraft, upsert, promote, publishResult, recordPublish
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def result(productId: String, version: Long, status: String): JsObject =
-    JsObject("product_id" -> JsString(productId), "version" -> JsNumber(version), "status" -> JsString(status))
-
-  /** The editable fields of a request body, as the store takes them (a price as its digits). */
-  private def fields(raw: String): Map[String, String] = raw.parseJson.asJsObject.fields.collect {
-    case (name, JsString(s)) => name -> s
-    case (name, JsNumber(n)) => name -> n.toBigInt.toString
-  }
-
-  val route: Route = concat(
-    path("v1" / "products") {
-      post {
-        entity(as[String]) { raw =>
-          val row = Store.create(raw.parseJson.asJsObject.fields("title").convertTo[String](DefaultJsonProtocol.StringJsonFormat))
-          complete(json(StatusCodes.Created, result(row.productId, row.version, "draft")))
-        }
-      }
-    },
-    path("v1" / "products" / Segment) { productId =>
-      patch {
-        entity(as[String]) { raw =>
-          // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-          val row = Store.upsert(productId, fields(raw))
-          complete(json(StatusCodes.OK, result(productId, row.version, row.status)))
-        }
-      }
-    },
-    path("v1" / "products" / Segment / "publish") { productId =>
-      post {
-        Store.latest(productId) match {
-          case None => complete(StatusCodes.NotFound -> "no such product")
-          case Some(row) =>
-            val promoted = Store.promote(productId, row.version)
-            complete(json(StatusCodes.OK, result(productId, promoted.version, "published")))
-        }
-      }
-    },
-  )
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import catalog.Store // Store.create, latest, draftOf, writeDraft, upsert, promote, publishResult, recordPublish
-
-object Api {
-  val RequiredFields: Seq[String] = Seq("title", "price_cents", "tax_class")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def result(productId: String, version: Long, status: String): JsObject =
-    JsObject("product_id" -> JsString(productId), "version" -> JsNumber(version), "status" -> JsString(status))
-
-  /** The editable fields of a request body, as the store takes them (a price as its digits). */
-  private def fields(raw: String): Map[String, String] = raw.parseJson.asJsObject.fields.collect {
-    case (name, JsString(s)) => name -> s
-    case (name, JsNumber(n)) => name -> n.toBigInt.toString
-  }
-
-  /** The first required field the draft lacks. */
-  private def missingField(draft: Store.Row): Option[String] = {
-    val present = Map("title" -> draft.title, "price_cents" -> draft.priceCents.map(_.toString), "tax_class" -> draft.taxClass)
-    RequiredFields.find(name => present(name).forall(_.isEmpty))
-  }
-
-  val route: Route = concat(
-    path("v1" / "products") {
-      post {
-        entity(as[String]) { raw =>
-          val row = Store.create(raw.parseJson.asJsObject.fields("title").convertTo[String](DefaultJsonProtocol.StringJsonFormat))
-          complete(json(StatusCodes.Created, result(row.productId, row.version, "draft")))
-        }
-      }
-    },
-    path("v1" / "products" / Segment) { productId =>
-      patch {
-        entity(as[String]) { raw =>
-          // The published row is immutable: an edit opens or extends the draft.
-          val row = Store.writeDraft(productId, fields(raw))
-          complete(json(StatusCodes.OK, result(productId, row.version, "draft")))
-        }
-      }
-    },
-    path("v1" / "products" / Segment / "publish") { productId =>
-      post {
-        optionalHeaderValueByName("Idempotency-Key") {
-          case None | Some("") => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
-          case Some(key) =>
-            Store.publishResult(productId, key) match {
-              case Some(recorded) => complete(json(StatusCodes.OK, recorded)) // a replay answers what the first attempt answered
-              case None =>
-                Store.draftOf(productId) match {
-                  case None => complete(StatusCodes.Conflict -> "nothing to publish: no draft")
-                  case Some(draft) =>
-                    missingField(draft) match {
-                      case Some(missing) =>
-                        complete(json(StatusCodes.UnprocessableEntity, JsObject("error" -> JsString("missing required field"), "missing" -> JsString(missing))))
-                      case None =>
-                        val promoted = Store.promote(productId, draft.version)
-                        val recorded = result(productId, promoted.version, "published")
-                        Store.recordPublish(productId, key, recorded)
-                        complete(json(StatusCodes.OK, recorded))
-                    }
-                }
-            }
-        }
-      }
-    },
-  )
 }
 `,
     },

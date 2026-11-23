@@ -45,7 +45,6 @@ and nothing says so; equal scores follow the client's order, so one request yiel
         python: {all: [/@app\.post\(\s*["']\/v1\/rerank["']/, /\b401\b/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/rerank['"]/, /\b401\b/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/rerank"/, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"rerank"\s*\)/, /Unauthorized/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/rerank"/, /\b401\b/]},
       },
     },
@@ -58,7 +57,6 @@ and nothing says so; equal scores follow the client's order, so one request yiel
         python: {all: [/MAX_QUERY_BYTES/, /\b413\b/, /\.encode\(/]},
         typescript: {all: [/MAX_QUERY_BYTES/, /\b413\b/, /TextEncoder|Buffer\.byteLength/]},
         go: {all: [/maxQueryBytes/, /StatusRequestEntityTooLarge|\b413\b/]},
-        scala: {all: [/MaxQueryBytes/, /PayloadTooLarge|RequestEntityTooLarge|\b413\b/, /getBytes\(/]},
         cpp: {all: [/kMaxQueryBytes/, /\b413\b/]},
       },
     },
@@ -71,7 +69,6 @@ and nothing says so; equal scores follow the client's order, so one request yiel
         python: {all: [/MAX_CANDIDATES/, /\b400\b/], order: [/>\s*MAX_CANDIDATES/, /\bscore\(/]},
         typescript: {all: [/MAX_CANDIDATES/, /\b400\b/], order: [/>\s*MAX_CANDIDATES/, /\bscore\(/]},
         go: {all: [/maxCandidates/, /StatusBadRequest|\b400\b/], order: [/>\s*maxCandidates/, /model\.Score\(/]},
-        scala: {all: [/MaxCandidates/, /BadRequest/], order: [/>\s*MaxCandidates/, /Model\.score\(/]},
         cpp: {all: [/kMaxCandidates/, /\b400\b/], order: [/>\s*kMaxCandidates/, /model::score\(/]},
       },
     },
@@ -84,7 +81,6 @@ and nothing says so; equal scores follow the client's order, so one request yiel
         python: {all: [/MAX_PASSAGE_BYTES/, /["']truncated["']/]},
         typescript: {all: [/MAX_PASSAGE_BYTES/, /truncated/]},
         go: {all: [/maxPassageBytes/, /json:"truncated"/]},
-        scala: {all: [/MaxPassageBytes/, /"truncated"/]},
         cpp: {all: [/kMaxPassageBytes/, /"truncated"/]},
       },
     },
@@ -97,7 +93,6 @@ and nothing says so; equal scores follow the client's order, so one request yiel
         python: {all: [/sort(ed)?\([\s\S]{0,200}?passage_id/]},
         typescript: {all: [/\.sort\([\s\S]{0,200}?passage_id/]},
         go: {all: [/sort\.(Slice|SliceStable)\([\s\S]{0,300}?PassageID|slices\.SortFunc\([\s\S]{0,300}?PassageID/]},
-        scala: {all: [/sort(By|With)\([\s\S]{0,200}?passageId/]},
         cpp: {all: [/std::(stable_)?sort\([\s\S]{0,300}?passage_id/]},
       },
     },
@@ -371,96 +366,6 @@ func rerank(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/rerank", rerank)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import rerank.Model // Model.score(query, passage): the cross-encoder stand-in, in process — provided
-
-object RerankApi {
-  private def json(status: StatusCode, body: ujson.Value): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
-
-  val route: Route = path("v1" / "rerank") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing X-Tenant-Id")))
-        case Some(_) =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val body = ujson.read(raw)
-            val query = body("query").str
-            val results = body("candidates").arr.toSeq.map { c =>
-              ujson.Obj("passage_id" -> c("passage_id").str, "score" -> Model.score(query, c("text").str.take(4096)))
-            }
-            complete(json(StatusCodes.OK, ujson.Obj("results" -> ujson.Arr.from(results))))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import rerank.Model // Model.score(query, passage): the cross-encoder stand-in, in process — provided
-
-object RerankApi {
-  val MaxQueryBytes = 2 * 1024
-  val MaxCandidates = 200
-  val MaxPassageBytes = 4 * 1024
-
-  private def json(status: StatusCode, body: ujson.Value): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
-
-  /** The text cut to at most limit UTF-8 bytes on a character boundary, and whether it was cut. */
-  private def clip(text: String, limit: Int): (String, Boolean) = {
-    val raw = text.getBytes(UTF_8)
-    if (raw.length <= limit) (text, false)
-    else {
-      var end = limit
-      while (end > 0 && (raw(end) & 0xc0) == 0x80) end -= 1 // a continuation byte: step back to the character's start
-      (new String(raw, 0, end, UTF_8), true)
-    }
-  }
-
-  private final case class Scored(passageId: String, score: Double, truncated: Boolean)
-
-  val route: Route = path("v1" / "rerank") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing X-Tenant-Id")))
-        case Some(_) =>
-          entity(as[String]) { raw =>
-            val body = ujson.read(raw)
-            val query = body("query").str
-            val candidates = body("candidates").arr.toSeq
-            // The caps run before the model: a refused request costs a parse, not a model call.
-            if (query.getBytes(UTF_8).length > MaxQueryBytes)
-              complete(json(StatusCodes.PayloadTooLarge, ujson.Obj("error" -> "query exceeds 2 KiB")))
-            else if (candidates.length > MaxCandidates)
-              complete(json(StatusCodes.BadRequest, ujson.Obj("error" -> "more than 200 candidates")))
-            else {
-              val scored = candidates.map { c =>
-                val (text, truncated) = clip(c("text").str, MaxPassageBytes)
-                Scored(c("passage_id").str, Model.score(query, text), truncated)
-              }
-              val results = scored.sortBy(r => (-r.score, r.passageId)).map { r =>
-                ujson.Obj("passage_id" -> r.passageId, "score" -> r.score, "truncated" -> r.truncated)
-              }
-              complete(json(StatusCodes.OK, ujson.Obj("results" -> ujson.Arr.from(results))))
-            }
-          }
-      }
-    }
-  }
 }
 `,
     },

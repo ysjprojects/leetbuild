@@ -30,7 +30,7 @@ people say in the room, \`unsubscribe\` undoes it.
 - Every incoming \`say\` becomes a \`ServerMsg{room, user, text, ts}\` passed to \`publish(room, …)\`.
   Nothing is written back directly: the message reaches this client through the bus like everyone else.
 - When the client hangs up (cancels, or the connection drops) **unsubscribe**: use the call's
-  cancellation hook (\`add_done_callback\` / \`ctx.Done()\` / \`setOnCancelHandler\` / \`IsCancelled\`).
+  cancellation hook (\`add_done_callback\` / \`ctx.Done()\` / \`IsCancelled\`).
   A stream that keeps its subscription after the client is gone leaks one per disconnect.
 
 :::widget grpc-streams {"mode": "bidi"}
@@ -60,7 +60,7 @@ people say in the room, \`unsubscribe\` undoes it.
       id: 'join-first',
       title: 'The first message must be a join',
       detail:
-        'Inspect the `join` branch of the first `ClientMsg` (`HasField("join")` / `GetJoin()` / `Kind.Join` / `has_join()`); anything else ends the call with `INVALID_ARGUMENT` (or `FAILED_PRECONDITION`).',
+        'Inspect the `join` branch of the first `ClientMsg` (`HasField("join")` / `GetJoin()` / `has_join()`); anything else ends the call with `INVALID_ARGUMENT` (or `FAILED_PRECONDITION`).',
       match: {
         python: {
           all: [
@@ -72,7 +72,6 @@ people say in the room, \`unsubscribe\` undoes it.
           all: [/\.kind\s*[!=]==?\s*['"]join['"]|\.join\b/, /status\.(INVALID_ARGUMENT|FAILED_PRECONDITION)/],
         },
         go: {all: [/GetJoin\(\)|ClientMsg_Join\b/, /codes\.(InvalidArgument|FailedPrecondition)/]},
-        scala: {all: [/Kind\.Join\(|\.kind\.join/, /Status\.(INVALID_ARGUMENT|FAILED_PRECONDITION)/]},
         cpp: {all: [/has_join\(\)|kJoin\b/, /StatusCode::(INVALID_ARGUMENT|FAILED_PRECONDITION)/]},
       },
     },
@@ -85,7 +84,6 @@ people say in the room, \`unsubscribe\` undoes it.
         python: {all: [/HasField\(\s*"say"\s*\)|WhichOneof\(\s*"kind"\s*\)/, /\bpublish\(\s*room\s*,/]},
         typescript: {all: [/\.kind\s*[!=]==?\s*['"]say['"]|\.say\b/, /\bpublish\(\s*room\s*,/]},
         go: {all: [/GetSay\(\)|ClientMsg_Say\b/, /\bpublish\(\s*ctx\s*,\s*room\s*,/]},
-        scala: {all: [/Kind\.Say\(|\.kind\.say/, /\bpublish\(\s*room\s*,/]},
         cpp: {all: [/has_say\(\)|kSay\b/, /\bpublish\(\s*room\s*,/]},
       },
     },
@@ -97,7 +95,6 @@ people say in the room, \`unsubscribe\` undoes it.
         python: {all: [/\bsubscribe\(\s*room\s*\)/, /context\.write\(/]},
         typescript: {all: [/\bsubscribe\(\s*room\s*\)/, /call\.write\(/]},
         go: {all: [/\bsubscribe\(\s*room\s*\)/, /stream\.Send\(/]},
-        scala: {all: [/\bsubscribe\(\s*room\s*,/, /out\.onNext\(|responseObserver\.onNext\(/]},
         cpp: {all: [/\bsubscribe\(\s*room\s*,/, /stream->Write\(/]},
       },
     },
@@ -105,12 +102,11 @@ people say in the room, \`unsubscribe\` undoes it.
       id: 'cancel-cleanup',
       title: 'Unsubscribes when the client hangs up',
       detail:
-        "Hook the call's cancellation (`add_done_callback`, `ctx.Done()`, `setOnCancelHandler`, `IsCancelled`) and `unsubscribe(room, …)` from it.",
+        "Hook the call's cancellation (`add_done_callback`, `ctx.Done()`, `IsCancelled`) and `unsubscribe(room, …)` from it.",
       match: {
         python: {all: [/add_done_callback\(|add_callback\(/, /\bunsubscribe\(\s*room\s*,/]},
         typescript: {all: [/on\(\s*['"]cancelled['"]/, /\bunsubscribe\(\s*room\s*,/]},
         go: {all: [/ctx\.Done\(\)|Context\(\)\.Done\(\)/, /\bunsubscribe\(\s*room\s*,/]},
-        scala: {all: [/setOnCancelHandler\(|isCancelled/, /\bunsubscribe\(\s*room\s*,/]},
         cpp: {all: [/IsCancelled\(\)/, /\bunsubscribe\(\s*room\s*,/]},
       },
     },
@@ -419,79 +415,6 @@ func main() {
 	srv := grpc.NewServer()
 	pb.RegisterChatServer(srv, &chatServer{})
 	log.Fatal(srv.Serve(lis))
-}
-`,
-    },
-    scala: {
-      starter: `import livechat.chat.{ChatGrpc, ClientMsg, ServerMsg}
-import io.grpc.{ServerBuilder, Status}
-import io.grpc.stub.{ServerCallStreamObserver, StreamObserver}
-import scala.concurrent.ExecutionContext
-
-object ChatService extends ChatGrpc.Chat {
-  /** Built in step 3 (RoomBus) and provided (Subscriptions): deliver is called for every message in the room. */
-  def publish(room: String, msg: ServerMsg): Unit = ???
-  def subscribe(room: String, deliver: ServerMsg => Unit): Unit = ???
-  def unsubscribe(room: String, deliver: ServerMsg => Unit): Unit = ???
-
-  override def chat(responseObserver: StreamObserver[ServerMsg]): StreamObserver[ClientMsg] = {
-    val out = responseObserver.asInstanceOf[ServerCallStreamObserver[ServerMsg]]
-    new StreamObserver[ClientMsg] {
-      // TODO: the first message must be a Join → otherwise onError(INVALID_ARGUMENT)
-      // TODO: subscribe(room, deliver) where deliver calls out.onNext; setOnCancelHandler → unsubscribe
-      // TODO: publish(room, ServerMsg(...)) for every Say
-      override def onNext(msg: ClientMsg): Unit =
-        out.onError(Status.UNIMPLEMENTED.asRuntimeException())
-      override def onError(t: Throwable): Unit = ()
-      override def onCompleted(): Unit = out.onCompleted()
-    }
-  }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder.forPort(9000).addService(ChatGrpc.bindService(this, ExecutionContext.global)).build().start().awaitTermination()
-}
-`,
-      solution: `import livechat.chat.{ChatGrpc, ClientMsg, ServerMsg}
-import io.grpc.{ServerBuilder, Status}
-import io.grpc.stub.{ServerCallStreamObserver, StreamObserver}
-import scala.concurrent.ExecutionContext
-
-object ChatService extends ChatGrpc.Chat {
-  /** Built in step 3 (RoomBus) and provided (Subscriptions): deliver is called for every message in the room. */
-  def publish(room: String, msg: ServerMsg): Unit = ???
-  def subscribe(room: String, deliver: ServerMsg => Unit): Unit = ???
-  def unsubscribe(room: String, deliver: ServerMsg => Unit): Unit = ???
-
-  override def chat(responseObserver: StreamObserver[ServerMsg]): StreamObserver[ClientMsg] = {
-    val out = responseObserver.asInstanceOf[ServerCallStreamObserver[ServerMsg]]
-    new StreamObserver[ClientMsg] {
-      private var room: String = _
-      private var user: String = _
-      private val deliver: ServerMsg => Unit = m => out.synchronized(out.onNext(m)) // onNext is not thread-safe
-
-      override def onNext(msg: ClientMsg): Unit = msg.kind match {
-        case ClientMsg.Kind.Join(join) if room == null =>
-          room = join.room
-          user = join.user
-          subscribe(room, deliver)
-          out.setOnCancelHandler(() => unsubscribe(room, deliver)) // the client hung up
-        case ClientMsg.Kind.Say(say) if room != null =>
-          publish(room, ServerMsg(room = room, user = user, text = say.text, ts = System.currentTimeMillis()))
-        case _ =>
-          out.onError(Status.INVALID_ARGUMENT.withDescription("first message must be a join").asRuntimeException())
-      }
-
-      override def onError(t: Throwable): Unit = if (room != null) unsubscribe(room, deliver)
-
-      override def onCompleted(): Unit = {
-        if (room != null) unsubscribe(room, deliver)
-        out.onCompleted()
-      }
-    }
-  }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder.forPort(9000).addService(ChatGrpc.bindService(this, ExecutionContext.global)).build().start().awaitTermination()
 }
 `,
     },

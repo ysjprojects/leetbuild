@@ -62,10 +62,6 @@ leaves the counters short.
         python: {all: [/key\s*=\s*locale_pair\(/], none: [/key\s*=\s*segment\[\s*["']tenant["']\s*\]/]},
         typescript: {all: [/key:\s*localePair\(/], none: [/key:\s*segment\.tenant/]},
         go: {all: [/Key:\s*\[\]byte\(localePair\(/], none: [/Key:\s*\[\]byte\(seg\.Tenant\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(Topic,\s*localePair\(/],
-          none: [/ProducerRecord\[String, String\]\(Topic,\s*segment\.tenant/],
-        },
         cpp: {all: [/key\s*=\s*localePair\(/], none: [/key\s*=\s*seg\.tenant/]},
       },
     },
@@ -78,7 +74,6 @@ leaves the counters short.
         python: {all: [/source_sha256/, /target_sha256/], none: [/["']source_text["']|["']target_text["']/]},
         typescript: {all: [/source_sha256/, /target_sha256/], none: [/source_text|target_text/]},
         go: {all: [/source_sha256/, /target_sha256/], none: [/"source_text"|"target_text"/]},
-        scala: {all: [/source_sha256/, /target_sha256/], none: [/"source_text"|"target_text"/]},
         cpp: {all: [/source_sha256/, /target_sha256/], none: [/"source_text"|"target_text"/]},
       },
     },
@@ -91,7 +86,6 @@ leaves the counters short.
         python: {all: [/on_delivery\s*=|callback\s*=/, /outbox\.insert\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/outbox\.insert\(/, /catch/]},
         go: {all: [/outbox\.Insert\(/, /WriteMessages\(/]},
-        scala: {all: [/Outbox\.insert\(/, /exception != null/]},
         cpp: {all: [/outbox::insert\(/, /dr_cb/]},
       },
     },
@@ -104,7 +98,6 @@ leaves the counters short.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -117,7 +110,6 @@ leaves the counters short.
         python: {order: [/def run\(/, /\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/function run\(/, /\.hincrby\(/, /commitOffsets\(/]},
         go: {order: [/func run\(/, /HIncrBy\(/, /CommitMessages\(/]},
-        scala: {order: [/def run\(/, /hincrBy\(/, /commitSync\(/]},
         cpp: {order: [/void run\(/, /hincrby\(/, /commitSync\(/]},
       },
     },
@@ -622,169 +614,6 @@ func run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import translate.{Outbox, Text} // Outbox.insert(value), Text.sha256Hex
-
-/** One translated segment. */
-final case class Segment(tenant: String, source: String, target: String, glossaryVersion: Long, text: String, translation: String, latencyMs: Long, qualityScore: Double)
-
-object Events {
-  val Topic = "translation.done"
-  val Group = "quality"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", Group)
-  consumerProps.put("auto.offset.reset", "earliest")
-  consumerProps.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Topic).asJava)
-
-  def localePair(source: String, target: String): String = s"$source->$target"
-
-  /** One translation.done event for a translated segment. */
-  def publishDone(segment: Segment): Unit = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val value = JsObject(
-      "tenant" -> JsString(segment.tenant),
-      "source" -> JsString(segment.source),
-      "target" -> JsString(segment.target),
-      "glossary_version" -> JsNumber(segment.glossaryVersion),
-      "latency_ms" -> JsNumber(segment.latencyMs),
-      "quality_score" -> JsNumber(segment.qualityScore),
-      "source_text" -> JsString(segment.text),
-      "target_text" -> JsString(segment.translation),
-    ).compactPrint
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) System.err.println(s"translation.done not delivered: \${exception.getMessage}")
-    }
-    producer.send(new ProducerRecord[String, String](Topic, segment.tenant, value), onDelivery)
-  }
-
-  /** The quality consumer: per-locale counters in quality:{source}->{target}. */
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      consumer.commitSync()
-      records.asScala.foreach { record =>
-        scala.util.Try(record.value().parseJson.asJsObject.fields) match {
-          case scala.util.Success(fields) if Seq("source", "target", "quality_score").forall(fields.contains) =>
-            val key = s"quality:\${localePair(fields("source").convertTo[String](DefaultJsonProtocol.StringJsonFormat), fields("target").convertTo[String](DefaultJsonProtocol.StringJsonFormat))}"
-            val score = math.round(fields("quality_score").convertTo[Double](DefaultJsonProtocol.DoubleJsonFormat) * 1000)
-            val tx = jedis.multi()
-            tx.hincrBy(key, "segments", 1)
-            tx.hincrBy(key, "score_milli", score)
-            tx.exec()
-          case _ => System.err.println(s"skipping malformed record at offset \${record.offset()}")
-        }
-      }
-    }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import translate.{Outbox, Text} // Outbox.insert(value), Text.sha256Hex
-
-/** One translated segment. */
-final case class Segment(tenant: String, source: String, target: String, glossaryVersion: Long, text: String, translation: String, latencyMs: Long, qualityScore: Double)
-
-object Events {
-  val Topic = "translation.done"
-  val Group = "quality"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes once, and every replica has it.
-  producerProps.put("enable.idempotence", "true")
-  producerProps.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", Group)
-  consumerProps.put("auto.offset.reset", "earliest")
-  consumerProps.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Topic).asJava)
-
-  def localePair(source: String, target: String): String = s"$source->$target"
-
-  /** One translation.done event for a translated segment. */
-  def publishDone(segment: Segment): Unit = {
-    val value = JsObject(
-      "tenant" -> JsString(segment.tenant),
-      "source" -> JsString(segment.source),
-      "target" -> JsString(segment.target),
-      "glossary_version" -> JsNumber(segment.glossaryVersion),
-      "latency_ms" -> JsNumber(segment.latencyMs),
-      "quality_score" -> JsNumber(segment.qualityScore),
-      // Hashes let a reviewer match an event to a segment; the text stays out of a retained topic.
-      "source_sha256" -> JsString(Text.sha256Hex(segment.text)),
-      "target_sha256" -> JsString(Text.sha256Hex(segment.translation)),
-    ).compactPrint
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) {
-          System.err.println(s"translation.done not delivered: \${exception.getMessage}")
-          Outbox.insert(value) // the broker said no: the relay replays the row later
-        }
-    }
-    // One locale pair, one partition: the quality consumer sees a pair's events in order.
-    producer.send(new ProducerRecord[String, String](Topic, localePair(segment.source, segment.target), value), onDelivery)
-  }
-
-  /** The quality consumer: per-locale counters in quality:{source}->{target}. */
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        scala.util.Try(record.value().parseJson.asJsObject.fields) match {
-          case scala.util.Success(fields) if Seq("source", "target", "quality_score").forall(fields.contains) =>
-            val key = s"quality:\${localePair(fields("source").convertTo[String](DefaultJsonProtocol.StringJsonFormat), fields("target").convertTo[String](DefaultJsonProtocol.StringJsonFormat))}"
-            val score = math.round(fields("quality_score").convertTo[Double](DefaultJsonProtocol.DoubleJsonFormat) * 1000)
-            val tx = jedis.multi() // both counters or neither
-            tx.hincrBy(key, "segments", 1)
-            tx.hincrBy(key, "score_milli", score)
-            // A failed count is thrown, not committed: the batch is replayed after a restart.
-            tx.exec().asScala.collectFirst { case e: Exception => e }.foreach(e => throw e)
-          case _ => System.err.println(s"skipping malformed record at offset \${record.offset()}")
-        }
-      }
-      consumer.commitSync() // every record of the batch is counted: a crash before this replays them
-    }
 }
 `,
     },

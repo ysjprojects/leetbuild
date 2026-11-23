@@ -74,7 +74,6 @@ The service sits behind a load balancer that terminates TLS and talks plain HTTP
         python: {all: [/x-forwarded-proto/i, /split\(\s*["'],["']\s*\)\s*\[0\]/, /\.lower\(\)/]},
         typescript: {all: [/x-forwarded-proto/i, /split\(\s*['"],['"]\s*\)\s*\[0\]/, /\.toLowerCase\(\)/]},
         go: {all: [/X-Forwarded-Proto/, /strings\.Split\(\s*\w+\s*,\s*","\s*\)\s*\[0\]/, /strings\.ToLower\(/]},
-        scala: {all: [/x-forwarded-proto/i, /split\(\s*","\s*\)\.head/, /toLowerCase/]},
         cpp: {all: [/"X-Forwarded-Proto"/, /substr\(\s*0\s*,\s*\w+\.find\(\s*','\s*\)\s*\)/, /tolower/]},
       },
     },
@@ -100,10 +99,6 @@ The service sits behind a load balancer that terminates TLS and talks plain HTTP
           ],
           none: [/http\.Status(MovedPermanently|Found|SeeOther|TemporaryRedirect)/],
         },
-        scala: {
-          all: [/StatusCodes\.PermanentRedirect/, /s"https:\/\/\$/, /rawQueryString/],
-          none: [/StatusCodes\.(MovedPermanently|Found|SeeOther|TemporaryRedirect)/],
-        },
         cpp: {
           all: [/res\.status\s*=\s*308/, /"https:\/\/"\s*\+\s*req\.get_header_value\(\s*"Host"\s*\)/, /req\.target/],
           none: [/res\.status\s*=\s*30[1237]\b/],
@@ -125,10 +120,6 @@ The service sits behind a load balancer that terminates TLS and talks plain HTTP
           none: [/trustProxy/],
         },
         go: {all: [/net\.SplitHostPort\(\s*r\.RemoteAddr/, /trustedProxies\[\s*peer\s*\]/]},
-        scala: {
-          all: [/AttributeKeys\.remoteAddress/, /TrustedProxies\.contains\(\s*peer\s*\)/],
-          none: [/extractClientIP/],
-        },
         cpp: {all: [/req\.remote_addr/, /kTrustedProxies\.count\(\s*peer\s*\)/]},
       },
     },
@@ -152,10 +143,6 @@ The service sits behind a load balancer that terminates TLS and talks plain HTTP
         },
         go: {
           all: [/X-Forwarded-For/, /len\(\w+\)\s*-\s*1;\s*\w+\s*>=\s*0;\s*\w+--/, /!trustedProxies\[/],
-        },
-        scala: {
-          all: [/x-forwarded-for/i, /reverseIterator|\.reverse\b|findLast/, /!TrustedProxies\.contains\(/],
-          none: [/extractClientIP/],
         },
         cpp: {all: [/"X-Forwarded-For"/, /\.rbegin\(\)/, /!kTrustedProxies\.count\(/]},
       },
@@ -187,13 +174,6 @@ The service sits behind a load balancer that terminates TLS and talks plain HTTP
             /\.Scheme\s*==\s*"https"/,
           ],
         },
-        scala: {
-          all: [
-            /Hsts\s*=\s*"max-age=63072000; includeSubDomains"/,
-            /respondWithHeader\(\s*RawHeader\(\s*"Strict-Transport-Security"\s*,\s*Hsts\s*\)\s*\)/,
-            /Route\.seal\(/,
-          ],
-        },
         cpp: {
           all: [
             /kHsts\s*=\s*"max-age=63072000; includeSubDomains"/,
@@ -212,7 +192,6 @@ The service sits behind a load balancer that terminates TLS and talks plain HTTP
         python: {all: [/\.path\s*!=\s*["']\/healthz["']/]},
         typescript: {all: [/!==\s*['"]\/healthz['"]/]},
         go: {all: [/r\.URL\.Path\s*!=\s*"\/healthz"/]},
-        scala: {all: [/!=\s*"\/healthz"/]},
         cpp: {all: [/req\.path\s*!=\s*"\/healthz"/]},
       },
     },
@@ -610,147 +589,6 @@ func main() {
 	mux.HandleFunc("POST /orders", createOrder)
 	// plain HTTP: TLS ends at the load balancer
 	log.Fatal(http.ListenAndServe(":8080", proxyAware(mux)))
-}
-`,
-    },
-    scala: {
-      starter: `import scala.collection.mutable.ListBuffer
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.{Location, RawHeader}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-object ProxyAware {
-  val TrustedProxies: Set[String] = Set("10.0.0.2", "10.0.0.3")
-  val Hsts = "max-age=63072000; includeSubDomains"
-  val orders: ListBuffer[String] = ListBuffer.empty
-
-  final case class Origin(clientIp: String, scheme: String)
-
-  /** The client's address and scheme as the client saw them. */
-  def resolve(request: HttpRequest): Origin = {
-    val peer = request.attribute(AttributeKeys.remoteAddress).flatMap(_.toOption).map(_.getHostAddress).getOrElse("")
-    // TODO: only when the peer is in TrustedProxies: the scheme from X-Forwarded-Proto (first value,
-    // lowercased) and the client from X-Forwarded-For (right to left, skipping TrustedProxies)
-    Origin(peer, request.uri.scheme)
-  }
-
-  val api: Route = concat(
-    path("whoami") {
-      get {
-        extractRequest { request =>
-          val o = resolve(request)
-          complete(HttpEntity(ContentTypes.\`application/json\`, s"""{"client_ip":"\${o.clientIp}","scheme":"\${o.scheme}"}"""))
-        }
-      }
-    },
-    path("healthz") {
-      get {
-        complete("ok")
-      }
-    },
-    path("orders") {
-      post {
-        entity(as[String]) { body =>
-          val id = orders.synchronized { orders += body; orders.size }
-          complete(StatusCodes.Created, HttpEntity(ContentTypes.\`application/json\`, s"""{"id":$id}"""))
-        }
-      }
-    },
-  )
-
-  // TODO: effective http on any path but /healthz → 308, Location: https://<Host><path>[?query], no body
-  // TODO: effective https → Strict-Transport-Security: Hsts on every response, 404s included
-  val route: Route = api
-
-  def main(args: Array[String]): Unit = {
-    // pekko.http.server.remote-address-attribute = on
-    implicit val system: ActorSystem = ActorSystem("proxy-aware")
-    Http().newServerAt("0.0.0.0", 8080).bind(route)
-  }
-}
-`,
-      solution: `import scala.collection.mutable.ListBuffer
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.{Location, RawHeader}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-object ProxyAware {
-  val TrustedProxies: Set[String] = Set("10.0.0.2", "10.0.0.3")
-  val Hsts = "max-age=63072000; includeSubDomains"
-  val orders: ListBuffer[String] = ListBuffer.empty
-
-  final case class Origin(clientIp: String, scheme: String)
-
-  /** Right to left through X-Forwarded-For: the first hop that is not one of ours is the client. */
-  def clientIp(peer: String, xff: Seq[String]): String = {
-    val hops = xff.flatMap(_.split(",")).map(_.trim).filter(_.nonEmpty)
-    hops.reverseIterator.find(hop => !TrustedProxies.contains(hop)).orElse(hops.headOption).getOrElse(peer)
-  }
-
-  /** The client's address and scheme. The peer is the socket, never a header; headers count only from our proxy. */
-  def resolve(request: HttpRequest): Origin = {
-    val peer = request.attribute(AttributeKeys.remoteAddress).flatMap(_.toOption).map(_.getHostAddress).getOrElse("")
-    val own = request.uri.scheme
-    if (!TrustedProxies.contains(peer)) Origin(peer, own)
-    else {
-      val proto = request.headers.find(_.is("x-forwarded-proto")).map(_.value)
-      val xff = request.headers.filter(_.is("x-forwarded-for")).map(_.value)
-      Origin(clientIp(peer, xff), proto.map(_.split(",").head.trim.toLowerCase).getOrElse(own))
-    }
-  }
-
-  val api: Route = concat(
-    path("whoami") {
-      get {
-        extractRequest { request =>
-          val o = resolve(request)
-          complete(HttpEntity(ContentTypes.\`application/json\`, s"""{"client_ip":"\${o.clientIp}","scheme":"\${o.scheme}"}"""))
-        }
-      }
-    },
-    path("healthz") {
-      get {
-        complete("ok")
-      }
-    },
-    path("orders") {
-      post {
-        entity(as[String]) { body =>
-          val id = orders.synchronized { orders += body; orders.size }
-          complete(StatusCodes.Created, HttpEntity(ContentTypes.\`application/json\`, s"""{"id":$id}"""))
-        }
-      }
-    },
-  )
-
-  val route: Route = extractRequest { request =>
-    val origin = resolve(request)
-    val uri = request.uri
-    if (origin.scheme != "https" && uri.path.toString != "/healthz") {
-      val host = request.headers.find(_.is("host")).map(_.value).getOrElse(uri.authority.toString)
-      val target = s"https://$host\${uri.path}" + uri.rawQueryString.map("?" + _).getOrElse("")
-      // not the redirect directive: it adds an HTML body
-      complete(HttpResponse(StatusCodes.PermanentRedirect, headers = List(Location(Uri(target)))))
-    } else if (origin.scheme == "https")
-      // sealed inside, so a rejection becomes a 404 response the header can join
-      respondWithHeader(RawHeader("Strict-Transport-Security", Hsts))(Route.seal(api))
-    else api
-  }
-
-  def main(args: Array[String]): Unit = {
-    // pekko.http.server.remote-address-attribute = on
-    implicit val system: ActorSystem = ActorSystem("proxy-aware")
-    // plain HTTP: TLS ends at the load balancer
-    Http().newServerAt("0.0.0.0", 8080).bind(route)
-  }
 }
 `,
     },
@@ -1378,7 +1216,7 @@ void CheckHealthzExempt(harness::Ctx& ctx) {
 }
 `,
   },
-  debrief: `The whole drill is one function, \`resolve\`, and its first line: is the peer one of ours? A forwarded header is a claim made by whoever opened the connection, so it is worth exactly as much as that party. From \`10.0.0.2\` it is the load balancer reporting what it saw on the TLS side; from anyone else it is text the client typed. That is why the peer comes from the socket (\`request.client.host\`, \`request.ip\` without \`trustProxy\`, \`r.RemoteAddr\`, Pekko's remote-address attribute, \`req.remote_addr\`) and never from a helper such as Pekko's \`extractClientIP\` that reads the headers itself.
+  debrief: `The whole drill is one function, \`resolve\`, and its first line: is the peer one of ours? A forwarded header is a claim made by whoever opened the connection, so it is worth exactly as much as that party. From \`10.0.0.2\` it is the load balancer reporting what it saw on the TLS side; from anyone else it is text the client typed. That is why the peer comes from the socket (\`request.client.host\`, \`request.ip\` without \`trustProxy\`, \`r.RemoteAddr\`, \`req.remote_addr\`) and never from a helper that reads the headers itself.
 
 \`X-Forwarded-For\` is appended to, never rewritten: each proxy adds the address it received the connection from. So the trustworthy part is a suffix, and the client is the first hop from the right that you did not put there. The leftmost entry, which Fastify's \`trustProxy: true\` and many hand-rolled parsers return, is whatever the client sent in its own header.
 

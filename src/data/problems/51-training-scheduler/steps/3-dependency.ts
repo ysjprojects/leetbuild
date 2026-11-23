@@ -54,7 +54,6 @@ service Worker {
         python: {all: [/runs\.set_checkpoint\(/], order: [/worker\.Checkpoint\(/, /worker\.Terminate\(/]},
         typescript: {all: [/setCheckpoint\(/], order: [/worker\.Checkpoint\(/, /worker\.Terminate\(/]},
         go: {all: [/runs\.SetCheckpoint\(/], order: [/worker\.Checkpoint\(/, /worker\.Terminate\(/]},
-        scala: {all: [/Runs\.setCheckpoint\(/], order: [/\.checkpoint\(/, /\.terminate\(/]},
         cpp: {all: [/runs::setCheckpoint\(/], order: [/worker->Checkpoint\(/, /worker->Terminate\(/]},
       },
     },
@@ -67,7 +66,6 @@ service Worker {
         python: {all: [/timeout\s*=\s*GRACE_S/, /DEADLINE_EXCEEDED/, /grace_deadline_exceeded/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*GRACE_S/, /DEADLINE_EXCEEDED/, /grace_deadline_exceeded/]},
         go: {all: [/context\.WithTimeout\([^\n]*graceS/, /codes\.DeadlineExceeded/, /grace_deadline_exceeded/]},
-        scala: {all: [/withDeadlineAfter\(\s*GraceS/, /DEADLINE_EXCEEDED/, /grace_deadline_exceeded/]},
         cpp: {all: [/set_deadline\([^\n]*kGraceS/, /DEADLINE_EXCEEDED/, /grace_deadline_exceeded/]},
       },
     },
@@ -80,7 +78,6 @@ service Worker {
         python: {order: [/not reply\.supported/, /reason\s*=\s*["']preempted["']/]},
         typescript: {order: [/!reply\.supported/, /reason:\s*['"]preempted['"]/]},
         go: {order: [/!reply\.GetSupported\(\)|!reply\.Supported/, /Reason:\s*"preempted"/]},
-        scala: {order: [/!reply\.supported/, /"preempted"/]},
         cpp: {order: [/!reply\.supported\(\)/, /"preempted"/]},
       },
     },
@@ -93,7 +90,6 @@ service Worker {
         python: {all: [/queue\.enqueue\([^\n]*enqueued_at_ms/]},
         typescript: {all: [/enqueue\([^\n]*enqueued_at_ms/]},
         go: {all: [/queue\.Enqueue\([^\n]*EnqueuedAtMs/]},
-        scala: {all: [/Queue\.enqueue\([^\n]*enqueuedAtMs/]},
         cpp: {all: [/queue::enqueue\([^\n]*enqueued_at_ms/]},
       },
     },
@@ -304,63 +300,6 @@ func preempt(ctx context.Context, runID string) (bool, error) {
 		return false, err
 	}
 	return true, queue.Enqueue(ctx, runID, run.Band, run.EnqueuedAtMs)
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.ManagedChannelBuilder
-
-import trainsched.{Queue, Runs} // Runs.get, setCheckpoint; Queue.enqueue
-import trainsched.trainsched.{CheckpointRequest, TerminateRequest, WorkerGrpc}
-
-object Preemption {
-  val GraceS = 30
-
-  private val worker = WorkerGrpc.blockingStub(ManagedChannelBuilder.forAddress("worker", 9000).usePlaintext().build())
-
-  /** Make room on the GPUs the run holds. */
-  def preempt(runId: String): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    worker.terminate(TerminateRequest(runId = runId, reason = "preempted"))
-    val reply = worker.checkpoint(CheckpointRequest(runId = runId, graceS = GraceS))
-    Runs.setCheckpoint(runId, reply.checkpointId)
-    true
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import trainsched.{Queue, Runs} // Runs.get, setCheckpoint; Queue.enqueue
-import trainsched.trainsched.{CheckpointRequest, TerminateRequest, WorkerGrpc}
-
-object Preemption {
-  val GraceS = 30
-
-  private val worker = WorkerGrpc.blockingStub(ManagedChannelBuilder.forAddress("worker", 9000).usePlaintext().build())
-
-  /** Make room on the GPUs the run holds: checkpoint it, stop it, queue it again. False when it keeps running. */
-  def preempt(runId: String): Boolean = {
-    val run = Runs.get(runId).getOrElse(throw new NoSuchElementException(s"no run $runId"))
-    // The job has GraceS to write its checkpoint, and the call waits no longer than that.
-    val reply =
-      try Some(worker.withDeadlineAfter(GraceS, TimeUnit.SECONDS).checkpoint(CheckpointRequest(runId = runId, graceS = GraceS)))
-      catch { case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED => None }
-    reply match {
-      case None =>
-        // Out of grace: stop it anyway; it resumes from the checkpoint it already had.
-        worker.terminate(TerminateRequest(runId = runId, reason = "grace_deadline_exceeded"))
-        Queue.enqueue(runId, run.band, run.enqueuedAtMs)
-        true
-      case Some(reply) if !reply.supported => false // a job that cannot checkpoint keeps its GPUs
-      case Some(reply) =>
-        Runs.setCheckpoint(runId, reply.checkpointId)
-        worker.terminate(TerminateRequest(runId = runId, reason = "preempted"))
-        Queue.enqueue(runId, run.band, run.enqueuedAtMs)
-        true
-    }
-  }
 }
 `,
     },

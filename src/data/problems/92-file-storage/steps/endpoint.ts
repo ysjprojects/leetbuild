@@ -59,7 +59,6 @@ client declares zero bytes, or 4 KiB and then sends far more; and an executable 
           all: [/app\.post\(\s*['"]\/v1\/files['"]/, /app\.put\(\s*['"]\/v1\/uploads\/:uploadId\/parts\/:n['"]/],
         },
         go: {all: [/HandleFunc\(\s*"POST \/v1\/files"/, /HandleFunc\(\s*"PUT \/v1\/uploads\/\{id\}\/parts\/\{n\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"files"\s*\)/, /"uploads"\s*\/\s*Segment\s*\/\s*"parts"\s*\/\s*IntNumber/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/files"/, /svr\.Put\(\s*R"\(\/v1\/uploads\//]},
       },
     },
@@ -77,7 +76,6 @@ client declares zero bytes, or 4 KiB and then sends far more; and an executable 
         },
         typescript: {all: [/session\.tenant\s*!==?\s*tenant|tenant\s*!==?\s*session\.tenant/, /code\(\s*403\s*\)/]},
         go: {all: [/session\.Tenant\s*!=\s*tenant|tenant\s*!=\s*session\.Tenant/, /StatusForbidden/]},
-        scala: {all: [/session\.tenant\s*!=\s*tenant|tenant\s*!=\s*session\.tenant/, /StatusCodes\.Forbidden/]},
         cpp: {all: [/session->tenant\s*!=\s*tenant|tenant\s*!=\s*session->tenant/, /\b403\b/]},
       },
     },
@@ -90,7 +88,6 @@ client declares zero bytes, or 4 KiB and then sends far more; and an executable 
         python: {all: [/store\.MAX_UPLOAD_BYTES/, /session\[["']declared_size["']\]/]},
         typescript: {all: [/store\.MAX_UPLOAD_BYTES/, /session\.declared_size/]},
         go: {all: [/store\.MaxUploadBytes/, /session\.DeclaredSize/]},
-        scala: {all: [/Store\.MaxUploadBytes/, /session\.declaredSize/]},
         cpp: {all: [/store::kMaxUploadBytes/, /session->declared_size/]},
       },
     },
@@ -103,7 +100,6 @@ client declares zero bytes, or 4 KiB and then sends far more; and an executable 
         python: {all: [/store\.ALLOWED_MIME/, /store\.sniff_mime\(/, /status_code\s*=\s*415/]},
         typescript: {all: [/store\.ALLOWED_MIME/, /store\.sniffMime\(/, /code\(\s*415\s*\)/]},
         go: {all: [/store\.AllowedMime/, /store\.SniffMime\(/, /StatusUnsupportedMediaType/]},
-        scala: {all: [/Store\.AllowedMime/, /Store\.sniffMime\(/, /StatusCodes\.UnsupportedMediaType/]},
         cpp: {all: [/store::kAllowedMime/, /store::sniffMime\(/, /\b415\b/]},
       },
     },
@@ -487,122 +483,6 @@ func putPart(rw http.ResponseWriter, r *http.Request) {
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/files", createUpload)
 	mux.HandleFunc("PUT /v1/uploads/{id}/parts/{n}", putPart)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import files.{Sessions, Store} // Sessions.openSession, findSession, ackPart; Store.stagePart, sniffMime, MaxUploadBytes, AllowedMime
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private val tenantHeader = optionalHeaderValueByName("X-Tenant-Id")
-
-  val route: Route = concat(
-    path("v1" / "files") {
-      post {
-        tenantHeader {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            entity(as[String]) { raw =>
-              val body = raw.parseJson.asJsObject.fields
-              val size = body.get("size").collect { case JsNumber(n) if n.isValidLong => n.toLong }.getOrElse(0L)
-              val mime = body.get("mime").collect { case JsString(s) => s }.getOrElse("")
-              val name = body.get("name").collect { case JsString(s) => s }.getOrElse("")
-              // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-              Sessions.openSession(tenant, size, mime, name) match {
-                case None => complete(StatusCodes.PayloadTooLarge -> "the upload does not fit the tenant's quota")
-                case Some(uploadId) => complete(json(StatusCodes.Created, JsObject("upload_id" -> JsString(uploadId), "declared_size" -> JsNumber(size))))
-              }
-            }
-        }
-      }
-    },
-    path("v1" / "uploads" / Segment / "parts" / IntNumber) { (uploadId, n) =>
-      put {
-        tenantHeader {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            entity(as[Array[Byte]]) { data =>
-              Sessions.findSession(uploadId) match {
-                case None => complete(StatusCodes.NotFound -> "no such upload")
-                case Some(session) =>
-                  Store.stagePart(uploadId, n, data)
-                  val actual = Sessions.ackPart(uploadId, n, data.length.toLong)
-                  complete(json(StatusCodes.OK, JsObject("part" -> JsNumber(n), "actual_bytes" -> JsNumber(actual))))
-              }
-            }
-        }
-      }
-    },
-  )
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import files.{Sessions, Store} // Sessions.openSession, findSession, ackPart; Store.stagePart, sniffMime, MaxUploadBytes, AllowedMime
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private val tenantHeader = optionalHeaderValueByName("X-Tenant-Id")
-
-  val route: Route = concat(
-    path("v1" / "files") {
-      post {
-        tenantHeader {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            entity(as[String]) { raw =>
-              val body = raw.parseJson.asJsObject.fields
-              val size = body.get("size").collect { case JsNumber(n) if n.isValidLong => n.toLong }.getOrElse(0L)
-              val mime = body.get("mime").collect { case JsString(s) => s }.getOrElse("")
-              val name = body.get("name").collect { case JsString(s) => s }.getOrElse("")
-              if (size < 1 || size > Store.MaxUploadBytes) complete(StatusCodes.PayloadTooLarge -> s"size must be an integer from 1 to \${Store.MaxUploadBytes}")
-              else if (!Store.AllowedMime.contains(mime)) complete(StatusCodes.UnsupportedMediaType -> s"$mime is not an accepted type")
-              else
-                Sessions.openSession(tenant, size, mime, name) match {
-                  case None => complete(StatusCodes.PayloadTooLarge -> "the upload does not fit the tenant's quota")
-                  case Some(uploadId) => complete(json(StatusCodes.Created, JsObject("upload_id" -> JsString(uploadId), "declared_size" -> JsNumber(size))))
-                }
-            }
-        }
-      }
-    },
-    path("v1" / "uploads" / Segment / "parts" / IntNumber) { (uploadId, n) =>
-      put {
-        tenantHeader {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            entity(as[Array[Byte]]) { data =>
-              Sessions.findSession(uploadId) match {
-                case None => complete(StatusCodes.NotFound -> "no such upload")
-                case Some(session) if session.tenant != tenant => complete(StatusCodes.Forbidden -> "this upload belongs to another tenant")
-                // A retried part replaces its earlier count; the total may not pass the declaration.
-                case Some(session) if session.actualBytes - session.parts.getOrElse(n, 0L) + data.length > session.declaredSize =>
-                  complete(StatusCodes.PayloadTooLarge -> "the parts exceed the declared size")
-                case Some(session) if n == 1 && Store.sniffMime(data.take(16)) != session.mime =>
-                  complete(StatusCodes.UnsupportedMediaType -> s"the bytes are not \${session.mime}")
-                case Some(_) =>
-                  Store.stagePart(uploadId, n, data)
-                  val actual = Sessions.ackPart(uploadId, n, data.length.toLong)
-                  complete(json(StatusCodes.OK, JsObject("part" -> JsNumber(n), "actual_bytes" -> JsNumber(actual))))
-              }
-            }
-        }
-      }
-    },
-  )
 }
 `,
     },

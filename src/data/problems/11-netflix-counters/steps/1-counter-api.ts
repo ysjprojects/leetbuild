@@ -85,15 +85,6 @@ Implement the three routes:
             /HandleFunc\(\s*"DELETE \/counters\/\{ns\}\/\{name\}"/,
           ],
         },
-        scala: {
-          all: [
-            /pathPrefix\(\s*"counters"\s*\/\s*Segment\s*\/\s*Segment\s*\)/,
-            /path\(\s*"add"\s*\)/,
-            /\bpost\s*\{/,
-            /\bget\s*\{/,
-            /\bdelete\s*\{/,
-          ],
-        },
         cpp: {
           all: [
             /svr\.Post\(\s*R?"\(?\/counters\//,
@@ -112,7 +103,6 @@ Implement the three routes:
         python: {all: [/NAMESPACES\.get\(|in NAMESPACES/, /status_code\s*=\s*404/]},
         typescript: {all: [/NAMESPACES\[/, /notFound\(|code\(\s*404\s*\)|HttpError\(\s*404/]},
         go: {all: [/namespaces\[/, /http\.StatusNotFound|\b404\b/]},
-        scala: {all: [/Namespaces\.get\(|Namespaces\.contains\(/, /StatusCodes\.NotFound|\b404\b/]},
         cpp: {all: [/kNamespaces\.find\(|kNamespaces\.count\(/, /(status\s*=|fail\(\s*res\s*,)\s*404/]},
       },
     },
@@ -125,13 +115,6 @@ Implement the three routes:
         python: {all: [/NAME_RE\.(fullmatch|match)\(/, /MAX_DELTA/, /status_code\s*=\s*400/]},
         typescript: {all: [/NAME_RE\.test\(/, /MAX_DELTA/, /badRequest\(|code\(\s*400\s*\)|HttpError\(\s*400/]},
         go: {all: [/nameRe\.MatchString\(/, /maxDelta/, /http\.StatusBadRequest|\b400\b/]},
-        scala: {
-          all: [
-            /NameRe\.(matches|findFirstIn|unapplySeq)\(|matches\(\s*NameRe/,
-            /MaxDelta/,
-            /StatusCodes\.BadRequest|\b400\b/,
-          ],
-        },
         cpp: {all: [/std::regex_match\([^\n]*kNameRe/, /kMaxDelta/, /(status\s*=|fail\(\s*res\s*,)\s*400/]},
       },
     },
@@ -144,9 +127,6 @@ Implement the three routes:
         python: {all: [/(?<!def )add_best_effort\(/, /(?<!def )append_event\(/, /status_code\s*=\s*202/, /"count"/]},
         typescript: {all: [/\baddBestEffort\(/, /\bappendEvent\(/, /code\(\s*202\s*\)/, /count:/]},
         go: {all: [/(?<!func )addBestEffort\(/, /(?<!func )appendEvent\(/, /http\.StatusAccepted|\b202\b/, /"count"/]},
-        scala: {
-          all: [/(?<!def )addBestEffort\(/, /(?<!def )appendEvent\(/, /StatusCodes\.Accepted|\b202\b/, /"count"/],
-        },
         cpp: {all: [/(?<!long )add_best_effort\(/, /(?<!void )append_event\(/, /status\s*=\s*202/, /"count"/]},
       },
     },
@@ -181,15 +161,6 @@ Implement the three routes:
             /(?<!func )clearBestEffort\(/,
             /(?<!func )clearRolledUp\(/,
             /http\.StatusNoContent|\b204\b/,
-          ],
-        },
-        scala: {
-          all: [
-            /(?<!def )getBestEffort\(/,
-            /(?<!def )getRolledUp\(/,
-            /(?<!def )clearBestEffort\(/,
-            /(?<!def )clearRolledUp\(/,
-            /StatusCodes\.NoContent|\b204\b/,
           ],
         },
         cpp: {
@@ -651,162 +622,6 @@ func main() {
 	mux.HandleFunc("GET /counters/{ns}/{name}", get)
 	mux.HandleFunc("DELETE /counters/{ns}/{name}", clear)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import counters.Tls // Tls.serverContext — provided
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-final case class AddRequest(delta: Option[Long], token: Option[String])
-
-object CounterApi {
-  /** Namespaces and their counter type (provided): configured per use case, never chosen per request. */
-  val Namespaces = Map("views" -> "best_effort", "plays" -> "eventually_consistent")
-  val NameRe = "^[A-Za-z0-9_-]{1,64}$".r
-  val MaxDelta = 1000000L
-
-  implicit val addFormat: RootJsonFormat[AddRequest] = jsonFormat2(AddRequest)
-
-  /** Built in later steps. */
-  def addBestEffort(ns: String, name: String, delta: Long): Long = BestEffort.addCount(ns, name, delta) // step 2
-  def getBestEffort(ns: String, name: String): Long = BestEffort.getCount(ns, name) // step 2
-  def clearBestEffort(ns: String, name: String): Unit = BestEffort.clearCount(ns, name) // step 2
-  def appendEvent(ns: String, name: String, delta: Long, token: String): Unit = CountEvents.appendEvent(ns, name, delta, token) // step 3: throws EventNotDurable
-  def getRolledUp(ns: String, name: String): Long = Rollup.getCount(ns, name) // step 4
-  def clearRolledUp(ns: String, name: String): Unit = Rollup.clearCount(ns, name) // step 4
-
-  private def json(status: StatusCode, body: String): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-
-  val route: Route =
-    pathPrefix("counters" / Segment / Segment) { (ns, name) =>
-      // TODO: 404 unless Namespaces has ns; 400 unless NameRe matches name
-      concat(
-        path("add") {
-          post {
-            entity(as[AddRequest]) { req =>
-              // TODO: 400 when delta is missing, 0 or beyond ±MaxDelta; eventually_consistent → 400 without a token
-              // TODO: best_effort → addBestEffort → 200 {"count": …}
-              // TODO: eventually_consistent → appendEvent → 202 {"accepted": true}; catch EventNotDurable → 503
-              json(StatusCodes.NotImplemented, """{"error":"not implemented"}""")
-            }
-          }
-        },
-        pathEnd {
-          concat(
-            get {
-              // TODO: best_effort → getBestEffort, else getRolledUp → 200 {"count": …}
-              json(StatusCodes.NotImplemented, """{"error":"not implemented"}""")
-            },
-            delete {
-              // TODO: clearBestEffort or clearRolledUp → 204
-              json(StatusCodes.NotImplemented, """{"error":"not implemented"}""")
-            },
-          )
-        },
-      )
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("counters")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import counters.Tls // Tls.serverContext — provided
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-final case class AddRequest(delta: Option[Long], token: Option[String])
-
-object CounterApi {
-  /** Namespaces and their counter type (provided): configured per use case, never chosen per request. */
-  val Namespaces = Map("views" -> "best_effort", "plays" -> "eventually_consistent")
-  val NameRe = "^[A-Za-z0-9_-]{1,64}$".r
-  val MaxDelta = 1000000L
-
-  implicit val addFormat: RootJsonFormat[AddRequest] = jsonFormat2(AddRequest)
-
-  /** Built in later steps. */
-  def addBestEffort(ns: String, name: String, delta: Long): Long = BestEffort.addCount(ns, name, delta) // step 2
-  def getBestEffort(ns: String, name: String): Long = BestEffort.getCount(ns, name) // step 2
-  def clearBestEffort(ns: String, name: String): Unit = BestEffort.clearCount(ns, name) // step 2
-  def appendEvent(ns: String, name: String, delta: Long, token: String): Unit = CountEvents.appendEvent(ns, name, delta, token) // step 3: throws EventNotDurable
-  def getRolledUp(ns: String, name: String): Long = Rollup.getCount(ns, name) // step 4
-  def clearRolledUp(ns: String, name: String): Unit = Rollup.clearCount(ns, name) // step 4
-
-  private def json(status: StatusCode, body: String): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-
-  private def validDelta(delta: Option[Long]): Boolean =
-    delta.exists(d => d != 0 && d <= MaxDelta && d >= -MaxDelta)
-
-  val route: Route =
-    pathPrefix("counters" / Segment / Segment) { (ns, name) =>
-      Namespaces.get(ns) match {
-        case None => json(StatusCodes.NotFound, """{"error":"unknown namespace"}""")
-        case Some(_) if !NameRe.matches(name) => json(StatusCodes.BadRequest, """{"error":"name must match [A-Za-z0-9_-]{1,64}"}""")
-        case Some(kind) =>
-          concat(
-            path("add") {
-              post {
-                entity(as[AddRequest]) { req =>
-                  if (!validDelta(req.delta))
-                    json(StatusCodes.BadRequest, """{"error":"delta must be a non-zero integer within ±1000000"}""")
-                  else if (kind == "best_effort") {
-                    val count = addBestEffort(ns, name, req.delta.get)
-                    json(StatusCodes.OK, s"""{"count":$count}""")
-                  } else
-                    req.token.filter(_.nonEmpty) match {
-                      case None => json(StatusCodes.BadRequest, """{"error":"token is required: it is what makes a retry safe"}""")
-                      case Some(token) =>
-                        try {
-                          appendEvent(ns, name, req.delta.get, token)
-                          json(StatusCodes.Accepted, """{"accepted":true}""")
-                        } catch {
-                          case _: EventNotDurable =>
-                            json(StatusCodes.ServiceUnavailable, """{"error":"the event is not durable yet: retry with the same token"}""")
-                        }
-                    }
-                }
-              }
-            },
-            pathEnd {
-              concat(
-                get {
-                  val count = if (kind == "best_effort") getBestEffort(ns, name) else getRolledUp(ns, name)
-                  json(StatusCodes.OK, s"""{"count":$count}""")
-                },
-                delete {
-                  if (kind == "best_effort") clearBestEffort(ns, name) else clearRolledUp(ns, name)
-                  complete(StatusCodes.NoContent)
-                },
-              )
-            },
-          )
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("counters")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

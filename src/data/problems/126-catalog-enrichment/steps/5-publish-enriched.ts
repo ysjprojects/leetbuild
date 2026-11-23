@@ -57,7 +57,6 @@ visible only weeks later as a bad brand coming back.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/ENABLE_IDEMPOTENCE_CONFIG,\s*"true"/, /ACKS_CONFIG,\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -65,12 +64,11 @@ visible only weeks later as a bad brand coming back.
       id: 'outbox',
       title: 'A refused event goes to the outbox',
       detail:
-        "The delivery report (`on_delivery`, the send promise's rejection, the delivery channel, the `Callback`, `dr_cb`) writes a refused event to `store.insert_outbox(event, reason)` for the relay. The starter ignores the report, so the event is lost.",
+        "The delivery report (`on_delivery`, the send promise's rejection, the delivery channel, `dr_cb`) writes a refused event to `store.insert_outbox(event, reason)` for the relay. The starter ignores the report, so the event is lost.",
       match: {
         python: {all: [/store\.insert_outbox\(/, /on_delivery\s*=/], none: [/except KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
         go: {all: [/store\.InsertOutbox\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Store\.insertOutbox\(/, /Callback/]},
         cpp: {all: [/store::insert_outbox\(/, /dr_cb/]},
       },
     },
@@ -83,7 +81,6 @@ visible only weeks later as a bad brand coming back.
         python: {order: [/store\.apply_catalog\(/, /consumer\.commit\(/]},
         typescript: {order: [/applyCatalog\(/, /commitOffsets\(/]},
         go: {order: [/store\.ApplyCatalog\(/, /CommitMessage\(/]},
-        scala: {order: [/Store\.applyCatalog\(/, /commitSync\(/]},
         cpp: {order: [/store::apply_catalog\(/, /commitSync\(/]},
       },
     },
@@ -96,7 +93,6 @@ visible only weeks later as a bad brand coming back.
         python: {all: [/store\.index_upsert\(/]},
         typescript: {all: [/indexUpsert\(/]},
         go: {all: [/store\.IndexUpsert\(/]},
-        scala: {all: [/Store\.indexUpsert\(/]},
         cpp: {all: [/store::index_upsert\(/]},
       },
     },
@@ -109,7 +105,6 @@ visible only weeks later as a bad brand coming back.
         python: {all: [/store\.catalog_current\(/, /["']human["']/]},
         typescript: {all: [/catalogCurrent\(/, /'human'/]},
         go: {all: [/store\.CatalogCurrent\(/, /"human"/]},
-        scala: {all: [/Store\.catalogCurrent\(/, /"human"/]},
         cpp: {all: [/store::catalog_current\(/, /"human"/]},
       },
     },
@@ -416,115 +411,6 @@ func runIndexer(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-
-import scala.jdk.CollectionConverters._
-
-import enrich.Store // Store.applyCatalog, indexUpsert, catalogCurrent, insertOutbox
-
-object EnrichedEvents {
-  val Topic = "sku.enriched"
-  val Group = "catalog-index"
-
-  private val producer = {
-    val props = new Properties()
-    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** One sku.enriched event: {sku_id, merchant, attributes, attributes_version, taxonomy_version, source}. */
-  def publish(event: ujson.Value): Unit = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    producer.send(new ProducerRecord[String, String](Topic, event("merchant").str, ujson.write(event)))
-  }
-
-  def runIndexer(): Unit = {
-    val props = new Properties()
-    props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props.put(ConsumerConfig.GROUP_ID_CONFIG, Group)
-    props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-        Store.applyCatalog(ujson.read(record.value()))
-      }
-    }
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-
-import scala.jdk.CollectionConverters._
-
-import enrich.Store // Store.applyCatalog, indexUpsert, catalogCurrent, insertOutbox
-
-object EnrichedEvents {
-  val Topic = "sku.enriched"
-  val Group = "catalog-index"
-
-  private val producer = {
-    val props = new Properties()
-    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
-    props.put(ProducerConfig.ACKS_CONFIG, "all")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** One sku.enriched event: {sku_id, merchant, attributes, attributes_version, taxonomy_version, source}. */
-  def publish(event: ujson.Value): Unit = {
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) Store.insertOutbox(event, exception.getMessage) // the broker refused it: the relay produces it later
-    }
-    producer.send(new ProducerRecord[String, String](Topic, event("merchant").str, ujson.write(event)), onDelivery)
-  }
-
-  def shouldApply(current: Option[ujson.Obj], event: ujson.Value): Boolean = current match {
-    case None => true
-    case Some(now) =>
-      // a newer version only, and a reviewer's correction stands against the model
-      event("attributes_version").num > now("attributes_version").num && !(event("source").str == "model" && now("source").str == "human")
-  }
-
-  def runIndexer(): Unit = {
-    val props = new Properties()
-    props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props.put(ConsumerConfig.GROUP_ID_CONFIG, Group)
-    props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val event = ujson.read(record.value())
-        if (shouldApply(Store.catalogCurrent(event("sku_id").str), event)) {
-          Store.applyCatalog(event)
-          Store.indexUpsert(event)
-        }
-        // After the writes: a crash before this point redelivers.
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-      }
-    }
-  }
 }
 `,
     },

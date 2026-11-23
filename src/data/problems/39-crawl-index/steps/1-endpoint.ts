@@ -51,7 +51,6 @@ every client retry into a second copy in the frontier.
         python: {all: [/@app\.post\(\s*["']\/v1\/crawl\/targets["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/crawl\/targets['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/crawl\/targets"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"crawl"\s*\/\s*"targets"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/crawl\/targets"/]},
       },
     },
@@ -64,7 +63,6 @@ every client retry into a second copy in the frontier.
         python: {all: [/ALLOWED_SCHEMES/, /ALLOWED_HOSTS/, /status_code\s*=\s*400/]},
         typescript: {all: [/ALLOWED_SCHEMES/, /ALLOWED_HOSTS/, /code\(\s*400\s*\)/]},
         go: {all: [/allowedSchemes/, /allowedHosts/, /StatusBadRequest/]},
-        scala: {all: [/AllowedSchemes/, /AllowedHosts/, /BadRequest/]},
         cpp: {all: [/kAllowedSchemes/, /kAllowedHosts/, /\b400\b/]},
       },
     },
@@ -77,7 +75,6 @@ every client retry into a second copy in the frontier.
         python: {order: [/in ALLOWED_HOSTS/, /web\.fetch_robots\(/], none: [/fetch_page\(/]},
         typescript: {order: [/ALLOWED_HOSTS(\.(has|includes)\(|\[)/, /fetchRobots\(/], none: [/fetchPage\(/]},
         go: {order: [/allowedHosts\[/, /web\.FetchRobots\(/], none: [/FetchPage\(/]},
-        scala: {order: [/AllowedHosts(\.contains)?\(/, /Web\.fetchRobots\(/], none: [/fetchPage\(/]},
         cpp: {order: [/kAllowedHosts\.(count|find|contains)\(/, /web::fetchRobots\(/], none: [/fetchPage\(/]},
       },
     },
@@ -96,7 +93,6 @@ every client retry into a second copy in the frontier.
           order: [/fetchRobots\(/, /(?<![.\w])insert\(|registry\.insert\(/],
         },
         go: {all: [/StatusForbidden/, /disallowed by robots/], order: [/web\.FetchRobots\(/, /registry\.Insert\(/]},
-        scala: {all: [/Forbidden/, /disallowed by robots/], order: [/Web\.fetchRobots\(/, /Registry\.insert\(/]},
         cpp: {all: [/\b403\b/, /disallowed by robots/], order: [/web::fetchRobots\(/, /registry::insert\(/]},
       },
     },
@@ -109,7 +105,6 @@ every client retry into a second copy in the frontier.
         python: {order: [/registry\.find\(/, /registry\.insert\(/]},
         typescript: {order: [/(?<![.\w])find\(|registry\.find\(/, /(?<![.\w])insert\(|registry\.insert\(/]},
         go: {order: [/registry\.Find\(/, /registry\.Insert\(/]},
-        scala: {order: [/Registry\.find\(/, /Registry\.insert\(/]},
         cpp: {order: [/registry::find\(/, /registry::insert\(/]},
       },
     },
@@ -358,94 +353,6 @@ func registerTarget(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/crawl/targets", registerTarget)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import crawl.{Frontier, Registry, Web} // Web.splitUrl, fetchRobots, fetchPage; Registry.find, insert; Frontier.enqueue
-
-object Api {
-  private def accepted(targetId: String): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, JsObject("target_id" -> JsString(targetId), "status" -> JsString("accepted")).compactPrint))
-
-  private def text(raw: String, name: String): String =
-    raw.parseJson.asJsObject.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  val route: Route = path("v1" / "crawl" / "targets") {
-    post {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          entity(as[String]) { raw =>
-            val (jobId, url) = (text(raw, "job_id"), text(raw, "url"))
-            Web.splitUrl(url) match {
-              case None => complete(StatusCodes.BadRequest -> "not an absolute URL")
-              case Some(parts) =>
-                Web.fetchPage(url) // make sure the seed answers before it is queued
-                val target = Registry.insert(jobId, url, tenant)
-                Frontier.enqueue(jobId, parts.host, url)
-                complete(accepted(target.targetId))
-            }
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import crawl.{Frontier, Registry, Web} // Web.splitUrl, fetchRobots, fetchPage; Registry.find, insert; Frontier.enqueue
-
-object Api {
-  val AllowedSchemes: Set[String] = Set("http", "https")
-  val AllowedHosts: Set[String] = Set("blog.example.com", "docs.example.com", "example.com")
-
-  private def accepted(targetId: String): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, JsObject("target_id" -> JsString(targetId), "status" -> JsString("accepted")).compactPrint))
-
-  private def text(raw: String, name: String): String =
-    raw.parseJson.asJsObject.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  /** The first Disallow prefix the path falls under. */
-  private def robotsRule(path: String, rules: Seq[String]): Option[String] = rules.find(rule => rule.nonEmpty && path.startsWith(rule))
-
-  val route: Route = path("v1" / "crawl" / "targets") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          entity(as[String]) { raw =>
-            val (jobId, url) = (text(raw, "job_id"), text(raw, "url"))
-            // Everything the URL alone decides is decided before the service touches the network.
-            Web.splitUrl(url).filter(parts => AllowedSchemes.contains(parts.scheme)) match {
-              case None => complete(StatusCodes.BadRequest -> "only http and https URLs are crawled")
-              case Some(parts) if !AllowedHosts.contains(parts.host) => complete(StatusCodes.BadRequest -> s"host \${parts.host} is not on the allowlist")
-              case Some(parts) =>
-                Registry.find(jobId, url) match {
-                  case Some(existing) => complete(accepted(existing.targetId))
-                  case None =>
-                    robotsRule(parts.path, Web.fetchRobots(parts.host)) match {
-                      case Some(rule) => complete(StatusCodes.Forbidden -> s"disallowed by robots: $rule")
-                      case None =>
-                        val target = Registry.insert(jobId, url, tenant)
-                        Frontier.enqueue(jobId, parts.host, url)
-                        complete(accepted(target.targetId))
-                    }
-                }
-            }
-          }
-      }
-    }
-  }
 }
 `,
     },

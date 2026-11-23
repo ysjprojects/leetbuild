@@ -36,7 +36,7 @@ Implement \`publish_order(order)\`: one record on the **\`orders\`** topic per a
   },
   hints: [
     'Two producer settings and one key: `acks=all`, idempotence on, and `order.symbol` as the record key. The value is just the JSON of the order.',
-    'Waiting for the ack means blocking on the delivery result with a timeout: `flush(timeout)` after a delivery callback (librdkafka clients), `send(...).get(timeout)` (Java), or a synchronous `WriteMessages` under a context with a deadline (kafka-go).',
+    'Waiting for the ack means blocking on the delivery result with a timeout: `flush(timeout)` after a delivery callback (librdkafka clients) or a synchronous `WriteMessages` under a context with a deadline (kafka-go).',
     'Distinguish the three outcomes after the wait: acknowledged → return; error reported → raise with the broker’s reason; nothing reported within the timeout → raise too. The caller cannot tell the last two apart and should not have to.',
   ],
   checks: [
@@ -55,10 +55,6 @@ Implement \`publish_order(order)\`: one record on the **\`orders\`** topic per a
           none: [/key:\s*order\.order_id/],
         },
         go: {all: [/Key:\s*\[\]byte\(\s*order\.Symbol\s*\)/], none: [/Key:\s*\[\]byte\(\s*order\.OrderID\s*\)/]},
-        scala: {
-          all: [/new ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*order\.symbol\s*,/],
-          none: [/ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*order\.orderId/],
-        },
         cpp: {
           all: [
             /produce\(\s*kTopic\s*,[\s\S]{0,400}?order\.symbol\.(c_str|data)\(\)\s*,\s*order\.symbol\.(size|length)\(\)/,
@@ -76,7 +72,6 @@ Implement \`publish_order(order)\`: one record on the **\`orders\`** topic per a
         python: {all: [/"acks"\s*:\s*"all"/]},
         typescript: {all: [/acks:\s*(-1|['"]all['"])/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"acks"\s*,\s*"all"|ACKS_CONFIG\s*,\s*"all"/]},
         cpp: {all: [/"acks"\s*,\s*"all"/]},
       },
     },
@@ -89,7 +84,6 @@ Implement \`publish_order(order)\`: one record on the **\`orders\`** topic per a
         python: {all: [/"enable\.idempotence"\s*:\s*True/]},
         typescript: {all: [/idempotent:\s*true/]},
         go: {all: [/Headers:\s*\[\]kafka\.Header\{[\s\S]{0,200}?"order_id"/]},
-        scala: {all: [/"enable\.idempotence"\s*,\s*"true"|ENABLE_IDEMPOTENCE_CONFIG\s*,\s*"true"/]},
         cpp: {all: [/"enable\.idempotence"\s*,\s*"true"/]},
       },
     },
@@ -109,7 +103,6 @@ Implement \`publish_order(order)\`: one record on the **\`orders\`** topic per a
           all: [/context\.WithTimeout\(\s*ctx\s*,\s*ackTimeout\s*\)/, /err\s*:?=\s*writer\.WriteMessages\(/],
           none: [/Async:\s*true/],
         },
-        scala: {all: [/producer\.send\([^\n]*\)\s*\.get\(\s*AckTimeoutMillis\s*,\s*(TimeUnit\.)?MILLISECONDS\s*\)/]},
         cpp: {all: [/void publish_order(?:(?!\n\})[\s\S])*?producer->flush\(\s*kAckTimeoutMs\s*\)/]},
       },
     },
@@ -122,7 +115,6 @@ Implement \`publish_order(order)\`: one record on the **\`orders\`** topic per a
         python: {all: [/raise PublishFailed\(/]},
         typescript: {all: [/throw new PublishFailed\(/]},
         go: {order: [/writer\.WriteMessages\(/, /return\s+(fmt\.Errorf\([^\n]*%w|err\b)/]},
-        scala: {all: [/throw new PublishFailed\(/]},
         cpp: {all: [/throw PublishFailed\(/]},
       },
     },
@@ -321,72 +313,6 @@ func publishOrder(ctx context.Context, order Order) error {
 		return fmt.Errorf("order %s not acknowledged: %w", order.OrderID, err)
 	}
 	return nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-import java.util.concurrent.{ExecutionException, TimeUnit, TimeoutException}
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import OrderGateway.{Order, PublishFailed}
-
-object OrderPublisher {
-  val Topic = "orders"
-  val AckTimeoutMillis = 2000L
-
-  implicit val orderFormat: RootJsonFormat[Order] = jsonFormat6(Order)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  props.put("linger.ms", "0")
-  // TODO: acks=all and enable.idempotence: an accepted order is never lost or duplicated
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  def publishOrder(order: Order): Unit = {
-    val value = order.toJson.compactPrint
-    // TODO: send a record keyed by order.symbol (not orderId: one partition per symbol keeps its orders in sequence)
-    // TODO: block on the future with AckTimeoutMillis; ExecutionException or TimeoutException → throw PublishFailed
-    val _ = (value, TimeUnit.MILLISECONDS, classOf[ExecutionException], classOf[TimeoutException])
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.{ExecutionException, TimeUnit, TimeoutException}
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import OrderGateway.{Order, PublishFailed}
-
-object OrderPublisher {
-  val Topic = "orders"
-  val AckTimeoutMillis = 2000L
-
-  implicit val orderFormat: RootJsonFormat[Order] = jsonFormat6(Order)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  props.put("enable.idempotence", "true")
-  props.put("linger.ms", "0")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  def publishOrder(order: Order): Unit = {
-    val record = new ProducerRecord[String, String](Topic, order.symbol, order.toJson.compactPrint)
-    try producer.send(record).get(AckTimeoutMillis, TimeUnit.MILLISECONDS) // blocks until every in-sync replica has it
-    catch {
-      case e @ (_: ExecutionException | _: TimeoutException) =>
-        throw new PublishFailed(s"order \${order.orderId} not acknowledged: \${e.getMessage}")
-    }
-  }
 }
 `,
     },

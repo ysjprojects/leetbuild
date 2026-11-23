@@ -51,7 +51,6 @@ purge twice.
         python: {all: [/@app\.post\(\s*["']\/v1\/purges["']/, /records\.create\(/, /status_code=202/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/purges['"]/, /\bcreate\(/, /code\(202\)/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/purges"/, /records\.Create\(/, /StatusAccepted/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"purges"\s*\)/, /Records\.create\(/, /StatusCodes\.Accepted/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/purges"/, /records::create\(/, /\b202\b/]},
       },
     },
@@ -64,7 +63,6 @@ purge twice.
         python: {all: [/status_code=403/], order: [/records\.owns_domain\(/, /records\.create\(/]},
         typescript: {all: [/code\(403\)/], order: [/\bownsDomain\(/, /\bcreate\(/]},
         go: {all: [/StatusForbidden/], order: [/records\.OwnsDomain\(/, /records\.Create\(/]},
-        scala: {all: [/StatusCodes\.Forbidden/], order: [/Records\.ownsDomain\(/, /Records\.create\(/]},
         cpp: {all: [/\b403\b/], order: [/records::ownsDomain\(/, /records::create\(/]},
       },
     },
@@ -77,7 +75,6 @@ purge twice.
         python: {all: [/MAX_PATHS\s*=\s*500/, /startswith\(\s*["']\/["']\s*\)/]},
         typescript: {all: [/MAX_PATHS\s*=\s*500/, /startsWith\(\s*['"]\/['"]\s*\)/]},
         go: {all: [/maxPaths\s*=\s*500/, /strings\.HasPrefix\([^)]*"\/"\s*\)/]},
-        scala: {all: [/MaxPaths\s*=\s*500/, /startsWith\(\s*"\/"\s*\)/]},
         cpp: {
           all: [/kMaxPaths\s*=\s*500/, /starts_with\(\s*"\/"\s*\)|rfind\(\s*"\/"\s*,\s*0\s*\)|\[0\]\s*[!=]=\s*'\/'/],
         },
@@ -104,7 +101,6 @@ purge twice.
           ],
         },
         go: {all: [/wildcardScope\s*=\s*"purge:wildcard"/, /domainScope\s*=\s*"purge:domain"/, /X-Purge-Scope/i]},
-        scala: {all: [/WildcardScope\s*=\s*"purge:wildcard"/, /DomainScope\s*=\s*"purge:domain"/, /X-Purge-Scope/i]},
         cpp: {all: [/kWildcardScope\s*=\s*"purge:wildcard"/, /kDomainScope\s*=\s*"purge:domain"/, /X-Purge-Scope/i]},
       },
     },
@@ -125,10 +121,6 @@ purge twice.
         go: {
           all: [/Idempotency-Key/i, /records\.RememberKey\(/, /StatusBadRequest/],
           order: [/records\.PurgeForKey\(/, /records\.Create\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Records\.rememberKey\(/, /StatusCodes\.BadRequest/],
-          order: [/Records\.purgeForKey\(/, /Records\.create\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /records::rememberKey\(/, /\b400\b/],
@@ -446,110 +438,6 @@ func createPurge(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/purges", createPurge)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import purge.Records // Records.ownsDomain, create, get, purgeForKey, rememberKey
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def accepted(p: Records.Purge): JsObject = JsObject(
-    "purge_id" -> JsString(p.purgeId),
-    "status" -> JsString("accepted"),
-    "domain" -> JsString(p.domain),
-    "paths" -> JsArray(p.paths.map(JsString(_)).toVector)
-  )
-
-  def createPurge(tenant: String, raw: String): HttpResponse = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    if (tenant.isEmpty) return error(StatusCodes.Unauthorized, "X-Tenant-Id is required")
-    val body = raw.parseJson.asJsObject
-    val domain = body.fields.get("domain").collect { case JsString(s) => s }.getOrElse("")
-    val paths = body.fields.get("paths").collect { case JsArray(items) => items.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
-    json(StatusCodes.Accepted, accepted(Records.create(tenant, domain, paths)))
-  }
-
-  val route: Route = path("v1" / "purges") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        entity(as[String]) { raw => complete(createPurge(tenant.getOrElse(""), raw)) }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import purge.Records // Records.ownsDomain, create, get, purgeForKey, rememberKey
-
-object Api {
-  val MaxPaths = 500
-  val WildcardScope = "purge:wildcard"
-  val DomainScope = "purge:domain"
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def accepted(p: Records.Purge): JsObject = JsObject(
-    "purge_id" -> JsString(p.purgeId),
-    "status" -> JsString("accepted"),
-    "domain" -> JsString(p.domain),
-    "paths" -> JsArray(p.paths.map(JsString(_)).toVector)
-  )
-
-  /** The scope the request's patterns need: the whole domain, a wildcard, or none for literal paths. */
-  def requiredScope(paths: Seq[String]): Option[String] =
-    if (paths.contains("/*")) Some(DomainScope)
-    else if (paths.exists(_.contains("*"))) Some(WildcardScope)
-    else None
-
-  def createPurge(tenant: String, key: String, scopes: String, raw: String): HttpResponse = {
-    if (tenant.isEmpty) return error(StatusCodes.Unauthorized, "X-Tenant-Id is required")
-    if (key.isEmpty) return error(StatusCodes.BadRequest, "Idempotency-Key is required")
-    val body = raw.parseJson.asJsObject
-    val domain = body.fields.get("domain").collect { case JsString(s) => s }.getOrElse("")
-    val requested = body.fields.get("paths").collect { case JsArray(items) => items.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
-    if (!Records.ownsDomain(tenant, domain)) return error(StatusCodes.Forbidden, s"$domain is not one of your domains")
-    if (requested.isEmpty || requested.size > MaxPaths) return error(StatusCodes.BadRequest, s"a purge carries 1 to $MaxPaths paths")
-    if (requested.exists(path => !path.startsWith("/"))) return error(StatusCodes.BadRequest, "every path starts with /")
-    val paths = requested.distinct // duplicates collapse, first occurrence kept
-    val granted = scopes.split(",").map(_.trim).toSet
-    requiredScope(paths).filterNot(granted.contains) match {
-      case Some(scope) => error(StatusCodes.Forbidden, s"these patterns need the $scope scope")
-      case None =>
-        Records.purgeForKey(tenant, key).flatMap(Records.get) match {
-          case Some(recorded) => json(StatusCodes.Accepted, accepted(recorded)) // a replay answers the first purge
-          case None =>
-            val created = Records.create(tenant, domain, paths)
-            Records.rememberKey(tenant, key, created.purgeId)
-            json(StatusCodes.Accepted, accepted(created))
-        }
-    }
-  }
-
-  val route: Route = path("v1" / "purges") {
-    post {
-      (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("Idempotency-Key") & optionalHeaderValueByName("X-Purge-Scope")) {
-        (tenant, key, scopes) =>
-          entity(as[String]) { raw => complete(createPurge(tenant.getOrElse(""), key.getOrElse(""), scopes.getOrElse(""), raw)) }
-      }
-    }
-  }
 }
 `,
     },

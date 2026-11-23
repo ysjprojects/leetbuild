@@ -56,7 +56,6 @@ Requirements:
         python: {all: [/@app\.post\(\s*["']\/v1\/answer["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/answer['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/answer"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"answer"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/answer"/]},
       },
     },
@@ -69,7 +68,6 @@ Requirements:
         python: {all: [/system\s*=\s*SYSTEM_PROMPT\s*[,)]/], none: [/SYSTEM_PROMPT\s*\+/]},
         typescript: {all: [/system:\s*SYSTEM_PROMPT\s*[,}]/], none: [/SYSTEM_PROMPT\s*\+/]},
         go: {all: [/System:\s*config\.SystemPrompt\s*[,}]/], none: [/config\.SystemPrompt\s*\+/]},
-        scala: {all: [/system\s*=\s*Config\.SystemPrompt\s*[,)]/], none: [/Config\.SystemPrompt\s*\+/]},
         cpp: {all: [/set_system\(\s*config::kSystemPrompt\s*\)/], none: [/kSystemPrompt\)?\s*\+/]},
       },
     },
@@ -82,7 +80,6 @@ Requirements:
         python: {all: [/\bREFUSAL\b/]},
         typescript: {all: [/\bREFUSAL\b/]},
         go: {all: [/config\.Refusal\b/]},
-        scala: {all: [/Config\.Refusal\b/]},
         cpp: {all: [/config::kRefusal\b/]},
       },
     },
@@ -95,7 +92,6 @@ Requirements:
         python: {all: [/\.find\(\s*\w+\.quote\s*\)/]},
         typescript: {all: [/\.indexOf\(\s*\w+\.quote\s*\)/]},
         go: {all: [/strings\.Index\(\s*\w+\.Text\s*,/]},
-        scala: {all: [/\.indexOf\(\s*\w+\.quote\s*\)/]},
         cpp: {all: [/\.find\(\s*\w+\.quote\(\)\s*\)/]},
       },
     },
@@ -108,7 +104,6 @@ Requirements:
         python: {all: [/\bMAX_CONTEXT_TOKENS\b/, /approx_tokens\(/]},
         typescript: {all: [/\bMAX_CONTEXT_TOKENS\b/, /approxTokens\(/]},
         go: {all: [/\bmaxContextTokens\b/, /config\.ApproxTokens\(/]},
-        scala: {all: [/\bMaxContextTokens\b/, /Config\.approxTokens\(/]},
         cpp: {all: [/\bkMaxContextTokens\b/, /config::approx_tokens\(/]},
       },
     },
@@ -580,161 +575,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import rag.Config
-import rag.rag.{GenerateRequest, LlmGrpc, Passage}
-
-final case class AnswerRequest(query: String, k: Option[Int])
-
-object AnswerApi {
-  implicit val system: ActorSystem = ActorSystem("ragd-answer")
-  implicit val requestFormat: RootJsonFormat[AnswerRequest] = jsonFormat2(AnswerRequest)
-
-  val LlmDeadlineMs = 10000L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Llm).usePlaintext().build()
-  private val stub = LlmGrpc.blockingStub(channel)
-
-  def reply(status: StatusCode, body: ujson.Value): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body))))
-
-  def answer(tenant: String, body: AnswerRequest): Route = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val hits = Retriever.retrieve(tenant, body.query, body.k.getOrElse(5))
-    val notes = Config.SystemPrompt + "\\n\\nReference notes:\\n" + hits.map(_.text).mkString("\\n\\n")
-    try {
-      val out = stub
-        .withDeadlineAfter(LlmDeadlineMs, TimeUnit.MILLISECONDS)
-        .generate(GenerateRequest(system = notes, passages = hits.map(h => Passage(chunkId = h.chunk_id, text = h.text)), question = body.query))
-      val citations = ujson.Arr.from(out.citations.map(c => ujson.Obj("chunk_id" -> c.chunkId, "quote" -> c.quote)))
-      reply(StatusCodes.OK, ujson.Obj("answer" -> out.answer, "citations" -> citations))
-    } catch {
-      case e: StatusRuntimeException =>
-        system.log.warning(s"answer model failed tenant=$tenant code=\${e.getStatus.getCode}")
-        reply(StatusCodes.ServiceUnavailable, ujson.Obj("error" -> "model unavailable"))
-    }
-  }
-
-  val route: Route =
-    path("v1" / "answer") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[AnswerRequest]) { body =>
-            if (!tenantOpt.exists(_.nonEmpty)) reply(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing X-Tenant-Id"))
-            else answer(tenantOpt.get, body)
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import scala.collection.mutable.ListBuffer
-
-import rag.{Config, Hit}
-import rag.rag.{GenerateRequest, LlmGrpc, Passage}
-
-final case class AnswerRequest(query: String, k: Option[Int])
-
-object AnswerApi {
-  implicit val system: ActorSystem = ActorSystem("ragd-answer")
-  implicit val requestFormat: RootJsonFormat[AnswerRequest] = jsonFormat2(AnswerRequest)
-
-  val MaxContextTokens = 3000
-  val LlmDeadlineMs = 10000L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Llm).usePlaintext().build()
-  private val stub = LlmGrpc.blockingStub(channel)
-
-  def reply(status: StatusCode, body: ujson.Value): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body))))
-
-  def refusal: Route = reply(StatusCodes.OK, ujson.Obj("answer" -> Config.Refusal, "citations" -> ujson.Arr()))
-
-  def answer(tenant: String, body: AnswerRequest): Route = {
-    val passages = ListBuffer.empty[Hit]
-    var used = 0
-    val hits = Retriever.retrieve(tenant, body.query, body.k.getOrElse(5)).iterator
-    var full = false
-    while (hits.hasNext && !full) {
-      val hit = hits.next()
-      val cost = Config.approxTokens(hit.text)
-      if (used + cost > MaxContextTokens) full = true
-      else {
-        passages += hit
-        used += cost
-      }
-    }
-    if (passages.isEmpty) return refusal
-
-    try {
-      val out = stub
-        .withDeadlineAfter(LlmDeadlineMs, TimeUnit.MILLISECONDS)
-        .generate(GenerateRequest(system = Config.SystemPrompt, passages = passages.toSeq.map(h => Passage(chunkId = h.chunk_id, text = h.text)), question = body.query))
-      val citations = out.citations.flatMap { cited =>
-        passages.find(_.chunk_id == cited.chunkId).filter(_ => cited.quote.nonEmpty).flatMap { hit =>
-          val at = hit.text.indexOf(cited.quote)
-          if (at < 0) None
-          else {
-            val start = hit.start + at
-            Some(ujson.Obj("chunk_id" -> cited.chunkId, "doc_id" -> hit.doc_id, "quote" -> cited.quote, "start" -> start, "end" -> (start + cited.quote.length)))
-          }
-        }
-      }
-      if (citations.isEmpty) refusal
-      else reply(StatusCodes.OK, ujson.Obj("answer" -> out.answer, "citations" -> ujson.Arr.from(citations)))
-    } catch {
-      case e: StatusRuntimeException =>
-        system.log.warning(s"answer model failed tenant=$tenant code=\${e.getStatus.getCode}")
-        reply(StatusCodes.ServiceUnavailable, ujson.Obj("error" -> "model unavailable"))
-    }
-  }
-
-  val route: Route =
-    path("v1" / "answer") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[AnswerRequest]) { body =>
-            if (!tenantOpt.exists(_.nonEmpty)) reply(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing X-Tenant-Id"))
-            else answer(tenantOpt.get, body)
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

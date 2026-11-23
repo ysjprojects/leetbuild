@@ -3,10 +3,9 @@
  * package's task store. Redis holds every record labeld keeps: the task hash, its items, the pool
  * step 2 claims from, the content hashes step 1 deduplicates against, the recorded answer of a
  * create, the submitted labels step 4 writes and step 5 reads, the outbox and the annotators
- * quality review flagged. The five languages keep the same keys, so a harness reads one layout
+ * quality review flagged. The four languages keep the same keys, so a harness reads one layout
  * whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'labeling/__init__.py': '',
@@ -458,97 +457,5 @@ inline std::set<std::string> flagged(const std::string& task_id) {
 }
 
 }  // namespace store
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('labeling', 'Store')]: `package labeling
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The task store (provided). task:{id} is a task's hash (task_id, tenant, spec_version, overlap,
- * total_items); items:{id} maps its item ids (i-1, i-2, ...) to their text; pool:{id} is the sorted
- * set of items waiting for an annotator (score: queue order), the pool step 2 claims from.
- * spec:{version}:hashes holds the content hashes queued under a spec version,
- * task:create:{tenant}:{key} the recorded answer of a create. labels:{id} lists the submitted labels
- * as JSON, oldest first; outbox lists the events the broker did not take; flagged:{id} is the set of
- * annotators quality review excluded from a task.
- */
-object Store {
-  final case class Task(taskId: String, tenant: String, specVersion: String, overlap: Int, totalItems: Int)
-
-  /** One annotator's answer for one item. */
-  final case class Label(labelId: String, taskId: String, itemId: String, annotator: String, specVersion: String, value: String) {
-    def toJson: JsObject = JsObject(
-      "label_id" -> JsString(labelId),
-      "task_id" -> JsString(taskId),
-      "item_id" -> JsString(itemId),
-      "annotator" -> JsString(annotator),
-      "spec_version" -> JsString(specVersion),
-      "value" -> JsString(value)
-    )
-  }
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def labelFrom(raw: String): Label = {
-    val f = raw.parseJson.asJsObject.fields
-    def text(name: String): String = f.get(name).collect { case JsString(s) => s }.getOrElse("")
-    Label(text("label_id"), text("task_id"), text("item_id"), text("annotator"), text("spec_version"), text("value"))
-  }
-
-  /** The task, if it exists. */
-  def getTask(taskId: String): Option[Task] = {
-    val raw = jedis.hgetAll(s"task:$taskId").asScala.toMap
-    if (raw.isEmpty) None
-    else Some(Task(raw("task_id"), raw("tenant"), raw("spec_version"), raw("overlap").toInt, raw("total_items").toInt))
-  }
-
-  /** A new task over items (ids i-1, i-2, ... in order), every item queued in the pool; returns the task. */
-  def createTask(tenant: String, specVersion: String, overlap: Int, items: Seq[String]): Task = {
-    val taskId = s"t-\${jedis.incr("task:seq")}"
-    jedis.hset(
-      s"task:$taskId",
-      Map("task_id" -> taskId, "tenant" -> tenant, "spec_version" -> specVersion, "overlap" -> overlap.toString, "total_items" -> items.size.toString).asJava
-    )
-    items.zipWithIndex.foreach { case (text, n) =>
-      jedis.hset(s"items:$taskId", s"i-\${n + 1}", text)
-      jedis.zadd(s"pool:$taskId", (n + 1).toDouble, s"i-\${n + 1}")
-    }
-    getTask(taskId).get
-  }
-
-  /** The content hashes already queued under specVersion. */
-  def seenHashes(specVersion: String): Set[String] = jedis.smembers(s"spec:$specVersion:hashes").asScala.toSet
-
-  /** Register content hashes as queued under specVersion. */
-  def addHashes(specVersion: String, hashes: Seq[String]): Unit =
-    if (hashes.nonEmpty) jedis.sadd(s"spec:$specVersion:hashes", hashes: _*)
-
-  /** The answer recorded for the create (tenant, Idempotency-Key), if any. */
-  def createResult(tenant: String, key: String): Option[JsObject] =
-    Option(jedis.get(s"task:create:$tenant:$key")).map(_.parseJson.asJsObject)
-
-  /** Record what the create (tenant, Idempotency-Key) answered, for its replays. */
-  def recordCreate(tenant: String, key: String, result: JsObject): Unit =
-    jedis.set(s"task:create:$tenant:$key", result.compactPrint)
-
-  /** Persist a submitted label. */
-  def saveLabel(label: Label): Unit = jedis.rpush(s"labels:\${label.taskId}", label.toJson.compactPrint)
-
-  /** The task's submitted labels, oldest first. */
-  def labelsOf(taskId: String): Seq[Label] = jedis.lrange(s"labels:$taskId", 0, -1).asScala.toSeq.map(labelFrom)
-
-  /** Keep an event the broker did not take; the relay produces it later. */
-  def insertOutbox(topic: String, key: String, payload: JsObject): Unit =
-    jedis.rpush("outbox", JsObject("topic" -> JsString(topic), "key" -> JsString(key), "payload" -> payload).compactPrint)
-
-  /** The annotators quality review excluded from the task. */
-  def flagged(taskId: String): Set[String] = jedis.smembers(s"flagged:$taskId").asScala.toSet
-}
 `,
 };

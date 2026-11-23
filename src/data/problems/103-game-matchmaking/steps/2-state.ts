@@ -54,7 +54,6 @@ cancel that lands while a matchmaker claims the ticket leaves a match waiting fo
         python: {all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]ZREM['"]/], none: [/\br\.(zrem|hset)\(/]},
         typescript: {all: [/\.eval\(|defineCommand\(/, /redis\.call\(\s*['"]ZREM['"]/], none: [/redis\.(zrem|hset)\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]ZREM['"]/], none: [/rdb\.(ZRem|HSet)\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]ZREM['"]/], none: [/jedis\.(zrem|hset)\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]ZREM['"]/], none: [/redis\.(zrem|hset)\(/]},
       },
     },
@@ -71,7 +70,6 @@ cancel that lands while a matchmaker claims the ticket leaves a match waiting fo
           order: [/redis\.call\(\s*['"]HGET['"][^\n]*['"]state['"]/, /return 0/, /redis\.call\(\s*['"]ZREM['"]/],
         },
         go: {order: [/redis\.call\(\s*['"]HGET['"][^\n]*['"]state['"]/, /return 0/, /redis\.call\(\s*['"]ZREM['"]/]},
-        scala: {order: [/redis\.call\(\s*['"]HGET['"][^\n]*['"]state['"]/, /return 0/, /redis\.call\(\s*['"]ZREM['"]/]},
         cpp: {order: [/redis\.call\(\s*['"]HGET['"][^\n]*['"]state['"]/, /return 0/, /redis\.call\(\s*['"]ZREM['"]/]},
       },
     },
@@ -84,7 +82,6 @@ cancel that lands while a matchmaker claims the ticket leaves a match waiting fo
         python: {all: [/redis\.call\(\s*['"]HINCRBY['"]/], none: [/\.hincrby\([^)\n]*,\s*-1\s*\)/]},
         typescript: {all: [/redis\.call\(\s*['"]HINCRBY['"]/], none: [/\.hincrby\([^)\n]*,\s*-1\s*\)/]},
         go: {all: [/redis\.call\(\s*['"]HINCRBY['"]/], none: [/\.HIncrBy\([^)\n]*,\s*-1\s*\)/]},
-        scala: {all: [/redis\.call\(\s*['"]HINCRBY['"]/], none: [/\.hincrBy\([^)\n]*,\s*-1L?\s*\)/]},
         cpp: {all: [/redis\.call\(\s*['"]HINCRBY['"]/], none: [/\.hincrby\([^)\n]*,\s*-1\s*\)/]},
       },
     },
@@ -97,7 +94,6 @@ cancel that lands while a matchmaker claims the ticket leaves a match waiting fo
         python: {all: [/\[["']participants["']\]/, /register_script\(|\.eval\(/], none: [/\br\.delete\(/]},
         typescript: {all: [/\.participants\b/, /\.eval\(|defineCommand\(/], none: [/redis\.del\(/]},
         go: {all: [/\.Participants\b/, /redis\.NewScript\(|\.Eval\(/], none: [/rdb\.Del\(/]},
-        scala: {all: [/\.participants\b/, /jedis\.eval(sha)?\(/], none: [/jedis\.del\(/]},
         cpp: {all: [/->participants|\.participants\b/, /redis\.eval(sha)?[<(]/], none: [/redis\.del\(/]},
       },
     },
@@ -358,93 +354,6 @@ func cancelTicket(ctx context.Context, ticketID string) (bool, error) {
 	}
 	n, err := cancelScript.Run(ctx, rdb, keys, ticketID, strconv.Itoa(t.Bucket)).Int64()
 	return n == 1, err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import matchmaking.Store // Store.getTicket, ticketKey, poolKey, openKey, DepthKey
-
-object Pool {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Claim every ticket of the roster for matchId; false when one of them is no longer waiting. */
-  def claimTickets(matchId: String, bucket: Long, ticketIds: Seq[String]): Boolean = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val refused = ticketIds.exists { ticketId =>
-      if (jedis.hget(Store.ticketKey(ticketId), "state") != "waiting") true
-      else {
-        jedis.zrem(Store.poolKey(bucket), ticketId)
-        jedis.hset(Store.ticketKey(ticketId), Map("state" -> "claimed", "match_id" -> matchId).asJava)
-        false
-      }
-    }
-    if (!refused) jedis.hincrBy(Store.DepthKey, bucket.toString, -1L)
-    !refused
-  }
-
-  /** The players leave the queue; false when the ticket is unknown or already in a match. */
-  def cancelTicket(ticketId: String): Boolean = Store.getTicket(ticketId) match {
-    case None => false
-    case Some(ticket) =>
-      jedis.del(Store.ticketKey(ticketId), Store.openKey(ticket.owner))
-      true
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import matchmaking.Store // Store.getTicket, ticketKey, poolKey, openKey, DepthKey
-
-object Pool {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /**
-   * KEYS: pool:{bucket}, pool:depth, ticket:{id}…; ARGV: match id, bucket.
-   * Every ticket is checked before the first write: a refused claim touches nothing.
-   */
-  val ClaimLua: String =
-    """for i = 3, #KEYS do
-      |  if redis.call('HGET', KEYS[i], 'state') ~= 'waiting' then return 0 end
-      |end
-      |for i = 3, #KEYS do
-      |  redis.call('ZREM', KEYS[1], redis.call('HGET', KEYS[i], 'ticket_id'))
-      |  redis.call('HSET', KEYS[i], 'state', 'claimed', 'match_id', ARGV[1])
-      |end
-      |redis.call('HINCRBY', KEYS[2], ARGV[2], -(#KEYS - 2))
-      |return 1
-      |""".stripMargin
-
-  /** KEYS: ticket:{id}, pool:{bucket}, pool:depth, open:{player}…; ARGV: ticket id, bucket. */
-  val CancelLua: String =
-    """if redis.call('HGET', KEYS[1], 'state') ~= 'waiting' then return 0 end
-      |redis.call('ZREM', KEYS[2], ARGV[1])
-      |redis.call('HINCRBY', KEYS[3], ARGV[2], -1)
-      |for i = 4, #KEYS do
-      |  if redis.call('GET', KEYS[i]) == ARGV[1] then redis.call('DEL', KEYS[i]) end
-      |end
-      |redis.call('DEL', KEYS[1])
-      |return 1
-      |""".stripMargin
-
-  /** Claim every ticket of the roster for matchId; false, touching nothing, when one is not waiting. */
-  def claimTickets(matchId: String, bucket: Long, ticketIds: Seq[String]): Boolean = {
-    val keys = Seq(Store.poolKey(bucket), Store.DepthKey) ++ ticketIds.map(Store.ticketKey)
-    jedis.eval(ClaimLua, keys.asJava, Seq(matchId, bucket.toString).asJava).asInstanceOf[java.lang.Long] == 1L
-  }
-
-  /** The players leave the queue; false when the ticket is unknown or already in a match. */
-  def cancelTicket(ticketId: String): Boolean = Store.getTicket(ticketId) match {
-    case None => false
-    case Some(ticket) =>
-      val keys = Seq(Store.ticketKey(ticketId), Store.poolKey(ticket.bucket), Store.DepthKey) ++ ticket.participants.map(Store.openKey)
-      jedis.eval(CancelLua, keys.asJava, Seq(ticketId, ticket.bucket.toString).asJava).asInstanceOf[java.lang.Long] == 1L
-  }
 }
 `,
     },

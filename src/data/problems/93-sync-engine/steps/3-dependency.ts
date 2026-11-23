@@ -48,7 +48,6 @@ laptop's edit is written over the phone's while both users are told the document
         python: {all: [/timeout\s*=\s*MERGE_DEADLINE_S/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*MERGE_DEADLINE_MS/]},
         go: {all: [/context\.WithTimeout\([^)]*mergeDeadline/]},
-        scala: {all: [/withDeadlineAfter\(\s*MergeDeadlineMs/]},
         cpp: {all: [/set_deadline\([^;]*kMergeDeadline/]},
       },
     },
@@ -61,7 +60,6 @@ laptop's edit is written over the phone's while both users are told the document
         python: {all: [/MAX_MERGE_ATTEMPTS/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
         typescript: {all: [/MAX_MERGE_ATTEMPTS/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
         go: {all: [/maxMergeAttempts/, /codes\.Unavailable/, /codes\.DeadlineExceeded/]},
-        scala: {all: [/MaxMergeAttempts/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
         cpp: {all: [/kMaxMergeAttempts/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
       },
     },
@@ -74,7 +72,6 @@ laptop's edit is written over the phone's while both users are told the document
         python: {all: [/\.code\(\)/], none: [/time\.sleep\(/]},
         typescript: {all: [/ServiceError/], none: [/setTimeout\(/]},
         go: {all: [/status\.Code\(/], none: [/time\.Sleep\(/]},
-        scala: {all: [/getStatus\.getCode/], none: [/Thread\.sleep\(/]},
         cpp: {all: [/error_code\(\)/], none: [/sleep_for\(/]},
       },
     },
@@ -87,7 +84,6 @@ laptop's edit is written over the phone's while both users are told the document
         python: {all: [/store\.mark_conflicted\(/], none: [/store\.content_hash\(body\)/]},
         typescript: {all: [/markConflicted\(/], none: [/contentHash\(body\)/]},
         go: {all: [/store\.MarkConflicted\(/], none: [/store\.ContentHash\(body\)/]},
-        scala: {all: [/Store\.markConflicted\(/], none: [/Store\.contentHash\(body\)/]},
         cpp: {all: [/store::markConflicted\(/], none: [/store::contentHash\(body\)/]},
       },
     },
@@ -370,80 +366,6 @@ func resolveConflict(ctx context.Context, docID string, baseRevision int64, body
 		return store.Outcome{Status: "conflicted", Revision: outcome.Revision}, nil
 	}
 	return store.Outcome{Status: "merged", Revision: outcome.Revision}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import docsync.{Revisions, Store} // Store.head, bodyAt, contentHash, markConflicted, Outcome; Revisions.applyChange
-import syncd.sync_engine.{MergeRequest, MergerGrpc}
-
-object Client {
-  private val merger = MergerGrpc.blockingStub(ManagedChannelBuilder.forAddress("merger", 9000).usePlaintext().build())
-
-  /** Merge the device's edit of baseRevision into the head. */
-  def resolveConflict(docId: String, baseRevision: Long, body: String, device: String): Store.Outcome = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val head = Store.head(docId).getOrElse(throw new NoSuchElementException(s"no document $docId"))
-    val request = MergeRequest(docId = docId, baseRevision = baseRevision, base = Store.bodyAt(docId, baseRevision).getOrElse(""), local = body, remote = head.body)
-    var attempt = 0
-    var outcome: Option[Store.Outcome] = None
-    while (attempt < 5 && outcome.isEmpty) {
-      try {
-        val merged = merger.threeWayMerge(request).body
-        outcome = Some(Store.Outcome("merged", Revisions.applyChange(docId, head.revision, Store.contentHash(merged), merged, device).revision))
-      } catch {
-        case _: StatusRuntimeException =>
-          Thread.sleep(1000) // the merger is busy: give it a moment
-          attempt += 1
-      }
-    }
-    outcome.getOrElse {
-      // The merger is down: the device's edit is the newest, keep it.
-      Store.Outcome("merged", Revisions.applyChange(docId, head.revision, Store.contentHash(body), body, device).revision)
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import docsync.{Revisions, Store} // Store.head, bodyAt, contentHash, markConflicted, Outcome; Revisions.applyChange
-import syncd.sync_engine.{MergeRequest, MergerGrpc}
-
-object Client {
-  val MergeDeadlineMs = 2000L
-  val MaxMergeAttempts = 2
-  private val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val merger = MergerGrpc.blockingStub(ManagedChannelBuilder.forAddress("merger", 9000).usePlaintext().build())
-
-  /** Merge the device's edit of baseRevision into the head. */
-  def resolveConflict(docId: String, baseRevision: Long, body: String, device: String): Store.Outcome = {
-    val head = Store.head(docId).getOrElse(throw new NoSuchElementException(s"no document $docId"))
-    val request = MergeRequest(docId = docId, baseRevision = baseRevision, base = Store.bodyAt(docId, baseRevision).getOrElse(""), local = body, remote = head.body)
-    def attempt(n: Int): Option[String] =
-      try Some(merger.withDeadlineAfter(MergeDeadlineMs, TimeUnit.MILLISECONDS).threeWayMerge(request).body)
-      catch {
-        // Only a merger that did not answer may answer differently next time; a refusal is final.
-        case e: StatusRuntimeException if Retryable(e.getStatus.getCode) && n < MaxMergeAttempts => attempt(n + 1)
-        case _: StatusRuntimeException => None
-      }
-    attempt(1) match {
-      case None =>
-        Store.markConflicted(docId, device, baseRevision, body)
-        Store.Outcome("conflicted", head.revision)
-      case Some(merged) =>
-        val outcome = Revisions.applyChange(docId, head.revision, Store.contentHash(merged), merged, device)
-        if (outcome.status == "conflict") {
-          // The head moved while the merge ran: keep the edit rather than merge against a stale remote.
-          Store.markConflicted(docId, device, baseRevision, body)
-          Store.Outcome("conflicted", outcome.revision)
-        } else Store.Outcome("merged", outcome.revision)
-    }
-  }
 }
 `,
     },

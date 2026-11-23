@@ -60,12 +60,11 @@ cites quotes its sources do not contain.
       id: 'deadline',
       title: 'Every Tools.Call carries a 30 s deadline',
       detail:
-        'Every attempt, the retries included, is made with a 30 s deadline of its own (`TOOL_DEADLINE_S`, `TOOL_DEADLINE_MS` in TypeScript: a call timeout, a context with a timeout, `withDeadlineAfter`, `set_deadline`), so a retry after a slow failure still has the time to succeed.',
+        'Every attempt, the retries included, is made with a 30 s deadline of its own (`TOOL_DEADLINE_S`, `TOOL_DEADLINE_MS` in TypeScript: a call timeout, a context with a timeout, `set_deadline`), so a retry after a slow failure still has the time to succeed.',
       match: {
         python: {all: [/TOOL_DEADLINE_S\s*=\s*30\b/, /timeout\s*=\s*TOOL_DEADLINE_S/]},
         typescript: {all: [/TOOL_DEADLINE_MS\s*=\s*30_?000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*TOOL_DEADLINE_MS/]},
         go: {all: [/toolDeadline\s*=\s*30\s*\*\s*time\.Second/, /context\.WithTimeout\([^)\n]*toolDeadline/]},
-        scala: {all: [/ToolDeadlineS\s*=\s*30L?\b/, /withDeadlineAfter\(\s*ToolDeadlineS/]},
         cpp: {all: [/kToolDeadlineS\s*=\s*30\b/, /set_deadline\(/]},
       },
     },
@@ -108,17 +107,6 @@ cites quotes its sources do not contain.
           ],
           none: [/for\s*\{/],
         },
-        scala: {
-          all: [
-            /MaxAttempts\s*=\s*3\b/,
-            /UNAVAILABLE/,
-            /DEADLINE_EXCEEDED/,
-            /BackoffBaseMs\s*=\s*500L?\b/,
-            /Thread\.sleep\(/,
-            /throw new ToolFailed/,
-          ],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
         cpp: {
           all: [
             /kMaxAttempts\s*=\s*3\b/,
@@ -141,7 +129,6 @@ cites quotes its sources do not contain.
         python: {all: [/INSTRUCTION_PATTERN\s*=/, /sanitize_result\(\s*reply\.text\s*\)/]},
         typescript: {all: [/INSTRUCTION_PATTERN\s*=/, /sanitizeResult\(\s*reply\.text\s*\)/]},
         go: {all: [/instructionPattern\s*=/, /sanitizeResult\(\s*reply\.GetText\(\)\s*\)/]},
-        scala: {all: [/InstructionPattern\s*=/, /sanitizeResult\(\s*reply\.text\s*\)/]},
         cpp: {all: [/kInstructionPattern/, /sanitizeResult\(\s*reply\.text\(\)\s*\)/]},
       },
     },
@@ -154,7 +141,6 @@ cites quotes its sources do not contain.
         python: {all: [/\.span\s+in\s+/], none: [/,\s*True\)/]},
         typescript: {all: [/\.includes\(/], none: [/verified:\s*true/]},
         go: {all: [/strings\.Contains\(/], none: [/Verified\s*=\s*true/]},
-        scala: {all: [/\.contains\(/], none: [/verified\s*=\s*true/]},
         cpp: {all: [/\.find\(/, /npos/], none: [/verified\s*=\s*true/]},
       },
     },
@@ -529,93 +515,6 @@ func verifyCitations(citations []Citation, sources map[string]string) []Citation
 		out[i] = c
 	}
 	return out
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import researchd.research_orchestrator.{CallRequest, ToolsGrpc}
-
-final case class ToolResult(text: String, sourceId: String, flaggedLines: Int = 0)
-final case class Citation(span: String, sourceId: String, verified: Boolean = false)
-
-/** The tool call failed for good: the subagent sees the reason and adapts its plan. */
-final class ToolFailed(message: String) extends Exception(message)
-
-object ToolCalls {
-  private val tools = ToolsGrpc.blockingStub(ManagedChannelBuilder.forAddress("tools", 9000).usePlaintext().build())
-
-  /** One tool call (search, fetch) on behalf of a subagent. */
-  def callTool(name: String, input: String): ToolResult = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    var result: Option[ToolResult] = None
-    while (result.isEmpty) {
-      try {
-        val reply = tools.call(CallRequest(name = name, input = input))
-        result = Some(ToolResult(reply.text, reply.sourceId))
-      } catch {
-        case _: StatusRuntimeException => ()
-      }
-    }
-    result.get
-  }
-
-  /** The citations, each marked verified or not against the fetched sources (source id → text). */
-  def verifyCitations(citations: Seq[Citation], sources: Map[String, String]): Seq[Citation] =
-    citations.map(_.copy(verified = true))
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import researchd.research_orchestrator.{CallRequest, ToolsGrpc}
-
-final case class ToolResult(text: String, sourceId: String, flaggedLines: Int = 0)
-final case class Citation(span: String, sourceId: String, verified: Boolean = false)
-
-/** The tool call failed for good: the subagent sees the reason and adapts its plan. */
-final class ToolFailed(message: String) extends Exception(message)
-
-object ToolCalls {
-  val ToolDeadlineS = 30L
-  val MaxAttempts = 3
-  val BackoffBaseMs = 500L
-  val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-  val InstructionPattern = "(?i)^\\\\s*(ignore|disregard|forget)\\\\b.*\\\\binstructions?\\\\b|^\\\\s*(system|assistant)\\\\s*:|\\\\byou are now\\\\b".r
-
-  private val tools = ToolsGrpc.blockingStub(ManagedChannelBuilder.forAddress("tools", 9000).usePlaintext().build())
-
-  /** The text without instruction-like lines, and how many were dropped. */
-  def sanitizeResult(text: String): (String, Int) = {
-    val (flagged, kept) = text.split("\\n", -1).toSeq.partition(line => InstructionPattern.findFirstIn(line).isDefined)
-    (kept.mkString("\\n"), flagged.size)
-  }
-
-  /** One tool call (search, fetch) on behalf of a subagent. */
-  def callTool(name: String, input: String): ToolResult = {
-    var attempt = 0
-    while (attempt < MaxAttempts) {
-      try {
-        val reply = tools.withDeadlineAfter(ToolDeadlineS, TimeUnit.SECONDS).call(CallRequest(name = name, input = input))
-        val (text, flagged) = sanitizeResult(reply.text)
-        return ToolResult(text, reply.sourceId, flagged)
-      } catch {
-        case e: StatusRuntimeException =>
-          val code = e.getStatus.getCode
-          // An invalid request fails the same way every time: the model must change it, not wait.
-          if (!Retryable.contains(code) || attempt == MaxAttempts - 1) throw new ToolFailed(s"$name: $code")
-          Thread.sleep(BackoffBaseMs << attempt)
-      }
-      attempt += 1
-    }
-    throw new ToolFailed(s"$name: no attempt left")
-  }
-
-  /** The citations, each marked verified or not against the fetched sources (source id → text). */
-  def verifyCitations(citations: Seq[Citation], sources: Map[String, String]): Seq[Citation] =
-    citations.map(c => c.copy(verified = c.span.nonEmpty && sources.get(c.sourceId).exists(_.contains(c.span))))
 }
 `,
     },

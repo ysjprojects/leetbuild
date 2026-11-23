@@ -56,12 +56,11 @@ Requirements:
       id: 'deadline',
       title: 'An 800 ms deadline on every attempt',
       detail:
-        'Each Score call carries a deadline of about 800 ms (timeout=DEADLINE_S, deadline: Date.now() + DEADLINE_MS, context.WithTimeout, withDeadlineAfter, set_deadline); a judge answering in 500 ms is used on the first call. The starter sends no deadline.',
+        'Each Score call carries a deadline of about 800 ms (timeout=DEADLINE_S, deadline: Date.now() + DEADLINE_MS, context.WithTimeout, set_deadline); a judge answering in 500 ms is used on the first call. The starter sends no deadline.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*0?\.8\b/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/\b800\b|\b0?\.8\b/, /deadline:\s*Date\.now\(\)\s*\+/]},
         go: {all: [/context\.WithTimeout\(/, /\b800\b/]},
-        scala: {all: [/withDeadlineAfter\(/, /\b800L?\b|\b0?\.8\b/]},
         cpp: {all: [/set_deadline\(/, /\b800\b/]},
       },
     },
@@ -74,7 +73,6 @@ Requirements:
         python: {all: [/grpc\.StatusCode\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/while\s+True/]},
         typescript: {all: [/status\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/while\s*\(\s*true\s*\)/]},
         go: {all: [/codes\.Unavailable/, /maxAttempts/], none: [/\bfor\s*\{/]},
-        scala: {all: [/Status\.Code\.UNAVAILABLE/, /MaxAttempts/], none: [/while\s*\(\s*true\s*\)/]},
         cpp: {
           all: [/grpc::StatusCode::UNAVAILABLE/, /kMaxAttempts/],
           none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
@@ -90,7 +88,6 @@ Requirements:
         python: {all: [/exact_match\(/, /["']fallback["']/]},
         typescript: {all: [/exactMatch\(/, /['"]fallback['"]/]},
         go: {all: [/metrics\.ExactMatch\(/, /"fallback"/]},
-        scala: {all: [/Metrics\.exactMatch\(/, /"fallback"/]},
         cpp: {all: [/metrics::exact_match\(/, /"fallback"/]},
       },
     },
@@ -103,7 +100,6 @@ Requirements:
         python: {all: [/grpc\.StatusCode\.INVALID_ARGUMENT/, /["']invalid["']/]},
         typescript: {all: [/status\.INVALID_ARGUMENT/, /['"]invalid['"]/]},
         go: {all: [/codes\.InvalidArgument/, /"invalid"/]},
-        scala: {all: [/Status\.Code\.INVALID_ARGUMENT/, /"invalid"/]},
         cpp: {all: [/grpc::StatusCode::INVALID_ARGUMENT/, /"invalid"/]},
       },
     },
@@ -116,7 +112,6 @@ Requirements:
         python: {all: [/BREAKER_FAILURES/, /BREAKER_COOLDOWN_S/, /\.allow\(\)/]},
         typescript: {all: [/BREAKER_FAILURES/, /BREAKER_COOLDOWN/, /\.allow\(\)/]},
         go: {all: [/breakerFailures/, /breakerCooldown/, /\.allow\(\)/]},
-        scala: {all: [/BreakerFailures/, /BreakerCooldown/, /\.allow\(\)/]},
         cpp: {all: [/kBreakerFailures/, /kBreakerCooldown/, /\.allow\(\)/]},
       },
     },
@@ -519,113 +514,6 @@ attempt:
 		}
 	}
 	return SampleScore{Status: "scored", Score: metrics.ExactMatch(sample.Expected, sample.Output), Judge: "fallback", Attempts: attempts}
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import evals.{Config, GoldenSample}
-import evals.judge.{JudgeGrpc, ScoreRequest}
-
-/** One sample's score: status scored or invalid, the score, which judge produced it, the attempts made. */
-final case class SampleScore(status: String, score: Double, judge: String, attempts: Int)
-
-object JudgeClient {
-  val BackoffMs = 100L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Judge).usePlaintext().build()
-  private val stub = JudgeGrpc.blockingStub(channel)
-
-  /** Score one golden sample with the judge. */
-  def scoreSample(sample: GoldenSample): SampleScore = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val request = ScoreRequest(runId = sample.run_id, sampleId = sample.sample_id, expected = sample.expected, output = sample.output)
-    var attempts = 0
-    while (true) {
-      attempts += 1
-      try {
-        val reply = stub.score(request)
-        return SampleScore("scored", reply.score, "model", attempts)
-      } catch {
-        case e: StatusRuntimeException =>
-          System.err.println(s"judge call failed run=\${sample.run_id} sample=\${sample.sample_id} code=\${e.getStatus.getCode}")
-          Thread.sleep(BackoffMs)
-      }
-    }
-    SampleScore("scored", 0.0, "model", attempts)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import evals.{Config, GoldenSample, Metrics}
-import evals.judge.{JudgeGrpc, ScoreRequest}
-
-/** One sample's score: status scored or invalid, the score, which judge produced it, the attempts made. */
-final case class SampleScore(status: String, score: Double, judge: String, attempts: Int)
-
-/** Opens after BreakerFailures failed attempts in a row; while open, samples skip the judge. */
-final class Breaker(failuresToOpen: Int, cooldownMs: Long) {
-  private var failures = 0
-  private var openUntil = 0L
-
-  def allow(): Boolean = System.currentTimeMillis() >= openUntil
-
-  def record(ok: Boolean): Unit =
-    if (ok) failures = 0
-    else {
-      failures += 1
-      if (failures >= failuresToOpen) {
-        openUntil = System.currentTimeMillis() + cooldownMs
-        failures = 0
-      }
-    }
-}
-
-object JudgeClient {
-  val DeadlineMs = 800L
-  val MaxAttempts = 3
-  val BackoffMs = 100L
-  val BreakerFailures = 5
-  val BreakerCooldownMs = 30000L
-  private val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Judge).usePlaintext().build()
-  private val stub = JudgeGrpc.blockingStub(channel)
-  val breaker = new Breaker(BreakerFailures, BreakerCooldownMs)
-
-  /** Score one golden sample: the judge within a deadline and bounded retries, else the marked fallback. */
-  def scoreSample(sample: GoldenSample): SampleScore = {
-    val request = ScoreRequest(runId = sample.run_id, sampleId = sample.sample_id, expected = sample.expected, output = sample.output)
-    var attempts = 0
-    var judgeFailed = false
-    while (!judgeFailed && attempts < MaxAttempts && breaker.allow()) {
-      attempts += 1
-      try {
-        val reply = stub.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).score(request)
-        breaker.record(true)
-        return SampleScore("scored", reply.score, "model", attempts)
-      } catch {
-        case e: StatusRuntimeException =>
-          val code = e.getStatus.getCode
-          if (code == Status.Code.INVALID_ARGUMENT) {
-            System.err.println(s"judge refused run=\${sample.run_id} sample=\${sample.sample_id}: \${e.getStatus.getDescription}")
-            return SampleScore("invalid", 0.0, "", attempts)
-          }
-          if (Retryable.contains(code)) {
-            breaker.record(false)
-            if (attempts < MaxAttempts) Thread.sleep(BackoffMs * attempts)
-          } else {
-            System.err.println(s"judge failed run=\${sample.run_id} sample=\${sample.sample_id} code=$code")
-            judgeFailed = true
-          }
-      }
-    }
-    SampleScore("scored", Metrics.exactMatch(sample.expected, sample.output), "fallback", attempts)
-  }
 }
 `,
     },

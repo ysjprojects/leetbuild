@@ -67,7 +67,6 @@ Requirements:
             /context\.WithTimeout\(\s*ctx\s*,\s*heartbeatDeadline\s*\)/,
           ],
         },
-        scala: {all: [/HeartbeatDeadlineMs\s*=\s*60000L?/, /withDeadlineAfter\(\s*HeartbeatDeadlineMs/]},
         cpp: {all: [/kHeartbeatDeadline\s*\{\s*60\s*\}/, /set_deadline\([^;]*kHeartbeatDeadline/]},
       },
     },
@@ -80,7 +79,6 @@ Requirements:
         python: {order: [/stub\.RequestCheckpoint\(/, /stub\.Restart\(/]},
         typescript: {order: [/stub\.RequestCheckpoint\(/, /stub\.Restart\(/]},
         go: {order: [/stub\.RequestCheckpoint\(/, /stub\.Restart\(/]},
-        scala: {order: [/\.requestCheckpoint\(/, /\.restart\(/]},
         cpp: {order: [/->RequestCheckpoint\(/, /->Restart\(/]},
       },
     },
@@ -93,7 +91,6 @@ Requirements:
         python: {all: [/resume_from\s*=\s*\w+\.checkpoint_id/]},
         typescript: {all: [/resume_from:\s*\w+\.checkpoint_id/]},
         go: {all: [/ResumeFrom:\s*\w+\.(GetCheckpointId\(\)|CheckpointId)/]},
-        scala: {all: [/resumeFrom\s*=\s*\w+\.checkpointId/]},
         cpp: {all: [/set_resume_from\(\s*\w+\.checkpoint_id\(\)\s*\)/]},
       },
     },
@@ -106,7 +103,6 @@ Requirements:
         python: {all: [/["']checkpoint_failed["']/]},
         typescript: {all: [/["']checkpoint_failed["']/]},
         go: {all: [/"checkpoint_failed"/]},
-        scala: {all: [/"checkpoint_failed"/]},
         cpp: {all: [/"checkpoint_failed"/]},
       },
     },
@@ -119,7 +115,6 @@ Requirements:
         python: {all: [/MAX_HEARTBEAT_FAILURES/, /["']heartbeat_lost["']/]},
         typescript: {all: [/MAX_HEARTBEAT_FAILURES/, /["']heartbeat_lost["']/]},
         go: {all: [/maxHeartbeatFailures/, /"heartbeat_lost"/]},
-        scala: {all: [/MaxHeartbeatFailures/, /"heartbeat_lost"/]},
         cpp: {all: [/kMaxHeartbeatFailures/, /"heartbeat_lost"/]},
       },
     },
@@ -465,104 +460,6 @@ func supervise(ctx context.Context, jobID string) (Supervision, error) {
 			return failed("restart_failed")
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import finetune.Config
-import finetuned.finetuned.{HeartbeatRequest, RestartRequest, TrainerGrpc}
-
-/** How one watched run ended. */
-final case class Supervision(status: String, reason: String, restarts: Int, checkpointIds: List[String])
-
-object Supervisor {
-  val HeartbeatTimeoutMs = 30000L
-  val HeartbeatIntervalMs = 30000L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Trainer).usePlaintext().build()
-  private val stub = TrainerGrpc.blockingStub(channel)
-
-  /** Watch one training run to its end. */
-  def supervise(jobId: String): Supervision = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    var restarts = 0
-    while (true) {
-      try {
-        val beat = stub.withDeadlineAfter(HeartbeatTimeoutMs, TimeUnit.MILLISECONDS).heartbeat(HeartbeatRequest(jobId = jobId))
-        if (beat.done) return Supervision("succeeded", "", restarts, Nil)
-        Thread.sleep(HeartbeatIntervalMs)
-      } catch {
-        case e: StatusRuntimeException =>
-          System.err.println(s"heartbeat missed job=$jobId code=\${e.getStatus.getCode}: restarting")
-          stub.withDeadlineAfter(HeartbeatTimeoutMs, TimeUnit.MILLISECONDS).restart(RestartRequest(jobId = jobId))
-          restarts += 1
-      }
-    }
-    Supervision("failed", "unreachable", restarts, Nil)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import scala.collection.mutable.ListBuffer
-
-import finetune.Config
-import finetuned.finetuned.{CheckpointRequest, HeartbeatRequest, RestartRequest, TrainerGrpc}
-
-/** How one watched run ended. */
-final case class Supervision(status: String, reason: String, restarts: Int, checkpointIds: List[String])
-
-object Supervisor {
-  val HeartbeatDeadlineMs = 60000L
-  val HeartbeatIntervalMs = 30000L
-  val MaxHeartbeatFailures = 3
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Trainer).usePlaintext().build()
-  private val stub = TrainerGrpc.blockingStub(channel)
-
-  private def bounded = stub.withDeadlineAfter(HeartbeatDeadlineMs, TimeUnit.MILLISECONDS)
-
-  /** Watch one training run to its end. */
-  def supervise(jobId: String): Supervision = {
-    var failures = 0
-    val checkpointIds = ListBuffer[String]()
-    def failed(reason: String): Supervision = {
-      System.err.println(s"run failed job=$jobId reason=$reason checkpoints=\${checkpointIds.mkString(",")}")
-      Supervision("failed", reason, checkpointIds.size, checkpointIds.toList)
-    }
-
-    while (true) {
-      val beat =
-        try Some(bounded.heartbeat(HeartbeatRequest(jobId = jobId)))
-        catch {
-          case e: StatusRuntimeException =>
-            failures += 1
-            System.err.println(s"heartbeat missed job=$jobId code=\${e.getStatus.getCode} failures=$failures")
-            None
-        }
-      beat match {
-        case Some(reply) =>
-          if (reply.done) return Supervision("succeeded", "", checkpointIds.size, checkpointIds.toList)
-          Thread.sleep(HeartbeatIntervalMs)
-        case None =>
-          if (failures >= MaxHeartbeatFailures) return failed("heartbeat_lost")
-          val checkpoint =
-            try bounded.requestCheckpoint(CheckpointRequest(jobId = jobId))
-            catch { case _: StatusRuntimeException => return failed("checkpoint_failed") }
-          if (checkpoint.checkpointId.isEmpty) return failed("checkpoint_failed")
-          checkpointIds += checkpoint.checkpointId
-          try bounded.restart(RestartRequest(jobId = jobId, resumeFrom = checkpoint.checkpointId))
-          catch { case _: StatusRuntimeException => return failed("restart_failed") }
-      }
-    }
-    failed("unreachable")
-  }
 }
 `,
     },

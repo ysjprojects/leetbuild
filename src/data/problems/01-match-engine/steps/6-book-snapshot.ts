@@ -53,10 +53,6 @@ Not every client wants a stream. Implement \`GET /book/{symbol}\` on the gateway
           order: [/SYMBOL_RE\.test\(\s*symbol\s*\)/, /\.hgetall\(/],
         },
         go: {all: [/http\.StatusBadRequest|\b400\b/], order: [/symbolRe\.MatchString\(\s*symbol\s*\)/, /\.HGetAll\(/]},
-        scala: {
-          all: [/StatusCodes\.BadRequest|\b400\b/],
-          order: [/SymbolRe\.(matches|findFirstIn|unapplySeq)\(\s*symbol\s*\)|case SymbolRe\(\)/, /\.hgetAll\(/],
-        },
         cpp: {all: [/\b400\b/], order: [/std::regex_match\(\s*symbol\s*,\s*kSymbolRe\s*\)/, /\.hgetall\(/]},
       },
     },
@@ -68,7 +64,6 @@ Not every client wants a stream. Implement \`GET /book/{symbol}\` on the gateway
         python: {all: [/f"book:\{symbol\}"/, /\.hgetall\(/]},
         typescript: {all: [/`book:\$\{symbol\}`|['"]book:['"]\s*\+\s*symbol/, /\.hgetall\(/]},
         go: {all: [/"book:"\s*\+\s*symbol/, /\.HGetAll\(\s*ctx\s*,/]},
-        scala: {all: [/s"book:\$symbol"/, /\.hgetAll\(/]},
         cpp: {all: [/"book:"\s*\+\s*symbol/, /\.hgetall\(/]},
       },
     },
@@ -80,7 +75,6 @@ Not every client wants a stream. Implement \`GET /book/{symbol}\` on the gateway
         python: {all: [/status_code\s*=\s*404|HTTP_404/]},
         typescript: {all: [/code\(\s*404\s*\)|status\(\s*404\s*\)|statusCode:\s*404|notFound\(/]},
         go: {all: [/http\.StatusNotFound|\b404\b/]},
-        scala: {all: [/StatusCodes\.NotFound|\b404\b/]},
         cpp: {all: [/\b404\b/]},
       },
     },
@@ -92,7 +86,6 @@ Not every client wants a stream. Implement \`GET /book/{symbol}\` on the gateway
         python: {all: [/Cache-Control/i, /no-store/]},
         typescript: {all: [/Cache-Control/i, /no-store/]},
         go: {all: [/Cache-Control/i, /no-store/]},
-        scala: {all: [/Cache-Control/i, /no-store/]},
         cpp: {all: [/Cache-Control/i, /no-store/]},
       },
     },
@@ -261,90 +254,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /book/{symbol}", bookHandler)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import exchange.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-
-object BookEndpoint {
-  val jedis = new JedisPooled("redis", 6379)
-  val SymbolRe = "^[A-Z]{1,6}$".r
-
-  val route: Route =
-    path("book" / Segment) { symbol =>
-      get {
-        // TODO: 400 unless SymbolRe matches the symbol
-        // TODO: hgetAll book:{symbol}; empty → 404
-        // TODO: 200 {"symbol", "bid", "ask", "last"} with Cache-Control: no-store
-        val _ = (jedis, symbol, classOf[RawHeader])
-        complete(StatusCodes.NotImplemented)
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("gateway")
-    // Tls (provided) builds an SSLContext from the PEM certificate and key.
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import exchange.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-
-object BookEndpoint {
-  val jedis = new JedisPooled("redis", 6379)
-  val SymbolRe = "^[A-Z]{1,6}$".r
-
-  val route: Route =
-    path("book" / Segment) { symbol =>
-      get {
-        if (!SymbolRe.matches(symbol)) complete(StatusCodes.BadRequest -> "symbol must be 1–6 upper-case letters")
-        else {
-          val fields = jedis.hgetAll(s"book:$symbol").asScala.toMap
-          if (fields.isEmpty) complete(StatusCodes.NotFound -> s"no book for $symbol")
-          else {
-            val body = (fields + ("symbol" -> symbol)).toJson.compactPrint
-            complete(
-              HttpResponse(
-                StatusCodes.OK,
-                headers = List(RawHeader("Cache-Control", "no-store")),
-                entity = HttpEntity(ContentTypes.\`application/json\`, body),
-              )
-            )
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("gateway")
-    // Tls (provided) builds an SSLContext from the PEM certificate and key.
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

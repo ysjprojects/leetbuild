@@ -44,7 +44,6 @@ the redirect handler calls it right after answering — so each click produces o
         python: {all: [/"clicks"/, /producer\.produce\(/]},
         typescript: {all: [/['"]clicks['"]/, /producer\.send\(/]},
         go: {all: [/"clicks"/, /WriteMessages\(/]},
-        scala: {all: [/"clicks"/, /producer\.send\(/]},
         cpp: {all: [/"clicks"/, /producer->produce\(/]},
       },
     },
@@ -56,7 +55,6 @@ the redirect handler calls it right after answering — so each click produces o
         python: {all: [/produce\([^\n]*key\s*=\s*code/]},
         typescript: {all: [/key:\s*code\b/]},
         go: {all: [/Key:\s*\[\]byte\(\s*code\s*\)/]},
-        scala: {all: [/new ProducerRecord\[[^\]]*\]\(\s*Topic\s*,\s*code\s*,/]},
         cpp: {all: [/produce\([\s\S]{0,400}?code\.(c_str|data)\(\)\s*,\s*code\.(size|length)\(\)/]},
       },
     },
@@ -72,7 +70,6 @@ the redirect handler calls it right after answering — so each click produces o
           none: [/async function recordClick\b/, /function recordClick(?:(?!\n\})[\s\S])*?(await\s|producer\.send\()/],
         },
         go: {all: [/Async:\s*true/], none: [/if err := writer\.WriteMessages/]},
-        scala: {all: [/producer\.send\(\s*\w+\s*,/], none: [/\.send\([^\n]*\)\.get\(/]},
         cpp: {all: [/producer->poll\(\s*0\s*\)/], none: [/void record_click(?:(?!\n\})[\s\S])*?producer->flush\(/]},
       },
     },
@@ -84,7 +81,6 @@ the redirect handler calls it right after answering — so each click produces o
         python: {all: [/on_delivery\s*=\s*on_delivery|callback\s*=\s*on_delivery/]},
         typescript: {all: [/\.(catch|then)\([^\n]*onDelivery/]},
         go: {all: [/Completion:\s*func\(/]},
-        scala: {all: [/onCompletion\(/]},
         cpp: {all: [/dr_cb\(|DeliveryReportCb/]},
       },
     },
@@ -96,7 +92,6 @@ the redirect handler calls it right after answering — so each click produces o
         python: {all: [/def shutdown(?:(?!\ndef )[\s\S])*?producer\.flush\(/]},
         typescript: {all: [/async function shutdown(?:(?!\n\})[\s\S])*?await [^\n]*(sendBatch\(\)|Promise\.all)/]},
         go: {all: [/func shutdown(?:(?!\n\})[\s\S])*?writer\.Close\(\)/]},
-        scala: {all: [/def shutdown(?:(?!\n {2}def )[\s\S])*?producer\.(flush|close)\(/]},
         cpp: {all: [/void shutdown(?:(?!\n\})[\s\S])*?producer->flush\(/]},
       },
     },
@@ -340,75 +335,6 @@ func shutdown() {
 	if err := writer.Close(); err != nil {
 		log.Printf("closing clicks writer: %v", err)
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-object ClickEvents {
-  val Topic = "clicks"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  props.put("linger.ms", "5")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  def recordClick(code: String, referrer: String, ua: String): Unit = {
-    val value = JsObject(
-      "code" -> JsString(code),
-      "ts" -> JsNumber(System.currentTimeMillis() / 1000.0),
-      "referrer" -> JsString(referrer),
-      "ua" -> JsString(ua),
-    ).compactPrint
-    // TODO: send a record keyed by code with a Callback that logs failures; do not block on the future
-  }
-
-  def shutdown(): Unit = {
-    // TODO: flush and close so buffered clicks reach the broker
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-object ClickEvents {
-  val Topic = "clicks"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  props.put("linger.ms", "5")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"click not delivered: \${exception.getMessage}")
-  }
-
-  def recordClick(code: String, referrer: String, ua: String): Unit = {
-    val value = JsObject(
-      "code" -> JsString(code),
-      "ts" -> JsNumber(System.currentTimeMillis() / 1000.0),
-      "referrer" -> JsString(referrer),
-      "ua" -> JsString(ua),
-    ).compactPrint
-    val record = new ProducerRecord[String, String](Topic, code, value)
-    producer.send(record, onDelivery) // enqueues; the future is not awaited
-  }
-
-  def shutdown(): Unit = {
-    producer.flush()
-    producer.close()
-  }
 }
 `,
     },

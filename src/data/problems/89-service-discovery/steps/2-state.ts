@@ -66,10 +66,6 @@ the instance just promised.
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]EXPIRE['"]/],
           none: [/rdb\.Exists\(/, /rdb\.Expire\(/, /rdb\.HSet\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]EXPIRE['"]/],
-          none: [/jedis\.exists\(/, /jedis\.expire\(/, /jedis\.hset\(/],
-        },
         cpp: {
           all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]EXPIRE['"]/],
           none: [/redis\.exists\(/, /redis\.expire\(/, /redis\.hset\(/],
@@ -85,7 +81,6 @@ the instance just promised.
         python: {all: [/tonumber\(/, /return\s+['"]stale['"]/]},
         typescript: {all: [/tonumber\(/, /return\s+['"]stale['"]/]},
         go: {all: [/tonumber\(/, /return\s+['"]stale['"]/]},
-        scala: {all: [/tonumber\(/, /return\s+['"]stale['"]/]},
         cpp: {all: [/tonumber\(/, /return\s+['"]stale['"]/]},
       },
     },
@@ -98,7 +93,6 @@ the instance just promised.
         python: {all: [/TTL_INTERVALS\s*\*\s*heartbeat_interval/], none: [/TTL_SECONDS/]},
         typescript: {all: [/TTL_INTERVALS\s*\*\s*heartbeatInterval/], none: [/TTL_SECONDS/]},
         go: {all: [/TTLIntervals\s*\*\s*heartbeatInterval/], none: [/ttlSeconds/]},
-        scala: {all: [/TtlIntervals\s*\*\s*heartbeatInterval/], none: [/TtlSeconds/]},
         cpp: {all: [/kTtlIntervals\s*\*\s*heartbeat_interval/], none: [/kTtlSeconds/]},
       },
     },
@@ -303,65 +297,6 @@ func heartbeat(ctx context.Context, service, instanceID, address string, port, m
 	ttl := instances.TTLIntervals * heartbeatInterval
 	key := instances.RecordKey(service, instanceID)
 	return renewScript.Run(ctx, rdb, []string{key}, address, port, metadataVersion, heartbeatInterval, time.Now().Unix(), ttl).Text()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import discovery.Instances // Instances.recordKey, membersKey, TtlIntervals
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val TtlSeconds = 30L
-
-  /** Renew a registered instance: renewed, or gone when its record lapsed (the agent re-registers). */
-  def heartbeat(service: String, instanceId: String, address: String, port: Int, metadataVersion: Long, heartbeatInterval: Int): String = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    val key = Instances.recordKey(service, instanceId)
-    if (!jedis.exists(key)) "gone"
-    else {
-      jedis.hset(key, Map(
-        "address" -> address, "port" -> port.toString, "metadata_version" -> metadataVersion.toString,
-        "heartbeat_interval" -> heartbeatInterval.toString, "last_heartbeat" -> (System.currentTimeMillis() / 1000).toString).asJava)
-      jedis.expire(key, TtlSeconds)
-      "renewed"
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import discovery.Instances // Instances.recordKey, membersKey, TtlIntervals
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /**
-   * KEYS[1] the record; ARGV address, port, metadata_version, heartbeat_interval, now, ttl.
-   * Only registration creates a record: a lapsed one stays gone, and versions only move forward.
-   */
-  val RenewLua: String =
-    """local stored = redis.call('HGET', KEYS[1], 'metadata_version')
-      |if not stored then return 'gone' end
-      |if tonumber(ARGV[3]) < tonumber(stored) then return 'stale' end
-      |redis.call('HSET', KEYS[1], 'address', ARGV[1], 'port', ARGV[2], 'metadata_version', ARGV[3],
-      |  'heartbeat_interval', ARGV[4], 'last_heartbeat', ARGV[5])
-      |redis.call('EXPIRE', KEYS[1], ARGV[6])
-      |return 'renewed'
-      |""".stripMargin
-
-  /** Renew a registered instance: renewed, stale (an older metadata_version, nothing written) or gone (re-register). */
-  def heartbeat(service: String, instanceId: String, address: String, port: Int, metadataVersion: Long, heartbeatInterval: Int): String = {
-    val ttl = Instances.TtlIntervals * heartbeatInterval
-    val args = List(address, port.toString, metadataVersion.toString, heartbeatInterval.toString, (System.currentTimeMillis() / 1000).toString, ttl.toString)
-    jedis.eval(RenewLua, List(Instances.recordKey(service, instanceId)).asJava, args.asJava).asInstanceOf[String]
-  }
 }
 `,
     },

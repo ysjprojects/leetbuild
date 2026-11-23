@@ -58,7 +58,6 @@ crashes between its commit and its write loses the turn.
         python: {all: [/key\s*=\s*session\[["']session_id["']\]/]},
         typescript: {all: [/key:\s*session\.session_id/]},
         go: {all: [/Key:\s*\[\]byte\(session\.SessionID\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(TurnTopic,\s*session\.sessionId/]},
         cpp: {all: [/session\.session_id\.c_str\(\),\s*session\.session_id\.(size|length)\(\)/]},
       },
     },
@@ -71,7 +70,6 @@ crashes between its commit and its write loses the turn.
         python: {all: [/transcripts\.redact\(/, /["']transcript_ref["']/], none: [/["']text["']\s*:\s*turn\[/]},
         typescript: {all: [/\bredact\(/, /transcript_ref:/], none: [/text:\s*turn\.text/]},
         go: {all: [/transcripts\.Redact\(/, /"transcript_ref"/], none: [/"text":\s*turn\.Text/]},
-        scala: {all: [/Transcripts\.redact\(/, /"transcript_ref"/], none: [/"text"\s*->/]},
         cpp: {all: [/transcripts::redact\(/, /"transcript_ref"/], none: [/\{"text",\s*turn\.text\}/]},
       },
     },
@@ -84,7 +82,6 @@ crashes between its commit and its write loses the turn.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["'](all|-1)["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"(all|-1)"/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"(all|-1)"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"(all|-1)"/]},
       },
     },
@@ -97,7 +94,6 @@ crashes between its commit and its write loses the turn.
         python: {order: [/transcripts\.insert_turn\(/, /consumer\.commit\(/]},
         typescript: {order: [/await insertTurn\(/, /commitOffsets\(/]},
         go: {order: [/transcripts\.InsertTurn\(/, /consumer\.CommitMessage\(/]},
-        scala: {order: [/Transcripts\.insertTurn\(/, /consumer\.commitSync\(/]},
         cpp: {order: [/transcripts::insertTurn\(/, /consumer->commitSync\(/]},
       },
     },
@@ -525,139 +521,6 @@ func run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import spray.json._
-
-import voice.Sessions.Session
-import voice.Transcripts // Transcripts.redact, insertTurn
-
-import scala.jdk.CollectionConverters._
-
-object Events {
-  val TurnTopic = "voice.turn"
-  val TurnGroup = "transcripts"
-
-  /** One finished turn of a call, as the speech loop hands it over. */
-  final case class Turn(turnIndex: Int, startedAt: Long, endedAt: Long, text: String)
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Publish one finished turn; returns the event. get() throws when the broker did not take it. */
-  def recordTurn(session: Session, turn: Turn): JsObject = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val event = JsObject(
-      "session_id" -> JsString(session.sessionId),
-      "tenant" -> JsString(session.tenant),
-      "turn_index" -> JsNumber(turn.turnIndex),
-      "started_at" -> JsNumber(turn.startedAt),
-      "ended_at" -> JsNumber(turn.endedAt),
-      "text" -> JsString(turn.text))
-    producer.send(new ProducerRecord[String, String](TurnTopic, event.compactPrint)).get(5, TimeUnit.SECONDS)
-    event
-  }
-
-  private val consumer: KafkaConsumer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", TurnGroup)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val c = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    c.subscribe(List(TurnTopic).asJava)
-    c
-  }
-
-  /** The transcript consumer: one row per voice.turn record. */
-  def run(): Unit =
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-        Transcripts.insertTurn(record.value.parseJson.asJsObject)
-      }
-    }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import spray.json._
-
-import voice.Sessions.Session
-import voice.Transcripts // Transcripts.redact, insertTurn
-
-import scala.jdk.CollectionConverters._
-
-object Events {
-  val TurnTopic = "voice.turn"
-  val TurnGroup = "transcripts"
-
-  /** One finished turn of a call, as the speech loop hands it over. */
-  final case class Turn(turnIndex: Int, startedAt: Long, endedAt: Long, text: String)
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    // Idempotent with acks=all: a retry after a lost acknowledgement writes the turn once, on every replica.
-    props.put("enable.idempotence", "true")
-    props.put("acks", "all")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Publish one finished turn; returns the event. get() throws when the broker did not take it. */
-  def recordTurn(session: Session, turn: Turn): JsObject = {
-    val event = JsObject(
-      "session_id" -> JsString(session.sessionId),
-      "tenant" -> JsString(session.tenant),
-      "turn_index" -> JsNumber(turn.turnIndex),
-      "started_at" -> JsNumber(turn.startedAt),
-      "ended_at" -> JsNumber(turn.endedAt),
-      // The redacted text stays in the transcript store; the retained topic carries where it is.
-      "transcript_ref" -> JsString(Transcripts.redact(session.sessionId, turn.turnIndex, turn.text)))
-    producer.send(new ProducerRecord[String, String](TurnTopic, session.sessionId, event.compactPrint)).get(5, TimeUnit.SECONDS)
-    event
-  }
-
-  private val consumer: KafkaConsumer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", TurnGroup)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val c = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    c.subscribe(List(TurnTopic).asJava)
-    c
-  }
-
-  /** The transcript consumer: one row per voice.turn record. */
-  def run(): Unit =
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        Transcripts.insertTurn(record.value.parseJson.asJsObject)
-        // The row is durable: a crash before this commit redelivers the turn.
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-      }
-    }
 }
 `,
     },

@@ -63,7 +63,6 @@ timeout starts a second browser.
         python: {all: [/@app\.post\(\s*["']\/v1\/browser\/sessions["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/browser\/sessions['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/browser\/sessions"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"browser"\s*\/\s*"sessions"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/browser\/sessions"/]},
       },
     },
@@ -76,7 +75,6 @@ timeout starts a second browser.
         python: {all: [/profiles\.authorize_navigation\(/], none: [/DEFAULT_PROFILE/]},
         typescript: {all: [/authorizeNavigation\(/], none: [/DEFAULT_PROFILE/]},
         go: {all: [/profiles\.AuthorizeNavigation\(/], none: [/defaultProfile/]},
-        scala: {all: [/Profiles\.authorizeNavigation\(/], none: [/DefaultProfile/]},
         cpp: {all: [/profiles::authorizeNavigation\(/], none: [/kDefaultProfile/]},
       },
     },
@@ -89,7 +87,6 @@ timeout starts a second browser.
         python: {all: [/MAX_STEPS\s*=\s*60\b/], none: [/UNLIMITED/]},
         typescript: {all: [/MAX_STEPS\s*=\s*60\b/], none: [/UNLIMITED/]},
         go: {all: [/maxSteps\s*=\s*60\b/], none: [/\bunlimited\b/]},
-        scala: {all: [/MaxSteps\s*=\s*60L?\b/], none: [/\bUnlimited\b/]},
         cpp: {all: [/kMaxSteps\s*=\s*60\b/], none: [/kUnlimited/]},
       },
     },
@@ -110,10 +107,6 @@ timeout starts a second browser.
         go: {
           all: [/Idempotency-Key/i, /sessions\.SessionForKey\(/, /sessions\.RememberKey\(/],
           order: [/sessions\.SessionForKey\(/, /sessions\.CreateSession\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Sessions\.sessionForKey\(/, /Sessions\.rememberKey\(/],
-          order: [/Sessions\.sessionForKey\(/, /Sessions\.createSession\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /sessions::sessionForKey\(/, /sessions::rememberKey\(/],
@@ -433,117 +426,6 @@ func startSession(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/browser/sessions", startSession)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import browser.Profiles // Profiles.getProfile, authorizeNavigation
-import browser.Sessions // Sessions.createSession, loadSession, sessionForKey, rememberKey, publicView
-
-object Api {
-  val MaxTaskBytes = 4096
-  val DefaultProfile = "public-web"
-  val Unlimited = 0L
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def text(body: JsObject, name: String): Option[String] = body.fields.get(name).collect { case JsString(s) => s }
-
-  def start(tenant: String, raw: String): HttpResponse = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    val body = raw.parseJson.asJsObject
-    val task = text(body, "task").getOrElse("")
-    if (task.isEmpty || task.getBytes("UTF-8").length > MaxTaskBytes) error(StatusCodes.BadRequest, "task must be 1 to 4096 bytes")
-    else {
-      val profile = Profiles.getProfile(text(body, "profile").getOrElse(DefaultProfile)).getOrElse(Profiles.getProfile(DefaultProfile).get)
-      val maxSteps = body.fields.get("max_steps").collect { case JsNumber(n) => n.toLong }.getOrElse(Unlimited)
-      val session = Sessions.createSession(tenant, profile.name, task, maxSteps, text(body, "start_url").filter(_.nonEmpty).getOrElse(profile.entry))
-      json(StatusCodes.Created, Sessions.publicView(session))
-    }
-  }
-
-  val route: Route = path("v1" / "browser" / "sessions") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        entity(as[String]) { raw =>
-          tenant.filter(_.nonEmpty) match {
-            case None => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-            case Some(t) => complete(start(t, raw))
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import browser.Profiles // Profiles.getProfile, authorizeNavigation
-import browser.Sessions // Sessions.createSession, loadSession, sessionForKey, rememberKey, publicView
-
-object Api {
-  val MaxTaskBytes = 4096
-  val MinSteps = 1L
-  val MaxSteps = 60L
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def text(body: JsObject, name: String): Option[String] = body.fields.get(name).collect { case JsString(s) => s }
-
-  def start(tenant: String, key: String, raw: String): HttpResponse = {
-    val body = raw.parseJson.asJsObject
-    val task = text(body, "task").getOrElse("")
-    val maxSteps = body.fields.get("max_steps").collect { case JsNumber(n) if n.isValidLong => n.toLong }
-    val startUrl = text(body, "start_url").filter(_.nonEmpty)
-    if (task.isEmpty || task.getBytes("UTF-8").length > MaxTaskBytes) error(StatusCodes.BadRequest, "task must be 1 to 4096 bytes")
-    else
-      Profiles.getProfile(text(body, "profile").getOrElse("")) match {
-        case None => error(StatusCodes.BadRequest, "unknown egress profile")
-        case Some(profile) =>
-          // The caller may choose where inside the profile to start, never a page outside it.
-          val refused = startUrl.map(Profiles.authorizeNavigation(profile, _)).filter(_.nonEmpty)
-          if (!maxSteps.exists(n => n >= MinSteps && n <= MaxSteps)) error(StatusCodes.BadRequest, s"max_steps must be $MinSteps to $MaxSteps")
-          else if (refused.nonEmpty) error(StatusCodes.BadRequest, refused.get)
-          else
-            Sessions.sessionForKey(tenant, key).flatMap(Sessions.loadSession) match {
-              case Some(existing) => json(StatusCodes.OK, Sessions.publicView(existing))
-              case None =>
-                val session = Sessions.createSession(tenant, profile.name, task, maxSteps.get, startUrl.getOrElse(profile.entry))
-                Sessions.rememberKey(tenant, key, session.sessionId)
-                json(StatusCodes.Created, Sessions.publicView(session))
-            }
-      }
-  }
-
-  val route: Route = path("v1" / "browser" / "sessions") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        optionalHeaderValueByName("Idempotency-Key") { key =>
-          entity(as[String]) { raw =>
-            (tenant.filter(_.nonEmpty), key.filter(_.nonEmpty)) match {
-              case (None, _) => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-              case (_, None) => complete(error(StatusCodes.BadRequest, "Idempotency-Key is required"))
-              case (Some(t), Some(k)) => complete(start(t, k, raw))
-            }
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

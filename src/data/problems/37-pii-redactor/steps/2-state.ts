@@ -51,7 +51,6 @@ still costs a detector call.
         python: {all: [/register_script\(|\.eval\(/, /INCRBY/], none: [/\br\.incrby\(/, /\br\.get\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /INCRBY/], none: [/redis\.incrby\(/, /redis\.get\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /INCRBY/], none: [/rdb\.IncrBy\(/, /rdb\.Get\(/]},
-        scala: {all: [/\.eval\(/, /INCRBY/], none: [/jedis\.incrBy\(/, /jedis\.get\(/]},
         cpp: {all: [/\.eval</, /INCRBY/], none: [/\.incrby\(/, /\.get\(key\)/]},
       },
     },
@@ -64,7 +63,6 @@ still costs a detector call.
         python: {all: [/\+\s*(?:chars|tonumber\(ARGV\[1\]\))\s*>/], none: [/used\s*>=\s*BUDGET_PER_HOUR/]},
         typescript: {all: [/\+\s*(?:chars|tonumber\(ARGV\[1\]\))\s*>/], none: [/used\s*>=\s*BUDGET_PER_HOUR/]},
         go: {all: [/\+\s*(?:chars|tonumber\(ARGV\[1\]\))\s*>/], none: [/used\s*>=\s*budgetPerHour/]},
-        scala: {all: [/\+\s*(?:chars|tonumber\(ARGV\[1\]\))\s*>/], none: [/used\s*>=\s*BudgetPerHour/]},
         cpp: {all: [/\+\s*(?:chars|tonumber\(ARGV\[1\]\))\s*>/], none: [/used\s*>=\s*kBudgetPerHour/]},
       },
     },
@@ -77,7 +75,6 @@ still costs a detector call.
         python: {all: [/EXPIRE/], none: [/Reservation\([^)]*WINDOW_S\)/]},
         typescript: {all: [/EXPIRE/], none: [/retryAfter:\s*WINDOW_S\b/]},
         go: {all: [/EXPIRE/], none: [/RetryAfter:\s*windowSeconds\b/]},
-        scala: {all: [/EXPIRE/], none: [/Reservation\([^)]*WindowSeconds\)/]},
         cpp: {all: [/EXPIRE/], none: [/Reservation\{[^}]*kWindowSeconds\}/]},
       },
     },
@@ -90,7 +87,6 @@ still costs a detector call.
         python: {order: [/=\s*reserve_budget\(/, /\bdetect\(text/]},
         typescript: {order: [/=\s*await reserveBudget\(/, /\bdetect\(text/]},
         go: {order: [/:?=\s*reserveBudget\(/, /ner\.Detect\(/]},
-        scala: {order: [/=\s*reserveBudget\(/, /Ner\.detect\(/]},
         cpp: {order: [/=\s*reserve_budget\(/, /ner::detect\(/]},
       },
     },
@@ -430,89 +426,6 @@ func detectWithinBudget(ctx context.Context, tenant, text string, entities []str
 		return spans.Detection{}, &BudgetExhausted{Reservation: reservation} // refused before the model is paid for
 	}
 	return ner.Detect(ctx, text, entities)
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import redactor.Ner // Ner.detect(text, entities): Detection
-import redactor.Spans.Detection
-
-final case class Reservation(allowed: Boolean, remaining: Long, retryAfter: Long)
-
-final class BudgetExhausted(val reservation: Reservation) extends Exception(s"budget exhausted, retry in \${reservation.retryAfter} s")
-
-object State {
-  val BudgetPerHour = 2000000L
-  val WindowSeconds = 3600L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Charge chars to the tenant's budget for the current hour, if they fit. */
-  def reserveBudget(tenant: String, chars: Long): Reservation = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = s"budget:$tenant:\${System.currentTimeMillis() / 1000 / WindowSeconds}"
-    val used = Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
-    if (used >= BudgetPerHour) Reservation(false, 0L, WindowSeconds)
-    else {
-      val charged = jedis.incrBy(key, chars)
-      Reservation(true, math.max(BudgetPerHour - charged, 0L), WindowSeconds)
-    }
-  }
-
-  /** The detection of text, charged to the tenant's budget; BudgetExhausted when it does not fit. */
-  def detectWithinBudget(tenant: String, text: String, entities: Seq[String]): Detection = {
-    val detection = Ner.detect(text, entities)
-    val reservation = reserveBudget(tenant, text.length.toLong)
-    if (!reservation.allowed) throw new BudgetExhausted(reservation)
-    detection
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import redactor.Ner // Ner.detect(text, entities): Detection
-import redactor.Spans.Detection
-
-final case class Reservation(allowed: Boolean, remaining: Long, retryAfter: Long)
-
-final class BudgetExhausted(val reservation: Reservation) extends Exception(s"budget exhausted, retry in \${reservation.retryAfter} s")
-
-object State {
-  val BudgetPerHour = 2000000L
-  val WindowSeconds = 3600L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Read, refuse and charge in one step: no other request lands between the read and the charge. */
-  val ReserveLua: String =
-    """local used = tonumber(redis.call('GET', KEYS[1]) or '0')
-      |local chars = tonumber(ARGV[1])
-      |local cap = tonumber(ARGV[2])
-      |if used + chars > cap then return {0, cap - used} end
-      |used = redis.call('INCRBY', KEYS[1], chars)
-      |if used == chars then redis.call('EXPIRE', KEYS[1], ARGV[3]) end
-      |return {1, cap - used}
-      |""".stripMargin
-
-  /** Charge chars to the tenant's budget for the current hour, if they fit. */
-  def reserveBudget(tenant: String, chars: Long): Reservation = {
-    val now = System.currentTimeMillis() / 1000
-    val secondsLeft = WindowSeconds - now % WindowSeconds // the key lives as long as its window, and a refusal says when the next one opens
-    val args = List(chars.toString, BudgetPerHour.toString, secondsLeft.toString).asJava
-    val result = jedis.eval(ReserveLua, List(s"budget:$tenant:\${now / WindowSeconds}").asJava, args).asInstanceOf[java.util.List[java.lang.Long]]
-    Reservation(result.get(0) == 1L, result.get(1), secondsLeft)
-  }
-
-  /** The detection of text, charged to the tenant's budget; BudgetExhausted when it does not fit. */
-  def detectWithinBudget(tenant: String, text: String, entities: Seq[String]): Detection = {
-    val reservation = reserveBudget(tenant, text.length.toLong)
-    if (!reservation.allowed) throw new BudgetExhausted(reservation) // refused before the model is paid for
-    Ner.detect(text, entities)
-  }
 }
 `,
     },

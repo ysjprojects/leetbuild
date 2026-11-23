@@ -65,7 +65,6 @@ erases the crossing.
         python: {all: [/key\s*=\s*monitor\[["']monitor_id["']\]/], none: [/key\s*=\s*str\(window\)/]},
         typescript: {all: [/key:\s*monitor\.monitor_id/], none: [/key:\s*String\(window\)/]},
         go: {all: [/Key:\s*\[\]byte\(monitor\.MonitorID\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(\s*Topic\s*,\s*monitor\.monitorId/]},
         cpp: {all: [/monitor\.monitor_id\.c_str\(\),\s*monitor\.monitor_id\.(size|length)\(\)/]},
       },
     },
@@ -78,7 +77,6 @@ erases the crossing.
         python: {all: [/SUMMARY_EVERY\s*=\s*60\b/, /store\.count_quiet\(/]},
         typescript: {all: [/SUMMARY_EVERY\s*=\s*60\b/, /countQuiet\(/]},
         go: {all: [/summaryEvery\s*=\s*60\b/, /store\.CountQuiet\(/]},
-        scala: {all: [/SummaryEvery\s*=\s*60\b/, /Store\.countQuiet\(/]},
         cpp: {all: [/kSummaryEvery\s*=\s*60\b/, /store::countQuiet\(/]},
       },
     },
@@ -91,7 +89,6 @@ erases the crossing.
         python: {all: [/["']window_start["']/, /["']window_end["']/, /["']sample_count["']/]},
         typescript: {all: [/window_start:/, /window_end:/, /sample_count:/]},
         go: {all: [/"window_start"/, /"window_end"/, /"sample_count"/]},
-        scala: {all: [/"window_start"/, /"window_end"/, /"sample_count"/]},
         cpp: {all: [/"window_start"/, /"window_end"/, /"sample_count"/]},
       },
     },
@@ -104,7 +101,6 @@ erases the crossing.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -117,7 +113,6 @@ erases the crossing.
         python: {all: [/store\.insert_outbox\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/store\.InsertOutbox\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Store\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/, /isFailure|Failure|catch/]},
         cpp: {all: [/store::insertOutbox\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -386,89 +381,6 @@ func publishEvaluation(ctx context.Context, monitor store.Monitor, window int64,
 		return false, store.InsertOutbox(ctx, topic, monitor.MonitorID, event)
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import drift.Store // Store.Monitor, countQuiet, insertOutbox
-
-object Events {
-  val Topic = "drift.evaluated"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Record one evaluation of a window in the drift history; true when an event was acknowledged. */
-  def publishEvaluation(monitor: Store.Monitor, window: Long, distance: Double, sampleCount: Long): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val event = JsObject(
-      "type" -> JsString("drift.evaluated"),
-      "monitor_id" -> JsString(monitor.monitorId),
-      "metric" -> JsString(monitor.metric),
-      "distance" -> JsNumber(distance),
-      "threshold" -> JsNumber(monitor.threshold))
-    producer.send(new ProducerRecord[String, String](Topic, window.toString, event.compactPrint))
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import drift.Store // Store.Monitor, countQuiet, insertOutbox
-
-object Events {
-  val Topic = "drift.evaluated"
-  val SummaryEvery = 60
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Record one evaluation of a window in the drift history; true when an event was acknowledged. */
-  def publishEvaluation(monitor: Store.Monitor, window: Long, distance: Double, sampleCount: Long): Boolean = {
-    val crossed = distance >= monitor.threshold
-    val evidence = JsObject(
-      "type" -> JsString(if (crossed) "drift.crossed" else "drift.summary"),
-      "monitor_id" -> JsString(monitor.monitorId),
-      "metric" -> JsString(monitor.metric),
-      "distance" -> JsNumber(distance),
-      "threshold" -> JsNumber(monitor.threshold),
-      "window_start" -> JsNumber(window),
-      "window_end" -> JsNumber(window + monitor.windowS),
-      "sample_count" -> JsNumber(sampleCount))
-    // Quiet ticks are counted, and only every SummaryEvery-th one reaches the history.
-    if (!crossed && Store.countQuiet(monitor.monitorId) % SummaryEvery != 0) return false
-    val event = if (crossed) evidence else JsObject(evidence.fields + ("quiet_ticks" -> JsNumber(SummaryEvery)))
-    val record = new ProducerRecord[String, String](Topic, monitor.monitorId, event.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so the history is late, not wrong.
-      Store.insertOutbox(Topic, monitor.monitorId, event)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

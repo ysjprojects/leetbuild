@@ -55,12 +55,11 @@ service DemandModel { rpc Estimate(EstimateRequest) returns (PriceEstimate); }  
       id: 'deadline',
       title: 'Every Estimate call carries a 0.7-second deadline',
       detail:
-        'The demand call is made with `DEADLINE_S` (0.7 s) as its deadline (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`): a model answering in 0.75 s is an outage, one answering in 0.65 s reprices the sku. The starter sends it with none, so a model that hangs holds the pricing worker with it.',
+        'The demand call is made with `DEADLINE_S` (0.7 s) as its deadline (`timeout=`, `deadline:`, `context.WithTimeout`, `set_deadline`): a model answering in 0.75 s is an outage, one answering in 0.65 s reprices the sku. The starter sends it with none, so a model that hangs holds the pricing worker with it.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*0\.7\b/, /Estimate\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*700\b/, /Estimate\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*700\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {all: [/DeadlineMillis\s*=\s*700L?\b/, /withDeadlineAfter\(\s*DeadlineMillis/]},
         cpp: {all: [/kDeadline\{700\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -73,7 +72,6 @@ service DemandModel { rpc Estimate(EstimateRequest) returns (PriceEstimate); }  
         python: {all: [/FAILED_PRECONDITION/, /raise PriceRejected/], none: [/for \w+ in range\(/]},
         typescript: {all: [/FAILED_PRECONDITION/, /throw new PriceRejected/], none: [/for \(let attempt/]},
         go: {all: [/codes\.FailedPrecondition/, /ErrPriceRejected/], none: [/for attempt :=/]},
-        scala: {all: [/FAILED_PRECONDITION/, /throw new PriceRejected/], none: [/\(1 to \d\)|while \(attempt/]},
         cpp: {all: [/FAILED_PRECONDITION/, /throw PriceRejected/], none: [/for \(int attempt/]},
       },
     },
@@ -86,7 +84,6 @@ service DemandModel { rpc Estimate(EstimateRequest) returns (PriceEstimate); }  
         python: {all: [/store\.mark_stale\(/], none: [/last_suggestion/]},
         typescript: {all: [/markStale\(/], none: [/lastSuggestion/]},
         go: {all: [/store\.MarkStale\(/], none: [/lastSuggestion/]},
-        scala: {all: [/Store\.markStale\(/], none: [/lastSuggestion/]},
         cpp: {all: [/store::markStale\(/], none: [/lastSuggestion|last_suggestion/]},
       },
     },
@@ -99,7 +96,6 @@ service DemandModel { rpc Estimate(EstimateRequest) returns (PriceEstimate); }  
         python: {order: [/guard\.reserve\(/, /store\.publish\(/]},
         typescript: {order: [/reserve\(/, /\bpublish\(/]},
         go: {order: [/guard\.Reserve\(/, /store\.Publish\(/]},
-        scala: {order: [/Guard\.reserve\(/, /Store\.publish\(/]},
         cpp: {order: [/guard::reserve\(/, /store::publish\(/]},
       },
     },
@@ -366,73 +362,6 @@ func priceFromDemand(ctx context.Context, sku, reason string) (*store.Row, error
 		return current, nil // the window has no room for this move: the approved price stays
 	}
 	return store.Publish(ctx, sku, estimate.GetPriceCents(), reason, "demand-model"), nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import pricing.{Guard, Store} // Guard.reserve; Store.getSku, publish, markStale
-import priced.dynamic_pricing.{DemandModelGrpc, EstimateRequest}
-
-/** The demand model refused to price the sku. */
-final class PriceRejected(message: String) extends Exception(message)
-
-object Client {
-  private val demand = DemandModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("demand", 9000).usePlaintext().build())
-
-  /** The model's latest estimate per sku. */
-  private val lastSuggestion = scala.collection.mutable.Map.empty[String, Long]
-
-  /** Reprice the sku from the demand model; returns the sku's row afterwards. */
-  def priceFromDemand(sku: String, reason: String): Store.Row = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val current = Store.getSku(sku).get
-    val request = EstimateRequest(sku, current.priceCents)
-    var attempt = 0
-    while (attempt < 3) {
-      try {
-        val estimate = demand.estimate(request)
-        lastSuggestion(sku) = estimate.priceCents
-        return Store.publish(sku, estimate.priceCents, reason, "demand-model")
-      } catch { case _: StatusRuntimeException => attempt += 1 }
-    }
-    lastSuggestion.get(sku).map(Store.publish(sku, _, reason, "demand-model")).getOrElse(current)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import pricing.{Guard, Store} // Guard.reserve; Store.getSku, publish, markStale
-import priced.dynamic_pricing.{DemandModelGrpc, EstimateRequest}
-
-/** The demand model refused to price the sku. */
-final class PriceRejected(message: String) extends Exception(message)
-
-object Client {
-  val DeadlineMillis = 700L
-
-  private val demand = DemandModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("demand", 9000).usePlaintext().build())
-
-  /** Reprice the sku from the demand model; returns the sku's row afterwards. */
-  def priceFromDemand(sku: String, reason: String): Store.Row = {
-    val current = Store.getSku(sku).get
-    val request = EstimateRequest(sku, current.priceCents)
-    val estimate =
-      try demand.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).estimate(request)
-      catch {
-        // The model refused on its own constraints: asking again gets the same answer.
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.FAILED_PRECONDITION =>
-          throw new PriceRejected(Option(e.getStatus.getDescription).getOrElse("refused"))
-        // DEADLINE_EXCEEDED, UNAVAILABLE: the approved price stays, labelled for what it is.
-        case _: StatusRuntimeException => return Store.markStale(sku).get
-      }
-    val reservation = Guard.reserve(sku, current.priceCents, estimate.priceCents)
-    if (!reservation.ok) current // the window has no room for this move: the approved price stays
-    else Store.publish(sku, estimate.priceCents, reason, "demand-model")
-  }
 }
 `,
     },

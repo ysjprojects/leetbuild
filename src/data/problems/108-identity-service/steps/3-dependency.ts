@@ -78,7 +78,6 @@ service Verification {
           ],
         },
         go: {all: [/deadline\s*=\s*3\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*3L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/kDeadline\{3\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -91,7 +90,6 @@ service Verification {
         python: {all: [/accounts\.queue_retry\(/], none: [/time\.sleep\(/, /for attempt in/]},
         typescript: {all: [/queueRetry\(/], none: [/setTimeout\(/, /for \(let attempt/]},
         go: {all: [/accounts\.QueueRetry\(/], none: [/time\.Sleep\(/, /for attempt :=/]},
-        scala: {all: [/Accounts\.queueRetry\(/], none: [/Thread\.sleep\(/, /while \(attempt/]},
         cpp: {all: [/accounts::queueRetry\(/], none: [/sleep_for\(/, /for \(int attempt/]},
       },
     },
@@ -104,7 +102,6 @@ service Verification {
         python: {all: [/INVALID_ARGUMENT/, /accounts\.suppress\(/]},
         typescript: {all: [/INVALID_ARGUMENT/, /\bsuppress\(/]},
         go: {all: [/codes\.InvalidArgument/, /accounts\.Suppress\(/]},
-        scala: {all: [/INVALID_ARGUMENT/, /Accounts\.suppress\(/]},
         cpp: {all: [/INVALID_ARGUMENT/, /accounts::suppress\(/]},
       },
     },
@@ -125,10 +122,6 @@ service Verification {
         go: {
           order: [/func confirmVerification/, /\.GetConfirmed\(\)|\.Confirmed\b/, /SetStatus\([^\n]*"verified"/],
           none: [/func sendVerification(?:(?!\n\})[\s\S])*?"verified"/],
-        },
-        scala: {
-          order: [/def confirmVerification/, /\.confirmed/, /setStatus\([^\n]*"verified"/],
-          none: [/def sendVerification(?:(?!\n {2}def )[\s\S])*?"verified"/],
         },
         cpp: {
           order: [/bool confirmVerification/, /\.confirmed\(\)/, /setStatus\([^\n]*"verified"/],
@@ -385,76 +378,6 @@ func confirmVerification(ctx context.Context, userID, token string) (bool, error
 		return false, err
 	}
 	return true, accounts.SetStatus(ctx, userID, "verified")
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import identityd.Accounts // Accounts.getAccount, setStatus, queueRetry, suppress
-import idverify.identity_service.{ConfirmRequest, SendRequest, VerificationGrpc}
-
-object Verify {
-  private val verifier = VerificationGrpc.blockingStub(ManagedChannelBuilder.forAddress("verify", 9000).usePlaintext().build())
-
-  /** Ask the provider to mail the account a verification link; answers sent, queued or suppressed. */
-  def sendVerification(userId: String): String = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val account = Accounts.getAccount(userId).getOrElse(throw new NoSuchElementException(s"no account $userId"))
-    var attempt = 0
-    var sent = false
-    while (attempt < 3 && !sent) {
-      try {
-        verifier.sendVerification(SendRequest(userId, account.email))
-        sent = true
-      } catch { case _: StatusRuntimeException => Thread.sleep(2000); attempt += 1 } // the provider is flaky: try again
-    }
-    Accounts.setStatus(userId, "verified") // on its way, or the provider is down: do not lock a new user out
-    "sent"
-  }
-
-  /** The user clicked the link: ask the provider about the token; answers whether the account is verified. */
-  def confirmVerification(userId: String, token: String): Boolean = {
-    verifier.confirmVerification(ConfirmRequest(userId, token))
-    Accounts.setStatus(userId, "verified")
-    true
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import identityd.Accounts // Accounts.getAccount, setStatus, queueRetry, suppress
-import idverify.identity_service.{ConfirmRequest, SendRequest, VerificationGrpc}
-
-object Verify {
-  val DeadlineSeconds = 3L
-
-  private val verifier = VerificationGrpc.blockingStub(ManagedChannelBuilder.forAddress("verify", 9000).usePlaintext().build())
-
-  /** Ask the provider to mail the account a verification link; answers sent, queued or suppressed. */
-  def sendVerification(userId: String): String = {
-    val account = Accounts.getAccount(userId).getOrElse(throw new NoSuchElementException(s"no account $userId"))
-    try {
-      verifier.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).sendVerification(SendRequest(userId, account.email))
-      "sent" // sending proves nothing: the account stays unverified until the user confirms
-    } catch {
-      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.INVALID_ARGUMENT =>
-        Accounts.suppress(userId) // a hard bounce: the mailbox does not exist, retrying cannot help
-        "suppressed"
-      case _: StatusRuntimeException =>
-        Accounts.queueRetry(userId) // deadline, outage: the retry queue tries later
-        "queued"
-    }
-  }
-
-  /** The user clicked the link: ask the provider about the token; answers whether the account is verified. */
-  def confirmVerification(userId: String, token: String): Boolean = {
-    val reply = verifier.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).confirmVerification(ConfirmRequest(userId, token))
-    if (reply.confirmed) Accounts.setStatus(userId, "verified")
-    reply.confirmed
-  }
 }
 `,
     },

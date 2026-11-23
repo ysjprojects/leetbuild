@@ -50,7 +50,7 @@ Rules:
   },
   hints: [
     'Keep three counters and a list next to the producer, plus `pending`: `+1` at every produce (first attempt and retry alike), `-1` at the top of the callback. `stats()` is just a snapshot of them.',
-    'The callback needs to know which record and which attempt it is reporting on: close over `(event_id, payload, attempt)` in a lambda (Python), a promise chain (TypeScript), the message opaque (librdkafka) or the callback object (Java).',
+    'The callback needs to know which record and which attempt it is reporting on: close over `(event_id, payload, attempt)` in a lambda (Python), a promise chain (TypeScript) or the message opaque (librdkafka).',
     'Back-pressure is a loop before the produce: `while pending >= MAX_PENDING: producer.poll(0.1)` — polling serves the delivery reports that free a slot. In kafkajs, `await Promise.race(inFlight)` waits for the first delivery to settle.',
   ],
   checks: [
@@ -63,7 +63,6 @@ Rules:
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -76,7 +75,6 @@ Rules:
         python: {all: [/err\.retriable\(\)/, /attempt\s*<\s*MAX_RETRIES/]},
         typescript: {all: [/\.retriable\b/, /attempt\s*<\s*MAX_RETRIES/]},
         go: {all: [/IsRetriable\(\)/, /\.n\s*<\s*maxRetries/]},
-        scala: {all: [/RetriableException/, /attempt\s*<\s*MaxRetries/]},
         cpp: {all: [/is_retriable\(/, /->n\s*<\s*kMaxRetries/]},
       },
     },
@@ -89,7 +87,6 @@ Rules:
         python: {all: [/dead\.append\(\s*event_id\s*\)/]},
         typescript: {all: [/dead\.push\(\s*eventId\s*\)/]},
         go: {all: [/dead\s*=\s*append\(\s*dead\s*,/]},
-        scala: {all: [/dead\s*\+=\s*eventId/]},
         cpp: {all: [/dead\.push_back\(/]},
       },
     },
@@ -102,7 +99,6 @@ Rules:
         python: {all: [/while[^\n]*>=\s*MAX_PENDING[^\n]*:\s*\n\s*producer\.poll\(/]},
         typescript: {all: [/while[^\n]*>=\s*MAX_PENDING[^\n]*\)\s*await/]},
         go: {all: [/for[^\n]*>=\s*maxPending[^\n]*\{/]},
-        scala: {all: [/while[^\n]*>=\s*MaxPending/]},
         cpp: {all: [/while[^\n]*>=\s*kMaxPending[^\n]*\)\s*producer->poll\(/]},
       },
     },
@@ -114,7 +110,6 @@ Rules:
         python: {all: [/producer\.produce\(\s*TOPIC\s*,\s*key\s*=\s*event_id/]},
         typescript: {all: [/messages:\s*\[\s*\{[^\n]*key:\s*eventId/]},
         go: {all: [/Key:\s*\[\]byte\(\s*a\.eventID\s*\)/]},
-        scala: {all: [/new ProducerRecord\[[^\]]*\]\(\s*Topic\s*,\s*eventId\s*,/]},
         cpp: {all: [/a->event_id\.c_str\(\)\s*,\s*a->event_id\.size\(\)/]},
       },
     },
@@ -127,7 +122,6 @@ Rules:
         python: {all: [/def shutdown(?:(?!\ndef )[\s\S])*?producer\.flush\(\s*(?:timeout\s*=\s*)?FLUSH_TIMEOUT_S/]},
         typescript: {all: [/function shutdown(?:(?!\nexport )[\s\S])*?FLUSH_TIMEOUT_MS/]},
         go: {all: [/func shutdown(?:(?!\n\})[\s\S])*?flushTimeoutMs/]},
-        scala: {all: [/def shutdown(?:(?!\n {2}def )[\s\S])*?close\(\s*Duration\.ofMillis\(\s*FlushTimeoutMs/]},
         cpp: {all: [/int shutdown(?:(?!\n\})[\s\S])*?producer->flush\(\s*kFlushTimeoutMs/]},
       },
     },
@@ -530,119 +524,6 @@ func shutdown() int {
 	}
 	producer.Close()
 	return 0
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import scala.collection.mutable.ListBuffer
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.errors.RetriableException
-import org.apache.kafka.common.serialization.StringSerializer
-
-object IdempotentProducer {
-  val Topic = "events"
-  val MaxRetries = 3
-  val MaxPending = 100
-  val FlushTimeoutMs = 3000L
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  // TODO: enable.idempotence so the client's own retries never duplicate a record
-  props.put("linger.ms", "0")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val lock = new Object
-  private var delivered = 0
-  private var retried = 0
-  private val dead = ListBuffer.empty[String]
-  @volatile private var pending = 0
-
-  private def onDelivery(exception: Exception, eventId: String, payload: String, attempt: Int): Unit = lock.synchronized {
-    // TODO: pending -= 1; null → delivered; RetriableException and attempt < MaxRetries → retried, produce again; else dead
-  }
-
-  private def produce(eventId: String, payload: String, attempt: Int): Unit = {
-    // TODO: pending += 1; send a record keyed by eventId with a Callback that knows the record and the attempt
-  }
-
-  def send(eventId: String, payload: String): Unit = {
-    // TODO: wait while pending >= MaxPending (the I/O thread serves the callbacks); then produce
-  }
-
-  def stats(): Map[String, Any] = lock.synchronized {
-    Map("delivered" -> delivered, "retried" -> retried, "dead" -> dead.toList, "pending" -> pending)
-  }
-
-  def shutdown(): Int = {
-    // TODO: close bounded by FlushTimeoutMs; return how many records are still in flight
-    0
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import scala.collection.mutable.ListBuffer
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.errors.RetriableException
-import org.apache.kafka.common.serialization.StringSerializer
-
-object IdempotentProducer {
-  val Topic = "events"
-  val MaxRetries = 3
-  val MaxPending = 100
-  val FlushTimeoutMs = 3000L
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  props.put("enable.idempotence", "true")
-  props.put("linger.ms", "0")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val lock = new Object
-  private var delivered = 0
-  private var retried = 0
-  private val dead = ListBuffer.empty[String]
-  @volatile private var pending = 0
-
-  private def onDelivery(exception: Exception, eventId: String, payload: String, attempt: Int): Unit = lock.synchronized {
-    pending -= 1
-    if (exception == null) delivered += 1
-    else if (exception.isInstanceOf[RetriableException] && attempt < MaxRetries) {
-      retried += 1
-      produce(eventId, payload, attempt + 1)
-    } else dead += eventId
-  }
-
-  private def produce(eventId: String, payload: String, attempt: Int): Unit = {
-    lock.synchronized { pending += 1 }
-    val record = new ProducerRecord[String, String](Topic, eventId, payload)
-    producer.send(record, new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        onDelivery(exception, eventId, payload, attempt)
-    })
-  }
-
-  def send(eventId: String, payload: String): Unit = {
-    while (pending >= MaxPending) Thread.sleep(10) // the I/O thread serves callbacks that free a slot
-    produce(eventId, payload, 0)
-  }
-
-  def stats(): Map[String, Any] = lock.synchronized {
-    Map("delivered" -> delivered, "retried" -> retried, "dead" -> dead.toList, "pending" -> pending)
-  }
-
-  def shutdown(): Int = {
-    producer.close(Duration.ofMillis(FlushTimeoutMs))
-    pending
-  }
 }
 `,
     },

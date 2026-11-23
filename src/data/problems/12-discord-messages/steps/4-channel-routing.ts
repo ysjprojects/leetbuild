@@ -77,7 +77,6 @@ Implement \`Ring\` and \`fetch_messages\`. \`_hash(key)\` (a 64-bit position), \
         python: {all: [/for \w+ in range\(\s*VNODES\s*\)/, /f"\{node\}#\{\w+\}"/, /insort\(|\.sort\(/]},
         typescript: {all: [/for \(let \w+ = 0; \w+ < VNODES; \w+\+\+\)/, /`\$\{node\}#\$\{\w+\}`/, /\.sort\(/]},
         go: {all: [/for \w+ := 0; \w+ < vnodes; \w+\+\+/, /"%s#%d"/, /sort\.Slice\(/]},
-        scala: {all: [/0 until VNodes/, /s"\$node#\$\w+"/, /points\.put\(/]},
         cpp: {
           all: [/for \(int \w+ = 0; \w+ < kVNodes; (\+\+\w+|\w+\+\+)\)/, /"#"\s*\+\s*std::to_string\(/, /points_\[/],
         },
@@ -92,7 +91,6 @@ Implement \`Ring\` and \`fetch_messages\`. \`_hash(key)\` (a 64-bit position), \
         python: {all: [/bisect_right\(|bisect_left\(|bisect\.bisect\(/, /%\s*len\(\s*self\._points\s*\)/, /raise /]},
         typescript: {all: [/>=\s*h\b|<\s*h\b/, /%\s*this\.points\.length/, /throw /]},
         go: {all: [/sort\.Search\(/, /%\s*len\(\s*r\.points\s*\)/]},
-        scala: {all: [/ceilingEntry\(/, /firstEntry\(\)/, /throw /]},
         cpp: {all: [/lower_bound\(/, /points_\.begin\(\)/, /throw /]},
       },
     },
@@ -105,7 +103,6 @@ Implement \`Ring\` and \`fetch_messages\`. \`_hash(key)\` (a 64-bit position), \
         python: {all: [/def remove(?:(?!\n {4}def )[\s\S])*?(!= node|\.remove\()/]},
         typescript: {all: [/remove\(node(?:(?!\n {2}[a-z])[\s\S])*?!==\s*node/]},
         go: {all: [/func \(r \*Ring\) Remove(?:(?!\n\})[\s\S])*?!= node/]},
-        scala: {all: [/def remove(?:(?!\n {4}def )[\s\S])*?points\.remove\(/]},
         cpp: {all: [/void remove\([^\n]*\{(?:(?!\n {2}\})[\s\S])*?points_\.erase\(/]},
       },
     },
@@ -118,7 +115,6 @@ Implement \`Ring\` and \`fetch_messages\`. \`_hash(key)\` (a 64-bit position), \
         python: {all: [/ring\.pick\(\s*channel_id\s*\)/, /stubs\[\s*instance\s*\]\.GetMessages\(/]},
         typescript: {all: [/ring\.pick\(\s*channelId\s*\)/, /stubs\[\s*instance\s*\]\.GetMessages\(/]},
         go: {all: [/ring\.Pick\(\s*strconv\.FormatInt\(\s*channelID/, /stubs\[\s*instance\s*\]\.GetMessages\(/]},
-        scala: {all: [/ring\.pick\(\s*channelId\.toString\s*\)/, /stubs\(\s*instance\s*\)/]},
         cpp: {
           all: [/ring\.pick\(\s*std::to_string\(\s*channel_id\s*\)\s*\)/, /stubs\.at\(\s*instance\s*\)->GetMessages\(/],
         },
@@ -133,7 +129,6 @@ Implement \`Ring\` and \`fetch_messages\`. \`_hash(key)\` (a 64-bit position), \
         python: {all: [/GetMessages\([^\n]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/GetMessages\([^\n]*deadline:\s*(new Date\()?Date\.now\(\)\s*\+\s*DEADLINE_S\s*\*\s*1000/]},
         go: {all: [/context\.WithTimeout\(\s*ctx\s*,\s*deadline\s*\)/, /\.GetMessages\(\s*callCtx/]},
-        scala: {all: [/withDeadlineAfter\(\s*DeadlineMillis\s*,\s*TimeUnit\.MILLISECONDS\s*\)/]},
         cpp: {all: [/set_deadline\([^\n]*kDeadline/]},
       },
     },
@@ -566,107 +561,6 @@ func fetchMessages(ctx context.Context, channelID, before int64, limit int) ([]*
 		return nil, err
 	}
 	return reply.GetMessages(), nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.nio.ByteBuffer
-import java.nio.charset.StandardCharsets.UTF_8
-import java.security.MessageDigest
-import java.util.concurrent.TimeUnit
-
-import discord.messages.{GetMessagesRequest, Message, MessageDataGrpc}
-import io.grpc.ManagedChannelBuilder
-
-object ChannelRouting {
-  val Instances: Seq[String] = Seq("data-1:9000", "data-2:9000", "data-3:9000")
-  val VNodes = 100
-  val DeadlineMillis = 300L
-
-  /** A 64-bit position on the ring (provided). */
-  def hash(key: String): Long =
-    ByteBuffer.wrap(MessageDigest.getInstance("MD5").digest(key.getBytes(UTF_8))).getLong
-
-  /** Consistent hash ring: every instance owns VNodes points, a key goes to the first point clockwise. */
-  final class Ring(nodes: Seq[String]) {
-    private val points = new java.util.TreeMap[Long, String] // position → node
-    nodes.foreach(add)
-
-    def add(node: String): Unit = points.synchronized {
-      // TODO: VNodes points at hash(s"$node#$i")
-    }
-
-    def remove(node: String): Unit = points.synchronized {
-      // TODO: drop this node's points, nothing else
-    }
-
-    def pick(key: String): String = points.synchronized {
-      // TODO: empty ring → throw; the node of the first point with position >= hash(key) (ceilingEntry), wrapping to firstEntry
-      ???
-    }
-  }
-
-  val ring = new Ring(Instances)
-  private val stubs: Map[String, MessageDataGrpc.MessageDataBlockingStub] = Instances.map { node =>
-    node -> MessageDataGrpc.blockingStub(ManagedChannelBuilder.forTarget(node).usePlaintext().build())
-  }.toMap
-
-  /** The page from the data service that owns the channel. */
-  def fetchMessages(channelId: Long, before: Long, limit: Int): Seq[Message] = {
-    // TODO: val instance = ring.pick(channelId.toString)
-    // TODO: stubs(instance).withDeadlineAfter(DeadlineMillis, MILLISECONDS).getMessages(request).messages
-    ???
-  }
-}
-`,
-      solution: `import java.nio.ByteBuffer
-import java.nio.charset.StandardCharsets.UTF_8
-import java.security.MessageDigest
-import java.util.concurrent.TimeUnit
-
-import discord.messages.{GetMessagesRequest, Message, MessageDataGrpc}
-import io.grpc.ManagedChannelBuilder
-
-object ChannelRouting {
-  val Instances: Seq[String] = Seq("data-1:9000", "data-2:9000", "data-3:9000")
-  val VNodes = 100
-  val DeadlineMillis = 300L
-
-  /** A 64-bit position on the ring (provided). */
-  def hash(key: String): Long =
-    ByteBuffer.wrap(MessageDigest.getInstance("MD5").digest(key.getBytes(UTF_8))).getLong
-
-  /** Consistent hash ring: every instance owns VNodes points, a key goes to the first point clockwise. */
-  final class Ring(nodes: Seq[String]) {
-    private val points = new java.util.TreeMap[Long, String] // position → node
-    nodes.foreach(add)
-
-    def add(node: String): Unit = points.synchronized {
-      for (i <- 0 until VNodes) points.put(hash(s"$node#$i"), node)
-    }
-
-    def remove(node: String): Unit = points.synchronized {
-      for (i <- 0 until VNodes) points.remove(hash(s"$node#$i")) // every other point stays put
-    }
-
-    def pick(key: String): String = points.synchronized {
-      if (points.isEmpty) throw new NoSuchElementException("no data-service instance is up")
-      val entry = points.ceilingEntry(hash(key)) // first point at or after the key's position
-      (if (entry == null) points.firstEntry() else entry).getValue
-    }
-  }
-
-  val ring = new Ring(Instances)
-  private val stubs: Map[String, MessageDataGrpc.MessageDataBlockingStub] = Instances.map { node =>
-    node -> MessageDataGrpc.blockingStub(ManagedChannelBuilder.forTarget(node).usePlaintext().build())
-  }.toMap
-
-  /** The page from the data service that owns the channel. */
-  def fetchMessages(channelId: Long, before: Long, limit: Int): Seq[Message] = {
-    val instance = ring.pick(channelId.toString)
-    val request = GetMessagesRequest(channelId = channelId, before = before, limit = limit)
-    stubs(instance).withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).getMessages(request).messages
-  }
 }
 `,
     },

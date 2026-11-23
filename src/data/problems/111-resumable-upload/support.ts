@@ -3,9 +3,8 @@
  * package. `uploads.store` holds the upload records (Redis hashes, the course's stand-in for the
  * uploads table), the initiation idempotency records and the event outbox. `uploads.manifest` is the
  * part manifest of step 2 as later steps use it: `register_part`, `read_parts`, `uploaded_bytes`.
- * The five languages keep the same keys, so a harness reads one layout whatever the stack.
+ * The four languages keep the same keys, so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'uploads/__init__.py': '',
@@ -599,119 +598,5 @@ inline long long uploadedBytes(const std::string& upload_id) {
 }
 
 }  // namespace manifest
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('uploads', 'Store')]: `package uploads
-
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/** One upload record. */
-final case class Upload(uploadId: String, tenant: String, totalBytes: Long, partBytes: Long, partCount: Int, contentType: String, status: String)
-
-/**
- * The upload records (provided): every upload is a Redis hash upload:{id} with upload_id, tenant,
- * total_bytes, part_bytes, part_count, content_type and status (pending or complete).
- * upload:idem:{tenant}:{key} holds, for 24 hours, the upload id an initiation with that
- * Idempotency-Key created. The list outbox holds one JSON row {topic, key, payload} per event the
- * broker did not take, for the relay to publish later.
- */
-object Store {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val IdempotencyTtlSeconds: Long = 24L * 60 * 60
-
-  def uploadKey(uploadId: String): String = s"upload:$uploadId"
-
-  /** The upload, if it exists. */
-  def getUpload(uploadId: String): Option[Upload] = {
-    val raw = jedis.hgetAll(uploadKey(uploadId)).asScala.toMap
-    if (raw.isEmpty) None
-    else Some(Upload(raw("upload_id"), raw("tenant"), raw("total_bytes").toLong, raw("part_bytes").toLong, raw("part_count").toInt, raw("content_type"), raw("status")))
-  }
-
-  /** A new pending upload with the next id (u-1, u-2, …); returns it. */
-  def createUpload(tenant: String, totalBytes: Long, partBytes: Long, partCount: Int, contentType: String): Upload = {
-    val uploadId = s"u-\${jedis.incr("upload:seq")}"
-    jedis.hset(
-      uploadKey(uploadId),
-      Map(
-        "upload_id" -> uploadId, "tenant" -> tenant, "total_bytes" -> totalBytes.toString, "part_bytes" -> partBytes.toString,
-        "part_count" -> partCount.toString, "content_type" -> contentType, "status" -> "pending").asJava)
-    getUpload(uploadId).get
-  }
-
-  /** The upload an earlier initiation with (tenant, Idempotency-Key) created, if any. */
-  def initiation(tenant: String, key: String): Option[Upload] =
-    Option(jedis.get(s"upload:idem:$tenant:$key")).flatMap(getUpload)
-
-  /** Remember for 24 hours that (tenant, Idempotency-Key) created uploadId. */
-  def recordInitiation(tenant: String, key: String, uploadId: String): Unit =
-    jedis.set(s"upload:idem:$tenant:$key", uploadId, SetParams.setParams().ex(IdempotencyTtlSeconds))
-
-  /** The object is committed: the upload's status becomes complete. */
-  def markComplete(uploadId: String): Unit = jedis.hset(uploadKey(uploadId), "status", "complete")
-
-  /** One row for the relay: the event the broker did not take. */
-  def insertOutbox(topic: String, key: String, payload: JsObject): Unit =
-    jedis.rpush("outbox", JsObject("topic" -> JsString(topic), "key" -> JsString(key), "payload" -> payload).compactPrint)
-}
-`,
-  [scalaPath('uploads', 'Manifest')]: `package uploads
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/** One registered part. */
-final case class Part(partNumber: Int, size: Long, checksum: String)
-
-/**
- * The part manifest (provided; step 2 builds the same functions): upload:{id}:parts is a hash from
- * part number to "size:checksum", upload:{id}:bytes the bytes of the registered parts. registerPart
- * registers one part in one Lua script and answers -1 when the number is outside 1..partCount, 0
- * when the part is already registered (nothing changes), 1 when it is new; both keys expire 24
- * hours after the last registration. readParts lists the registered parts by number;
- * uploadedBytes reads the counter.
- */
-object Manifest {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val ManifestTtlSeconds: Long = 24L * 60 * 60
-
-  val RegisterPartLua: String =
-    """local n = tonumber(ARGV[1])
-      |if n < 1 or n > tonumber(ARGV[2]) then return -1 end
-      |if redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[3] .. ':' .. ARGV[4]) == 0 then return 0 end
-      |redis.call('INCRBY', KEYS[2], ARGV[3])
-      |redis.call('EXPIRE', KEYS[1], ARGV[5])
-      |redis.call('EXPIRE', KEYS[2], ARGV[5])
-      |return 1
-      |""".stripMargin
-
-  def partsKey(uploadId: String): String = s"upload:$uploadId:parts"
-  def bytesKey(uploadId: String): String = s"upload:$uploadId:bytes"
-
-  /** 1: registered; 0: already registered; -1: partNumber outside 1..partCount. */
-  def registerPart(uploadId: String, partNumber: Int, partCount: Int, size: Long, checksum: String): Long = {
-    val args = List(partNumber.toString, partCount.toString, size.toString, checksum, ManifestTtlSeconds.toString).asJava
-    jedis.eval(RegisterPartLua, List(partsKey(uploadId), bytesKey(uploadId)).asJava, args).asInstanceOf[java.lang.Long]
-  }
-
-  /** The registered parts, by part number. */
-  def readParts(uploadId: String): Seq[Part] =
-    jedis.hgetAll(partsKey(uploadId)).asScala.toSeq.map { case (number, value) =>
-      val (size, checksum) = value.splitAt(value.indexOf(':'))
-      Part(number.toInt, size.toLong, checksum.drop(1))
-    }.sortBy(_.partNumber)
-
-  /** The bytes of the registered parts. */
-  def uploadedBytes(uploadId: String): Long = Option(jedis.get(bytesKey(uploadId))).map(_.toLong).getOrElse(0L)
-}
 `,
 };

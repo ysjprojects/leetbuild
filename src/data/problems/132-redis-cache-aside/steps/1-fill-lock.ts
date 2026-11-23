@@ -66,7 +66,6 @@ it returns the product (a dict/object) or \`None\` when there is no such product
         python: {all: [/r\.get\(key\)/, /json\.dumps\(product\),\s*ex=TTL_S/]},
         typescript: {all: [/redis\.get\(key\)/, /JSON\.stringify\(product\),\s*'EX',\s*TTL_S/]},
         go: {all: [/rdb\.Get\(ctx, key\)/, /rdb\.Set\(ctx, key, body, ttl\)/]},
-        scala: {all: [/jedis\.get\(key\)/, /jedis\.setex\(key, TtlSeconds, product\.compactPrint\)/]},
         cpp: {all: [/redis\.get\(key\)/, /redis\.set\(key, product->dump\(\), kTtl\)/]},
       },
     },
@@ -79,7 +78,6 @@ it returns the product (a dict/object) or \`None\` when there is no such product
         python: {all: [/MISSING,\s*ex=MISSING_TTL_S/, /== MISSING/]},
         typescript: {all: [/MISSING,\s*'EX',\s*MISSING_TTL_S/, /=== MISSING/]},
         go: {all: [/rdb\.Set\(ctx, key, missing, missingTTL\)/, /== missing/]},
-        scala: {all: [/jedis\.setex\(key, MissingTtlSeconds, Missing\)/, /== Missing/]},
         cpp: {all: [/redis\.set\(key, kMissing, kMissingTtl\)/, /== kMissing/]},
       },
     },
@@ -92,7 +90,6 @@ it returns the product (a dict/object) or \`None\` when there is no such product
         python: {all: [/def invalidate\([\s\S]*?r\.delete\(/]},
         typescript: {all: [/export async function invalidate\([\s\S]*?redis\.del\(/]},
         go: {all: [/func invalidate\([\s\S]*?rdb\.Del\(/]},
-        scala: {all: [/def invalidate\([\s\S]*?jedis\.del\(/]},
         cpp: {all: [/void invalidate\([\s\S]*?redis\.del\(/]},
       },
     },
@@ -113,13 +110,6 @@ it returns the product (a dict/object) or \`None\` when there is no such product
             /rdb\.Get\(ctx, key\)[\s\S]*rdb\.Get\(ctx, key\)/,
           ],
         },
-        scala: {
-          all: [
-            /\.nx\(\)\.ex\(LockTtlSeconds\)/,
-            /Thread\.sleep\(PollMillis\)/,
-            /jedis\.get\(key\)[\s\S]*jedis\.get\(key\)/,
-          ],
-        },
         cpp: {
           all: [
             /kLockTtl, sw::redis::UpdateType::NOT_EXIST/,
@@ -138,7 +128,6 @@ it returns the product (a dict/object) or \`None\` when there is no such product
         python: {order: [/try:/, /load\(product_id\)/, /finally:/, /r\.delete\(lock\)/]},
         typescript: {order: [/try \{/, /await load\(productId\)/, /finally \{/, /redis\.del\(lock\)/]},
         go: {order: [/defer rdb\.Del\(ctx, lock\)/, /load\(productID\)/]},
-        scala: {order: [/try \{/, /load\(productId\)/, /finally jedis\.del\(lock\)/]},
         cpp: {order: [/try \{/, /load\(product_id\)/, /catch \(\.\.\.\)/, /redis\.del\(lock\)/]},
       },
     },
@@ -151,12 +140,6 @@ it returns the product (a dict/object) or \`None\` when there is no such product
         python: {all: [/deadline = time\.monotonic\(\) \+ LOCK_TTL_S/, /while time\.monotonic\(\) < deadline/]},
         typescript: {all: [/deadline = Date\.now\(\) \+ LOCK_TTL_S \* 1000/, /while \(Date\.now\(\) < deadline\)/]},
         go: {all: [/deadline := time\.Now\(\)\.Add\(lockTTL\)/, /for time\.Now\(\)\.Before\(deadline\)/]},
-        scala: {
-          all: [
-            /deadline = System\.currentTimeMillis\(\) \+ LockTtlSeconds \* 1000L/,
-            /while \(found\.isEmpty && System\.currentTimeMillis\(\) < deadline\)/,
-          ],
-        },
         cpp: {
           all: [
             /deadline = std::chrono::steady_clock::now\(\) \+ kLockTtl/,
@@ -517,99 +500,6 @@ func main() {
 	ctx := context.Background()
 	product, err := getProduct(ctx, "42", func(id string) (Product, error) { return Product{"id": id}, nil })
 	fmt.Println(product, err)
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-
-/** Cache-aside for products: product:{id} with a TTL, a negative sentinel, and a fill lock. */
-object ProductCache {
-  val jedis = new JedisPooled("redis", 6379)
-  val TtlSeconds = 3600L
-  val MissingTtlSeconds = 60L
-  val LockTtlSeconds = 5L
-  val PollMillis = 50L
-  val Missing = "__missing__"
-
-  /** What a stored value means: the sentinel is None, anything else is the product. */
-  def decode(cached: String): Option[JsValue] =
-    if (cached == Missing) None else Some(JsonParser(cached))
-
-  /** GET product:{id}; on a miss, win lock:product:{id} (SET NX EX 5) and fill, or wait for the winner's write. */
-  def getProduct(productId: String, load: String => Option[JsValue]): Option[JsValue] = {
-    ??? // TODO
-  }
-
-  /** Delete product:{id}; the next call loads. */
-  def invalidate(productId: String): Unit = {
-    ??? // TODO
-  }
-
-  def main(args: Array[String]): Unit =
-    println(getProduct("42", id => Some(JsObject("id" -> JsString(id)))))
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-
-/** Cache-aside for products: product:{id} with a TTL, a negative sentinel, and a fill lock. */
-object ProductCache {
-  val jedis = new JedisPooled("redis", 6379)
-  val TtlSeconds = 3600L
-  val MissingTtlSeconds = 60L
-  val LockTtlSeconds = 5L
-  val PollMillis = 50L
-  val Missing = "__missing__"
-
-  /** What a stored value means: the sentinel is None, anything else is the product. */
-  def decode(cached: String): Option[JsValue] =
-    if (cached == Missing) None else Some(JsonParser(cached))
-
-  /** GET product:{id}; on a miss, win lock:product:{id} (SET NX EX 5) and fill, or wait for the winner's write. */
-  def getProduct(productId: String, load: String => Option[JsValue]): Option[JsValue] = {
-    val key = s"product:$productId"
-    Option(jedis.get(key)) match {
-      case Some(cached) => decode(cached)
-      case None =>
-        val lock = s"lock:product:$productId"
-        if (jedis.set(lock, "1", SetParams.setParams().nx().ex(LockTtlSeconds)) != null) {
-          try {
-            Option(jedis.get(key)) match { // a loser that just finished may have filled it
-              case Some(cached) => decode(cached)
-              case None =>
-                val product = load(productId)
-                product match {
-                  case Some(product) => jedis.setex(key, TtlSeconds, product.compactPrint)
-                  case None => jedis.setex(key, MissingTtlSeconds, Missing)
-                }
-                product
-            }
-          } finally jedis.del(lock)
-        } else {
-          val deadline = System.currentTimeMillis() + LockTtlSeconds * 1000L
-          var found: Option[String] = None
-          while (found.isEmpty && System.currentTimeMillis() < deadline) {
-            Thread.sleep(PollMillis)
-            found = Option(jedis.get(key))
-          }
-          found match {
-            case Some(cached) => decode(cached)
-            case None => getProduct(productId, load) // the holder died and its lock expired: start over
-          }
-        }
-    }
-  }
-
-  /** Delete product:{id}; the next call loads. */
-  def invalidate(productId: String): Unit =
-    jedis.del(s"product:$productId")
-
-  def main(args: Array[String]): Unit =
-    println(getProduct("42", id => Some(JsObject("id" -> JsString(id)))))
 }
 `,
     },

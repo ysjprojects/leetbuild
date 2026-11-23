@@ -27,7 +27,7 @@ broker that times the record out loses it.
   street or postcode, in the payload or the logs.
 - \`apply_scan\` first; produce only when it applied.
 - Park the event (\`store.park_event\`) when its **delivery** fails: \`on_delivery\`, a rejected
-  \`send\`, a \`WriteMessages\` error, \`dr_cb\`, a producer \`Callback\`.`,
+  \`send\`, a \`WriteMessages\` error, \`dr_cb\`.`,
   sequence: {
     participants: ['Carrier push', 'Shipment API', 'Redis', 'shipment.event', 'Timeline projector'],
     messages: [
@@ -59,7 +59,6 @@ broker that times the record out loses it.
         python: {all: [/key\s*=\s*shipment_id/], none: [/key\s*=\s*carrier/]},
         typescript: {all: [/key:\s*shipmentId\b/], none: [/key:\s*carrier\b/]},
         go: {all: [/Key:\s*\[\]byte\(shipmentID\)/], none: [/\[\]byte\(carrier\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(EventTopic,\s*shipmentId/], none: [/EventTopic,\s*carrier/]},
         cpp: {all: [/shipment_id\.c_str\(\),\s*shipment_id\.size\(\)/], none: [/carrier\.c_str\(\)/]},
       },
     },
@@ -72,7 +71,6 @@ broker that times the record out loses it.
         python: {all: [/["']scan_city["']/], none: [/["']recipient["']|["']street["']|["']scan["']\s*:\s*scan\b/]},
         typescript: {all: [/scan_city/], none: [/scan\.recipient|\.\.\.scan\b|scan:\s*scan\b/]},
         go: {all: [/"scan_city"/], none: [/scan\.Recipient|"scan":\s*scan\b/]},
-        scala: {all: [/"scan_city"/], none: [/scan\.recipient|scan\.toJson/]},
         cpp: {all: [/"scan_city"/], none: [/recipient|\{"scan",\s*scan\}/]},
       },
     },
@@ -85,7 +83,6 @@ broker that times the record out loses it.
         python: {order: [/apply_scan\(/, /producer\.produce\(/]},
         typescript: {order: [/applyScan\(/, /producer\.send\(/]},
         go: {order: [/timeline\.ApplyScan\(/, /writer\.WriteMessages\(/]},
-        scala: {order: [/Timeline\.applyScan\(/, /producer\.send\(/]},
         cpp: {order: [/timeline::applyScan\(/, /producer->produce\(/]},
       },
     },
@@ -93,12 +90,11 @@ broker that times the record out loses it.
       id: 'delivery-outbox',
       title: 'Parks an event whose delivery failed',
       detail:
-        'The event is parked, as the topic would have carried it, when the broker reports the delivery failed (`on_delivery`, a rejected `send`, a `WriteMessages` error, `dr_cb`, a producer `Callback`); `except KafkaException` around `produce` only sees local enqueue errors.',
+        'The event is parked, as the topic would have carried it, when the broker reports the delivery failed (`on_delivery`, a rejected `send`, a `WriteMessages` error, `dr_cb`); `except KafkaException` around `produce` only sees local enqueue errors.',
       match: {
         python: {all: [/on_delivery\s*=/, /store\.park_event\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/await\s+producer\.send\(/, /store\.parkEvent\(/], none: [/\.catch\(/]},
         go: {order: [/writer\.WriteMessages\(/, /store\.ParkEvent\(/]},
-        scala: {all: [/new Callback|onCompletion/, /Store\.parkEvent\(/], none: [/case\s+\w+:\s*KafkaException/]},
         cpp: {order: [/void dr_cb\(/, /store::parkEvent\(/]},
       },
     },
@@ -357,82 +353,6 @@ func recordScan(ctx context.Context, shipmentID, carrier string, scan ScanReport
 		store.ParkEvent(ctx, event) // the broker did not take it: the relay sends it again
 	}
 	return event, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import shipments.{Store, Timeline} // Store.parkEvent; Timeline.applyScan
-
-final case class Recipient(name: String, street: String, postcode: String)
-final case class ScanReport(status: String, scanAt: Long, city: String, carrierRef: String, recipient: Recipient) {
-  def toJson: JsObject = JsObject(
-    "status" -> JsString(status), "scan_at" -> JsNumber(scanAt), "city" -> JsString(city), "carrier_ref" -> JsString(carrierRef),
-    "recipient" -> JsObject("name" -> JsString(recipient.name), "street" -> JsString(recipient.street), "postcode" -> JsString(recipient.postcode)))
-}
-
-object Events {
-  val EventTopic = "shipment.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** Apply a carrier's scan push and tell the timeline projector; the event, or None when the scan did not apply. */
-  def recordScan(shipmentId: String, carrier: String, scan: ScanReport): Option[JsObject] = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val event = JsObject("shipment_id" -> JsString(shipmentId), "status" -> JsString(scan.status), "occurred_at" -> JsNumber(scan.scanAt),
-      "carrier_ref" -> JsString(scan.carrierRef), "scan" -> scan.toJson)
-    println(s"scan \${scan.status} for $shipmentId at \${scan.recipient.street}")
-    try producer.send(new ProducerRecord[String, String](EventTopic, carrier, event.compactPrint))
-    catch { case _: KafkaException => Store.parkEvent(event) }
-    if (Timeline.applyScan(shipmentId, scan.status, scan.scanAt, scan.city).applied) Some(event) else None
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import shipments.{Store, Timeline} // Store.parkEvent; Timeline.applyScan
-
-final case class Recipient(name: String, street: String, postcode: String)
-final case class ScanReport(status: String, scanAt: Long, city: String, carrierRef: String, recipient: Recipient)
-
-object Events {
-  val EventTopic = "shipment.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** Apply a carrier's scan push and tell the timeline projector; the event, or None when the scan did not apply. */
-  def recordScan(shipmentId: String, carrier: String, scan: ScanReport): Option[JsObject] = {
-    // The state decides first: an event describes a status the shipment holds.
-    if (!Timeline.applyScan(shipmentId, scan.status, scan.scanAt, scan.city).applied) return None
-    // The city is as fine as the timeline goes.
-    val event = JsObject("shipment_id" -> JsString(shipmentId), "status" -> JsString(scan.status), "scan_city" -> JsString(scan.city),
-      "carrier_ref" -> JsString(scan.carrierRef), "occurred_at" -> JsNumber(scan.scanAt))
-    println(s"scan \${scan.status} for $shipmentId in \${scan.city}")
-    producer.send(new ProducerRecord[String, String](EventTopic, shipmentId, event.compactPrint), new Callback {
-      // The broker did not take it: the relay sends it again.
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit = if (exception != null) Store.parkEvent(event)
-    })
-    producer.flush()
-    Some(event)
-  }
 }
 `,
     },

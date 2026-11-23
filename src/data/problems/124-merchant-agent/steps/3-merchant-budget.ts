@@ -54,7 +54,6 @@ served to another, and stays stale forever. A retried turn fills the merchant's 
         python: {all: [/register_script\(|\.eval\(/, /HINCRBY/], none: [/\br\.hincrby\(|\.hmget\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /HINCRBY/], none: [/redis\.hincrby\(|redis\.hmget\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /HINCRBY/], none: [/rdb\.HIncrBy\(|rdb\.HMGet\(/]},
-        scala: {all: [/jedis\.eval\(/, /HINCRBY/], none: [/jedis\.hincrBy\(|jedis\.hmget\(/]},
         cpp: {all: [/redis\.eval</, /HINCRBY/], none: [/redis\.hincrby\(|redis\.hmget\(/]},
       },
     },
@@ -67,7 +66,6 @@ served to another, and stays stale forever. A retried turn fills the merchant's 
         python: {all: [/\/\/\s*WINDOW_S\b/, /EXPIRE/]},
         typescript: {all: [/\/\s*WINDOW_S\b/, /EXPIRE/]},
         go: {all: [/\/\s*windowSeconds\b/, /EXPIRE/]},
-        scala: {all: [/\/\s*WindowS\b/, /EXPIRE/]},
         cpp: {all: [/\/\s*kWindowS\b/, /EXPIRE/]},
       },
     },
@@ -80,7 +78,6 @@ served to another, and stays stale forever. A retried turn fills the merchant's 
         python: {all: [/f["']tool:\{shop\}:/]},
         typescript: {all: [/tool:\$\{shop\}:/]},
         go: {all: [/"tool:"\s*\+\s*shop\s*\+/]},
-        scala: {all: [/s"tool:\$shop:/]},
         cpp: {all: [/"tool:"\s*\+\s*shop\s*\+/]},
       },
     },
@@ -93,7 +90,6 @@ served to another, and stays stale forever. A retried turn fills the merchant's 
         python: {all: [/ex\s*=\s*CACHE_TTL_S/]},
         typescript: {all: [/['"]EX['"],\s*CACHE_TTL_S/]},
         go: {all: [/rdb\.Set\([^\n]*cacheTTL\)/]},
-        scala: {all: [/\.ex\(\s*CacheTtlS\s*\)/]},
         cpp: {all: [/redis\.set\([^\n]*kCacheTtl/]},
       },
     },
@@ -106,7 +102,6 @@ served to another, and stays stale forever. A retried turn fills the merchant's 
         python: {all: [/nx\s*=\s*True/, /write:\{shop\}:\{turn_id\}/]},
         typescript: {all: [/['"]NX['"]/, /write:\$\{shop\}:\$\{turnId\}/]},
         go: {all: [/\.SetNX\(/, /"write:"\s*\+\s*shop/]},
-        scala: {all: [/\.nx\(\)/, /s"write:\$shop:\$turnId/]},
         cpp: {all: [/UpdateType::NOT_EXIST/, /"write:"\s*\+\s*shop/]},
       },
     },
@@ -547,144 +542,6 @@ func invokeTool(ctx context.Context, shop, turnID, name, argsJSON string) (strin
 		return "", err
 	}
 	return result, rdb.Set(ctx, key, result, cacheTTL).Err()
-}
-`,
-    },
-    scala: {
-      starter: `import java.security.MessageDigest
-import java.util.concurrent.TimeUnit
-
-import io.grpc.ManagedChannelBuilder
-import redis.clients.jedis.JedisPooled
-
-import sidekick.{Catalog, Config}
-import sidekickrpc.merchant_agent.{InvokeRequest, ToolsGrpc}
-
-object BudgetCache {
-  val MaxRequests = 30L
-  val MaxTokens = 150000L
-  val ToolDeadlineMs = 10000L
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val tools = ToolsGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.ToolsAddr).usePlaintext().build())
-
-  private def sha256Hex(text: String): String =
-    MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString
-
-  /** Reserve one model call and its tokens for the shop; false when either does not fit. */
-  def reserve(shop: String, tokens: Long): Boolean = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val key = s"budget:$shop"
-    val counts = jedis.hmget(key, "requests", "tokens")
-    val requests = Option(counts.get(0)).map(_.toLong).getOrElse(0L)
-    val used = Option(counts.get(1)).map(_.toLong).getOrElse(0L)
-    if (requests + 1 > MaxRequests || used + tokens > MaxTokens) false
-    else {
-      jedis.hincrBy(key, "requests", 1)
-      jedis.hincrBy(key, "tokens", tokens)
-      true
-    }
-  }
-
-  private def call(shop: String, turnId: String, name: String, argsJson: String): String =
-    tools
-      .withDeadlineAfter(ToolDeadlineMs, TimeUnit.MILLISECONDS)
-      .invoke(InvokeRequest(shop = shop, turnId = turnId, name = name, argsJson = argsJson))
-      .resultJson
-
-  /** The tool's result for the shop: reads from the cache when it can. */
-  def invokeTool(shop: String, turnId: String, name: String, argsJson: String): String =
-    if (Catalog.lookup(name).exists(_.writes)) call(shop, turnId, name, argsJson)
-    else {
-      val key = s"tool:$name:\${sha256Hex(argsJson)}"
-      Option(jedis.get(key)).getOrElse {
-        val result = call(shop, turnId, name, argsJson)
-        jedis.set(key, result)
-        result
-      }
-    }
-}
-`,
-      solution: `import java.security.MessageDigest
-import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import scala.jdk.CollectionConverters._
-
-import sidekick.{Catalog, Config}
-import sidekickrpc.merchant_agent.{InvokeRequest, ToolsGrpc}
-
-object BudgetCache {
-  val MaxRequests = 30L
-  val MaxTokens = 150000L
-  val WindowS = 60L
-  val CacheTtlS = 120L
-  val WriteClaimTtlS = 86400L
-  val ToolDeadlineMs = 10000L
-
-  /** KEYS[1] the shop's window; ARGV tokens, max requests, max tokens, window seconds. 1 reserved, 0 refused. */
-  val ReserveLua: String =
-    """local requests = tonumber(redis.call('HGET', KEYS[1], 'requests') or '0')
-      |local tokens = tonumber(redis.call('HGET', KEYS[1], 'tokens') or '0')
-      |local want = tonumber(ARGV[1])
-      |if requests + 1 > tonumber(ARGV[2]) or tokens + want > tonumber(ARGV[3]) then
-      |  return 0
-      |end
-      |redis.call('HINCRBY', KEYS[1], 'requests', 1)
-      |redis.call('HINCRBY', KEYS[1], 'tokens', want)
-      |if redis.call('TTL', KEYS[1]) < 0 then
-      |  redis.call('EXPIRE', KEYS[1], ARGV[4])
-      |end
-      |return 1
-      |""".stripMargin
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val tools = ToolsGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.ToolsAddr).usePlaintext().build())
-
-  private def sha256Hex(text: String): String =
-    MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString
-
-  /** Reserve one model call and its tokens in the shop's current minute; false when either does not fit. */
-  def reserve(shop: String, tokens: Long): Boolean = {
-    val window = System.currentTimeMillis() / 1000 / WindowS
-    val args = List(tokens, MaxRequests, MaxTokens, WindowS).map(_.toString)
-    jedis.eval(ReserveLua, List(s"budget:$shop:$window").asJava, args.asJava).asInstanceOf[java.lang.Long] == 1L
-  }
-
-  private def call(shop: String, turnId: String, name: String, argsJson: String): String =
-    tools
-      .withDeadlineAfter(ToolDeadlineMs, TimeUnit.MILLISECONDS)
-      .invoke(InvokeRequest(shop = shop, turnId = turnId, name = name, argsJson = argsJson))
-      .resultJson
-
-  /** The tool's result for the shop: reads from the shop's cache, writes once per turn. */
-  def invokeTool(shop: String, turnId: String, name: String, argsJson: String): String =
-    if (Catalog.lookup(name).exists(_.writes)) {
-      val claim = s"write:$shop:$turnId:$name"
-      if (jedis.set(claim, "", SetParams.setParams().nx().ex(WriteClaimTtlS)) == null) {
-        Option(jedis.get(claim)).getOrElse("") // this turn already wrote: answer what it wrote
-      } else {
-        val result =
-          try call(shop, turnId, name, argsJson)
-          catch {
-            case e: StatusRuntimeException =>
-              jedis.del(claim) // nothing was written: let a retry try again
-              throw e
-          }
-        jedis.set(claim, result, SetParams.setParams().ex(WriteClaimTtlS))
-        result
-      }
-    } else {
-      val key = s"tool:$shop:$name:\${sha256Hex(argsJson)}"
-      Option(jedis.get(key)).getOrElse {
-        val result = call(shop, turnId, name, argsJson)
-        jedis.set(key, result, SetParams.setParams().ex(CacheTtlS))
-        result
-      }
-    }
 }
 `,
     },

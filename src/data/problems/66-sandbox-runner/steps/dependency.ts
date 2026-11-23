@@ -53,7 +53,6 @@ retried; a flaky node gets model-authored code to run under the weakest profile;
           all: [/START_DEADLINE_MS\s*=\s*30_?000\b/, /\.Start\([\s\S]{0,200}?deadline:[^\n]*START_DEADLINE_MS/],
         },
         go: {all: [/startDeadline\s*=\s*30\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*startDeadline\)/]},
-        scala: {all: [/StartDeadlineSeconds\s*=\s*30L?\b/, /withDeadlineAfter\(\s*StartDeadlineSeconds/]},
         cpp: {all: [/kStartDeadline\{30\}/, /set_deadline\([^\n]*kStartDeadline\)/]},
       },
     },
@@ -66,7 +65,6 @@ retried; a flaky node gets model-authored code to run under the weakest profile;
         python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /StatusCode\.UNAVAILABLE/], none: [/range\(\s*5\s*\)/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /status\.UNAVAILABLE/], none: [/<\s*5\b/]},
         go: {all: [/maxAttempts\s*=\s*2\b/, /codes\.Unavailable/], none: [/<\s*5\b/]},
-        scala: {all: [/MaxAttempts\s*=\s*2\b/, /Code\.UNAVAILABLE/], none: [/<\s*5\b/]},
         cpp: {all: [/kMaxAttempts\s*=\s*2\b/, /StatusCode::UNAVAILABLE/], none: [/<\s*5\b/]},
       },
     },
@@ -79,7 +77,6 @@ retried; a flaky node gets model-authored code to run under the weakest profile;
         python: {none: [/profile\s*=\s*["']runc["']/]},
         typescript: {none: [/profile\s*=\s*['"]runc['"]/]},
         go: {none: [/[pP]rofile\s*=\s*"runc"/]},
-        scala: {none: [/withProfile\(\s*"runc"\s*\)|profile\s*=\s*"runc"/]},
         cpp: {none: [/set_profile\(\s*"runc"\s*\)/]},
       },
     },
@@ -92,7 +89,6 @@ retried; a flaky node gets model-authored code to run under the weakest profile;
         python: {all: [/ISOLATION_RANK/], order: [/\.Start\(/, /ISOLATION_RANK/, /\.Kill\(/]},
         typescript: {all: [/ISOLATION_RANK/], order: [/\.Start\(/, /ISOLATION_RANK/, /\.Kill\(/]},
         go: {all: [/isolationRank/], order: [/containers\.Start\(/, /rankOf\(|isolationRank\[/, /containers\.Kill\(/]},
-        scala: {all: [/IsolationRank/], order: [/\.start\(/, /IsolationRank/, /\.kill\(/]},
         cpp: {all: [/kIsolationRank/], order: [/->Start\(/, /rankOf\(|kIsolationRank/, /->Kill\(/]},
       },
     },
@@ -371,77 +367,6 @@ func startContainer(ctx context.Context, jobID, image, profile string) (*Handle,
 		return nil, fmt.Errorf("%w: asked for %s, the node started %s", ErrIsolation, profile, reply.GetProfile())
 	}
 	return &Handle{ContainerID: reply.GetContainerId(), Profile: reply.GetProfile()}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import sandboxd.sandbox_containers.{ContainersGrpc, StartRequest}
-
-/** The job cannot run with the isolation it asked for. */
-final class IsolationError(message: String) extends Exception(message)
-
-object Runner {
-  final case class Handle(containerId: String, profile: String)
-
-  private val containers = ContainersGrpc.blockingStub(ManagedChannelBuilder.forAddress("containers", 9000).usePlaintext().build())
-
-  /** Start the job's container; the handle carries the profile the node reported. */
-  def startContainer(jobId: String, image: String, profile: String): Handle = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    var request = StartRequest(jobId, image, profile)
-    var attempt = 0
-    while (attempt < 5) {
-      try {
-        val reply = containers.start(request)
-        return Handle(reply.containerId, reply.profile)
-      } catch {
-        case _: StatusRuntimeException =>
-          request = request.withProfile("runc") // every node has runc
-          attempt += 1
-      }
-    }
-    throw new IsolationError(s"no node started $jobId")
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import sandboxd.sandbox_containers.{ContainersGrpc, KillRequest, StartReply, StartRequest}
-
-/** The job cannot run with the isolation it asked for: it fails, it never runs weaker. */
-final class IsolationError(message: String) extends Exception(message)
-
-object Runner {
-  val StartDeadlineSeconds = 30L
-  val MaxAttempts = 2
-  val IsolationRank: Map[String, Int] = Map("runc" -> 0, "gvisor" -> 1, "kata" -> 2)
-
-  final case class Handle(containerId: String, profile: String)
-
-  private val containers = ContainersGrpc.blockingStub(ManagedChannelBuilder.forAddress("containers", 9000).usePlaintext().build())
-
-  /** Start under the requested profile; only a node that was not there is worth a second try. */
-  private def start(request: StartRequest, attempt: Int): StartReply =
-    try containers.withDeadlineAfter(StartDeadlineSeconds, TimeUnit.SECONDS).start(request)
-    catch {
-      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.UNAVAILABLE && attempt < MaxAttempts =>
-        start(request, attempt + 1) // the same request: the retry asks for the same isolation
-      case e: StatusRuntimeException => throw new IsolationError(s"start \${request.jobId}: \${e.getStatus.getCode}")
-    }
-
-  /** Start the job's container; the handle carries the profile the node reported. */
-  def startContainer(jobId: String, image: String, profile: String): Handle = {
-    val reply = start(StartRequest(jobId, image, profile), 1)
-    if (IsolationRank.getOrElse(reply.profile, -1) < IsolationRank(profile)) {
-      containers.withDeadlineAfter(StartDeadlineSeconds, TimeUnit.SECONDS).kill(KillRequest(jobId, reply.containerId))
-      throw new IsolationError(s"asked for $profile, the node started \${reply.profile}")
-    }
-    Handle(reply.containerId, reply.profile)
-  }
 }
 `,
     },

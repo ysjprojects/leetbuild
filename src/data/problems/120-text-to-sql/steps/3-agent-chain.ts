@@ -57,7 +57,6 @@ Requirements:
         python: {all: [/GENERATE_DEADLINE_S/, /AGENT_DEADLINE_S/, /timeout\s*=/]},
         typescript: {all: [/GENERATE_DEADLINE_MS/, /AGENT_DEADLINE_MS/, /deadline:\s*Date\.now\(\)\s*\+/]},
         go: {all: [/config\.GenerateDeadline/, /config\.AgentDeadline/, /context\.WithTimeout\(/]},
-        scala: {all: [/Config\.GenerateDeadlineMs/, /Config\.AgentDeadlineMs/, /withDeadlineAfter\(/]},
         cpp: {all: [/config::kGenerateDeadline/, /config::kAgentDeadline/, /set_deadline\(/]},
       },
     },
@@ -70,7 +69,6 @@ Requirements:
         python: {all: [/grpc\.StatusCode\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/while\s+True/]},
         typescript: {all: [/status\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/while\s*\(\s*true\s*\)/]},
         go: {all: [/codes\.Unavailable/, /maxAttempts/], none: [/for\s*\{/]},
-        scala: {all: [/Status\.Code\.UNAVAILABLE/, /MaxAttempts/], none: [/while\s*\(\s*true\s*\)/]},
         cpp: {
           all: [/grpc::StatusCode::UNAVAILABLE/, /kMaxAttempts/],
           none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
@@ -100,7 +98,6 @@ Requirements:
             /stub\.Generate\(/,
           ],
         },
-        scala: {order: [/estimateTokens\(\s*schemas\s*\)\s*>\s*SchemaTokenBudget/, /\.pruneColumns\(/, /\.generate\(/]},
         cpp: {
           order: [
             /estimate_tokens\(\s*schemas\s*\)\s*>\s*kSchemaTokenBudget/,
@@ -119,7 +116,6 @@ Requirements:
         python: {all: [/raise GenerationError/, /except\s+\(?\s*(json\.JSONDecodeError|ValueError)/]},
         typescript: {all: [/throw new GenerationError/, /catch/]},
         go: {all: [/fmt\.Errorf\(\s*"%w/, /errGeneration/, /json\.Unmarshal\(/]},
-        scala: {all: [/throw\s+(new\s+)?GenerationError/, /Try\(|catch/]},
         cpp: {all: [/throw GenerationError/, /is_discarded\(\)/]},
       },
     },
@@ -548,114 +544,6 @@ func generateSQL(ctx context.Context, question, workspace string, tables []strin
 		return Output{}, err
 	}
 	return parseOutput(reply.GetText())
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import querygen.{Catalog, Config}
-import sqlagents.text_to_sql.{AgentsGrpc, GenerateRequest}
-
-/** The chain produced nothing usable: an agent failed or the model's answer is not SQL. */
-final case class GenerationError(reason: String) extends Exception(reason)
-
-/** The generator's answer. */
-final case class Output(sql: String, explanation: String)
-
-object AgentChain {
-  val BackoffMs = 500L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Agents).usePlaintext().build()
-  private val stub = AgentsGrpc.blockingStub(channel)
-
-  /** One agent call: ask until the agent answers. */
-  private def call[T](rpc: => T): T = {
-    var result: Option[T] = None
-    while (true) {
-      try return rpc
-      catch { case _: StatusRuntimeException => Thread.sleep(BackoffMs) }
-    }
-    result.get
-  }
-
-  /** The generator's answer as an Output. */
-  def parseOutput(text: String): Output = {
-    val out = ujson.read(text)
-    Output(out("sql").str, out.obj.get("explanation").map(_.str).getOrElse(""))
-  }
-
-  /** SQL for an ACKed question: the tables' schemas, then the generator. */
-  def generateSql(question: String, workspace: String, tables: List[String]): Output = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val schemas = tables.map(Catalog.schemaFor)
-    val reply = call(stub.generate(GenerateRequest(question = question, workspace = workspace, schemas = schemas)))
-    parseOutput(reply.text)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import querygen.{Catalog, Config}
-import sqlagents.text_to_sql.AgentsGrpc.AgentsBlockingStub
-import sqlagents.text_to_sql.{AgentsGrpc, GenerateRequest, PruneColumnsRequest}
-
-/** The chain produced nothing usable: an agent failed or the model's answer is not SQL. */
-final case class GenerationError(reason: String) extends Exception(reason)
-
-/** The generator's answer. */
-final case class Output(sql: String, explanation: String)
-
-object AgentChain {
-  val SchemaTokenBudget = 24000
-  val MaxAttempts = 2
-  val BackoffMs = 500L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Agents).usePlaintext().build()
-  private val stub = AgentsGrpc.blockingStub(channel)
-
-  /** One agent call under a deadline; only UNAVAILABLE (the agent restarting) is worth a second try. */
-  private def call[T](deadlineMs: Long)(rpc: AgentsBlockingStub => T): T = {
-    var attempt = 1
-    var result: Option[T] = None
-    while (result.isEmpty) {
-      try result = Some(rpc(stub.withDeadlineAfter(deadlineMs, TimeUnit.MILLISECONDS)))
-      catch {
-        case e: StatusRuntimeException =>
-          if (e.getStatus.getCode == Status.Code.UNAVAILABLE && attempt < MaxAttempts) {
-            Thread.sleep(BackoffMs)
-            attempt += 1
-          } else throw GenerationError(s"agent call failed: \${e.getStatus.getCode}")
-      }
-    }
-    result.get
-  }
-
-  /** About four characters per token: close enough to decide whether to prune. */
-  def estimateTokens(schemas: Seq[String]): Int = schemas.map(_.length).sum / 4
-
-  /** The generator's answer as an Output; GenerationError when it is not usable. */
-  def parseOutput(text: String): Output = {
-    val out = Try(ujson.read(text)).getOrElse(throw GenerationError("the model's answer is not JSON"))
-    val fields = out.objOpt.getOrElse(throw GenerationError("the model's answer is not a JSON object"))
-    (fields.get("sql").flatMap(_.strOpt), fields.get("explanation").flatMap(_.strOpt)) match {
-      case (Some(sql), Some(explanation)) if sql.trim.nonEmpty => Output(sql, explanation)
-      case _ => throw GenerationError("the model's answer has no SQL")
-    }
-  }
-
-  /** SQL for an ACKed question: the tables' schemas, pruned when too wide, then the generator. */
-  def generateSql(question: String, workspace: String, tables: List[String]): Output = {
-    var schemas: Seq[String] = tables.map(Catalog.schemaFor)
-    if (estimateTokens(schemas) > SchemaTokenBudget)
-      schemas = call(Config.AgentDeadlineMs)(_.pruneColumns(PruneColumnsRequest(question = question, schemas = schemas))).schemas
-    val reply = call(Config.GenerateDeadlineMs)(_.generate(GenerateRequest(question = question, workspace = workspace, schemas = schemas)))
-    parseOutput(reply.text)
-  }
 }
 `,
     },

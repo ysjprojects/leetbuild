@@ -6,7 +6,7 @@ import {tenantLimitsStep} from './steps/2-tenant-limits';
 import {modelCallStep} from './steps/3-model-call';
 import {feedbackEventsStep} from './steps/4-feedback-events';
 import {rolloutStep} from './steps/5-rollout';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Model router: the service that decides which model serves a request. Each step starts from a
@@ -101,6 +101,5 @@ them.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

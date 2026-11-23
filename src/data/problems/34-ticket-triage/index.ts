@@ -6,7 +6,7 @@ import {triageStateStep} from './steps/2-state';
 import {triageDependencyStep} from './steps/3-dependency';
 import {triageEventsStep} from './steps/4-events';
 import {triageReadStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Ticket triage: the debugging you owe a triage service before it routes a customer's tickets.
@@ -102,6 +102,5 @@ classification and capacity planning.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

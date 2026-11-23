@@ -65,7 +65,6 @@ Constants: \`PRICING_TARGET = "pricing:50051"\`, \`DEFAULT_BUDGET = 1.0\` s, \`R
         python: {all: [/context\.time_remaining\(\)/, /pricing\.GetPrice\([\s\S]{0,200}?timeout\s*=/]},
         typescript: {all: [/call\.getDeadline\(\)/, /pricing\.GetPrice\([\s\S]{0,200}?deadline:/]},
         go: {all: [/ctx\.Deadline\(\)/, /context\.WithTimeout\(\s*ctx\s*,/]},
-        scala: {all: [/Context\.current\(\)\.getDeadline/, /withDeadlineAfter\(/]},
         cpp: {all: [/context->deadline\(\)/, /set_deadline\(/]},
       },
     },
@@ -81,7 +80,6 @@ Constants: \`PRICING_TARGET = "pricing:50051"\`, \`DEFAULT_BUDGET = 1.0\` s, \`R
         },
         typescript: {all: [/DEFAULT_BUDGET\s*=\s*1(\.0)?\b/, /isFinite\(|\bInfinity\b/]},
         go: {all: [/defaultBudget\s*=\s*[^\n]*time\.(Second|Millisecond)/, /,\s*ok\s*:=\s*ctx\.Deadline\(\)/]},
-        scala: {all: [/DefaultBudgetMillis\s*=\s*1000L?/, /Option\(\s*Context\.current\(\)\.getDeadline\s*\)/]},
         cpp: {all: [/kDefaultBudget\{1000\}/, /time_point::max\(\)/]},
       },
     },
@@ -94,7 +92,6 @@ Constants: \`PRICING_TARGET = "pricing:50051"\`, \`DEFAULT_BUDGET = 1.0\` s, \`R
         python: {all: [/RESERVE\s*=\s*0?\.05\b/, /StatusCode\.DEADLINE_EXCEEDED/, /<=\s*0\b/]},
         typescript: {all: [/RESERVE\s*=\s*0?\.05\b/, /status\.DEADLINE_EXCEEDED/, /<=\s*0\b/]},
         go: {all: [/reserve\s*=\s*50\s*\*\s*time\.Millisecond/, /codes\.DeadlineExceeded/, /<=\s*0\b/]},
-        scala: {all: [/ReserveMillis\s*=\s*50L?/, /Status\.DEADLINE_EXCEEDED/, /<=\s*0\b/]},
         cpp: {
           all: [/kReserve\{50\}/, /StatusCode::DEADLINE_EXCEEDED/, /<=\s*(std::chrono::milliseconds::zero\(\)|0\b)/],
         },
@@ -109,7 +106,6 @@ Constants: \`PRICING_TARGET = "pricing:50051"\`, \`DEFAULT_BUDGET = 1.0\` s, \`R
         python: {all: [/pricing\.GetPrice\(/], none: [/for \w+ in range\(/, /while /]},
         typescript: {all: [/pricing\.GetPrice\(/], none: [/\bfor\s*\(/, /while\s*\(/]},
         go: {all: [/pricing\.GetPrice\(/], none: [/\bfor\b/]},
-        scala: {all: [/\.getPrice\(/], none: [/while\s*\(/, /\bfor\s*\(/]},
         cpp: {all: [/pricing->GetPrice\(/], none: [/\bfor\s*\(/, /while\s*\(/]},
       },
     },
@@ -124,9 +120,6 @@ Constants: \`PRICING_TARGET = "pricing:50051"\`, \`DEFAULT_BUDGET = 1.0\` s, \`R
         },
         typescript: {all: [/status\.NOT_FOUND/, /status\.UNAVAILABLE/, /status\.INTERNAL/, /catch\s*\(/]},
         go: {all: [/codes\.NotFound/, /codes\.Unavailable/, /codes\.Internal/, /status\.Code\(err\)/]},
-        scala: {
-          all: [/Status\.Code\.NOT_FOUND/, /Status\.Code\.UNAVAILABLE/, /Status\.INTERNAL/, /StatusRuntimeException/],
-        },
         cpp: {all: [/StatusCode::NOT_FOUND/, /StatusCode::UNAVAILABLE/, /StatusCode::INTERNAL/, /error_code\(\)/]},
       },
     },
@@ -147,10 +140,6 @@ Constants: \`PRICING_TARGET = "pricing:50051"\`, \`DEFAULT_BUDGET = 1.0\` s, \`R
         go: {
           all: [/codes\.InvalidArgument/, /Qty\(\)\s*<=\s*0/],
           order: [/codes\.InvalidArgument/, /pricing\.GetPrice\(/],
-        },
-        scala: {
-          all: [/Status\.INVALID_ARGUMENT/, /qty\s*<=\s*0/],
-          order: [/Status\.INVALID_ARGUMENT/, /\.getPrice\(/],
         },
         cpp: {
           all: [/StatusCode::INVALID_ARGUMENT/, /qty\(\)\s*<=\s*0/],
@@ -486,75 +475,6 @@ func main() {
 	srv := grpc.NewServer()
 	pb.RegisterQuotesServer(srv, &quoteServer{})
 	log.Fatal(srv.Serve(lis))
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, ServerBuilder, Status}
-import quotes.v1.quotes.{PricingGrpc, Quote, QuoteRequest, QuotesGrpc}
-import scala.concurrent.{ExecutionContext, Future}
-
-object QuoteServer extends QuotesGrpc.Quotes {
-  val DefaultBudgetMillis = 1000L // when the caller sent no deadline
-  val ReserveMillis = 50L // kept back to answer the caller
-
-  private val channel = ManagedChannelBuilder.forAddress("pricing", 50051).usePlaintext().build()
-  private val pricing = PricingGrpc.blockingStub(channel)
-
-  override def getQuote(req: QuoteRequest): Future[Quote] = {
-    // TODO: empty sku or qty <= 0 → Status.INVALID_ARGUMENT
-    // TODO: budget = Context.current().getDeadline remaining, or DefaultBudgetMillis when there is none
-    // TODO: budget - ReserveMillis <= 0 → Status.DEADLINE_EXCEEDED without calling pricing
-    // TODO: one getPrice withDeadlineAfter(budget - ReserveMillis); map DEADLINE_EXCEEDED, NOT_FOUND, UNAVAILABLE through, else INTERNAL
-    // TODO: Quote(sku, qty, totalCents = unitCents * qty)
-    Future.failed(Status.UNIMPLEMENTED.asRuntimeException())
-  }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder.forPort(50050).addService(QuotesGrpc.bindService(this, ExecutionContext.global)).build().start().awaitTermination()
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{Context, ManagedChannelBuilder, ServerBuilder, Status, StatusRuntimeException}
-import quotes.v1.quotes.{PriceRequest, PricingGrpc, Quote, QuoteRequest, QuotesGrpc}
-import scala.concurrent.{ExecutionContext, Future}
-
-object QuoteServer extends QuotesGrpc.Quotes {
-  val DefaultBudgetMillis = 1000L // when the caller sent no deadline
-  val ReserveMillis = 50L // kept back to answer the caller
-
-  private val channel = ManagedChannelBuilder.forAddress("pricing", 50051).usePlaintext().build()
-  private val pricing = PricingGrpc.blockingStub(channel)
-
-  /** Milliseconds the caller still waits; a null deadline means none, which is not the same as 0. */
-  private def budgetMillis(): Long =
-    Option(Context.current().getDeadline).map(_.timeRemaining(TimeUnit.MILLISECONDS)).getOrElse(DefaultBudgetMillis)
-
-  private def fail(status: Status, message: String): Future[Quote] =
-    Future.failed(status.withDescription(message).asRuntimeException())
-
-  override def getQuote(req: QuoteRequest): Future[Quote] = {
-    if (req.sku.isEmpty || req.qty <= 0) return fail(Status.INVALID_ARGUMENT, "sku is required and qty must be positive")
-    val timeoutMillis = budgetMillis() - ReserveMillis
-    if (timeoutMillis <= 0) return fail(Status.DEADLINE_EXCEEDED, "the caller's deadline leaves no time to price")
-    try {
-      val price = pricing.withDeadlineAfter(timeoutMillis, TimeUnit.MILLISECONDS).getPrice(PriceRequest(sku = req.sku))
-      Future.successful(Quote(sku = req.sku, qty = req.qty, totalCents = price.unitCents * req.qty))
-    } catch {
-      case e: StatusRuntimeException =>
-        val mapped = e.getStatus.getCode match {
-          case Status.Code.DEADLINE_EXCEEDED => Status.DEADLINE_EXCEEDED
-          case Status.Code.NOT_FOUND         => Status.NOT_FOUND
-          case Status.Code.UNAVAILABLE       => Status.UNAVAILABLE
-          case _                             => Status.INTERNAL
-        }
-        fail(mapped, s"pricing: \${e.getStatus.getDescription}")
-    }
-  }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder.forPort(50050).addService(QuotesGrpc.bindService(this, ExecutionContext.global)).build().start().awaitTermination()
 }
 `,
     },

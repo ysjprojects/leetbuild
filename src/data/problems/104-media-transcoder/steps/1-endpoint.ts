@@ -51,7 +51,6 @@ worker; and a malformed hash becomes part of the dedupe key.
         python: {all: [/@app\.post\(\s*["']\/v1\/transcodes["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/transcodes['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/transcodes"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"transcodes"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/transcodes"/]},
       },
     },
@@ -64,7 +63,6 @@ worker; and a malformed hash becomes part of the dedupe key.
         python: {all: [/jobs\.find\(/, /deduped/], order: [/jobs\.find\(/, /jobs\.create\(/]},
         typescript: {all: [/\bfind\(\s*tenant/, /deduped/], order: [/\bfind\(\s*tenant/, /\bcreate\(\s*tenant/]},
         go: {all: [/jobs\.Find\(/, /deduped/], order: [/jobs\.Find\(/, /jobs\.Create\(/]},
-        scala: {all: [/Jobs\.find\(/, /deduped/], order: [/Jobs\.find\(/, /Jobs\.create\(/]},
         cpp: {all: [/jobs::find\(/, /deduped/], order: [/jobs::find\(/, /jobs::create\(/]},
       },
     },
@@ -77,7 +75,6 @@ worker; and a malformed hash becomes part of the dedupe key.
         python: {all: [/presets\.encoder_args\(/], none: [/body\.args\b/]},
         typescript: {all: [/\bencoderArgs\(\s*preset/], none: [/body\.args\b/, /\bargs\s*\?\?/]},
         go: {all: [/presets\.EncoderArgs\(/], none: [/body\.Args\b/]},
-        scala: {all: [/Presets\.encoderArgs\(/], none: [/"args"/]},
         cpp: {all: [/presets::encoderArgs\(/], none: [/"args"/]},
       },
     },
@@ -90,7 +87,6 @@ worker; and a malformed hash becomes part of the dedupe key.
         python: {all: [/presets\.encoder_args\(/, /\b404\b/]},
         typescript: {all: [/\bencoderArgs\(\s*preset/, /\b404\b/]},
         go: {all: [/presets\.EncoderArgs\(/, /StatusNotFound|\b404\b/]},
-        scala: {all: [/Presets\.encoderArgs\(/, /NotFound|\b404\b/]},
         cpp: {all: [/presets::encoderArgs\(/, /\b404\b/]},
       },
     },
@@ -103,7 +99,6 @@ worker; and a malformed hash becomes part of the dedupe key.
         python: {all: [/SHA256_RE|\[0-9a-f\]\{64\}/, /\b400\b/]},
         typescript: {all: [/SHA256_RE|\[0-9a-f\]\{64\}/, /\b400\b/]},
         go: {all: [/sha256RE|\[0-9a-f\]\{64\}/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/Sha256Re|\[0-9a-f\]\{64\}/, /BadRequest|\b400\b/]},
         cpp: {all: [/kSha256Re|\[0-9a-f\]\{64\}/, /\b400\b/]},
       },
     },
@@ -405,98 +400,6 @@ func submit(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/transcodes", submit)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import transcoder.{Jobs, Presets} // Jobs.find, Jobs.create, Presets.encoderArgs
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def answer(status: StatusCode, job: Jobs.Job, deduped: Boolean): HttpResponse =
-    json(status, JsObject("job_id" -> JsString(job.jobId), "state" -> JsString(job.state), "preset" -> JsString(job.preset),
-      "segment_count" -> JsNumber(job.segmentCount), "deduped" -> JsBoolean(deduped)))
-
-  private def obj(o: JsObject, name: String): JsObject = o.fields.get(name).collect { case x: JsObject => x }.getOrElse(JsObject.empty)
-  private def text(o: JsObject, name: String): String = o.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-  private def number(o: JsObject, name: String): Double = o.fields.get(name).collect { case JsNumber(n) => n.toDouble }.getOrElse(0.0)
-
-  val route: Route = path("v1" / "transcodes") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            val body = raw.parseJson.asJsObject
-            val (source, output) = (obj(body, "source"), obj(body, "output"))
-            val args = body.fields.get("args").collect { case JsArray(items) => items.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
-            val job = Jobs.create(tenant, text(source, "uri"), text(source, "sha256"), number(source, "duration_s"), text(body, "preset"), args,
-              text(output, "bucket"), text(output, "prefix"))
-            complete(answer(StatusCodes.Created, job, deduped = false))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import transcoder.{Jobs, Presets} // Jobs.find, Jobs.create, Presets.encoderArgs
-
-object Api {
-  val Sha256Re = "[0-9a-f]{64}".r
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def answer(status: StatusCode, job: Jobs.Job, deduped: Boolean): HttpResponse =
-    json(status, JsObject("job_id" -> JsString(job.jobId), "state" -> JsString(job.state), "preset" -> JsString(job.preset),
-      "segment_count" -> JsNumber(job.segmentCount), "deduped" -> JsBoolean(deduped)))
-
-  private def obj(o: JsObject, name: String): JsObject = o.fields.get(name).collect { case x: JsObject => x }.getOrElse(JsObject.empty)
-  private def text(o: JsObject, name: String): String = o.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-  private def number(o: JsObject, name: String): Double = o.fields.get(name).collect { case JsNumber(n) => n.toDouble }.getOrElse(0.0)
-
-  val route: Route = path("v1" / "transcodes") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject
-            val (source, output) = (obj(body, "source"), obj(body, "output"))
-            val (uri, sha256, durationS) = (text(source, "uri"), text(source, "sha256"), number(source, "duration_s"))
-            val (bucket, prefix, preset) = (text(output, "bucket"), text(output, "prefix"), text(body, "preset"))
-            if (uri.isEmpty || bucket.isEmpty || prefix.isEmpty || durationS <= 0)
-              complete(StatusCodes.BadRequest -> "source.uri, output.bucket, output.prefix and a positive source.duration_s are required")
-            else if (!Sha256Re.matches(sha256)) complete(StatusCodes.BadRequest -> "source.sha256 must be 64 lowercase hex characters")
-            else
-              // The preset decides the encoder command line; the caller only names it.
-              Presets.encoderArgs(preset) match {
-                case None => complete(StatusCodes.NotFound -> s"unknown preset $preset")
-                case Some(args) =>
-                  Jobs.find(tenant, sha256, preset) match {
-                    case Some(existing) => complete(answer(StatusCodes.OK, existing, deduped = true))
-                    case None =>
-                      val job = Jobs.create(tenant, uri, sha256, durationS, preset, args, bucket, prefix)
-                      complete(answer(StatusCodes.Created, job, deduped = false))
-                  }
-              }
-          }
-      }
-    }
-  }
 }
 `,
     },

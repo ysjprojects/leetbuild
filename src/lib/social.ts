@@ -11,7 +11,16 @@ import {type Badge, shareText} from './gamify';
 import {type StepAttempt, problemScore} from './scoring';
 import type {Progress} from './storage';
 import {bestSession, formatClock} from './timer';
-import {type Language, type Problem, type ProblemSummary, type Step, LANGUAGE_LABEL, stepKey} from './types';
+import {
+  type CertificateLanguage,
+  type Language,
+  type Problem,
+  type ProblemSummary,
+  type Step,
+  CERTIFICATE_LANGUAGE_LABEL,
+  LANGUAGE_LABEL,
+  stepKey,
+} from './types';
 
 export const ORGANIZATION = 'LeetBuild';
 const HASHTAGS = '#LeetBuild #SystemDesign #DistributedSystems';
@@ -36,7 +45,8 @@ export interface CertificateDetails {
   problem: ProblemSummary;
   /** When the last step was accepted. */
   completedAt: number;
-  language: Language;
+  /** A retired language too: a certificate already shared keeps verifying. */
+  language: CertificateLanguage;
   /** Points scored on the course, of its maximum. */
   score: number;
   max: number;
@@ -130,7 +140,7 @@ export function stepShareText(problem: Problem, step: Step, language: Language, 
 export function courseShareText(details: CertificateDetails, url: string): string {
   const time = details.time === null ? '' : ` in a timed run of ${formatClock(details.time)}`;
   return `Completed the ${details.problem.title} course on LeetBuild — ${details.problem.steps.length} steps in ${
-    LANGUAGE_LABEL[details.language]
+    CERTIFICATE_LANGUAGE_LABEL[details.language]
   }, ${details.score}/${details.max} points${time}.\n\n${
     details.problem.tagline
   }\n\nCertificate: ${url}\n\n${HASHTAGS}`;

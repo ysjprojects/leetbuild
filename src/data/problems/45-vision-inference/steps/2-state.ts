@@ -62,7 +62,6 @@ Requirements:
           none: [/\.zcard\(/],
         },
         go: {all: [/redis\.NewScript\(|\.Eval\(|\.EvalSha\(/, /redis\.call\(\s*['"]ZADD['"]/], none: [/\.ZCard\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]ZADD['"]/], none: [/\.zcard\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]ZADD['"]/], none: [/\.zcard\(/]},
       },
     },
@@ -75,7 +74,6 @@ Requirements:
         python: {all: [/ZREMRANGEBYSCORE/, /LEASE_S/]},
         typescript: {all: [/ZREMRANGEBYSCORE/, /LEASE_S/]},
         go: {all: [/ZREMRANGEBYSCORE/, /LeaseSeconds/]},
-        scala: {all: [/ZREMRANGEBYSCORE/, /LeaseSeconds/]},
         cpp: {all: [/ZREMRANGEBYSCORE/, /kLeaseSeconds/]},
       },
     },
@@ -88,7 +86,6 @@ Requirements:
         python: {all: [/\.zrem\(|['"]ZREM['"]/], none: [/zremrangebyrank/i]},
         typescript: {all: [/\.zrem\(|['"]ZREM['"]/], none: [/zremrangebyrank/i]},
         go: {all: [/\.ZRem\(|['"]ZREM['"]/], none: [/zremrangebyrank/i]},
-        scala: {all: [/\.zrem\(|['"]ZREM['"]/], none: [/zremrangebyrank/i]},
         cpp: {all: [/\.zrem\(|['"]ZREM['"]/], none: [/zremrangebyrank/i]},
       },
     },
@@ -101,7 +98,6 @@ Requirements:
         python: {all: [/WITHSCORES|withscores/], none: [/RETRY_AFTER_S/]},
         typescript: {all: [/WITHSCORES|withscores/i], none: [/RETRY_AFTER_S/]},
         go: {all: [/WITHSCORES|WithScores/], none: [/retryAfterSeconds/]},
-        scala: {all: [/WITHSCORES|WithScores/], none: [/RetryAfterSeconds/]},
         cpp: {all: [/WITHSCORES|withscores/i], none: [/kRetryAfterSeconds/]},
       },
     },
@@ -363,79 +359,6 @@ func release(ctx context.Context, tenant, ticket string) (bool, error) {
 func main() {
 	a, err := admit(context.Background(), "demo")
 	fmt.Println(a, err)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import redis.clients.jedis.JedisPooled
-
-import vision.Config
-
-/** admit's answer: the ticket that holds a slot (None when the pool is full) and the seconds to wait. */
-final case class Admission(ticket: Option[String], retryAfter: Long)
-
-object GpuPool {
-  val jedis = new JedisPooled("redis", 6379)
-  val RetryAfterSeconds = 1L
-
-  /** Take one of the tenant's GPU slots. */
-  def admit(tenant: String): Admission = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val pool = Config.gpuKey(tenant)
-    if (jedis.zcard(pool) >= Config.GpuTokens) {
-      Admission(None, RetryAfterSeconds)
-    } else {
-      val ticket = UUID.randomUUID().toString
-      jedis.zadd(pool, (System.currentTimeMillis() / 1000).toDouble, ticket)
-      Admission(Some(ticket), 0)
-    }
-  }
-
-  /** Give the slot back: true when this ticket held one. */
-  def release(tenant: String, ticket: String): Boolean =
-    jedis.zremrangeByRank(Config.gpuKey(tenant), 0, 0) == 1L
-}
-`,
-      solution: `import java.util.UUID
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import vision.Config
-
-/** admit's answer: the ticket that holds a slot (None when the pool is full) and the seconds to wait. */
-final case class Admission(ticket: Option[String], retryAfter: Long)
-
-object GpuPool {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Admit: String =
-    """local pool = KEYS[1]
-      |local now, lease, limit, ticket = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), ARGV[4]
-      |redis.call('ZREMRANGEBYSCORE', pool, '-inf', now)
-      |if redis.call('ZCARD', pool) >= limit then
-      |  local oldest = redis.call('ZRANGE', pool, 0, 0, 'WITHSCORES')
-      |  local wait = tonumber(oldest[2]) - now
-      |  if wait < 1 then wait = 1 end
-      |  return {'', tostring(wait)}
-      |end
-      |redis.call('ZADD', pool, now + lease, ticket)
-      |redis.call('EXPIRE', pool, lease)
-      |return {ticket, '0'}
-      |""".stripMargin
-
-  /** Take one of the tenant's GPU slots. */
-  def admit(tenant: String): Admission = {
-    val args = List((System.currentTimeMillis() / 1000).toString, Config.LeaseSeconds.toString, Config.GpuTokens.toString, UUID.randomUUID().toString)
-    val reply = jedis.eval(Admit, List(Config.gpuKey(tenant)).asJava, args.asJava).asInstanceOf[java.util.List[AnyRef]].asScala.map(_.toString)
-    Admission(Some(reply(0)).filter(_.nonEmpty), reply(1).toDouble.toLong)
-  }
-
-  /** Give the slot back: true when this ticket held one. */
-  def release(tenant: String, ticket: String): Boolean = jedis.zrem(Config.gpuKey(tenant), ticket) == 1L
 }
 `,
     },

@@ -53,12 +53,11 @@ already read, and never tries the fallback that was healthy all along.
       id: 'deadline',
       title: 'Every attempt carries the 8 s stream deadline',
       detail:
-        "Each StreamComplete call, the fallback's included, is opened with its own full 8 second deadline (`timeout=`, `deadline:`, a context with timeout, `withDeadlineAfter`, `set_deadline`), not what is left of one shared by both; a stalled provider then ends in DEADLINE_EXCEEDED and the fallback gets its turn.",
+        "Each StreamComplete call, the fallback's included, is opened with its own full 8 second deadline (`timeout=`, `deadline:`, a context with timeout, `set_deadline`), not what is left of one shared by both; a stalled provider then ends in DEADLINE_EXCEEDED and the fallback gets its turn.",
       match: {
         python: {all: [/StreamComplete\([\s\S]{0,300}?timeout\s*=/]},
         typescript: {all: [/StreamComplete\([\s\S]{0,300}?deadline\s*:/]},
         go: {all: [/context\.With(Timeout|Deadline)\(/]},
-        scala: {all: [/withDeadlineAfter\(/]},
         cpp: {all: [/set_deadline\(/]},
       },
     },
@@ -74,10 +73,6 @@ already read, and never tries the fallback that was healthy all along.
           none: [/for\s*\(\s*;\s*;\s*\)|while\s*\(\s*true\s*\)/],
         },
         go: {all: [/for\s+[\w, ]*:?=?\s*range\s+provider\w*/], none: [/for\s*\{/]},
-        scala: {
-          all: [/Providers\.(foreach|iterator|view)|for\s*\(\s*\w+\s*<-\s*Providers/],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
         cpp: {
           all: [/for\s*\(\s*(const\s+)?auto&?\s+\w+\s*:\s*kProviders/],
           none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
@@ -100,7 +95,6 @@ already read, and never tries the fallback that was healthy all along.
             /metadata\.(AppendToOutgoingContext|NewOutgoingContext)\(/,
           ],
         },
-        scala: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /"idempotency-key"/, /Metadata/]},
         cpp: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /"idempotency-key"/, /AddMetadata\(/]},
       },
     },
@@ -113,7 +107,6 @@ already read, and never tries the fallback that was healthy all along.
         python: {all: [/f["']circuit:\{/, /\.incr\(/, /["']open["']/, /\.expire\(|\bex\s*=/]},
         typescript: {all: [/`circuit:\$\{/, /\.incr\(/, /['"]open['"]/, /\.expire\(|['"]EX['"]/]},
         go: {all: [/"circuit:"\s*\+|"circuit:%s"/, /\.Incr\(/, /"open"/, /\.Expire\(/]},
-        scala: {all: [/s"circuit:\$/, /\.incr\(/, /"open"/, /\.expire\(|\.setex\(/]},
         cpp: {all: [/"circuit:"\s*\+/, /\.incr\(/, /"open"/, /\.expire\(|\.setex\(/]},
       },
     },
@@ -126,7 +119,6 @@ already read, and never tries the fallback that was healthy all along.
         python: {all: [/["']primary["']/, /["']fallback["']/, /for\s+\w+\s+in\s+PROVIDERS/]},
         typescript: {all: [/['"]primary['"]/, /['"]fallback['"]/, /for\s*\(\s*const\s+\w+\s+of\s+PROVIDERS/]},
         go: {all: [/"primary"/, /"fallback"/, /for\s+[\w, ]*:?=?\s*range\s+provider\w*/]},
-        scala: {all: [/"primary"/, /"fallback"/, /Providers\.(foreach|iterator|view)|for\s*\(\s*\w+\s*<-\s*Providers/]},
         cpp: {all: [/"primary"/, /"fallback"/, /for\s*\(\s*(const\s+)?auto&?\s+\w+\s*:\s*kProviders/]},
       },
     },
@@ -536,93 +528,6 @@ func streamWithFailover(ctx context.Context, req *pb.CompleteRequest, idempotenc
 		noteFailure(ctx, provider)
 	}
 	return errProviderUnavailable
-}
-`,
-    },
-    scala: {
-      starter: `import gateway.providers.{Chunk, CompleteRequest, ProviderGrpc}
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import scala.jdk.CollectionConverters._
-
-object Failover {
-  val StreamTimeoutMillis = 8000L
-  val RetryBackoffMillis = 200L
-
-  private val stubs = Map("primary" -> ProviderGrpc.blockingStub(ManagedChannelBuilder.forAddress("primary", 9000).usePlaintext().build()))
-
-  class ProviderUnavailable extends RuntimeException("primary and fallback failed")
-
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  /** Hands every chunk of one completion to onChunk, trying again after a failure. */
-  def streamWithFailover(request: CompleteRequest, idempotencyKey: String, onChunk: Chunk => Unit): Unit = {
-    while (true) {
-      try {
-        stubs("primary").streamComplete(request).foreach(onChunk)
-        return
-      } catch {
-        case _: StatusRuntimeException => Thread.sleep(RetryBackoffMillis)
-      }
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import gateway.providers.{Chunk, CompleteRequest, ProviderGrpc}
-import io.grpc.stub.MetadataUtils
-import io.grpc.{ManagedChannelBuilder, Metadata, Status, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object Failover {
-  val Providers = Seq("primary", "fallback")
-  val StreamTimeoutMillis = 8000L
-  val BreakerFailures = 5L
-  val BreakerTtlSeconds = 30L
-  val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val stubs = Providers.map(name => name -> ProviderGrpc.blockingStub(ManagedChannelBuilder.forAddress(name, 9000).usePlaintext().build())).toMap
-  private val IdempotencyKey = Metadata.Key.of("idempotency-key", Metadata.ASCII_STRING_MARSHALLER)
-
-  class ProviderUnavailable extends RuntimeException("primary and fallback failed")
-
-  def breakerOpen(provider: String): Boolean = jedis.get(s"circuit:$provider") == "open"
-
-  def noteFailure(provider: String): Unit = {
-    val key = s"circuit:$provider"
-    val failures = jedis.incr(key)
-    if (failures == 1L) jedis.expire(key, BreakerTtlSeconds)
-    if (failures >= BreakerFailures) jedis.setex(key, BreakerTtlSeconds, "open")
-  }
-
-  /** Hands every chunk of one completion to onChunk: the primary, then the fallback, one attempt each. */
-  def streamWithFailover(request: CompleteRequest, idempotencyKey: String, onChunk: Chunk => Unit): Unit = {
-    require(idempotencyKey.nonEmpty, "idempotency key required")
-    val headers = new Metadata()
-    headers.put(IdempotencyKey, idempotencyKey)
-    Providers.iterator.filterNot(breakerOpen).foreach { provider =>
-      var delivered = false
-      try {
-        val call = stubs(provider)
-          .withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers))
-          .withDeadlineAfter(StreamTimeoutMillis, TimeUnit.MILLISECONDS)
-        call.streamComplete(request).foreach { chunk =>
-          delivered = true
-          onChunk(chunk)
-        }
-        return
-      } catch {
-        case e: StatusRuntimeException =>
-          // The user already read part of the answer, or the provider refused the request itself.
-          if (delivered || !Retryable.contains(e.getStatus.getCode)) throw e
-          noteFailure(provider)
-      }
-    }
-    throw new ProviderUnavailable
-  }
 }
 `,
     },

@@ -52,7 +52,6 @@ resets at all; and a re-run of the freeze job silently rebases the monitor on to
         python: {all: [/register_script\(|\.eval\(/, /HINCRBY/], none: [/\.hget\(/, /\.hset\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /HINCRBY/], none: [/\.hget\(/, /\.hset\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /HINCRBY/], none: [/\.HGet\(/, /\.HSet\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /HINCRBY/], none: [/\.hget\(/, /\.hset\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /HINCRBY/], none: [/\.hget\(/, /\.hset\(/]},
       },
     },
@@ -65,7 +64,6 @@ resets at all; and a re-run of the freeze job silently rebases the monitor on to
         python: {all: [/def live_key\([^)]*\bwindow/]},
         typescript: {all: [/function liveKey\([^)]*\bwindow|liveKey\s*=\s*\([^)]*\bwindow/]},
         go: {all: [/func liveKey\([^)]*\bwindow/]},
-        scala: {all: [/def liveKey\([^)]*\bwindow/]},
         cpp: {all: [/liveKey\([^)]*\bwindow/]},
       },
     },
@@ -78,7 +76,6 @@ resets at all; and a re-run of the freeze job silently rebases the monitor on to
         python: {all: [/window_s\s*-\s*now|window_end\s*-\s*now|EXPIREAT|expireat/], none: [/\b3600\b/]},
         typescript: {all: [/windowS\s*-\s*now|windowEnd\s*-\s*now|EXPIREAT|expireat/], none: [/\b3600\b/]},
         go: {all: [/windowS\s*-\s*now|windowEnd\s*-\s*now|EXPIREAT|ExpireAt/], none: [/\b3600\b/, /time\.Hour/]},
-        scala: {all: [/windowS\s*-\s*now|windowEnd\s*-\s*now|EXPIREAT|expireAt/], none: [/\b3600\b/]},
         cpp: {all: [/window_s\s*-\s*now|window_end\s*-\s*now|EXPIREAT|expireat/], none: [/\b3600\b/]},
       },
     },
@@ -86,12 +83,11 @@ resets at all; and a re-run of the freeze job silently rebases the monitor on to
       id: 'baseline-frozen',
       title: 'Writes the baseline once',
       detail:
-        'The baseline is written with a set-if-absent (`nx=True`, `NX`, `SetNX`, `SetParams.nx()`, `UpdateType::NOT_EXIST`) and not deleted first, so a second freeze reports false and the reference stays as it was; of two racing freezes, exactly one reports true and its batch is the one stored.',
+        'The baseline is written with a set-if-absent (`nx=True`, `NX`, `SetNX`, `UpdateType::NOT_EXIST`) and not deleted first, so a second freeze reports false and the reference stays as it was; of two racing freezes, exactly one reports true and its batch is the one stored.',
       match: {
         python: {all: [/nx\s*=\s*True/], none: [/\.delete\(/]},
         typescript: {all: [/['"]NX['"]/], none: [/\.del\(/]},
         go: {all: [/SetNX\(|Mode:\s*"NX"/], none: [/\.Del\(/]},
-        scala: {all: [/\.nx\(\)/], none: [/\.del\(/]},
         cpp: {all: [/UpdateType::NOT_EXIST/], none: [/\.del\(/]},
       },
     },
@@ -351,80 +347,6 @@ func freezeBaseline(ctx context.Context, tenant, baselineRef string, batch map[i
 	key := "sketch:baseline:" + tenant + ":" + baselineRef
 	payload, _ := json.Marshal(batch)
 	return rdb.SetNX(ctx, key, payload, 0).Result() // a reference is written once, never rebased
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Merge a batch of bucket counts into the monitor's sketch for the current window; returns the window's sample count. */
-  def mergeBatch(tenant: String, monitorId: String, windowS: Long, batch: Map[Int, Long]): Long = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = s"sketch:live:$tenant:$monitorId"
-    batch.foreach { case (bucket, count) =>
-      val current = Option(jedis.hget(key, bucket.toString)).map(_.toLong).getOrElse(0L)
-      jedis.hset(key, bucket.toString, (current + count).toString)
-    }
-    jedis.expire(key, 3600L)
-    jedis.hvals(key).asScala.map(_.toLong).sum
-  }
-
-  /** Store the reference sketch monitors are compared against; true when this call wrote it. */
-  def freezeBaseline(tenant: String, baselineRef: String, batch: Map[Int, Long]): Boolean = {
-    val key = s"sketch:baseline:$tenant:$baselineRef"
-    jedis.del(key)
-    jedis.set(key, JsObject(batch.map { case (bucket, count) => bucket.toString -> JsNumber(count) }).compactPrint)
-    true
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** HINCRBY every (bucket, count) pair of ARGV, expire the hash after ARGV[#ARGV] seconds, return its total. */
-  val MergeLua: String =
-    """for i = 1, #ARGV - 1, 2 do
-      |  redis.call('HINCRBY', KEYS[1], ARGV[i], ARGV[i + 1])
-      |end
-      |redis.call('EXPIRE', KEYS[1], ARGV[#ARGV])
-      |local total = 0
-      |for _, count in ipairs(redis.call('HVALS', KEYS[1])) do
-      |  total = total + tonumber(count)
-      |end
-      |return total
-      |""".stripMargin
-
-  def windowStart(now: Long, windowS: Long): Long = now / windowS * windowS
-
-  def liveKey(tenant: String, monitorId: String, window: Long): String = s"sketch:live:$tenant:$monitorId:$window"
-
-  /** Merge a batch of bucket counts into the monitor's sketch for the current window; returns the window's sample count. */
-  def mergeBatch(tenant: String, monitorId: String, windowS: Long, batch: Map[Int, Long]): Long = {
-    val now = System.currentTimeMillis() / 1000
-    val window = windowStart(now, windowS)
-    val pairs = batch.toSeq.sortBy(_._1).flatMap { case (bucket, count) => Seq(bucket.toString, count.toString) }
-    val args = pairs :+ (window + windowS - now).toString // the seconds left in the window: the sketch dies with it
-    jedis.eval(MergeLua, List(liveKey(tenant, monitorId, window)).asJava, args.asJava).asInstanceOf[java.lang.Long]
-  }
-
-  /** Store the reference sketch monitors are compared against; true when this call wrote it. */
-  def freezeBaseline(tenant: String, baselineRef: String, batch: Map[Int, Long]): Boolean = {
-    val key = s"sketch:baseline:$tenant:$baselineRef"
-    val payload = JsObject(batch.map { case (bucket, count) => bucket.toString -> JsNumber(count) }).compactPrint
-    jedis.set(key, payload, SetParams.setParams().nx()) != null // a reference is written once, never rebased
-  }
 }
 `,
     },

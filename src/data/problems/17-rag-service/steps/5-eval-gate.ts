@@ -50,7 +50,6 @@ Requirements:
         python: {all: [/["']rag-eval["']/]},
         typescript: {all: [/['"]rag-eval['"]/]},
         go: {all: [/"rag-eval"/]},
-        scala: {all: [/"rag-eval"/]},
         cpp: {all: [/"rag-eval"/]},
       },
     },
@@ -63,7 +62,6 @@ Requirements:
         python: {order: [/^\s+handle\(/m, /consumer\.commit\(/]},
         typescript: {order: [/await handle\(/, /commitOffsets\(/]},
         go: {order: [/handle\(ctx,\s*\w+\)/, /CommitMessages\(/]},
-        scala: {order: [/=>\s*handle\(/, /commitSync\(/]},
         cpp: {order: [/handle\(\s*\*?\w+\s*\)\s*;/, /commitSync\(/]},
       },
     },
@@ -76,7 +74,6 @@ Requirements:
         python: {all: [/(!=|==)\s*MIN_SAMPLES\b/]},
         typescript: {all: [/(!==?|===?)\s*MIN_SAMPLES\b/]},
         go: {all: [/(!=|==)\s*minSamples\b/]},
-        scala: {all: [/(!=|==)\s*MinSamples\b/]},
         cpp: {all: [/(!=|==)\s*kMinSamples\b/]},
       },
     },
@@ -89,7 +86,6 @@ Requirements:
         python: {all: [/\bMIN_RECALL\b/, /\bMAX_REGRESSION\b/]},
         typescript: {all: [/\bMIN_RECALL\b/, /\bMAX_REGRESSION\b/]},
         go: {all: [/\bminRecall\b/, /\bmaxRegression\b/]},
-        scala: {all: [/\bMinRecall\b/, /\bMaxRegression\b/]},
         cpp: {all: [/\bkMinRecall\b/, /\bkMaxRegression\b/]},
       },
     },
@@ -102,7 +98,6 @@ Requirements:
         python: {none: [/\bquestion\b/]},
         typescript: {none: [/\bquestion\b/]},
         go: {none: [/\.Question\b/]},
-        scala: {none: [/\.question\b/]},
         cpp: {none: [/"question"/]},
       },
     },
@@ -475,151 +470,6 @@ func run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-
-import rag.{Config, EvalStore, Sample}
-
-object EvalGate {
-  val Group = "rag-eval-v2"
-  val MinGroundedness = 0.95
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  /** Count one sample and publish the release's verdict. */
-  def handle(sample: Sample): Unit = {
-    val count = EvalStore.record(sample)
-    val m = EvalStore.metrics(sample.release)
-    val decision = if (m.groundedness >= MinGroundedness) "pass" else "block"
-    if (decision == "pass") EvalStore.setBaseline(sample.release, m.groundedness)
-    val event = ujson.Obj(
-      "release" -> sample.release,
-      "samples" -> m.samples,
-      "groundedness" -> m.groundedness,
-      "recall_at_k" -> m.recall_at_k,
-      "refusal_accuracy" -> m.refusal_accuracy,
-      "verdict" -> decision,
-      "question" -> sample.question
-    )
-    producer.send(new ProducerRecord[String, String](Config.MetricsTopic, sample.release, ujson.write(event))).get()
-    System.err.println(s"eval release=\${sample.release} samples=$count verdict=$decision")
-  }
-
-  private def parse(raw: String): Option[Sample] = Try {
-    val j = ujson.read(raw)
-    Sample(j("release").str, j("sample_id").str, j("grounded").bool, j("recall_at_k").num, j("should_refuse").bool, j("refused").bool, j("question").str)
-  }.toOption
-
-  def run(): Unit = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    props.put("enable.auto.commit", "false")
-    props.put("auto.offset.reset", "earliest")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Config.SamplesTopic).asJava)
-    while (true) {
-      for (record <- consumer.poll(Duration.ofSeconds(1)).asScala) {
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-        parse(record.value()) match {
-          case Some(sample) => handle(sample)
-          case None => System.err.println(s"skipping malformed sample at offset \${record.offset}")
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-
-import rag.{Config, EvalStore, Metrics, Sample}
-
-object EvalGate {
-  val Group = "rag-eval"
-  val MinSamples = 200
-  val MinGroundedness = 0.95
-  val MinRecall = 0.90
-  val MaxRegression = 0.01
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  def verdict(m: Metrics, baseline: Option[Double]): String =
-    if (m.groundedness < MinGroundedness || m.recall_at_k < MinRecall) "block"
-    else if (baseline.exists(b => b - m.groundedness > MaxRegression)) "block"
-    else "pass"
-
-  /** Count one sample; at MinSamples, publish the release's verdict. */
-  def handle(sample: Sample): Unit = {
-    val count = EvalStore.record(sample)
-    if (count != MinSamples) return
-    val m = EvalStore.metrics(sample.release)
-    val decision = verdict(m, EvalStore.baseline())
-    if (decision == "pass") EvalStore.setBaseline(sample.release, m.groundedness)
-    val event = ujson.Obj(
-      "release" -> sample.release,
-      "samples" -> m.samples,
-      "groundedness" -> m.groundedness,
-      "recall_at_k" -> m.recall_at_k,
-      "refusal_accuracy" -> m.refusal_accuracy,
-      "verdict" -> decision
-    )
-    producer.send(new ProducerRecord[String, String](Config.MetricsTopic, sample.release, ujson.write(event))).get()
-    System.err.println(s"eval release=\${sample.release} samples=$count verdict=$decision")
-  }
-
-  private def parse(raw: String): Option[Sample] = Try {
-    val j = ujson.read(raw)
-    val text = j.obj.get("question").map(_.str).getOrElse("")
-    Sample(j("release").str, j("sample_id").str, j("grounded").bool, j("recall_at_k").num, j("should_refuse").bool, j("refused").bool, text)
-  }.toOption
-
-  def run(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    props.put("enable.auto.commit", "false")
-    props.put("auto.offset.reset", "earliest")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Config.SamplesTopic).asJava)
-    while (true) {
-      for (record <- consumer.poll(Duration.ofSeconds(1)).asScala) {
-        parse(record.value()) match {
-          case Some(sample) => handle(sample)
-          case None => System.err.println(s"skipping malformed sample at offset \${record.offset}")
-        }
-        // after the count: a crash before it redelivers, and record() counts once
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-      }
-    }
-  }
 }
 `,
     },

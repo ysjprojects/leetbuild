@@ -7,7 +7,7 @@
 import {night} from '@/styles/palette';
 
 import {type CertificateDetails, certificateId, ORGANIZATION} from './social';
-import {CONCEPT_LABEL, LANGUAGE_LABEL} from './types';
+import {CERTIFICATE_LANGUAGE_LABEL, CONCEPT_LABEL} from './types';
 
 /** A4 landscape at 2×: prints well, reads well in a feed. */
 export const CERTIFICATE_SIZE = {width: 2338, height: 1654};
@@ -129,7 +129,7 @@ export function drawCertificate(canvas: HTMLCanvasElement, details: CertificateD
   ctx.font = `400 36px ${SANS}`;
   const concepts = details.problem.concepts.map(c => CONCEPT_LABEL[c]).join(' · ');
   ctx.fillText(
-    `${details.problem.steps.length} steps · ${concepts} · in ${LANGUAGE_LABEL[details.language]}`,
+    `${details.problem.steps.length} steps · ${concepts} · in ${CERTIFICATE_LANGUAGE_LABEL[details.language]}`,
     left,
     890,
   );

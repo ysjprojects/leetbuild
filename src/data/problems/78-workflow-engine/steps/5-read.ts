@@ -52,7 +52,6 @@ stuck on a step looks like a run that is moving, and so does a finished one.
         },
         typescript: {all: [/x-tenant-id/i, /code\(\s*401\s*\)/, /\.tenant\s*!==\s*tenant|tenant\s*!==\s*run\.tenant/]},
         go: {all: [/X-Tenant-Id/i, /StatusUnauthorized/, /\.Tenant\s*!=\s*tenant|tenant\s*!=\s*run\.Tenant/]},
-        scala: {all: [/X-Tenant-Id/i, /StatusCodes\.Unauthorized/, /_\.tenant\s*==\s*tenant|\.tenant\s*!=\s*tenant/]},
         cpp: {all: [/X-Tenant-Id/i, /\b401\b/, /->tenant\s*!=\s*tenant|tenant\s*!=\s*run->tenant/]},
       },
     },
@@ -65,7 +64,6 @@ stuck on a step looks like a run that is moving, and so does a finished one.
         python: {all: [/checkpoint\.read\(/, /pinned_steps/], none: [/definitions\.latest\(/]},
         typescript: {all: [/checkpoint\.read\(/, /pinned_steps/], none: [/definitions\.latest\(/]},
         go: {all: [/checkpoint\.Read\(/, /pinned_steps/], none: [/definitions\.Latest\(/]},
-        scala: {all: [/Checkpoint\.read\(/, /pinned_steps/], none: [/Definitions\.latest\(/]},
         cpp: {all: [/checkpoint::read\(/, /pinned_steps/], none: [/definitions::latest\(/]},
       },
     },
@@ -78,7 +76,6 @@ stuck on a step looks like a run that is moving, and so does a finished one.
         python: {all: [/pending_effects/, /ledger\.incomplete\(/]},
         typescript: {all: [/pending_effects/, /ledger\.incomplete\(/]},
         go: {all: [/pending_effects/, /ledger\.Incomplete\(/]},
-        scala: {all: [/pending_effects/, /Ledger\.incomplete\(/]},
         cpp: {all: [/pending_effects/, /ledger::incomplete\(/]},
       },
     },
@@ -91,7 +88,6 @@ stuck on a step looks like a run that is moving, and so does a finished one.
         python: {all: [/STALL_AFTER_S/, /"stalled"/, /"succeeded"/]},
         typescript: {all: [/STALL_AFTER_S/, /'stalled'/, /'succeeded'/]},
         go: {all: [/stallAfterSeconds/, /"stalled"/, /"succeeded"/]},
-        scala: {all: [/StallAfterSeconds/, /"stalled"/, /"succeeded"/]},
         cpp: {all: [/kStallAfterSeconds/, /"stalled"/, /"succeeded"/]},
       },
     },
@@ -328,74 +324,6 @@ func readRun(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/runs/{runId}", readRun)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import workflow.{Checkpoint, Definitions, Ledger, Runs} // Checkpoint.read · Definitions.latest · Ledger.incomplete · Runs.get
-
-object Read {
-  val route: Route =
-    path("v1" / "runs" / Segment) { runId =>
-      get {
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        Runs.get(runId) match {
-          case None => complete(StatusCodes.NotFound -> "no such run")
-          case Some(run) =>
-            val steps = Definitions.latest(run.workflow).map(_.steps).getOrElse(Seq.empty)
-            val body = JsObject("run_id" -> JsString(runId), "workflow" -> JsString(run.workflow), "steps" -> steps.toJson, "status" -> JsString("running"))
-            complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import workflow.{Checkpoint, Definitions, Ledger, Runs} // Checkpoint.read · Definitions.latest · Ledger.incomplete · Runs.get
-
-object Read {
-  val StallAfterSeconds = 300L
-
-  val route: Route =
-    path("v1" / "runs" / Segment) { runId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            // Another tenant's run answers exactly like a missing one, so run ids cannot be probed.
-            Runs.get(runId).filter(_.tenant == tenant) match {
-              case None => complete(StatusCodes.NotFound -> "no such run")
-              case Some(run) =>
-                // The run's own records: its pinned steps, its checkpoint, its ledger. Never the newest definition.
-                val state = Checkpoint.read(runId)
-                val currentStep = state.getOrElse("current_step", "")
-                val checkpointAt = state.get("updated_at").map(_.toLong).getOrElse(run.startedAt)
-                val status =
-                  if (currentStep.isEmpty) "succeeded"
-                  else if (System.currentTimeMillis() / 1000 - checkpointAt > StallAfterSeconds) "stalled"
-                  else "running"
-                val body = JsObject(
-                  "run_id" -> JsString(runId), "workflow" -> JsString(run.workflow), "definition_version" -> JsNumber(run.definitionVersion),
-                  "pinned_steps" -> run.pinnedSteps.toJson, "current_step" -> JsString(currentStep),
-                  "completed" -> state.getOrElse("completed", "").split(",").filter(_.nonEmpty).toSeq.toJson,
-                  "checkpoint_at" -> JsNumber(checkpointAt), "pending_effects" -> Ledger.incomplete(runId, run.pinnedSteps).toJson,
-                  "status" -> JsString(status))
-                complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-            }
-        }
-      }
-    }
 }
 `,
     },

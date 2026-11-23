@@ -27,8 +27,7 @@ and an event the broker refused is gone.
   line text or notes.
 - \`finalize_and_publish\` claims first and publishes only when the claim answered a number.
 - A delivery the broker refuses goes to the outbox (\`store.outbox_add(payload)\`) from the delivery
-  report (\`on_delivery\`, a rejected \`send\`, the \`WriteMessages\` error, \`dr_cb\`, the producer
-  \`Callback\`), for the relay to produce again.`,
+  report (\`on_delivery\`, a rejected \`send\`, the \`WriteMessages\` error, \`dr_cb\`), for the relay to produce again.`,
   sequence: {
     participants: ['Finalize path', 'Redis', 'invoice.event', 'Ledger consumer'],
     messages: [
@@ -58,10 +57,6 @@ and an event the broker refused is gone.
         python: {all: [/key=invoice\["id"\]/, /invoice\.event/], none: [/key=event_type/]},
         typescript: {all: [/key:\s*invoice\.id\b/, /invoice\.event/], none: [/key:\s*eventType\b/]},
         go: {all: [/Key:\s*\[\]byte\(invoice\.ID\)/, /invoice\.event/], none: [/Key:\s*\[\]byte\(eventType\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(EventTopic,\s*invoice\.id/, /invoice\.event/],
-          none: [/EventTopic,\s*eventType/],
-        },
         cpp: {
           all: [/invoice\.id\.c_str\(\),\s*invoice\.id\.size\(\)/, /invoice\.event/],
           none: [/event_type\.c_str\(\)/],
@@ -77,7 +72,6 @@ and an event the broker refused is gone.
         python: {all: [/line_digest\(/, /line_digests/], none: [/["']line_items["']\s*:/, /internal_notes/]},
         typescript: {all: [/lineDigest\(/, /line_digests/], none: [/line_items:\s*invoice/, /internal_notes/]},
         go: {all: [/store\.LineDigest\(/, /line_digests/], none: [/"line_items":/, /InternalNotes/]},
-        scala: {all: [/Store\.lineDigest/, /line_digests/], none: [/"line_items"\s*->/, /internalNotes/]},
         cpp: {all: [/store::lineDigest\(/, /line_digests/], none: [/\{"line_items"/, /internal_notes/]},
       },
     },
@@ -90,7 +84,6 @@ and an event the broker refused is gone.
         python: {order: [/def finalize_and_publish\(/, /claim_number\(/, /publish_event\(/]},
         typescript: {order: [/function finalizeAndPublish\(/, /claimNumber\(/, /publishEvent\(/]},
         go: {order: [/func finalizeAndPublish\(/, /sequence\.ClaimNumber\(/, /publishEvent\(/]},
-        scala: {order: [/def finalizeAndPublish\(/, /Sequence\.claimNumber\(/, /publishEvent\(/]},
         cpp: {order: [/finalizeAndPublish\(const/, /sequence::claimNumber\(/, /publishEvent\(/]},
       },
     },
@@ -98,12 +91,11 @@ and an event the broker refused is gone.
       id: 'delivery',
       title: 'A refused delivery goes to the outbox',
       detail:
-        'The delivery report (`on_delivery`, the rejected `send`, the `WriteMessages` error, `dr_cb`, the producer `Callback`) puts the payload in the outbox (`outbox_add`/`outboxAdd`) when the broker refused it; logging it loses the event.',
+        'The delivery report (`on_delivery`, the rejected `send`, the `WriteMessages` error, `dr_cb`) puts the payload in the outbox (`outbox_add`/`outboxAdd`) when the broker refused it; logging it loses the event.',
       match: {
         python: {all: [/on_delivery/, /store\.outbox_add\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/outboxAdd\(/]},
         go: {all: [/store\.OutboxAdd\(/]},
-        scala: {all: [/Store\.outboxAdd\(/, /onCompletion/]},
         cpp: {all: [/store::outboxAdd\(/, /dr_cb/]},
       },
     },
@@ -427,106 +419,6 @@ func finalizeAndPublish(ctx context.Context, tenant, invoiceID string) (map[stri
 		return nil, err
 	}
 	return publishEvent(ctx, "invoice.finalized", store.Get(ctx, invoiceID))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import invoice.{Sequence, Store} // Store.get, lineDigest, outboxAdd; Sequence.claimNumber
-
-object Events {
-  val EventTopic = "invoice.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"invoice event not delivered: \${exception.getMessage}")
-  }
-
-  /** What the ledger needs to post the event. */
-  def eventPayload(eventType: String, invoice: Store.Invoice): JsObject = JsObject(
-    "event_type" -> JsString(eventType),
-    "invoice_id" -> JsString(invoice.id),
-    "tenant_id" -> JsString(invoice.tenantId),
-    "number" -> invoice.number.map(JsNumber(_)).getOrElse(JsNull),
-    "currency" -> JsString(invoice.currency),
-    "subtotal_cents" -> JsNumber(invoice.subtotalCents),
-    "tax_cents" -> invoice.taxCents.map(JsNumber(_)).getOrElse(JsNull),
-    "line_items" -> Store.linesJson(invoice.lineItems), // the ledger shows the lines
-    "internal_notes" -> JsString(invoice.internalNotes))
-
-  /** Produce one lifecycle event on invoice.event. */
-  def publishEvent(eventType: String, invoice: Store.Invoice): JsObject = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val payload = eventPayload(eventType, invoice)
-    producer.send(new ProducerRecord[String, String](EventTopic, eventType, payload.compactPrint), onDelivery)
-    producer.flush()
-    payload
-  }
-
-  /** Finalize the draft and tell the ledger; None when it was no longer a draft. */
-  def finalizeAndPublish(tenant: String, invoiceId: String): Option[JsObject] = {
-    val event = publishEvent("invoice.finalized", Store.get(invoiceId).get)
-    Sequence.claimNumber(tenant, invoiceId).map(_ => event)
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import invoice.{Sequence, Store} // Store.get, lineDigest, outboxAdd; Sequence.claimNumber
-
-object Events {
-  val EventTopic = "invoice.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** What the ledger needs to post the event: one digest per line proves the lines without their text. */
-  def eventPayload(eventType: String, invoice: Store.Invoice): JsObject = JsObject(
-    "event_type" -> JsString(eventType),
-    "invoice_id" -> JsString(invoice.id),
-    "tenant_id" -> JsString(invoice.tenantId),
-    "number" -> invoice.number.map(JsNumber(_)).getOrElse(JsNull),
-    "currency" -> JsString(invoice.currency),
-    "subtotal_cents" -> JsNumber(invoice.subtotalCents),
-    "tax_cents" -> invoice.taxCents.map(JsNumber(_)).getOrElse(JsNull),
-    "line_digests" -> JsArray(invoice.lineItems.map(line => JsString(Store.lineDigest(line))).toVector))
-
-  /** Produce one lifecycle event on invoice.event. */
-  def publishEvent(eventType: String, invoice: Store.Invoice): JsObject = {
-    val payload = eventPayload(eventType, invoice)
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        // The broker did not take it: the relay produces it again from the outbox.
-        if (exception != null) Store.outboxAdd(payload)
-    }
-    // Keyed by invoice: one invoice's events stay on one partition, in order.
-    producer.send(new ProducerRecord[String, String](EventTopic, invoice.id, payload.compactPrint), onDelivery)
-    producer.flush()
-    payload
-  }
-
-  /** Finalize the draft and tell the ledger; None when it was no longer a draft. */
-  def finalizeAndPublish(tenant: String, invoiceId: String): Option[JsObject] =
-    // The claim commits first: an event may lag the state, it may never precede it.
-    Sequence.claimNumber(tenant, invoiceId).map(_ => publishEvent("invoice.finalized", Store.get(invoiceId).get))
 }
 `,
     },

@@ -63,7 +63,6 @@ priced as 30 days; and the switch day is billed on both plans.
         python: {all: [/@app\.post\(\s*["']\/v1\/subscriptions["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/subscriptions['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/subscriptions"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"subscriptions"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/subscriptions"/]},
       },
     },
@@ -76,7 +75,6 @@ priced as 30 days; and the switch day is billed on both plans.
         python: {all: [/x-tenant-id/i, /\b401\b/, /\[["']tenant["']\]/]},
         typescript: {all: [/x-tenant-id/i, /\b401\b/, /\.tenant\b/]},
         go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/, /\.Tenant\b/]},
-        scala: {all: [/X-Tenant-Id/i, /Unauthorized|\b401\b/, /\.tenant\b/]},
         cpp: {all: [/X-Tenant-Id/i, /\b401\b/, /(->|\.)tenant\b/]},
       },
     },
@@ -89,7 +87,6 @@ priced as 30 days; and the switch day is billed on both plans.
         python: {all: [/not in PRORATION_POLICIES/, /\b400\b/]},
         typescript: {all: [/PRORATION_POLICIES\.includes\(/, /\b400\b/]},
         go: {all: [/prorationPolicies\[/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/ProrationPolicies\.contains\(/, /BadRequest|\b400\b/]},
         cpp: {all: [/kProrationPolicies\.(count|find|contains)\(/, /\b400\b/]},
       },
     },
@@ -102,7 +99,6 @@ priced as 30 days; and the switch day is billed on both plans.
         python: {all: [/days_between\([^,\n]*period_start\s*,[^)\n]*period_end\s*\)/], none: [/MONTH_DAYS/]},
         typescript: {all: [/daysBetween\([^,\n]*period_start\s*,[^)\n]*period_end\s*\)/], none: [/MONTH_DAYS/]},
         go: {all: [/DaysBetween\([^,\n]*PeriodStart\s*,[^)\n]*PeriodEnd\s*\)/], none: [/monthDays/]},
-        scala: {all: [/daysBetween\([^,\n]*periodStart\s*,[^)\n]*periodEnd\s*\)/], none: [/MonthDays/]},
         cpp: {all: [/daysBetween\([^,\n]*period_start\s*,[^)\n]*period_end\s*\)/], none: [/kMonthDays/]},
       },
     },
@@ -115,7 +111,6 @@ priced as 30 days; and the switch day is billed on both plans.
         python: {all: [/days_between\(/], none: [/days_between\([^)\n]*\)\s*\+\s*1\b/]},
         typescript: {all: [/daysBetween\(/], none: [/daysBetween\([^)\n]*\)\s*\+\s*1\b/]},
         go: {all: [/DaysBetween\(/], none: [/DaysBetween\([^)\n]*\)\s*\+\s*1\b/]},
-        scala: {all: [/daysBetween\(/], none: [/daysBetween\([^)\n]*\)\s*\+\s*1\b/]},
         cpp: {all: [/daysBetween\(/], none: [/daysBetween\([^)\n]*\)\s*\+\s*1\b/]},
       },
     },
@@ -514,125 +509,6 @@ func changePlan(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/subscriptions", changePlan)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import billing.{Dates, Store} // Dates.today, daysBetween; Store.findSubscription, planPrice, openInvoice
-
-object Api {
-  val MonthDays = 30
-  val ProrationPolicies: Set[String] = Set("actual_days")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(body: JsObject, name: String): Option[String] = body.fields.get(name).collect { case JsString(s) => s }
-
-  private def line(plan: String, days: Long, amountCents: Long): JsObject =
-    JsObject("plan" -> JsString(plan), "days" -> JsNumber(days), "amount_cents" -> JsNumber(amountCents))
-
-  /** The answer: the lines, their total, and the period's invoice opened for that total. */
-  private def schedule(subscription: Store.Subscription, plan: String, changeAt: String, lines: Seq[JsObject]): JsObject = {
-    val total = lines.map(_.fields("amount_cents").asInstanceOf[JsNumber].value.toLong).sum
-    val invoice = Store.openInvoice(subscription.subscriptionId, subscription.periodStart, subscription.periodEnd, total)
-    JsObject("subscription_id" -> JsString(subscription.subscriptionId), "plan" -> JsString(plan), "effective_at" -> JsString(changeAt),
-      "lines" -> JsArray(lines.toVector), "total_cents" -> JsNumber(total), "invoice_id" -> JsString(invoice.invoiceId))
-  }
-
-  val route: Route =
-    path("v1" / "subscriptions") {
-      post {
-        entity(as[String]) { raw =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val body = raw.parseJson.asJsObject
-          Store.findSubscription(text(body, "subscription_id").getOrElse("")) match {
-            case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("no such subscription"))))
-            case Some(subscription) =>
-              val plan = text(body, "plan").getOrElse("")
-              val effective = text(body, "effective_date").getOrElse("")
-              val changeAt = if (effective == "now") Dates.today() else effective
-              val oldDays = Dates.daysBetween(subscription.periodStart, changeAt) + 1
-              val newDays = Dates.daysBetween(changeAt, subscription.periodEnd)
-              val oldPrice = Store.planPrice(subscription.plan).getOrElse(0L)
-              val newPrice = Store.planPrice(plan).getOrElse(0L)
-              val lines = Seq(
-                line(subscription.plan, oldDays, math.round(oldPrice.toDouble * oldDays / MonthDays)),
-                line(plan, newDays, math.round(newPrice.toDouble * newDays / MonthDays)))
-              complete(json(StatusCodes.OK, schedule(subscription, plan, changeAt, lines)))
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import billing.{Dates, Store} // Dates.today, daysBetween; Store.findSubscription, planPrice, openInvoice
-
-object Api {
-  val ProrationPolicies: Set[String] = Set("actual_days")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def text(body: JsObject, name: String): Option[String] = body.fields.get(name).collect { case JsString(s) => s }
-
-  private def line(plan: String, days: Long, amountCents: Long): JsObject =
-    JsObject("plan" -> JsString(plan), "days" -> JsNumber(days), "amount_cents" -> JsNumber(amountCents))
-
-  /** The answer: the lines, their total, and the period's invoice opened for that total. */
-  private def schedule(subscription: Store.Subscription, plan: String, changeAt: String, lines: Seq[JsObject]): JsObject = {
-    val total = lines.map(_.fields("amount_cents").asInstanceOf[JsNumber].value.toLong).sum
-    val invoice = Store.openInvoice(subscription.subscriptionId, subscription.periodStart, subscription.periodEnd, total)
-    JsObject("subscription_id" -> JsString(subscription.subscriptionId), "plan" -> JsString(plan), "effective_at" -> JsString(changeAt),
-      "lines" -> JsArray(lines.toVector), "total_cents" -> JsNumber(total), "invoice_id" -> JsString(invoice.invoiceId))
-  }
-
-  private def change(tenant: String, body: JsObject): HttpResponse =
-    // Another tenant's subscription answers like a missing one: the id is not confirmed.
-    Store.findSubscription(text(body, "subscription_id").getOrElse("")).filter(_.tenant == tenant) match {
-      case None => error(StatusCodes.NotFound, "no such subscription")
-      case Some(subscription) =>
-        val plan = text(body, "plan").getOrElse("")
-        val policy = text(body, "proration_policy").getOrElse("actual_days")
-        val effective = text(body, "effective_date").getOrElse("")
-        (Store.planPrice(plan), Store.planPrice(subscription.plan)) match {
-          case (None, _) => error(StatusCodes.BadRequest, s"unknown plan $plan")
-          case _ if !ProrationPolicies.contains(policy) => error(StatusCodes.BadRequest, s"unsupported proration_policy $policy")
-          case _ if effective != "now" && effective != subscription.periodEnd => error(StatusCodes.BadRequest, "effective_date is now or the next period start")
-          case (Some(newPrice), oldPrice) =>
-            val changeAt = if (effective == "now") Dates.today() else subscription.periodEnd
-            // Half-open: the old plan covers [periodStart, changeAt), the new one [changeAt, periodEnd).
-            val periodDays = Dates.daysBetween(subscription.periodStart, subscription.periodEnd)
-            val oldDays = Dates.daysBetween(subscription.periodStart, changeAt)
-            val newDays = Dates.daysBetween(changeAt, subscription.periodEnd)
-            val lines = Seq(
-              line(subscription.plan, oldDays, math.round(oldPrice.getOrElse(0L).toDouble * oldDays / periodDays)),
-              line(plan, newDays, math.round(newPrice.toDouble * newDays / periodDays)))
-            json(StatusCodes.OK, schedule(subscription, plan, changeAt, lines))
-        }
-    }
-
-  val route: Route =
-    path("v1" / "subscriptions") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-          case Some(tenant) => entity(as[String]) { raw => complete(change(tenant, raw.parseJson.asJsObject)) }
-        }
-      }
-    }
 }
 `,
     },

@@ -50,12 +50,11 @@ or drops a segment.
       id: 'job-key',
       title: 'Keyed by job id',
       detail:
-        "The record key is the job id (`key=job_id`, `key: jobId`, `[]byte(jobID)`, `ProducerRecord(Topic, jobId, …)`), so one job's segments land on one partition, each chunk's in the order they were spoken; the starter keys by chunk index.",
+        "The record key is the job id (`key=job_id`, `key: jobId`, `[]byte(jobID)`), so one job's segments land on one partition, each chunk's in the order they were spoken; the starter keys by chunk index.",
       match: {
         python: {all: [/produce\([^\n]*key=job_id/], none: [/key\s*=\s*str\(/]},
         typescript: {all: [/key:\s*jobId\b/], none: [/key\s*=\s*String\(/]},
         go: {all: [/Key:\s*\[\]byte\(jobID\)/], none: [/Key:\s*\[\]byte\(strconv/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*jobId/], none: [/chunkIndex\.toString/]},
         cpp: {all: [/job_id\.c_str\(\),\s*job_id\.(size|length)\(\)/], none: [/key\.c_str\(\)/]},
       },
     },
@@ -68,7 +67,6 @@ or drops a segment.
         python: {order: [/\bredact\(/, /producer\.produce\(/]},
         typescript: {order: [/\bredact\(/, /producer\.send\(/]},
         go: {order: [/redact\.Redact\(/, /writer\.WriteMessages\(/]},
-        scala: {order: [/Redact\.redact\(/, /producer\.send\(/]},
         cpp: {order: [/redact::redact\(/, /producer->produce\(/]},
       },
     },
@@ -81,7 +79,6 @@ or drops a segment.
         python: {all: [/["']start_ms["']/, /["']end_ms["']/, /["']speaker["']/]},
         typescript: {all: [/start_ms\s*:/, /end_ms\s*:/, /speaker\s*:/]},
         go: {all: [/json:"start_ms"/, /json:"end_ms"/, /json:"speaker"/]},
-        scala: {all: [/"start_ms"\s*->/, /"end_ms"\s*->/, /"speaker"\s*->/]},
         cpp: {all: [/\{"start_ms",/, /\{"end_ms",/, /\{"speaker",/]},
       },
     },
@@ -89,7 +86,7 @@ or drops a segment.
       id: 'outbox-from-delivery',
       title: 'Writes the outbox row from the delivery report',
       detail:
-        'A record the broker refuses becomes an outbox row, with its redacted payload, where the broker answers: the delivery callback, the rejected `send`, the returned `WriteMessages` error, `dr_cb`, a producer `Callback`. Every refused record gets a row and no accepted one does (a batch the broker refuses whole is outboxed whole), and all of it before `publish_segments` returns, so each segment lands once. A `try` around `produce` catches only a full local queue.',
+        'A record the broker refuses becomes an outbox row, with its redacted payload, where the broker answers: the delivery callback, the rejected `send`, the returned `WriteMessages` error, `dr_cb`. Every refused record gets a row and no accepted one does (a batch the broker refuses whole is outboxed whole), and all of it before `publish_segments` returns, so each segment lands once. A `try` around `produce` catches only a full local queue.',
       match: {
         python: {all: [/on_delivery\s*=|callback\s*=/, /jobs\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {
@@ -97,7 +94,6 @@ or drops a segment.
           none: [/void producer\.send\(/],
         },
         go: {all: [/err\s*:?=\s*writer\.WriteMessages\(/, /jobs\.InsertOutbox\(/], none: [/Async:\s*true/]},
-        scala: {all: [/Jobs\.insertOutbox\(/, /exception != null/], none: [/case\s+_:\s*KafkaException/]},
         cpp: {all: [/jobs::insertOutbox\(/, /dr_cb/], none: [/!=\s*RdKafka::ERR_NO_ERROR\)\s*jobs::insertOutbox/]},
       },
     },
@@ -110,7 +106,6 @@ or drops a segment.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -324,75 +319,6 @@ func publishSegments(ctx context.Context, jobID string, segments []jobs.Segment)
 			jobs.InsertOutbox(ctx, topic, jobID, event) // the broker said no: the relay produces it later
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import transcribe.{Jobs, Redact} // Jobs.saveSegments, Jobs.insertOutbox; Redact.redact
-
-object SegmentEvents {
-  val Topic = "transcript.segment"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** Publish a chunk's segments for captions and search, and keep them on the job. */
-  def publishSegments(jobId: String, segments: Seq[Jobs.Segment]): Unit = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    segments.foreach { s =>
-      val key = s.chunkIndex.toString
-      val payload = JsObject("job_id" -> JsString(jobId), "chunk_index" -> JsNumber(s.chunkIndex), "text" -> JsString(s.text))
-      try producer.send(new ProducerRecord[String, String](Topic, key, payload.compactPrint))
-      catch { case _: KafkaException => Jobs.insertOutbox(Topic, key, payload) } // the broker said no: the relay produces it later
-    }
-    producer.flush()
-    Jobs.saveSegments(jobId, segments.map(s => s.copy(text = Redact.redact(s.text))))
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import transcribe.{Jobs, Redact} // Jobs.saveSegments, Jobs.insertOutbox; Redact.redact
-
-object SegmentEvents {
-  val Topic = "transcript.segment"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes the segment once, on every replica.
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** Publish a chunk's segments for captions and search, and keep them on the job. */
-  def publishSegments(jobId: String, segments: Seq[Jobs.Segment]): Unit = {
-    // Redaction comes first: nothing downstream ever holds the raw text.
-    val redacted = segments.map(s => s.copy(text = Redact.redact(s.text)))
-    Jobs.saveSegments(jobId, redacted)
-    redacted.foreach { s =>
-      val payload = JsObject(
-        "job_id" -> JsString(jobId), "chunk_index" -> JsNumber(s.chunkIndex), "start_ms" -> JsNumber(s.startMs),
-        "end_ms" -> JsNumber(s.endMs), "speaker" -> JsString(s.speaker), "text" -> JsString(s.text))
-      val onDelivery: Callback = new Callback {
-        override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-          if (exception != null) Jobs.insertOutbox(Topic, jobId, payload) // the broker said no: the relay produces it later
-      }
-      producer.send(new ProducerRecord[String, String](Topic, jobId, payload.compactPrint), onDelivery)
-    }
-    producer.flush()
-  }
 }
 `,
     },

@@ -46,7 +46,6 @@ an item that did breach goes to the back of the line, unmarked.
         python: {all: [/\.lpop\(|register_script\(|\.eval\(/], none: [/\.lindex\(/, /\.lrem\(/]},
         typescript: {all: [/\.lpop\(|defineCommand\(|\.eval\(/], none: [/\.lindex\(/, /\.lrem\(/]},
         go: {all: [/\.LPop\(|redis\.NewScript\(|\.Eval\(/], none: [/\.LIndex\(/, /\.LRem\(/]},
-        scala: {all: [/\.lpop\(|\.eval\(/], none: [/\.lindex\(/, /\.lrem\(/]},
         cpp: {all: [/\.lpop\(|\.eval</], none: [/\.lindex\(/, /\.lrem\(/]},
       },
     },
@@ -59,7 +58,6 @@ an item that did breach goes to the back of the line, unmarked.
         python: {all: [/\b(ex|px)\s*=\s*(LEASE_SECONDS|int\(LEASE_SECONDS)/]},
         typescript: {all: [/['"](EX|PX)['"],\s*LEASE_SECONDS/i]},
         go: {all: [/\.Set(NX)?\([^\n]*leaseTTL\)/]},
-        scala: {all: [/setex\([^\n]*LeaseSeconds|\.(ex|px)\(\s*LeaseSeconds/]},
         cpp: {all: [/\.set\([^\n]*kLeaseSeconds/]},
       },
     },
@@ -72,7 +70,6 @@ an item that did breach goes to the back of the line, unmarked.
         python: {all: [/sla_deadline/], none: [/["']sla_deadline["']\s*:/]},
         typescript: {all: [/sla_deadline/], none: [/sla_deadline:/]},
         go: {all: [/sla_deadline/], none: [/"sla_deadline":/]},
-        scala: {all: [/sla_deadline/], none: [/"sla_deadline"\s*->/]},
         cpp: {all: [/sla_deadline/], none: [/\{\s*"sla_deadline",/]},
       },
     },
@@ -85,7 +82,6 @@ an item that did breach goes to the back of the line, unmarked.
         python: {all: [/["']breached["']\s*[:,]\s*["']1["']/, /\.lpush\(/, /\.rpush\(/]},
         typescript: {all: [/breached:\s*['"]1['"]|['"]breached['"],\s*['"]1['"]/, /\.lpush\(/, /\.rpush\(/]},
         go: {all: [/"breached"\s*[:,]\s*"1"/, /\.LPush\(/, /\.RPush\(/]},
-        scala: {all: [/"breached"\s*(->|,)\s*"1"/, /\.lpush\(/, /\.rpush\(/]},
         cpp: {all: [/"breached",\s*"1"/, /\.lpush\(/, /\.rpush\(/]},
       },
     },
@@ -427,100 +423,6 @@ func reclaimExpired(ctx context.Context, tenant string) ([]string, error) {
 		returned = append(returned, itemID)
 	}
 	return returned, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import review.Store // Store.itemKey, queueKey, leaseKey, assignedKey, getItem, SlaSeconds
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val LeaseSeconds = 120L
-  val PriorityOrder: Seq[String] = Seq("p1", "p2", "p3")
-
-  /** Assign the tenant's next queued item, most urgent priority first, to reviewer; None when the queue is empty. */
-  def takeNext(tenant: String, reviewer: String): Option[Store.Item] = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    reclaimExpired(tenant)
-    PriorityOrder.iterator
-      .map(priority => priority -> Option(jedis.lindex(Store.queueKey(tenant, priority), 0)))
-      .collectFirst { case (priority, Some(itemId)) =>
-        jedis.lrem(Store.queueKey(tenant, priority), 1, itemId)
-        jedis.set(Store.leaseKey(itemId), reviewer)
-        jedis.sadd(Store.assignedKey(tenant), itemId)
-        val deadline = java.time.Instant.now.getEpochSecond + Store.SlaSeconds(priority)
-        jedis.hset(Store.itemKey(itemId), Map("state" -> "assigned", "reviewer" -> reviewer, "sla_deadline" -> deadline.toString).asJava)
-        itemId
-      }
-      .flatMap(Store.getItem)
-  }
-
-  /** Return every assigned item whose lease is gone to its queue; the ids returned. */
-  def reclaimExpired(tenant: String): Seq[String] =
-    jedis.smembers(Store.assignedKey(tenant)).asScala.toSeq.sorted.filterNot(itemId => jedis.exists(Store.leaseKey(itemId))).flatMap { itemId =>
-      jedis.srem(Store.assignedKey(tenant), itemId)
-      Store.getItem(itemId).map { item =>
-        jedis.hset(Store.itemKey(itemId), "state", "queued")
-        jedis.rpush(Store.queueKey(tenant, item("priority")), itemId)
-        itemId
-      }
-    }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import scala.jdk.CollectionConverters._
-
-import review.Store // Store.itemKey, queueKey, leaseKey, assignedKey, getItem, SlaSeconds
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val LeaseSeconds = 120L
-  val PriorityOrder: Seq[String] = Seq("p1", "p2", "p3")
-
-  /** Assign the tenant's next queued item, most urgent priority first, to reviewer; None when the queue is empty. */
-  def takeNext(tenant: String, reviewer: String): Option[Store.Item] = {
-    reclaimExpired(tenant)
-    // One command takes the item: no second reviewer can read it between a read and a remove.
-    PriorityOrder.iterator
-      .flatMap(priority => Option(jedis.lpop(Store.queueKey(tenant, priority))))
-      .nextOption()
-      .flatMap { itemId =>
-        // The lease ends by itself when the reviewer walks away.
-        jedis.set(Store.leaseKey(itemId), reviewer, SetParams.setParams().ex(LeaseSeconds))
-        jedis.sadd(Store.assignedKey(tenant), itemId)
-        // The SLA clock started at the enqueue: the item keeps its sla_deadline.
-        jedis.hset(Store.itemKey(itemId), Map("state" -> "assigned", "reviewer" -> reviewer).asJava)
-        Store.getItem(itemId)
-      }
-  }
-
-  /** Return every assigned item whose lease is gone to its queue; the ids returned. */
-  def reclaimExpired(tenant: String): Seq[String] = {
-    val now = java.time.Instant.now.getEpochSecond
-    jedis.smembers(Store.assignedKey(tenant)).asScala.toSeq.sorted.filterNot(itemId => jedis.exists(Store.leaseKey(itemId))).flatMap { itemId =>
-      jedis.srem(Store.assignedKey(tenant), itemId)
-      Store.getItem(itemId).map { item =>
-        val queue = Store.queueKey(tenant, item("priority"))
-        if (now >= item("sla_deadline").toLong) {
-          // Past its SLA: it goes first, and says so.
-          jedis.hset(Store.itemKey(itemId), Map("state" -> "queued", "breached" -> "1").asJava)
-          jedis.lpush(queue, itemId)
-        } else {
-          jedis.hset(Store.itemKey(itemId), "state", "queued")
-          jedis.rpush(queue, itemId)
-        }
-        itemId
-      }
-    }
-  }
 }
 `,
     },

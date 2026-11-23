@@ -77,7 +77,6 @@ to judge the hit.
         python: {all: [/@app\.post\(\s*["']\/v1\/semantic-cache\/lookup["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/semantic-cache\/lookup['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/semantic-cache\/lookup"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"semantic-cache"\s*\/\s*"lookup"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/semantic-cache\/lookup"/]},
       },
     },
@@ -90,7 +89,6 @@ to judge the hit.
         python: {all: [/SIMILARITY_FLOOR|0\.82/], none: [/,\s*body\.threshold\s*\)/]},
         typescript: {all: [/SIMILARITY_FLOOR|0\.82/], none: [/,\s*body\.threshold(\s*\?\?\s*[\d.]+)?\s*\)/]},
         go: {all: [/similarityFloor|0\.82/], none: [/,\s*threshold\s*\)/]},
-        scala: {all: [/SimilarityFloor|0\.82/], none: [/,\s*threshold\s*\)/]},
         cpp: {all: [/kSimilarityFloor|0\.82/], none: [/,\s*threshold\s*\)/]},
       },
     },
@@ -103,7 +101,6 @@ to judge the hit.
         python: {all: [/\bexpires_at\b/]},
         typescript: {all: [/\bexpires_at\b/]},
         go: {all: [/\.ExpiresAt\b/]},
-        scala: {all: [/\bexpiresAt\b/]},
         cpp: {all: [/\bexpires_at\b/]},
       },
     },
@@ -116,7 +113,6 @@ to judge the hit.
         python: {all: [/["']age_seconds["']/, /["']hit["']\s*:\s*True/]},
         typescript: {all: [/\bage_seconds\b/, /\bhit:\s*true\b/]},
         go: {all: [/"age_seconds"/, /"hit":\s*true/]},
-        scala: {all: [/"age_seconds"/, /"hit"\s*->\s*true/]},
         cpp: {all: [/"age_seconds"/, /\{"hit",\s*true\}/]},
       },
     },
@@ -129,7 +125,6 @@ to judge the hit.
         python: {all: [/["']hit["']\s*:\s*False/], none: [/["']answer["']\s*:\s*None/]},
         typescript: {all: [/\bhit:\s*false\b/], none: [/\banswer:\s*null\b/]},
         go: {all: [/"hit":\s*false/], none: [/"answer":\s*nil/]},
-        scala: {all: [/"hit"\s*->\s*false/], none: [/"answer"\s*->\s*ujson\.Null/]},
         cpp: {all: [/\{"hit",\s*false\}/], none: [/\{"answer",\s*nullptr\}/]},
       },
     },
@@ -543,105 +538,6 @@ func lookup(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/semantic-cache/lookup", lookup)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-/** POST /v1/semantic-cache/lookup: the nearest stored answer for a query embedding. */
-object Api {
-  private def json(status: StatusCode, value: ujson.Value): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(value)))
-
-  val route: Route =
-    path("v1" / "semantic-cache" / "lookup") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-          optionalHeaderValueByName("X-Client-Class") { clientClass =>
-            entity(as[String]) { raw =>
-              // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-              tenantHeader.filter(_.nonEmpty) match {
-                case None => complete(json(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing X-Tenant-Id")))
-                case Some(tenant) =>
-                  val body = ujson.read(raw)
-                  val embedding = body("query_embedding").arr.map(_.num).toSeq
-                  val modelVersion = body.obj.get("model_version").map(_.str).getOrElse("2024-06")
-                  val threshold = body.obj.get("threshold").map(_.num).getOrElse(0.9)
-                  val cls = clientClass.getOrElse("human")
-                  val now = System.currentTimeMillis() / 1000.0
-                  State.searchEntries(tenant, modelVersion, embedding, threshold) match {
-                    case None =>
-                      Events.publishResult(tenant, Events.ResultEvent("miss", "", None, "", modelVersion, cls, 0L))
-                      complete(json(StatusCodes.OK, ujson.Obj("answer" -> ujson.Null)))
-                    case Some(entry) =>
-                      val age = math.max(0L, (now - entry.createdAt).toLong)
-                      Events.publishResult(tenant, Events.ResultEvent("hit", entry.entryId, Some(entry.similarity), entry.policyVersion, modelVersion, cls, age))
-                      complete(json(StatusCodes.OK, ujson.Obj("answer" -> entry.answer)))
-                  }
-              }
-            }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-/** POST /v1/semantic-cache/lookup: the nearest stored answer, above a floor the caller cannot lower. */
-object Api {
-  val SimilarityFloor = 0.82
-  val MaxSimilarityThreshold = 0.99
-
-  /** The caller's threshold is a hint: the service decides the range. */
-  def effectiveThreshold(requested: Double): Double = math.min(math.max(requested, SimilarityFloor), MaxSimilarityThreshold)
-
-  def isLive(entry: State.Entry, now: Double): Boolean = entry.expiresAt > now
-
-  private def json(status: StatusCode, value: ujson.Value): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(value)))
-
-  val route: Route =
-    path("v1" / "semantic-cache" / "lookup") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-          optionalHeaderValueByName("X-Client-Class") { clientClass =>
-            entity(as[String]) { raw =>
-              tenantHeader.filter(_.nonEmpty) match {
-                case None => complete(json(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing X-Tenant-Id")))
-                case Some(tenant) =>
-                  val body = ujson.read(raw)
-                  val embedding = body("query_embedding").arr.map(_.num).toSeq
-                  val modelVersion = body.obj.get("model_version").map(_.str).getOrElse("2024-06")
-                  val threshold = body.obj.get("threshold").map(_.num).getOrElse(0.9)
-                  val cls = clientClass.getOrElse("human")
-                  val now = System.currentTimeMillis() / 1000.0
-                  State.searchEntries(tenant, modelVersion, embedding, effectiveThreshold(threshold)).filter(isLive(_, now)) match {
-                    case None =>
-                      Events.publishResult(tenant, Events.ResultEvent("miss", "", None, "", modelVersion, cls, 0L))
-                      complete(json(StatusCodes.OK, ujson.Obj("hit" -> false, "similarity" -> ujson.Null)))
-                    case Some(entry) =>
-                      val age = math.max(0L, (now - entry.createdAt).toLong)
-                      Events.publishResult(tenant, Events.ResultEvent("hit", entry.entryId, Some(entry.similarity), entry.policyVersion, modelVersion, cls, age))
-                      complete(json(StatusCodes.OK, ujson.Obj(
-                        "hit" -> true,
-                        "answer" -> entry.answer,
-                        "entry_id" -> entry.entryId,
-                        "similarity" -> entry.similarity,
-                        "age_seconds" -> age.toInt,
-                        "policy_version" -> entry.policyVersion)))
-                  }
-              }
-            }
-          }
-        }
-      }
-    }
 }
 `,
     },

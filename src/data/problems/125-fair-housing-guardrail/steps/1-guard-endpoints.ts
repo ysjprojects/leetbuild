@@ -52,12 +52,6 @@ straight to the classifier.
         python: {all: [/@app\.post\(\s*["']\/v1\/guard\/input["']/, /@app\.post\(\s*["']\/v1\/guard\/output["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/guard\/input['"]/, /app\.post\(\s*['"]\/v1\/guard\/output['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/guard\/input"/, /HandleFunc\(\s*"POST \/v1\/guard\/output"/]},
-        scala: {
-          all: [
-            /path\(\s*"v1"\s*\/\s*"guard"\s*\/\s*"input"\s*\)/,
-            /path\(\s*"v1"\s*\/\s*"guard"\s*\/\s*"output"\s*\)/,
-          ],
-        },
         cpp: {all: [/svr\.Post\(\s*"\/v1\/guard\/input"/, /svr\.Post\(\s*"\/v1\/guard\/output"/]},
       },
     },
@@ -72,10 +66,6 @@ straight to the classifier.
         go: {
           all: [/X-Api-Key/i, /store\.Caller\(/, /StatusUnauthorized|\b401\b/],
           order: [/store\.Caller\(/, /tiers\.Evaluate\(/],
-        },
-        scala: {
-          all: [/X-Api-Key/i, /Store\.caller/, /Unauthorized|\b401\b/],
-          order: [/Store\.caller/, /Tiers\.evaluate\(/],
         },
         cpp: {all: [/X-Api-Key/i, /store::caller\(/, /\b401\b/], order: [/store::caller\(/, /tiers::evaluate\(/]},
       },
@@ -94,10 +84,6 @@ straight to the classifier.
         go: {
           all: [/X-Policy-Version/i, /policyVersionRe/, /StatusBadRequest|\b400\b/],
           none: [/Evaluate\([^\n]*,\s*policyVersion\)/],
-        },
-        scala: {
-          all: [/X-Policy-Version/i, /PolicyVersionRe/, /BadRequest|\b400\b/],
-          none: [/evaluate\([^)]*,\s*PolicyVersion\)/],
         },
         cpp: {all: [/X-Policy-Version/i, /kPolicyVersionRe/, /\b400\b/], none: [/evaluate\([^\n]*kPolicyVersion\)/]},
       },
@@ -120,15 +106,6 @@ straight to the classifier.
           all: [/maxTextBytes/, /StatusRequestEntityTooLarge|\b413\b/, /conversationIDRe/],
           order: [/StatusRequestEntityTooLarge|\b413\b/, /tiers\.Evaluate\(/],
         },
-        scala: {
-          all: [
-            /MaxTextBytes/,
-            /getBytes\(/,
-            /PayloadTooLarge|RequestEntityTooLarge|ContentTooLarge|\b413\b/,
-            /ConversationIdRe/,
-          ],
-          order: [/PayloadTooLarge|\b413\b/, /Tiers\.evaluate\(/],
-        },
         cpp: {all: [/kMaxTextBytes/, /\b413\b/, /kConversationIdRe/], order: [/\b413\b/, /tiers::evaluate\(/]},
       },
     },
@@ -141,7 +118,6 @@ straight to the classifier.
         python: {all: [/tiers\.evaluate\(/], none: [/skip_guard/i]},
         typescript: {all: [/\bevaluate\(/], none: [/skip_guard|skipGuard/]},
         go: {all: [/tiers\.Evaluate\(/], none: [/SkipGuard|skip_guard/]},
-        scala: {all: [/Tiers\.evaluate\(/], none: [/skip_guard|skipGuard/]},
         cpp: {all: [/tiers::evaluate\(/], none: [/skip_guard/]},
       },
     },
@@ -420,88 +396,6 @@ func guard(direction string) http.HandlerFunc {
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/guard/input", guard("input"))
 	mux.HandleFunc("POST /v1/guard/output", guard("output"))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import fhguard.{Store, Tiers} // caller(apiKey): Option[String]; evaluate(text, policyVersion): Store.Decision
-
-object GuardApi {
-  val PolicyVersion = "fh-2024-05-21"
-
-  private def respond(direction: String, decision: Store.Decision, version: String): HttpResponse = {
-    val body = JsObject(
-      "direction" -> JsString(direction),
-      "allowed" -> JsBoolean(decision.allowed),
-      "reasons" -> JsArray(decision.reasons.map(JsString(_)).toVector),
-      "tier" -> JsString(decision.tier),
-      "policy_version" -> JsString(version),
-    )
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-  }
-
-  private def guard(direction: String): Route = entity(as[String]) { raw =>
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val body = raw.parseJson.asJsObject.fields
-    val text = body.get("text").collect { case JsString(s) => s }.getOrElse("")
-    if (body.get("skip_guard").contains(JsTrue)) complete(respond(direction, Store.Decision(allowed = true, "skipped", 0.0, Seq.empty), PolicyVersion))
-    else complete(respond(direction, Tiers.evaluate(text, PolicyVersion), PolicyVersion))
-  }
-
-  val route: Route = concat(
-    path("v1" / "guard" / "input") { post { guard("input") } },
-    path("v1" / "guard" / "output") { post { guard("output") } },
-  )
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import fhguard.{Store, Tiers} // caller(apiKey): Option[String]; evaluate(text, policyVersion): Store.Decision
-
-object GuardApi {
-  val MaxTextBytes = 8 * 1024
-  val PolicyVersionRe = """fh-\\d{4}-\\d{2}-\\d{2}(\\.\\d+)?""".r
-  val ConversationIdRe = "[A-Za-z0-9_-]{1,64}".r
-
-  private def respond(direction: String, decision: Store.Decision, version: String): HttpResponse = {
-    val body = JsObject(
-      "direction" -> JsString(direction),
-      "allowed" -> JsBoolean(decision.allowed),
-      "reasons" -> JsArray(decision.reasons.map(JsString(_)).toVector),
-      "tier" -> JsString(decision.tier),
-      "policy_version" -> JsString(version),
-    )
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-  }
-
-  private def guard(direction: String): Route =
-    (optionalHeaderValueByName("X-Api-Key") & optionalHeaderValueByName("X-Policy-Version")) { (apiKey, version) =>
-      entity(as[String]) { raw =>
-        val body = raw.parseJson.asJsObject.fields
-        val conversationId = body.get("conversation_id").collect { case JsString(s) => s }.getOrElse("")
-        val text = body.get("text").collect { case JsString(s) => s }.getOrElse("")
-        if (apiKey.flatMap(Store.caller).isEmpty) complete(StatusCodes.Unauthorized -> "unknown or missing X-Api-Key")
-        else if (!version.exists(PolicyVersionRe.matches)) complete(StatusCodes.BadRequest -> "X-Policy-Version must name a policy version, fh-YYYY-MM-DD[.n]")
-        else if (!ConversationIdRe.matches(conversationId)) complete(StatusCodes.BadRequest -> "conversation_id must match [A-Za-z0-9_-]{1,64}")
-        else if (text.getBytes(StandardCharsets.UTF_8).length > MaxTextBytes) complete(StatusCodes.PayloadTooLarge -> "text is over 8 KiB")
-        else complete(respond(direction, Tiers.evaluate(text, version.get), version.get))
-      }
-    }
-
-  val route: Route = concat(
-    path("v1" / "guard" / "input") { post { guard("input") } },
-    path("v1" / "guard" / "output") { post { guard("output") } },
-  )
 }
 `,
     },

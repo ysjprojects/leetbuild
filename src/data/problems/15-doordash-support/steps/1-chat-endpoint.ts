@@ -100,7 +100,6 @@ Implement \`support_api\` — a FastAPI / Fastify \`app\` with \`POST /chat\`, J
         python: {all: [/"invalid_request"/, /status_code=400/]},
         typescript: {all: [/'invalid_request'/, /code\(\s*400\s*\)/]},
         go: {all: [/"invalid_request"/, /http\.StatusBadRequest/]},
-        scala: {all: [/"invalid_request"/, /StatusCodes\.BadRequest/]},
         cpp: {all: [/"invalid_request"/, /\b400\b/]},
       },
     },
@@ -113,9 +112,6 @@ Implement \`support_api\` — a FastAPI / Fastify \`app\` with \`POST /chat\`, J
         python: {all: [/\.lrange\(/, /\.rpush\(/, /\.expire\(\s*[^\n]*HISTORY_TTL_S/, /answer_or_escalate\(/]},
         typescript: {all: [/\.lrange\(/, /\.rpush\(/, /\.expire\(\s*[^\n]*HISTORY_TTL_S/, /answerOrEscalate\(/]},
         go: {all: [/\.LRange\(/, /\.RPush\(/, /\.Expire\(\s*[^\n]*config\.HistoryTTL/, /answerOrEscalate\(/]},
-        scala: {
-          all: [/\.lrange\(/, /\.rpush\(/, /\.expire\(\s*[^\n]*Config\.HistoryTtlS/, /Guardrail\.answerOrEscalate\(/],
-        },
         cpp: {all: [/\.lrange\(/, /\.rpush\(/, /\.expire\(\s*[^\n]*config::kHistoryTtlS/, /answer_or_escalate\(/]},
       },
     },
@@ -128,7 +124,6 @@ Implement \`support_api\` — a FastAPI / Fastify \`app\` with \`POST /chat\`, J
         python: {all: [/cached_answer\(/, /remember_answer\(/, /"model": "cache"/, /if not \w+\["escalated"\]/]},
         typescript: {all: [/cachedAnswer\(/, /rememberAnswer\(/, /model: 'cache'/, /if \(!\w+\.escalated\)/]},
         go: {all: [/cachedAnswer\(/, /rememberAnswer\(/, /"cache"/, /if !\w+\.Escalated/]},
-        scala: {all: [/KbSearch\.cachedAnswer\(/, /KbSearch\.rememberAnswer\(/, /"cache"/, /if \(!\w+\.escalated\)/]},
         cpp: {all: [/cached_answer\(/, /remember_answer\(/, /"cache"/, /if \(!escalated\)/]},
       },
     },
@@ -165,15 +160,6 @@ Implement \`support_api\` — a FastAPI / Fastify \`app\` with \`POST /chat\`, J
             /"rate_limited"/,
           ],
         },
-        scala: {
-          all: [
-            /s"rl:\$dasherId:\$minute"/,
-            /\.incr\(/,
-            /\.expire\(\s*[^\n]*\b60\b/,
-            /Config\.RateLimitPerMinute/,
-            /"rate_limited"/,
-          ],
-        },
         cpp: {
           all: [
             /"rl:" \+ dasher_id \+ ":"/,
@@ -200,12 +186,6 @@ Implement \`support_api\` — a FastAPI / Fastify \`app\` with \`POST /chat\`, J
           none: [/await\s+producer\s*\.send\(/],
         },
         go: {all: [/go func\(\)[\s\S]{0,300}?writer\.WriteMessages\(/, /Key:\s*\[\]byte\(\s*sessionID\s*\)/]},
-        scala: {
-          all: [
-            /producer\.send\(\s*new ProducerRecord(\[[^\]]*\])?\(\s*(Config\.Topic|"support-conversations")\s*,\s*sessionId\s*,/,
-          ],
-          none: [/\.send\([^\n]*\)\.get\(/],
-        },
         cpp: {
           all: [
             /producer->produce\(\s*(config::kTopic|"support-conversations")\s*,[\s\S]{0,400}?session_id\.c_str\(\)/,
@@ -950,206 +930,6 @@ func chat(w http.ResponseWriter, r *http.Request) {
 func main() {
 	http.HandleFunc("POST /chat", chat)
 	log.Fatal(http.ListenAndServe(":8443", nil))
-}
-`,
-    },
-    scala: {
-      starter: `/** POST /chat: the Dasher's question in, a grounded answer out — limited per Dasher, remembered per session, cached per question, recorded per turn. */
-import java.util.Properties
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import assistant.Config // Config.Topic, Config.HistoryTtlS, Config.RateLimitPerMinute
-import assistant.Prompt // Prompt.Chunk(id, text, score)
-import assistant.Prompt.Turn // Turn(role, text)
-
-final case class ChatRequest(sessionId: String, dasherId: String, message: String)
-/** One record of support-conversations: an answered (cached, escalated) turn of a session. */
-final case class TurnRecord(sessionId: String, turn: Int, dasherId: String, question: String, answer: String,
-                            sources: Seq[String], escalated: Boolean, model: String, tokens: Int)
-
-object SupportApi {
-  implicit val system: ActorSystem = ActorSystem("support-api")
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private def json(status: StatusCodes.ClientError, error: String): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, JsObject("error" -> JsString(error)).compactPrint))
-
-  /** The request's three strings, or None when any is missing or empty. */
-  def validate(body: JsValue): Option[ChatRequest] =
-    // TODO: an object whose session_id, dasher_id and message are non-empty strings
-    ???
-
-  /** One INCR on this minute's counter for the Dasher; the key expires on its own. */
-  def allowed(dasherId: String): Boolean =
-    // TODO: rl:<dasher_id>:<unix-minute> → INCR, EXPIRE 60, count <= Config.RateLimitPerMinute
-    ???
-
-  /** The session's turns, oldest first. */
-  def loadHistory(sessionId: String): Seq[Turn] =
-    // TODO: LRANGE conv:<session_id> 0 -1, each entry JSON
-    ???
-
-  /** Append the Dasher's turn and the assistant's; the conversation lives Config.HistoryTtlS. */
-  def rememberTurns(sessionId: String, question: String, answer: String): Unit =
-    // TODO: RPUSH both JSON turns, EXPIRE Config.HistoryTtlS
-    ???
-
-  private val onDelivery: Callback = new Callback {
-    def onCompletion(meta: RecordMetadata, err: Exception): Unit =
-      if (err != null) system.log.warning(s"turn not recorded: \${err.getMessage}")
-  }
-
-  /** One record on Config.Topic keyed by the session; the caller never waits for the broker. */
-  def recordTurn(record: TurnRecord): Unit =
-    // TODO: producer.send(new ProducerRecord(Config.Topic, sessionId, json), onDelivery) — the future is not awaited
-    ???
-
-  val route = path("chat") {
-    post {
-      entity(as[String]) { raw =>
-        // TODO: validate → 400 invalid_request; allowed → 429 rate_limited
-        // TODO: history and turn; KbSearch.cachedAnswer → model "cache", tokens 0, cached = true
-        // TODO: else KbSearch.search → Guardrail.answerOrEscalate → KbSearch.rememberAnswer unless escalated
-        // TODO: rememberTurns, recordTurn, 200 {answer, sources, escalated, model, cached, turn}
-        complete(HttpResponse(StatusCodes.NotImplemented))
-      }
-    }
-  }
-
-  def main(args: Array[String]): Unit = Http().newServerAt("0.0.0.0", 8443).bind(route)
-}
-`,
-      solution: `/** POST /chat: the Dasher's question in, a grounded answer out — limited per Dasher, remembered per session, cached per question, recorded per turn. */
-import java.util.Properties
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import assistant.Config // Config.Topic, Config.HistoryTtlS, Config.RateLimitPerMinute
-import assistant.Prompt // Prompt.Chunk(id, text, score)
-import assistant.Prompt.Turn // Turn(role, text)
-
-final case class ChatRequest(sessionId: String, dasherId: String, message: String)
-/** One record of support-conversations: an answered (cached, escalated) turn of a session. */
-final case class TurnRecord(sessionId: String, turn: Int, dasherId: String, question: String, answer: String,
-                            sources: Seq[String], escalated: Boolean, model: String, tokens: Int)
-
-object SupportApi {
-  implicit val system: ActorSystem = ActorSystem("support-api")
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private def json(status: StatusCodes.ClientError, error: String): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, JsObject("error" -> JsString(error)).compactPrint))
-
-  /** The request's three strings, or None when any is missing or empty. */
-  def validate(body: JsValue): Option[ChatRequest] = body match {
-    case JsObject(f) =>
-      def str(name: String): Option[String] = f.get(name).collect { case JsString(s) if s.trim.nonEmpty => s }
-      for (s <- str("session_id"); d <- str("dasher_id"); m <- str("message")) yield ChatRequest(s, d, m)
-    case _ => None
-  }
-
-  /** One INCR on this minute's counter for the Dasher; the key expires on its own. */
-  def allowed(dasherId: String): Boolean = {
-    val minute = System.currentTimeMillis() / 60000L
-    val key = s"rl:$dasherId:$minute"
-    val count = jedis.incr(key)
-    jedis.expire(key, 60)
-    count <= Config.RateLimitPerMinute
-  }
-
-  private def turnJson(t: Turn): String = JsObject("role" -> JsString(t.role), "text" -> JsString(t.text)).compactPrint
-
-  /** The session's turns, oldest first. */
-  def loadHistory(sessionId: String): Seq[Turn] = {
-    import scala.jdk.CollectionConverters._
-    jedis.lrange(s"conv:$sessionId", 0, -1).asScala.toSeq.map { raw =>
-      val f = raw.parseJson.asJsObject.fields
-      Turn(f("role").convertTo[String], f("text").convertTo[String])
-    }
-  }
-
-  /** Append the Dasher's turn and the assistant's; the conversation lives Config.HistoryTtlS. */
-  def rememberTurns(sessionId: String, question: String, answer: String): Unit = {
-    val key = s"conv:$sessionId"
-    val tx = jedis.multi()
-    tx.rpush(key, turnJson(Turn("dasher", question)), turnJson(Turn("assistant", answer)))
-    tx.expire(key, Config.HistoryTtlS)
-    tx.exec()
-  }
-
-  private val onDelivery: Callback = new Callback {
-    def onCompletion(meta: RecordMetadata, err: Exception): Unit =
-      if (err != null) system.log.warning(s"turn not recorded: \${err.getMessage}")
-  }
-
-  private def recordJson(r: TurnRecord): String = JsObject(
-    "session_id" -> JsString(r.sessionId), "turn" -> JsNumber(r.turn), "dasher_id" -> JsString(r.dasherId),
-    "question" -> JsString(r.question), "answer" -> JsString(r.answer), "sources" -> JsArray(r.sources.map(JsString(_)).toVector),
-    "escalated" -> JsBoolean(r.escalated), "model" -> JsString(r.model), "tokens" -> JsNumber(r.tokens)).compactPrint
-
-  /** One record on Config.Topic keyed by the session; the caller never waits for the broker. */
-  def recordTurn(record: TurnRecord): Unit = {
-    val sessionId = record.sessionId
-    producer.send(new ProducerRecord[String, String](Config.Topic, sessionId, recordJson(record)), onDelivery) // not awaited
-  }
-
-  val route = path("chat") {
-    post {
-      entity(as[String]) { raw =>
-        val parsed = try validate(raw.parseJson) catch { case _: Exception => None }
-        parsed match {
-          case None => complete(json(StatusCodes.BadRequest, "invalid_request"))
-          case Some(req) if !allowed(req.dasherId) => complete(json(StatusCodes.TooManyRequests, "rate_limited"))
-          case Some(req) =>
-            val history = loadHistory(req.sessionId)
-            val turn = history.count(_.role == "dasher") + 1
-            val (answer, sources, escalated, model, tokens, cached) = KbSearch.cachedAnswer(req.message) match {
-              case Some(hit) => (hit.answer, hit.sources, false, "cache", 0, true)
-              case None =>
-                val chunks = KbSearch.search(req.message).map(h => Prompt.Chunk(h.id, h.text, h.score))
-                val out = Guardrail.answerOrEscalate(req.message, chunks, history)
-                if (!out.escalated) KbSearch.rememberAnswer(req.message, out.answer, out.sources)
-                (out.answer, out.sources, out.escalated, out.model, out.tokens, false)
-            }
-            rememberTurns(req.sessionId, req.message, answer)
-            recordTurn(TurnRecord(req.sessionId, turn, req.dasherId, req.message, answer, sources, escalated, model, tokens))
-            val body = JsObject(
-              "answer" -> JsString(answer), "sources" -> JsArray(sources.map(JsString(_)).toVector), "escalated" -> JsBoolean(escalated),
-              "model" -> JsString(model), "cached" -> JsBoolean(cached), "turn" -> JsNumber(turn)).compactPrint
-            complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-        }
-      }
-    }
-  }
-
-  def main(args: Array[String]): Unit = Http().newServerAt("0.0.0.0", 8443).bind(route)
 }
 `,
     },

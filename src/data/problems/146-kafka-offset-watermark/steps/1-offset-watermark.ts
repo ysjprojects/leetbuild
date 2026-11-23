@@ -57,7 +57,6 @@ redelivery. Every record is JSON \`{"account": "a", "delta": 5}\`; the consumer 
         python: {all: [/\+ event\["delta"\]/]},
         typescript: {all: [/\+ event\.delta/]},
         go: {all: [/\+= event\.Delta/]},
-        scala: {all: [/\+ delta/]},
         cpp: {all: [/\+= delta/]},
       },
     },
@@ -80,14 +79,6 @@ redelivery. Every record is JSON \`{"account": "a", "delta": 5}\`; the consumer 
           all: [/group\s*=\s*"balances"/, /GroupID:\s*group/, /Topic:\s*topic/, /\.FetchMessage\(/],
           none: [/\.ReadMessage\(/],
         },
-        scala: {
-          all: [
-            /Group = "balances"/,
-            /"group\.id"\s*,\s*Group/,
-            /"enable\.auto\.commit"\s*,\s*"false"|ENABLE_AUTO_COMMIT_CONFIG\s*,\s*"false"/,
-            /subscribe\(List\(Topic\)/,
-          ],
-        },
         cpp: {
           all: [
             /kGroup = "balances"/,
@@ -107,7 +98,6 @@ redelivery. Every record is JSON \`{"account": "a", "delta": 5}\`; the consumer 
         python: {all: [/offset > WATERMARK\.get\(partition, -1\)/]},
         typescript: {all: [/offset > \(WATERMARK\[partition\] \?\? -1\)/]},
         go: {all: [/msg\.Offset > wm/]},
-        scala: {all: [/offset > watermark\.getOrElse\(partition, -1L\)/]},
         cpp: {all: [/offset > wm/]},
       },
     },
@@ -120,7 +110,6 @@ redelivery. Every record is JSON \`{"account": "a", "delta": 5}\`; the consumer 
         python: {all: [/WATERMARK\[partition\] = offset/]},
         typescript: {all: [/WATERMARK\[partition\] = offset/]},
         go: {all: [/watermark\[msg\.Partition\] = msg\.Offset/]},
-        scala: {all: [/watermark\(partition\) = offset/]},
         cpp: {all: [/watermark\[partition\] = offset/]},
       },
     },
@@ -133,7 +122,6 @@ redelivery. Every record is JSON \`{"account": "a", "delta": 5}\`; the consumer 
         python: {all: [/WATERMARK\.get\(partition, -1\)/]},
         typescript: {all: [/WATERMARK\[partition\] \?\? -1/]},
         go: {all: [/wm = -1/]},
-        scala: {all: [/watermark\.getOrElse\(partition, -1L\)/]},
         cpp: {all: [/\? -1 :/]},
       },
     },
@@ -146,7 +134,6 @@ redelivery. Every record is JSON \`{"account": "a", "delta": 5}\`; the consumer 
         python: {order: [/WATERMARK\[partition\] = offset/, /consumer\.commit\(/]},
         typescript: {order: [/WATERMARK\[partition\] = offset/, /consumer\.commitOffsets\(/]},
         go: {order: [/watermark\[msg\.Partition\] = msg\.Offset/, /reader\.CommitMessages\(/]},
-        scala: {order: [/watermark\(partition\) = offset/, /consumer\.commitSync\(/]},
         cpp: {order: [/watermark\[partition\] = offset/, /consumer->commitSync\(/]},
       },
     },
@@ -488,123 +475,6 @@ func run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-object BalanceConsumer {
-  val Topic = "transfers"
-  val Group = "balances"
-
-  // The store outlives the consumer: balances by account, last applied offset by partition.
-  private val applied = mutable.Map[String, Long]()
-  private val watermark = mutable.Map[Int, Long]()
-
-  private val AccountField = """"account"\\s*:\\s*"([^"]+)"""".r
-  private val DeltaField = """"delta"\\s*:\\s*(-?\\d+)""".r
-
-  private def connect(): KafkaConsumer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    props.put("auto.offset.reset", "earliest")
-    // TODO: disable auto-commit
-    val c = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    c.subscribe(List(Topic).asJava)
-    c
-  }
-
-  private var consumer = connect()
-
-  def store(): (Map[String, Long], Map[Int, Long]) = (applied.toMap, watermark.toMap)
-
-  /** The consumer died, the process did not: a new consumer, the same store. */
-  def restart(): Unit = {
-    consumer.close()
-    consumer = connect()
-  }
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        val account = AccountField.findFirstMatchIn(record.value()).map(_.group(1)).getOrElse("")
-        val delta = DeltaField.findFirstMatchIn(record.value()).map(_.group(1).toLong).getOrElse(0L)
-        val partition = record.partition()
-        val offset = record.offset()
-        // TODO: apply only if offset is above the partition's watermark (-1L when unknown)
-        // TODO: on apply, add delta to the account and set the watermark to offset
-        // TODO: commitSync this record's offset + 1, applied or skipped
-      }
-    }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-object BalanceConsumer {
-  val Topic = "transfers"
-  val Group = "balances"
-
-  // The store outlives the consumer: balances by account, last applied offset by partition.
-  private val applied = mutable.Map[String, Long]()
-  private val watermark = mutable.Map[Int, Long]()
-
-  private val AccountField = """"account"\\s*:\\s*"([^"]+)"""".r
-  private val DeltaField = """"delta"\\s*:\\s*(-?\\d+)""".r
-
-  private def connect(): KafkaConsumer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val c = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    c.subscribe(List(Topic).asJava)
-    c
-  }
-
-  private var consumer = connect()
-
-  def store(): (Map[String, Long], Map[Int, Long]) = (applied.toMap, watermark.toMap)
-
-  /** The consumer died, the process did not: a new consumer, the same store. */
-  def restart(): Unit = {
-    consumer.close()
-    consumer = connect()
-  }
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        val account = AccountField.findFirstMatchIn(record.value()).map(_.group(1)).getOrElse("")
-        val delta = DeltaField.findFirstMatchIn(record.value()).map(_.group(1).toLong).getOrElse(0L)
-        val partition = record.partition()
-        val offset = record.offset()
-        if (offset > watermark.getOrElse(partition, -1L)) {
-          applied(account) = applied.getOrElse(account, 0L) + delta
-          watermark(partition) = offset
-        }
-        consumer.commitSync(
-          Map(new TopicPartition(Topic, partition) -> new OffsetAndMetadata(offset + 1)).asJava
-        )
-      }
-    }
 }
 `,
     },

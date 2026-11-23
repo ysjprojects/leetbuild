@@ -74,7 +74,6 @@ Implement the editing side of Stormcrow: \`PUT /gates/{name}\` with a JSON body,
         python: {all: [/NAME_RE\.fullmatch\(name\)/, /VARIANT_RE\.fullmatch\(/, /!= 100/, /"invalid_gate"/]},
         typescript: {all: [/NAME_RE\.test\(name\)/, /VARIANT_RE\.test\(/, /!== 100/, /'invalid_gate'/]},
         go: {all: [/nameRe\.MatchString\(name\)/, /variantRe\.MatchString\(/, /!= 100/, /"invalid_gate"/]},
-        scala: {all: [/NameRe\.matches\(name\)/, /VariantRe\.matches\(/, /!= 100/, /"invalid_gate"/]},
         cpp: {all: [/std::regex_match\(name, kNameRe\)/, /kVariantRe\)/, /!= 100/, /"invalid_gate"/]},
       },
     },
@@ -87,7 +86,6 @@ Implement the editing side of Stormcrow: \`PUT /gates/{name}\` with a JSON body,
         python: {all: [/\b201\b/, /"ETag"/, /"not_found"/, /r\.hget\("gates", name\)/]},
         typescript: {all: [/\b201\b/, /header\('ETag'/, /'not_found'/, /redis\.hget\('gates', name\)/]},
         go: {all: [/http\.StatusCreated/, /"ETag"/, /"not_found"/, /rdb\.HGet\(ctx, "gates", name\)/]},
-        scala: {all: [/StatusCodes\.Created/, /ETag\(/, /"not_found"/, /jedis\.hget\("gates", name\)/]},
         cpp: {all: [/\b201\b/, /"ETag"/, /"not_found"/, /redis\.hget\("gates", name\)/]},
       },
     },
@@ -100,9 +98,6 @@ Implement the editing side of Stormcrow: \`PUT /gates/{name}\` with a JSON body,
         python: {all: [/headers\.get\("if-match"\)/, /status_code=412/, /"version_conflict"/]},
         typescript: {all: [/headers\['if-match'\]/, /code\(\s*412\s*\)/, /'version_conflict'/]},
         go: {all: [/Header\.Get\("If-Match"\)/, /http\.StatusPreconditionFailed/, /"version_conflict"/]},
-        scala: {
-          all: [/optionalHeaderValueByName\("If-Match"\)/, /StatusCodes\.PreconditionFailed/, /"version_conflict"/],
-        },
         cpp: {all: [/has_header\("If-Match"\)/, /412/, /"version_conflict"/]},
       },
     },
@@ -131,15 +126,6 @@ Implement the editing side of Stormcrow: \`PUT /gates/{name}\` with a JSON body,
             /pipe\.LPush\(/,
             /pipe\.LTrim\(/,
             /UpdatedBy = .*editor/,
-          ],
-        },
-        scala: {
-          all: [
-            /optionalHeaderValueByName\("X-Editor"\)/,
-            /"editor_required"/,
-            /tx\.lpush\(/,
-            /tx\.ltrim\(/,
-            /updatedBy = by/,
           ],
         },
         cpp: {
@@ -176,9 +162,6 @@ Implement the editing side of Stormcrow: \`PUT /gates/{name}\` with a JSON body,
           ],
         },
         go: {order: [/rdb\.TxPipelined\(/, /pipe\.HSet\(ctx, "gates", name, /, /pipe\.Incr\(ctx, "gates:version"\)/]},
-        scala: {
-          order: [/jedis\.multi\(\)/, /tx\.hset\("gates", name, /, /tx\.incr\("gates:version"\)/, /tx\.exec\(\)/],
-        },
         cpp: {order: [/redis\.transaction\(\)/, /\.hset\("gates", name, /, /\.incr\("gates:version"\)/, /\.exec\(\)/]},
       },
     },
@@ -920,266 +903,6 @@ func main() {
 	mux.HandleFunc("GET /gates/{name}", getGate)
 	mux.HandleFunc("GET /gates/{name}/history", getHistory)
 	log.Fatal(http.ListenAndServe(":8080", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import scala.jdk.CollectionConverters._
-import scala.util.Try
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.ETag
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-/** The editing side of Stormcrow: validate a gate, version it, store it where the loaders look, remember who changed it. */
-object GateApi {
-  val jedis = new JedisPooled("redis", 6379)
-  val NameRe = "^[a-z][a-z0-9_]{2,63}$".r
-  val VariantRe = "^[A-Z][A-Z0-9_]*$".r
-  val HistoryN = 100
-  val Off = "OFF"
-
-  case class Share(variant: String, pct: Int)
-  case class Population(\`match\`: Map[String, String], mix: List[Share])
-  case class Override(userId: String, variant: String, expiresAt: Long)
-  /** What the hash gates holds and step 2's loaders read. */
-  case class Gate(name: String, seed: String, default: String, populations: List[Population], overrides: List[Override], version: Int, updatedAt: Long, updatedBy: String)
-  /** One line of gate:{name}:history. */
-  case class Entry(version: Int, at: Long, by: String, change: String)
-
-  implicit val shareFormat: RootJsonFormat[Share] = jsonFormat2(Share)
-  implicit val populationFormat: RootJsonFormat[Population] = jsonFormat2(Population)
-  implicit val overrideFormat: RootJsonFormat[Override] = jsonFormat(Override, "user_id", "variant", "expires_at")
-  implicit val gateFormat: RootJsonFormat[Gate] =
-    jsonFormat(Gate, "name", "seed", "default", "populations", "overrides", "version", "updated_at", "updated_by")
-  implicit val entryFormat: RootJsonFormat[Entry] = jsonFormat4(Entry)
-
-  private def json(status: StatusCode, body: JsValue, headers: List[HttpHeader] = Nil): Route =
-    complete(HttpResponse(status, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-
-  private def error(status: StatusCode, fields: (String, JsValue)*): Route = json(status, JsObject(fields: _*))
-
-  /** The normalised gate (seed, default, overrides filled in; version and audit fields still zero) or the reason it is invalid. */
-  def validate(name: String, body: JsValue): Either[String, Gate] = {
-    // TODO: name ~ NameRe; populations a non-empty array; every match value a JsString; every mix a non-empty array of
-    // TODO: {variant ~ VariantRe, pct: whole and >= 0} adding up to 100; default ~ VariantRe
-    ???
-  }
-
-  /** The gate as published in the hash gates, or None. */
-  private def stored(name: String): Option[Gate] = {
-    ??? // TODO: HGET gates {name} → JSON
-  }
-
-  val route: Route = concat(
-    path("gates" / Segment) { name =>
-      concat(
-        put {
-          entity(as[String]) { raw =>
-            optionalHeaderValueByName("X-Editor") { editor =>
-              optionalHeaderValueByName("If-Match") { ifMatch =>
-                // TODO: validate → 400 invalid_gate; no editor → 400 editor_required; stored(name); If-Match ≠ version → 412
-                // TODO: version + 1, updatedAt, updatedBy; one MULTI: hset gates, incr gates:version, lpush + ltrim history
-                // TODO: 201 (new) or 200 (update) with the stored gate and ETag(version)
-                val _ = (raw, editor, ifMatch)
-                complete(StatusCodes.NotImplemented)
-              }
-            }
-          }
-        },
-        get {
-          // TODO: the stored gate with its ETag, or 404 not_found
-          complete(StatusCodes.NotImplemented)
-        }
-      )
-    },
-    path("gates" / Segment / "history") { name =>
-      get {
-        // TODO: {"entries": [...]} newest first (lrange 0 -1), 404 not_found for an unknown gate
-        complete(StatusCodes.NotImplemented)
-      }
-    }
-  )
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("gates")
-    Http().newServerAt("0.0.0.0", 8080).bind(route)
-  }
-}
-`,
-      solution: `import scala.jdk.CollectionConverters._
-import scala.util.Try
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.ETag
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-/** The editing side of Stormcrow: validate a gate, version it, store it where the loaders look, remember who changed it. */
-object GateApi {
-  val jedis = new JedisPooled("redis", 6379)
-  val NameRe = "^[a-z][a-z0-9_]{2,63}$".r
-  val VariantRe = "^[A-Z][A-Z0-9_]*$".r
-  val HistoryN = 100
-  val Off = "OFF"
-
-  case class Share(variant: String, pct: Int)
-  case class Population(\`match\`: Map[String, String], mix: List[Share])
-  case class Override(userId: String, variant: String, expiresAt: Long)
-  /** What the hash gates holds and step 2's loaders read. */
-  case class Gate(name: String, seed: String, default: String, populations: List[Population], overrides: List[Override], version: Int, updatedAt: Long, updatedBy: String)
-  /** One line of gate:{name}:history. */
-  case class Entry(version: Int, at: Long, by: String, change: String)
-
-  implicit val shareFormat: RootJsonFormat[Share] = jsonFormat2(Share)
-  implicit val populationFormat: RootJsonFormat[Population] = jsonFormat2(Population)
-  implicit val overrideFormat: RootJsonFormat[Override] = jsonFormat(Override, "user_id", "variant", "expires_at")
-  implicit val gateFormat: RootJsonFormat[Gate] =
-    jsonFormat(Gate, "name", "seed", "default", "populations", "overrides", "version", "updated_at", "updated_by")
-  implicit val entryFormat: RootJsonFormat[Entry] = jsonFormat4(Entry)
-
-  private def json(status: StatusCode, body: JsValue, headers: List[HttpHeader] = Nil): Route =
-    complete(HttpResponse(status, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-
-  private def error(status: StatusCode, fields: (String, JsValue)*): Route = json(status, JsObject(fields: _*))
-
-  private final class Invalid(val reason: String) extends RuntimeException(reason)
-  private def invalid(reason: String): Nothing = throw new Invalid(reason)
-
-  private def share(value: JsValue): Share = value match {
-    case JsObject(s) =>
-      val variant = s.get("variant") match {
-        case Some(JsString(v)) if VariantRe.matches(v) => v
-        case _ => invalid("variant must match ^[A-Z][A-Z0-9_]*$")
-      }
-      val pct = s.get("pct") match {
-        case Some(JsNumber(n)) if n.isWhole && n >= 0 => n.toInt
-        case _ => invalid("pct must be a non-negative integer")
-      }
-      Share(variant, pct)
-    case _ => invalid("each share must be an object")
-  }
-
-  private def population(value: JsValue): Population = value match {
-    case JsObject(p) =>
-      val matches = p.get("match") match {
-        case Some(JsObject(m)) =>
-          val strings = m.collect { case (key, JsString(v)) => key -> v }
-          if (strings.size != m.size) invalid("match must map attribute names to strings")
-          strings
-        case _ => invalid("match must map attribute names to strings")
-      }
-      val mix = p.get("mix") match {
-        case Some(JsArray(shares)) if shares.nonEmpty => shares.map(share).toList
-        case _ => invalid("mix must be a non-empty list")
-      }
-      if (mix.map(_.pct).sum != 100) invalid("mix shares must add up to exactly 100")
-      Population(matches, mix)
-    case _ => invalid("each population must be an object")
-  }
-
-  /** The normalised gate (seed, default, overrides filled in; version and audit fields still zero) or the reason it is invalid. */
-  def validate(name: String, body: JsValue): Either[String, Gate] =
-    try {
-      if (!NameRe.matches(name)) invalid("name must match ^[a-z][a-z0-9_]{2,63}$")
-      val fields = body match {
-        case JsObject(f) => f
-        case _ => invalid("body must be a JSON object")
-      }
-      val populations = fields.get("populations") match {
-        case Some(JsArray(ps)) if ps.nonEmpty => ps.map(population).toList
-        case _ => invalid("populations must be a non-empty list")
-      }
-      val default = fields.getOrElse("default", JsString(Off)) match {
-        case JsString(d) if VariantRe.matches(d) => d
-        case _ => invalid("default must match ^[A-Z][A-Z0-9_]*$")
-      }
-      val seed = fields.getOrElse("seed", JsString(name)) match {
-        case JsString(s) if s.nonEmpty => s
-        case _ => invalid("seed must be a string")
-      }
-      val overrides = fields.getOrElse("overrides", JsArray()) match {
-        case JsArray(os) => os.map(_.convertTo[Override]).toList
-        case _ => invalid("overrides must be a list")
-      }
-      Right(Gate(name, seed, default, populations, overrides, 0, 0L, ""))
-    } catch {
-      case e: Invalid => Left(e.reason)
-      case e: DeserializationException => Left(e.getMessage)
-    }
-
-  /** The gate as published in the hash gates, or None. */
-  private def stored(name: String): Option[Gate] =
-    Option(jedis.hget("gates", name)).map(_.parseJson.convertTo[Gate])
-
-  val route: Route = concat(
-    path("gates" / Segment) { name =>
-      concat(
-        put {
-          entity(as[String]) { raw =>
-            optionalHeaderValueByName("X-Editor") { editor =>
-              optionalHeaderValueByName("If-Match") { ifMatch =>
-                (validate(name, Try(raw.parseJson).getOrElse(JsNull)), editor.filter(_.nonEmpty)) match {
-                  case (Left(reason), _) =>
-                    error(StatusCodes.BadRequest, "error" -> JsString("invalid_gate"), "reason" -> JsString(reason))
-                  case (_, None) => error(StatusCodes.BadRequest, "error" -> JsString("editor_required"))
-                  case (Right(spec), Some(by)) =>
-                    val current = stored(name)
-                    val version = current.map(_.version).getOrElse(0)
-                    if (ifMatch.exists(_.filter(_ != '"') != version.toString))
-                      error(StatusCodes.PreconditionFailed, "error" -> JsString("version_conflict"), "current" -> JsNumber(version))
-                    else {
-                      val now = System.currentTimeMillis() / 1000
-                      val gate = spec.copy(version = version + 1, updatedAt = now, updatedBy = by)
-                      val entry = Entry(gate.version, now, by, if (current.isDefined) "updated" else "created")
-                      val history = s"gate:$name:history"
-                      val tx = jedis.multi() // MULTI … EXEC: a loader never sees the gate without its version bump
-                      tx.hset("gates", name, gate.toJson.compactPrint)
-                      tx.incr("gates:version")
-                      tx.lpush(history, entry.toJson.compactPrint)
-                      tx.ltrim(history, 0, HistoryN - 1)
-                      tx.exec()
-                      json(if (current.isDefined) StatusCodes.OK else StatusCodes.Created, gate.toJson, List(ETag(gate.version.toString)))
-                    }
-                }
-              }
-            }
-          }
-        },
-        get {
-          stored(name) match {
-            case Some(gate) => json(StatusCodes.OK, gate.toJson, List(ETag(gate.version.toString)))
-            case None => error(StatusCodes.NotFound, "error" -> JsString("not_found"))
-          }
-        }
-      )
-    },
-    path("gates" / Segment / "history") { name =>
-      get {
-        if (!jedis.hexists("gates", name)) error(StatusCodes.NotFound, "error" -> JsString("not_found"))
-        else {
-          val entries = jedis.lrange(s"gate:$name:history", 0, -1).asScala.map(_.parseJson).toVector
-          json(StatusCodes.OK, JsObject("entries" -> JsArray(entries)))
-        }
-      }
-    }
-  )
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("gates")
-    Http().newServerAt("0.0.0.0", 8080).bind(route)
-  }
 }
 `,
     },

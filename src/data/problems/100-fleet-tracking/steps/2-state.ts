@@ -55,7 +55,6 @@ vehicle must not lose the fresher position.
         },
         typescript: {all: [/tonumber\(/, /\bseq\b/], none: [/position\.device_timestamp_ms\s*<\s*Number\(/]},
         go: {all: [/tonumber\(/, /\bseq\b/], none: [/p\.DeviceTimestampMs\s*<\s*current/]},
-        scala: {all: [/tonumber\(/, /\bseq\b/], none: [/p\.deviceTimestampMs\s*<\s*_/]},
         cpp: {all: [/tonumber\(/, /\bseq\b/], none: [/p\.device_timestamp_ms\s*<\s*std::stoll/]},
       },
     },
@@ -63,7 +62,7 @@ vehicle must not lose the fresher position.
       id: 'eval',
       title: 'Read, compare and write inside one Lua script',
       detail:
-        'The hash is read and written by a script run with `EVAL`/`EVALSHA` (`register_script`, `defineCommand`, `redis.NewScript`, `scriptLoad`); a client-side read then write lets another replica land in between.',
+        'The hash is read and written by a script run with `EVAL`/`EVALSHA` (`register_script`, `defineCommand`, `redis.NewScript`); a client-side read then write lets another replica land in between.',
       match: {
         python: {
           all: [
@@ -89,10 +88,6 @@ vehicle must not lose the fresher position.
           ],
           none: [/rdb\.HGet\(|rdb\.HSet\(|rdb\.HMGet\(/],
         },
-        scala: {
-          all: [/redis\.call\(\s*['"]HM?GET['"]/, /redis\.call\(\s*['"]HSET['"]/, /jedis\.eval(sha)?\(/],
-          none: [/jedis\.hget\(|jedis\.hset\(|jedis\.hmget\(/],
-        },
         cpp: {
           all: [/redis\.call\(\s*['"]HM?GET['"]/, /redis\.call\(\s*['"]HSET['"]/, /redis\.eval(sha)?[<(]/],
           none: [/redis\.hget\(|redis\.hset\(|redis\.hmget\(/],
@@ -108,7 +103,6 @@ vehicle must not lose the fresher position.
         python: {all: [/seq\s*<=\s*current_seq|current_seq\s*>=\s*seq/, /return 0/, /return 1/]},
         typescript: {all: [/seq\s*<=\s*current_seq|current_seq\s*>=\s*seq/, /return 0/, /return 1/]},
         go: {all: [/seq\s*<=\s*current_seq|current_seq\s*>=\s*seq/, /return 0/, /return 1/]},
-        scala: {all: [/seq\s*<=\s*current_seq|current_seq\s*>=\s*seq/, /return 0/, /return 1/]},
         cpp: {all: [/seq\s*<=\s*current_seq|current_seq\s*>=\s*seq/, /return 0/, /return 1/]},
       },
     },
@@ -121,7 +115,6 @@ vehicle must not lose the fresher position.
         python: {all: [/register_script\(|\.evalsha\(/], none: [/\br\.hget\(/]},
         typescript: {all: [/defineCommand\(|\.evalsha\(/], none: [/redis\.hget\(/]},
         go: {all: [/redis\.NewScript\(|\.EvalSha\(/], none: [/rdb\.HGet\(/]},
-        scala: {all: [/scriptLoad\(|jedis\.evalsha\(/], none: [/jedis\.hget\(/]},
         cpp: {all: [/script_load\(|redis\.evalsha[<(]/], none: [/redis\.hget\(/]},
       },
     },
@@ -308,66 +301,6 @@ func updateLatest(ctx context.Context, vehicleID string, p position.Position) (b
 		return false, err
 	}
 	return applied == 1, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import fleet.Position
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  def latestKey(vehicleId: String): String = s"vehicle:$vehicleId:latest"
-
-  /** Write the position as the vehicle's latest when it is newer; true when it was applied. */
-  def updateLatest(vehicleId: String, p: Position): Boolean = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val key = latestKey(vehicleId)
-    val current = Option(jedis.hget(key, "ts")).map(_.toLong)
-    if (current.exists(p.deviceTimestampMs < _)) return false
-    val fields = Map(
-      "ts"  -> p.deviceTimestampMs.toString,
-      "seq" -> p.sequence.toString,
-      "lat" -> p.lat.toString,
-      "lon" -> p.lon.toString
-    )
-    jedis.hset(key, fields.asJava)
-    true
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import fleet.Position
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val LatestScript: String =
-    """local stored = redis.call('HMGET', KEYS[1], 'ts', 'seq')
-      |local ts, seq = tonumber(ARGV[1]), tonumber(ARGV[2])
-      |local current_ts, current_seq = tonumber(stored[1]), tonumber(stored[2])
-      |if current_ts and (ts < current_ts or (ts == current_ts and seq <= current_seq)) then
-      |  return 0
-      |end
-      |redis.call('HSET', KEYS[1], 'ts', ARGV[1], 'seq', ARGV[2], 'lat', ARGV[3], 'lon', ARGV[4])
-      |return 1
-      |""".stripMargin
-  private val sha = jedis.scriptLoad(LatestScript)
-
-  def latestKey(vehicleId: String): String = s"vehicle:$vehicleId:latest"
-
-  /** Write the position as the vehicle's latest when it is newer; true when it was applied. */
-  def updateLatest(vehicleId: String, p: Position): Boolean = {
-    val args = List(p.deviceTimestampMs.toString, p.sequence.toString, p.lat.toString, p.lon.toString).asJava
-    jedis.evalsha(sha, List(latestKey(vehicleId)).asJava, args).asInstanceOf[java.lang.Long] == 1L
-  }
 }
 `,
     },

@@ -53,7 +53,6 @@ answer loses it.
         python: {all: [/producer\.produce\(\s*[^\n]*key\s*=\s*beacon\[["']campaign_id["']\]/]},
         typescript: {all: [/key:\s*beacon\.campaign_id/]},
         go: {all: [/Key:\s*\[\]byte\(\s*b\.CampaignID\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*(Topic|"ads\.impression")\s*,\s*beacon\.campaignId\s*,/]},
         cpp: {all: [/b\.campaign_id\.c_str\(\)\s*,\s*b\.campaign_id\.(size|length)\(\)/]},
       },
     },
@@ -66,7 +65,6 @@ answer loses it.
         python: {all: [/\.set\([^\n]*nx\s*=\s*True/, /ex\s*=\s*DEDUPE_TTL_S/]},
         typescript: {all: [/['"]NX['"]/, /['"]EX['"],\s*DEDUPE_TTL_S/]},
         go: {all: [/rdb\.SetNX\(|SetArgs\{[^}]*Mode:\s*"NX"/, /dedupeTTL/]},
-        scala: {all: [/\.nx\(\)/, /\.ex\(\s*DedupeTtlS/]},
         cpp: {all: [/UpdateType::NOT_EXIST/, /kDedupeTtl/]},
       },
     },
@@ -79,7 +77,6 @@ answer loses it.
         python: {order: [/store\.count_render\(/, /producer\.produce\(/]},
         typescript: {order: [/await countRender\(/, /producer\.send\(/]},
         go: {order: [/store\.CountRender\(/, /producer\.Produce\(/]},
-        scala: {order: [/Store\.countRender\(/, /producer\.send\(/]},
         cpp: {order: [/store::countRender\(/, /producer->produce\(/]},
       },
     },
@@ -92,7 +89,6 @@ answer loses it.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -105,7 +101,6 @@ answer loses it.
         python: {all: [/store\.insert_outbox\(/, /producer\.flush\(/, /on_delivery\s*=/]},
         typescript: {all: [/await insertOutbox\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/store\.InsertOutbox\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Store\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/, /Failure|catch|isFailure/]},
         cpp: {all: [/store::insertOutbox\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -398,108 +393,6 @@ func recordImpression(ctx context.Context, b store.Beacon) (bool, error) {
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import ads.Store // Store.Beacon, Store.countRender, Store.insertOutbox
-
-object Events {
-  val Topic = "ads.impression"
-  val DedupeTtlS = 86400L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def beaconKey(beaconId: String): String = s"beacon:$beaconId"
-
-  def impressionPayload(beacon: Store.Beacon): JsObject =
-    JsObject(
-      "beacon_id" -> JsString(beacon.beaconId),
-      "campaign_id" -> JsString(beacon.campaignId),
-      "creative_id" -> JsString(beacon.creativeId),
-      "price_micros" -> JsNumber(beacon.priceMicros)
-    )
-
-  /** Count a rendered impression and publish it; true once the event is on ads.impression. */
-  def recordImpression(beacon: Store.Beacon): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val payload = impressionPayload(beacon)
-    producer.send(new ProducerRecord[String, String](Topic, beacon.userHash, payload.compactPrint))
-    Store.countRender(beacon.campaignId, beacon.priceMicros)
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-
-import ads.Store // Store.Beacon, Store.countRender, Store.insertOutbox
-
-object Events {
-  val Topic = "ads.impression"
-  val DedupeTtlS = 86400L
-  val AckTimeoutMs = 2000L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def beaconKey(beaconId: String): String = s"beacon:$beaconId"
-
-  def impressionPayload(beacon: Store.Beacon): JsObject =
-    JsObject(
-      "beacon_id" -> JsString(beacon.beaconId),
-      "campaign_id" -> JsString(beacon.campaignId),
-      "creative_id" -> JsString(beacon.creativeId),
-      "price_micros" -> JsNumber(beacon.priceMicros)
-    )
-
-  /** Count a rendered impression and publish it; true once the event is on ads.impression. */
-  def recordImpression(beacon: Store.Beacon): Boolean = {
-    // The first delivery of a beacon claims it; a page that retries its beacon is billed once.
-    val first = jedis.set(beaconKey(beacon.beaconId), "1", SetParams.setParams().nx().ex(DedupeTtlS)) != null
-    if (!first) true
-    else {
-      // The count is committed before its event exists: a consumer never reads an impression the counters lack.
-      Store.countRender(beacon.campaignId, beacon.priceMicros)
-      val payload = impressionPayload(beacon)
-      val record = new ProducerRecord[String, String](Topic, beacon.campaignId, payload.compactPrint)
-      val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-      if (acked.isFailure) {
-        // The broker did not take it: the relay publishes the row later, so the report is late, not wrong.
-        Store.insertOutbox(Topic, beacon.campaignId, payload)
-      }
-      acked.isSuccess
-    }
-  }
 }
 `,
     },

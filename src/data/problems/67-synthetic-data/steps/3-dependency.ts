@@ -54,12 +54,11 @@ message ScoreReply   { double score = 1; bool refused = 2; string judge_version 
       id: 'attempt-deadline',
       title: '900 ms deadline on every attempt',
       detail:
-        'Each Score call carries a deadline of about 900 ms (DEADLINE_S as timeout=, a deadline: Date.now() + DEADLINE_MS, context.WithTimeout, withDeadlineAfter, set_deadline); a judge that answers in 600 ms admits the record with its score. The starter sends no deadline.',
+        'Each Score call carries a deadline of about 900 ms (DEADLINE_S as timeout=, a deadline: Date.now() + DEADLINE_MS, context.WithTimeout, set_deadline); a judge that answers in 600 ms admits the record with its score. The starter sends no deadline.',
       match: {
         python: {all: [/DEADLINE_S/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\b/, /context\.WithTimeout\(/]},
-        scala: {all: [/DeadlineMs/, /withDeadlineAfter\(/]},
         cpp: {all: [/kDeadline/, /set_deadline\(/]},
       },
     },
@@ -72,7 +71,6 @@ message ScoreReply   { double score = 1; bool refused = 2; string judge_version 
         python: {all: [/grpc\.StatusCode\.DEADLINE_EXCEEDED/, /judge_timeout/], none: [/DEFAULT_SCORE/]},
         typescript: {all: [/status\.DEADLINE_EXCEEDED/, /judge_timeout/], none: [/DEFAULT_SCORE/]},
         go: {all: [/codes\.DeadlineExceeded/, /judge_timeout/], none: [/defaultScore/]},
-        scala: {all: [/Status\.Code\.DEADLINE_EXCEEDED/, /judge_timeout/], none: [/DefaultScore/]},
         cpp: {all: [/grpc::StatusCode::DEADLINE_EXCEEDED/, /judge_timeout/], none: [/kDefaultScore/]},
       },
     },
@@ -85,7 +83,6 @@ message ScoreReply   { double score = 1; bool refused = 2; string judge_version 
         python: {all: [/grpc\.StatusCode\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/RETRY_LIMIT/]},
         typescript: {all: [/status\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/RETRY_LIMIT/]},
         go: {all: [/codes\.Unavailable/, /maxAttempts/], none: [/retryLimit/]},
-        scala: {all: [/Status\.Code\.UNAVAILABLE/, /MaxAttempts/], none: [/RetryLimit/]},
         cpp: {all: [/grpc::StatusCode::UNAVAILABLE/, /kMaxAttempts/], none: [/kRetryLimit/]},
       },
     },
@@ -98,7 +95,6 @@ message ScoreReply   { double score = 1; bool refused = 2; string judge_version 
         python: {all: [/reply\.refused/, /["']refused["']/]},
         typescript: {all: [/\.refused\b/, /['"]refused['"]/]},
         go: {all: [/GetRefused\(\)/, /"refused"/]},
-        scala: {all: [/\.refused\b/, /"refused"/]},
         cpp: {all: [/\.refused\(\)/, /"refused"/]},
       },
     },
@@ -111,7 +107,6 @@ message ScoreReply   { double score = 1; bool refused = 2; string judge_version 
         python: {all: [/stub\.Score\(/], none: [/JUDGE_PREFIX/]},
         typescript: {all: [/stub\.Score\(/], none: [/JUDGE_PREFIX/]},
         go: {all: [/stub\.Score\(/], none: [/judgePrefix/]},
-        scala: {all: [/\.score\(/], none: [/JudgePrefix/]},
         cpp: {all: [/->Score\(/], none: [/kJudgePrefix/]},
       },
     },
@@ -526,115 +521,6 @@ func judgeRecord(ctx context.Context, state JobState, record records.SyntheticRe
 		}
 		return settle(Verdict{Status: "admitted", Attempts: attempt, Score: reply.GetScore(), JudgeVersion: reply.GetJudgeVersion()})
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import synth.{Config, Records, SyntheticRecord}
-import synthd.synthetic_data.{JudgeGrpc, ScoreRequest}
-
-/** The step-2 job state the worker hands in: one settle per record. */
-trait RecordState {
-  def settle(jobId: String, recordId: String, entityId: String, outcome: String, seedDigest: String): Unit
-}
-
-/** One record's outcome. */
-final case class JudgeVerdict(status: String, reason: String = "", attempts: Int = 0, score: Double = 0.0, judgeVersion: String = "")
-
-object JudgeClient {
-  val RetryLimit = 3
-  val BackoffMs = 100L
-  val JudgePrefix = 100
-  val DefaultScore = 0.5
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Judge).usePlaintext().build()
-  private val stub = JudgeGrpc.blockingStub(channel)
-
-  /** Score one generated record and settle it: admitted with the judge's score, parked or rejected. */
-  def judgeRecord(state: RecordState, record: SyntheticRecord): JudgeVerdict = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val digest = Records.seedDigest(record.seed_text)
-    if (record.seq >= JudgePrefix) {
-      state.settle(record.job_id, record.record_id, record.entity_id, "admitted", digest)
-      return JudgeVerdict("admitted", score = DefaultScore)
-    }
-    val request = ScoreRequest(recordId = record.record_id, recipeId = record.recipe_id, text = record.text)
-    var attempt = 1
-    while (attempt <= RetryLimit) {
-      try {
-        val reply = stub.score(request)
-        if (!reply.refused) {
-          state.settle(record.job_id, record.record_id, record.entity_id, "admitted", digest)
-          return JudgeVerdict("admitted", attempts = attempt, score = reply.score, judgeVersion = reply.judgeVersion)
-        }
-      } catch {
-        case e: StatusRuntimeException =>
-          System.err.println(s"judge call failed record=\${record.record_id} code=\${e.getStatus.getCode}")
-      }
-      Thread.sleep(BackoffMs)
-      attempt += 1
-    }
-    state.settle(record.job_id, record.record_id, record.entity_id, "admitted", digest)
-    JudgeVerdict("admitted", attempts = RetryLimit, score = DefaultScore)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import synth.{Config, Records, SyntheticRecord}
-import synthd.synthetic_data.{JudgeGrpc, ScoreRequest}
-
-/** The step-2 job state the worker hands in: one settle per record. */
-trait RecordState {
-  def settle(jobId: String, recordId: String, entityId: String, outcome: String, seedDigest: String): Unit
-}
-
-/** One record's outcome. */
-final case class JudgeVerdict(status: String, reason: String = "", attempts: Int = 0, score: Double = 0.0, judgeVersion: String = "")
-
-object JudgeClient {
-  val DeadlineMs = 900L
-  val MaxAttempts = 3
-  val BackoffMs = 100L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Judge).usePlaintext().build()
-  private val stub = JudgeGrpc.blockingStub(channel)
-
-  /** Score one generated record and settle it: admitted with the judge's score, parked or rejected. */
-  def judgeRecord(state: RecordState, record: SyntheticRecord): JudgeVerdict = {
-    def settle(verdict: JudgeVerdict): JudgeVerdict = {
-      state.settle(record.job_id, record.record_id, record.entity_id, verdict.status, Records.seedDigest(record.seed_text))
-      verdict
-    }
-
-    val request = ScoreRequest(recordId = record.record_id, recipeId = record.recipe_id, text = record.text)
-    var attempt = 1
-    while (true) {
-      try {
-        val reply = stub.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).score(request)
-        if (reply.refused) return settle(JudgeVerdict("rejected", "refused", attempt))
-        return settle(JudgeVerdict("admitted", "", attempt, reply.score, reply.judgeVersion))
-      } catch {
-        case e: StatusRuntimeException =>
-          val code = e.getStatus.getCode
-          if (code == Status.Code.UNAVAILABLE && attempt < MaxAttempts) {
-            Thread.sleep(BackoffMs * attempt)
-            attempt += 1
-          } else if (code == Status.Code.DEADLINE_EXCEEDED) {
-            return settle(JudgeVerdict("parked", "judge_timeout", attempt))
-          } else if (code == Status.Code.UNAVAILABLE) {
-            return settle(JudgeVerdict("parked", "judge_unavailable", attempt))
-          } else {
-            return settle(JudgeVerdict("rejected", code.name.toLowerCase, attempt))
-          }
-      }
-    }
-    throw new IllegalStateException("the judge loop returns from inside")
-  }
 }
 `,
     },

@@ -56,7 +56,6 @@ its sub-batches is missing.
         python: {all: [/DEADLINE_S\s*=\s*4/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*4000/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*4\s*\*\s*time\.Second/, /context\.WithTimeout\(/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*4/, /withDeadlineAfter\(/]},
         cpp: {all: [/kDeadline\{4\}/, /set_deadline\(/]},
       },
     },
@@ -72,7 +71,6 @@ its sub-batches is missing.
           none: [/while\s*\(\s*true\s*\)/, /for\s*\(\s*;\s*;\s*\)/],
         },
         go: {all: [/maxAttempts\s*=\s*3/, /attempt\s*<\s*maxAttempts/], none: [/\bfor\s*\{/]},
-        scala: {all: [/MaxAttempts\s*=\s*3/, /attempt\s*<\s*MaxAttempts/]},
         cpp: {all: [/kMaxAttempts\s*=\s*3/, /attempt\s*<\s*kMaxAttempts/], none: [/for\s*\(\s*;\s*;\s*\)/]},
       },
     },
@@ -85,7 +83,6 @@ its sub-batches is missing.
         python: {all: [/sub_batches\s*=\s*pending/]},
         typescript: {all: [/sub_batches:\s*pending/]},
         go: {all: [/SubBatches:\s*pending/]},
-        scala: {all: [/subBatches\s*=\s*pending/]},
         cpp: {all: [/:\s*pending\)\s*\*request\.add_sub_batches\(\)/]},
       },
     },
@@ -98,7 +95,6 @@ its sub-batches is missing.
         python: {all: [/batch_id\s*=\s*batch_id/]},
         typescript: {all: [/batch_id:\s*batchId/]},
         go: {all: [/BatchId:\s*batchID/]},
-        scala: {all: [/batchId\s*=\s*batchId/]},
         cpp: {all: [/set_batch_id\(\s*batch_id\s*\)/]},
       },
     },
@@ -117,7 +113,6 @@ its sub-batches is missing.
           none: [/reply\.accepted\.length\s*>\s*0/, /complete:\s*true/],
         },
         go: {all: [/len\(pending\)\s*==\s*0/], none: [/len\(reply\.GetAccepted\(\)\)\s*>\s*0/, /Complete:\s*true/]},
-        scala: {all: [/pending\.isEmpty/], none: [/accepted\.nonEmpty/, /complete\s*=\s*true/]},
         cpp: {all: [/pending\.empty\(\)/], none: [/accepted_size\(\)\s*>\s*0/]},
       },
     },
@@ -388,71 +383,6 @@ func writeBatch(ctx context.Context, batchID string, subBatches []*pb.SubBatch) 
 		failed = append(failed, sub.GetId())
 	}
 	return WriteResult{Complete: len(pending) == 0, Accepted: accepted, Failed: failed}
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import tsdb.telemetry_ingest.{SubBatch, TimeSeriesGrpc, WriteRequest}
-
-/** A batch reported by sub-batch id. */
-final case class WriteResult(complete: Boolean, accepted: Seq[String], failed: Seq[String])
-
-object TsdbClient {
-  private val store = TimeSeriesGrpc.blockingStub(ManagedChannelBuilder.forAddress("tsdb", 9000).usePlaintext().build())
-
-  /** Store every sub-batch of one WAL batch. */
-  def writeBatch(batchId: String, subBatches: Seq[SubBatch]): WriteResult = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    var result: Option[WriteResult] = None
-    while (result.isEmpty) {
-      try {
-        val reply = store.write(WriteRequest(subBatches = subBatches))
-        if (reply.accepted.nonEmpty) result = Some(WriteResult(complete = true, reply.accepted, reply.failed))
-      } catch {
-        case _: StatusRuntimeException => Thread.sleep(1000) // the store is busy: try again
-      }
-    }
-    result.get
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import tsdb.telemetry_ingest.{SubBatch, TimeSeriesGrpc, WriteRequest}
-
-/** A batch reported by sub-batch id. */
-final case class WriteResult(complete: Boolean, accepted: Seq[String], failed: Seq[String])
-
-object TsdbClient {
-  val DeadlineSeconds = 4L
-  val MaxAttempts = 3
-
-  private val store = TimeSeriesGrpc.blockingStub(ManagedChannelBuilder.forAddress("tsdb", 9000).usePlaintext().build())
-
-  /** Store every sub-batch of one WAL batch. */
-  def writeBatch(batchId: String, subBatches: Seq[SubBatch]): WriteResult = {
-    var pending = subBatches
-    val accepted = Seq.newBuilder[String]
-    var attempt = 0
-    while (attempt < MaxAttempts && pending.nonEmpty) {
-      attempt += 1
-      try {
-        // The batch id is the store's dedupe key: every attempt carries the same one.
-        val reply = store.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).write(WriteRequest(batchId = batchId, subBatches = pending))
-        accepted ++= reply.accepted
-        val stored = reply.accepted.toSet
-        // Only what the store did not take goes again: an accepted sub-batch is never re-sent.
-        pending = pending.filterNot(sub => stored(sub.id))
-      } catch {
-        case _: StatusRuntimeException => () // nothing was acknowledged: the same sub-batches go again
-      }
-    }
-    WriteResult(pending.isEmpty, accepted.result(), pending.map(_.id))
-  }
 }
 `,
     },

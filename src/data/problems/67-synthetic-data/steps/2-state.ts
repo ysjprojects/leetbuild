@@ -65,7 +65,6 @@ Requirements, kept by **one Lua script** per operation:
         python: {all: [/ENTITY_LIMIT/, /window_key\(/]},
         typescript: {all: [/ENTITY_LIMIT/, /windowKey\(/]},
         go: {all: [/EntityLimit/, /WindowKey\(/]},
-        scala: {all: [/EntityLimit/, /windowKey\(/]},
         cpp: {all: [/kEntityLimit/, /window_key\(/]},
       },
     },
@@ -81,7 +80,6 @@ Requirements, kept by **one Lua script** per operation:
           none: [/redis\.get\(/],
         },
         go: {all: [/redis\.NewScript\(|\.Eval\(|\.EvalSha\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/rdb\.Get\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/jedis\.get\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]INCR['"]/], none: [/redis\.get\(/]},
       },
     },
@@ -94,7 +92,6 @@ Requirements, kept by **one Lua script** per operation:
         python: {order: [/['"]throttled['"]\s*,\s*1\b/, /['"]generated['"]\s*,\s*1\b/]},
         typescript: {order: [/['"]throttled['"]\s*,\s*1\b/, /['"]generated['"]\s*,\s*1\b/]},
         go: {order: [/['"]throttled['"]\s*,\s*1\b/, /['"]generated['"]\s*,\s*1\b/]},
-        scala: {order: [/['"]throttled['"]\s*,\s*1\b/, /['"]generated['"]\s*,\s*1\b/]},
         cpp: {order: [/['"]throttled['"]\s*,\s*1\b/, /['"]generated['"]\s*,\s*1\b/]},
       },
     },
@@ -107,7 +104,6 @@ Requirements, kept by **one Lua script** per operation:
         python: {all: [/coverage_key\(/, /HINCRBY/]},
         typescript: {all: [/coverageKey\(/, /HINCRBY/]},
         go: {all: [/CoverageKey\(/, /HINCRBY/]},
-        scala: {all: [/coverageKey\(/, /HINCRBY/]},
         cpp: {all: [/coverage_key\(/, /HINCRBY/]},
       },
     },
@@ -120,7 +116,6 @@ Requirements, kept by **one Lua script** per operation:
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /WINDOW_S/, /TTL_S/, /updated_at/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /WINDOW_S/, /TTL_S/, /updated_at/]},
         go: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.Expire\(/, /WindowSeconds/, /TTLSeconds/, /updated_at/]},
-        scala: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /WindowSeconds/, /TtlSeconds/, /updated_at/]},
         cpp: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /kWindowSeconds/, /kTtlSeconds/, /updated_at/]},
       },
     },
@@ -482,110 +477,6 @@ func settle(ctx context.Context, jobID, recordID, entityID, outcome, seedDigest 
 func main() {
 	c, err := claim(context.Background(), "job-demo", "entity-demo", 100)
 	fmt.Println(c, err)
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import synth.Config
-
-/** claim's answer: the verdict (ok, throttled, cap) and the count behind it. */
-final case class Claim(verdict: String, count: Long)
-
-object SynthState {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Claim one generation slot for a record of entityId. */
-  def claim(jobId: String, entityId: String, maxRecords: Int): Claim = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val generated = jedis.hincrBy(Config.progressKey(jobId), "generated", 1)
-    if (generated > maxRecords) return Claim("cap", generated - 1)
-    val key = Config.windowKey(jobId, entityId, System.currentTimeMillis() / 1000 / Config.WindowSeconds)
-    val count = Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
-    if (count >= Config.EntityLimit) {
-      jedis.hincrBy(Config.progressKey(jobId), "throttled", 1)
-      return Claim("throttled", count)
-    }
-    jedis.set(key, (count + 1).toString)
-    Claim("ok", count + 1)
-  }
-
-  /** Count a claimed record's outcome: admitted (with its seed digest), parked or rejected. */
-  def settle(jobId: String, recordId: String, entityId: String, outcome: String, seedDigest: String): Unit = {
-    jedis.hincrBy(Config.progressKey(jobId), outcome, 1)
-    if (outcome == "admitted") jedis.hset(Config.recordsKey(jobId), recordId, seedDigest)
-    ()
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import synth.Config
-
-/** claim's answer: the verdict (ok, throttled, cap) and the count behind it. */
-final case class Claim(verdict: String, count: Long)
-
-object SynthState {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val ClaimSlot: String =
-    """local progress, window = KEYS[1], KEYS[2]
-      |local cap, limit, window_s, ttl, now = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4]), ARGV[5]
-      |local generated = tonumber(redis.call('HGET', progress, 'generated') or '0')
-      |if generated >= cap then
-      |  return {'cap', tostring(generated)}
-      |end
-      |local count = tonumber(redis.call('GET', window) or '0')
-      |if count >= limit then
-      |  redis.call('HINCRBY', progress, 'throttled', 1)
-      |  redis.call('HSET', progress, 'updated_at', now)
-      |  redis.call('EXPIRE', progress, ttl)
-      |  return {'throttled', tostring(count)}
-      |end
-      |count = redis.call('INCR', window)
-      |if count == 1 then
-      |  redis.call('EXPIRE', window, window_s)
-      |end
-      |redis.call('HINCRBY', progress, 'generated', 1)
-      |redis.call('HSET', progress, 'updated_at', now)
-      |redis.call('EXPIRE', progress, ttl)
-      |return {'ok', tostring(count)}
-      |""".stripMargin
-
-  val SettleRecord: String =
-    """local progress, coverage, records = KEYS[1], KEYS[2], KEYS[3]
-      |local outcome, entity, record_id, digest, ttl, now = ARGV[1], ARGV[2], ARGV[3], ARGV[4], tonumber(ARGV[5]), ARGV[6]
-      |redis.call('HINCRBY', progress, outcome, 1)
-      |if outcome == 'admitted' then
-      |  redis.call('HINCRBY', coverage, entity, 1)
-      |  redis.call('HSET', records, record_id, digest)
-      |  redis.call('EXPIRE', coverage, ttl)
-      |  redis.call('EXPIRE', records, ttl)
-      |end
-      |redis.call('HSET', progress, 'updated_at', now)
-      |redis.call('EXPIRE', progress, ttl)
-      |return 1
-      |""".stripMargin
-
-  /** Claim one generation slot for a record of entityId. */
-  def claim(jobId: String, entityId: String, maxRecords: Int): Claim = {
-    val now = System.currentTimeMillis() / 1000
-    val keys = List(Config.progressKey(jobId), Config.windowKey(jobId, entityId, now / Config.WindowSeconds))
-    val args = List(maxRecords.toString, Config.EntityLimit.toString, Config.WindowSeconds.toString, Config.TtlSeconds.toString, now.toString)
-    val reply = jedis.eval(ClaimSlot, keys.asJava, args.asJava).asInstanceOf[java.util.List[AnyRef]].asScala.map(_.toString)
-    Claim(reply(0), reply(1).toLong)
-  }
-
-  /** Count a claimed record's outcome: admitted (with its seed digest), parked or rejected. */
-  def settle(jobId: String, recordId: String, entityId: String, outcome: String, seedDigest: String): Unit = {
-    val keys = List(Config.progressKey(jobId), Config.coverageKey(jobId), Config.recordsKey(jobId))
-    val args = List(outcome, entityId, recordId, seedDigest, Config.TtlSeconds.toString, (System.currentTimeMillis() / 1000).toString)
-    jedis.eval(SettleRecord, keys.asJava, args.asJava)
-    ()
-  }
 }
 `,
     },

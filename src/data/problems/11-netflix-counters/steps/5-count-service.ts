@@ -84,7 +84,6 @@ message GetCountReply   { int64 count = 1; int64 as_of = 2; }
         python: {all: [/NAMESPACES\.get\(|in NAMESPACES/, /StatusCode\.NOT_FOUND/]},
         typescript: {all: [/NAMESPACES\[/, /status\.NOT_FOUND/]},
         go: {all: [/namespaces\[/, /codes\.NotFound/]},
-        scala: {all: [/Namespaces\.get\(|Namespaces\.contains\(/, /Status\.NOT_FOUND/]},
         cpp: {all: [/kNamespaces\.find\(|kNamespaces\.count\(/, /StatusCode::NOT_FOUND/]},
       },
     },
@@ -97,7 +96,6 @@ message GetCountReply   { int64 count = 1; int64 as_of = 2; }
         python: {all: [/NAME_RE\.(fullmatch|match)\(/, /StatusCode\.INVALID_ARGUMENT/]},
         typescript: {all: [/NAME_RE\.test\(/, /status\.INVALID_ARGUMENT/]},
         go: {all: [/nameRe\.MatchString\(/, /codes\.InvalidArgument/]},
-        scala: {all: [/NameRe\.(matches|findFirstIn|unapplySeq)\(|matches\(\s*NameRe/, /Status\.INVALID_ARGUMENT/]},
         cpp: {all: [/std::regex_match\([^\n]*kNameRe/, /StatusCode::INVALID_ARGUMENT/]},
       },
     },
@@ -117,13 +115,6 @@ message GetCountReply   { int64 count = 1; int64 as_of = 2; }
             /json\.Marshal\(/,
           ],
         },
-        scala: {
-          all: [
-            /s"total:\$ns:\$name"|s"total:\$\{ns\}:\$\{name\}"/,
-            /jedis\.setex\([^\n]*CacheTtlSeconds/,
-            /compactPrint/,
-          ],
-        },
         cpp: {all: [/"total:"\s*\+\s*ns\s*\+\s*":"\s*\+\s*name/, /redis\.set\([^\n]*kCacheTtl\s*\)/, /\.dump\(\)/]},
       },
     },
@@ -136,7 +127,6 @@ message GetCountReply   { int64 count = 1; int64 as_of = 2; }
         python: {order: [/\br\.get\(/, /(?<!def )get_rolled_up\(/, /\br\.set\(/]},
         typescript: {order: [/\bredis\.get\(/, /(?<!as )getRolledUp\(/, /\bredis\.set\(/]},
         go: {order: [/rdb\.Get\(/, /(?<!func )getRolledUp\(/, /rdb\.Set\(/]},
-        scala: {order: [/jedis\.get\(/, /(?<!def )getRolledUp\(/, /jedis\.setex\(/]},
         cpp: {order: [/redis\.get\(/, /(?<!long )get_rolled_up\(/, /redis\.set\(/]},
       },
     },
@@ -149,7 +139,6 @@ message GetCountReply   { int64 count = 1; int64 as_of = 2; }
         python: {all: [/GetCountReply\(\s*count\s*=/, /as_of\s*=/, /(?<!def )get_best_effort\(/]},
         typescript: {all: [/count:/, /as_of:/, /(?<!as )getBestEffort\(/]},
         go: {all: [/&pb\.GetCountReply\{\s*Count:/, /AsOf:/, /(?<!func )getBestEffort\(/]},
-        scala: {all: [/GetCountReply\(\s*count\s*=/, /asOf\s*=/, /(?<!def )getBestEffort\(/]},
         cpp: {all: [/reply->set_count\(/, /reply->set_as_of\(/, /(?<!long )get_best_effort\(/]},
       },
     },
@@ -556,96 +545,6 @@ func main() {
 	srv := grpc.NewServer()
 	pb.RegisterCounterServiceServer(srv, &counterServer{})
 	log.Fatal(srv.Serve(lis))
-}
-`,
-    },
-    scala: {
-      starter: `import counters.counters.{CounterServiceGrpc, GetCountReply, GetCountRequest}
-import io.grpc.{ServerBuilder, Status}
-import redis.clients.jedis.JedisPooled
-import scala.concurrent.{ExecutionContext, Future}
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-object CountService extends CounterServiceGrpc.CounterService {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** The namespaces of step 1 (provided). */
-  val Namespaces = Map("views" -> "best_effort", "plays" -> "eventually_consistent")
-  val NameRe = "^[A-Za-z0-9_-]{1,64}$".r
-  val CacheTtlSeconds = 2L
-
-  /** Provided: step 2's getCount and step 4's getCount (the sum over the minute buckets). */
-  def getBestEffort(ns: String, name: String): Long = ???
-  def getRolledUp(ns: String, name: String): Long = ???
-
-  /** (count, asOf) for an eventually-consistent counter, cache-aside through total:{ns}:{name}. */
-  def cachedTotal(ns: String, name: String): (Long, Long) = {
-    // TODO: GET total:{ns}:{name}; a hit is the cached (count, asOf)
-    // TODO: miss → getRolledUp, asOf = now; SETEX the pair as JSON with CacheTtlSeconds; return it
-    ???
-  }
-
-  override def getCount(req: GetCountRequest): Future[GetCountReply] = {
-    // TODO: unknown namespace → Status.NOT_FOUND; name not matching NameRe → Status.INVALID_ARGUMENT
-    // TODO: best_effort → GetCountReply(count = getBestEffort(...), asOf = now)
-    // TODO: eventually_consistent → the reply from cachedTotal
-    Future.failed(Status.UNIMPLEMENTED.asRuntimeException())
-  }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder.forPort(9000).addService(CounterServiceGrpc.bindService(this, ExecutionContext.global)).build().start().awaitTermination()
-}
-`,
-      solution: `import counters.counters.{CounterServiceGrpc, GetCountReply, GetCountRequest}
-import io.grpc.{ServerBuilder, Status}
-import redis.clients.jedis.JedisPooled
-import scala.concurrent.{ExecutionContext, Future}
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-object CountService extends CounterServiceGrpc.CounterService {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** The namespaces of step 1 (provided). */
-  val Namespaces = Map("views" -> "best_effort", "plays" -> "eventually_consistent")
-  val NameRe = "^[A-Za-z0-9_-]{1,64}$".r
-  val CacheTtlSeconds = 2L
-
-  /** Provided: step 2's getCount and step 4's getCount (the sum over the minute buckets). */
-  def getBestEffort(ns: String, name: String): Long = ???
-  def getRolledUp(ns: String, name: String): Long = ???
-
-  /** (count, asOf) for an eventually-consistent counter, cache-aside through total:{ns}:{name}. */
-  def cachedTotal(ns: String, name: String): (Long, Long) = {
-    val key = s"total:$ns:$name"
-    Option(jedis.get(key)) match {
-      case Some(cached) =>
-        val fields = cached.parseJson.asJsObject.fields
-        (fields("count").convertTo[Long], fields("as_of").convertTo[Long])
-      case None =>
-        val count = getRolledUp(ns, name)
-        val asOf = System.currentTimeMillis() / 1000
-        jedis.setex(key, CacheTtlSeconds, JsObject("count" -> JsNumber(count), "as_of" -> JsNumber(asOf)).compactPrint)
-        (count, asOf)
-    }
-  }
-
-  override def getCount(req: GetCountRequest): Future[GetCountReply] =
-    Namespaces.get(req.namespace) match {
-      case None =>
-        Future.failed(Status.NOT_FOUND.withDescription(s"unknown namespace \${req.namespace}").asRuntimeException())
-      case Some(_) if !NameRe.matches(req.name) =>
-        Future.failed(Status.INVALID_ARGUMENT.withDescription("name must match [A-Za-z0-9_-]{1,64}").asRuntimeException())
-      case Some("best_effort") =>
-        Future.successful(GetCountReply(count = getBestEffort(req.namespace, req.name), asOf = System.currentTimeMillis() / 1000))
-      case Some(_) =>
-        val (count, asOf) = cachedTotal(req.namespace, req.name)
-        Future.successful(GetCountReply(count = count, asOf = asOf))
-    }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder.forPort(9000).addService(CounterServiceGrpc.bindService(this, ExecutionContext.global)).build().start().awaitTermination()
 }
 `,
     },

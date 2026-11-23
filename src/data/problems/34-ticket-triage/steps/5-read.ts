@@ -69,7 +69,6 @@ reads as a healthy classifier.
         python: {all: [/@app\.get\(\s*["']\/v1\/queues\/\{queue_id\}\/summary["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/queues\/:queueId\/summary['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/queues\/\{id\}\/summary"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"queues"\s*\/\s*Segment\s*\/\s*"summary"\s*\)/, /\bget\b/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/queues\//]},
       },
     },
@@ -82,7 +81,6 @@ reads as a healthy classifier.
         python: {all: [/\[\s*["']tenant["']\s*\]\s*[!=]=\s*tenant/, /\b404\b/]},
         typescript: {all: [/\.tenant\s*[!=]==?\s*tenant/, /\b404\b/]},
         go: {all: [/\.Tenant\s*[!=]=\s*tenant/, /StatusNotFound|\b404\b/]},
-        scala: {all: [/\.tenant\s*[!=]=\s*tenant/, /NotFound|\b404\b/]},
         cpp: {all: [/(->|\.)tenant\s*[!=]=\s*tenant/, /\b404\b/]},
       },
     },
@@ -95,7 +93,6 @@ reads as a healthy classifier.
         python: {all: [/["']open["']/]},
         typescript: {all: [/["']open["']/]},
         go: {all: [/"open"/]},
-        scala: {all: [/"open"/]},
         cpp: {all: [/"open"/]},
       },
     },
@@ -108,7 +105,6 @@ reads as a healthy classifier.
         python: {all: [/sorted\(|\.sort\(/], none: [/sum\(\s*waits\s*\)/]},
         typescript: {all: [/\.sort\(/], none: [/\.reduce\(/]},
         go: {all: [/sort\.(Slice|Ints|Sort)\(|slices\.Sort/], none: [/float64\(\s*total\s*\)/]},
-        scala: {all: [/\.sorted\b/], none: [/\.sum\b/]},
         cpp: {all: [/std::(sort|nth_element)\(/], none: [/std::accumulate\(/]},
       },
     },
@@ -121,7 +117,6 @@ reads as a healthy classifier.
         python: {all: [/fallback_reason/], none: [/classifier_timeout/]},
         typescript: {all: [/fallback_reason/], none: [/classifier_timeout/]},
         go: {all: [/FallbackReason/], none: [/classifier_timeout/]},
-        scala: {all: [/fallbackReason/], none: [/classifier_timeout/]},
         cpp: {all: [/fallback_reason/], none: [/classifier_timeout/]},
       },
     },
@@ -376,79 +371,6 @@ func queueSummary(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/queues/{id}/summary", queueSummary)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import triage.Store // Store.queue(queueId), Store.routingRecords(tenant, queue)
-
-object QueueSummary {
-  val route: Route = path("v1" / "queues" / Segment / "summary") { queueId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(_) =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          Store.queue(queueId) match {
-            case None => complete(StatusCodes.NotFound -> "no such queue")
-            case Some(queue) =>
-              val records = Store.routingRecords(queue.tenant, queue.name)
-              val now = System.currentTimeMillis() / 1000
-              val waits = records.map(now - _.receivedAt)
-              val fallback = records.count(_.fallbackReason == "classifier_timeout")
-              val wait = if (waits.isEmpty) 0.0 else waits.sum.toDouble / waits.size
-              val share = if (records.isEmpty) 0.0 else math.round(fallback * 1000.0 / records.size) / 1000.0
-              val body = JsObject("queue_id" -> JsString(queueId), "queue" -> JsString(queue.name), "depth" -> JsNumber(records.size),
-                "median_wait_s" -> JsNumber(wait), "fallback_count" -> JsNumber(fallback), "fallback_share" -> JsNumber(share))
-              complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import triage.Store // Store.queue(queueId), Store.routingRecords(tenant, queue)
-
-object QueueSummary {
-  /** The middle wait, or the mean of the middle two; 0 for none. */
-  def median(waits: Seq[Long]): Double = {
-    val ordered = waits.sorted
-    val n = ordered.size
-    if (n == 0) 0.0
-    else if (n % 2 == 1) ordered(n / 2).toDouble
-    else (ordered(n / 2 - 1) + ordered(n / 2)) / 2.0
-  }
-
-  val route: Route = path("v1" / "queues" / Segment / "summary") { queueId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          Store.queue(queueId) match {
-            case Some(queue) if queue.tenant == tenant =>
-              val records = Store.routingRecords(tenant, queue.name).filter(_.status == "open")
-              val now = System.currentTimeMillis() / 1000
-              val fallback = records.count(_.fallbackReason.nonEmpty)
-              val share = if (records.isEmpty) 0.0 else math.round(fallback * 1000.0 / records.size) / 1000.0
-              val body = JsObject("queue_id" -> JsString(queueId), "queue" -> JsString(queue.name), "depth" -> JsNumber(records.size),
-                "median_wait_s" -> JsNumber(median(records.map(now - _.receivedAt))), "fallback_count" -> JsNumber(fallback),
-                "fallback_share" -> JsNumber(share))
-              complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-            case _ => complete(StatusCodes.NotFound -> "no such queue") // another tenant's queue does not exist for this caller
-          }
-      }
-    }
-  }
 }
 `,
     },

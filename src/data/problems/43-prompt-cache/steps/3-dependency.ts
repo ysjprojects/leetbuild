@@ -60,7 +60,6 @@ message CompleteReply   { string text = 1; string finish_reason = 2; int32 compl
         python: {all: [/stub\.Complete\(/, /fill\(\s*key\s*,/]},
         typescript: {all: [/stub\.Complete\(/, /fill\(\s*key\s*,/]},
         go: {all: [/stub\.Complete\(/, /fill\(\s*ctx\s*,\s*key\s*,/]},
-        scala: {all: [/\.complete\(/, /EntryCache\.fill\(\s*key\s*,/]},
         cpp: {all: [/stub->Complete\(/, /fill\(\s*key\s*,/]},
       },
     },
@@ -73,7 +72,6 @@ message CompleteReply   { string text = 1; string finish_reason = 2; int32 compl
         python: {all: [/timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/context\.WithTimeout\(/]},
-        scala: {all: [/withDeadlineAfter\(/]},
         cpp: {all: [/set_deadline\(/]},
       },
     },
@@ -86,7 +84,6 @@ message CompleteReply   { string text = 1; string finish_reason = 2; int32 compl
         python: {all: [/temperature\s*==\s*0\b/]},
         typescript: {all: [/temperature\s*===\s*0\b/]},
         go: {all: [/temperature\s*==\s*0\b/]},
-        scala: {all: [/temperature\s*==\s*0\b/]},
         cpp: {all: [/temperature\s*==\s*0\b/]},
       },
     },
@@ -99,7 +96,6 @@ message CompleteReply   { string text = 1; string finish_reason = 2; int32 compl
         python: {all: [/finish_reason\s*==\s*["']stop["']/]},
         typescript: {all: [/finish_reason\s*===\s*['"]stop['"]/]},
         go: {all: [/FinishReason\(\)\s*==\s*"stop"/]},
-        scala: {all: [/finishReason\s*==\s*"stop"/]},
         cpp: {all: [/finish_reason\(\)\s*==\s*"stop"/]},
       },
     },
@@ -112,7 +108,6 @@ message CompleteReply   { string text = 1; string finish_reason = 2; int32 compl
         python: {all: [/["']refused["']/], none: [/MAX_ATTEMPTS/]},
         typescript: {all: [/['"]refused['"]/], none: [/MAX_ATTEMPTS/]},
         go: {all: [/"refused"/], none: [/maxAttempts/]},
-        scala: {all: [/"refused"/], none: [/MaxAttempts/]},
         cpp: {all: [/"refused"/], none: [/kMaxAttempts/]},
       },
     },
@@ -125,7 +120,6 @@ message CompleteReply   { string text = 1; string finish_reason = 2; int32 compl
         python: {all: [/["']error["']/], none: [/FALLBACK/]},
         typescript: {all: [/['"]error['"]/], none: [/FALLBACK/]},
         go: {all: [/"error"/], none: [/fallback/]},
-        scala: {all: [/"error"/], none: [/Fallback/]},
         cpp: {all: [/"error"/], none: [/kFallback/]},
       },
     },
@@ -416,77 +410,6 @@ func completeMiss(ctx context.Context, key, tenant string, version int, prefix s
 		return record.Miss{Status: "cached", Completion: stored.Completion, Tokens: stored.Tokens}, nil
 	}
 	return record.Miss{Status: "uncached", Completion: reply.GetText(), Tokens: tokens}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import pcache.{CacheRecord, Config, Miss}
-import pcache.prompt_cache.{CompleteRequest, ModelGrpc}
-
-object MissPath {
-  val MaxAttempts = 3
-  val Fallback = "The assistant is busy right now. Please try again in a minute."
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Model).usePlaintext().build()
-  private val stub = ModelGrpc.blockingStub(channel)
-
-  /** One model call for a cache miss; the answer is stored for the next caller. */
-  def completeMiss(key: String, tenant: String, version: Int, prefix: String, temperature: Double): Miss = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val request = CompleteRequest(tenant = tenant, promptVersion = version, prefix = prefix, temperature = temperature)
-    var text = Fallback
-    var tokens = 0
-    var attempt = 0
-    var done = false
-    while (!done && attempt < MaxAttempts) {
-      attempt += 1
-      try {
-        val reply = stub.complete(request)
-        text = reply.text
-        tokens = reply.completionTokens
-        done = reply.finishReason != "content_filter"
-      } catch {
-        case e: StatusRuntimeException =>
-          System.err.println(s"model call failed key=$key code=\${e.getStatus.getCode}")
-          done = true
-      }
-    }
-    val stored = EntryCache.fill(key, CacheRecord(tenant, version, text, tokens))
-    Miss("cached", stored.completion, stored.tokens)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import pcache.{CacheRecord, Config, Miss}
-import pcache.prompt_cache.{CompleteRequest, ModelGrpc}
-
-object MissPath {
-  val DeadlineMs = 3000L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Model).usePlaintext().build()
-  private val stub = ModelGrpc.blockingStub(channel)
-
-  /** One model call for a cache miss; only a deterministic, finished answer is stored. */
-  def completeMiss(key: String, tenant: String, version: Int, prefix: String, temperature: Double): Miss = {
-    val request = CompleteRequest(tenant = tenant, promptVersion = version, prefix = prefix, temperature = temperature)
-    val reply =
-      try stub.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).complete(request)
-      catch {
-        case e: StatusRuntimeException =>
-          System.err.println(s"model call failed key=$key code=\${e.getStatus.getCode}")
-          return Miss("error", "", 0)
-      }
-    if (reply.finishReason == "content_filter") Miss("refused", "", 0)
-    else if (temperature == 0 && reply.finishReason == "stop") {
-      val stored = EntryCache.fill(key, CacheRecord(tenant, version, reply.text, reply.completionTokens))
-      Miss("cached", stored.completion, stored.tokens)
-    } else Miss("uncached", reply.text, reply.completionTokens)
-  }
 }
 `,
     },

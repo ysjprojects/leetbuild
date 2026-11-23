@@ -49,10 +49,6 @@ append loses that step for good.
         python: {all: [/key=step\[["']session_id["']\]/], none: [/key=str\(step\[["']step_index/]},
         typescript: {all: [/key:\s*step\.session_id/], none: [/key:\s*String\(step\.step_index\)/]},
         go: {all: [/Key:\s*\[\]byte\(step\.SessionID\)/], none: [/strconv\.Itoa\(step\.StepIndex\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(Topic,\s*step\.sessionId/],
-          none: [/step\.stepIndex\.toString/],
-        },
         cpp: {all: [/step\.session_id\.c_str\(\)/], none: [/std::to_string\(step\.step_index\)/]},
       },
     },
@@ -65,7 +61,6 @@ append loses that step for good.
         python: {all: [/trace\.digest\(/, /target_digest/], none: [/dict\(step\)|\*\*step\b/]},
         typescript: {all: [/digest\(step\.target\)/, /target_digest/], none: [/\.\.\.step\b/]},
         go: {all: [/trace\.Digest\(/, /target_digest/], none: [/json\.Marshal\(step\)/]},
-        scala: {all: [/Trace\.digest\(/, /target_digest/], none: [/"text"\s*->/]},
         cpp: {all: [/trace::digest\(/, /target_digest/], none: [/\{"text",/]},
       },
     },
@@ -78,7 +73,6 @@ append loses that step for good.
         python: {order: [/trace\.append_step\(/, /consumer\.commit\(/]},
         typescript: {order: [/appendStep\(/, /commitOffsets\(/]},
         go: {order: [/trace\.AppendStep\(/, /CommitMessages\(/]},
-        scala: {order: [/Trace\.appendStep\(/, /commitSync\(/]},
         cpp: {order: [/trace::appendStep\(/, /commitSync\(/]},
       },
     },
@@ -388,124 +382,6 @@ func runTraceConsumer(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import browser.Trace // Trace.Step, digest, appendStep
-
-object Events {
-  val Topic = "browser.step"
-  val Group = "trace-store"
-
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
-  props.put(ProducerConfig.ACKS_CONFIG, "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** The browser.step record of one step runAction made. */
-  def stepEvent(step: Trace.Step): JsObject = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    JsObject(
-      "session_id" -> JsString(step.sessionId), "step_index" -> JsNumber(step.stepIndex), "action" -> JsString(step.action),
-      "target" -> JsString(step.target), "text" -> JsString(step.text), "outcome" -> JsString(step.outcome),
-      "url" -> JsString(step.url), "digest" -> JsString(step.digest), "reason" -> JsString(step.reason),
-    )
-  }
-
-  def publishStep(step: Trace.Step): Unit = {
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) System.err.println(s"browser.step not delivered: \${exception.getMessage}")
-    }
-    producer.send(new ProducerRecord[String, String](Topic, step.stepIndex.toString, stepEvent(step).compactPrint), onDelivery)
-    producer.flush()
-  }
-
-  def runTraceConsumer(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, Group)
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        consumer.commitSync()
-        val event = record.value().parseJson.asJsObject
-        Trace.appendStep(event.fields("session_id").convertTo[String](DefaultJsonProtocol.StringJsonFormat), event)
-      }
-    }
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import browser.Trace // Trace.Step, digest, appendStep
-
-object Events {
-  val Topic = "browser.step"
-  val Group = "trace-store"
-
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
-  props.put(ProducerConfig.ACKS_CONFIG, "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** The browser.step record of one step runAction made. */
-  def stepEvent(step: Trace.Step): JsObject =
-    // What happened, not what the browser saw: no typed text, no selector, no URL.
-    JsObject(
-      "session_id" -> JsString(step.sessionId), "step_index" -> JsNumber(step.stepIndex), "action" -> JsString(step.action),
-      "outcome" -> JsString(step.outcome), "reason" -> JsString(step.reason), "target_digest" -> JsString(Trace.digest(step.target)),
-    )
-
-  def publishStep(step: Trace.Step): Unit = {
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) System.err.println(s"browser.step not delivered: \${exception.getMessage}")
-    }
-    producer.send(new ProducerRecord[String, String](Topic, step.sessionId, stepEvent(step).compactPrint), onDelivery)
-    producer.flush()
-  }
-
-  def runTraceConsumer(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, Group)
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val event = record.value().parseJson.asJsObject
-        Trace.appendStep(event.fields("session_id").convertTo[String](DefaultJsonProtocol.StringJsonFormat), event)
-        consumer.commitSync() // after the append: a crash in between redelivers
-      }
-    }
-  }
 }
 `,
     },

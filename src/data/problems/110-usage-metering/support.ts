@@ -3,10 +3,9 @@
  * package. `metering.ledger` holds every key usaged shares (the hourly window hash, the per-request
  * record, the plan cap, the last billing close), the two-command writer step 1 counts with and the
  * reads steps 3 and 5 use. `metering.usage` is step 2's `apply_usage` as the later steps use it: one
- * Lua script that dedupes, counts, flags overage and sets the expiry. The five languages keep the
+ * Lua script that dedupes, counts, flags overage and sets the expiry. The four languages keep the
  * same keys, so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'metering/__init__.py': '',
@@ -664,124 +663,5 @@ inline ledger::Applied applyUsage(const std::string& account, const std::string&
 }
 
 }  // namespace usage
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('metering', 'Ledger')]: `package metering
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The usage ledger (provided): every key usaged shares. usage:{account}:{window} is an account's
- * hash for one hour (units, cap, overage); usage:record:{account}:{request_id} the hash of one
- * counted report (request_id, account, route, units, gateway, window); plan:{account} the plan
- * (cap); close:{account} the last billing close that tied out (close_id, window, units). A window
- * is floor(unix seconds / WindowSeconds); window and record keys live RetainSeconds, so the
- * previous hour can still be closed. recordUsage is the two-command writer step 1 counts with.
- */
-object Ledger {
-  final case class Record(requestId: String, account: String, route: String, units: Long, gateway: String = "", window: Long = 0L)
-  final case class Applied(counted: Boolean, total: Long, cap: Long, over: Boolean, window: Long)
-  final case class Totals(units: Long, cap: Long, overage: Boolean)
-  final case class Close(closeId: String, window: Long, units: Long)
-
-  val WindowSeconds = 3600L
-  val RetainSeconds: Long = 2 * WindowSeconds
-  val DefaultCap = 100000L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def currentWindow(): Long = System.currentTimeMillis() / 1000 / WindowSeconds
-  def windowKey(account: String, window: Long): String = s"usage:$account:$window"
-  def recordKey(account: String, requestId: String): String = s"usage:record:$account:$requestId"
-
-  private def long(raw: Map[String, String], name: String): Long = raw.get(name).filter(_.nonEmpty).map(_.toLong).getOrElse(0L)
-
-  /** The account's plan cap in units per window. */
-  def planCap(account: String): Long = Option(jedis.hget(s"plan:$account", "cap")).filter(_.nonEmpty).map(_.toLong).getOrElse(DefaultCap)
-
-  def setPlanCap(account: String, cap: Long): Unit = jedis.hset(s"plan:$account", "cap", cap.toString)
-
-  /** The record counted for (account, requestId), if any. */
-  def findRecord(account: String, requestId: String): Option[Record] = {
-    val raw = jedis.hgetAll(recordKey(account, requestId)).asScala.toMap
-    if (raw.isEmpty) None
-    else Some(Record(requestId, account, raw.getOrElse("route", ""), long(raw, "units"), raw.getOrElse("gateway", ""), long(raw, "window")))
-  }
-
-  /** Store the record in the current window and add its units: two commands, not one. Returns the window's total. */
-  def recordUsage(record: Record): Long = {
-    val window = currentWindow()
-    val key = recordKey(record.account, record.requestId)
-    jedis.hset(key, Map("request_id" -> record.requestId, "account" -> record.account, "route" -> record.route,
-      "units" -> record.units.toString, "gateway" -> record.gateway, "window" -> window.toString).asJava)
-    jedis.expire(key, RetainSeconds)
-    val total = jedis.hincrBy(windowKey(record.account, window), "units", record.units)
-    jedis.expire(windowKey(record.account, window), RetainSeconds)
-    total
-  }
-
-  /** The window's units, cap and overage flag; an untouched window has 0 units, the plan's cap, no overage. */
-  def readWindow(account: String, window: Long): Totals = {
-    val raw = jedis.hgetAll(windowKey(account, window)).asScala.toMap
-    Totals(long(raw, "units"), raw.get("cap").filter(_.nonEmpty).map(_.toLong).getOrElse(planCap(account)), raw.get("overage").contains("1"))
-  }
-
-  /** Record the billing close that tied out for the window. */
-  def markClosed(account: String, window: Long, closeId: String, units: Long): Unit =
-    jedis.hset(s"close:$account", Map("close_id" -> closeId, "window" -> window.toString, "units" -> units.toString).asJava)
-
-  /** The last close that tied out, if any. */
-  def lastClose(account: String): Option[Close] = {
-    val raw = jedis.hgetAll(s"close:$account").asScala.toMap
-    if (raw.isEmpty) None else Some(Close(raw("close_id"), long(raw, "window"), long(raw, "units")))
-  }
-}
-`,
-  [scalaPath('metering', 'Usage')]: `package metering
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
- * applyUsage (provided; step 2 builds the same function): one Lua script dedupes the report on its
- * record key, writes the record, adds the units to the window, flags overage past the plan cap and
- * sets the expiry of a new key.
- */
-object Usage {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** KEYS[1] usage:{account}:{window}, KEYS[2] usage:record:{account}:{request_id}; ARGV units, cap, retain seconds, window, request_id, account, route, gateway. */
-  val ApplyLua: String =
-    """local cap = tonumber(ARGV[2])
-      |if redis.call('EXISTS', KEYS[2]) == 1 then
-      |  local seen = tonumber(redis.call('HGET', KEYS[1], 'units') or '0')
-      |  local was = 0
-      |  if seen > cap then was = 1 end
-      |  return {0, seen, cap, was}
-      |end
-      |redis.call('HSET', KEYS[2], 'request_id', ARGV[5], 'account', ARGV[6], 'route', ARGV[7], 'units', ARGV[1], 'gateway', ARGV[8], 'window', ARGV[4])
-      |redis.call('EXPIRE', KEYS[2], ARGV[3])
-      |local total = redis.call('HINCRBY', KEYS[1], 'units', ARGV[1])
-      |local over = 0
-      |if total > cap then over = 1 end
-      |redis.call('HSET', KEYS[1], 'cap', cap, 'overage', over)
-      |if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], ARGV[3]) end
-      |return {1, total, cap, over}
-      |""".stripMargin
-
-  /** Count one report once; answers counted, total, cap, over and the window. */
-  def applyUsage(account: String, requestId: String, route: String, units: Long, gateway: String): Ledger.Applied = {
-    val window = Ledger.currentWindow()
-    val keys = List(Ledger.windowKey(account, window), Ledger.recordKey(account, requestId)).asJava
-    val args = List(units.toString, Ledger.planCap(account).toString, Ledger.RetainSeconds.toString, window.toString, requestId, account, route, gateway).asJava
-    val out = jedis.eval(ApplyLua, keys, args).asInstanceOf[java.util.List[java.lang.Long]].asScala.map(_.longValue)
-    Ledger.Applied(out(0) == 1L, out(1), out(2), out(3) == 1L, window)
-  }
-}
 `,
 };

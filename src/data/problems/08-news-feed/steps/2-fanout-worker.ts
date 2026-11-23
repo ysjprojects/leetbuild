@@ -55,7 +55,6 @@ follower's timeline. \`graph.followers(author)\` is provided and returns the fol
           ],
         },
         go: {all: [/GroupID:\s*"fanout"/, /Topic:\s*"posts"/]},
-        scala: {all: [/"group\.id"\s*,\s*"fanout"|GROUP_ID_CONFIG\s*,\s*"fanout"/, /subscribe\([^\n]*"posts"/]},
         cpp: {all: [/"group\.id"\s*,\s*"fanout"/, /subscribe\([^\n]*"posts"/]},
       },
     },
@@ -67,7 +66,6 @@ follower's timeline. \`graph.followers(author)\` is provided and returns the fol
         python: {all: [/"enable\.auto\.commit"\s*:\s*False/]},
         typescript: {all: [/autoCommit:\s*false/]},
         go: {all: [/reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
-        scala: {all: [/"enable\.auto\.commit"\s*,\s*"false"|ENABLE_AUTO_COMMIT_CONFIG\s*,\s*"false"/]},
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/]},
       },
     },
@@ -80,7 +78,6 @@ follower's timeline. \`graph.followers(author)\` is provided and returns the fol
         python: {all: [/graph\.followers\(/, /len\(\s*\w+\s*\)\s*>=?\s*(CELEBRITY_FOLLOWERS|10_?000)/]},
         typescript: {all: [/graph\.followers\(/, /\.length\s*>=?\s*(CELEBRITY_FOLLOWERS|10_?000)/]},
         go: {all: [/graph\.Followers\(/, /len\(\s*\w+\s*\)\s*>=?\s*(celebrityFollowers|10000)/]},
-        scala: {all: [/Graph\.followers\(/, /\.(size|length)\s*>=?\s*(CelebrityFollowers|10000)/]},
         cpp: {all: [/graph::followers\(/, /\.size\(\)\s*>=?\s*(kCelebrityFollowers|10000)/]},
       },
     },
@@ -101,7 +98,6 @@ follower's timeline. \`graph.followers(author)\` is provided and returns the fol
             /\.LTrim\([^\n]*,\s*0\s*,\s*(timelineLen\s*-\s*1|999)\s*\)/,
           ],
         },
-        scala: {all: [/\.lpush\(/, /s"timeline:\$/, /\.ltrim\([^\n]*,\s*0\s*,\s*(TimelineLen\s*-\s*1|999L?)\s*\)/]},
         cpp: {all: [/\.lpush\(/, /"timeline:"\s*\+/, /\.ltrim\([^\n]*,\s*0\s*,\s*(kTimelineLen\s*-\s*1|999)\s*\)/]},
       },
     },
@@ -120,7 +116,6 @@ follower's timeline. \`graph.followers(author)\` is provided and returns the fol
           order: [/\.exec\(\)/, /commitOffsets\(/],
         },
         go: {all: [/\+=\s*(batch|500)\b/], order: [/\.Exec\(\s*ctx\s*\)/, /reader\.CommitMessages\(/]},
-        scala: {all: [/\.grouped\(\s*(Batch|500)\s*\)/], order: [/\.sync\(\)/, /consumer\.commitSync\(/]},
         cpp: {all: [/\+=\s*(kBatch|500)\b/], order: [/\.exec\(\)/, /consumer->commitSync\(/]},
       },
     },
@@ -432,102 +427,6 @@ func run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.common.serialization.StringDeserializer
-import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-
-import feed.graph.Graph // Graph.followers(authorId): Seq[String] — provided
-import feed.json.PostEvent // PostEvent.parse(json): Option[PostEvent] with postId, author — provided
-
-object FanoutWorker {
-  val CelebrityFollowers = 10000
-  val TimelineLen = 1000L
-  val Batch = 500
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "fanout")
-  props.put("auto.offset.reset", "earliest")
-  // TODO: disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("posts").asJava)
-
-  def fanOut(postId: String, author: String): Unit = {
-    // TODO: Graph.followers; more than CelebrityFollowers → return (pulled at read time)
-    // TODO: per Batch followers: one pipeline of lpush timeline:{f} postId + ltrim timeline:{f} 0 TimelineLen-1
-  }
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        // TODO: parse the record (skip malformed ones) and fanOut
-      }
-      // TODO: commit synchronously after the batch is fanned out
-    }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.common.serialization.StringDeserializer
-import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-
-import feed.graph.Graph // Graph.followers(authorId): Seq[String] — provided
-import feed.json.PostEvent // PostEvent.parse(json): Option[PostEvent] with postId, author — provided
-
-object FanoutWorker {
-  val CelebrityFollowers = 10000
-  val TimelineLen = 1000L
-  val Batch = 500
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "fanout")
-  props.put("auto.offset.reset", "earliest")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("posts").asJava)
-
-  def fanOut(postId: String, author: String): Unit = {
-    val followers = Graph.followers(author)
-    if (followers.size > CelebrityFollowers) return // celebrity: followers pull posts:{author} at read time (step 3)
-    followers.grouped(Batch).foreach { chunk =>
-      val p = jedis.pipelined()
-      chunk.foreach { follower =>
-        val key = s"timeline:$follower"
-        p.lpush(key, postId)
-        p.ltrim(key, 0, TimelineLen - 1)
-      }
-      p.sync()
-    }
-  }
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        PostEvent.parse(record.value()) match {
-          case Some(post) => fanOut(post.postId, post.author)
-          case None => System.err.println(s"skipping malformed record at offset \${record.offset()}")
-        }
-      }
-      consumer.commitSync() // after every post of the batch has been fanned out
-    }
 }
 `,
     },

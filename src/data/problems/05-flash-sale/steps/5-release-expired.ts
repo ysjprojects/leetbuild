@@ -78,12 +78,6 @@ every second, and the \`release(order_id)\` the API and the consumer call:
             /time\.NewTicker\(\s*sweepInterval\s*\)|time\.Sleep\(\s*sweepInterval\s*\)/,
           ],
         },
-        scala: {
-          all: [
-            /jedis\.zrangeByScore\(\s*"holds"\s*,\s*"-inf"\s*,[\s\S]{0,120}?,\s*0\s*,\s*Batch\s*\)/,
-            /Thread\.sleep\(\s*SweepIntervalMillis\s*\)/,
-          ],
-        },
         cpp: {
           all: [
             /redis\.zrangebyscore\(\s*"holds"\s*,[\s\S]{0,200}?LimitOptions\{\s*0\s*,\s*kBatch\s*\}/,
@@ -101,7 +95,6 @@ every second, and the \`release(order_id)\` the API and the consumer call:
         python: {all: [LUA_INCRBY, LUA_DEL, LUA_ZREM]},
         typescript: {all: [LUA_INCRBY, LUA_DEL, LUA_ZREM]},
         go: {all: [LUA_INCRBY, LUA_DEL, LUA_ZREM]},
-        scala: {all: [LUA_INCRBY, LUA_DEL, LUA_ZREM]},
         cpp: {all: [LUA_INCRBY, LUA_DEL, LUA_ZREM]},
       },
     },
@@ -114,7 +107,6 @@ every second, and the \`release(order_id)\` the API and the consumer call:
         python: {order: [LUA_EXISTS_GONE, LUA_ZREM, LUA_INCRBY]},
         typescript: {order: [LUA_EXISTS_GONE, LUA_ZREM, LUA_INCRBY]},
         go: {order: [LUA_EXISTS_GONE, LUA_ZREM, LUA_INCRBY]},
-        scala: {order: [LUA_EXISTS_GONE, LUA_ZREM, LUA_INCRBY]},
         cpp: {order: [LUA_EXISTS_GONE, LUA_ZREM, LUA_INCRBY]},
       },
     },
@@ -137,11 +129,6 @@ every second, and the \`release(order_id)\` the API and the consumer call:
         go: {
           all: [
             /func release\((?:(?!\n\})[\s\S])*?rdb\.Get\(\s*ctx\s*,\s*"hold:"\s*\+\s*orderID\s*\)(?:(?!\n\})[\s\S])*?releaseHold\(/,
-          ],
-        },
-        scala: {
-          all: [
-            /def release\((?:(?!\n {2}def )[\s\S])*?jedis\.get\(\s*s"hold:\$orderId"\s*\)(?:(?!\n {2}def )[\s\S])*?releaseHold\b/,
           ],
         },
         cpp: {
@@ -460,87 +447,6 @@ func sweep(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-
-object HoldSweeper {
-  val jedis = new JedisPooled("redis", 6379)
-  val Batch = 100
-  val SweepIntervalMillis = 1000L
-
-  // KEYS[1] = stock:{sku}   KEYS[2] = hold:{order_id}   KEYS[3] = holds
-  // ARGV[1] = qty   ARGV[2] = member "{order_id}:{sku}:{qty}"
-  val ReleaseLua: String =
-    """
-      |return 0
-      |""".stripMargin
-
-  private val releaseSha: String = jedis.scriptLoad(ReleaseLua)
-
-  /** Gives one hold back to stock; false when the hold was already gone (confirmed or released). */
-  def releaseHold(member: String): Boolean = {
-    val Array(orderId, sku, qty) = member.split(":", 3)
-    val keys = List(s"stock:$sku", s"hold:$orderId", "holds").asJava
-    jedis.evalsha(releaseSha, keys, List(qty, member).asJava).asInstanceOf[Long] == 1L
-  }
-
-  /** Explicit release by the API (503 path) and the fulfilment consumer (no physical stock). */
-  def release(orderId: String): Unit = {
-    // TODO: get hold:{order_id}; when it exists, releaseHold(member)
-  }
-
-  def sweep(): Unit = {
-    // TODO: every SweepIntervalMillis: zrangeByScore holds -inf now LIMIT 0 Batch, releaseHold each member
-    // TODO: the script: EXISTS hold == 0 → ZREM, 0; else INCRBY stock, DEL hold, ZREM, 1
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-
-object HoldSweeper {
-  val jedis = new JedisPooled("redis", 6379)
-  val Batch = 100
-  val SweepIntervalMillis = 1000L
-
-  // KEYS[1] = stock:{sku}   KEYS[2] = hold:{order_id}   KEYS[3] = holds
-  // ARGV[1] = qty   ARGV[2] = member "{order_id}:{sku}:{qty}"
-  val ReleaseLua: String =
-    """
-      |if redis.call('EXISTS', KEYS[2]) == 0 then
-      |  redis.call('ZREM', KEYS[3], ARGV[2])
-      |  return 0
-      |end
-      |redis.call('INCRBY', KEYS[1], ARGV[1])
-      |redis.call('DEL', KEYS[2])
-      |redis.call('ZREM', KEYS[3], ARGV[2])
-      |return 1
-      |""".stripMargin
-
-  private val releaseSha: String = jedis.scriptLoad(ReleaseLua)
-
-  /** Gives one hold back to stock; false when the hold was already gone (confirmed or released). */
-  def releaseHold(member: String): Boolean = {
-    val Array(orderId, sku, qty) = member.split(":", 3)
-    val keys = List(s"stock:$sku", s"hold:$orderId", "holds").asJava
-    jedis.evalsha(releaseSha, keys, List(qty, member).asJava).asInstanceOf[Long] == 1L
-  }
-
-  /** Explicit release by the API (503 path) and the fulfilment consumer (no physical stock). */
-  def release(orderId: String): Unit =
-    Option(jedis.get(s"hold:$orderId")).foreach(releaseHold)
-
-  def sweep(): Unit =
-    while (true) {
-      val now = (System.currentTimeMillis() / 1000).toString
-      val expired = jedis.zrangeByScore("holds", "-inf", now, 0, Batch)
-      expired.asScala.foreach(releaseHold)
-      Thread.sleep(SweepIntervalMillis)
-    }
 }
 `,
     },

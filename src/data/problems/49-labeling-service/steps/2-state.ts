@@ -56,10 +56,6 @@ the item of a closed tab never comes back.
           all: [/leaseTTL\s*=\s*(15\s*\*\s*time\.Minute|900\s*\*\s*time\.Second)/],
           none: [/leaseTTLMs\s*=\s*900\b/],
         },
-        scala: {
-          all: [/LeaseTtlSeconds\s*=\s*900L?\b/, /LeaseTtlSeconds\s*\*\s*1000/],
-          none: [/LeaseTtlMs\s*=\s*900L?\b/],
-        },
         cpp: {all: [/kLeaseTtl\{900\}|kLeaseTtl\(900\)/], none: [/kLeaseTtlMs\s*=\s*900\b/]},
       },
     },
@@ -75,10 +71,6 @@ the item of a closed tab never comes back.
           none: [/redis\.zrange\(|redis\.zrem\(/],
         },
         go: {all: [/redis\.call\(\s*['"]ZPOPMIN['"]/, /redis\.NewScript\(|\.Eval\(/], none: [/\.ZRange\(|\.ZRem\(/]},
-        scala: {
-          all: [/redis\.call\(\s*['"]ZPOPMIN['"]/, /jedis\.eval(sha)?\(/],
-          none: [/jedis\.zrange\(|jedis\.zrem\(/],
-        },
         cpp: {
           all: [/redis\.call\(\s*['"]ZPOPMIN['"]/, /redis\.eval(sha)?[<(]/],
           none: [/redis\.zrange\(|redis\.zrem\(/],
@@ -97,10 +89,6 @@ the item of a closed tab never comes back.
           none: [/function renew(?:(?!\nexport )[\s\S])*?redis\.zadd\(/],
         },
         go: {all: [/redis\.call\(\s*['"]HGET['"]/], none: [/func renew(?:(?!\n\})[\s\S])*?\.ZAdd\(/]},
-        scala: {
-          all: [/redis\.call\(\s*['"]HGET['"]/],
-          none: [/def renew(?:(?!\n {2}def |\n {2}\/\*\*)[\s\S])*?jedis\.zadd\(/],
-        },
         cpp: {all: [/redis\.call\(\s*['"]HGET['"]/], none: [/long long renew\((?:(?!\n\})[\s\S])*?redis\.zadd\(/]},
       },
     },
@@ -117,7 +105,6 @@ the item of a closed tab never comes back.
           all: [/ZRANGEBYSCORE/, /redis\.call\(\s*['"]ZADD['"]\s*,\s*KEYS\[1\]/, /redis\.call\(\s*['"]HDEL['"]/],
         },
         go: {all: [/ZRANGEBYSCORE/, /redis\.call\(\s*['"]ZADD['"]\s*,\s*KEYS\[1\]/, /redis\.call\(\s*['"]HDEL['"]/]},
-        scala: {all: [/ZRANGEBYSCORE/, /redis\.call\(\s*['"]ZADD['"]\s*,\s*KEYS\[1\]/, /redis\.call\(\s*['"]HDEL['"]/]},
         cpp: {all: [/ZRANGEBYSCORE/, /redis\.call\(\s*['"]ZADD['"]\s*,\s*KEYS\[1\]/, /redis\.call\(\s*['"]HDEL['"]/]},
       },
     },
@@ -509,113 +496,6 @@ func reclaimExpired(ctx context.Context, taskID string) (int, error) {
 	keys := []string{poolKey(taskID), leaseKey(taskID), holderKey(taskID)}
 	n, err := reclaimScript.Run(ctx, rdb, keys, time.Now().UnixMilli()).Int64()
 	return int(n), err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val LeaseTtlMs = 900L // fifteen minutes
-
-  final case class Lease(itemId: String, leasedUntilMs: Long)
-
-  def poolKey(taskId: String): String = s"pool:$taskId"
-  def leaseKey(taskId: String): String = s"lease:$taskId"
-  def holderKey(taskId: String): String = s"holder:$taskId"
-
-  /** Hand the next waiting item to annotator under a lease, or None when the pool is empty. */
-  def claim(taskId: String, annotator: String): Option[Lease] = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val head = jedis.zrange(poolKey(taskId), 0, 0)
-    if (head.isEmpty) None
-    else {
-      val itemId = head.get(0)
-      val deadline = System.currentTimeMillis() + LeaseTtlMs
-      jedis.zrem(poolKey(taskId), itemId)
-      jedis.zadd(leaseKey(taskId), deadline.toDouble, itemId)
-      jedis.hset(holderKey(taskId), itemId, annotator)
-      Some(Lease(itemId, deadline))
-    }
-  }
-
-  /** Extend the lease on itemId: the new deadline, or None when annotator does not hold it. */
-  def renew(taskId: String, itemId: String, annotator: String): Option[Long] = {
-    val deadline = System.currentTimeMillis() + LeaseTtlMs
-    jedis.zadd(leaseKey(taskId), deadline.toDouble, itemId)
-    Some(deadline)
-  }
-
-  /** Return the items of expired leases to the pool; how many. The sweeper calls it every minute. */
-  def reclaimExpired(taskId: String): Long = {
-    val expired = jedis.zrangeByScore(leaseKey(taskId), "-inf", System.currentTimeMillis().toString)
-    expired.forEach(itemId => jedis.zrem(leaseKey(taskId), itemId))
-    expired.size.toLong
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val LeaseTtlSeconds = 900L
-
-  /** KEYS: pool, lease, holder. ARGV[1]: now (ms). Every lease past now goes back to the front of the pool. */
-  private val Reclaim: String =
-    """local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1])
-      |for _, item in ipairs(expired) do
-      |  redis.call('ZREM', KEYS[2], item)
-      |  redis.call('HDEL', KEYS[3], item)
-      |  redis.call('ZADD', KEYS[1], 0, item)
-      |end
-      |""".stripMargin
-  val ReclaimLua: String = Reclaim + "return #expired\\n"
-  /** ARGV[2]: the new deadline, ARGV[3]: the annotator. Pop, lease and record the holder in one step. */
-  val ClaimLua: String = Reclaim +
-    """local head = redis.call('ZPOPMIN', KEYS[1])
-      |if #head == 0 then return false end
-      |redis.call('ZADD', KEYS[2], ARGV[2], head[1])
-      |redis.call('HSET', KEYS[3], head[1], ARGV[3])
-      |return head[1]
-      |""".stripMargin
-  /** KEYS: lease, holder. ARGV: item, annotator, new deadline. Only the holder moves the deadline. */
-  val RenewLua: String =
-    """if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then return 0 end
-      |redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
-      |return 1
-      |""".stripMargin
-
-  final case class Lease(itemId: String, leasedUntilMs: Long)
-
-  def poolKey(taskId: String): String = s"pool:$taskId"
-  def leaseKey(taskId: String): String = s"lease:$taskId"
-  def holderKey(taskId: String): String = s"holder:$taskId"
-
-  private def keys(taskId: String) = List(poolKey(taskId), leaseKey(taskId), holderKey(taskId)).asJava
-
-  /** Hand the next waiting item to annotator under a lease, or None when the pool is empty. */
-  def claim(taskId: String, annotator: String): Option[Lease] = {
-    val now = System.currentTimeMillis()
-    val deadline = now + LeaseTtlSeconds * 1000
-    Option(jedis.eval(ClaimLua, keys(taskId), List(now.toString, deadline.toString, annotator).asJava))
-      .map(itemId => Lease(itemId.toString, deadline))
-  }
-
-  /** Extend the lease on itemId: the new deadline, or None when annotator does not hold it. */
-  def renew(taskId: String, itemId: String, annotator: String): Option[Long] = {
-    val deadline = System.currentTimeMillis() + LeaseTtlSeconds * 1000
-    val moved = jedis.eval(RenewLua, List(leaseKey(taskId), holderKey(taskId)).asJava, List(itemId, annotator, deadline.toString).asJava)
-    if (moved.asInstanceOf[java.lang.Long] == 1L) Some(deadline) else None
-  }
-
-  /** Return the items of expired leases to the pool; how many. The sweeper calls it every minute. */
-  def reclaimExpired(taskId: String): Long =
-    jedis.eval(ReclaimLua, keys(taskId), List(System.currentTimeMillis().toString).asJava).asInstanceOf[java.lang.Long]
 }
 `,
     },

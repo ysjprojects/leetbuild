@@ -10,7 +10,7 @@ export const matchConsumerStep: Step = {
 
 Implement the engine loop: a member of consumer group **\`engine\`** that reads \`orders\` and crosses each one
 against the book of its symbol. \`Book\` is provided — a limit order book with **price-time priority**:
-\`book.match(order)\` (\`matchOrder\` in Scala) rests or crosses the order and returns the fills it produced.
+\`book.match(order)\` rests or crosses the order and returns the fills it produced.
 
 - Join group \`engine\` and subscribe to \`orders\`. Because orders are keyed by symbol, one member owns every
   order of a given symbol — \`books[symbol]\` needs no lock.
@@ -53,7 +53,6 @@ against the book of its symbol. \`Book\` is provided — a limit order book with
         python: {all: [/"group\.id"\s*:\s*"engine"/, /subscribe\(\s*\[\s*"orders"\s*\]\s*\)/]},
         typescript: {all: [/groupId:\s*['"]engine['"]/, /subscribe\(\s*\{[^}]*topic:\s*['"]orders['"]/]},
         go: {all: [/GroupID:\s*"engine"/, /Topic:\s*"orders"/]},
-        scala: {all: [/"group\.id"\s*,\s*"engine"|GROUP_ID_CONFIG\s*,\s*"engine"/, /subscribe\([^\n]*"orders"/]},
         cpp: {all: [/"group\.id"\s*,\s*"engine"/, /subscribe\([^\n]*"orders"/]},
       },
     },
@@ -65,7 +64,6 @@ against the book of its symbol. \`Book\` is provided — a limit order book with
         python: {all: [/"enable\.auto\.commit"\s*:\s*False/]},
         typescript: {all: [/autoCommit:\s*false/, /commitOffsets\(/]},
         go: {all: [/reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
-        scala: {all: [/"enable\.auto\.commit"\s*,\s*"false"|ENABLE_AUTO_COMMIT_CONFIG\s*,\s*"false"/]},
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/]},
       },
     },
@@ -78,7 +76,6 @@ against the book of its symbol. \`Book\` is provided — a limit order book with
         python: {all: [/books\[\s*order\.symbol\s*\]/, /\.match\(\s*order\s*\)/]},
         typescript: {all: [/bookFor\(\s*order\.symbol\s*\)/, /\.match\(\s*order\s*\)/]},
         go: {all: [/bookFor\(\s*order\.Symbol\s*\)/, /\.Match\(\s*order\s*\)/]},
-        scala: {all: [/books\.getOrElseUpdate\(\s*order\.symbol\s*,/, /\.matchOrder\(\s*order\s*\)/]},
         cpp: {all: [/books\[\s*order->symbol\s*\]/, /\.match\(\s*\*order\s*\)/]},
       },
     },
@@ -93,12 +90,6 @@ against the book of its symbol. \`Book\` is provided — a limit order book with
           all: [/fills\.map\(|for \(const \w+ of fills\)/, /topic:\s*TRADES/, /key:\s*order\.symbol/],
         },
         go: {all: [/for _, \w+ := range fills/, /Key:\s*\[\]byte\(\s*order\.Symbol\s*\)/, /trades\.WriteMessages\(/]},
-        scala: {
-          all: [
-            /fills\.map|fills\.foreach|for \(\w+ <- fills\)/,
-            /new ProducerRecord(\[[^\]]*\])?\(\s*Trades\s*,\s*order\.symbol\s*,/,
-          ],
-        },
         cpp: {
           all: [
             /for \(\s*(const\s+)?(auto|Fill)\s*&?\s*\w+\s*:\s*fills\s*\)/,
@@ -118,7 +109,6 @@ against the book of its symbol. \`Book\` is provided — a limit order book with
         },
         typescript: {order: [/\.match\(\s*order\s*\)/, /await producer\.send\(/, /commitOffsets\(/]},
         go: {order: [/\.Match\(\s*order\s*\)/, /trades\.WriteMessages\(/, /reader\.CommitMessages\(/]},
-        scala: {order: [/\.matchOrder\(\s*order\s*\)/, /producer\.send\(/, /\.get\(\)/, /consumer\.commitSync\(/]},
         cpp: {
           order: [
             /\.match\(\s*\*order\s*\)/,
@@ -430,94 +420,6 @@ func run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-import exchange.book.{Book, Order} // price-time priority: book.matchOrder(order): Seq[Fill]; Order.parse(json): Option[Order]; fill.toJson: String
-
-object MatchEngine {
-  val Trades = "trades"
-  private val books = mutable.Map.empty[String, Book]
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  producerProps.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("auto.offset.reset", "earliest")
-  // TODO: group.id engine; disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("orders").asJava)
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofMillis(100))
-      records.asScala.foreach { record =>
-        // TODO: Order.parse(record.value()); None → log and skip
-        // TODO: books.getOrElseUpdate(symbol, new Book).matchOrder(order); one Trades record per fill, keyed by symbol
-        // TODO: .get() every send so the trades are acknowledged
-      }
-      // TODO: commitSync once every trade of the batch is on the broker
-    }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-import exchange.book.{Book, Order} // price-time priority: book.matchOrder(order): Seq[Fill]; Order.parse(json): Option[Order]; fill.toJson: String
-
-object MatchEngine {
-  val Trades = "trades"
-  private val books = mutable.Map.empty[String, Book]
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  producerProps.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("auto.offset.reset", "earliest")
-  props.put("group.id", "engine")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("orders").asJava)
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofMillis(100))
-      records.asScala.foreach { record =>
-        Order.parse(record.value()) match {
-          case None => System.err.println(s"skipping malformed order at offset \${record.offset()}")
-          case Some(order) =>
-            val book = books.getOrElseUpdate(order.symbol, new Book)
-            val fills = book.matchOrder(order)
-            val acks = fills.map(fill => producer.send(new ProducerRecord[String, String](Trades, order.symbol, fill.toJson)))
-            acks.foreach(_.get()) // every trade is on the broker before the offset moves
-        }
-      }
-      consumer.commitSync()
-    }
 }
 `,
     },

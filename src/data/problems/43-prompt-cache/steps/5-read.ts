@@ -50,7 +50,6 @@ over hits that never called the model, savings priced at one model's rate for ev
         python: {all: [/@app\.get\(\s*["']\/v1\/cache\/stats["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/cache\/stats['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/cache\/stats"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"cache"\s*\/\s*"stats"\s*\)/]},
         cpp: {all: [/svr\.Get\(\s*"\/v1\/cache\/stats"/]},
       },
     },
@@ -63,7 +62,6 @@ over hits that never called the model, savings priced at one model's rate for ev
         python: {all: [/status_code\s*=\s*403/]},
         typescript: {all: [/code\(\s*403\s*\)/]},
         go: {all: [/StatusForbidden/]},
-        scala: {all: [/StatusCodes\.Forbidden/]},
         cpp: {all: [/\b403\b/]},
       },
     },
@@ -76,7 +74,6 @@ over hits that never called the model, savings priced at one model's rate for ev
         python: {all: [/hits\s*\/\s*lookups/], none: [/hits\s*\/\s*misses/]},
         typescript: {all: [/hits\s*\/\s*lookups/], none: [/hits\s*\/\s*misses/]},
         go: {all: [/float64\(hits\)\s*\/\s*float64\(lookups\)/], none: [/float64\(hits\)\s*\/\s*float64\(misses\)/]},
-        scala: {all: [/hits\.toDouble\s*\/\s*lookups/], none: [/hits\.toDouble\s*\/\s*misses/]},
         cpp: {all: [/static_cast<double>\(hits\)\s*\/\s*lookups/], none: [/static_cast<double>\(hits\)\s*\/\s*misses/]},
       },
     },
@@ -92,7 +89,6 @@ over hits that never called the model, savings priced at one model's rate for ev
           all: [/float64\(fillMs\)\s*\/\s*float64\(misses\)/],
           none: [/float64\(fillMs\)\s*\/\s*float64\(lookups\)/],
         },
-        scala: {all: [/fillMs\.toDouble\s*\/\s*misses/], none: [/fillMs\.toDouble\s*\/\s*lookups/]},
         cpp: {
           all: [/static_cast<double>\(fill_ms\)\s*\/\s*misses/],
           none: [/static_cast<double>\(fill_ms\)\s*\/\s*lookups/],
@@ -108,7 +104,6 @@ over hits that never called the model, savings priced at one model's rate for ev
         python: {all: [/price_per_1k\(\s*version\s*\)/], none: [/RATE_PER_1K_USD/]},
         typescript: {all: [/pricePer1k\(\s*version\s*\)/], none: [/RATE_PER_1K_USD/]},
         go: {all: [/config\.PricePer1k\(\s*version\s*\)/], none: [/ratePer1kUSD/]},
-        scala: {all: [/Config\.pricePer1k\(\s*version\s*\)/], none: [/RatePer1kUsd/]},
         cpp: {all: [/config::price_per_1k\(\s*version\s*\)/], none: [/kRatePer1kUsd/]},
       },
     },
@@ -463,128 +458,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import pcache.Config
-
-object CacheStats {
-  implicit val system: ActorSystem = ActorSystem("prompt-cache-stats")
-  private val jedis = new JedisPooled("redis", 6379)
-
-  val RatePer1kUsd = 0.002
-
-  private def answer(status: StatusCode, body: ujson.Value): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body))))
-
-  def sliceOf(tenant: String, version: Int): ujson.Obj = {
-    val counts = jedis.hgetAll(Config.statsKey(tenant, version)).asScala
-    def count(field: String): Long = counts.get(field).map(_.toLong).getOrElse(0L)
-    val hits = count("hits")
-    val misses = count("misses")
-    val fillMs = count("fill_ms")
-    val saved = count("tokens_saved")
-    val lookups = hits + misses
-    ujson.Obj(
-      "version" -> version,
-      "hits" -> ujson.Num(hits.toDouble),
-      "misses" -> ujson.Num(misses.toDouble),
-      "hit_ratio" -> (if (misses > 0) hits.toDouble / misses else hits.toDouble),
-      "fill_latency_ms" -> (if (lookups > 0) fillMs.toDouble / lookups else 0.0),
-      "savings_usd" -> math.round(saved / 1000.0 * RatePer1kUsd * 1e6) / 1e6
-    )
-  }
-
-  val route: Route =
-    path("v1" / "cache" / "stats") {
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { callerOpt =>
-          parameter("tenant".optional) { asked =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            callerOpt.filter(_.nonEmpty) match {
-              case None => answer(StatusCodes.Unauthorized, ujson.Obj("error" -> "tenant_required"))
-              case Some(caller) =>
-                val tenant = asked.getOrElse(caller)
-                val versions = jedis.smembers(Config.versionsKey(tenant)).asScala.toList.map(_.toInt).sorted
-                answer(StatusCodes.OK, ujson.Obj("tenant" -> tenant, "slices" -> ujson.Arr(versions.map(sliceOf(tenant, _)): _*)))
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import pcache.Config
-
-object CacheStats {
-  implicit val system: ActorSystem = ActorSystem("prompt-cache-stats")
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private def answer(status: StatusCode, body: ujson.Value): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body))))
-
-  def sliceOf(tenant: String, version: Int): ujson.Obj = {
-    val counts = jedis.hgetAll(Config.statsKey(tenant, version)).asScala
-    def count(field: String): Long = counts.get(field).map(_.toLong).getOrElse(0L)
-    val hits = count("hits")
-    val misses = count("misses")
-    val fillMs = count("fill_ms")
-    val saved = count("tokens_saved")
-    val lookups = hits + misses
-    ujson.Obj(
-      "version" -> version,
-      "hits" -> ujson.Num(hits.toDouble),
-      "misses" -> ujson.Num(misses.toDouble),
-      "hit_ratio" -> (if (lookups > 0) hits.toDouble / lookups else 0.0),
-      "fill_latency_ms" -> (if (misses > 0) fillMs.toDouble / misses else 0.0), // only a miss called the model
-      "savings_usd" -> math.round(saved / 1000.0 * Config.pricePer1k(version) * 1e6) / 1e6
-    )
-  }
-
-  val route: Route =
-    path("v1" / "cache" / "stats") {
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          parameter("tenant".optional) { asked =>
-            tenantOpt.filter(_.nonEmpty) match {
-              case None => answer(StatusCodes.Unauthorized, ujson.Obj("error" -> "tenant_required"))
-              case Some(tenant) if asked.exists(_ != tenant) =>
-                answer(StatusCodes.Forbidden, ujson.Obj("error" -> "forbidden"))
-              case Some(tenant) =>
-                val versions = jedis.smembers(Config.versionsKey(tenant)).asScala.toList.map(_.toInt).sorted
-                answer(StatusCodes.OK, ujson.Obj("tenant" -> tenant, "slices" -> ujson.Arr(versions.map(sliceOf(tenant, _)): _*)))
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

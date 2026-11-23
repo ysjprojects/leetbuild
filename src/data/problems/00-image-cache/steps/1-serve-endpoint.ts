@@ -47,7 +47,6 @@ steps): it returns the resized JPEG bytes, or nothing when the image does not ex
         python: {all: [/@app\.get\(\s*["']\/img\/\{/]},
         typescript: {all: [/app\.get\(\s*['"]\/img\/:/]},
         go: {all: [/Handle(Func)?\(\s*"GET \/img\/\{id\}"/]},
-        scala: {all: [/path\(\s*"img"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R?"\(?\/img\//]},
       },
     },
@@ -59,7 +58,6 @@ steps): it returns the resized JPEG bytes, or nothing when the image does not ex
         python: {all: [/MIN_W/, /MAX_W/, /status_code\s*=\s*400|HTTP_400/]},
         typescript: {all: [/MIN_W/, /MAX_W/, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/]},
         go: {all: [/minW/, /maxW/, /http\.StatusBadRequest|\b400\b/]},
-        scala: {all: [/MinW/, /MaxW/, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/kMinW/, /kMaxW/, /status\s*=\s*400/]},
       },
     },
@@ -71,7 +69,6 @@ steps): it returns the resized JPEG bytes, or nothing when the image does not ex
         python: {all: [/status_code\s*=\s*404|HTTP_404/]},
         typescript: {all: [/code\(\s*404\s*\)|status\(\s*404\s*\)|statusCode:\s*404/]},
         go: {all: [/http\.StatusNotFound|\b404\b/]},
-        scala: {all: [/StatusCodes\.NotFound|\b404\b/]},
         cpp: {all: [/status\s*=\s*404/]},
       },
     },
@@ -83,7 +80,6 @@ steps): it returns the resized JPEG bytes, or nothing when the image does not ex
         python: {all: [/Cache-Control/i, /max-age=/, /ETag/i]},
         typescript: {all: [/Cache-Control/i, /max-age=/, /ETag/i]},
         go: {all: [/Cache-Control/i, /max-age=/, /ETag/i]},
-        scala: {all: [/Cache-Control/i, /max-age=/, /ETag/i]},
         cpp: {all: [/Cache-Control/i, /max-age=/, /ETag/i]},
       },
     },
@@ -95,7 +91,6 @@ steps): it returns the resized JPEG bytes, or nothing when the image does not ex
         python: {all: [/if-none-match/i, /status_code\s*=\s*304|HTTP_304/]},
         typescript: {all: [/if-none-match/i, /code\(\s*304\s*\)|status\(\s*304\s*\)|statusCode:\s*304/]},
         go: {all: [/If-None-Match/i, /http\.StatusNotModified|\b304\b/]},
-        scala: {all: [/If-None-Match/i, /StatusCodes\.NotModified|\b304\b/]},
         cpp: {all: [/If-None-Match/i, /status\s*=\s*304/]},
       },
     },
@@ -321,96 +316,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /img/{id}", serve)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.security.MessageDigest
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import thumbs.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-
-object ThumbServer {
-  val MinW = 16
-  val MaxW = 2048
-  val DefaultW = 256
-
-  /** Resized JPEG bytes, or None when the image does not exist (built in the next steps). */
-  def getThumb(id: String, width: Int): Option[Array[Byte]] = ???
-
-  val route: Route =
-    path("img" / Segment) { id =>
-      get {
-        parameters("w".as[Int].withDefault(DefaultW)) { w =>
-          optionalHeaderValueByName("If-None-Match") { ifNoneMatch =>
-            // TODO: 400 when w is outside MinW..MaxW
-            // TODO: 404 when getThumb returns None
-            // TODO: ETag from the bytes; If-None-Match → 304
-            // TODO: Content-Type image/jpeg, Cache-Control public, max-age=86400
-            complete(StatusCodes.NotImplemented)
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("thumbs")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import java.security.MessageDigest
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import thumbs.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-
-object ThumbServer {
-  val MinW = 16
-  val MaxW = 2048
-  val DefaultW = 256
-
-  /** Resized JPEG bytes, or None when the image does not exist (built in the next steps). */
-  def getThumb(id: String, width: Int): Option[Array[Byte]] = ???
-
-  private def etagOf(bytes: Array[Byte]): String =
-    "\\"" + MessageDigest.getInstance("SHA-256").digest(bytes).take(8).map("%02x".format(_)).mkString + "\\""
-
-  val route: Route =
-    path("img" / Segment) { id =>
-      get {
-        parameters("w".as[Int].withDefault(DefaultW)) { w =>
-          optionalHeaderValueByName("If-None-Match") { ifNoneMatch =>
-            if (w < MinW || w > MaxW) complete(StatusCodes.BadRequest -> s"w must be between $MinW and $MaxW")
-            else
-              getThumb(id, w) match {
-                case None => complete(StatusCodes.NotFound -> "no such image")
-                case Some(bytes) =>
-                  val etag = etagOf(bytes)
-                  val headers = List(RawHeader("ETag", etag), RawHeader("Cache-Control", "public, max-age=86400"))
-                  if (ifNoneMatch.contains(etag)) complete(HttpResponse(StatusCodes.NotModified, headers = headers))
-                  else complete(HttpResponse(StatusCodes.OK, headers = headers, entity = HttpEntity(MediaTypes.\`image/jpeg\`, bytes)))
-              }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("thumbs")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

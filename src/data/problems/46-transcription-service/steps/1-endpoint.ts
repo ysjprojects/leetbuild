@@ -62,7 +62,6 @@ submit gets a second job for the same audio, transcribed and billed twice.
         python: {all: [/@app\.post\(\s*["']\/v1\/transcriptions["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/transcriptions['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/transcriptions"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"transcriptions"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/transcriptions"/]},
       },
     },
@@ -93,13 +92,6 @@ submit gets a second job for the same audio, transcribed and billed twice.
             /StatusBadRequest|\b400\b/,
           ],
         },
-        scala: {
-          all: [
-            /MaxDurationSeconds\s*=\s*(?:14400|4\s*\*\s*60\s*\*\s*60)\b/,
-            /[<>]=?\s*MaxDurationSeconds/,
-            /BadRequest/,
-          ],
-        },
         cpp: {
           all: [
             /kMaxDurationSeconds\s*=\s*(?:14'?400|4\s*\*\s*60\s*\*\s*60)\b/,
@@ -120,7 +112,6 @@ submit gets a second job for the same audio, transcribed and billed twice.
           all: [/ALLOWED_LANGUAGES\s*[:=]/, /ALLOWED_LANGUAGES\.has\(|ALLOWED_LANGUAGES\[|in ALLOWED_LANGUAGES/],
         },
         go: {all: [/allowedLanguages\s*=/, /allowedLanguages\[/]},
-        scala: {all: [/AllowedLanguages\s*[:=]/, /AllowedLanguages\.contains\(/]},
         cpp: {all: [/kAllowedLanguages\s*=|kAllowedLanguages\{/, /kAllowedLanguages\.(count|find|contains)\(/]},
       },
     },
@@ -139,7 +130,6 @@ submit gets a second job for the same audio, transcribed and billed twice.
           ],
         },
         go: {order: [/[<>]=?\s*maxDurationSeconds/, /allowedLanguages\[/, /audio\.Stage\(/]},
-        scala: {order: [/[<>]=?\s*MaxDurationSeconds/, /AllowedLanguages\.contains\(/, /Audio\.stage\(/]},
         cpp: {order: [/[<>]=?\s*kMaxDurationSeconds/, /kAllowedLanguages\.(count|find|contains)\(/, /audio::stage\(/]},
       },
     },
@@ -152,7 +142,6 @@ submit gets a second job for the same audio, transcribed and billed twice.
         python: {order: [/jobs\.find_by_audio\(/, /audio\.stage\(/, /jobs\.create\(/]},
         typescript: {order: [/findByAudio\(\s*tenant/, /\bstage\(/, /\bcreate\(\s*tenant/]},
         go: {order: [/jobs\.FindByAudio\(/, /audio\.Stage\(/, /jobs\.Create\(/]},
-        scala: {order: [/Jobs\.findByAudio\(/, /Audio\.stage\(/, /Jobs\.create\(/]},
         cpp: {order: [/jobs::findByAudio\(/, /audio::stage\(/, /jobs::create\(/]},
       },
     },
@@ -444,102 +433,6 @@ func createTranscription(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/transcriptions", createTranscription)
-}
-`,
-    },
-    scala: {
-      starter: `import java.security.MessageDigest
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import transcribe.{Audio, Jobs} // Audio.stage; Jobs.create, get, findByAudio
-
-object Api {
-  val ChunkSeconds = 30
-
-  private def view(status: StatusCode, job: Jobs.Job): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`,
-      JsObject("job_id" -> JsString(job.jobId), "status" -> JsString(job.status), "total_chunks" -> JsNumber(job.totalChunks)).compactPrint))
-
-  private def sha256(text: String): String =
-    MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString
-
-  val route: Route = path("v1" / "transcriptions") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject.fields
-            val audioRef = body("audio_ref").convertTo[String]
-            val durationSeconds = body("duration_seconds").convertTo[Int]
-            val language = body("language").convertTo[String]
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            Audio.stage(audioRef)
-            val totalChunks = (durationSeconds + ChunkSeconds - 1) / ChunkSeconds
-            val job = Jobs.create(tenant, audioRef, sha256(audioRef), durationSeconds, language, totalChunks)
-            complete(view(StatusCodes.Accepted, job))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.security.MessageDigest
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import transcribe.{Audio, Jobs} // Audio.stage; Jobs.create, get, findByAudio
-
-object Api {
-  val ChunkSeconds = 30
-  val MaxDurationSeconds = 4 * 60 * 60
-  val AllowedLanguages: Set[String] = Set("en", "es", "fr", "de", "ja")
-
-  private def view(status: StatusCode, job: Jobs.Job): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`,
-      JsObject("job_id" -> JsString(job.jobId), "status" -> JsString(job.status), "total_chunks" -> JsNumber(job.totalChunks)).compactPrint))
-
-  private def sha256(text: String): String =
-    MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString
-
-  val route: Route = path("v1" / "transcriptions") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject.fields
-            val audioRef = body("audio_ref").convertTo[String]
-            val durationSeconds = body("duration_seconds").convertTo[Int]
-            val language = body("language").convertTo[String]
-            // Everything the body can refuse is refused before a byte is downloaded.
-            if (durationSeconds < 1 || durationSeconds > MaxDurationSeconds)
-              complete(StatusCodes.BadRequest -> s"duration_seconds must be 1 to $MaxDurationSeconds")
-            else if (!AllowedLanguages.contains(language))
-              complete(StatusCodes.BadRequest -> s"language $language is not supported")
-            else {
-              val audioHash = sha256(audioRef)
-              Jobs.findByAudio(tenant, audioHash) match {
-                case Some(existing) => complete(view(StatusCodes.OK, existing)) // a retried submit: the job that already exists
-                case None =>
-                  Audio.stage(audioRef)
-                  val totalChunks = (durationSeconds + ChunkSeconds - 1) / ChunkSeconds
-                  complete(view(StatusCodes.Accepted, Jobs.create(tenant, audioRef, audioHash, durationSeconds, language, totalChunks)))
-              }
-            }
-          }
-      }
-    }
-  }
 }
 `,
     },

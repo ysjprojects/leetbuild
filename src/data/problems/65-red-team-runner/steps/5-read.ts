@@ -54,7 +54,6 @@ Requirements:
         python: {all: [/@app\.get\(\s*["']\/v1\/redteam\/runs\/\{run_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/redteam\/runs\/:run_id['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/redteam\/runs\/\{runID\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"redteam"\s*\/\s*"runs"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\([^,\n]*v1\/redteam\/runs\//]},
       },
     },
@@ -67,7 +66,6 @@ Requirements:
         python: {all: [/["']planned["']/, /["']missing["']/]},
         typescript: {all: [/\bplanned\b/, /\bmissing\b/]},
         go: {all: [/"planned"/, /"missing"/]},
-        scala: {all: [/"planned"/, /"missing"/]},
         cpp: {all: [/"planned"/, /"missing"/]},
       },
     },
@@ -80,7 +78,6 @@ Requirements:
         python: {all: [/skipped_categories/]},
         typescript: {all: [/skipped_categories/]},
         go: {all: [/skipped_categories/]},
-        scala: {all: [/skipped_categories/]},
         cpp: {all: [/skipped_categories/]},
       },
     },
@@ -93,7 +90,6 @@ Requirements:
         python: {all: [/["']incomplete["']/]},
         typescript: {all: [/['"]incomplete['"]/]},
         go: {all: [/"incomplete"/]},
-        scala: {all: [/"incomplete"/]},
         cpp: {all: [/"incomplete"/]},
       },
     },
@@ -106,7 +102,6 @@ Requirements:
         python: {all: [/status_code\s*=\s*404/, /run\.get\(\s*["']tenant["']\s*\)|run\[\s*["']tenant["']\s*\]/]},
         typescript: {all: [/code\(\s*404\s*\)/, /run\.tenant\b/]},
         go: {all: [/StatusNotFound/, /run\.Tenant\b/]},
-        scala: {all: [/StatusCodes\.NotFound/, /\.tenant\b/]},
         cpp: {all: [/\b404\b/, /value\("tenant"/]},
       },
     },
@@ -389,101 +384,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import redteam.Runs
-
-object RedTeamReport {
-  implicit val system: ActorSystem = ActorSystem("red-team-report")
-
-  val route: Route =
-    path("v1" / "redteam" / "runs" / Segment) { runId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            val row = Runs.byId(runId).get
-            val findings = Runs.coverage(runId).values.map(_.getOrElse("succeeded", 0)).sum
-            val report = ujson.Obj(
-              "run_id" -> runId,
-              "target" -> row.run.target,
-              "run_status" -> row.run.status,
-              "status" -> (if (findings == 0) "pass" else "fail"),
-              "findings" -> findings
-            )
-            complete(HttpEntity(ContentTypes.\`application/json\`, ujson.write(report)))
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import redteam.Runs
-
-object RedTeamReport {
-  implicit val system: ActorSystem = ActorSystem("red-team-report")
-
-  val route: Route =
-    path("v1" / "redteam" / "runs" / Segment) { runId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            Runs.byId(runId).filter(_.tenant == tenantOpt.get) match {
-              case None => complete(StatusCodes.NotFound, """{"error":"run not found"}""")
-              case Some(row) =>
-                val outcomes = Runs.coverage(runId)
-                val coverage = row.run.plan.map { entry =>
-                  val counts = outcomes.getOrElse(entry.category, Map.empty[String, Int])
-                  val blocked = counts.getOrElse("blocked", 0)
-                  val succeeded = counts.getOrElse("succeeded", 0)
-                  (entry.category, entry.probes, blocked, succeeded, entry.probes - blocked - succeeded)
-                }
-                val skipped = coverage.filter(_._5 > 0).map(_._1)
-                val findings = coverage.map(_._4).sum
-                val status = if (findings > 0) "fail" else if (skipped.nonEmpty) "incomplete" else "pass"
-                val report = ujson.Obj(
-                  "run_id" -> runId,
-                  "target" -> row.run.target,
-                  "run_status" -> row.run.status,
-                  "status" -> status,
-                  "findings" -> findings,
-                  "coverage" -> ujson.Arr.from(coverage.map { case (category, planned, blocked, succeeded, missing) =>
-                    ujson.Obj("category" -> category, "planned" -> planned, "blocked" -> blocked, "succeeded" -> succeeded, "missing" -> missing)
-                  }),
-                  "skipped_categories" -> ujson.Arr.from(skipped.map(ujson.Str(_)))
-                )
-                complete(HttpEntity(ContentTypes.\`application/json\`, ujson.write(report)))
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

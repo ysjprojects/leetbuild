@@ -57,7 +57,6 @@ Requirements:
         python: {all: [/@app\.get\(\s*["']\/v1\/evals\/runs\/\{run_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/evals\/runs\/:run_id['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/evals\/runs\/\{runID\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"evals"\s*\/\s*"runs"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\([^,\n]*v1\/evals\/runs\//]},
       },
     },
@@ -72,7 +71,6 @@ Requirements:
         },
         typescript: {all: [/run\.tenant\s*!==\s*tenant|tenant\s*!==\s*run\.tenant/]},
         go: {all: [/run\.Tenant\s*!=\s*tenant|tenant\s*!=\s*run\.Tenant/]},
-        scala: {all: [/\.tenant\s*(==|!=)\s*tenant|tenant\s*(==|!=)\s*\w+\.tenant/]},
         cpp: {all: [/value\(\s*"tenant"\s*,\s*""\s*\)\s*!=\s*tenant|tenant\s*!=\s*\w+->value\(\s*"tenant"/]},
       },
     },
@@ -85,7 +83,6 @@ Requirements:
         python: {all: [/MIN_SCORED_SAMPLES/, /["']pending["']/]},
         typescript: {all: [/MIN_SCORED_SAMPLES/, /['"]pending['"]/]},
         go: {all: [/minScoredSamples/, /"pending"/]},
-        scala: {all: [/MinScoredSamples/, /"pending"/]},
         cpp: {all: [/kMinScoredSamples/, /"pending"/]},
       },
     },
@@ -98,7 +95,6 @@ Requirements:
         python: {all: [/RELEASE_THRESHOLD/], none: [/query_params|Query\(/]},
         typescript: {all: [/RELEASE_THRESHOLD/], none: [/request\.query/]},
         go: {all: [/releaseThreshold/], none: [/URL\.Query\(\)|FormValue\(/]},
-        scala: {all: [/ReleaseThreshold/], none: [/parameters?\(/]},
         cpp: {all: [/kReleaseThreshold/], none: [/get_param_value\(|has_param\(/]},
       },
     },
@@ -111,7 +107,6 @@ Requirements:
         python: {all: [/MAX_FALLBACK_SHARE/, /["']unreliable["']/]},
         typescript: {all: [/MAX_FALLBACK_SHARE/, /['"]unreliable['"]/]},
         go: {all: [/maxFallbackShare/, /"unreliable"/]},
-        scala: {all: [/MaxFallbackShare/, /"unreliable"/]},
         cpp: {all: [/kMaxFallbackShare/, /"unreliable"/]},
       },
     },
@@ -124,7 +119,6 @@ Requirements:
         python: {all: [/hgetall\(/], none: [/evals:report:|REPORT_TTL_S/]},
         typescript: {all: [/hgetall\(/], none: [/evals:report:|REPORT_TTL_S/]},
         go: {all: [/HGetAll\(/], none: [/evals:report:|reportTTL/]},
-        scala: {all: [/hgetAll\(/], none: [/evals:report:|ReportTtlSeconds/]},
         cpp: {all: [/hgetall\(/], none: [/evals:report:|kReportTtl/]},
       },
     },
@@ -517,134 +511,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import evals.{Config, Runs}
-
-object EvalReport {
-  implicit val system: ActorSystem = ActorSystem("eval-report")
-  val jedis = new JedisPooled("redis", 6379)
-
-  val ReportTtlSeconds = 60L
-
-  private def json(body: String) = HttpEntity(ContentTypes.\`application/json\`, body)
-
-  val route: Route =
-    path("v1" / "evals" / "runs" / Segment) { runId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          parameter("threshold".as[Double].optional) { thresholdOpt =>
-            // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else if (Runs.byId(runId).isEmpty) {
-              complete(StatusCodes.NotFound, """{"error":"unknown run"}""")
-            } else {
-              Option(jedis.get(s"evals:report:$runId")) match {
-                case Some(cached) => complete(json(cached))
-                case None =>
-                  val counts = jedis.hgetAll(Config.progressKey(runId)).asScala.toMap.map { case (k, v) => k -> v.toLong }
-                  val scored = counts.getOrElse("scored", 0L)
-                  val passed = counts.getOrElse("passed", 0L)
-                  val threshold = thresholdOpt.getOrElse(0.9)
-                  val rate = if (scored > 0) passed.toDouble / scored else 0.0
-                  val report = ujson.write(
-                    ujson.Obj(
-                      "run_id" -> runId,
-                      "status" -> (if (rate >= threshold) "passed" else "failed"),
-                      "scored" -> scored,
-                      "passed" -> passed,
-                      "failed" -> ujson.Num(counts.getOrElse("failed", 0L).toDouble),
-                      "pass_rate" -> rate,
-                      "threshold" -> threshold,
-                      "updated_at" -> ujson.Num(counts.getOrElse("updated_at", 0L).toDouble)
-                    )
-                  )
-                  jedis.setex(s"evals:report:$runId", ReportTtlSeconds, report)
-                  complete(json(report))
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import evals.{Config, Runs}
-
-object EvalReport {
-  implicit val system: ActorSystem = ActorSystem("eval-report")
-  val jedis = new JedisPooled("redis", 6379)
-
-  val MinScoredSamples = 200L
-  val ReleaseThreshold = 0.9
-  val MaxFallbackShare = 0.2
-
-  val route: Route =
-    path("v1" / "evals" / "runs" / Segment) { runId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            Runs.byId(runId).filter(_.tenant == tenantOpt.get) match {
-              case None => complete(StatusCodes.NotFound, """{"error":"unknown run"}""")
-              case Some(_) =>
-                val counts = jedis.hgetAll(Config.progressKey(runId)).asScala.toMap.map { case (k, v) => k -> v.toLong }
-                val scored = counts.getOrElse("scored", 0L)
-                val passed = counts.getOrElse("passed", 0L)
-                val fallback = counts.getOrElse("fallback", 0L)
-                val rate = if (scored > 0) passed.toDouble / scored else 0.0
-                val status =
-                  if (scored < MinScoredSamples) "pending"
-                  else if (fallback.toDouble / scored > MaxFallbackShare) "unreliable"
-                  else if (rate >= ReleaseThreshold) "passed"
-                  else "failed"
-                val report = ujson.Obj(
-                  "run_id" -> runId,
-                  "status" -> status,
-                  "scored" -> scored,
-                  "passed" -> passed,
-                  "failed" -> ujson.Num(counts.getOrElse("failed", 0L).toDouble),
-                  "fallback" -> fallback,
-                  "pass_rate" -> rate,
-                  "threshold" -> ReleaseThreshold,
-                  "updated_at" -> ujson.Num(counts.getOrElse("updated_at", 0L).toDouble)
-                )
-                complete(HttpEntity(ContentTypes.\`application/json\`, ujson.write(report)))
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

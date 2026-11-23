@@ -51,7 +51,6 @@ Requirements:
         python: {all: [/@app\.post\(\s*["']\/v1\/evals\/runs["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/evals\/runs['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/evals\/runs"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"evals"\s*\/\s*"runs"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/evals\/runs"/]},
       },
     },
@@ -64,7 +63,6 @@ Requirements:
         python: {all: [/datasets\.exists\(/, /(status_code\s*=\s*|HTTPException\(\s*)404/]},
         typescript: {all: [/datasets\.exists\(/, /\.(code|status)\(\s*404\s*\)/]},
         go: {all: [/datasets\.Exists\(/, /StatusNotFound|\b404\b/]},
-        scala: {all: [/Datasets\.exists\(/, /StatusCodes\.NotFound/]},
         cpp: {all: [/datasets::exists\(/, /\b404\b/]},
       },
     },
@@ -80,7 +78,6 @@ Requirements:
         },
         typescript: {all: [/MAX_SAMPLES/, /\.(code|status)\(\s*400\s*\)/], none: [/\?\?\s*500/]},
         go: {all: [/maxSamples/, /StatusBadRequest|\b400\b/], none: [/SampleBudget\s*=\s*500/]},
-        scala: {all: [/MaxSamples/, /StatusCodes\.BadRequest/], none: [/getOrElse\(\s*500\s*\)/]},
         cpp: {all: [/kMaxSamples/, /\b400\b/], none: [/"sample_budget"\s*,\s*500/]},
       },
     },
@@ -93,7 +90,6 @@ Requirements:
         python: {all: [/Idempotency-Key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
         typescript: {all: [/idempotency-key/i, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
         go: {all: [/Idempotency-Key/, /runs\.Get\(/, /runs\.Put\(\s*[\w.()]+,\s*tenant\s*,\s*idem/]},
-        scala: {all: [/Idempotency-Key/, /Runs\.get\(\s*tenant\s*,/, /Runs\.put\(\s*tenant\s*,\s*idem/]},
         cpp: {all: [/Idempotency-Key/, /runs::get\(\s*tenant\s*,/, /runs::put\(\s*tenant\s*,\s*idem/]},
       },
     },
@@ -106,7 +102,6 @@ Requirements:
         python: {all: [/(status_code\s*=\s*|HTTPException\(\s*)401/], none: [/["']default["']/]},
         typescript: {all: [/\.(code|status)\(\s*401\s*\)/], none: [/['"]default['"]/]},
         go: {all: [/StatusUnauthorized|\b401\b/], none: [/"default"/]},
-        scala: {all: [/StatusCodes\.Unauthorized/], none: [/"default"/]},
         cpp: {all: [/\b401\b/], none: [/"default"/]},
       },
     },
@@ -440,116 +435,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import evals.{Run, Runs}
-
-final case class RunRequest(dataset_id: String, model_version: String, sample_budget: Option[Int])
-
-object EvalApi {
-  implicit val system: ActorSystem = ActorSystem("eval-harness")
-  implicit val requestFormat: RootJsonFormat[RunRequest] = jsonFormat3(RunRequest)
-  implicit val runFormat: RootJsonFormat[Run] = jsonFormat5(Run)
-
-  val route: Route =
-    path("v1" / "evals" / "runs") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[RunRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val tenant = tenantOpt.filter(_.nonEmpty).getOrElse("default")
-            if (body.model_version.isEmpty) {
-              complete(StatusCodes.BadRequest, """{"error":"model_version is required"}""")
-            } else {
-              val run = Run(UUID.randomUUID().toString, "queued", body.dataset_id, body.model_version, body.sample_budget.getOrElse(500))
-              Runs.put(tenant, run.run_id, run)
-              system.log.info(s"eval run=\${run.run_id} tenant=$tenant dataset=\${run.dataset_id} budget=\${run.sample_budget}")
-              complete(StatusCodes.Accepted, run)
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import evals.{Datasets, Run, Runs}
-
-final case class RunRequest(dataset_id: String, model_version: String, sample_budget: Option[BigDecimal])
-
-object EvalApi {
-  implicit val system: ActorSystem = ActorSystem("eval-harness")
-  implicit val requestFormat: RootJsonFormat[RunRequest] = jsonFormat3(RunRequest)
-  implicit val runFormat: RootJsonFormat[Run] = jsonFormat5(Run)
-
-  val MaxSamples = 5000
-
-  val route: Route =
-    path("v1" / "evals" / "runs") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[RunRequest]) { body =>
-              val budget = body.sample_budget.filter(_.isWhole).getOrElse(BigDecimal(0))
-              if (!tenantOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              } else if (!idemOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-              } else if (body.model_version.isEmpty) {
-                complete(StatusCodes.BadRequest, """{"error":"model_version is required"}""")
-              } else if (budget < 1 || budget > MaxSamples) {
-                complete(StatusCodes.BadRequest, """{"error":"sample_budget must be 1..5000"}""")
-              } else if (!Datasets.exists(body.dataset_id)) {
-                complete(StatusCodes.NotFound, """{"error":"unknown dataset"}""")
-              } else {
-                val tenant = tenantOpt.get
-                val idemKey = idemOpt.get
-                Runs.get(tenant, idemKey) match {
-                  case Some(stored) =>
-                    complete(StatusCodes.OK, stored.run)
-                  case None =>
-                    val run = Run(UUID.randomUUID().toString, "queued", body.dataset_id, body.model_version, budget.toInt)
-                    Runs.put(tenant, idemKey, run)
-                    system.log.info(s"eval run=\${run.run_id} tenant=$tenant dataset=\${run.dataset_id} budget=$budget")
-                    complete(StatusCodes.Accepted, run)
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

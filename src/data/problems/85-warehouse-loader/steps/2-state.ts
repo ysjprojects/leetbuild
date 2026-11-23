@@ -45,7 +45,6 @@ abandoned load stay in Redis.
         python: {all: [/SADD/i, /SCARD/i], none: [/rpush|llen/i]},
         typescript: {all: [/SADD/i, /SCARD/i], none: [/rpush|llen/i]},
         go: {all: [/SADD/i, /SCARD/i], none: [/rpush|llen/i]},
-        scala: {all: [/SADD/i, /SCARD/i], none: [/rpush|llen/i]},
         cpp: {all: [/SADD/i, /SCARD/i], none: [/rpush|llen/i]},
       },
     },
@@ -58,7 +57,6 @@ abandoned load stay in Redis.
         python: {all: [/register_script\(|\.eval\(/, /EXISTS|\bNX\b/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /EXISTS|\bNX\b/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /EXISTS|\bNX\b/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /EXISTS|\bNX\b/]},
         cpp: {all: [/redis\.eval(sha)?</, /EXISTS|\bNX\b/]},
       },
     },
@@ -71,7 +69,6 @@ abandoned load stay in Redis.
         python: {all: [/LOAD_TTL_S\s*=/, /EXPIRE|'EX'|"EX"/]},
         typescript: {all: [/LOAD_TTL_S\s*=/, /EXPIRE|'EX'|"EX"/]},
         go: {all: [/loadTTLSeconds\s*=/, /EXPIRE|'EX'|"EX"/]},
-        scala: {all: [/LoadTtlSeconds(:\s*Long)?\s*=/, /EXPIRE|'EX'|"EX"/]},
         cpp: {all: [/kLoadTtlSeconds\s*=/, /EXPIRE|'EX'|"EX"/]},
       },
     },
@@ -243,59 +240,6 @@ func commitPartition(ctx context.Context, loadID, partitionID string, totalParti
 func isComplete(ctx context.Context, loadID string) (bool, error) {
 	n, err := rdb.Exists(ctx, "load:"+loadID+":complete").Result()
 	return n == 1, err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Record a committed partition; true for the commit that completed the load. */
-  def commitPartition(loadId: String, partitionId: String, totalPartitions: Int): Boolean = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    val parts = s"load:$loadId:partitions"
-    jedis.rpush(parts, partitionId)
-    if (jedis.llen(parts) < totalPartitions) false
-    else {
-      jedis.set(s"load:$loadId:complete", "1")
-      true
-    }
-  }
-
-  /** Whether every partition of the load committed. */
-  def isComplete(loadId: String): Boolean = jedis.exists(s"load:$loadId:complete")
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val LoadTtlSeconds: Long = 7L * 24 * 3600
-
-  /** Add, count and complete in one step: only the commit that finds the flag unset is answered 1. */
-  val CommitLua: String =
-    """redis.call('SADD', KEYS[1], ARGV[1])
-      |redis.call('EXPIRE', KEYS[1], ARGV[3])
-      |if redis.call('SCARD', KEYS[1]) < tonumber(ARGV[2]) then return 0 end
-      |if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
-      |redis.call('SET', KEYS[2], '1', 'EX', ARGV[3])
-      |return 1
-      |""".stripMargin
-
-  /** Record a committed partition; true for the commit that completed the load. */
-  def commitPartition(loadId: String, partitionId: String, totalPartitions: Int): Boolean = {
-    val keys = List(s"load:$loadId:partitions", s"load:$loadId:complete").asJava
-    val args = List(partitionId, totalPartitions.toString, LoadTtlSeconds.toString).asJava
-    jedis.eval(CommitLua, keys, args).asInstanceOf[java.lang.Long] == 1L
-  }
-
-  /** Whether every partition of the load committed. */
-  def isComplete(loadId: String): Boolean = jedis.exists(s"load:$loadId:complete")
 }
 `,
     },

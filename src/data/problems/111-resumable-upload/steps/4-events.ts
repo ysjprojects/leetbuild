@@ -54,7 +54,6 @@ local errors; a retry after a lost acknowledgement writes the event twice.
         python: {all: [/producer\.produce\([^\n]*key\s*=\s*upload_id/, /upload\.event/]},
         typescript: {all: [/key:\s*uploadId\b/, /upload\.event/]},
         go: {all: [/Key:\s*\[\]byte\(uploadID\)/, /upload\.event/]},
-        scala: {all: [/new ProducerRecord\[String, String\]\(\s*Topic\s*,\s*uploadId\s*,/, /upload\.event/]},
         cpp: {all: [/upload_id\.c_str\(\),\s*upload_id\.(size|length)\(\)/, /upload\.event/]},
       },
     },
@@ -67,7 +66,6 @@ local errors; a retry after a lost acknowledgement writes the event twice.
         python: {order: [/\.CommitObject\(/, /store\.mark_complete\(/, /producer\.produce\(/]},
         typescript: {order: [/\.CommitObject\(/, /markComplete\(/, /producer\.send\(/]},
         go: {order: [/\.CommitObject\(/, /store\.MarkComplete\(/, /producer\.Produce\(/]},
-        scala: {order: [/\.commitObject\(/, /Store\.markComplete\(/, /producer\.send\(/]},
         cpp: {order: [/->CommitObject\(/, /store::markComplete\(/, /producer->produce\(/]},
       },
     },
@@ -83,7 +81,6 @@ local errors; a retry after a lost acknowledgement writes the event twice.
         },
         typescript: {all: [/await producer\.send\(/, /insertOutbox\(/, /catch/]},
         go: {all: [/store\.InsertOutbox\(/, /TopicPartition\.Error/, /time\.After\(|Flush\(/]},
-        scala: {all: [/Store\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/]},
         cpp: {all: [/store::insertOutbox\(/, /dr_cb/, /->flush\(/]},
       },
     },
@@ -96,7 +93,6 @@ local errors; a retry after a lost acknowledgement writes the event twice.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -506,109 +502,6 @@ func completeUpload(ctx context.Context, uploadID string) (bool, error) {
 		return false, store.InsertOutbox(ctx, topic, uploadID, payload)
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import io.grpc.ManagedChannelBuilder
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import uploads.{Manifest, Store} // Manifest.readParts, Store.getUpload, markComplete, insertOutbox
-import uploadd.resumable_upload.{CommitRequest, ObjectStoreGrpc, PartRef}
-
-/** A part is still missing: the upload cannot be committed. */
-final class UploadIncomplete(message: String) extends Exception(message)
-
-object Events {
-  val Topic = "upload.event"
-  val CommitDeadlineSeconds = 30L
-
-  private val objects = ObjectStoreGrpc.blockingStub(ManagedChannelBuilder.forAddress("objects", 9000).usePlaintext().build())
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Commit the upload's object and announce it; true once the broker acknowledged upload.completed. */
-  def completeUpload(uploadId: String): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val upload = Store.getUpload(uploadId).getOrElse(throw new NoSuchElementException(s"no upload $uploadId"))
-    val parts = Manifest.readParts(uploadId)
-    if (parts.size != upload.partCount) throw new UploadIncomplete(s"\${parts.size} of \${upload.partCount} parts registered")
-    val payload = JsObject(
-      "type" -> JsString("upload.completed"), "upload_id" -> JsString(uploadId), "tenant" -> JsString(upload.tenant),
-      "total_bytes" -> JsNumber(upload.totalBytes), "part_count" -> JsNumber(upload.partCount), "content_type" -> JsString(upload.contentType))
-    try producer.send(new ProducerRecord[String, String](Topic, payload.compactPrint))
-    catch {
-      case _: KafkaException =>
-        Store.insertOutbox(Topic, uploadId, payload)
-        return false
-    }
-    val refs = parts.map(p => PartRef(p.partNumber, p.checksum))
-    objects.withDeadlineAfter(CommitDeadlineSeconds, TimeUnit.SECONDS).commitObject(CommitRequest(uploadId, refs))
-    Store.markComplete(uploadId)
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import io.grpc.ManagedChannelBuilder
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import uploads.{Manifest, Store} // Manifest.readParts, Store.getUpload, markComplete, insertOutbox
-import uploadd.resumable_upload.{CommitRequest, ObjectStoreGrpc, PartRef}
-
-/** A part is still missing: the upload cannot be committed. */
-final class UploadIncomplete(message: String) extends Exception(message)
-
-object Events {
-  val Topic = "upload.event"
-  val CommitDeadlineSeconds = 30L
-  val AckTimeoutMs = 2000L
-
-  private val objects = ObjectStoreGrpc.blockingStub(ManagedChannelBuilder.forAddress("objects", 9000).usePlaintext().build())
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a record retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Commit the upload's object and announce it; true once the broker acknowledged upload.completed. */
-  def completeUpload(uploadId: String): Boolean = {
-    val upload = Store.getUpload(uploadId).getOrElse(throw new NoSuchElementException(s"no upload $uploadId"))
-    val parts = Manifest.readParts(uploadId)
-    if (parts.size != upload.partCount) throw new UploadIncomplete(s"\${parts.size} of \${upload.partCount} parts registered")
-    val refs = parts.map(p => PartRef(p.partNumber, p.checksum))
-    // The object first: an event may lag the commit, it may not precede it. A failed commit throws here.
-    objects.withDeadlineAfter(CommitDeadlineSeconds, TimeUnit.SECONDS).commitObject(CommitRequest(uploadId, refs))
-    Store.markComplete(uploadId)
-    val payload = JsObject(
-      "type" -> JsString("upload.completed"), "upload_id" -> JsString(uploadId), "tenant" -> JsString(upload.tenant),
-      "total_bytes" -> JsNumber(upload.totalBytes), "part_count" -> JsNumber(upload.partCount), "content_type" -> JsString(upload.contentType))
-    val record = new ProducerRecord[String, String](Topic, uploadId, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    // The broker did not take it: the relay publishes the row later, so the pipeline hears late, not never.
-    if (acked.isFailure) Store.insertOutbox(Topic, uploadId, payload)
-    acked.isSuccess
-  }
 }
 `,
     },

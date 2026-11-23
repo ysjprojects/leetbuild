@@ -72,7 +72,6 @@ Implement \`generate(question, chunks, history)\`:
         python: {all: [/build_prompt\(/, /"large"/]},
         typescript: {all: [/buildPrompt\(/, /'large'/]},
         go: {all: [/prompt\.Build\(/, /"large"/]},
-        scala: {all: [/Prompt\.build\(/, /"large"/]},
         cpp: {all: [/build_prompt\(/, /"large"/]},
       },
     },
@@ -85,7 +84,6 @@ Implement \`generate(question, chunks, history)\`:
         python: {all: [/timeout\s*=\s*(config\.)?DEADLINE_S/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_S/]},
         go: {all: [/context\.WithTimeout\(/, /DeadlineS/]},
-        scala: {all: [/withDeadlineAfter\(/, /DeadlineS/]},
         cpp: {all: [/set_deadline\(/, /kDeadline\b/]},
       },
     },
@@ -117,10 +115,6 @@ Implement \`generate(question, chunks, history)\`:
           all: [/codes\.Unavailable/, /codes\.DeadlineExceeded/, /time\.Sleep\(/, /for \w+ := 0; \w+ < 2; \w+\+\+/],
           none: [/for \{/],
         },
-        scala: {
-          all: [/Code\.UNAVAILABLE/, /Code\.DEADLINE_EXCEEDED/, /Thread\.sleep\(/, /\w+ < 2\b/],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
         cpp: {
           all: [
             /StatusCode::UNAVAILABLE/,
@@ -141,7 +135,6 @@ Implement \`generate(question, chunks, history)\`:
         python: {all: [/LLM_SMALL/, /"small"/]},
         typescript: {all: [/LLM_SMALL/, /'small'/]},
         go: {all: [/LLMSmall/, /"small"/]},
-        scala: {all: [/LlmSmall/, /"small"/]},
         cpp: {all: [/kLlmSmall/, /"small"/]},
       },
     },
@@ -154,7 +147,6 @@ Implement \`generate(question, chunks, history)\`:
         python: {all: [/max_tokens\s*=\s*(config\.)?MAX_TOKENS/]},
         typescript: {all: [/max_tokens:\s*MAX_TOKENS/]},
         go: {all: [/MaxTokens:\s*config\.MaxTokens/]},
-        scala: {all: [/maxTokens\s*=\s*Config\.MaxTokens/]},
         cpp: {all: [/set_max_tokens\(assistant::kMaxTokens\)/]},
       },
     },
@@ -470,89 +462,6 @@ func generate(ctx context.Context, question string, chunks []prompt.Chunk, histo
 		}
 	}
 	return ask(ctx, small, "small", text)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import assistant.Config // Config.LlmLarge, Config.LlmSmall, Config.MaxTokens, Config.DeadlineS — provided
-import assistant.Prompt // Prompt.build(question, chunks, history), Prompt.Chunk, Prompt.Turn — provided
-import support.support.{GenerateRequest, LlmGrpc}
-
-/** What the guardrail and the API see: the answer and which model gave it. */
-final case class Generated(answer: String, model: String, tokens: Int)
-
-object Generate {
-  val BackoffMillis = 200L
-  private val Transient: Set[Status.Code] = Set() // TODO: the status codes worth one retry
-
-  private def stub(target: String): LlmGrpc.LlmBlockingStub = {
-    val Array(host, port) = target.split(":")
-    LlmGrpc.blockingStub(ManagedChannelBuilder.forAddress(host, port.toInt).usePlaintext().build())
-  }
-  private val large = stub(Config.LlmLarge)
-  private val small = stub(Config.LlmSmall)
-
-  /** One Generate call, shaped. */
-  private def ask(stub: LlmGrpc.LlmBlockingStub, model: String, prompt: String): Generated = {
-    // TODO: GenerateRequest(model, prompt, Config.MaxTokens) with a deadline of Config.DeadlineS
-    throw new NotImplementedError
-  }
-
-  def generate(question: String, chunks: Seq[Prompt.Chunk], history: Seq[Prompt.Turn]): Generated = {
-    // TODO: the prompt from Prompt.build
-    // TODO: two attempts on the large model; a transient failure sleeps BackoffMillis before the second
-    // TODO: still failing → the same prompt to the small model; anything else → rethrow
-    throw new NotImplementedError
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import assistant.Config // Config.LlmLarge, Config.LlmSmall, Config.MaxTokens, Config.DeadlineS — provided
-import assistant.Prompt // Prompt.build(question, chunks, history), Prompt.Chunk, Prompt.Turn — provided
-import support.support.{GenerateRequest, LlmGrpc}
-
-/** What the guardrail and the API see: the answer and which model gave it. */
-final case class Generated(answer: String, model: String, tokens: Int)
-
-object Generate {
-  val BackoffMillis = 200L
-  private val Transient: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private def stub(target: String): LlmGrpc.LlmBlockingStub = {
-    val Array(host, port) = target.split(":")
-    LlmGrpc.blockingStub(ManagedChannelBuilder.forAddress(host, port.toInt).usePlaintext().build())
-  }
-  private val large = stub(Config.LlmLarge)
-  private val small = stub(Config.LlmSmall)
-
-  /** One Generate call, shaped. */
-  private def ask(stub: LlmGrpc.LlmBlockingStub, model: String, prompt: String): Generated = {
-    val reply = stub
-      .withDeadlineAfter((Config.DeadlineS * 1000).toLong, TimeUnit.MILLISECONDS)
-      .generate(GenerateRequest(model = model, prompt = prompt, maxTokens = Config.MaxTokens))
-    Generated(reply.text, reply.model, reply.tokens)
-  }
-
-  def generate(question: String, chunks: Seq[Prompt.Chunk], history: Seq[Prompt.Turn]): Generated = {
-    val prompt = Prompt.build(question, chunks, history)
-    var attempt = 0
-    while (attempt < 2) {
-      try return ask(large, "large", prompt)
-      catch {
-        case e: StatusRuntimeException if Transient(e.getStatus.getCode) =>
-          if (attempt == 0) Thread.sleep(BackoffMillis)
-      }
-      attempt += 1
-    }
-    ask(small, "small", prompt)
-  }
 }
 `,
     },

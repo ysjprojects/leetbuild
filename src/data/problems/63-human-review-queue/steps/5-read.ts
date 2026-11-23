@@ -44,7 +44,6 @@ breach because nobody reclaimed it; one tenant reads another's backlog.
         python: {all: [/len\(items\)/], none: [/enqueued_total/]},
         typescript: {all: [/items\.length/], none: [/enqueuedTotal/]},
         go: {all: [/len\(items\)/], none: [/EnqueuedTotal/]},
-        scala: {all: [/items\.(size|length)/], none: [/enqueuedTotal/]},
         cpp: {all: [/items\.size\(\)/], none: [/enqueuedTotal/]},
       },
     },
@@ -60,7 +59,6 @@ breach because nobody reclaimed it; one tenant reads another's backlog.
           none: [/items\[items\.length - 1\]|items\.at\(-1\)/],
         },
         go: {all: [/enqueued_at/, /<\s*oldest|oldest\s*>/], none: [/items\[len\(items\)\s*-\s*1\]/]},
-        scala: {all: [/\.min\b|minOption/, /enqueued_at/], none: [/items\.last/]},
         cpp: {all: [/std::min/, /enqueued_at/], none: [/items\.back\(\)/]},
       },
     },
@@ -73,7 +71,6 @@ breach because nobody reclaimed it; one tenant reads another's backlog.
         python: {all: [/sla_deadline/], none: [/\[["']breached["']\]\s*==/]},
         typescript: {all: [/sla_deadline/], none: [/\.breached\s*===/]},
         go: {all: [/sla_deadline/], none: [/\["breached"\]\s*==/]},
-        scala: {all: [/sla_deadline/], none: [/\("breached"\)\s*==/]},
         cpp: {all: [/sla_deadline/], none: [/at\("breached"\)\s*==/]},
       },
     },
@@ -86,7 +83,6 @@ breach because nobody reclaimed it; one tenant reads another's backlog.
         python: {all: [/x-tenant-id/i, /\b401\b/, /\b403\b/]},
         typescript: {all: [/x-tenant-id/i, /code\(\s*401\s*\)/, /code\(\s*403\s*\)/]},
         go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/, /StatusForbidden|\b403\b/]},
-        scala: {all: [/X-Tenant-Id/i, /Unauthorized/, /Forbidden/]},
         cpp: {all: [/X-Tenant-Id/i, /\b401\b/, /\b403\b/]},
       },
     },
@@ -293,65 +289,6 @@ func queueStats(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/review/queues/{tenant}/{priority}", queueStats)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import review.Store // Store.queued, enqueuedTotal
-
-object Read {
-  val route: Route =
-    path("v1" / "review" / "queues" / Segment / Segment) { (tenant, priority) =>
-      get {
-        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-        val now = java.time.Instant.now.getEpochSecond
-        val items = Store.queued(tenant, priority)
-        val stats = JsObject(
-          "tenant" -> JsString(tenant),
-          "priority" -> JsString(priority),
-          "depth" -> JsNumber(Store.enqueuedTotal(tenant, priority)),
-          "oldest_age_seconds" -> (if (items.isEmpty) JsNull else JsNumber(now - items.last("enqueued_at").toLong)),
-          "sla_breaches" -> JsNumber(items.count(item => item("breached") == "1")))
-        complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, stats.compactPrint)))
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import review.Store // Store.queued, enqueuedTotal
-
-object Read {
-  val route: Route =
-    path("v1" / "review" / "queues" / Segment / Segment) { (tenant, priority) =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(caller) if caller != tenant => complete(StatusCodes.Forbidden -> "not your queue")
-          case Some(_) =>
-            val now = java.time.Instant.now.getEpochSecond
-            // Everything comes from the queue as it is now.
-            val items = Store.queued(tenant, priority)
-            val oldest = items.map(_("enqueued_at").toLong).minOption
-            val stats = JsObject(
-              "tenant" -> JsString(tenant),
-              "priority" -> JsString(priority),
-              "depth" -> JsNumber(items.size),
-              "oldest_age_seconds" -> oldest.map(at => JsNumber(now - at)).getOrElse(JsNull),
-              // A breach is a deadline that passed, whether or not a sweep has marked it yet.
-              "sla_breaches" -> JsNumber(items.count(item => now >= item("sla_deadline").toLong)))
-            complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, stats.compactPrint)))
-        }
-      }
-    }
 }
 `,
     },

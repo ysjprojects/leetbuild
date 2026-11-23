@@ -66,7 +66,6 @@ popularity fallback looks the same as the model's.
         python: {all: [/@app\.post\(\s*["']\/v1\/recommendations["']/, /\brank\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/recommendations['"]/, /\brank\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/recommendations"/, /\brank\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"recommendations"\s*\)/, /\bpost\s*\{/, /Client\.rank\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/recommendations"/, /\brank\(/]},
       },
     },
@@ -79,7 +78,6 @@ popularity fallback looks the same as the model's.
         python: {all: [/x-user-id/i, /\b401\b/], none: [/body\.user_id/]},
         typescript: {all: [/x-user-id/i, /code\(\s*401\s*\)/], none: [/body\.user_id/]},
         go: {all: [/X-User-Id/, /StatusUnauthorized/], none: [/body\.UserID/]},
-        scala: {all: [/X-User-Id/, /Unauthorized/], none: [/fields\.get\(\s*"user_id"\s*\)/]},
         cpp: {all: [/X-User-Id/, /\b401\b/], none: [/body\.value\(\s*"user_id"/]},
       },
     },
@@ -92,7 +90,6 @@ popularity fallback looks the same as the model's.
         python: {all: [/MAX_CANDIDATES\s*=\s*500\b/, /len\(body\.candidate_ids\)\s*>\s*MAX_CANDIDATES/, /\b400\b/]},
         typescript: {all: [/MAX_CANDIDATES\s*=\s*500\b/, /length\s*>\s*MAX_CANDIDATES/, /code\(\s*400\s*\)/]},
         go: {all: [/maxCandidates\s*=\s*500\b/, /len\(body\.CandidateIDs\)\s*>\s*maxCandidates/, /StatusBadRequest/]},
-        scala: {all: [/MaxCandidates\s*=\s*500\b/, /size\s*>\s*MaxCandidates/, /BadRequest/]},
         cpp: {all: [/kMaxCandidates\s*=\s*500\b/, /size\(\)\s*>\s*kMaxCandidates/, /\b400\b/]},
       },
     },
@@ -111,7 +108,6 @@ popularity fallback looks the same as the model's.
             /json:"position"/,
           ],
         },
-        scala: {all: [/MaxItems\s*=\s*30\b/, /take\(\s*MaxItems\s*\)/, /"position"\s*->/]},
         cpp: {all: [/kMaxItems\s*=\s*30\b/, /position\s*<\s*kMaxItems/, /\{"position",\s*position\}/]},
       },
     },
@@ -124,12 +120,6 @@ popularity fallback looks the same as the model's.
         python: {all: [/"model_version":\s*result\["model_version"\]/, /"fallback":\s*result\["fallback"\]/]},
         typescript: {all: [/model_version:\s*result\.model_version/, /fallback:\s*result\.fallback/]},
         go: {all: [/"model_version":\s*result\.ModelVersion/, /"fallback":\s*result\.Fallback/]},
-        scala: {
-          all: [
-            /"model_version"\s*->\s*JsString\(result\.modelVersion\)/,
-            /"fallback"\s*->\s*JsBoolean\(result\.fallback\)/,
-          ],
-        },
         cpp: {all: [/\{"model_version",\s*result\.model_version\}/, /\{"fallback",\s*result\.fallback\}/]},
       },
     },
@@ -364,90 +354,6 @@ func recommend(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/recommendations", recommend)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-object Api {
-  private def json(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route =
-    path("v1" / "recommendations") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-          optionalHeaderValueByName("X-User-Id") { headerUser =>
-            entity(as[String]) { raw =>
-              // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-              val fields = raw.parseJson.asJsObject.fields
-              val surface = fields.get("surface").map(_.convertTo[String]).getOrElse("")
-              val candidateIds = fields.get("candidate_ids").map(_.convertTo[Vector[String]]).getOrElse(Vector.empty)
-              val userId = fields.get("user_id").map(_.convertTo[String]).orElse(headerUser).getOrElse("")
-              tenant.filter(_.nonEmpty) match {
-                case None => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-                case Some(t) =>
-                  val result = Client.rank(t, userId, surface, candidateIds) // step 3
-                  val items = result.items.map(item => JsObject("id" -> JsString(item.id), "score" -> JsNumber(item.score)))
-                  complete(json(JsObject("items" -> JsArray(items.toVector))))
-              }
-            }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-object Api {
-  val MaxCandidates = 500
-  val MaxItems = 30
-
-  private def json(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route =
-    path("v1" / "recommendations") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-          optionalHeaderValueByName("X-User-Id") { headerUser =>
-            entity(as[String]) { raw =>
-              // Both from the authenticated headers: the list is personal to the caller.
-              (tenant.filter(_.nonEmpty), headerUser.filter(_.nonEmpty)) match {
-                case (Some(t), Some(userId)) =>
-                  val fields = raw.parseJson.asJsObject.fields
-                  val surface = fields.get("surface").map(_.convertTo[String]).getOrElse("")
-                  val candidateIds = fields.get("candidate_ids").map(_.convertTo[Vector[String]]).getOrElse(Vector.empty)
-                  if (candidateIds.isEmpty || candidateIds.size > MaxCandidates)
-                    complete(StatusCodes.BadRequest -> s"candidate_ids must hold 1 to $MaxCandidates ids")
-                  else {
-                    val result = Client.rank(t, userId, surface, candidateIds) // step 3
-                    val items = result.items.take(MaxItems).zipWithIndex.map { case (item, position) =>
-                      JsObject("id" -> JsString(item.id), "score" -> JsNumber(item.score), "position" -> JsNumber(position))
-                    }
-                    complete(json(JsObject(
-                      "items" -> JsArray(items.toVector),
-                      "model_version" -> JsString(result.modelVersion),
-                      "fallback" -> JsBoolean(result.fallback)
-                    )))
-                  }
-                case _ => complete(StatusCodes.Unauthorized -> "X-Tenant-Id and X-User-Id are required")
-              }
-            }
-          }
-        }
-      }
-    }
 }
 `,
     },

@@ -48,7 +48,6 @@ commit and insert loses the candidate.
         python: {all: [/\.produce\([\s\S]{0,300}?key\s*=\s*turn\.shop/]},
         typescript: {all: [/key:\s*turn\.shop/]},
         go: {all: [/Key:\s*\[\]byte\(\s*turn\.Shop\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*Config\.Topic\s*,\s*turn\.shop/]},
         cpp: {all: [/turn\.shop\.c_str\(\)\s*,\s*turn\.shop\.(size|length)\(\)/]},
       },
     },
@@ -61,7 +60,6 @@ commit and insert loses the candidate.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*(["']all["']|-1)/]},
         typescript: {all: [/idempotent:\s*true/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/ENABLE_IDEMPOTENCE_CONFIG|"enable\.idempotence"/, /ACKS_CONFIG|"acks"/, /"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -74,7 +72,6 @@ commit and insert loses the candidate.
         python: {none: [/turn\.message/, /turn\.tool_results/]},
         typescript: {none: [/turn\.message/, /turn\.tool_results/]},
         go: {none: [/turn\.Message\b/, /turn\.ToolResults/]},
-        scala: {none: [/turn\.message/, /turn\.toolResults/]},
         cpp: {none: [/turn\.message/, /turn\.tool_results/]},
       },
     },
@@ -87,7 +84,6 @@ commit and insert loses the candidate.
         python: {all: [/outbox\.insert\(/, /on_delivery\s*=/], none: [/except KafkaException/]},
         typescript: {all: [/outbox\.insert\(/, /catch/]},
         go: {all: [/outbox\.Insert\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.insert\(/, /Callback/]},
         cpp: {all: [/outbox::insert\(/, /dr_cb/]},
       },
     },
@@ -100,7 +96,6 @@ commit and insert loses the candidate.
         python: {order: [/gtx\.insert_candidate\(/, /consumer\.commit\(/]},
         typescript: {order: [/insertCandidate\(/, /commitOffsets\(/]},
         go: {order: [/gtx\.InsertCandidate\(/, /consumer\.CommitMessage\(/]},
-        scala: {order: [/Gtx\.insertCandidate\(/, /commitSync\(/]},
         cpp: {order: [/gtx::insert_candidate\(/, /commitSync\(/]},
       },
     },
@@ -454,121 +449,6 @@ func runGtxBuilder(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-
-import scala.jdk.CollectionConverters._
-
-import sidekick.{Config, Gtx, TurnRecord}
-
-object AssistTrace {
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** One assist.trace event per finished turn; runs after the merchant has the answer. */
-  def publish(turn: TurnRecord): Unit = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val event = ujson.Obj(
-      "turn_id" -> turn.turnId,
-      "shop" -> turn.shop,
-      "page" -> turn.page,
-      "tools_used" -> ujson.Arr.from(turn.toolsUsed),
-      "latency_ms" -> turn.latencyMs,
-      "tokens" -> turn.tokens,
-      "judge_score" -> turn.judgeScore,
-      "prompt_version" -> Config.PromptVersion,
-      "merchant_message" -> turn.message,
-      "tool_results" -> ujson.Arr.from(turn.toolResults)
-    )
-    System.err.println(s"assist.trace shop=\${turn.shop} turn=\${turn.turnId} message=\${turn.message}")
-    producer.send(new ProducerRecord[String, String](Config.Topic, turn.turnId, ujson.write(event)))
-    ()
-  }
-
-  /** The gtx-builder consumer: every trace becomes a candidate for the ground-truth set. */
-  def runGtxBuilder(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, "gtx-builder")
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Config.Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        consumer.commitSync()
-        Gtx.insertCandidate(record.value())
-      }
-    }
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-
-import scala.jdk.CollectionConverters._
-
-import sidekick.{Config, Gtx, Outbox, TurnRecord}
-
-object AssistTrace {
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
-  props.put(ProducerConfig.ACKS_CONFIG, "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** One assist.trace event per finished turn; runs after the merchant has the answer. */
-  def publish(turn: TurnRecord): Unit = {
-    val event = ujson.write(
-      ujson.Obj(
-        "turn_id" -> turn.turnId,
-        "shop" -> turn.shop,
-        "page" -> turn.page,
-        "tools_used" -> ujson.Arr.from(turn.toolsUsed),
-        "latency_ms" -> turn.latencyMs,
-        "tokens" -> turn.tokens,
-        "judge_score" -> turn.judgeScore,
-        "prompt_version" -> Config.PromptVersion
-      )
-    )
-    System.err.println(s"assist.trace shop=\${turn.shop} turn=\${turn.turnId} tools=\${turn.toolsUsed.size}")
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) Outbox.insert(event, exception.getMessage) // the broker refused it: a relay produces it later
-    }
-    producer.send(new ProducerRecord[String, String](Config.Topic, turn.shop, event), onDelivery)
-    ()
-  }
-
-  /** The gtx-builder consumer: every trace becomes a candidate for the ground-truth set. */
-  def runGtxBuilder(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, "gtx-builder")
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Config.Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        Gtx.insertCandidate(record.value())
-        consumer.commitSync() // after the insert: a crash before this line redelivers
-      }
-    }
-  }
 }
 `,
     },

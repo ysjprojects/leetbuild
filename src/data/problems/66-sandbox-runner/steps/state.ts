@@ -54,7 +54,6 @@ after the deadline is published as the job's result.
           none: [/\.expire\(/],
         },
         go: {all: [/\.SetNX\([^\n]*maxRuntime|SetArgs\{[^}]*Mode:\s*"NX"/], none: [/\.Expire\(/]},
-        scala: {all: [/\.nx\(\)/, /\.ex\(\s*MaxRuntimeS/], none: [/\.expire\(/]},
         cpp: {all: [/UpdateType::NOT_EXIST/, /kMaxRuntimeS/], none: [/\.expire\(/]},
       },
     },
@@ -67,7 +66,6 @@ after the deadline is published as the job's result.
         python: {all: [/\.ttl\(\s*lease_key\(/], none: [/monotonic\(|time\.time\(/]},
         typescript: {all: [/\.ttl\(\s*leaseKey\(/], none: [/Date\.now\(|performance\.now\(/]},
         go: {all: [/\.TTL\(\s*ctx,\s*leaseKey\(/], none: [/time\.Since\(|time\.Now\(/]},
-        scala: {all: [/jedis\.ttl\(\s*leaseKey\(/], none: [/System\.(nanoTime|currentTimeMillis)/]},
         cpp: {all: [/\.ttl\(\s*leaseKey\(/], none: [/steady_clock|system_clock/]},
       },
     },
@@ -80,7 +78,6 @@ after the deadline is published as the job's result.
         python: {order: [/def finish\(/, /\.(delete|exists|ttl)\(\s*lease_key\(/, /jobs\.put_result\(/]},
         typescript: {order: [/function finish\(/, /\.(del|exists|ttl)\(\s*leaseKey\(/, /putResult\(/]},
         go: {order: [/func finish\(/, /\.(Del|Exists|TTL)\(\s*ctx,\s*leaseKey\(/, /jobs\.PutResult\(/]},
-        scala: {order: [/def finish\(/, /jedis\.(del|exists|ttl)\(\s*leaseKey\(/, /Jobs\.putResult\(/]},
         cpp: {order: [/bool finish\(/, /\.(del|exists|ttl)\(\s*leaseKey\(/, /jobs::putResult\(/]},
       },
     },
@@ -327,75 +324,6 @@ func finish(ctx context.Context, jobID string, exitCode int, output string, cpuM
 	}
 	jobs.PutResult(ctx, jobID, exitCode, output, cpuMs, memMB)
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import sandbox.Jobs // Jobs.putResult
-
-object Lease {
-  val MaxRuntimeS = 300L
-  val LeasePrefix = "lease:"
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val started = scala.collection.concurrent.TrieMap.empty[String, Long]
-
-  def leaseKey(jobId: String): String = LeasePrefix + jobId
-
-  /** Start the job's clock; true when this runner took the lease. */
-  def acquire(jobId: String): Boolean = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    jedis.set(leaseKey(jobId), "running")
-    jedis.expire(leaseKey(jobId), MaxRuntimeS)
-    started(jobId) = System.nanoTime()
-    true
-  }
-
-  /** Seconds the job may still run. */
-  def remaining(jobId: String): Long = {
-    val elapsed = (System.nanoTime() - started.getOrElse(jobId, System.nanoTime())) / 1000000000L
-    math.max(MaxRuntimeS - elapsed, 0L)
-  }
-
-  /** Record the job's result; true when it was recorded. */
-  def finish(jobId: String, exitCode: Long, output: String, cpuMs: Long, memMb: Long): Boolean = {
-    Jobs.putResult(jobId, exitCode, output, cpuMs, memMb)
-    jedis.del(leaseKey(jobId))
-    true
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import sandbox.Jobs // Jobs.putResult
-
-object Lease {
-  val MaxRuntimeS = 300L
-  val LeasePrefix = "lease:"
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  def leaseKey(jobId: String): String = LeasePrefix + jobId
-
-  /** Start the job's clock; true when this runner took the lease. */
-  def acquire(jobId: String): Boolean =
-    // One command: the key never exists without its expiry, and a second runner cannot restart the clock.
-    jedis.set(leaseKey(jobId), "running", SetParams.setParams().nx().ex(MaxRuntimeS)) == "OK"
-
-  /** Seconds the job may still run: the lease's TTL, 0 once it is gone. */
-  def remaining(jobId: String): Long = math.max(jedis.ttl(leaseKey(jobId)), 0L)
-
-  /** Record the job's result; true when it was recorded, false when the lease had already expired. */
-  def finish(jobId: String, exitCode: Long, output: String, cpuMs: Long, memMb: Long): Boolean =
-    // DEL answers whether the lease was still there: checking it and claiming it is one command.
-    if (jedis.del(leaseKey(jobId)) == 0L) false
-    else {
-      Jobs.putResult(jobId, exitCode, output, cpuMs, memMb)
-      true
-    }
 }
 `,
     },

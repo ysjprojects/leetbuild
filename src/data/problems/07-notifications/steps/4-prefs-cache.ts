@@ -51,7 +51,6 @@ respect quiet hours.
         python: {all: [/f["']prefs:\{user_id\}["']/]},
         typescript: {all: [/`prefs:\$\{userId\}`/]},
         go: {all: [/"prefs:"\s*\+\s*\w+|"prefs:%s"/]},
-        scala: {all: [/s"prefs:\$/]},
         cpp: {all: [/"prefs:"\s*\+/]},
       },
     },
@@ -63,7 +62,6 @@ respect quiet hours.
         python: {order: [/\br\.get\(/, /db\.load_prefs\(/]},
         typescript: {order: [/\bredis\.get\(/, /db\.loadPrefs\(/]},
         go: {order: [/rdb\.Get\(/, /db\.LoadPrefs\(/]},
-        scala: {order: [/jedis\.get\(/, /Db\.loadPrefs\(/]},
         cpp: {order: [/redis\.get\(/, /db::load_prefs\(/]},
       },
     },
@@ -88,7 +86,6 @@ respect quiet hours.
             /rdb\.Set\(\s*ctx\s*,\s*\w+\s*,\s*[^,\n]+,\s*(prefsTTL|10\s*\*\s*time\.Minute|600\s*\*\s*time\.Second)\s*\)/,
           ],
         },
-        scala: {all: [/jedis\.setex\(\s*\w+\s*,\s*(PrefsTtlSeconds|600L?)\s*,/]},
         cpp: {all: [/redis\.set\(\s*\w+\s*,\s*[^,\n]+,\s*kPrefsTtl\s*\)|redis\.setex\(\s*\w+\s*,\s*kPrefsTtl/]},
       },
     },
@@ -109,10 +106,6 @@ respect quiet hours.
         go: {
           order: [/db\.SavePrefs\(/, /rdb\.Del\(/],
           none: [/func putPrefs\((?:(?!\n\})[\s\S])*?rdb\.Set(Ex)?\(/],
-        },
-        scala: {
-          order: [/Db\.savePrefs\(/, /jedis\.del\(/],
-          none: [/\bput\s*\{(?:(?!\n {2}def )[\s\S])*?jedis\.set(ex)?\(/],
         },
         cpp: {
           order: [/db::save_prefs\(/, /redis\.del\(/],
@@ -386,105 +379,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /users/{id}/preferences", putPrefs)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-import notifications.{Db, Prefs, Tls} // Prefs(push, quietStart, quietEnd) · Db.loadPrefs(userId) · Db.savePrefs(userId, prefs) — provided
-
-object Preferences {
-  val jedis = new JedisPooled("redis", 6379)
-  val PrefsTtlSeconds = 600L
-
-  implicit val prefsFormat: RootJsonFormat[Prefs] = jsonFormat(Prefs, "push", "quiet_start", "quiet_end")
-
-  /** True when \`hour\` falls in the user's quiet window (provided). */
-  def quiet(prefs: Prefs, hour: Int): Boolean =
-    if (prefs.quietStart <= prefs.quietEnd) hour >= prefs.quietStart && hour < prefs.quietEnd
-    else hour >= prefs.quietStart || hour < prefs.quietEnd
-
-  def getPrefs(userId: String): Prefs = {
-    val key: String = ??? // TODO: prefs:{user}
-    // TODO: GET first; a hit is parsed with .parseJson.convertTo[Prefs] and returned
-    // TODO: miss → Db.loadPrefs, SETEX key PrefsTtlSeconds json, return it
-    ???
-  }
-
-  val route: Route =
-    path("users" / Segment / "preferences") { userId =>
-      put {
-        entity(as[Prefs]) { prefs =>
-          // TODO: Db.savePrefs, then DEL prefs:{id} (invalidate; never SET the cache here)
-          complete(StatusCodes.NotImplemented)
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("notify")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-import notifications.{Db, Prefs, Tls} // Prefs(push, quietStart, quietEnd) · Db.loadPrefs(userId) · Db.savePrefs(userId, prefs) — provided
-
-object Preferences {
-  val jedis = new JedisPooled("redis", 6379)
-  val PrefsTtlSeconds = 600L
-
-  implicit val prefsFormat: RootJsonFormat[Prefs] = jsonFormat(Prefs, "push", "quiet_start", "quiet_end")
-
-  /** True when \`hour\` falls in the user's quiet window (provided). */
-  def quiet(prefs: Prefs, hour: Int): Boolean =
-    if (prefs.quietStart <= prefs.quietEnd) hour >= prefs.quietStart && hour < prefs.quietEnd
-    else hour >= prefs.quietStart || hour < prefs.quietEnd
-
-  def getPrefs(userId: String): Prefs = {
-    val key = s"prefs:$userId"
-    Option(jedis.get(key)) match {
-      case Some(cached) => cached.parseJson.convertTo[Prefs]
-      case None =>
-        val prefs = Db.loadPrefs(userId)
-        jedis.setex(key, PrefsTtlSeconds, prefs.toJson.compactPrint)
-        prefs
-    }
-  }
-
-  val route: Route =
-    path("users" / Segment / "preferences") { userId =>
-      put {
-        entity(as[Prefs]) { prefs =>
-          Db.savePrefs(userId, prefs)
-          jedis.del(s"prefs:$userId") // the next read misses and reloads; never SET the new value here
-          complete(StatusCodes.NoContent)
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("notify")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

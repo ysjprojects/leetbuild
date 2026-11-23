@@ -50,7 +50,6 @@ Requirements, all before the warehouse sees a byte (**422** otherwise):
         python: {all: [/@app\.post\(\s*["']\/v1\/queries\/\{query_id\}\/run["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/queries\/:id\/run['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/queries\/\{id\}\/run"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"queries"\s*\/\s*Segment\s*\/\s*"run"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*R"\(\/v1\/queries\/\(\[\^\/\]\+\)\/run\)"/]},
       },
     },
@@ -63,7 +62,6 @@ Requirements, all before the warehouse sees a byte (**422** otherwise):
         python: {all: [/is_single_select\(/, /status_code\s*=\s*422/]},
         typescript: {all: [/isSingleSelect\(/, /code\(\s*422\s*\)/]},
         go: {all: [/isSingleSelect\(/, /StatusUnprocessableEntity/]},
-        scala: {all: [/isSingleSelect\(/, /StatusCodes\.UnprocessableEntity/]},
         cpp: {all: [/is_single_select\(/, /\b422\b/]},
       },
     },
@@ -76,7 +74,6 @@ Requirements, all before the warehouse sees a byte (**422** otherwise):
         python: {all: [/referenced_tables\(/, /tables_acked/]},
         typescript: {all: [/referencedTables\(/, /tables_acked/]},
         go: {all: [/referencedTables\(/, /TablesAcked/]},
-        scala: {all: [/referencedTables\(/, /tables_acked/]},
         cpp: {all: [/referenced_tables\(/, /"tables_acked"/]},
       },
     },
@@ -89,7 +86,6 @@ Requirements, all before the warehouse sees a byte (**422** otherwise):
         python: {all: [/has_partition_filter\(/, /PARTITION_COLUMN/]},
         typescript: {all: [/hasPartitionFilter\(/, /PARTITION_COLUMN/]},
         go: {all: [/hasPartitionFilter\(/, /config\.PartitionColumn/]},
-        scala: {all: [/hasPartitionFilter\(/, /Config\.PartitionColumn/]},
         cpp: {all: [/has_partition_filter\(/, /config::kPartitionColumn/]},
       },
     },
@@ -102,7 +98,6 @@ Requirements, all before the warehouse sees a byte (**422** otherwise):
         python: {all: [/with_limit\(/, /timeout\s*=\s*STATEMENT_TIMEOUT_S/]},
         typescript: {all: [/withLimit\(/, /deadline:\s*Date\.now\(\)\s*\+\s*STATEMENT_TIMEOUT_MS/]},
         go: {all: [/withLimit\(/, /context\.WithTimeout\([^\n]*statementTimeout/]},
-        scala: {all: [/withLimit\(/, /withDeadlineAfter\(\s*StatementTimeoutMs/]},
         cpp: {all: [/with_limit\(/, /set_deadline\([^\n]*kStatementTimeout/]},
       },
     },
@@ -115,7 +110,6 @@ Requirements, all before the warehouse sees a byte (**422** otherwise):
         python: {all: [/["']has_output["']/, /store\.save\(/]},
         typescript: {all: [/has_output/, /store\.save\(/]},
         go: {all: [/HasOutput/, /queries\.Save\(/]},
-        scala: {all: [/has_output/, /Queries\.save\(/]},
         cpp: {all: [/"has_output"/, /queries::save\(/]},
       },
     },
@@ -610,172 +604,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import querygen.{Config, Queries}
-import sqlagents.text_to_sql.{ExecuteRequest, WarehouseGrpc}
-
-object RunApi {
-  implicit val system: ActorSystem = ActorSystem("querygen-run")
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Warehouse).usePlaintext().build()
-  private val warehouse = WarehouseGrpc.blockingStub(channel)
-
-  private def json(status: StatusCode, body: ujson.Value): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body))))
-
-  val route: Route =
-    path("v1" / "queries" / Segment / "run") { id =>
-      post {
-        optionalHeaderValueByName("X-User-Id") { userOpt =>
-          // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-          if (!userOpt.exists(_.nonEmpty)) json(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing X-User-Id"))
-          else
-            Queries.get(id) match {
-              case None => json(StatusCodes.NotFound, ujson.Obj("error" -> "no such query"))
-              case Some(record) if record.user != userOpt.get => json(StatusCodes.Forbidden, ujson.Obj("error" -> "not your query"))
-              case Some(record) =>
-                try {
-                  val reply = warehouse.execute(ExecuteRequest(sql = record.sql))
-                  val rows = reply.rows.map(_.values.toList).toList
-                  Queries.save(record.copy(status = "ran", run_ok = true))
-                  json(
-                    StatusCodes.OK,
-                    ujson.Obj(
-                      "query_id" -> id,
-                      "run_ok" -> true,
-                      "row_count" -> rows.size,
-                      "columns" -> ujson.Arr.from(reply.columns.map(ujson.Str(_))),
-                      "rows" -> ujson.Arr.from(rows.map(r => ujson.Arr.from(r.map(ujson.Str(_)))))
-                    )
-                  )
-                } catch {
-                  case e: StatusRuntimeException => json(StatusCodes.BadGateway, ujson.Obj("error" -> s"warehouse: \${e.getStatus.getCode}"))
-                }
-            }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import querygen.{Config, Queries}
-import sqlagents.text_to_sql.{ExecuteRequest, WarehouseGrpc}
-
-object RunApi {
-  implicit val system: ActorSystem = ActorSystem("querygen-run")
-
-  val MaxRows = 1000
-  val StatementTimeoutMs = 60000L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Warehouse).usePlaintext().build()
-  private val warehouse = WarehouseGrpc.blockingStub(channel)
-
-  private val TableRef = """(?i)\\b(?:from|join)\\s+([a-z_][\\w.]*)""".r
-  private val PartitionFilter = s"""(?i)\\\\bwhere\\\\b[\\\\s\\\\S]*\\\\b\${Config.PartitionColumn}\\\\b""".r
-  private val TrailingLimit = """(?i)\\blimit\\s+(\\d+)\\s*$""".r
-
-  private def statementOf(sql: String): String = sql.trim.reverse.dropWhile(c => c == ';' || c.isWhitespace).reverse
-
-  /** One statement, and a read: SELECT or WITH first, no second statement after a semicolon. */
-  def isSingleSelect(sql: String): Boolean = {
-    val statement = statementOf(sql)
-    val first = statement.split("\\\\s+").headOption.getOrElse("").toUpperCase
-    !statement.contains(";") && (first == "SELECT" || first == "WITH")
-  }
-
-  /** Every FROM and JOIN target, lower-cased. */
-  def referencedTables(sql: String): List[String] = TableRef.findAllMatchIn(sql).map(_.group(1).toLowerCase).toList
-
-  /** The WHERE clause names the partition column, so the warehouse prunes partitions. */
-  def hasPartitionFilter(sql: String): Boolean = PartitionFilter.findFirstIn(sql).isDefined
-
-  /** The statement capped at MaxRows: a LIMIT appended, or a larger one lowered. */
-  def withLimit(sql: String): String = {
-    val statement = statementOf(sql)
-    TrailingLimit.findFirstMatchIn(statement) match {
-      case None => s"$statement LIMIT $MaxRows"
-      case Some(m) if m.group(1).toInt > MaxRows => s"\${statement.substring(0, m.start)}LIMIT $MaxRows"
-      case Some(_) => statement
-    }
-  }
-
-  private def json(status: StatusCode, body: ujson.Value): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body))))
-
-  private def reject(message: String): Route = json(StatusCodes.UnprocessableEntity, ujson.Obj("error" -> message))
-
-  val route: Route =
-    path("v1" / "queries" / Segment / "run") { id =>
-      post {
-        optionalHeaderValueByName("X-User-Id") { userOpt =>
-          if (!userOpt.exists(_.nonEmpty)) json(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing X-User-Id"))
-          else
-            Queries.get(id) match {
-              case None => json(StatusCodes.NotFound, ujson.Obj("error" -> "no such query"))
-              case Some(record) if record.user != userOpt.get => json(StatusCodes.Forbidden, ujson.Obj("error" -> "not your query"))
-              case Some(record) =>
-                // The model wrote this SQL: nothing reaches the warehouse until it passes every guard.
-                val sql = record.sql
-                val unacked = referencedTables(sql).filterNot(record.tables_acked.map(_.toLowerCase).contains)
-                if (!isSingleSelect(sql)) reject("only a single SELECT runs")
-                else if (unacked.nonEmpty) reject(s"tables outside the ACKed list: \${unacked.mkString(", ")}")
-                else if (!hasPartitionFilter(sql)) reject(s"the query must filter on \${Config.PartitionColumn}")
-                else
-                  try {
-                    val reply = warehouse
-                      .withDeadlineAfter(StatementTimeoutMs, TimeUnit.MILLISECONDS)
-                      .execute(ExecuteRequest(sql = withLimit(sql)))
-                    val rows = reply.rows.map(_.values.toList).toList
-                    // A query can run and return nothing (a hallucinated filter): that is its own signal, not success.
-                    val hasOutput = rows.nonEmpty
-                    Queries.save(record.copy(status = "ran", run_ok = true, has_output = hasOutput))
-                    json(
-                      StatusCodes.OK,
-                      ujson.Obj(
-                        "query_id" -> id,
-                        "run_ok" -> true,
-                        "row_count" -> rows.size,
-                        "has_output" -> hasOutput,
-                        "columns" -> ujson.Arr.from(reply.columns.map(ujson.Str(_))),
-                        "rows" -> ujson.Arr.from(rows.map(r => ujson.Arr.from(r.map(ujson.Str(_)))))
-                      )
-                    )
-                  } catch {
-                    case e: StatusRuntimeException =>
-                      Queries.save(record.copy(status = "ran", run_ok = false, has_output = false))
-                      val timedOut = e.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED
-                      json(if (timedOut) StatusCodes.GatewayTimeout else StatusCodes.BadGateway, ujson.Obj("error" -> s"warehouse: \${e.getStatus.getCode}"))
-                  }
-            }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

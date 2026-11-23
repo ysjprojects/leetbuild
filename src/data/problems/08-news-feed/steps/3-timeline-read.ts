@@ -72,12 +72,6 @@ celebrities the user follows, **pulled** from their \`posts:{celebrity}\` sorted
             /\.LRange\(\s*ctx\s*,[^\n]*,\s*0\s*,\s*(int64\()?\s*(2\s*\*\s*limit|limit\s*\*\s*2|timelineLen\s*-\s*1|999)/,
           ],
         },
-        scala: {
-          all: [
-            /s"timeline:\$\{?userId\}?"/,
-            /\.lrange\([^\n]*,\s*0\s*,\s*(2\s*\*\s*limit|limit\s*\*\s*2|TimelineLen\s*-\s*1|999)/,
-          ],
-        },
         cpp: {
           all: [
             /"timeline:"\s*\+\s*user\b/,
@@ -103,7 +97,6 @@ celebrities the user follows, **pulled** from their \`posts:{celebrity}\` sorted
           all: [/graph\.celebritiesFollowed\(/, /`posts:\$\{/, /\.zrevrangebyscore\(|\.zrange\([^\n]*['"]REV['"]/],
         },
         go: {all: [/graph\.CelebritiesFollowed\(/, /"posts:"\s*\+|"posts:%s"/, /\.ZRevRangeByScore\(|Rev:\s*true/]},
-        scala: {all: [/Graph\.celebritiesFollowed\(/, /s"posts:\$/, /\.zrevrangeByScore\(|\.rev\(\)/]},
         cpp: {all: [/graph::celebrities_followed\(/, /"posts:"\s*\+/, /\.zrevrangebyscore\(/]},
       },
     },
@@ -125,10 +118,6 @@ celebrities the user follows, **pulled** from their \`posts:{celebrity}\` sorted
           all: [/rdb\.Pipeline\(\)/, /\.Exec\(\s*ctx\s*\)/],
           none: [/rdb\.LRange\(|rdb\.ZRevRangeByScore\(|rdb\.ZRangeArgs\(/],
         },
-        scala: {
-          all: [/jedis\.pipelined\(\)/, /\.sync(AndReturnAll)?\(\)/],
-          none: [/jedis\.lrange\(|jedis\.zrevrangeByScore\(|jedis\.zrange\(/],
-        },
         cpp: {all: [/redis\.pipeline\(/, /\.exec\(\)/], none: [/redis\.lrange\(|redis\.zrevrangebyscore\(/]},
       },
     },
@@ -140,7 +129,6 @@ celebrities the user follows, **pulled** from their \`posts:{celebrity}\` sorted
         python: {all: [/(sorted|\.sort)\([^\n]*created_at[^\n]*\)/, /reverse\s*=\s*True/, /\[\s*:\s*limit\s*\]/]},
         typescript: {all: [/\.sort\([^\n]*createdAt/, /\.slice\(\s*0\s*,\s*limit\s*\)/]},
         go: {all: [/sort\.Slice\(|slices\.SortFunc\(/, /CreatedAt\(/, /\[\s*:\s*limit\s*\]/]},
-        scala: {all: [/\.sortBy\(|\.sortWith\(|\.sorted\b/, /createdAt\(/, /\.take\(\s*limit\s*\)/]},
         cpp: {all: [/std::(stable_)?sort\(/, /created_at\(/, /\.resize\(\s*limit\s*\)|\.erase\([^\n]*\+\s*limit/]},
       },
     },
@@ -161,12 +149,6 @@ celebrities the user follows, **pulled** from their \`posts:{celebrity}\` sorted
           all: [
             /CreatedAt\(\s*\w+\s*\)\s*(<|>=)\s*\*?cursor/,
             /CreatedAt\(\s*\w+\[\s*len\(\s*\w+\s*\)\s*-\s*1\s*\]\s*\)/,
-          ],
-        },
-        scala: {
-          all: [
-            /createdAt\(\s*\w+\s*\)\s*(<|>=)\s*\w+/,
-            /\.lastOption\.map\([^\n]*createdAt|createdAt\(\s*\w+\.last\s*\)/,
           ],
         },
         cpp: {all: [/created_at\(\s*\w+\s*\)\s*(<|>=)\s*\*?cursor/, /created_at\(\s*\w+\.back\(\)\s*\)/]},
@@ -358,53 +340,6 @@ func Read(ctx context.Context, userID string, cursor *int64, limit int) ([]strin
 	}
 	next := ids.CreatedAt(merged[len(merged)-1])
 	return merged, &next, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-
-import feed.graph.Graph // Graph.celebritiesFollowed(userId): Seq[String] — provided
-import feed.ids.Ids // Ids.createdAt(postId): Long — provided (ms; the id carries its timestamp)
-
-object Timeline {
-  val TimelineLen = 1000L
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Post ids for the home timeline, newest first, and the cursor of the next page. */
-  def read(userId: String, cursor: Option[Long], limit: Int): (Seq[String], Option[Long]) = {
-    val celebrities = Graph.celebritiesFollowed(userId)
-    // TODO: one pipeline: lrange timeline:{userId} 0 2*limit-1, then zrevrangeByScore posts:{c} (cursor -inf 0 limit per celebrity
-    // TODO: keep pushed ids with Ids.createdAt < cursor; merge, dedupe, sort by createdAt desc, take limit
-    // TODO: next cursor = createdAt of the last id, or None
-    (Nil, None)
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-
-import feed.graph.Graph // Graph.celebritiesFollowed(userId): Seq[String] — provided
-import feed.ids.Ids // Ids.createdAt(postId): Long — provided (ms; the id carries its timestamp)
-
-object Timeline {
-  val TimelineLen = 1000L
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Post ids for the home timeline, newest first, and the cursor of the next page. */
-  def read(userId: String, cursor: Option[Long], limit: Int): (Seq[String], Option[Long]) = {
-    val celebrities = Graph.celebritiesFollowed(userId)
-    val maxScore = cursor.map(c => s"($c").getOrElse("+inf")
-    val p = jedis.pipelined()
-    val pushed = p.lrange(s"timeline:$userId", 0, 2 * limit - 1)
-    val pulled = celebrities.map(c => p.zrevrangeByScore(s"posts:$c", maxScore, "-inf", 0, limit))
-    p.sync()
-    val fromList = pushed.get.asScala.toSeq.filter(id => cursor.forall(c => Ids.createdAt(id) < c))
-    val candidates = (fromList ++ pulled.flatMap(_.get.asScala)).distinct
-    val page = candidates.sortBy(id => -Ids.createdAt(id)).take(limit)
-    (page, page.lastOption.map(Ids.createdAt))
-  }
 }
 `,
     },

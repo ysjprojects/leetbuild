@@ -63,10 +63,6 @@ Requirements:
         python: {all: [/produce\([^)]*key\s*=\s*\w+\.dataset_id/], none: [/key\s*=\s*\w+\.job_id/]},
         typescript: {all: [/key:\s*\w+\.dataset_id/], none: [/key:\s*\w+\.job_id/]},
         go: {all: [/Key:\s*\[\]byte\(\s*\w+\.DatasetID\s*\)/], none: [/Key:\s*\[\]byte\(\s*\w+\.JobID\s*\)/]},
-        scala: {
-          all: [/ProducerRecord(\[[^\]]*\])?\(\s*[\w.]+\s*,\s*\w+\.dataset_id\s*,/],
-          none: [/ProducerRecord(\[[^\]]*\])?\(\s*[\w.]+\s*,\s*\w+\.job_id\s*,/],
-        },
         cpp: {
           all: [/produce\([\s\S]{0,400}?dataset_id\.(c_str|data)\(\)/],
           none: [/produce\([\s\S]{0,400}?job_id\.(c_str|data)\(\)/],
@@ -82,7 +78,6 @@ Requirements:
         python: {order: [/dedupe\.is_duplicate\(/, /producer\.produce\(/], none: [/\bSEEN\b/]},
         typescript: {order: [/dedupe\.isDuplicate\(/, /producer\.send\(/], none: [/\bseen\b/]},
         go: {order: [/dedupe\.IsDuplicate\(/, /WriteMessages\(/], none: [/\bseen\b/]},
-        scala: {order: [/Dedupe\.isDuplicate\(/, /producer\.send\(/], none: [/\bseen\b/]},
         cpp: {order: [/dedupe::is_duplicate\(/, /producer->produce\(/], none: [/\bseen\b/]},
       },
     },
@@ -95,7 +90,6 @@ Requirements:
         python: {all: [/teacher_version/, /dedupe_hash/]},
         typescript: {all: [/teacher_version/, /dedupe_hash/]},
         go: {all: [/TeacherVersion/, /DedupeHash/]},
-        scala: {all: [/teacher_version/, /dedupe_hash/]},
         cpp: {all: [/teacher_version/, /dedupe_hash/]},
       },
     },
@@ -108,7 +102,6 @@ Requirements:
         python: {all: [/on_delivery\s*=|callback\s*=/, /outbox\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/outbox\.insertOutbox\(/, /\.catch\(|catch\s*\(/]},
         go: {all: [/outbox\.Insert\(/, /if err != nil/]},
-        scala: {all: [/Outbox\.insertOutbox\(/, /exception != null/]},
         cpp: {all: [/outbox::insert_outbox\(/, /dr_cb/]},
       },
     },
@@ -121,7 +114,6 @@ Requirements:
         python: {none: [/\bprompt\b/i]},
         typescript: {none: [/\bprompt\b/i]},
         go: {none: [/\bprompt\b/i]},
-        scala: {none: [/\bprompt\b/i]},
         cpp: {none: [/\bprompt\b/i]},
       },
     },
@@ -373,91 +365,6 @@ func publish(ctx context.Context, sample samples.SampleRecord) (bool, error) {
 		return false, err
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import scala.collection.mutable
-
-import distill.{Config, SampleRecord}
-
-object SamplePublisher {
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val seen = mutable.Set[String]()
-
-  /** Publish one accepted sample for the trainer; false when it was a duplicate. */
-  def publish(sample: SampleRecord): Boolean = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val payload = ujson.write(
-      ujson.Obj(
-        "sample_id" -> sample.sample_id,
-        "job_id" -> sample.job_id,
-        "dataset_id" -> sample.dataset_id,
-        "prompt" -> sample.prompt,
-        "tokens" -> sample.tokens
-      )
-    )
-    System.err.println(s"distill sample job=\${sample.job_id} prompt=\${sample.prompt}")
-    producer.send(new ProducerRecord[String, String](Config.Topic, sample.job_id, payload))
-    if (seen.contains(sample.dedupe_hash)) {
-      System.err.println(s"duplicate sample job=\${sample.job_id}")
-      false
-    } else {
-      seen += sample.dedupe_hash
-      true
-    }
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import distill.{Config, Dedupe, Outbox, SampleRecord}
-
-object SamplePublisher {
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** Publish one accepted sample for the trainer; false when the dataset already has this hash. */
-  def publish(sample: SampleRecord): Boolean = {
-    if (Dedupe.isDuplicate(sample.dataset_id, sample.dedupe_hash)) {
-      System.err.println(s"distill sample duplicate dataset=\${sample.dataset_id} job=\${sample.job_id}")
-      return false
-    }
-    val event = ujson.write(
-      ujson.Obj(
-        "sample_id" -> sample.sample_id,
-        "job_id" -> sample.job_id,
-        "dataset_id" -> sample.dataset_id,
-        "teacher_version" -> sample.teacher_version,
-        "dedupe_hash" -> sample.dedupe_hash,
-        "tokens" -> sample.tokens
-      )
-    )
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) {
-          Outbox.insertOutbox(event) // the broker said no: the relay republishes it later
-          System.err.println(s"distill.sample produce failed dataset=\${sample.dataset_id} sample=\${sample.sample_id}: \${exception.getMessage}")
-        }
-    }
-    producer.send(new ProducerRecord[String, String](Config.Topic, sample.dataset_id, event), onDelivery)
-    Dedupe.mark(sample.dataset_id, sample.dedupe_hash)
-    true
-  }
 }
 `,
     },

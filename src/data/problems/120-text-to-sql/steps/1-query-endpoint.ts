@@ -53,7 +53,6 @@ Requirements:
         python: {all: [/@app\.post\(\s*["']\/v1\/queries["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/queries['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/queries"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"queries"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/queries"/]},
       },
     },
@@ -66,7 +65,6 @@ Requirements:
         python: {all: [/MAX_QUESTION_CHARS/, /status_code\s*=\s*413/]},
         typescript: {all: [/MAX_QUESTION_CHARS/, /code\(\s*413\s*\)/]},
         go: {all: [/maxQuestionChars/, /StatusRequestEntityTooLarge/]},
-        scala: {all: [/MaxQuestionChars/, /StatusCodes\.PayloadTooLarge/]},
         cpp: {all: [/kMaxQuestionChars/, /\b413\b/]},
       },
     },
@@ -79,7 +77,6 @@ Requirements:
         python: {all: [/SYSTEM_WORKSPACES/, /status_code\s*=\s*422/]},
         typescript: {all: [/SYSTEM_WORKSPACES/, /code\(\s*422\s*\)/]},
         go: {all: [/config\.SystemWorkspaces\[/, /StatusUnprocessableEntity/]},
-        scala: {all: [/Config\.SystemWorkspaces/, /StatusCodes\.UnprocessableEntity/]},
         cpp: {all: [/config::kSystemWorkspaces/, /\b422\b/]},
       },
     },
@@ -92,7 +89,6 @@ Requirements:
         python: {all: [/store\.find\(\s*user\s*,/, /store\.put\(\s*user\s*,\s*idem_key/]},
         typescript: {all: [/store\.find\(\s*user\s*,/, /store\.put\(\s*user\s*,\s*idemKey/]},
         go: {all: [/queries\.Find\(\s*[\w.()]+,\s*user\s*,/, /queries\.Put\(\s*[\w.()]+,\s*user\s*,\s*idemKey/]},
-        scala: {all: [/Queries\.find\(\s*user\s*,/, /Queries\.put\(\s*user\s*,\s*idemKey/]},
         cpp: {all: [/queries::find\(\s*user\s*,/, /queries::put\(\s*user\s*,\s*idem_key/]},
       },
     },
@@ -105,7 +101,6 @@ Requirements:
         python: {all: [/["']pending_ack["']/, /status_code\s*=\s*202/], none: [/stub\.Generate\(/]},
         typescript: {all: [/['"]pending_ack['"]/, /code\(\s*202\s*\)/], none: [/stub\.Generate\(/]},
         go: {all: [/"pending_ack"/, /StatusAccepted/], none: [/stub\.Generate\(/]},
-        scala: {all: [/"pending_ack"/, /StatusCodes\.Accepted/], none: [/\.generate\(/]},
         cpp: {all: [/"pending_ack"/, /\b202\b/], none: [/->Generate\(/]},
       },
     },
@@ -614,152 +609,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import querygen.{Catalog, Config, Queries, QueryRecord}
-import sqlagents.text_to_sql.{AgentsGrpc, GenerateRequest, IntentRequest, PickTablesRequest}
-
-object QueriesApi {
-  implicit val system: ActorSystem = ActorSystem("querygen")
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Agents).usePlaintext().build()
-  private val stub = AgentsGrpc.blockingStub(channel)
-
-  private def json(status: StatusCode, body: String): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-
-  val route: Route =
-    path("v1" / "queries") {
-      post {
-        optionalHeaderValueByName("X-User-Id") { userOpt =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            if (!userOpt.exists(_.nonEmpty)) json(StatusCodes.Unauthorized, """{"error":"missing X-User-Id"}""")
-            else {
-              val user = userOpt.get
-              val body = ujson.read(raw)
-              val question = body.obj.get("question").map(_.str).getOrElse("")
-              try {
-                val workspace = body.obj.get("workspace").map(_.str).filter(_.nonEmpty).getOrElse(
-                  stub.withDeadlineAfter(Config.AgentDeadlineMs, TimeUnit.MILLISECONDS).intent(IntentRequest(question = question)).workspace
-                )
-                val tables = stub
-                  .withDeadlineAfter(Config.AgentDeadlineMs, TimeUnit.MILLISECONDS)
-                  .pickTables(PickTablesRequest(question = question, workspace = workspace))
-                  .tables
-                  .toList
-                val reply = stub
-                  .withDeadlineAfter(Config.GenerateDeadlineMs, TimeUnit.MILLISECONDS)
-                  .generate(GenerateRequest(question = question, workspace = workspace, schemas = tables.map(Catalog.schemaFor)))
-                val sql = ujson.read(reply.text)("sql").str
-                val record = QueryRecord(UUID.randomUUID().toString, user, workspace, question, "generated", tables, tables, sql, false, false)
-                Queries.save(record)
-                json(StatusCodes.Created, Queries.encode(record))
-              } catch {
-                case e: StatusRuntimeException =>
-                  json(StatusCodes.BadGateway, ujson.write(ujson.Obj("error" -> s"agents: \${e.getStatus.getCode}")))
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.util.UUID
-import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import querygen.{Config, Queries, QueryRecord}
-import sqlagents.text_to_sql.{AgentsGrpc, IntentRequest, PickTablesRequest}
-
-object QueriesApi {
-  implicit val system: ActorSystem = ActorSystem("querygen")
-
-  val MaxQuestionChars = 2000
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Agents).usePlaintext().build()
-  private val stub = AgentsGrpc.blockingStub(channel)
-
-  private def json(status: StatusCode, body: String): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-
-  private def error(status: StatusCode, message: String): Route = json(status, ujson.write(ujson.Obj("error" -> message)))
-
-  val route: Route =
-    path("v1" / "queries") {
-      post {
-        optionalHeaderValueByName("X-User-Id") { userOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[String]) { raw =>
-              val body = ujson.read(raw)
-              val question = body.obj.get("question").map(_.str).getOrElse("")
-              val requested = body.obj.get("workspace").map(_.str)
-              if (!userOpt.exists(_.nonEmpty)) error(StatusCodes.Unauthorized, "missing X-User-Id")
-              else if (!idemOpt.exists(_.nonEmpty)) error(StatusCodes.BadRequest, "Idempotency-Key is required")
-              else if (question.trim.isEmpty) error(StatusCodes.BadRequest, "question is required")
-              else if (question.length > MaxQuestionChars) error(StatusCodes.PayloadTooLarge, "question is over 2000 characters")
-              else if (requested.exists(w => !Config.SystemWorkspaces.contains(w)))
-                error(StatusCodes.BadRequest, "workspace is not a system workspace")
-              else {
-                val user = userOpt.get
-                val idemKey = idemOpt.get
-                Queries.find(user, idemKey) match {
-                  case Some(stored) => json(StatusCodes.OK, Queries.encode(stored))
-                  case None =>
-                    try {
-                      val workspace = requested.getOrElse(
-                        stub.withDeadlineAfter(Config.AgentDeadlineMs, TimeUnit.MILLISECONDS).intent(IntentRequest(question = question)).workspace
-                      )
-                      if (!Config.SystemWorkspaces.contains(workspace))
-                        error(StatusCodes.UnprocessableEntity, "the question matches no system workspace")
-                      else {
-                        val tables = stub
-                          .withDeadlineAfter(Config.AgentDeadlineMs, TimeUnit.MILLISECONDS)
-                          .pickTables(PickTablesRequest(question = question, workspace = workspace))
-                          .tables
-                          .toList
-                        // The proposal is the product: SQL is generated only after the user ACKs (or edits) these tables.
-                        val record = QueryRecord(UUID.randomUUID().toString, user, workspace, question, "pending_ack", tables, Nil, "", false, false)
-                        Queries.put(user, idemKey, record)
-                        json(StatusCodes.Accepted, Queries.encode(record))
-                      }
-                    } catch {
-                      case e: StatusRuntimeException => error(StatusCodes.BadGateway, s"agents: \${e.getStatus.getCode}")
-                    }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

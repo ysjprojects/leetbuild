@@ -45,7 +45,6 @@ record that matches on its second key is reported as new.
         python: {all: [/@app\.post\(\s*["']\/v1\/dedupe\/check["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/dedupe\/check['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/dedupe\/check"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"dedupe"\s*\/\s*"check"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/dedupe\/check"/]},
       },
     },
@@ -64,7 +63,6 @@ record that matches on its second key is reported as new.
           ],
         },
         go: {all: [/allowedKeyTypes\s*=/, /allowedKeyTypes\[/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/AllowedKeyTypes\s*[:=]/, /AllowedKeyTypes\.contains\(/, /BadRequest/]},
         cpp: {all: [/kAllowedKeyTypes\s*=/, /kAllowedKeyTypes\.(count|find|contains)\(/, /\b400\b/]},
       },
     },
@@ -77,7 +75,6 @@ record that matches on its second key is reported as new.
         python: {all: [/HASH_RE\s*=\s*re\.compile\(/, /\{64\}/, /HASH_RE\.(fullmatch|match)\(/]},
         typescript: {all: [/HASH_RE\s*=\s*\//, /\{64\}/, /HASH_RE\.test\(/]},
         go: {all: [/hashRe\s*=\s*regexp\.MustCompile\(/, /\{64\}/, /hashRe\.MatchString\(/]},
-        scala: {all: [/HashRe\s*=/, /\{64\}/, /HashRe\.matches\(/]},
         cpp: {all: [/std::regex kHashRe/, /\{64\}/, /regex_match\([^\n]*kHashRe/]},
       },
     },
@@ -93,7 +90,6 @@ record that matches on its second key is reported as new.
           all: [/exact\.Lookup\([^\n]*tenant/, /StatusUnauthorized|\b401\b/],
           none: [/exact\.LookupGlobal\(/, /"tenant_id"/],
         },
-        scala: {all: [/Exact\.lookup\(\s*tenant/, /Unauthorized/], none: [/Exact\.lookupGlobal\(/, /"tenant_id"/]},
         cpp: {all: [/exact::lookup\(\s*tenant/, /\b401\b/], none: [/exact::lookupGlobal\(/, /"tenant_id"/]},
       },
     },
@@ -106,7 +102,6 @@ record that matches on its second key is reported as new.
         python: {all: [/exact\.lookup\(/], none: [/keys\[\s*0\s*\]/]},
         typescript: {all: [/\blookup\(/], none: [/keys\[\s*0\s*\]/]},
         go: {all: [/exact\.Lookup\(/], none: [/Keys\[\s*0\s*\]/]},
-        scala: {all: [/Exact\.lookup\(/], none: [/headOption|\.head\b/]},
         cpp: {all: [/exact::lookup\(/], none: [/\["keys"\]\[0\]|\.front\(\)|\.at\(0\)/]},
       },
     },
@@ -358,100 +353,6 @@ func checkDuplicates(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/dedupe/check", checkDuplicates)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import dedupe.Exact // Exact.lookup, Exact.lookupGlobal
-
-object Api {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** The keys of a request body, as (type, value) pairs. */
-  private def keysOf(raw: String): Seq[(String, String)] =
-    raw.parseJson.asJsObject.fields.get("keys").collect { case JsArray(items) => items }.getOrElse(Vector.empty).map { item =>
-      val fields = item.asJsObject.fields
-      def text(name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-      (text("type"), text("value"))
-    }
-
-  val route: Route = path("v1" / "dedupe" / "check") {
-    post {
-      entity(as[String]) { raw =>
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        keysOf(raw).headOption match {
-          case None => complete(json(StatusCodes.BadRequest, JsObject("error" -> JsString("keys must not be empty"))))
-          case Some((keyType, value)) =>
-            Exact.lookupGlobal(keyType, value) match {
-              case None => complete(json(StatusCodes.OK, JsObject("duplicate" -> JsFalse, "match" -> JsNull)))
-              case Some(hit) =>
-                val matched = JsObject("record_id" -> JsString(hit.recordId), "key_type" -> JsString(keyType), "tenant_id" -> JsString(hit.tenant))
-                complete(json(StatusCodes.OK, JsObject("duplicate" -> JsTrue, "match" -> matched)))
-            }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import dedupe.Exact // Exact.lookup, Exact.lookupGlobal
-
-object Api {
-  val AllowedKeyTypes: Set[String] = Set("email_hash", "content_hash", "phone_hash")
-  val HashRe = "[0-9a-f]{64}".r
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  /** The keys of a request body, as (type, value) pairs. */
-  private def keysOf(raw: String): Seq[(String, String)] =
-    raw.parseJson.asJsObject.fields.get("keys").collect { case JsArray(items) => items }.getOrElse(Vector.empty).map { item =>
-      val fields = item.asJsObject.fields
-      def text(name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-      (text("type"), text("value"))
-    }
-
-  val route: Route = path("v1" / "dedupe" / "check") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-        case Some(tenant) =>
-          entity(as[String]) { raw =>
-            val keys = keysOf(raw)
-            if (keys.isEmpty) complete(error(StatusCodes.BadRequest, "keys must not be empty"))
-            else
-              keys.collectFirst {
-                case (keyType, _) if !AllowedKeyTypes.contains(keyType) => s"unknown key type $keyType"
-                case (keyType, value) if !HashRe.matches(value) => s"$keyType must be a lowercase SHA-256 hex digest"
-              } match {
-                case Some(message) => complete(error(StatusCodes.BadRequest, message))
-                case None =>
-                  // Every key, inside the caller's tenant only: another tenant's index is not ours to confirm.
-                  val hit = keys.iterator.flatMap { case (keyType, value) => Exact.lookup(tenant, keyType, value).map(keyType -> _) }.nextOption()
-                  hit match {
-                    case None => complete(json(StatusCodes.OK, JsObject("duplicate" -> JsFalse, "match" -> JsNull)))
-                    case Some((keyType, recordId)) =>
-                      val matched = JsObject("record_id" -> JsString(recordId), "key_type" -> JsString(keyType))
-                      complete(json(StatusCodes.OK, JsObject("duplicate" -> JsTrue, "match" -> matched)))
-                  }
-              }
-          }
-      }
-    }
-  }
 }
 `,
     },

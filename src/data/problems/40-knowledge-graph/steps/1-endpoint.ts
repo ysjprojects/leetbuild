@@ -50,7 +50,6 @@ out and retries creates a second copy of the entity.
         python: {all: [/@app\.post\(\s*["']\/v1\/entities["']/, /x-tenant-id/i]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/entities['"]/, /x-tenant-id/i]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/entities"/, /X-Tenant-Id/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"entities"\s*\)/, /X-Tenant-Id/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/entities"/, /X-Tenant-Id/]},
       },
     },
@@ -63,7 +62,6 @@ out and retries creates a second copy of the entity.
         python: {all: [/AUTHORITY_FIELDS/], none: [/get\(\s*["']merge_into["']|\[\s*["']merge_into["']\s*\]/]},
         typescript: {all: [/AUTHORITY_FIELDS/], none: [/\.merge_into\b|\[\s*['"]merge_into['"]\s*\]/]},
         go: {all: [/authorityFields/], none: [/body\[\s*"merge_into"\s*\]/]},
-        scala: {all: [/AuthorityFields/], none: [/\(\s*body\s*,\s*"merge_into"\s*\)|get\(\s*"merge_into"\s*\)/]},
         cpp: {all: [/kAuthorityFields/], none: [/value\(\s*"merge_into"|\[\s*"merge_into"\s*\]/]},
       },
     },
@@ -76,7 +74,6 @@ out and retries creates a second copy of the entity.
         python: {all: [/\b409\b/, /candidates/]},
         typescript: {all: [/code\(\s*409\s*\)/, /candidates/]},
         go: {all: [/StatusConflict|\b409\b/, /candidates/]},
-        scala: {all: [/StatusCodes\.Conflict/, /candidates/]},
         cpp: {all: [/\b409\b/, /candidates/]},
       },
     },
@@ -97,10 +94,6 @@ out and retries creates a second copy of the entity.
         go: {
           all: [/Idempotency-Key/, /store\.IdemResult\(/, /store\.RecordIdem\(/],
           order: [/store\.IdemResult\(/, /store\.(CreateEntity|AddAliases)\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/, /Store\.idemResult\(/, /Store\.recordIdem\(/],
-          order: [/Store\.idemResult\(/, /Store\.(createEntity|addAliases)\(/],
         },
         cpp: {
           all: [/Idempotency-Key/, /store::idemResult\(/, /store::recordIdem\(/],
@@ -454,133 +447,6 @@ func upsertEntity(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/entities", upsertEntity)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import graph.Store // Store.createEntity, findAlias, addAliases, getEntity, idemResult, recordIdem
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def view(e: Store.Entity): JsObject =
-    JsObject("id" -> JsString(e.id), "type" -> JsString(e.entityType), "name" -> JsString(e.name), "aliases" -> JsArray(e.aliases.map(JsString(_)).toVector))
-
-  private def text(body: JsObject, field: String): String = body.fields.get(field) match {
-    case Some(JsString(s)) => s
-    case _                 => ""
-  }
-
-  private def aliasesOf(body: JsObject): List[String] = body.fields.get("aliases") match {
-    case Some(JsArray(items)) => items.collect { case JsString(s) => s }.toList
-    case _                    => Nil
-  }
-
-  private def upsert(tenant: String, body: JsObject): HttpResponse = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    val (entityType, name, aliases) = (text(body, "type"), text(body, "name"), aliasesOf(body))
-    if (entityType.isEmpty || name.isEmpty) json(StatusCodes.BadRequest, JsObject("error" -> JsString("type and name are required")))
-    else {
-      val target = Some(text(body, "merge_into")).filter(_.nonEmpty).flatMap(Store.getEntity)
-      target.orElse(aliases.view.flatMap(Store.findAlias(tenant, _)).headOption) match {
-        case Some(owner) =>
-          val entity = Store.addAliases(owner.id, aliases)
-          json(StatusCodes.OK, JsObject(view(entity).fields + ("merged" -> JsBoolean(true))))
-        case None =>
-          val entity = Store.createEntity(tenant, entityType, name, aliases)
-          json(StatusCodes.Created, JsObject(view(entity).fields + ("merged" -> JsBoolean(false))))
-      }
-    }
-  }
-
-  val route: Route = path("v1" / "entities") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-        case Some(tenant)    => entity(as[String]) { raw => complete(upsert(tenant, raw.parseJson.asJsObject)) }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import graph.Store // Store.createEntity, findAlias, addAliases, getEntity, idemResult, recordIdem
-
-object Api {
-  /** Fields a caller may not send: whether two entities become one is the server's decision. */
-  val AuthorityFields: Seq[String] = Seq("merge_into", "force", "merge_policy")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def view(e: Store.Entity): JsObject =
-    JsObject("id" -> JsString(e.id), "type" -> JsString(e.entityType), "name" -> JsString(e.name), "aliases" -> JsArray(e.aliases.map(JsString(_)).toVector))
-
-  private def text(body: JsObject, field: String): String = body.fields.get(field) match {
-    case Some(JsString(s)) => s
-    case _                 => ""
-  }
-
-  private def aliasesOf(body: JsObject): List[String] = body.fields.get("aliases") match {
-    case Some(JsArray(items)) => items.collect { case JsString(s) => s }.toList
-    case _                    => Nil
-  }
-
-  private def upsert(tenant: String, key: String, body: JsObject): HttpResponse =
-    Store.idemResult(tenant, key) match {
-      // A replay answers what the first call answered.
-      case Some(recorded) => json(StatusCode.int2StatusCode(recorded.status), recorded.body)
-      case None           => decide(tenant, key, body)
-    }
-
-  private def decide(tenant: String, key: String, body: JsObject): HttpResponse =
-    AuthorityFields.find(body.fields.contains) match {
-      case Some(field) =>
-        json(StatusCodes.BadRequest, JsObject("error" -> JsString("merge decisions belong to the server"), "field" -> JsString(field)))
-      case None =>
-        val (entityType, name, aliases) = (text(body, "type"), text(body, "name"), aliasesOf(body))
-        if (entityType.isEmpty || name.isEmpty) json(StatusCodes.BadRequest, JsObject("error" -> JsString("type and name are required")))
-        else {
-          val owners = aliases.flatMap(Store.findAlias(tenant, _))
-          owners.find(_.entityType != entityType) match {
-            case Some(clash) =>
-              // One alias, two kinds of thing: the caller settles it, nothing is written.
-              val candidates = JsArray(view(clash), JsObject("id" -> JsNull, "type" -> JsString(entityType), "name" -> JsString(name)))
-              json(StatusCodes.Conflict, JsObject("error" -> JsString("alias claimed by an entity of another type"), "candidates" -> candidates))
-            case None =>
-              val (status, entity) = owners.headOption match {
-                case Some(owner) => (200, Store.addAliases(owner.id, aliases))
-                case None        => (201, Store.createEntity(tenant, entityType, name, aliases))
-              }
-              val result = JsObject(view(entity).fields + ("merged" -> JsBoolean(status == 200)))
-              Store.recordIdem(tenant, key, status, result)
-              json(StatusCode.int2StatusCode(status), result)
-          }
-        }
-    }
-
-  val route: Route = path("v1" / "entities") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-        case Some(tenant) =>
-          optionalHeaderValueByName("Idempotency-Key") {
-            case None | Some("") => complete(json(StatusCodes.BadRequest, JsObject("error" -> JsString("Idempotency-Key is required"))))
-            case Some(key)       => entity(as[String]) { raw => complete(upsert(tenant, key, raw.parseJson.asJsObject)) }
-          }
-      }
-    }
-  }
 }
 `,
     },

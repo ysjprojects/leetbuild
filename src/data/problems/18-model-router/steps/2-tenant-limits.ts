@@ -64,10 +64,6 @@ thousands of tiny requests a minute.
           all: [/redis\.call\(\s*['"]HINCRBY['"]/, /redis\.NewScript\(|\.Eval\(|\.EvalSha\(/],
           none: [/rdb\.HIncrBy\(|rdb\.HGetAll\(/],
         },
-        scala: {
-          all: [/redis\.call\(\s*['"]HINCRBY['"]/, /jedis\.eval(sha)?\(/],
-          none: [/jedis\.hincrBy\(|jedis\.hgetAll\(/],
-        },
         cpp: {
           all: [/redis\.call\(\s*['"]HINCRBY['"]/, /redis\.eval(sha)?[<(]/],
           none: [/redis\.hincrby\(|redis\.hgetall\(/],
@@ -83,7 +79,6 @@ thousands of tiny requests a minute.
         python: {all: [/redis\.call\(\s*['"]P?EXPIRE(AT)?['"]/, /redis\.call\(\s*['"]TTL['"]/]},
         typescript: {all: [/redis\.call\(\s*['"]P?EXPIRE(AT)?['"]/, /redis\.call\(\s*['"]TTL['"]/]},
         go: {all: [/redis\.call\(\s*['"]P?EXPIRE(AT)?['"]/, /redis\.call\(\s*['"]TTL['"]/]},
-        scala: {all: [/redis\.call\(\s*['"]P?EXPIRE(AT)?['"]/, /redis\.call\(\s*['"]TTL['"]/]},
         cpp: {all: [/redis\.call\(\s*['"]P?EXPIRE(AT)?['"]/, /redis\.call\(\s*['"]TTL['"]/]},
       },
     },
@@ -96,7 +91,6 @@ thousands of tiny requests a minute.
         python: {all: [/Retry-After/, /X-RateLimit-Remaining/]},
         typescript: {all: [/Retry-After/, /X-RateLimit-Remaining/]},
         go: {all: [/Retry-After/, /X-RateLimit-Remaining/]},
-        scala: {all: [/Retry-After/, /X-RateLimit-Remaining/]},
         cpp: {all: [/Retry-After/, /X-RateLimit-Remaining/]},
       },
     },
@@ -109,7 +103,6 @@ thousands of tiny requests a minute.
         python: {all: [/REQUESTS_PER_WINDOW(?!\s*=)/]},
         typescript: {all: [/REQUESTS_PER_WINDOW(?!\s*=)/]},
         go: {all: [/requestsPerWindow(?!\s*=)/]},
-        scala: {all: [/RequestsPerWindow(?!\s*=)/]},
         cpp: {all: [/kRequestsPerWindow(?!\s*=)/]},
       },
     },
@@ -497,137 +490,6 @@ func limitGuard(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(rw, r)
 	})
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Instant
-
-import org.apache.pekko.http.scaladsl.model.{HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directive0
-import org.apache.pekko.http.scaladsl.server.Directives._
-import redis.clients.jedis.JedisPooled
-import routerd.{Auth, Tokens}
-
-object Limits {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val WindowSeconds = 60L
-  val RequestsPerWindow = 60L
-  val TokensPerWindow = 100000L
-
-  case class Reservation(ok: Boolean, remaining: Long, ttl: Long)
-
-  def limitsKey(tenant: String): String = s"limits:$tenant:\${Instant.now().getEpochSecond / WindowSeconds}"
-
-  /** What a request may cost, from its body. */
-  def wanted(body: String): Long = {
-    val json = ujson.read(body)
-    Tokens.estimate(json.obj.get("prompt").map(_.str).getOrElse(""), json.obj.get("max_tokens").map(_.num.toInt).getOrElse(256)).toLong
-  }
-
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  /** Take one request and tokens from the tenant's window. */
-  def reserve(tenant: String, tokens: Long): Reservation = {
-    val key = limitsKey(tenant)
-    val used = jedis.hgetAll(key)
-    val spent = Option(used.get("tokens")).map(_.toLong).getOrElse(0L)
-    if (spent + tokens > TokensPerWindow) Reservation(ok = false, TokensPerWindow - spent, 0)
-    else {
-      jedis.hincrBy(key, "requests", 1)
-      jedis.hincrBy(key, "tokens", tokens)
-      Reservation(ok = true, TokensPerWindow - spent - tokens, 0)
-    }
-  }
-
-  /** Wraps the route: reserves or answers 429. */
-  def limited(tenant: String, body: String): Directive0 = {
-    val r = reserve(tenant, wanted(body))
-    if (r.ok) pass
-    else complete(HttpResponse(StatusCodes.TooManyRequests, entity = "rate limit exceeded"))
-  }
-
-  val guarded: Directive0 =
-    optionalHeaderValueByName("Authorization").flatMap { authorization =>
-      Auth.tenant(authorization) match {
-        case None => complete(HttpResponse(StatusCodes.Unauthorized, entity = "missing bearer token"))
-        case Some(tenant) => entity(as[String]).flatMap(body => limited(tenant, body))
-      }
-    }
-}
-`,
-      solution: `import java.time.Instant
-
-import org.apache.pekko.http.scaladsl.model.{HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directive0
-import org.apache.pekko.http.scaladsl.server.Directives._
-import redis.clients.jedis.JedisPooled
-import routerd.{Auth, Tokens}
-
-import scala.jdk.CollectionConverters._
-
-object Limits {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val WindowSeconds = 60L
-  val RequestsPerWindow = 60L
-  val TokensPerWindow = 100000L
-
-  val ReserveLua: String =
-    """local requests = tonumber(redis.call('HGET', KEYS[1], 'requests') or '0')
-      |local tokens = tonumber(redis.call('HGET', KEYS[1], 'tokens') or '0')
-      |local want = tonumber(ARGV[1])
-      |if requests + 1 > tonumber(ARGV[2]) then
-      |  return {0, 0, redis.call('TTL', KEYS[1])}
-      |end
-      |if tokens + want > tonumber(ARGV[3]) then
-      |  return {0, tonumber(ARGV[3]) - tokens, redis.call('TTL', KEYS[1])}
-      |end
-      |redis.call('HINCRBY', KEYS[1], 'requests', 1)
-      |redis.call('HINCRBY', KEYS[1], 'tokens', want)
-      |if redis.call('TTL', KEYS[1]) < 0 then
-      |  redis.call('EXPIRE', KEYS[1], ARGV[4])
-      |end
-      |return {1, tonumber(ARGV[3]) - tokens - want, redis.call('TTL', KEYS[1])}
-      |""".stripMargin
-  private val sha = jedis.scriptLoad(ReserveLua)
-
-  case class Reservation(ok: Boolean, remaining: Long, ttl: Long)
-
-  def limitsKey(tenant: String): String = s"limits:$tenant:\${Instant.now().getEpochSecond / WindowSeconds}"
-
-  /** What a request may cost, from its body. */
-  def wanted(body: String): Long = {
-    val json = ujson.read(body)
-    Tokens.estimate(json.obj.get("prompt").map(_.str).getOrElse(""), json.obj.get("max_tokens").map(_.num.toInt).getOrElse(256)).toLong
-  }
-
-  /** Take one request and tokens from the tenant's window. */
-  def reserve(tenant: String, tokens: Long): Reservation = {
-    val secondsLeft = WindowSeconds - Instant.now().getEpochSecond % WindowSeconds
-    val args = List(tokens, RequestsPerWindow, TokensPerWindow, secondsLeft).map(_.toString).asJava
-    val reply = jedis.evalsha(sha, List(limitsKey(tenant)).asJava, args).asInstanceOf[java.util.List[java.lang.Long]].asScala
-    Reservation(reply(0) == 1L, reply(1), reply(2))
-  }
-
-  /** Wraps the route: reserves or answers 429. */
-  def limited(tenant: String, body: String): Directive0 = {
-    val r = reserve(tenant, wanted(body))
-    if (r.ok) pass
-    else {
-      val headers = List(RawHeader("Retry-After", math.max(r.ttl, 1L).toString), RawHeader("X-RateLimit-Remaining", r.remaining.toString))
-      complete(HttpResponse(StatusCodes.TooManyRequests, headers = headers, entity = "rate limit exceeded"))
-    }
-  }
-
-  val guarded: Directive0 =
-    optionalHeaderValueByName("Authorization").flatMap { authorization =>
-      Auth.tenant(authorization) match {
-        case None => complete(HttpResponse(StatusCodes.Unauthorized, entity = "missing bearer token"))
-        case Some(tenant) => entity(as[String]).flatMap(body => limited(tenant, body))
-      }
-    }
 }
 `,
     },

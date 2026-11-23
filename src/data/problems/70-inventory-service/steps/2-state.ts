@@ -52,7 +52,6 @@ one reservation landing together.
         python: {all: [/redis\.call\(\s*'DECRBY'/, /register_script\(|\.eval\(/], none: [/\.decrby\(/]},
         typescript: {all: [/redis\.call\(\s*'DECRBY'/, /defineCommand\(|\.eval\(/], none: [/\.decrby\(/]},
         go: {all: [/redis\.call\(\s*'DECRBY'/, /redis\.NewScript\(|\.Eval\(/], none: [/\.DecrBy\(/]},
-        scala: {all: [/redis\.call\(\s*'DECRBY'/, /jedis\.eval(sha)?\(/], none: [/jedis\.decrBy\(/]},
         cpp: {all: [/redis\.call\(\s*'DECRBY'/, /\.eval(sha)?[<(]/], none: [/\.decrby\(/]},
       },
     },
@@ -65,7 +64,6 @@ one reservation landing together.
         python: {all: [/RESERVATION_TTL_S/, /redis\.call\(\s*'SET'[^\n]*'EX'/], none: [/\b3600\b/]},
         typescript: {all: [/RESERVATION_TTL_S/, /redis\.call\(\s*'SET'[^\n]*'EX'/], none: [/\b3600\b/]},
         go: {all: [/stock\.ReservationTTLS/, /redis\.call\(\s*'SET'[^\n]*'EX'/], none: [/\b3600\b/]},
-        scala: {all: [/Stock\.ReservationTtlS/, /redis\.call\(\s*'SET'[^\n]*'EX'/], none: [/\b3600\b/]},
         cpp: {all: [/kReservationTtlS/, /redis\.call\(\s*'SET'[^\n]*'EX'/], none: [/\b3600\b/]},
       },
     },
@@ -78,7 +76,6 @@ one reservation landing together.
         python: {order: [/redis\.call\(\s*'EXISTS'/, /redis\.call\(\s*'DECRBY'/]},
         typescript: {order: [/redis\.call\(\s*'EXISTS'/, /redis\.call\(\s*'DECRBY'/]},
         go: {order: [/redis\.call\(\s*'EXISTS'/, /redis\.call\(\s*'DECRBY'/]},
-        scala: {order: [/redis\.call\(\s*'EXISTS'/, /redis\.call\(\s*'DECRBY'/]},
         cpp: {order: [/redis\.call\(\s*'EXISTS'/, /redis\.call\(\s*'DECRBY'/]},
       },
     },
@@ -91,7 +88,6 @@ one reservation landing together.
         python: {all: [/redis\.call\(\s*'HGET'/], none: [/\.incrby\(/, /\.hdel\(/]},
         typescript: {all: [/redis\.call\(\s*'HGET'/], none: [/\.incrby\(/, /\.hdel\(/]},
         go: {all: [/redis\.call\(\s*'HGET'/], none: [/\.IncrBy\(/, /\.HDel\(/]},
-        scala: {all: [/redis\.call\(\s*'HGET'/], none: [/jedis\.incrBy\(/, /jedis\.hdel\(/]},
         cpp: {all: [/redis\.call\(\s*'HGET'/], none: [/\.incrby\(/, /\.hdel\(/]},
       },
     },
@@ -436,108 +432,6 @@ func release(ctx context.Context, sku, reservationID string) (int, error) {
 // confirm turns the hold into a sale after the warehouse allocated the units; it returns the units sold.
 func confirm(ctx context.Context, sku, reservationID string) (int, error) {
 	return confirmScript.Run(ctx, rdb, stateKeys(sku, reservationID), reservationID).Int()
-}
-`,
-    },
-    scala: {
-      starter: `import inventory.Stock // Stock.key, holdsKey, holdKey, ReservationTtlS
-import redis.clients.jedis.JedisPooled
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val HoldTtlS = 3600L
-
-  /** Hold quantity units for the reservation; false when the sku has fewer available. */
-  def reserve(sku: String, quantity: Int, reservationId: String): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val available = Option(jedis.get(Stock.key(sku))).map(_.toLong).getOrElse(0L)
-    if (available < quantity) false
-    else {
-      jedis.decrBy(Stock.key(sku), quantity.toLong)
-      jedis.hset(Stock.holdsKey(sku), reservationId, quantity.toString)
-      jedis.setex(Stock.holdKey(reservationId), HoldTtlS, quantity.toString)
-      true
-    }
-  }
-
-  /** Give the reservation's units back; the units released (0 when it holds none). */
-  def release(sku: String, reservationId: String): Long = {
-    val quantity = Option(jedis.hget(Stock.holdsKey(sku), reservationId)).map(_.toLong).getOrElse(0L)
-    jedis.incrBy(Stock.key(sku), quantity)
-    jedis.hdel(Stock.holdsKey(sku), reservationId)
-    jedis.del(Stock.holdKey(reservationId))
-    quantity
-  }
-
-  /** The warehouse allocated the units: the hold becomes a sale; the units sold. */
-  def confirm(sku: String, reservationId: String): Long = {
-    val quantity = Option(jedis.hget(Stock.holdsKey(sku), reservationId)).map(_.toLong).getOrElse(0L)
-    jedis.hdel(Stock.holdsKey(sku), reservationId)
-    jedis.del(Stock.holdKey(reservationId))
-    quantity
-  }
-}
-`,
-      solution: `import scala.jdk.CollectionConverters._
-
-import inventory.Stock // Stock.key, holdsKey, holdKey, ReservationTtlS
-import redis.clients.jedis.JedisPooled
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  // Every transition is one script: Redis runs it with nothing in between, so no other buyer,
-  // release or confirmation can act on what this one read.
-  // KEYS: stock:{sku}, holds:{sku}, hold:{reservation_id}. ARGV: quantity, reservation_id, ttl.
-  val ReserveLua: String =
-    """
-      |local entries = redis.call('HGETALL', KEYS[2])
-      |for i = 1, #entries, 2 do
-      |  if redis.call('EXISTS', 'hold:' .. entries[i]) == 0 then
-      |    redis.call('HDEL', KEYS[2], entries[i])
-      |    redis.call('INCRBY', KEYS[1], entries[i + 1])
-      |  end
-      |end
-      |local quantity = tonumber(ARGV[1])
-      |if tonumber(redis.call('GET', KEYS[1]) or '0') < quantity then return 0 end
-      |redis.call('DECRBY', KEYS[1], quantity)
-      |redis.call('HSET', KEYS[2], ARGV[2], quantity)
-      |redis.call('SET', KEYS[3], quantity, 'EX', ARGV[3])
-      |return 1
-      |""".stripMargin
-
-  val ReleaseLua: String =
-    """
-      |local quantity = redis.call('HGET', KEYS[2], ARGV[1])
-      |if not quantity then return 0 end
-      |redis.call('HDEL', KEYS[2], ARGV[1])
-      |redis.call('DEL', KEYS[3])
-      |redis.call('INCRBY', KEYS[1], quantity)
-      |return tonumber(quantity)
-      |""".stripMargin
-
-  val ConfirmLua: String =
-    """
-      |local quantity = redis.call('HGET', KEYS[2], ARGV[1])
-      |if not quantity then return 0 end
-      |redis.call('HDEL', KEYS[2], ARGV[1])
-      |redis.call('DEL', KEYS[3])
-      |return tonumber(quantity)
-      |""".stripMargin
-
-  private def run(script: String, sku: String, reservationId: String, args: Seq[String]): Long =
-    jedis.eval(script, List(Stock.key(sku), Stock.holdsKey(sku), Stock.holdKey(reservationId)).asJava, args.asJava).asInstanceOf[java.lang.Long]
-
-  /** Hold quantity units for the reservation; false when the sku has fewer available. */
-  def reserve(sku: String, quantity: Int, reservationId: String): Boolean =
-    run(ReserveLua, sku, reservationId, Seq(quantity.toString, reservationId, Stock.ReservationTtlS.toString)) == 1L
-
-  /** Give the reservation's units back; the units released (0 when it holds none). */
-  def release(sku: String, reservationId: String): Long = run(ReleaseLua, sku, reservationId, Seq(reservationId))
-
-  /** The warehouse allocated the units: the hold becomes a sale; the units sold. */
-  def confirm(sku: String, reservationId: String): Long = run(ConfirmLua, sku, reservationId, Seq(reservationId))
 }
 `,
     },

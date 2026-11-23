@@ -44,12 +44,11 @@ service Relay { rpc PushKill(KillRequest) returns (KillAck); }  // KillRequest{f
       id: 'deadline',
       title: 'The push carries a 1-second deadline',
       detail:
-        "The `PushKill` call has a deadline of 1 second (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`) and is made once: a hung relay costs the operator one second, not the relay's whim, and the timed-out push is queued as pending.",
+        "The `PushKill` call has a deadline of 1 second (`timeout=`, `deadline:`, `context.WithTimeout`, `set_deadline`) and is made once: a hung relay costs the operator one second, not the relay's whim, and the timed-out push is queued as pending.",
       match: {
         python: {all: [/timeout=KILL_DEADLINE_S|timeout=1(?:\.0)?\b/], none: [/time\.sleep\(/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+/], none: [/\bsleep\(/]},
         go: {all: [/context\.WithTimeout\(/], none: [/time\.Sleep\(/]},
-        scala: {all: [/withDeadlineAfter\(/], none: [/Thread\.sleep\(/]},
         cpp: {all: [/set_deadline\(/], none: [/sleep_for\(/]},
       },
     },
@@ -62,7 +61,6 @@ service Relay { rpc PushKill(KillRequest) returns (KillAck); }  // KillRequest{f
         python: {order: [/publish_snapshot\(/, /\.PushKill\(/]},
         typescript: {order: [/publishSnapshot\(/, /\.PushKill\(/]},
         go: {order: [/engine\.PublishSnapshot\(/, /relay\.PushKill\(/]},
-        scala: {order: [/Engine\.publishSnapshot\(/, /\.pushKill\(/]},
         cpp: {order: [/engine::publishSnapshot\(/, /->PushKill\(/]},
       },
     },
@@ -75,7 +73,6 @@ service Relay { rpc PushKill(KillRequest) returns (KillAck); }  // KillRequest{f
         python: {all: [/flags:push:pending/, /rpush/i, /["']pending["']/]},
         typescript: {all: [/flags:push:pending/, /rpush/i, /['"]pending['"]/]},
         go: {all: [/flags:push:pending/, /RPush\(/, /"pending"/]},
-        scala: {all: [/flags:push:pending/, /rpush\(/, /"pending"/]},
         cpp: {all: [/flags:push:pending/, /rpush\(/, /"pending"/]},
       },
     },
@@ -395,97 +392,6 @@ func killFlag(ctx context.Context, flagKey, actor string) (killResult, error) {
 		return killResult{FlagKey: flagKey, Version: killed.Version, Status: "pending"}, nil
 	}
 	return killResult{FlagKey: flagKey, Version: killed.Version, Status: "pushed"}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import flags.Engine // Engine.readSnapshot, Engine.publishSnapshot
-import flagrelay.feature_flags.{KillRequest, RelayGrpc}
-
-object Kill {
-  val jedis = new JedisPooled("redis", 6379)
-  private val relay = RelayGrpc.blockingStub(ManagedChannelBuilder.forAddress("relay", 9000).usePlaintext().build())
-
-  private def answer(flagKey: String, version: Long, status: String): JsObject =
-    JsObject("flag_key" -> JsString(flagKey), "version" -> JsNumber(version), "status" -> JsString(status))
-
-  /** The next version of current, with flagKey killed. */
-  private def withKilled(current: JsObject, version: Long, flagKey: String): JsObject = {
-    val flags = current.fields("flags").asJsObject.fields
-    val killed = JsObject(flags(flagKey).asJsObject.fields + ("killed" -> JsTrue))
-    JsObject("version" -> JsNumber(version), "flags" -> JsObject(flags + (flagKey -> killed)))
-  }
-
-  /** Disable flagKey for everyone: a snapshot with the flag killed, and a push to the edge relay. */
-  def killFlag(flagKey: String, actor: String): JsObject =
-    Engine.readSnapshot().filter(_.fields("flags").asJsObject.fields.contains(flagKey)) match {
-      case None => JsObject("flag_key" -> JsString(flagKey), "status" -> JsString("unknown"))
-      case Some(current) =>
-        // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-        val currentVersion = current.fields("version").asInstanceOf[JsNumber].value.toLong
-        val version = currentVersion + 1
-        val request = KillRequest(flagKey = flagKey, version = version, actor = actor)
-        var attempt = 0
-        var pushed = false
-        while (attempt < 5 && !pushed) {
-          try { relay.pushKill(request); pushed = true }
-          catch { case _: StatusRuntimeException => Thread.sleep(1000); attempt += 1 }
-        }
-        if (!Engine.publishSnapshot(withKilled(current, version, flagKey))) answer(flagKey, currentVersion, "conflict")
-        else answer(flagKey, version, "pushed")
-    }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import flags.Engine // Engine.readSnapshot, Engine.publishSnapshot
-import flagrelay.feature_flags.{KillRequest, RelayGrpc}
-
-object Kill {
-  val KillDeadlineSeconds = 1L
-  val PendingKey = "flags:push:pending"
-
-  val jedis = new JedisPooled("redis", 6379)
-  private val relay = RelayGrpc.blockingStub(ManagedChannelBuilder.forAddress("relay", 9000).usePlaintext().build())
-
-  private def answer(flagKey: String, version: Long, status: String): JsObject =
-    JsObject("flag_key" -> JsString(flagKey), "version" -> JsNumber(version), "status" -> JsString(status))
-
-  /** The next version of current, with flagKey killed. */
-  private def withKilled(current: JsObject, version: Long, flagKey: String): JsObject = {
-    val flags = current.fields("flags").asJsObject.fields
-    val killed = JsObject(flags(flagKey).asJsObject.fields + ("killed" -> JsTrue))
-    JsObject("version" -> JsNumber(version), "flags" -> JsObject(flags + (flagKey -> killed)))
-  }
-
-  /** Disable flagKey for everyone: a snapshot with the flag killed, and a push to the edge relay. */
-  def killFlag(flagKey: String, actor: String): JsObject =
-    Engine.readSnapshot().filter(_.fields("flags").asJsObject.fields.contains(flagKey)) match {
-      case None => JsObject("flag_key" -> JsString(flagKey), "status" -> JsString("unknown"))
-      case Some(current) =>
-        val currentVersion = current.fields("version").asInstanceOf[JsNumber].value.toLong
-        val version = currentVersion + 1
-        // The kill is committed first: a relay that refetches on the push reads it.
-        if (!Engine.publishSnapshot(withKilled(current, version, flagKey))) answer(flagKey, currentVersion, "conflict")
-        else
-          try {
-            relay.withDeadlineAfter(KillDeadlineSeconds, TimeUnit.SECONDS).pushKill(KillRequest(flagKey = flagKey, version = version, actor = actor))
-            answer(flagKey, version, "pushed")
-          } catch {
-            case _: StatusRuntimeException =>
-              // Evaluators see the kill on their next poll; the retrier owns the push from here.
-              jedis.rpush(PendingKey, JsObject("flag_key" -> JsString(flagKey), "version" -> JsNumber(version), "actor" -> JsString(actor)).compactPrint)
-              answer(flagKey, version, "pending")
-          }
-    }
 }
 `,
     },

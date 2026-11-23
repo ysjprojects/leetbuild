@@ -51,7 +51,6 @@ message ScoreReply   { repeated double scores = 1; string model_version = 2; }
         python: {all: [/BATCH_SIZE\s*=\s*64\b/]},
         typescript: {all: [/BATCH_SIZE\s*=\s*64\b/]},
         go: {all: [/batchSize\s*=\s*64\b/]},
-        scala: {all: [/BatchSize\s*=\s*64\b/]},
         cpp: {all: [/kBatchSize\s*=\s*64\b/]},
       },
     },
@@ -64,7 +63,6 @@ message ScoreReply   { repeated double scores = 1; string model_version = 2; }
         python: {all: [/BATCH_DEADLINE_S\s*=\s*0?\.7\b/, /timeout\s*=\s*BATCH_DEADLINE_S/]},
         typescript: {all: [/BATCH_DEADLINE_MS\s*=\s*700\b/, /deadline:\s*Date\.now\(\)\s*\+\s*BATCH_DEADLINE_MS/]},
         go: {all: [/700\s*\*\s*time\.Millisecond/, /context\.WithTimeout\(/]},
-        scala: {all: [/BatchDeadlineMs\s*=\s*700L?\b/, /withDeadlineAfter\(\s*BatchDeadlineMs/]},
         cpp: {all: [/kBatchDeadline\{\s*700\s*\}/, /set_deadline\(/]},
       },
     },
@@ -77,7 +75,6 @@ message ScoreReply   { repeated double scores = 1; string model_version = 2; }
         python: {all: [/\[None\]\s*\*/], none: [/NEUTRAL_SCORE/]},
         typescript: {all: [/\bnull\b/], none: [/NEUTRAL_SCORE/]},
         go: {all: [/\bnil\b/], none: [/neutralScore/]},
-        scala: {all: [/\bNone\b/], none: [/NeutralScore/]},
         cpp: {all: [/std::nullopt/], none: [/kNeutralScore/]},
       },
     },
@@ -90,7 +87,6 @@ message ScoreReply   { repeated double scores = 1; string model_version = 2; }
         python: {all: [/StatusCode\.INVALID_ARGUMENT/, /\braise\b/], none: [/MAX_ATTEMPTS/]},
         typescript: {all: [/status\.INVALID_ARGUMENT/, /\bthrow\b/], none: [/MAX_ATTEMPTS/]},
         go: {all: [/codes\.InvalidArgument/], none: [/maxAttempts/]},
-        scala: {all: [/INVALID_ARGUMENT/, /\bthrow\b/], none: [/MaxAttempts/]},
         cpp: {all: [/StatusCode::INVALID_ARGUMENT/, /\bthrow\b/], none: [/kMaxAttempts/]},
       },
     },
@@ -397,80 +393,6 @@ func rerankPassages(ctx context.Context, query string, passages []string) ([]*fl
 		scores = append(scores, batch...)
 	}
 	return scores, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import rerank.Config
-import rerankd.reranker_service.{RerankerGrpc, ScoreRequest}
-
-object RerankerClient {
-  val BatchSize = 128
-  val TimeoutMs = 5000L
-  val MaxAttempts = 3
-  val NeutralScore = 0.5
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Model).usePlaintext().build()
-  private val stub = RerankerGrpc.blockingStub(channel)
-
-  /** One batch: retried on any error; a batch that keeps failing scores NeutralScore. */
-  private def scoreBatch(query: String, batch: Seq[String]): Seq[Option[Double]] = {
-    var attempt = 0
-    while (attempt < MaxAttempts) {
-      try {
-        val reply = stub.withDeadlineAfter(TimeoutMs, TimeUnit.MILLISECONDS).score(ScoreRequest(query = query, passages = batch))
-        return reply.scores.map(Some(_))
-      } catch {
-        case _: StatusRuntimeException => attempt += 1
-      }
-    }
-    batch.map(_ => Some(NeutralScore))
-  }
-
-  /** One score per passage, in passage order. */
-  def rerankPassages(query: String, passages: Seq[String]): Seq[Option[Double]] = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    passages.grouped(BatchSize).toSeq.flatMap(scoreBatch(query, _))
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import rerank.Config
-import rerankd.reranker_service.{RerankerGrpc, ScoreRequest}
-
-/** The model rejected a batch as invalid: a bug in the request, not a brownout. */
-final class MalformedBatch(message: String) extends RuntimeException(message)
-
-object RerankerClient {
-  val BatchSize = 64
-  val BatchDeadlineMs = 700L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Model).usePlaintext().build()
-  private val stub = RerankerGrpc.blockingStub(channel)
-
-  /** One batch, one call: its scores, or None for each passage when the call failed. */
-  private def scoreBatch(query: String, batch: Seq[String]): Seq[Option[Double]] =
-    try {
-      val reply = stub.withDeadlineAfter(BatchDeadlineMs, TimeUnit.MILLISECONDS).score(ScoreRequest(query = query, passages = batch))
-      reply.scores.map(Some(_))
-    } catch {
-      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.INVALID_ARGUMENT =>
-        throw new MalformedBatch(e.getStatus.getDescription)
-      case e: StatusRuntimeException =>
-        System.err.println(s"rerank batch unscored: \${e.getStatus.getCode} (\${batch.size} passages)")
-        batch.map(_ => None) // unscored is not a score: the caller keeps retrieval order for these
-    }
-
-  /** One score per passage, in passage order; None for a passage whose batch failed. */
-  def rerankPassages(query: String, passages: Seq[String]): Seq[Option[Double]] =
-    passages.grouped(BatchSize).toSeq.flatMap(scoreBatch(query, _))
 }
 `,
     },

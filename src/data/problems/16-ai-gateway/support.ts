@@ -1,5 +1,3 @@
-import {scalaPath} from '../scala-support';
-
 /**
  * The gateway's provided modules, the same in every language: `gateway/auth` turns the
  * `Authorization: Bearer <tenant>` header into the tenant (steps 1 to 3), and `gateway/outbox`
@@ -150,33 +148,5 @@ inline void insert(const std::string& event_json, const std::string& reason) {
 }
 
 }  // namespace gateway::outbox
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('gateway', 'Auth')]: `package gateway
-
-/** Tenant authentication (provided): the bearer token is the tenant id. */
-object Auth {
-  /** The tenant named by \`Authorization: Bearer <tenant>\`; None when the header is missing or malformed (answer 401). */
-  def tenant(authorization: Option[String]): Option[String] =
-    authorization.filter(_.startsWith("Bearer ")).map(_.drop(7).trim).filter(_.nonEmpty)
-}
-`,
-  [scalaPath('gateway', 'Outbox')]: `package gateway
-
-import redis.clients.jedis.JedisPooled
-
-/**
- * The usage outbox (provided): \`insert(eventJson, reason)\` appends the event to the Redis list
- * \`outbox:usage\` as JSON (\`{"event": …, "reason": …}\`); a relay produces the rows later.
- */
-object Outbox {
-  val Key = "outbox:usage"
-  private val jedis = new JedisPooled("redis", 6379)
-
-  def insert(eventJson: String, reason: String): Unit =
-    jedis.rpush(Key, s"""{"event":$eventJson,"reason":"\${reason.replace("\\"", "'")}"}""")
-}
 `,
 };

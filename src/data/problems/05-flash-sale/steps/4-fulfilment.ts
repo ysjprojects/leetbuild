@@ -53,7 +53,7 @@ allocation:
   },
   hints: [
     'Split the work: a helper that returns "allocated" or "no stock" (and throws for everything else) keeps the retry loop away from the commit logic in the poll loop.',
-    'The deadline is per attempt and set on the call (timeout argument, context with timeout, `withDeadlineAfter`, `set_deadline`). Sleep *before* each retry: base × 2^(attempt − 1), so the first call is immediate.',
+    'The deadline is per attempt and set on the call (timeout argument, context with timeout, `set_deadline`). Sleep *before* each retry: base × 2^(attempt − 1), so the first call is immediate.',
     'In the poll loop: helper → on success `confirm`, on no-stock `release` + `publish_failed` → commit. If the helper throws, do not catch it here — an uncommitted offset is exactly what you want for a warehouse that is down.',
   ],
   checks: [
@@ -74,9 +74,6 @@ allocation:
           all: [/groupId:\s*['"]fulfilment['"]/, /subscribe\(\s*\{[^}]*topic:\s*['"]orders['"]/, /autoCommit:\s*false/],
         },
         go: {all: [/GroupID:\s*"fulfilment"/, /Topic:\s*"orders"/, /reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
-        scala: {
-          all: [/"group\.id"\s*,\s*"fulfilment"/, /subscribe\([^\n]*"orders"/, /"enable\.auto\.commit"\s*,\s*"false"/],
-        },
         cpp: {
           all: [/"group\.id"\s*,\s*"fulfilment"/, /subscribe\([^\n]*"orders"/, /"enable\.auto\.commit"\s*,\s*"false"/],
         },
@@ -90,11 +87,6 @@ allocation:
         python: {all: [/stub\.Allocate\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/stub\.Allocate\([\s\S]{0,200}?deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {order: [/context\.WithTimeout\(\s*\w+\s*,\s*deadline\s*\)/, /stub\.Allocate\(/]},
-        scala: {
-          all: [
-            /withDeadlineAfter\(\s*(DeadlineMillis\s*,\s*TimeUnit\.MILLISECONDS|5L?\s*,\s*TimeUnit\.SECONDS)\s*\)\s*\.allocate\(/,
-          ],
-        },
         cpp: {all: [/set_deadline\([^\n]*kDeadline\s*\)/, /stub->Allocate\(\s*&\w+\s*,/]},
       },
     },
@@ -126,14 +118,6 @@ allocation:
             /attempt\s*<=?\s*maxAttempts/,
             /time\.Sleep\(/,
             /backoff\s*\*\s*(time\.Duration\()?\(?\s*1\s*<<|backoff\s*<<|\*=\s*2\b|<<=\s*1\b/,
-          ],
-        },
-        scala: {
-          all: [
-            /Code\.UNAVAILABLE/,
-            /attempt\s*<=?\s*MaxAttempts/,
-            /Thread\.sleep\(/,
-            /BackoffMillis\s*\*\s*\(?\s*1L?\s*<<|BackoffMillis\s*<<|\*=\s*2L?\b|<<=\s*1\b/,
           ],
         },
         cpp: {
@@ -169,7 +153,6 @@ allocation:
             /publishFailed\(\s*ctx\s*,\s*order\s*\)/,
           ],
         },
-        scala: {all: [/Code\.FAILED_PRECONDITION/, /release\(\s*order\.orderId\s*\)/, /publishFailed\(\s*order\s*\)/]},
         cpp: {
           all: [/StatusCode::FAILED_PRECONDITION/, /release\(\s*order\.order_id\s*\)/, /publish_failed\(\s*order\s*\)/],
         },
@@ -184,7 +167,6 @@ allocation:
         python: {order: [/stub\.Allocate\(/, /confirm\(\s*order\[["']order_id["']\]\s*\)/, /consumer\.commit\(/]},
         typescript: {order: [/stub\.Allocate\(/, /confirm\(\s*order\.order_id\s*\)/, /consumer\.commitOffsets\(/]},
         go: {order: [/stub\.Allocate\(/, /confirm\(\s*ctx\s*,\s*order\.OrderID\s*\)/, /reader\.CommitMessages\(/]},
-        scala: {order: [/\.allocate\(/, /confirm\(\s*order\.orderId\s*\)/, /consumer\.commitSync\(/]},
         cpp: {order: [/stub->Allocate\(/, /confirm\(\s*order\.order_id\s*\)/, /consumer->commitSync\(/]},
       },
     },
@@ -639,138 +621,6 @@ func run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import flashsale.warehouse.{AllocateRequest, WarehouseGrpc}
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.jdk.CollectionConverters._
-
-// Order(orderId, sku, qty, user) comes from the checkout endpoint (step 2).
-
-object FulfilmentConsumer {
-  val DeadlineMillis = 5000L
-  val BackoffMillis = 250L
-  val MaxAttempts = 4
-
-  private val channel = ManagedChannelBuilder.forAddress("warehouse", 9000).usePlaintext().build()
-  private val stub = WarehouseGrpc.blockingStub(channel)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "fulfilment")
-  props.put("auto.offset.reset", "earliest")
-  // TODO: disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("orders").asJava)
-
-  /** The reservation became a sale: DEL hold:{order_id}, ZREM holds (provided). */
-  def confirm(orderId: String): Unit = ???
-  /** Gives the hold back to stock (step 5). */
-  def release(orderId: String): Unit = ???
-  /** Dead-letters the order on orders-failed (provided). */
-  def publishFailed(order: Order): Unit = ???
-  /** Parses the JSON record written by the intake (provided). */
-  def parseOrder(json: String): Order = ???
-
-  /** True when the warehouse took the order, false when it has no physical stock. */
-  def allocate(order: Order): Boolean = {
-    val request = AllocateRequest(orderId = order.orderId, sku = order.sku, qty = order.qty)
-    // TODO: up to MaxAttempts calls with withDeadlineAfter(DeadlineMillis)
-    // TODO: FAILED_PRECONDITION → false; UNAVAILABLE → sleep BackoffMillis << (attempt-1) and retry; else rethrow
-    false
-  }
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        val order = parseOrder(record.value())
-        // TODO: allocate → confirm; no stock → release + publishFailed
-      }
-      // TODO: commit synchronously once every record of the batch is handled
-    }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import flashsale.warehouse.{AllocateRequest, WarehouseGrpc}
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.jdk.CollectionConverters._
-
-// Order(orderId, sku, qty, user) comes from the checkout endpoint (step 2).
-
-object FulfilmentConsumer {
-  val DeadlineMillis = 5000L
-  val BackoffMillis = 250L
-  val MaxAttempts = 4
-
-  private val channel = ManagedChannelBuilder.forAddress("warehouse", 9000).usePlaintext().build()
-  private val stub = WarehouseGrpc.blockingStub(channel)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "fulfilment")
-  props.put("auto.offset.reset", "earliest")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("orders").asJava)
-
-  /** The reservation became a sale: DEL hold:{order_id}, ZREM holds (provided). */
-  def confirm(orderId: String): Unit = ???
-  /** Gives the hold back to stock (step 5). */
-  def release(orderId: String): Unit = ???
-  /** Dead-letters the order on orders-failed (provided). */
-  def publishFailed(order: Order): Unit = ???
-  /** Parses the JSON record written by the intake (provided). */
-  def parseOrder(json: String): Order = ???
-
-  /** True when the warehouse took the order, false when it has no physical stock. */
-  def allocate(order: Order): Boolean = {
-    val request = AllocateRequest(orderId = order.orderId, sku = order.sku, qty = order.qty)
-    var attempt = 0
-    while (attempt < MaxAttempts) {
-      if (attempt > 0) Thread.sleep(BackoffMillis * (1L << (attempt - 1)))
-      try {
-        stub.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).allocate(request)
-        return true
-      } catch {
-        case e: StatusRuntimeException =>
-          e.getStatus.getCode match {
-            case Status.Code.FAILED_PRECONDITION => return false
-            case Status.Code.UNAVAILABLE => attempt += 1
-            case _ => throw e
-          }
-      }
-    }
-    throw new IllegalStateException(s"warehouse unavailable after $MaxAttempts attempts")
-  }
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        val order = parseOrder(record.value())
-        if (allocate(order)) confirm(order.orderId)
-        else {
-          System.err.println(s"no physical stock for \${order.sku}: releasing \${order.orderId}")
-          release(order.orderId)
-          publishFailed(order)
-        }
-      }
-      consumer.commitSync() // every record of the batch is handled
-    }
 }
 `,
     },

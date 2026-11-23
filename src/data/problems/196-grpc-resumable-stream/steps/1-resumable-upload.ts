@@ -79,7 +79,6 @@ ignores a seq below its committed point and rejects one above it with \`FAILED_P
         python: {all: [/stub\.Upload\(/, /Chunk\(/]},
         typescript: {all: [/\.Upload\(/, /\.write\(\s*\{/]},
         go: {all: [/\.Upload\(ctx\)/, /\.Send\(&pb\.Chunk\{/]},
-        scala: {all: [/\.upload\(/, /onNext\(\s*Chunk\(/]},
         cpp: {all: [/\bUpload\(&\w+\)/, /->Write\(/]},
       },
     },
@@ -92,7 +91,6 @@ ignores a seq below its committed point and rejects one above it with \`FAILED_P
         python: {all: [/\.GetStatus\(/, /\.next_seq\b/]},
         typescript: {all: [/\.GetStatus\(/, /\bnext_seq\b/]},
         go: {all: [/\.GetStatus\(/, /GetNextSeq\(\)|\.NextSeq\b/]},
-        scala: {all: [/\.getStatus\(/, /\.nextSeq\b/]},
         cpp: {all: [/\bGetStatus\(&/, /\.next_seq\(\)/]},
       },
     },
@@ -105,7 +103,6 @@ ignores a seq below its committed point and rejects one above it with \`FAILED_P
         python: {all: [/asyncio\.sleep\(/, /2\s*\*\*|<<\s*\(?attempt|pow\(\s*2/]},
         typescript: {all: [/setTimeout\(/, /2\s*\*\*|Math\.pow\(\s*2|<<\s*\(?attempt/]},
         go: {all: [/time\.(Sleep|After|NewTimer)\(/, /<<\s*\(?attempt|math\.Pow\(\s*2/]},
-        scala: {all: [/Thread\.sleep\(|TimeUnit\.\w+\.sleep\(/, /<<\s*\(?attempt|math\.pow\(\s*2|Math\.pow\(\s*2/]},
         cpp: {all: [/sleep_for\(/, /<<\s*\(?attempt|std::pow\(\s*2/]},
       },
     },
@@ -118,7 +115,6 @@ ignores a seq below its committed point and rejects one above it with \`FAILED_P
         python: {all: [/(==|>=|<|<=)\s*max_attempts|range\([^)\n]*max_attempts/, /\braise\b/]},
         typescript: {all: [/attempt\s*(>=|===|==|<|<=)\s*maxAttempts/, /\bthrow\b/]},
         go: {all: [/attempt\s*(>=|==|<|<=)\s*maxAttempts/, /return attempt, err\b/]},
-        scala: {all: [/attempt\s*(>=|==|<|<=)\s*maxAttempts/, /\bthrow\b/]},
         cpp: {all: [/attempt\s*(>=|==|<|<=)\s*max_attempts/, /\bthrow\b/]},
       },
     },
@@ -131,7 +127,6 @@ ignores a seq below its committed point and rejects one above it with \`FAILED_P
         python: {all: [/StatusCode\.UNAVAILABLE/, /StatusCode\.ABORTED/, /\.code\(\)/]},
         typescript: {all: [/status\.UNAVAILABLE/, /status\.ABORTED/, /\.code\b|\{\s*code\s*\}/]},
         go: {all: [/codes\.Unavailable/, /codes\.Aborted/, /status\.Code\(/]},
-        scala: {all: [/Code\.UNAVAILABLE/, /Code\.ABORTED/, /getCode\b/]},
         cpp: {all: [/StatusCode::UNAVAILABLE/, /StatusCode::ABORTED/, /error_code\(\)/]},
       },
     },
@@ -144,7 +139,6 @@ ignores a seq below its committed point and rejects one above it with \`FAILED_P
         python: {all: [/return attempt\b/]},
         typescript: {all: [/return attempt\b/]},
         go: {all: [/return attempt, nil\b/]},
-        scala: {all: [/\)\s*attempt\s*$|=>\s*attempt\s*$|return attempt\b/m]},
         cpp: {all: [/return attempt;/]},
       },
     },
@@ -393,78 +387,6 @@ func send(ctx context.Context, client pb.IngestClient, uploadID string, chunks [
 			return nil
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import com.google.protobuf.ByteString
-import io.grpc.{ManagedChannel, Status, StatusRuntimeException}
-import io.grpc.stub.StreamObserver
-import ingest.v1.ingest.{Ack, Chunk, IngestGrpc, StatusRequest}
-
-object Uploader {
-  val BaseBackoffMillis = 100L
-
-  /** Streams chunks to Ingest.Upload and returns the attempts it used. */
-  def upload(channel: ManagedChannel, uploadId: String, chunks: IndexedSeq[Array[Byte]], maxAttempts: Int = 4): Int = {
-    // TODO: per attempt, getStatus for nextSeq; nothing left to send means done
-    // TODO: IngestGrpc.stub(channel).upload(...), onNext every Chunk from nextSeq on, wait for the Ack of the last seq
-    // TODO: UNAVAILABLE / ABORTED: sleep BaseBackoffMillis << (attempt - 1) and retry, up to maxAttempts;
-    //       any other code, or the last attempt, throws
-    0
-  }
-}
-`,
-      solution: `import scala.concurrent.{Await, Promise}
-import scala.concurrent.duration.Duration
-
-import com.google.protobuf.ByteString
-import io.grpc.{ManagedChannel, Status, StatusRuntimeException}
-import io.grpc.stub.StreamObserver
-import ingest.v1.ingest.{Ack, Chunk, IngestGrpc, StatusRequest}
-
-object Uploader {
-  val BaseBackoffMillis = 100L
-  private val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.ABORTED)
-
-  /** Streams chunks to Ingest.Upload and returns the attempts it used. */
-  def upload(channel: ManagedChannel, uploadId: String, chunks: IndexedSeq[Array[Byte]], maxAttempts: Int = 4): Int = {
-    val blocking = IngestGrpc.blockingStub(channel)
-    val async = IngestGrpc.stub(channel)
-
-    @annotation.tailrec
-    def attemptFrom(attempt: Int): Int = {
-      val nextSeq = blocking.getStatus(StatusRequest(uploadId = uploadId)).nextSeq
-      if (nextSeq >= chunks.length) attempt // everything is committed; only the final ack was lost
-      else {
-        val failure =
-          try { send(async, uploadId, chunks, nextSeq); None }
-          catch { case e: StatusRuntimeException => Some(e) }
-        failure match {
-          case None => attempt
-          case Some(e) if Retryable(e.getStatus.getCode) && attempt < maxAttempts =>
-            Thread.sleep(BaseBackoffMillis << (attempt - 1))
-            attemptFrom(attempt + 1)
-          case Some(e) => throw e
-        }
-      }
-    }
-    attemptFrom(1)
-  }
-
-  /** One stream: every chunk from \`from\` on; returns on the Ack for the last one, throws the stream's error. */
-  private def send(stub: IngestGrpc.IngestStub, uploadId: String, chunks: IndexedSeq[Array[Byte]], from: Int): Unit = {
-    val last = chunks.length - 1
-    val done = Promise[Unit]()
-    lazy val requests: StreamObserver[Chunk] = stub.upload(new StreamObserver[Ack] {
-      def onNext(ack: Ack): Unit = if (ack.seq == last) { requests.onCompleted(); done.trySuccess(()) }
-      def onError(t: Throwable): Unit = done.tryFailure(Status.fromThrowable(t).asRuntimeException())
-      def onCompleted(): Unit = done.tryFailure(new IllegalStateException("the stream ended before the last chunk was acked"))
-    })
-    for (seq <- from to last)
-      requests.onNext(Chunk(uploadId = uploadId, seq = seq, data = ByteString.copyFrom(chunks(seq))))
-    Await.result(done.future, Duration.Inf)
-  }
 }
 `,
     },

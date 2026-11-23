@@ -51,7 +51,6 @@ no end; and the audit trail says which tenant asked but not who.
         python: {all: [/@app\.get\(\s*["']\/v1\/files\/\{file_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/files\/:fileId['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/files\/\{id\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"files"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/files\//]},
       },
     },
@@ -70,7 +69,6 @@ no end; and the audit trail says which tenant asked but not who.
           none: [/code\(\s*403\s*\)/],
         },
         go: {all: [/record\.Tenant\s*!=\s*tenant/, /record\.State\s*!=\s*"committed"/], none: [/StatusForbidden/]},
-        scala: {all: [/\.tenant\s*==\s*tenant/, /\.state\s*==\s*"committed"/], none: [/StatusCodes\.Forbidden/]},
         cpp: {all: [/record->tenant\s*!=\s*tenant/, /record->state\s*!=\s*"committed"/], none: [/\b403\b/]},
       },
     },
@@ -83,7 +81,6 @@ no end; and the audit trail says which tenant asked but not who.
         python: {all: [/URL_TTL_S\s*=\s*600\b/, /store\.sign_url\(/], none: [/store\.CDN/]},
         typescript: {all: [/URL_TTL_S\s*=\s*600\b/, /store\.signUrl\(/], none: [/store\.CDN/]},
         go: {all: [/urlTTL\s*=\s*600\s*\*\s*time\.Second/, /store\.SignURL\(/], none: [/store\.CDN/]},
-        scala: {all: [/UrlTtlSeconds\s*=\s*600L?\b/, /Store\.signUrl\(/], none: [/Store\.Cdn/]},
         cpp: {all: [/kUrlTtl\{600\}/, /store::signUrl\(/], none: [/store::kCdn/]},
       },
     },
@@ -96,7 +93,6 @@ no end; and the audit trail says which tenant asked but not who.
         python: {all: [/x-user-id/i, /["']user["']\s*:\s*user\b/]},
         typescript: {all: [/x-user-id/i, /\buser(\s*:\s*user)?\s*[,}]/]},
         go: {all: [/X-User-Id/i, /"user":\s*user\b/]},
-        scala: {all: [/X-User-Id/i, /"user"\s*->\s*JsString\(\s*user\s*\)/]},
         cpp: {all: [/X-User-Id/i, /\{"user",\s*user\}/]},
       },
     },
@@ -347,95 +343,6 @@ func downloadLink(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/files/{id}", downloadLink)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import files.Store // Store.findFile, signUrl, Cdn
-
-object Read {
-  val AuditTopic = "file.audit"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  val route: Route =
-    path("v1" / "files" / Segment) { fileId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-            Store.findFile(fileId) match {
-              case None => complete(StatusCodes.NotFound -> "no such file")
-              case Some(_) =>
-                val url = s"\${Store.Cdn}/f/$fileId"
-                val audit = JsObject("event" -> JsString("download_issued"), "file_id" -> JsString(fileId), "tenant" -> JsString(tenant))
-                producer.send(new ProducerRecord[String, String](AuditTopic, fileId, audit.compactPrint)).get()
-                val body = JsObject("file_id" -> JsString(fileId), "url" -> JsString(url))
-                complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-            }
-        }
-      }
-    }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import files.Store // Store.findFile, signUrl, Cdn
-
-object Read {
-  val AuditTopic = "file.audit"
-  val UrlTtlSeconds = 600L
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  val route: Route =
-    path("v1" / "files" / Segment) { fileId =>
-      get {
-        (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("X-User-Id")) {
-          case (Some(tenant), Some(user)) if tenant.nonEmpty && user.nonEmpty =>
-            // Another tenant's file, or one not committed, gets the answer a missing id gets.
-            Store.findFile(fileId).filter(record => record.tenant == tenant && record.state == "committed") match {
-              case None => complete(StatusCodes.NotFound -> "no such file")
-              case Some(_) =>
-                val expiresAt = System.currentTimeMillis() / 1000 + UrlTtlSeconds
-                val url = Store.signUrl(fileId, tenant, expiresAt)
-                val audit = JsObject(
-                  "event" -> JsString("download_issued"), "file_id" -> JsString(fileId), "tenant" -> JsString(tenant),
-                  "user" -> JsString(user), "expires_at" -> JsNumber(expiresAt))
-                // The issuance is on the trail before the link leaves.
-                producer.send(new ProducerRecord[String, String](AuditTopic, fileId, audit.compactPrint)).get()
-                val body = JsObject("file_id" -> JsString(fileId), "url" -> JsString(url), "expires_at" -> JsNumber(expiresAt))
-                complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-            }
-          case _ => complete(StatusCodes.Unauthorized -> "X-Tenant-Id and X-User-Id are required")
-        }
-      }
-    }
 }
 `,
     },

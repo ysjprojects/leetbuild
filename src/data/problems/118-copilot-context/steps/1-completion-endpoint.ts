@@ -54,7 +54,6 @@ keystroke.
         python: {all: [/@app\.post\(\s*["']\/v1\/completions["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/completions['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/completions"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"completions"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/completions"/]},
       },
     },
@@ -67,7 +66,6 @@ keystroke.
         python: {all: [/status_code\s*=\s*401/, /["']request_id["']\s*:/]},
         typescript: {all: [/code\(\s*401\s*\)/, /request_id\s*:/]},
         go: {all: [/StatusUnauthorized/, /"request_id"/]},
-        scala: {all: [/StatusCodes\.Unauthorized/, /"request_id"/]},
         cpp: {all: [/\b401\b/, /"request_id"/]},
       },
     },
@@ -94,14 +92,6 @@ keystroke.
           ],
         },
         go: {all: [/maxPrefixChars\s*=\s*3500/, /maxSuffixChars/, /MaxBytesReader|StatusRequestEntityTooLarge/]},
-        scala: {
-          all: [
-            /MaxPrefixChars\s*=\s*3500/,
-            /takeRight\(\s*MaxPrefixChars\s*\)/,
-            /take\(\s*MaxSuffixChars\s*\)/,
-            /RequestEntityTooLarge|withSizeLimit/,
-          ],
-        },
         cpp: {all: [/kMaxPrefixChars\s*=\s*3500/, /kMaxSuffixChars/, /\b413\b/]},
       },
     },
@@ -117,10 +107,6 @@ keystroke.
           none: [/log\.\w+\(\s*\{[^}]*\b(prefix|suffix|open_tabs)\s*:/],
         },
         go: {all: [/log\.Printf\([^)]*requestID/], none: [/log\.\w+\([^)]*body\.(Prefix|Suffix|OpenTabs)/]},
-        scala: {
-          all: [/System\.err\.println\([^)]*requestId/],
-          none: [/System\.err\.println\([^)]*body\.(prefix|suffix|openTabs)/],
-        },
         cpp: {
           all: [/std::cerr\s*<<[^;]*request_id/],
           none: [/std::cerr\s*<<[^;]*body\[\s*"(prefix|suffix|open_tabs)"/],
@@ -489,117 +475,6 @@ func completions(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/completions", completions)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import copilot.{Model, Tabs} // Model.complete, Tabs.rememberTabs, Tabs.pickSnippets
-
-object CompletionApi {
-  final case class CompletionRequest(prefix: String, suffix: String, language: String, path: String, token: Long, openTabs: Seq[Tabs.Tab])
-
-  private def parse(raw: String): CompletionRequest = {
-    val fields = raw.parseJson.asJsObject.fields
-    def text(o: Map[String, JsValue], name: String): String = o.get(name).collect { case JsString(s) => s }.getOrElse("")
-    val open = fields.get("open_tabs").collect { case JsArray(items) => items.map(i => Tabs.Tab(text(i.asJsObject.fields, "path"), text(i.asJsObject.fields, "text"))) }
-    val token = fields.get("token").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-    CompletionRequest(text(fields, "prefix"), text(fields, "suffix"), text(fields, "language"), text(fields, "path"), token, open.getOrElse(Vector.empty))
-  }
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "completions") {
-    post {
-      optionalHeaderValueByName("X-Session-Id") { header =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-          val session = header.getOrElse("")
-          val body = parse(raw)
-          System.err.println(s"complete session=$session path=\${body.path} prefix=\${body.prefix} suffix=\${body.suffix}")
-          val others = body.openTabs.filter(_.path != body.path)
-          Tabs.rememberTabs(session, others)
-          val snippets = Tabs.pickSnippets(session, others.map(_.path), body.prefix)
-          val candidates = Model.complete(body.prefix, body.suffix, snippets, body.language)
-          complete(json(StatusCodes.OK, JsObject("token" -> JsNumber(body.token), "candidates" -> JsArray(candidates.map(JsString(_)).toVector))))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import copilot.{Model, Tabs} // Model.complete, Tabs.rememberTabs, Tabs.pickSnippets
-
-object CompletionApi {
-  val PromptWindowChars = 6000
-  val MaxPrefixChars = 3500
-  val MaxSuffixChars = 1000
-  val MaxSnippetChars: Int = PromptWindowChars - MaxPrefixChars - MaxSuffixChars
-  val MaxBodyBytes: Long = 1L << 20
-
-  final case class CompletionRequest(prefix: String, suffix: String, language: String, path: String, token: Long, openTabs: Seq[Tabs.Tab])
-
-  private def parse(raw: String): CompletionRequest = {
-    val fields = raw.parseJson.asJsObject.fields
-    def text(o: Map[String, JsValue], name: String): String = o.get(name).collect { case JsString(s) => s }.getOrElse("")
-    val open = fields.get("open_tabs").collect { case JsArray(items) => items.map(i => Tabs.Tab(text(i.asJsObject.fields, "path"), text(i.asJsObject.fields, "text"))) }
-    val token = fields.get("token").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-    CompletionRequest(text(fields, "prefix"), text(fields, "suffix"), text(fields, "language"), text(fields, "path"), token, open.getOrElse(Vector.empty))
-  }
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** The lines nearest the cursor matter most: the prefix keeps its tail, the suffix its head, snippets fill the rest. */
-  def fitWindow(prefix: String, suffix: String, snippets: Seq[String]): (String, String, Seq[String]) = {
-    val kept = snippets
-      .scanLeft(("", MaxSnippetChars)) { case ((_, left), snippet) => (snippet.take(left), left - snippet.take(left).length) }
-      .drop(1)
-      .map(_._1)
-      .filter(_.nonEmpty)
-    (prefix.takeRight(MaxPrefixChars), suffix.take(MaxSuffixChars), kept)
-  }
-
-  val route: Route = path("v1" / "completions") {
-    post {
-      optionalHeaderValueByName("X-Session-Id") {
-        case None | Some("") =>
-          complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Session-Id is required"))))
-        case Some(session) =>
-          withSizeLimit(MaxBodyBytes) {
-            entity(as[String]) { raw =>
-              val body = parse(raw)
-              val requestId = UUID.randomUUID().toString
-              val others = body.openTabs.filter(_.path != body.path)
-              Tabs.rememberTabs(session, others)
-              val picked = Tabs.pickSnippets(session, others.map(_.path), body.prefix)
-              val (prefix, suffix, snippets) = fitWindow(body.prefix, body.suffix, picked)
-              val candidates = Model.complete(prefix, suffix, snippets, body.language)
-              val promptChars = prefix.length + suffix.length + snippets.map(_.length).sum
-              System.err.println(s"complete session=$session request_id=$requestId language=\${body.language} prompt_chars=$promptChars snippets=\${snippets.size}")
-              complete(
-                json(
-                  StatusCodes.OK,
-                  JsObject("request_id" -> JsString(requestId), "token" -> JsNumber(body.token), "candidates" -> JsArray(candidates.map(JsString(_)).toVector))
-                )
-              )
-            }
-          }
-      }
-    }
-  }
 }
 `,
     },

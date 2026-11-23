@@ -47,7 +47,6 @@ its create forks the flag into a second version.
         python: {all: [/@app\.post\(\s*["']\/v1\/flags["']/, /store\.save\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/flags['"]/, /\bsave\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/flags"/, /store\.Save\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"flags"\s*\)/, /\bpost\s*\{/, /Store\.save\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/flags"/, /store::save\(/]},
       },
     },
@@ -66,10 +65,6 @@ its create forks the flag into a second version.
           all: [/registry\.RuleError\(|registry\.Attributes\[/],
           order: [/registry\.RuleError\(|registry\.Attributes\[/, /store\.Save\(/],
         },
-        scala: {
-          all: [/Registry\.ruleError\(|Registry\.Attributes/],
-          order: [/Registry\.ruleError\(|Registry\.Attributes/, /Store\.save\(/],
-        },
         cpp: {
           all: [/registry::ruleError\(|registry::kAttributes/],
           order: [/registry::ruleError\(|registry::kAttributes/, /store::save\(/],
@@ -80,7 +75,7 @@ its create forks the flag into a second version.
       id: 'default',
       title: 'A create without a default is 422',
       detail:
-        'An absent or null `default` is a 422 naming it, not a `false` nobody chose: the starter gives the field a `false` fallback (`= False`, `?? false`, a plain `bool`, `value("default", false)`, `getOrElse(false)`).',
+        'An absent or null `default` is a 422 naming it, not a `false` nobody chose: the starter gives the field a `false` fallback (`= False`, `?? false`, a plain `bool`, `value("default", false)`).',
       match: {
         python: {all: [/body\.default is None|["']default["'] not in/], none: [/default:\s*bool\s*=\s*False/]},
         typescript: {
@@ -88,7 +83,6 @@ its create forks the flag into a second version.
           none: [/default\s*\?\?\s*false/],
         },
         go: {all: [/Default\s+\*bool/, /Default == nil/]},
-        scala: {all: [/"default"/], none: [/getOrElse\(false\)/]},
         cpp: {
           all: [/contains\(\s*"default"\s*\)|\["default"\]\.is_boolean\(\)/],
           none: [/value\(\s*"default",\s*false\s*\)/],
@@ -112,10 +106,6 @@ its create forks the flag into a second version.
         go: {
           all: [/Idempotency-Key/i, /store\.CreateResult\(/, /store\.RecordCreate\(/, /StatusBadRequest|\b400\b/],
           order: [/store\.CreateResult\(/, /store\.Save\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Store\.createResult\(/, /Store\.recordCreate\(/, /BadRequest|\b400\b/],
-          order: [/Store\.createResult\(/, /Store\.save\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /store::createResult\(/, /store::recordCreate\(/, /\b400\b/],
@@ -390,98 +380,6 @@ func createFlag(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/flags", createFlag)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import flags.{Registry, Store} // Registry.ruleError; Store.save, load, createResult, recordCreate
-
-object Api {
-  val KeyPattern = "^[a-z0-9][a-z0-9-]{0,127}$".r
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  val route: Route =
-    path("v1" / "flags") {
-      post {
-        entity(as[String]) { raw =>
-          // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-          val fields = raw.parseJson.asJsObject.fields
-          val key = fields.get("key").collect { case JsString(s) => s }.getOrElse("")
-          val default = fields.get("default").collect { case JsBoolean(b) => b }.getOrElse(false)
-          val rules = fields.get("rules").collect { case JsArray(rs) => rs }.getOrElse(Vector.empty)
-          val rollout = fields.get("rollout").collect { case JsNumber(n) => n.toInt }.getOrElse(0)
-          if (KeyPattern.findFirstIn(key).isEmpty || rollout < 0 || rollout > 100) complete(error(StatusCodes.UnprocessableEntity, "key or rollout out of range"))
-          else {
-            val saved = Store.save(JsObject("key" -> JsString(key), "default" -> JsBoolean(default), "rules" -> JsArray(rules), "rollout" -> JsNumber(rollout)))
-            complete(json(StatusCodes.Created, JsObject("key" -> saved.fields("key"), "version" -> saved.fields("version"))))
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import flags.{Registry, Store} // Registry.ruleError; Store.save, load, createResult, recordCreate
-
-object Api {
-  val KeyPattern = "^[a-z0-9][a-z0-9-]{0,127}$".r
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  val route: Route =
-    path("v1" / "flags") {
-      post {
-        optionalHeaderValueByName("Idempotency-Key") {
-          case None | Some("") => complete(error(StatusCodes.BadRequest, "Idempotency-Key is required"))
-          case Some(idempotencyKey) =>
-            entity(as[String]) { raw =>
-              val fields = raw.parseJson.asJsObject.fields
-              val key = fields.get("key").collect { case JsString(s) => s }.getOrElse("")
-              Store.createResult(key, idempotencyKey) match {
-                case Some(recorded) => complete(json(StatusCodes.Created, recorded)) // a replay answers what the first attempt answered
-                case None => complete(create(fields, idempotencyKey))
-              }
-            }
-        }
-      }
-    }
-
-  /** The stored answer of a valid create, or the 422 that refuses it. */
-  private def create(fields: Map[String, JsValue], idempotencyKey: String): HttpResponse = {
-    val key = fields.get("key").collect { case JsString(s) => s }.getOrElse("")
-    val rules = fields.get("rules").collect { case JsArray(rs) => rs }.getOrElse(Vector.empty)
-    val rollout = fields.get("rollout").collect { case JsNumber(n) => n.toInt }.getOrElse(0)
-    val refused = rules.flatMap(rule => Registry.ruleError(rule.asJsObject)).headOption
-    fields.get("default") match {
-      case _ if KeyPattern.findFirstIn(key).isEmpty || rollout < 0 || rollout > 100 => error(StatusCodes.UnprocessableEntity, "key or rollout out of range")
-      case Some(JsBoolean(default)) =>
-        refused match {
-          case Some(reason) => error(StatusCodes.UnprocessableEntity, reason)
-          case None =>
-            val saved = Store.save(JsObject("key" -> JsString(key), "default" -> JsBoolean(default), "rules" -> JsArray(rules), "rollout" -> JsNumber(rollout)))
-            val result = JsObject("key" -> saved.fields("key"), "version" -> saved.fields("version"))
-            Store.recordCreate(key, idempotencyKey, result)
-            json(StatusCodes.Created, result)
-        }
-      case _ => error(StatusCodes.UnprocessableEntity, "default is required")
-    }
-  }
 }
 `,
     },

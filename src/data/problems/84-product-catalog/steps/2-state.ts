@@ -47,7 +47,6 @@ pointer; and two regions can serve two versions of one product.
         python: {all: [/def snapshot_key/, /\.set\(\s*snapshot_key\(/], none: [/\bhset\b/i]},
         typescript: {all: [/snapshotKey\s*=|function snapshotKey/, /\.set\(\s*snapshotKey\(/], none: [/\bhset\b/i]},
         go: {all: [/func snapshotKey/, /\.Set\([^\n]*snapshotKey\(/], none: [/\bHSet\(/]},
-        scala: {all: [/def snapshotKey/, /\.set\(\s*snapshotKey\(/], none: [/\bhset\b/i]},
         cpp: {all: [/snapshotKey\(/, /\.set\(\s*snapshotKey\(/], none: [/\bhset\b/i]},
       },
     },
@@ -60,7 +59,6 @@ pointer; and two regions can serve two versions of one product.
         python: {all: [/def pointer_key/], none: [/[Rr]egion/]},
         typescript: {all: [/pointerKey\s*=|function pointerKey/], none: [/[Rr]egion/]},
         go: {all: [/func pointerKey/], none: [/[Rr]egion/]},
-        scala: {all: [/def pointerKey/], none: [/[Rr]egion/]},
         cpp: {all: [/pointerKey\(/], none: [/[Rr]egion/]},
       },
     },
@@ -79,7 +77,6 @@ pointer; and two regions can serve two versions of one product.
           all: [/func readPublished\(/, /\.Get\([^\n]*pointerKey\(/, /\.Get\([^\n]*snapshotKey\(/],
           none: [/HGetAll\(/],
         },
-        scala: {all: [/def readPublished\(/, /\.get\(\s*pointerKey\(/, /\.get\(\s*snapshotKey\(/], none: [/hgetall/i]},
         cpp: {all: [/readPublished\(/, /\.get\(\s*pointerKey\(/, /\.get\(\s*snapshotKey\(/], none: [/hgetall/i]},
       },
     },
@@ -100,10 +97,6 @@ pointer; and two regions can serve two versions of one product.
         go: {
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]GET['"]/, /ARGV\[2\]/],
           none: [/\.Set\([^\n]*pointerKey\(/, /\.Set\([^)\n]*:published/],
-        },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]GET['"]/, /ARGV\[2\]/],
-          none: [/\.set\(\s*pointerKey\(/, /\.set\([^)\n]*:published/],
         },
         cpp: {
           all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]GET['"]/, /ARGV\[2\]/],
@@ -367,69 +360,6 @@ func readPublished(ctx context.Context, productID string) (map[string]any, error
 	}
 	var snapshot map[string]any
 	return snapshot, json.Unmarshal([]byte(raw), &snapshot)
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Region = "eu-west"
-
-  /** Make version the published one; snapshot is the whole version (product_id, version, title, price_cents, tax_class). */
-  def publishSnapshot(productId: String, version: Long, snapshot: JsObject, expected: Option[Long]): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    snapshot.fields.foreach { case (name, value) => jedis.hset(s"catalog:$productId", name, value.compactPrint) }
-    jedis.set(s"catalog:$productId:published", version.toString)
-    jedis.set(s"catalog:$productId:region:$Region:published", version.toString)
-    true
-  }
-
-  /** The published snapshot, or None when nothing is published. */
-  def readPublished(productId: String): Option[JsObject] =
-    Option(jedis.get(s"catalog:$productId:published")).map { version =>
-      val fields = jedis.hgetAll(s"catalog:$productId").asScala.toMap.map { case (name, raw) => name -> raw.parseJson }
-      JsObject(fields + ("version" -> JsNumber(version.toLong)))
-    }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Moves the pointer to ARGV[1] only if it still holds ARGV[2] ("" when nothing is published yet). */
-  val SwapLua: String =
-    """local current = redis.call('GET', KEYS[1]) or ''
-      |if current ~= ARGV[2] then return 0 end
-      |redis.call('SET', KEYS[1], ARGV[1])
-      |return 1
-      |""".stripMargin
-
-  def snapshotKey(productId: String, version: Long): String = s"catalog:$productId:v$version"
-  def pointerKey(productId: String): String = s"catalog:$productId:published"
-
-  /** Make version the published one; snapshot is the whole version (product_id, version, title, price_cents, tax_class). */
-  def publishSnapshot(productId: String, version: Long, snapshot: JsObject, expected: Option[Long]): Boolean = {
-    // The whole version first, under its own key; then one conditional move of the pointer.
-    jedis.set(snapshotKey(productId, version), snapshot.compactPrint)
-    val args = List(version.toString, expected.map(_.toString).getOrElse("")).asJava
-    jedis.eval(SwapLua, List(pointerKey(productId)).asJava, args).asInstanceOf[java.lang.Long] == 1L
-  }
-
-  /** The published snapshot, or None when nothing is published. */
-  def readPublished(productId: String): Option[JsObject] =
-    Option(jedis.get(pointerKey(productId)))
-      .flatMap(version => Option(jedis.get(snapshotKey(productId, version.toLong))))
-      .map(_.parseJson.asJsObject)
 }
 `,
     },

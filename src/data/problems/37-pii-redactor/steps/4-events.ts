@@ -22,7 +22,7 @@ delivery the broker refuses is lost; and a lost acknowledgement writes the event
   spans: [{start, end, entity}], entity_counts, detector_version, source}\`, an empty span list
   included, and nothing taken from the text: no value, no part of one, no text around them.
 - A delivery failure, read where the broker answers (the delivery callback, the rejected \`send\`,
-  the delivery channel, \`dr_cb\`, the producer \`Callback\`), goes to
+  the delivery channel, \`dr_cb\`), goes to
   \`store.insert_outbox(event, reason)\`.
 - The producer is idempotent with \`acks=all\`. In Go this step uses confluent-kafka-go, since
   kafka-go has no idempotent producer.`,
@@ -51,10 +51,6 @@ delivery the broker refuses is lost; and a lost acknowledgement writes the event
         python: {all: [/key\s*=\s*document_id/], none: [/key\s*=\s*\w+\.entity/]},
         typescript: {all: [/key:\s*documentId/], none: [/key:\s*\w+\.entity/]},
         go: {all: [/Key:\s*\[\]byte\(documentID\)/], none: [/Key:\s*\[\]byte\(\w+\.Entity\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(Topic,\s*documentId/],
-          none: [/ProducerRecord\[String, String\]\(Topic,\s*\w+\.entity/],
-        },
         cpp: {all: [/document_id\.c_str\(\),\s*document_id\.size\(\)/], none: [/\.entity\.c_str\(\)/]},
       },
     },
@@ -67,7 +63,6 @@ delivery the broker refuses is lost; and a lost acknowledgement writes the event
         python: {all: [/["']spans["']/, /entity_counts/], none: [/["']sample["']/, /text\[\s*\w+\.start/]},
         typescript: {all: [/spans:/, /entity_counts/], none: [/\bsample:/, /text\.slice\(/]},
         go: {all: [/"spans"/, /"entity_counts"/], none: [/"sample"/, /text\[\w+\.Start/]},
-        scala: {all: [/"spans"/, /"entity_counts"/], none: [/"sample"/, /text\.substring\(/]},
         cpp: {all: [/"spans"/, /"entity_counts"/], none: [/"sample"/, /text\.substr\(/]},
       },
     },
@@ -75,12 +70,11 @@ delivery the broker refuses is lost; and a lost acknowledgement writes the event
       id: 'outbox',
       title: 'A refused delivery goes to the outbox',
       detail:
-        "A delivery error, read where the broker's answer arrives (`on_delivery`, the rejected `send`, the delivery channel's `TopicPartition.Error`, `dr_cb`, the `Callback`), writes the whole event, spans and `text_length` included, to `store.insert_outbox`; the starter wraps the enqueue in a `try`, which sees only local errors, and the refused event is gone.",
+        "A delivery error, read where the broker's answer arrives (`on_delivery`, the rejected `send`, the delivery channel's `TopicPartition.Error`, `dr_cb`), writes the whole event, spans and `text_length` included, to `store.insert_outbox`; the starter wraps the enqueue in a `try`, which sees only local errors, and the refused event is gone.",
       match: {
         python: {all: [/on_delivery\s*=|callback\s*=/, /store\.insert_outbox\(/], none: [/except KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /catch/]},
         go: {all: [/store\.InsertOutbox\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Store\.insertOutbox\(/, /Callback/]},
         cpp: {all: [/store::insert_outbox\(/, /dr_cb/]},
       },
     },
@@ -93,7 +87,6 @@ delivery the broker refuses is lost; and a lost acknowledgement writes the event
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -328,73 +321,6 @@ func emitRedacted(ctx context.Context, tenant, documentID, text string, detectio
 		return store.InsertOutbox(ctx, value, err.Error())
 	}
 	return nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import redactor.Spans.Detection // Store.insertOutbox(event, reason) keeps an event the broker refused
-
-object Events {
-  val Topic = "privacy.redacted"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** The audit trail of the redaction of documentId. */
-  def emitRedacted(tenant: String, documentId: String, text: String, detection: Detection): Unit = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    detection.spans.foreach { s =>
-      val record = JsObject(
-        "document_id" -> JsString(documentId), "tenant" -> JsString(tenant), "entity" -> JsString(s.entity),
-        "start" -> JsNumber(s.start), "end" -> JsNumber(s.end), "sample" -> JsString(text.substring(s.start, s.end)))
-      try producer.send(new ProducerRecord[String, String](Topic, s.entity, record.compactPrint))
-      catch { case e: KafkaException => System.err.println(s"audit event for $documentId not produced: \${e.getMessage}") }
-    }
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import redactor.Spans.{Detection, countEntities, countsJson}
-import redactor.Store // Store.insertOutbox(event, reason) keeps an event the broker refused
-
-object Events {
-  val Topic = "privacy.redacted"
-
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes the event once, on every replica.
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** The audit trail of the redaction of documentId. */
-  def emitRedacted(tenant: String, documentId: String, text: String, detection: Detection): Unit = {
-    // Offsets and types: the values stay out of a topic that is retained and replicated.
-    val offsets = detection.spans.map(s => JsObject("start" -> JsNumber(s.start), "end" -> JsNumber(s.end), "entity" -> JsString(s.entity)))
-    val event = JsObject(
-      "document_id" -> JsString(documentId), "tenant" -> JsString(tenant), "text_length" -> JsNumber(text.length),
-      "spans" -> JsArray(offsets.toVector), "entity_counts" -> countsJson(countEntities(detection.spans)),
-      "detector_version" -> JsString(detection.detectorVersion), "source" -> JsString(detection.source))
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) Store.insertOutbox(event, exception.getMessage) // the broker refused it: the relay produces it later
-    }
-    producer.send(new ProducerRecord[String, String](Topic, documentId, event.compactPrint), onDelivery)
-  }
 }
 `,
     },

@@ -49,7 +49,6 @@ proxy. \`upstream(request)\` is provided: it is the step-3 proxy and returns sta
         python: {all: [/["']resp:["']\s*\+|f["']resp:\{/, /hashlib\.sha256\(/]},
         typescript: {all: [/['"]resp:['"]\s*\+|`resp:\$\{/, /createHash\(\s*['"]sha256['"]\s*\)/]},
         go: {all: [/"resp:"\s*\+|"resp:%x"/, /sha256\.Sum256\(/]},
-        scala: {all: [/"resp:"\s*\+/, /"SHA-256"/]},
         cpp: {all: [/"resp:"\s*\+/, /sha256_hex\(/]},
       },
     },
@@ -62,7 +61,6 @@ proxy. \`upstream(request)\` is provided: it is the step-3 proxy and returns sta
         python: {all: [/cache-control/i, /no-cache/]},
         typescript: {all: [/cache-control/i, /no-cache/]},
         go: {all: [/cache-control/i, /no-cache/]},
-        scala: {all: [/cache-control/i, /no-cache/]},
         cpp: {all: [/cache-control/i, /no-cache/]},
       },
     },
@@ -77,7 +75,6 @@ proxy. \`upstream(request)\` is provided: it is the step-3 proxy and returns sta
           all: [/\.set\(\s*key\s*,[^\n]*['"]EX['"]\s*,\s*(TTL_S|10)\s*\)|\.setex\(\s*key\s*,\s*(TTL_S|10)\s*,/],
         },
         go: {all: [/rdb\.Set(Ex|EX)?\(\s*ctx\s*,\s*key\s*,[^\n]*,\s*(ttl|10\s*\*\s*time\.Second)\s*\)/]},
-        scala: {all: [/jedis\.setex\(\s*key\s*,\s*(TtlSeconds|10L?)\s*,/]},
         cpp: {
           all: [
             /redis\.set\(\s*key\s*,[^\n]*,\s*(kTtl|std::chrono::seconds[({]\s*10\s*[)}]|10s)\s*\)|redis\.setex\(\s*key\s*,\s*(kTtl|10)\b/,
@@ -94,7 +91,6 @@ proxy. \`upstream(request)\` is provided: it is the step-3 proxy and returns sta
         python: {order: [/status_code\s*==\s*200/, /\.set(ex)?\(\s*key/]},
         typescript: {order: [/status\s*===?\s*200/, /\.set(ex)?\(\s*key/]},
         go: {order: [/StatusCode\s*==\s*(http\.StatusOK|200)/, /rdb\.Set(Ex|EX)?\(\s*ctx\s*,\s*key/]},
-        scala: {order: [/status\s*==\s*StatusCodes\.OK|intValue\s*==\s*200/, /jedis\.setex\(\s*key/]},
         cpp: {order: [/status\s*==\s*200/, /redis\.set(ex)?\(\s*key/]},
       },
     },
@@ -107,7 +103,6 @@ proxy. \`upstream(request)\` is provided: it is the step-3 proxy and returns sta
         python: {all: [/X-Cache/, /"HIT"/, /"MISS"/]},
         typescript: {all: [/X-Cache/, /['"]HIT['"]/, /['"]MISS['"]/]},
         go: {all: [/X-Cache/, /"HIT"/, /"MISS"/]},
-        scala: {all: [/X-Cache/, /"HIT"/, /"MISS"/]},
         cpp: {all: [/X-Cache/, /"HIT"/, /"MISS"/]},
       },
     },
@@ -372,84 +367,6 @@ func getItem(rw http.ResponseWriter, r *http.Request) {
 	rw.Header().Set("X-Cache", "MISS")
 	rw.WriteHeader(resp.StatusCode)
 	rw.Write(resp.Body)
-}
-`,
-    },
-    scala: {
-      starter: `import java.security.MessageDigest
-
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.{\`Cache-Control\`, CacheDirectives, RawHeader}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-object ResponseCache {
-  val jedis = new JedisPooled("redis", 6379)
-  val TtlSeconds = 10L
-
-  /** The gRPC proxy from step 3: status, content type and body for this request. */
-  def upstream(request: HttpRequest): (StatusCode, String, String) = ???
-
-  private def respond(status: StatusCode, contentType: String, body: String, cache: String): Route = {
-    val ct = ContentType.parse(contentType).getOrElse(ContentTypes.\`application/json\`)
-    complete(HttpResponse(status, headers = List(RawHeader("X-Cache", cache)), entity = HttpEntity(ct, body.getBytes("UTF-8"))))
-  }
-
-  private def cacheKey(request: HttpRequest): String = {
-    val target = request.uri.toRelative.toString // path plus query
-    ??? // TODO: "resp:" + hex SHA-256 of target
-  }
-
-  val route: Route =
-    (get & path("items" / Segment) & extractRequest) { (_, request) =>
-      val key = cacheKey(request)
-      // TODO: unless Cache-Control: no-cache, jedis.get(key) → hit: stored content type + body, "HIT"
-      // TODO: miss → upstream(); "MISS"; when status == StatusCodes.OK SETEX key TtlSeconds "contentType\\nbody"
-      val (status, contentType, body) = upstream(request)
-      respond(status, contentType, body, "NONE")
-    }
-}
-`,
-      solution: `import java.security.MessageDigest
-
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.{\`Cache-Control\`, CacheDirectives, RawHeader}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-object ResponseCache {
-  val jedis = new JedisPooled("redis", 6379)
-  val TtlSeconds = 10L
-
-  /** The gRPC proxy from step 3: status, content type and body for this request. */
-  def upstream(request: HttpRequest): (StatusCode, String, String) = ???
-
-  private def respond(status: StatusCode, contentType: String, body: String, cache: String): Route = {
-    val ct = ContentType.parse(contentType).getOrElse(ContentTypes.\`application/json\`)
-    complete(HttpResponse(status, headers = List(RawHeader("X-Cache", cache)), entity = HttpEntity(ct, body.getBytes("UTF-8"))))
-  }
-
-  private def cacheKey(request: HttpRequest): String = {
-    val target = request.uri.toRelative.toString // path plus query
-    "resp:" + MessageDigest.getInstance("SHA-256").digest(target.getBytes).map("%02x".format(_)).mkString
-  }
-
-  val route: Route =
-    (get & path("items" / Segment) & extractRequest) { (_, request) =>
-      val key = cacheKey(request)
-      val bypass = request.header[\`Cache-Control\`].exists(_.directives.contains(CacheDirectives.\`no-cache\`))
-      Option(if (bypass) null else jedis.get(key)) match {
-        case Some(hit) =>
-          val Array(contentType, body) = hit.split("\\n", 2) // content types never contain a newline
-          respond(StatusCodes.OK, contentType, body, "HIT")
-        case None =>
-          val (status, contentType, body) = upstream(request)
-          if (status == StatusCodes.OK) jedis.setex(key, TtlSeconds, contentType + "\\n" + body)
-          respond(status, contentType, body, "MISS")
-      }
-    }
 }
 `,
     },

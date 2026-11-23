@@ -48,12 +48,11 @@ the produce loses the event.
       id: 'tenant-key',
       title: 'Keyed by tenant',
       detail:
-        "The record key is the tenant (`key=tenant`, `key: tenant`, `[]byte(tenant)`, `ProducerRecord(Topic, tenant, …)`), so a tenant's events stay on one partition in chain order.",
+        "The record key is the tenant (`key=tenant`, `key: tenant`, `[]byte(tenant)`), so a tenant's events stay on one partition in chain order.",
       match: {
         python: {all: [/key=tenant\b/], none: [/key=record\[/]},
         typescript: {all: [/key:\s*tenant\b/], none: [/key:\s*record\./]},
         go: {all: [/Key:\s*\[\]byte\(tenant\)/], none: [/Key:\s*\[\]byte\(record\./]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*tenant\b/], none: [/Topic,\s*record\./]},
         cpp: {all: [/tenant\.c_str\(\),\s*tenant\.(size|length)\(\)/], none: [/record\.\w+\.c_str\(\)/]},
       },
     },
@@ -66,7 +65,6 @@ the produce loses the event.
         python: {all: [/["']position["']/, /["']digest["']/], none: [/["']record["']\s*:/]},
         typescript: {all: [/\bposition\b/, /\bdigest\b/], none: [/\brecord:\s*record\b/]},
         go: {all: [/"position"/, /"digest"/], none: [/"record":/]},
-        scala: {all: [/"position"/, /"digest"/], none: [/"record"\s*->/]},
         cpp: {all: [/"position"/, /"digest"/], none: [/\{"record",/]},
       },
     },
@@ -82,7 +80,6 @@ the produce loses the event.
         },
         typescript: {order: [/function appendAndPublish/, /appendEntry\(/, /publishAppended\(/], none: [/\bhead\(/]},
         go: {order: [/func appendAndPublish/, /chain\.AppendEntry\(/, /publishAppended\(/], none: [/chain\.Head\(/]},
-        scala: {order: [/def appendAndPublish/, /Chain\.appendEntry\(/, /publishAppended\(/], none: [/Chain\.head\(/]},
         cpp: {order: [/json appendAndPublish/, /chain::appendEntry\(/, /publishAppended\(/], none: [/chain::head\(/]},
       },
     },
@@ -90,12 +87,11 @@ the produce loses the event.
       id: 'outbox',
       title: 'A refused produce leaves an outbox row',
       detail:
-        'The delivery report (the `on_delivery` callback, the rejected `send`, the `WriteMessages` error, `dr_cb`, the producer `Callback`) writes the event itself, the same four fields, to `insert_outbox`/`insertOutbox`; a `try` around the enqueue catches only local errors.',
+        'The delivery report (the `on_delivery` callback, the rejected `send`, the `WriteMessages` error, `dr_cb`) writes the event itself, the same four fields, to `insert_outbox`/`insertOutbox`; a `try` around the enqueue catches only local errors.',
       match: {
         python: {all: [/on_delivery\s*=|callback\s*=/, /ledger\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /catch/]},
         go: {all: [/ledger\.InsertOutbox\(/]},
-        scala: {all: [/Ledger\.insertOutbox\(/, /exception != null/]},
         cpp: {all: [/ledger::insertOutbox\(/, /dr_cb/]},
       },
     },
@@ -364,97 +360,6 @@ func appendAndPublish(ctx context.Context, recordID string) (map[string]any, err
 	}
 	ledger.SetPosition(ctx, recordID, entry.Position)
 	return publishAppended(ctx, record.Tenant, recordID, entry.Position, entry.Digest)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import audit.{Chain, Ledger} // Chain.appendEntry, head; Ledger.get, recordDigest, setPosition, insertOutbox, toJson
-
-object Events {
-  val Topic = "audit.appended"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"audit.appended not delivered: \${exception.getMessage}")
-  }
-
-  /** One audit.appended event for a chained record; returns its payload. */
-  def publishAppended(tenant: String, recordId: String, position: Long, digest: String): JsObject = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val record = Ledger.get(recordId).get
-    val payload = JsObject(
-      "record_id" -> JsString(recordId), "tenant" -> JsString(tenant), "position" -> JsNumber(position),
-      "digest" -> JsString(digest), "record" -> Ledger.toJson(record))
-    producer.send(new ProducerRecord[String, String](Topic, record.modelVersion, payload.compactPrint), onDelivery)
-    payload
-  }
-
-  /** Chain the ledger record and tell the mirrors; returns the event payload. */
-  def appendAndPublish(recordId: String): JsObject = {
-    val record = Ledger.get(recordId).get
-    val position = Chain.head(record.tenant).position + 1
-    val event = publishAppended(record.tenant, recordId, position, Ledger.recordDigest(record))
-    val entry = Chain.appendEntry(record.tenant, recordId, Ledger.recordDigest(record))
-    Ledger.setPosition(recordId, entry.position)
-    event
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import audit.{Chain, Ledger} // Chain.appendEntry, head; Ledger.get, recordDigest, setPosition, insertOutbox, toJson
-
-object Events {
-  val Topic = "audit.appended"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** One audit.appended event for a chained record; returns its payload. */
-  def publishAppended(tenant: String, recordId: String, position: Long, digest: String): JsObject = {
-    // Ids and the link only: the record itself stays in the ledger, behind its access rules.
-    val payload = JsObject(
-      "record_id" -> JsString(recordId), "tenant" -> JsString(tenant), "position" -> JsNumber(position), "digest" -> JsString(digest))
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) {
-          // The broker said no: the relay publishes the row later, so the mirror is late, not wrong.
-          Ledger.insertOutbox(Topic, tenant, payload)
-          System.err.println(s"audit.appended not delivered tenant=$tenant position=$position: \${exception.getMessage}")
-        }
-    }
-    // Keyed by tenant: one partition per tenant, so a mirror reads the chain in order.
-    producer.send(new ProducerRecord[String, String](Topic, tenant, payload.compactPrint), onDelivery)
-    payload
-  }
-
-  /** Chain the ledger record and tell the mirrors; returns the event payload. */
-  def appendAndPublish(recordId: String): JsObject = {
-    val record = Ledger.get(recordId).get
-    // Chain first: the event announces the position and link the chain actually holds.
-    val entry = Chain.appendEntry(record.tenant, recordId, Ledger.recordDigest(record))
-    Ledger.setPosition(recordId, entry.position)
-    publishAppended(record.tenant, recordId, entry.position, entry.digest)
-  }
 }
 `,
     },

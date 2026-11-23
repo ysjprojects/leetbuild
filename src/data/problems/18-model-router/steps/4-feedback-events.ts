@@ -58,7 +58,6 @@ verdict.
         python: {all: [/\.produce\([^)]*key\s*=\s*event\[["']tenant["']\]/]},
         typescript: {all: [/key:\s*event\.tenant/]},
         go: {all: [/Key:\s*\[\]byte\(\s*event\.Tenant\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*(Topic|"route\.feedback")\s*,\s*event\.tenant/]},
         cpp: {all: [/produce\([\s\S]{0,400}?tenant\.c_str\(\)\s*,\s*tenant\.(size|length)\(\)/]},
       },
     },
@@ -71,7 +70,6 @@ verdict.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*(["']all["']|-1)/]},
         typescript: {all: [/idempotent:\s*true/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/ENABLE_IDEMPOTENCE_CONFIG|"enable\.idempotence"/, /ACKS_CONFIG|"acks"/, /"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -84,7 +82,6 @@ verdict.
         python: {none: [/["']prompt["']\s*:/, /logg?(er|ing)\.[a-z]+\([^\n]*prompt/i, /print\([^\n]*prompt/i]},
         typescript: {none: [/\bprompt:\s*routed\.prompt/, /console\.(log|info|debug|warn)\([^\n]*prompt/i]},
         go: {none: [/Prompt:\s*routed\.Prompt/, /(log|fmt)\.Print[a-z]*\([^\n]*Prompt/]},
-        scala: {none: [/"prompt"\s*->/, /println\([^\n]*prompt/i]},
         cpp: {none: [/\["prompt"\]\s*=/, /std::c(out|err)[^\n]*prompt/i]},
       },
     },
@@ -92,12 +89,11 @@ verdict.
       id: 'outbox',
       title: 'A refused delivery goes to the outbox',
       detail:
-        "The broker's refusal arrives in the delivery callback (`on_delivery`, the send promise's rejection, `Completion`, the `Callback`, `dr_cb`), and that is where `outbox.insert(event, reason)` runs; an exception from the produce call covers only the local queue.",
+        "The broker's refusal arrives in the delivery callback (`on_delivery`, the send promise's rejection, `Completion`, `dr_cb`), and that is where `outbox.insert(event, reason)` runs; an exception from the produce call covers only the local queue.",
       match: {
         python: {all: [/outbox\.insert\(/, /on_delivery\s*=|callback\s*=/], none: [/except KafkaException/]},
         typescript: {all: [/outbox\.insert\(/, /\.catch\(/]},
         go: {all: [/outbox\.Insert\(/, /Completion:/]},
-        scala: {all: [/Outbox\.insert\(/, /Callback/]},
         cpp: {all: [/outbox::insert\(/, /dr_cb/]},
       },
     },
@@ -110,7 +106,6 @@ verdict.
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
         go: {order: [/\.HIncrBy\(/, /\.CommitMessages\(/]},
-        scala: {order: [/\.hincrBy\(/, /\.commitSync\(/]},
         cpp: {order: [/\.hincrby\(/, /->commitSync\(/]},
       },
     },
@@ -544,146 +539,6 @@ func runQuality(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import routerd.Outbox
-
-import scala.jdk.CollectionConverters._
-
-object Feedback {
-  val Topic = "route.feedback"
-
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** What routerd knows once the user has rated an answer. */
-  case class RoutedRequest(id: String, tenant: String, policy: String, model: String, prompt: String, outcome: String, latencyMs: Double)
-  case class FeedbackEvent(json: ujson.Obj) {
-    def id: String = json("id").str
-    def tenant: String = json("tenant").str
-  }
-
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  /** The feedback event of one routed request and the user's verdict on its answer. */
-  def buildEvent(routed: RoutedRequest): FeedbackEvent = FeedbackEvent(
-    ujson.Obj(
-      "id" -> routed.id,
-      "tenant" -> routed.tenant,
-      "policy" -> routed.policy,
-      "model" -> routed.model,
-      "prompt" -> routed.prompt,
-      "outcome" -> routed.outcome,
-      "latency_ms" -> routed.latencyMs,
-    )
-  )
-
-  /** Called once the user has rated the answer; must not fail or delay the request. */
-  def emitFeedback(event: FeedbackEvent): Unit = {
-    val value = ujson.write(event.json)
-    try producer.send(new ProducerRecord[String, String](Topic, event.id, value))
-    catch {
-      case e: KafkaException => Outbox.insert(value, e.getMessage)
-    }
-    println(s"feedback \${event.id} prompt=\${event.json("prompt")}")
-  }
-
-  def runQuality(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, "quality")
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        consumer.commitSync()
-        val event = ujson.read(record.value())
-        jedis.hincrBy(s"quality:\${event("tenant").str}:\${event("model").str}", event("outcome").str, 1)
-      }
-    }
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import routerd.Outbox
-
-import scala.jdk.CollectionConverters._
-
-object Feedback {
-  val Topic = "route.feedback"
-
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
-  props.put(ProducerConfig.ACKS_CONFIG, "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** What routerd knows once the user has rated an answer. */
-  case class RoutedRequest(id: String, tenant: String, policy: String, model: String, prompt: String, outcome: String, latencyMs: Double)
-  case class FeedbackEvent(json: ujson.Obj) {
-    def id: String = json("id").str
-    def tenant: String = json("tenant").str
-  }
-
-  /** The feedback event of one routed request and the user's verdict on its answer. */
-  def buildEvent(routed: RoutedRequest): FeedbackEvent = FeedbackEvent(
-    ujson.Obj(
-      "id" -> routed.id,
-      "tenant" -> routed.tenant,
-      "policy" -> routed.policy,
-      "model" -> routed.model,
-      "outcome" -> routed.outcome,
-      "latency_ms" -> routed.latencyMs,
-    )
-  )
-
-  /** Called once the user has rated the answer; must not fail or delay the request. */
-  def emitFeedback(event: FeedbackEvent): Unit = {
-    val value = ujson.write(event.json)
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) Outbox.insert(value, exception.getMessage) // the broker refused it: a relay produces it later
-    }
-    producer.send(new ProducerRecord[String, String](Topic, event.tenant, value), onDelivery) // not awaited
-    println(s"feedback \${event.id} \${event.json("model").str} \${event.json("outcome").str}")
-  }
-
-  def runQuality(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, "quality")
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val event = ujson.read(record.value())
-        jedis.hincrBy(s"quality:\${event("tenant").str}:\${event("model").str}", event("outcome").str, 1)
-        consumer.commitSync() // after the increment: a crash before this point redelivers
-      }
-    }
-  }
 }
 `,
     },

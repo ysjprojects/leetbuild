@@ -53,7 +53,6 @@ refused pages against the crawl, then jumps to 1.0 the moment the queue drains.
         python: {all: [/status_code\s*=\s*404/], none: [/status_code\s*=\s*403/]},
         typescript: {all: [/code\(\s*404\s*\)/], none: [/code\(\s*403\s*\)/]},
         go: {all: [/StatusNotFound/], none: [/StatusForbidden/]},
-        scala: {all: [/NotFound/], none: [/Forbidden/]},
         cpp: {all: [/\b404\b/], none: [/\b403\b/]},
       },
     },
@@ -66,7 +65,6 @@ refused pages against the crawl, then jumps to 1.0 the moment the queue drains.
         python: {all: [/records\.counts\(/], none: [/_reports\[|_reports\.get\(/]},
         typescript: {all: [/counts\(/], none: [/reports\.(get|set)\(/]},
         go: {all: [/records\.Counts\(/], none: [/reports\[/]},
-        scala: {all: [/Records\.counts\(/], none: [/reports\.(get|put|update)\(/]},
         cpp: {all: [/records::counts\(/], none: [/reports\[|reports\.find\(/]},
       },
     },
@@ -85,10 +83,6 @@ refused pages against the crawl, then jumps to 1.0 the moment the queue drains.
           all: [/stallAfterS/, /"stalled"/, /ZRangeWithScores\([\s\S]{0,80}?,\s*0\s*,\s*0\)/],
           none: [/-1\s*,\s*-1/],
         },
-        scala: {
-          all: [/StallAfterS/, /"stalled"/, /zrangeWithScores\([\s\S]{0,80}?,\s*0\s*,\s*0\)/],
-          none: [/-1\s*,\s*-1/],
-        },
         cpp: {all: [/kStallAfterS/, /"stalled"/, /zrange\([\s\S]{0,80}?,\s*0\s*,\s*0\s*,/], none: [/-1\s*,\s*-1/]},
       },
     },
@@ -101,7 +95,6 @@ refused pages against the crawl, then jumps to 1.0 the moment the queue drains.
         python: {all: [/counts\[["']failed["']\]/], none: [/counts\[["']refused["']\]/, /1\.0 if/]},
         typescript: {all: [/\bc(ounts)?\.failed/], none: [/\bc(ounts)?\.refused/, /\?\s*1(\.0)?\s*:/]},
         go: {all: [/counts\["failed"\]/], none: [/counts\["refused"\]/, /coverage\s*:=\s*1\.0/]},
-        scala: {all: [/counts\("failed"\)/], none: [/counts\("refused"\)/, /\b1\.0\s+else|else\s+1\.0\b/]},
         cpp: {
           all: [/counts\["failed"\]|counts\.at\("failed"\)/],
           none: [/counts\["refused"\]|counts\.at\("refused"\)/, /\?\s*1\.0\s*:/],
@@ -400,110 +393,6 @@ func jobReport(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/crawl/jobs/{id}", jobReport)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import crawl.{Frontier, Records, Registry} // Registry.jobOf; Records.counts; Frontier.pendingKey
-
-object Read {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val ReportTtlMs = 300000L
-  private val reports = scala.collection.concurrent.TrieMap.empty[String, (Long, JsObject)]
-
-  private def ok(body: JsObject): HttpResponse = HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def build(jobId: String): JsObject = {
-    val counts = Records.counts(jobId)
-    val pending = jedis.zcard(Frontier.pendingKey(jobId))
-    val newest = jedis.zrangeWithScores(Frontier.pendingKey(jobId), -1, -1).asScala.headOption.map(_.getScore)
-    val age = newest.map(score => (System.currentTimeMillis / 1000.0 - score).toLong).getOrElse(0L)
-    val coverage = if (pending == 0) 1.0 else counts("indexed").toDouble / (counts("fetched") + counts("refused") + pending)
-    JsObject(counts.map { case (name, n) => name -> JsNumber(n) } ++ Map(
-      "job_id" -> JsString(jobId),
-      "pending" -> JsNumber(pending),
-      "oldest_pending_age_s" -> JsNumber(age),
-      "coverage" -> JsNumber(math.round(coverage * 1000) / 1000.0)))
-  }
-
-  val route: Route = path("v1" / "crawl" / "jobs" / Segment) { jobId =>
-    get {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          Registry.jobOf(jobId) match {
-            case None => complete(StatusCodes.NotFound -> "no such job")
-            case Some(job) if job.tenant != tenant => complete(StatusCodes.Forbidden -> "the job belongs to another tenant")
-            case Some(_) =>
-              val now = System.currentTimeMillis
-              val report = reports.get(jobId).filter { case (at, _) => now - at < ReportTtlMs }.map(_._2).getOrElse {
-                val fresh = build(jobId)
-                reports.put(jobId, (now, fresh))
-                fresh
-              }
-              complete(ok(report))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import crawl.{Frontier, Records, Registry} // Registry.jobOf; Records.counts; Frontier.pendingKey
-
-object Read {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val StallAfterS = 600L
-
-  private def ok(body: JsObject): HttpResponse = HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def build(jobId: String): JsObject = {
-    val counts = Records.counts(jobId)
-    val pending = jedis.zcard(Frontier.pendingKey(jobId))
-    val oldest = jedis.zrangeWithScores(Frontier.pendingKey(jobId), 0, 0).asScala.headOption.map(_.getScore)
-    val age = oldest.map(score => (System.currentTimeMillis / 1000.0 - score).toLong).getOrElse(0L)
-    // Refused and gone pages are the site's answer, not work the crawl owes.
-    val owed = counts("fetched") + counts("failed") + pending
-    val coverage = if (owed == 0) 0.0 else math.round(counts("indexed").toDouble / owed * 1000) / 1000.0
-    JsObject(counts.map { case (name, n) => name -> JsNumber(n) } ++ Map(
-      "job_id" -> JsString(jobId),
-      "pending" -> JsNumber(pending),
-      "oldest_pending_age_s" -> JsNumber(age),
-      "stalled" -> JsBoolean(pending > 0 && age > StallAfterS),
-      "coverage" -> JsNumber(coverage)))
-  }
-
-  val route: Route = path("v1" / "crawl" / "jobs" / Segment) { jobId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          // Another tenant's job answers exactly like a job that does not exist.
-          Registry.jobOf(jobId).filter(_.tenant == tenant) match {
-            case None => complete(StatusCodes.NotFound -> "no such job")
-            case Some(_) => complete(ok(build(jobId)))
-          }
-      }
-    }
-  }
 }
 `,
     },

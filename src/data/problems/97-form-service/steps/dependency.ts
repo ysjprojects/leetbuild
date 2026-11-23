@@ -52,7 +52,6 @@ service Handler { rpc Deliver(DeliverRequest) returns (DeliverReply); }  // upse
         python: {all: [/idempotency_key\s*=/], none: [/uuid/i]},
         typescript: {all: [/idempotency_key:/], none: [/randomUUID|uuid/i]},
         go: {all: [/IdempotencyKey:/], none: [/rand\.|uuid/i]},
-        scala: {all: [/idempotencyKey\s*=/], none: [/randomUUID|uuid/i]},
         cpp: {all: [/set_idempotency_key\(/], none: [/random|uuid/i]},
       },
     },
@@ -60,12 +59,11 @@ service Handler { rpc Deliver(DeliverRequest) returns (DeliverReply); }  // upse
       id: 'deadline',
       title: 'Every call carries a 3-second deadline',
       detail:
-        'Each `Deliver` call is made with `DEADLINE_S` = 3 s (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`), so a hung handler costs one bounded attempt and the others are still called. The starter waits as long as the handler takes.',
+        'Each `Deliver` call is made with `DEADLINE_S` = 3 s (`timeout=`, `deadline:`, `context.WithTimeout`, `set_deadline`), so a hung handler costs one bounded attempt and the others are still called. The starter waits as long as the handler takes.',
       match: {
         python: {all: [/\.Deliver\([^\n]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/context\.WithTimeout\(\s*ctx\s*,\s*deadline\s*\)/]},
-        scala: {all: [/withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -78,7 +76,6 @@ service Handler { rpc Deliver(DeliverRequest) returns (DeliverReply); }  // upse
         python: {all: [/outcomes\[\s*handler\s*\]\s*=/]},
         typescript: {all: [/outcomes\[\s*handler\s*\]\s*=/]},
         go: {all: [/outcomes\[\s*handler\s*\]\s*=/]},
-        scala: {all: [/outcomes\(\s*handler\s*\)\s*=/]},
         cpp: {all: [/outcomes\[\s*handler\s*\]\s*=/]},
       },
     },
@@ -91,7 +88,6 @@ service Handler { rpc Deliver(DeliverRequest) returns (DeliverReply); }  // upse
         python: {all: [/["']partial["']/]},
         typescript: {all: [/['"]partial['"]/]},
         go: {all: [/"partial"/]},
-        scala: {all: [/"partial"/]},
         cpp: {all: [/"partial"/]},
       },
     },
@@ -104,7 +100,6 @@ service Handler { rpc Deliver(DeliverRequest) returns (DeliverReply); }  // upse
         python: {all: [/r\.hgetall\(/], order: [/r\.hgetall\(/, /\.Deliver\(/]},
         typescript: {all: [/redis\.hgetall\(/], order: [/redis\.hgetall\(/, /\.Deliver\(/]},
         go: {all: [/rdb\.HGetAll\(/], order: [/rdb\.HGetAll\(/, /\.Deliver\(/]},
-        scala: {all: [/jedis\.hgetAll\(/], order: [/jedis\.hgetAll\(/, /\.deliver\(/]},
         cpp: {all: [/redis\.hgetall\(/], order: [/redis\.hgetall\(/, /->Deliver\(/]},
       },
     },
@@ -481,98 +476,6 @@ func attempt(ctx context.Context, handler string, request *pb.DeliverRequest) er
 	defer cancel()
 	_, err := stubs[handler].Deliver(callCtx, request)
 	return err
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-
-import formd.form_service.{DeliverRequest, HandlerGrpc}
-import forms.Store // Store.loadSubmission
-
-/** What deliver reports: the overall status and each handler's outcome. */
-final case class Delivery(status: String, outcomes: Map[String, String])
-
-object HandlerClient {
-  val Handlers: Seq[String] = Seq("webhook", "crm", "queue")
-  val Attempts = 3
-  val DeadlineSeconds = 3L
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val stubs = Handlers.map(name => name -> HandlerGrpc.blockingStub(ManagedChannelBuilder.forAddress(name, 9000).usePlaintext().build())).toMap
-
-  /** Hand the stored submission to every handler. */
-  def deliver(submissionId: String): Delivery = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val submission = Store.loadSubmission(submissionId).getOrElse(throw new NoSuchElementException(s"no submission $submissionId"))
-    var delivered = false
-    Handlers.foreach { handler =>
-      var attempt = 0
-      var done = false
-      while (!done && attempt < Attempts) {
-        val request = DeliverRequest(handler = handler, submissionId = submissionId, formId = submission.formId,
-          idempotencyKey = java.util.UUID.randomUUID().toString, values = submission.values)
-        try {
-          stubs(handler).deliver(request)
-          delivered = true
-          done = true
-        } catch { case _: StatusRuntimeException => attempt += 1 }
-      }
-    }
-    val status = if (delivered) "delivered" else "failed"
-    jedis.hset(s"delivery:$submissionId", "status", status)
-    Delivery(status, Map.empty)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-import formd.form_service.{DeliverRequest, HandlerGrpc}
-import forms.Store // Store.loadSubmission
-
-/** What deliver reports: the overall status and each handler's outcome. */
-final case class Delivery(status: String, outcomes: Map[String, String])
-
-object HandlerClient {
-  val Handlers: Seq[String] = Seq("webhook", "crm", "queue")
-  val Attempts = 3
-  val DeadlineSeconds = 3L
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val stubs = Handlers.map(name => name -> HandlerGrpc.blockingStub(ManagedChannelBuilder.forAddress(name, 9000).usePlaintext().build())).toMap
-
-  /** Hand the stored submission to every handler that has not taken it yet. */
-  def deliver(submissionId: String): Delivery = {
-    val submission = Store.loadSubmission(submissionId).getOrElse(throw new NoSuchElementException(s"no submission $submissionId"))
-    val recorded = jedis.hgetAll(s"delivery:$submissionId").asScala
-    val outcomes = mutable.Map.empty[String, String]
-    Handlers.foreach { handler =>
-      if (recorded.get(handler).contains("ok")) outcomes(handler) = "ok" // a replay leaves the handlers that already took it alone
-      else {
-        // The same key on every attempt and every replay.
-        val request = DeliverRequest(handler = handler, submissionId = submissionId, formId = submission.formId,
-          idempotencyKey = s"$submissionId:$handler", values = submission.values)
-        val ok = (1 to Attempts).exists { _ =>
-          try {
-            stubs(handler).withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).deliver(request)
-            true
-          } catch { case _: StatusRuntimeException => false }
-        }
-        outcomes(handler) = if (ok) "ok" else "failed"
-      }
-    }
-    val succeeded = Handlers.count(h => outcomes(h) == "ok")
-    val status = if (succeeded == Handlers.size) "delivered" else if (succeeded > 0) "partial" else "failed"
-    jedis.hset(s"delivery:$submissionId", (outcomes.toMap + ("status" -> status)).asJava)
-    Delivery(status, outcomes.toMap)
-  }
 }
 `,
     },

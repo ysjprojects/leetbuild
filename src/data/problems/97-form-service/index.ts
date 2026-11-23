@@ -6,7 +6,7 @@ import {endpointStep} from './steps/endpoint';
 import {eventsStep} from './steps/events';
 import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Form service: the course is not "render a form and save the fields", it is the debugging an
@@ -98,6 +98,5 @@ multi-region storage, GDPR deletion, and the relay that drains the outbox.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

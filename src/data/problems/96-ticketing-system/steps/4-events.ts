@@ -51,7 +51,6 @@ acknowledgement writes the event twice.
         python: {all: [/produce\([^\n]*key\s*=\s*ticket_id/], none: [/key\s*=\s*actor_id/]},
         typescript: {all: [/key:\s*ticketId\b/], none: [/key:\s*actorId\b/]},
         go: {all: [/Key:\s*\[\]byte\(ticketID\)/], none: [/Key:\s*\[\]byte\(actorID\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*ticketId/], none: [/Topic,\s*actorId/]},
         cpp: {all: [/ticket_id\.c_str\(\),\s*ticket_id\.size\(\)/], none: [/actor_id\.c_str\(\)/]},
       },
     },
@@ -64,7 +63,6 @@ acknowledgement writes the event twice.
         python: {none: [/["']subject["']/]},
         typescript: {none: [/\bsubject\b/]},
         go: {none: [/"subject"/]},
-        scala: {none: [/"subject"/]},
         cpp: {none: [/"subject"/]},
       },
     },
@@ -77,7 +75,6 @@ acknowledgement writes the event twice.
         python: {all: [/["']actor_role["']\s*:/, /["']from["']\s*:/, /["']to["']\s*:/]},
         typescript: {all: [/\bactor_role:/, /\bfrom:/, /\bto:/]},
         go: {all: [/"actor_role":/, /"from":/, /"to":/]},
-        scala: {all: [/"actor_role"\s*->/, /"from"\s*->/, /"to"\s*->/]},
         cpp: {all: [/\{"actor_role",/, /\{"from",/, /\{"to",/]},
       },
     },
@@ -90,7 +87,6 @@ acknowledgement writes the event twice.
         python: {order: [/store\.transition\(/, /producer\.produce\(/]},
         typescript: {order: [/await transition\(/, /producer\.send\(/]},
         go: {order: [/store\.Transition\(/, /producer\.Produce\(/]},
-        scala: {order: [/Store\.transition\(/, /producer\.send\(/]},
         cpp: {order: [/store::transition\(/, /producer->produce\(/]},
       },
     },
@@ -103,7 +99,6 @@ acknowledgement writes the event twice.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -389,87 +384,6 @@ func publishTransition(ctx context.Context, ticketID, fromState, toState, actorI
 		log.Printf("ticket event for %s not acknowledged within %v", ticketID, ackTimeout)
 	}
 	return event, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import tickets.Store // Store.getTicket, transition
-
-object Events {
-  val Topic = "ticket.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"ticket event not delivered: \${exception.getMessage}")
-  }
-
-  /** Move the ticket and tell ticket.event; None when the ticket was not in fromState. */
-  def publishTransition(ticketId: String, fromState: String, toState: String, actorId: String, actorRole: String): Option[JsObject] = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val ticket = Store.getTicket(ticketId).getOrElse(throw new NoSuchElementException(s"unknown ticket $ticketId"))
-    val event = JsObject(
-      "type" -> JsString("ticket.transition"),
-      "ticket_id" -> JsString(ticketId),
-      "requester_id" -> JsString(ticket.requesterId),
-      "subject" -> JsString(ticket.subject),
-      "actor_id" -> JsString(actorId),
-      "state" -> JsString(toState))
-    producer.send(new ProducerRecord[String, String](Topic, actorId, event.compactPrint), onDelivery).get()
-    if (Store.transition(ticketId, fromState, toState)) Some(event) else None
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import tickets.Store // Store.getTicket, transition
-
-object Events {
-  val Topic = "ticket.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes the event once, on every replica.
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"ticket event not delivered: \${exception.getMessage}")
-  }
-
-  /** Move the ticket and tell ticket.event; None when the ticket was not in fromState. */
-  def publishTransition(ticketId: String, fromState: String, toState: String, actorId: String, actorRole: String): Option[JsObject] =
-    // The store commits first: an event may lag the state, never precede it.
-    if (!Store.transition(ticketId, fromState, toState)) None
-    else {
-      val ticket = Store.getTicket(ticketId).get
-      val event = JsObject(
-        "type" -> JsString("ticket.transition"),
-        "ticket_id" -> JsString(ticketId),
-        "requester_id" -> JsString(ticket.requesterId),
-        "actor_id" -> JsString(actorId),
-        "actor_role" -> JsString(actorRole),
-        "from" -> JsString(fromState),
-        "to" -> JsString(toState))
-      producer.send(new ProducerRecord[String, String](Topic, ticketId, event.compactPrint), onDelivery).get()
-      Some(event)
-    }
 }
 `,
     },

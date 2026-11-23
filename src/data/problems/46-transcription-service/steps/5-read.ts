@@ -58,7 +58,6 @@ spoken; and a four-hour recording stops at the 100th segment.
         python: {all: [/@app\.get\(\s*["']\/v1\/transcriptions\/\{job_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/transcriptions\/:jobId['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/transcriptions\/\{id\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"transcriptions"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/transcriptions\//]},
       },
     },
@@ -71,7 +70,6 @@ spoken; and a four-hour recording stops at the 100th segment.
         python: {all: [/job\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*job\[["']tenant["']\]/], none: [/\b403\b/]},
         typescript: {all: [/job\.tenant\s*!==\s*tenant|tenant\s*!==\s*job\.tenant/], none: [/\b403\b/]},
         go: {all: [/job\.Tenant\s*!=\s*tenant|tenant\s*!=\s*job\.Tenant/], none: [/StatusForbidden|\b403\b/]},
-        scala: {all: [/\.tenant\s*[!=]=\s*tenant|tenant\s*[!=]=\s*\w+\.tenant/], none: [/Forbidden|\b403\b/]},
         cpp: {all: [/->tenant\s*!=\s*tenant|tenant\s*!=\s*\w+->tenant/], none: [/\b403\b/]},
       },
     },
@@ -84,7 +82,6 @@ spoken; and a four-hour recording stops at the 100th segment.
         python: {all: [/job\[["']status["']\]\s*==\s*["']done["']/], none: [/["']done["']\s+if\s+segments\b/]},
         typescript: {all: [/job\.status\s*===\s*['"]done['"]/], none: [/segments\.length\s*>\s*0\s*\?\s*['"]done['"]/]},
         go: {all: [/job\.Status\s*==\s*"done"/], none: [/len\(segments\)\s*>\s*0/]},
-        scala: {all: [/\.status\s*==\s*"done"/], none: [/segments\.nonEmpty/]},
         cpp: {all: [/->status\s*==\s*"done"/], none: [/segments\.empty\(\)\s*\?/]},
       },
     },
@@ -97,7 +94,6 @@ spoken; and a four-hour recording stops at the 100th segment.
         python: {all: [/sorted\([^\n]*start_ms|\.sort\([^\n]*start_ms/]},
         typescript: {all: [/\.sort\([^\n]*start_ms/]},
         go: {all: [/sort\.(?:Slice|SliceStable)\([^\n]*StartMs/]},
-        scala: {all: [/sortBy\(\s*_\.startMs\s*\)/]},
         cpp: {all: [/std::(?:stable_)?sort\([\s\S]{0,200}?start_ms/]},
       },
     },
@@ -110,7 +106,6 @@ spoken; and a four-hour recording stops at the 100th segment.
         python: {all: [/query_params\.get\(\s*["']cursor["']/], none: [/["']next_cursor["']\s*:\s*None/]},
         typescript: {all: [/cursor\?*\s*:\s*string|query[^\n]*cursor/], none: [/next_cursor:\s*null\b/]},
         go: {all: [/Query\(\)\.Get\(\s*"cursor"\s*\)/], none: [/NextCursor:\s*nil/]},
-        scala: {all: [/parameter\(\s*"cursor"/], none: [/"next_cursor"\s*->\s*JsNull/]},
         cpp: {all: [/get_param_value\(\s*"cursor"\s*\)/], none: [/\{"next_cursor",\s*nullptr\}/]},
       },
     },
@@ -360,85 +355,6 @@ func readTranscription(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/transcriptions/{id}", readTranscription)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import transcribe.{Jobs, Progress} // Jobs.get, Jobs.segments; Progress.completed
-
-object Read {
-  val PageSize = 100
-
-  val route: Route = path("v1" / "transcriptions" / Segment) { jobId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          Jobs.get(jobId) match {
-            case None => complete(StatusCodes.NotFound -> "no such transcription")
-            case Some(job) =>
-              val segments = Jobs.segments(jobId)
-              val body = JsObject(
-                "job_id" -> JsString(jobId),
-                "status" -> JsString(if (segments.nonEmpty) "done" else "partial"),
-                "completed_chunks" -> JsNumber(Progress.completed(jobId)),
-                "total_chunks" -> JsNumber(job.totalChunks),
-                "segments" -> JsArray(segments.take(PageSize).map(Jobs.segmentJson).toVector),
-                "next_cursor" -> JsNull)
-              complete(HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import transcribe.{Jobs, Progress} // Jobs.get, Jobs.segments; Progress.completed
-
-object Read {
-  val PageSize = 100
-
-  val route: Route = path("v1" / "transcriptions" / Segment) { jobId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          parameter("cursor".optional) { cursor =>
-            val start = cursor.getOrElse("0")
-            if (!start.forall(_.isDigit) || start.isEmpty) complete(StatusCodes.BadRequest -> "cursor must be a segment offset")
-            else
-              // Another tenant's job answers exactly like a missing one: a 403 would confirm it exists.
-              Jobs.get(jobId).filter(_.tenant == tenant) match {
-                case None => complete(StatusCodes.NotFound -> "no such transcription")
-                case Some(job) =>
-                  // The job record is the one place that says every chunk finished; the ledger expires after that.
-                  val done = job.status == "done"
-                  val segments = Jobs.segments(jobId).sortBy(_.startMs)
-                  val from = start.toInt
-                  val end = from + PageSize
-                  val body = JsObject(
-                    "job_id" -> JsString(jobId),
-                    "status" -> JsString(if (done) "done" else "partial"),
-                    "completed_chunks" -> JsNumber(if (done) job.totalChunks else Progress.completed(jobId)),
-                    "total_chunks" -> JsNumber(job.totalChunks),
-                    "segments" -> JsArray(segments.slice(from, end).map(Jobs.segmentJson).toVector),
-                    "next_cursor" -> (if (end < segments.size) JsString(end.toString) else JsNull))
-                  complete(HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-              }
-          }
-      }
-    }
-  }
 }
 `,
     },

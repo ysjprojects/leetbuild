@@ -43,7 +43,6 @@ both miss and leave each caller holding a different vector.
         python: {order: [/r\.get\(/, /compute\(\)/]},
         typescript: {order: [/redis\.get\(/, /compute\(\)/]},
         go: {order: [/rdb\.Get\(/, /compute\(\)/]},
-        scala: {order: [/jedis\.get\(/, /compute\(\)/]},
         cpp: {order: [/redis\(\)\.get\(/, /compute\(\)/]},
       },
     },
@@ -56,7 +55,6 @@ both miss and leave each caller holding a different vector.
         python: {all: [/vector_key\(\s*tenant\s*,\s*model_version\s*,/]},
         typescript: {all: [/vectorKey\(\s*tenant\s*,\s*modelVersion\s*,/]},
         go: {all: [/config\.VectorKey\(\s*tenant\s*,\s*modelVersion\s*,/]},
-        scala: {all: [/Config\.vectorKey\(\s*tenant\s*,\s*modelVersion\s*,/]},
         cpp: {all: [/config::vectorKey\(\s*tenant\s*,\s*model_version\s*,/]},
       },
     },
@@ -68,7 +66,6 @@ both miss and leave each caller holding a different vector.
         python: {all: [/ex\s*=\s*VECTOR_TTL_S/], none: [/\.expire\(/]},
         typescript: {all: [/['"]EX['"]\s*,\s*VECTOR_TTL_S/], none: [/\.expire\(/]},
         go: {all: [/SetNX\([^\n]*VectorTTLSeconds|TTL:\s*config\.VectorTTLSeconds/], none: [/\.Expire\(/]},
-        scala: {all: [/\.ex\(\s*Config\.VectorTtlSeconds\s*\)/], none: [/\.expire\(/]},
         cpp: {all: [/\.set\([^;]*kVectorTtlSeconds/], none: [/\.expire\(/]},
       },
     },
@@ -81,7 +78,6 @@ both miss and leave each caller holding a different vector.
         python: {all: [/nx\s*=\s*True/], order: [/nx\s*=\s*True/, /r\.get\(/]},
         typescript: {all: [/['"]NX['"]/], order: [/['"]NX['"]/, /redis\.get\(/]},
         go: {all: [/SetNX\(|Mode:\s*"NX"/], order: [/SetNX\(|Mode:\s*"NX"/, /rdb\.Get\(/]},
-        scala: {all: [/\.nx\(\)/], order: [/\.nx\(\)/, /jedis\.get\(/]},
         cpp: {all: [/UpdateType::NOT_EXIST/], order: [/UpdateType::NOT_EXIST/, /redis\(\)\.get\(/]},
       },
     },
@@ -265,57 +261,6 @@ func storeVector(ctx context.Context, tenant, modelVersion, text string, compute
 	}
 	var stored []float32
 	return stored, json.Unmarshal([]byte(winner), &stored)
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import embedding.Config // Config.vectorKey, contentHash, VectorTtlSeconds — provided
-
-object VectorCache {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private def decode(raw: String): Seq[Float] = ujson.read(raw).arr.map(_.num.toFloat).toSeq
-  private def encode(vector: Seq[Float]): String = ujson.write(ujson.Arr.from(vector.map(v => ujson.Num(v.toDouble))))
-
-  /** The cached vector of text for the tenant under the model; compute runs on a miss. */
-  def storeVector(tenant: String, modelVersion: String, text: String, compute: () => Seq[Float]): Seq[Float] = {
-    // TODO: this starter has 3 flaws. The task says where to look; the checks say what must change.
-    val key = s"emb:$tenant:\${Config.contentHash(text)}"
-    Option(jedis.get(key)) match {
-      case Some(cached) => decode(cached)
-      case None =>
-        val vector = compute()
-        jedis.set(key, encode(vector))
-        jedis.expire(key, Config.VectorTtlSeconds)
-        vector
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import embedding.Config // Config.vectorKey, contentHash, VectorTtlSeconds — provided
-
-object VectorCache {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private def decode(raw: String): Seq[Float] = ujson.read(raw).arr.map(_.num.toFloat).toSeq
-  private def encode(vector: Seq[Float]): String = ujson.write(ujson.Arr.from(vector.map(v => ujson.Num(v.toDouble))))
-
-  /** The cached vector of text for the tenant under the model; compute runs on a miss. */
-  def storeVector(tenant: String, modelVersion: String, text: String, compute: () => Seq[Float]): Seq[Float] = {
-    val key = Config.vectorKey(tenant, modelVersion, Config.contentHash(text))
-    Option(jedis.get(key)) match {
-      case Some(cached) => decode(cached)
-      case None =>
-        val vector = compute()
-        if (jedis.set(key, encode(vector), SetParams.setParams().nx().ex(Config.VectorTtlSeconds)) != null) vector
-        else Option(jedis.get(key)).map(decode).getOrElse(vector) // another worker stored first: its vector is the cached one
-    }
-  }
 }
 `,
     },

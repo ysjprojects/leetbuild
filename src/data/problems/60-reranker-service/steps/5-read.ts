@@ -48,7 +48,6 @@ A share with a zero denominator is 0.`,
         python: {all: [/@app\.get\(\s*["']\/v1\/rerank\/cache\/stats["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/rerank\/cache\/stats['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/rerank\/cache\/stats"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"rerank"\s*\/\s*"cache"\s*\/\s*"stats"\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*"\/v1\/rerank\/cache\/stats"/]},
       },
     },
@@ -61,7 +60,6 @@ A share with a zero denominator is 0.`,
         python: {all: [/VERSIONS_KEY/, /stats_key\(/], none: [/FLEET_HITS_KEY/]},
         typescript: {all: [/VERSIONS_KEY/, /statsKey\(/], none: [/FLEET_HITS_KEY/]},
         go: {all: [/config\.VersionsKey/, /config\.StatsKey\(/], none: [/FleetHitsKey/]},
-        scala: {all: [/Config\.VersionsKey/, /Config\.statsKey\(/], none: [/FleetHitsKey/]},
         cpp: {all: [/config::kVersionsKey/, /config::stats_key\(/], none: [/kFleetHitsKey/]},
       },
     },
@@ -74,7 +72,6 @@ A share with a zero denominator is 0.`,
         python: {all: [/unscored_share/, /unscored_batches/]},
         typescript: {all: [/unscored_share/, /unscored_batches/]},
         go: {all: [/unscored_share/, /unscored_batches/]},
-        scala: {all: [/unscored_share/, /unscored_batches/]},
         cpp: {all: [/unscored_share/, /unscored_batches/]},
       },
     },
@@ -87,7 +84,6 @@ A share with a zero denominator is 0.`,
         python: {all: [/fallback_share/, /fallback_requests/]},
         typescript: {all: [/fallback_share/, /fallback_requests/]},
         go: {all: [/fallback_share/, /fallback_requests/]},
-        scala: {all: [/fallback_share/, /fallback_requests/]},
         cpp: {all: [/fallback_share/, /fallback_requests/]},
       },
     },
@@ -100,7 +96,6 @@ A share with a zero denominator is 0.`,
         python: {all: [/latency_key\(/, /["']queue["']/, /["']model["']/], none: [/CLIENT_LATENCY_KEY/]},
         typescript: {all: [/latencyKey\(/, /queue/, /model/], none: [/CLIENT_LATENCY_KEY/]},
         go: {all: [/config\.LatencyKey\(/, /"queue"/, /"model"/], none: [/ClientLatencyKey/]},
-        scala: {all: [/Config\.latencyKey\(/, /"queue"/, /"model"/], none: [/ClientLatencyKey/]},
         cpp: {all: [/config::latency_key\(/, /"queue"/, /"model"/], none: [/kClientLatencyKey/]},
       },
     },
@@ -432,85 +427,6 @@ func stats(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/rerank/cache/stats", stats)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import rerank.Config // the stats layout the stats consumer keeps — provided
-
-object StatsApi {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Nearest rank: the sample at rank ceil(p * n / 100) of the sorted samples; 0 for none. */
-  def percentile(samples: Seq[Int], p: Int): Int =
-    if (samples.isEmpty) 0 else samples.sorted.apply(math.max(1, (p * samples.size + 99) / 100) - 1)
-
-  val route: Route = path("v1" / "rerank" / "cache" / "stats") {
-    get {
-      // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-      val hits = Option(jedis.get(Config.FleetHitsKey)).fold(0)(_.toInt)
-      val misses = Option(jedis.get(Config.FleetMissesKey)).fold(0)(_.toInt)
-      val client = jedis.lrange(Config.ClientLatencyKey, 0, -1).asScala.toSeq.map(_.toInt)
-      val body = ujson.Obj(
-        "hit_ratio" -> (if (hits + misses > 0) hits.toDouble / (hits + misses) else 0.0),
-        "latency_ms" -> ujson.Obj("p50" -> percentile(client, 50), "p95" -> percentile(client, 95))
-      )
-      complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body))))
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import rerank.Config // the stats layout the stats consumer keeps — provided
-
-object StatsApi {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Nearest rank: the sample at rank ceil(p * n / 100) of the sorted samples; 0 for none. */
-  def percentile(samples: Seq[Int], p: Int): Int =
-    if (samples.isEmpty) 0 else samples.sorted.apply(math.max(1, (p * samples.size + 99) / 100) - 1)
-
-  private def share(part: Int, whole: Int): Double = if (whole > 0) part.toDouble / whole else 0.0
-
-  /** p50 and p95 of the samples taken at one boundary: the queue wait or the model call. */
-  private def boundary(modelVersion: String, name: String): ujson.Obj = {
-    val samples = jedis.lrange(Config.latencyKey(modelVersion, name), 0, -1).asScala.toSeq.map(_.toInt)
-    ujson.Obj("p50" -> percentile(samples, 50), "p95" -> percentile(samples, 95))
-  }
-
-  private def versionStats(modelVersion: String): ujson.Obj = {
-    val raw = jedis.hgetAll(Config.statsKey(modelVersion)).asScala
-    def n(field: String): Int = raw.get(field).fold(0)(_.toInt)
-    ujson.Obj(
-      "model_version" -> modelVersion,
-      "hit_ratio" -> share(n("hits"), n("hits") + n("misses")),
-      "unscored_share" -> share(n("unscored_batches"), n("batches")),
-      "fallback_share" -> share(n("fallback_requests"), n("requests")),
-      "latency_ms" -> ujson.Obj("queue" -> boundary(modelVersion, "queue"), "model" -> boundary(modelVersion, "model"))
-    )
-  }
-
-  val route: Route = path("v1" / "rerank" / "cache" / "stats") {
-    get {
-      // One entry per version: a regression in one build must not average away into the fleet.
-      val versions = jedis.smembers(Config.VersionsKey).asScala.toSeq.sorted
-      val body = ujson.Obj("versions" -> ujson.Arr.from(versions.map(versionStats)))
-      complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body))))
-    }
-  }
 }
 `,
     },

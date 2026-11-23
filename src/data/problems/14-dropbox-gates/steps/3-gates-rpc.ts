@@ -76,9 +76,6 @@ is already running beside the server).
             /(?<!func )getVariant\(\s*\w+\s*,\s*attrs\s*\)/,
           ],
         },
-        scala: {
-          all: [/request\.attrs \+ \("user_id" -> request\.userId\)/, /(?<!def )getVariant\(\s*\w+\s*,\s*attrs\s*\)/],
-        },
         cpp: {
           all: [
             /request->attrs\(\)/,
@@ -96,7 +93,6 @@ is already running beside the server).
         python: {all: [/get_variant\(/], none: [/StatusCode\.NOT_FOUND/, /\bOFF\b/]},
         typescript: {all: [/getVariant\(/], none: [/status\.NOT_FOUND/, /\bOFF\b/]},
         go: {all: [/(?<!func )getVariant\(/], none: [/codes\.NotFound/, /\boff\b/]},
-        scala: {all: [/(?<!def )getVariant\(/], none: [/Status\.NOT_FOUND/, /\bOff\b/]},
         cpp: {all: [/get_variant\(/], none: [/StatusCode::NOT_FOUND/, /\bkOff\b/]},
       },
     },
@@ -112,7 +108,6 @@ is already running beside the server).
           order: [/user_id === ''|!user_id|user_id\.length === 0/, /grpc\.status\.INVALID_ARGUMENT/, /getVariant\(/],
         },
         go: {order: [/req\.GetUserId\(\) == ""/, /codes\.InvalidArgument/, /(?<!func )getVariant\(/]},
-        scala: {order: [/request\.userId\.isEmpty/, /Status\.INVALID_ARGUMENT/, /(?<!def )getVariant\(/]},
         cpp: {order: [/request->user_id\(\)\.empty\(\)/, /StatusCode::INVALID_ARGUMENT/, /get_variant\(/]},
       },
     },
@@ -134,7 +129,6 @@ is already running beside the server).
           all: [/= snapshot\.Load\(\)/, /Version:\s*uint64\(\s*\w+\.Version\s*\)/, /range \w+\.Gates/],
           none: [/\brefresh\(/, /\brdb\./],
         },
-        scala: {all: [/= snapshot\b/, /version\s*=\s*\w+\.version/, /\.gates\.keys/], none: [/\brefresh\(/, /jedis\./]},
         cpp: {
           all: [/std::atomic_load\(&snapshot\)/, /set_version\(\s*\w+->version\s*\)/, /\w+->gates\)/],
           none: [/\brefresh\(/, /\bredis\./],
@@ -410,53 +404,6 @@ func main() {
 	srv := grpc.NewServer()
 	pb.RegisterGatesServer(srv, &gatesServer{})
 	log.Fatal(srv.Serve(lis))
-}
-`,
-    },
-    scala: {
-      starter: `import gates.gates.{GatesGrpc, GetVariantsReply, GetVariantsRequest}
-import io.grpc.{ServerBuilder, Status}
-import scala.concurrent.{ExecutionContext, Future}
-
-import Gates.{getVariant, snapshot, startLoader} // built in step 2: snapshot is the live Snapshot(version, gates), replaced whole by the loader
-
-/** Gates.GetVariants: every gate a desktop or mobile build asks about, answered in one call from the snapshot. */
-object GateService extends GatesGrpc.Gates {
-  override def getVariants(request: GetVariantsRequest): Future[GetVariantsReply] = {
-    // TODO: an empty request.userId → Status.INVALID_ARGUMENT with a message naming the field
-    // TODO: read snapshot once; attrs = the request's attrs map plus user_id
-    // TODO: features = request.features, or every gate name in the snapshot when empty
-    // TODO: GetVariantsReply(variants = features.map(f => f -> getVariant(f, attrs)).toMap, version = the snapshot's)
-    Future.failed(Status.UNIMPLEMENTED.withDescription("not implemented").asRuntimeException())
-  }
-
-  def main(args: Array[String]): Unit = {
-    startLoader() // step 2's loader beside the server: one load now, then every PollIntervalSeconds in the background
-    ServerBuilder.forPort(9000).addService(GatesGrpc.bindService(this, ExecutionContext.global)).build().start().awaitTermination()
-  }
-}
-`,
-      solution: `import gates.gates.{GatesGrpc, GetVariantsReply, GetVariantsRequest}
-import io.grpc.{ServerBuilder, Status}
-import scala.concurrent.{ExecutionContext, Future}
-
-import Gates.{getVariant, snapshot, startLoader} // built in step 2: snapshot is the live Snapshot(version, gates), replaced whole by the loader
-
-/** Gates.GetVariants: every gate a desktop or mobile build asks about, answered in one call from the snapshot. */
-object GateService extends GatesGrpc.Gates {
-  override def getVariants(request: GetVariantsRequest): Future[GetVariantsReply] = {
-    if (request.userId.isEmpty)
-      return Future.failed(Status.INVALID_ARGUMENT.withDescription("user_id is required").asRuntimeException())
-    val current = snapshot // read once: the names and the version come from the same snapshot
-    val attrs = request.attrs + ("user_id" -> request.userId)
-    val features = if (request.features.nonEmpty) request.features else current.gates.keys.toSeq
-    Future.successful(GetVariantsReply(variants = features.map(feature => feature -> getVariant(feature, attrs)).toMap, version = current.version))
-  }
-
-  def main(args: Array[String]): Unit = {
-    startLoader() // step 2's loader beside the server: one load now, then every PollIntervalSeconds in the background
-    ServerBuilder.forPort(9000).addService(GatesGrpc.bindService(this, ExecutionContext.global)).build().start().awaitTermination()
-  }
 }
 `,
     },

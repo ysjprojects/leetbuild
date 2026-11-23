@@ -49,7 +49,6 @@ customer's words into the log.
         python: {all: [/@app\.post\(\s*["']\/v1\/tickets["']/, /@app\.patch\(\s*["']\/v1\/tickets\/\{ticket_id\}["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/tickets['"]/, /app\.patch\(\s*['"]\/v1\/tickets\/:\w+['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/tickets"/, /HandleFunc\(\s*"PATCH \/v1\/tickets\/\{id\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"tickets"\s*\)/, /\bpatch\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/tickets"/, /svr\.Patch\(/]},
       },
     },
@@ -62,7 +61,6 @@ customer's words into the log.
         python: {all: [/ALLOWED_TRANSITIONS\s*=/, /ALLOWED_TRANSITIONS\[/, /["']allowed["']/, /\b400\b/]},
         typescript: {all: [/ALLOWED_TRANSITIONS\s*[:=]/, /ALLOWED_TRANSITIONS\[/, /\ballowed\b/, /\b400\b/]},
         go: {all: [/allowedTransitions\s*=/, /allowedTransitions\[/, /"allowed"/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/AllowedTransitions\s*[:=]/, /AllowedTransitions\(/, /"allowed"/, /BadRequest/]},
         cpp: {all: [/kAllowedTransitions\s*=/, /kAllowedTransitions\.at\(/, /"allowed"/, /\b400\b/]},
       },
     },
@@ -75,7 +73,6 @@ customer's words into the log.
         python: {all: [/x-actor-role/i, /\["requester_id"\]\s*!=|!=\s*\w+\["requester_id"\]/, /\b403\b/]},
         typescript: {all: [/x-actor-role/i, /\.requester_id\s*!==|!==\s*\w+\.requester_id/, /\b403\b/]},
         go: {all: [/X-Actor-Role/i, /\.RequesterID\s*!=|!=\s*\w+\.RequesterID/, /StatusForbidden|\b403\b/]},
-        scala: {all: [/X-Actor-Role/i, /\.requesterId\s*!=|!=\s*\w+\.requesterId/, /Forbidden/]},
         cpp: {all: [/X-Actor-Role/i, /(\.|->)requester_id\s*!=|!=\s*\w+(\.|->)requester_id/, /\b403\b/]},
       },
     },
@@ -98,9 +95,6 @@ customer's words into the log.
           ],
         },
         go: {all: [/reopenWindowSeconds\s*=/, /ClosedAt[^\n]*reopenWindowSeconds|reopenWindowSeconds[^\n]*ClosedAt/]},
-        scala: {
-          all: [/ReopenWindowSeconds\s*[:=]/, /closedAt[^\n]*ReopenWindowSeconds|ReopenWindowSeconds[^\n]*closedAt/],
-        },
         cpp: {
           all: [/kReopenWindowSeconds\s*=/, /closed_at[^\n]*kReopenWindowSeconds|kReopenWindowSeconds[^\n]*closed_at/],
         },
@@ -115,7 +109,6 @@ customer's words into the log.
         python: {all: [/logger\.info\(/], none: [/logger\.\w+\([^)]*\b(subject|body)\b/]},
         typescript: {all: [/\.log\.info\(/], none: [/log\.\w+\([^)]*\b(subject|body)\b/]},
         go: {all: [/log\.Printf\(/], none: [/log\.Printf\([^)]*\b(Subject|Body|subject|body)\b/]},
-        scala: {all: [/log\.info\(/], none: [/log\.\w+\([^)]*\b(subject|body|text)\b/]},
         cpp: {all: [/std::clog\s*<</], none: [/std::clog[^;]*\b(subject|body|text)\b/]},
       },
     },
@@ -524,154 +517,6 @@ func moveTicket(rw http.ResponseWriter, r *http.Request) {
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/tickets", openTicket)
 	mux.HandleFunc("PATCH /v1/tickets/{id}", moveTicket)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.logging.Logger
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import tickets.Store // Store.createTicket, getTicket, transition, appendNote
-
-object Api {
-  private val log = Logger.getLogger("ticketd")
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def field(raw: String, name: String): String =
-    raw.parseJson.asJsObject.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  private def move(ticketId: String, state: String): HttpResponse =
-    Store.getTicket(ticketId) match {
-      case None => error(StatusCodes.NotFound, "unknown ticket")
-      case Some(t) =>
-        if (!Store.transition(ticketId, t.state, state)) error(StatusCodes.Conflict, "the ticket changed meanwhile")
-        else {
-          log.info(s"ticket moved id=$ticketId to=$state")
-          json(StatusCodes.OK, Store.toJson(Store.getTicket(ticketId).get))
-        }
-    }
-
-  val route: Route = concat(
-    path("v1" / "tickets") {
-      post {
-        optionalHeaderValueByName("X-Actor-Id") {
-          case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Actor-Id is required"))
-          case Some(actorId) =>
-            entity(as[String]) { raw =>
-              val subject = field(raw, "subject")
-              val text = field(raw, "body")
-              val ticket = Store.createTicket(actorId, subject)
-              if (text.nonEmpty) Store.appendNote(ticket.id, actorId, "public", text)
-              log.info(s"ticket created id=\${ticket.id} requester=$actorId subject=$subject body=$text")
-              complete(json(StatusCodes.Created, Store.toJson(ticket)))
-            }
-        }
-      }
-    },
-    path("v1" / "tickets" / Segment) { ticketId =>
-      patch {
-        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-        optionalHeaderValueByName("X-Actor-Id") {
-          case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Actor-Id is required"))
-          case Some(_) => entity(as[String]) { raw => complete(move(ticketId, field(raw, "state"))) }
-        }
-      }
-    },
-  )
-}
-`,
-      solution: `import java.util.logging.Logger
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import tickets.Store // Store.createTicket, getTicket, transition, appendNote
-
-object Api {
-  val States: Seq[String] = Seq("open", "pending", "resolved", "closed")
-  val AllowedTransitions: Map[String, Seq[String]] = Map(
-    "open" -> Seq("pending", "resolved"),
-    "pending" -> Seq("open", "resolved"),
-    "resolved" -> Seq("open", "closed"),
-    "closed" -> Seq("open"))
-  val ReopenWindowSeconds: Long = 7L * 24 * 3600
-  val Roles: Seq[String] = Seq("requester", "agent")
-
-  private val log = Logger.getLogger("ticketd")
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def field(raw: String, name: String): String =
-    raw.parseJson.asJsObject.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  /** Where the ticket may move now: the table, minus a reopen past its window. */
-  private def allowedFrom(ticket: Store.Ticket): Seq[String] =
-    if (ticket.state == "closed" && System.currentTimeMillis() / 1000 - ticket.closedAt.getOrElse(0L) > ReopenWindowSeconds) Seq.empty
-    else AllowedTransitions(ticket.state)
-
-  /** X-Actor-Id (401 without one) and X-Actor-Role, requester or agent (403 otherwise). */
-  private def caller(inner: (String, String) => Route): Route =
-    optionalHeaderValueByName("X-Actor-Id") { actorId =>
-      optionalHeaderValueByName("X-Actor-Role") { role =>
-        (actorId.filter(_.nonEmpty), role.filter(Roles.contains)) match {
-          case (None, _) => complete(error(StatusCodes.Unauthorized, "X-Actor-Id is required"))
-          case (_, None) => complete(error(StatusCodes.Forbidden, "X-Actor-Role must be requester or agent"))
-          case (Some(id), Some(r)) => inner(id, r)
-        }
-      }
-    }
-
-  private def move(ticketId: String, actorId: String, role: String, state: String): HttpResponse =
-    Store.getTicket(ticketId) match {
-      case None => error(StatusCodes.NotFound, "unknown ticket")
-      case Some(t) if role == "requester" && t.requesterId != actorId => error(StatusCodes.Forbidden, "this ticket belongs to another requester")
-      case Some(_) if !States.contains(state) => error(StatusCodes.BadRequest, s"unknown state $state")
-      case Some(t) =>
-        val allowed = allowedFrom(t)
-        if (!allowed.contains(state))
-          json(StatusCodes.Conflict, JsObject("error" -> JsString("illegal transition"), "from" -> JsString(t.state), "allowed" -> JsArray(allowed.map(JsString(_)).toVector)))
-        else if (!Store.transition(ticketId, t.state, state)) error(StatusCodes.Conflict, "the ticket changed meanwhile")
-        else {
-          log.info(s"ticket moved id=$ticketId from=\${t.state} to=$state role=$role")
-          json(StatusCodes.OK, Store.toJson(Store.getTicket(ticketId).get))
-        }
-    }
-
-  val route: Route = concat(
-    path("v1" / "tickets") {
-      post {
-        caller { (actorId, _) =>
-          entity(as[String]) { raw =>
-            val ticket = Store.createTicket(actorId, field(raw, "subject"))
-            val note = field(raw, "body")
-            if (note.nonEmpty) Store.appendNote(ticket.id, actorId, "public", note)
-            log.info(s"ticket created id=\${ticket.id} requester=$actorId")
-            complete(json(StatusCodes.Created, Store.toJson(ticket)))
-          }
-        }
-      }
-    },
-    path("v1" / "tickets" / Segment) { ticketId =>
-      patch {
-        caller { (actorId, role) =>
-          entity(as[String]) { raw => complete(move(ticketId, actorId, role, field(raw, "state"))) }
-        }
-      }
-    },
-  )
 }
 `,
     },

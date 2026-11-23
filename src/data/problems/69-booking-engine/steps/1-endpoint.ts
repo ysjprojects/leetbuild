@@ -50,7 +50,6 @@ Rules, in this order, before any hold is taken:
         python: {all: [/@app\.post\(\s*["']\/v1\/bookings["']/, /take_hold\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/bookings['"]/, /takeHold\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/bookings"/, /takeHold\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"bookings"\s*\)/, /\bpost\s*\{/, /takeHold\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/bookings"/, /takeHold\(/]},
       },
     },
@@ -63,7 +62,6 @@ Rules, in this order, before any hold is taken:
         python: {all: [/invalid_range/, /\bend\s*(<=|>)\s*start\b|\bstart\s*(>=|<)\s*end\b/]},
         typescript: {all: [/invalid_range/, /\bend\s*(<=|>)\s*start\b|\bstart\s*(>=|<)\s*end\b/]},
         go: {all: [/invalid_range/, /\bend\s*(<=|>)\s*start\b|\bstart\s*(>=|<)\s*end\b/]},
-        scala: {all: [/invalid_range/, /\bend\s*(<=|>)\s*start\b|\bstart\s*(>=|<)\s*end\b/]},
         cpp: {all: [/invalid_range/, /\*?end\s*(<=|>)\s*\*?start\b|\*?start\s*(>=|<)\s*\*?end\b/]},
       },
     },
@@ -76,7 +74,6 @@ Rules, in this order, before any hold is taken:
         python: {all: [/range_in_past/, /start\s*<\s*now|now\s*>\s*start/]},
         typescript: {all: [/range_in_past/, /start\s*<\s*now|now\s*>\s*start/]},
         go: {all: [/range_in_past/, /start\s*<\s*now|now\s*>\s*start/]},
-        scala: {all: [/range_in_past/, /start\s*<\s*now|now\s*>\s*start/]},
         cpp: {all: [/range_in_past/, /start\s*<\s*now|now\s*>\s*start/]},
       },
     },
@@ -89,7 +86,6 @@ Rules, in this order, before any hold is taken:
         python: {all: [/beyond_horizon/, /MAX_HORIZON_DAYS|\b90\b/]},
         typescript: {all: [/beyond_horizon/, /MAX_HORIZON_DAYS|\b90\b/]},
         go: {all: [/beyond_horizon/, /MaxHorizonDays|\b90\b/]},
-        scala: {all: [/beyond_horizon/, /MaxHorizonDays|\b90\b/]},
         cpp: {all: [/beyond_horizon/, /kMaxHorizonDays|\b90\b/]},
       },
     },
@@ -102,7 +98,6 @@ Rules, in this order, before any hold is taken:
         python: {all: [/missing_idempotency_key/], order: [/store\.get_by_key\(/, /take_hold\(/]},
         typescript: {all: [/missing_idempotency_key/], order: [/store\.getByKey\(/, /takeHold\(/]},
         go: {all: [/missing_idempotency_key/], order: [/store\.GetByKey\(/, /takeHold\(/]},
-        scala: {all: [/missing_idempotency_key/], order: [/Store\.getByKey\(/, /takeHold\(/]},
         cpp: {all: [/missing_idempotency_key/], order: [/store::GetByKey\(/, /takeHold\(/]},
       },
     },
@@ -491,146 +486,6 @@ func createBooking(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/bookings", createBooking)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import booking.{Booking, Slots, Store, Tz}
-
-final case class BookingRequest(resource_id: String, start: String, end: String)
-
-object BookingApi {
-  implicit val system: ActorSystem = ActorSystem("booking")
-  implicit val requestFormat: RootJsonFormat[BookingRequest] = jsonFormat3(BookingRequest)
-
-  private def error(status: StatusCode, code: String): Route =
-    complete(status, HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$code"}"""))
-
-  val route: Route =
-    path("v1" / "bookings") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[BookingRequest]) { body =>
-              // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-              val tenant = tenantOpt.getOrElse("")
-              if (tenant.isEmpty) error(StatusCodes.Unauthorized, "missing_tenant")
-              else {
-                (Tz.parseInstant(body.start), Tz.parseInstant(body.end)) match {
-                  case (Some(start), Some(end)) =>
-                    HoldMap.takeHold(body.resource_id, Slots.fields(start, end)) match { // step 2: None when a slot is taken
-                      case None => error(StatusCodes.Conflict, "slot_taken")
-                      case Some(hold) =>
-                        val booking = Booking(
-                          Store.newId(),
-                          tenant,
-                          body.resource_id,
-                          body.start,
-                          body.end,
-                          hold.hold_id,
-                          idemOpt.getOrElse(""),
-                          "held"
-                        )
-                        Store.put(booking)
-                        system.log.info(s"booking=\${booking.booking_id} tenant=$tenant resource=\${body.resource_id}")
-                        complete(StatusCodes.Created, booking)
-                    }
-                  case _ => error(StatusCodes.BadRequest, "invalid_range")
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.time.Instant
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import booking.{Booking, Slots, Store, Tz}
-
-final case class BookingRequest(resource_id: String, start: String, end: String)
-
-object BookingApi {
-  implicit val system: ActorSystem = ActorSystem("booking")
-  implicit val requestFormat: RootJsonFormat[BookingRequest] = jsonFormat3(BookingRequest)
-
-  private def error(status: StatusCode, code: String): Route =
-    complete(status, HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$code"}"""))
-
-  val route: Route =
-    path("v1" / "bookings") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[BookingRequest]) { body =>
-              val tenant = tenantOpt.getOrElse("")
-              val idemKey = idemOpt.getOrElse("")
-              val now = Instant.now().getEpochSecond
-              if (tenant.isEmpty) error(StatusCodes.Unauthorized, "missing_tenant")
-              else if (idemKey.isEmpty) error(StatusCodes.BadRequest, "missing_idempotency_key")
-              else {
-                (Tz.parseInstant(body.start), Tz.parseInstant(body.end)) match {
-                  case (Some(start), Some(end)) if end > start =>
-                    if (start < now) error(StatusCodes.UnprocessableEntity, "range_in_past")
-                    else if (end > now + Slots.MaxHorizonDays * 86400L) error(StatusCodes.UnprocessableEntity, "beyond_horizon")
-                    else
-                      // The key is this tenant's name for the booking: a retry after a timeout is the same booking.
-                      Store.getByKey(tenant, idemKey) match {
-                        case Some(stored) => complete(StatusCodes.OK, stored)
-                        case None =>
-                          HoldMap.takeHold(body.resource_id, Slots.fields(start, end)) match { // step 2: None when a slot is taken
-                            case None => error(StatusCodes.Conflict, "slot_taken")
-                            case Some(hold) =>
-                              val booking = Booking(
-                                Store.newId(),
-                                tenant,
-                                body.resource_id,
-                                body.start,
-                                body.end,
-                                hold.hold_id,
-                                idemKey,
-                                "held"
-                              )
-                              Store.put(booking)
-                              system.log.info(s"booking=\${booking.booking_id} tenant=$tenant resource=\${body.resource_id}")
-                              complete(StatusCodes.Created, booking)
-                          }
-                      }
-                  case _ => error(StatusCodes.BadRequest, "invalid_range")
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

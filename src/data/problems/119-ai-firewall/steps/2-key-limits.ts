@@ -51,7 +51,6 @@ after the handler ran has already paid for the detector and the model on the req
         python: {all: [/redis\.call\(\s*['"]INCR['"]/, /\.eval\(|register_script\(|\.evalsha\(/], none: [/\.incr\(/]},
         typescript: {all: [/redis\.call\(\s*['"]INCR['"]/, /\.eval\(|defineCommand\(|\.evalsha\(/], none: [/\.incr\(/]},
         go: {all: [/redis\.call\(\s*['"]INCR['"]/, /NewScript\(|\.Eval\(|\.EvalSha\(/], none: [/\.Incr\(/]},
-        scala: {all: [/redis\.call\(\s*['"]INCR['"]/, /\.eval(sha)?\(/], none: [/\.incr\(/]},
         cpp: {all: [/redis\.call\(\s*['"]INCR['"]/, /\.eval(sha)?[<(]/], none: [/\.incr\(/]},
       },
     },
@@ -64,7 +63,6 @@ after the handler ran has already paid for the detector and the model on the req
         python: {all: [/aifw:rl:\{[^}]+\}:\{[^}]+\}/, /WINDOW_S/, /EXPIRE/, /TTL/]},
         typescript: {all: [/aifw:rl:\$\{[^}]+\}:\$\{[^}]+\}/, /WINDOW_S/, /EXPIRE/, /TTL/]},
         go: {all: [/aifw:rl:%s:%d/, /windowSeconds/, /EXPIRE/, /TTL/]},
-        scala: {all: [/aifw:rl:\$\{?\w+\}?:\$\{?\w+\}?/, /WindowSeconds/, /EXPIRE/, /TTL/]},
         cpp: {all: [/"aifw:rl:"/, /kWindowSeconds/, /EXPIRE/, /TTL/]},
       },
     },
@@ -77,7 +75,6 @@ after the handler ran has already paid for the detector and the model on the req
         python: {all: [/Retry-After/, /status_code\s*=\s*429|HTTP_429/]},
         typescript: {all: [/Retry-After/, /code\(\s*429\s*\)|status(Code)?\s*[:=(]\s*429/]},
         go: {all: [/Retry-After/, /StatusTooManyRequests|\b429\b/]},
-        scala: {all: [/Retry-After/, /StatusCodes\.TooManyRequests|\b429\b/]},
         cpp: {all: [/Retry-After/, /status\s*=\s*429/]},
       },
     },
@@ -93,7 +90,6 @@ after the handler ran has already paid for the detector and the model on the req
           none: [/addHook\(\s*['"](onSend|onResponse|preSerialization)['"]/],
         },
         go: {order: [/:=\s*checkLimit\(/, /next\.ServeHTTP\(/], none: [/httptest\./]},
-        scala: {none: [/mapResponse|mapRouteResult/]},
         cpp: {all: [/set_pre_routing_handler\(/], none: [/set_post_routing_handler\(/]},
       },
     },
@@ -358,95 +354,6 @@ func rateLimit(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(rw, r)
 	})
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directive0
-import org.apache.pekko.http.scaladsl.server.Directives._
-import redis.clients.jedis.JedisPooled
-
-object RateLimit {
-  val LimitRequests = 120L
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** (allowed, retryAfter): the caller's count in the window against LimitRequests. */
-  def checkLimit(apiKey: String): (Boolean, Long) = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val key = s"aifw:rl:$apiKey"
-    val count = Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
-    if (count >= LimitRequests) {
-      (false, 60L)
-    } else {
-      jedis.incr(key)
-      (true, 60L)
-    }
-  }
-
-  /** The per-key limit on every request the proxy serves. */
-  val rateLimited: Directive0 =
-    optionalHeaderValueByName("X-Api-Key").flatMap[Unit] {
-      case None => pass
-      case Some(apiKey) =>
-        mapResponse { response =>
-          val (allowed, _) = checkLimit(apiKey)
-          if (allowed) response
-          else HttpResponse(StatusCodes.TooManyRequests, entity = HttpEntity(ContentTypes.\`application/json\`, """{"error":"rate limit exceeded"}"""))
-        }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directive0
-import org.apache.pekko.http.scaladsl.server.Directives._
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object RateLimit {
-  val WindowSeconds = 60L
-  val LimitRequests = 120L
-  val jedis = new JedisPooled("redis", 6379)
-
-  val LimitLua: String =
-    """local count = redis.call('INCR', KEYS[1])
-      |if count == 1 then
-      |  redis.call('EXPIRE', KEYS[1], ARGV[1])
-      |end
-      |return {count, redis.call('TTL', KEYS[1])}
-      |""".stripMargin
-
-  def limitKey(apiKey: String, window: Long): String = s"aifw:rl:$apiKey:$window"
-
-  /** (allowed, retryAfter): one INCR + EXPIRE on the server, so concurrent requests cannot all pass. */
-  def checkLimit(apiKey: String): (Boolean, Long) = {
-    val window = System.currentTimeMillis() / 1000 / WindowSeconds
-    val reply = jedis
-      .eval(LimitLua, List(limitKey(apiKey, window)).asJava, List(WindowSeconds.toString).asJava)
-      .asInstanceOf[java.util.List[java.lang.Long]]
-      .asScala
-    (reply(0).longValue <= LimitRequests, math.max(reply(1).longValue, 1L))
-  }
-
-  /** The per-key limit on every request the proxy serves, consulted before the route runs. */
-  val rateLimited: Directive0 =
-    optionalHeaderValueByName("X-Api-Key").flatMap[Unit] {
-      case None => pass // the route answers 401
-      case Some(apiKey) =>
-        checkLimit(apiKey) match {
-          case (true, _) => pass
-          case (false, retryAfter) =>
-            complete(
-              HttpResponse(
-                StatusCodes.TooManyRequests,
-                headers = List(RawHeader("Retry-After", retryAfter.toString)),
-                entity = HttpEntity(ContentTypes.\`application/json\`, """{"error":"rate limit exceeded"}""")
-              )
-            )
-        }
-    }
 }
 `,
     },

@@ -4,10 +4,9 @@
  * the stats layout the stats consumer keeps); `model` the deterministic cross-encoder stand-in (step
  * 1 scores with it in process, the checks serve it over gRPC for step 3); `outcome` the record a
  * finished rerank hands to step 4; `outbox` the rows kept for the relay when the broker refuses a
- * produce. The five languages keep the same keys, so a harness reads one layout whatever the stack.
+ * produce. The four languages keep the same keys, so a harness reads one layout whatever the stack.
  */
 import {CPP_DIGEST_H} from '../cpp-support';
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'rerank/__init__.py': '',
@@ -515,107 +514,5 @@ inline std::vector<nlohmann::json> rows() {
 }
 
 }  // namespace outbox
-`,
-};
-
-/** The Scala twins: the same \`rerank\` objects, compiled with the steps by \`yarn check:scala\`. */
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('rerank', 'Config')]: `package rerank
-
-import java.nio.charset.StandardCharsets.UTF_8
-import java.security.MessageDigest
-
-/** Addresses, topics, keys and limits every step of rerankd agrees on. */
-object Config {
-  /** The cross-encoder's gRPC address: a stand-in served by the checks (rerank.Model). */
-  val Model = "reranker:9000"
-  /** One event per finished rerank, keyed by query fingerprint, for the stats consumer. */
-  val Topic = "rerank.done"
-
-  /** The first 32 hex digits of the SHA-256 of the text's UTF-8 bytes: a query's or a passage's id. */
-  def fingerprint(text: String): String =
-    MessageDigest.getInstance("SHA-256").digest(text.getBytes(UTF_8)).map("%02x".format(_)).mkString.take(32)
-
-  // What the stats consumer keeps per model version (step 5 reads it). VersionsKey: the set of model
-  // versions seen. statsKey(v): a hash of requests, hits, misses (score cache lookups), batches,
-  // unscored_batches (model batches that failed) and fallback_requests (requests answered in
-  // retrieval order). latencyKey(v, "queue" | "model"): a list of samples in whole milliseconds, the
-  // wait before the model call and the model call itself.
-  val VersionsKey = "rerank:versions"
-  def statsKey(modelVersion: String): String = s"rerank:stats:$modelVersion"
-  def latencyKey(modelVersion: String, boundary: String): String = s"rerank:latency:$modelVersion:$boundary"
-
-  // The fleet totals the first dashboard read, still kept: hits and misses over every version, and the
-  // request times clients reported (queue, model and network together).
-  val FleetHitsKey = "rerank:hits"
-  val FleetMissesKey = "rerank:misses"
-  val ClientLatencyKey = "rerank:latency:client"
-}
-`,
-  [scalaPath('rerank', 'Model')]: `package rerank
-
-/**
- * The stand-in for the cross-encoder. Step 1 scores with it in process; the checks serve it over
- * gRPC (Reranker.Score at Config.Model) for step 3. Deterministic on purpose: the course grades what
- * the service does around the model, never the model.
- *
- * score(query, passage): the share of the query's distinct words (lower-cased, split on whitespace)
- * that the passage contains, from 0 to 1; 0 for a query with no words.
- * batchFault(passages): how the served model answers a batch: "unavailable" when a passage starts
- * with "brownout:" (a replica that keeps failing), "invalid_argument" when a passage is empty (a
- * request the model rejects), "" when it scores the batch.
- */
-object Model {
-  val Version = "xenc-v7"
-
-  private def words(text: String): Set[String] = text.toLowerCase.split("\\\\s+").filter(_.nonEmpty).toSet
-
-  def score(query: String, passage: String): Double = {
-    val terms = words(query)
-    if (terms.isEmpty) 0.0 else terms.count(words(passage).contains).toDouble / terms.size
-  }
-
-  def batchFault(passages: Seq[String]): String =
-    if (passages.exists(_.startsWith("brownout:"))) "unavailable"
-    else if (passages.exists(_.isEmpty)) "invalid_argument"
-    else ""
-}
-`,
-  [scalaPath('rerank', 'RerankOutcome')]: `package rerank
-
-/**
- * The outcome record (provided): what a finished rerank hands to step 4's publisher. The query and
- * the passages are tenant content: the service has them, the topic must not. scores has one entry per
- * passage, in retrieval order; None is a passage the model did not score.
- */
-final case class RerankOutcome(
-    tenant: String,
-    query: String,
-    passages: Seq[String],
-    scores: Seq[Option[Double]],
-    modelVersion: String,
-    latencyMs: Long
-)
-`,
-  [scalaPath('rerank', 'Outbox')]: `package rerank
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/** The outbox (provided): events the broker refused, kept for the relay to republish. */
-object Outbox {
-  val Key = "rerank:outbox"
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** Durably keep an event the broker refused: one row of topic, key and payload. */
-  def insert(topic: String, key: String, payload: ujson.Obj): Unit = {
-    jedis.rpush(Key, ujson.write(ujson.Obj("topic" -> topic, "key" -> key, "payload" -> payload)))
-    ()
-  }
-
-  /** The kept rows, oldest first. */
-  def rows(): List[ujson.Value] = jedis.lrange(Key, 0, -1).asScala.toList.map(ujson.read(_))
-}
 `,
 };

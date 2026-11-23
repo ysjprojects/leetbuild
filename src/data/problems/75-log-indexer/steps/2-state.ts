@@ -1,6 +1,6 @@
 import type {Step} from '@/lib/types';
 
-import {APPEND_LUA, DRAIN_LUA, scalaLua} from '../support';
+import {APPEND_LUA, DRAIN_LUA} from '../support';
 
 export const stateStep: Step = {
   id: 'state',
@@ -58,7 +58,6 @@ record at once; and a record appended while a drain runs is deleted unread.
         python: {all: [/MAX_BUFFER_BYTES\s*=\s*64\s*<<\s*20/, /return 0/]},
         typescript: {all: [/MAX_BUFFER_BYTES\s*=\s*64\s*<<\s*20/, /return 0/]},
         go: {all: [/maxBufferBytes\s*=\s*64\s*<<\s*20/, /return 0/]},
-        scala: {all: [/MaxBufferBytes\s*:\s*Long\s*=\s*64L\s*<<\s*20/, /return 0/]},
         cpp: {all: [/kMaxBufferBytes\s*=\s*64LL\s*<<\s*20/, /return 0/]},
       },
     },
@@ -71,7 +70,6 @@ record at once; and a record appended while a drain runs is deleted unread.
         python: {all: [/register_script\(|\.eval\(/, /HGET/], none: [/\br\.rpush\(/, /\br\.hincrby\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /HGET/], none: [/redis\.rpush\(/, /redis\.hincrby\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /HGET/], none: [/\.RPush\(/, /\.HIncrBy\(/]},
-        scala: {all: [/jedis\.eval\(/, /HGET/], none: [/jedis\.rpush\(/, /jedis\.hincrBy\(/]},
         cpp: {all: [/redis\.eval</, /HGET/], none: [/redis\.rpush\(/, /redis\.hincrby\(/]},
       },
     },
@@ -84,7 +82,6 @@ record at once; and a record appended while a drain runs is deleted unread.
         python: {all: [/BATCH_SIZE\s*=\s*1000/, /LTRIM/], none: [/\.lrange\(/]},
         typescript: {all: [/BATCH_SIZE\s*=\s*1000/, /LTRIM/], none: [/\.lrange\(/]},
         go: {all: [/batchSize\s*=\s*1000/, /LTRIM/], none: [/\.LRange\(/]},
-        scala: {all: [/BatchSize\s*=\s*1000/, /LTRIM/], none: [/\.lrange\(/]},
         cpp: {all: [/kBatchSize\s*=\s*1000/, /LTRIM/], none: [/\.lrange\(/]},
       },
     },
@@ -97,7 +94,6 @@ record at once; and a record appended while a drain runs is deleted unread.
         python: {all: [/LTRIM/, /register_script\(|\.eval\(/], none: [/\.delete\(/]},
         typescript: {all: [/LTRIM/, /defineCommand\(|\.eval\(/], none: [/\.del\(/]},
         go: {all: [/LTRIM/, /redis\.NewScript\(|\.Eval\(/], none: [/\.Del\(/]},
-        scala: {all: [/LTRIM/, /jedis\.eval\(/], none: [/\.del\(/]},
         cpp: {all: [/LTRIM/, /redis\.eval/], none: [/\.del\(/]},
       },
     },
@@ -354,84 +350,6 @@ func drainBatch(ctx context.Context, tenant, service string) ([]buffer.Record, e
 		batch = append(batch, record)
 	}
 	return batch, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import logindex.Buffer // Buffer.Record and its JSON format
-
-object State {
-  import Buffer.recordFormat
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def bufferKey(tenant: String, service: String): String = s"buffer:$tenant:$service"
-  def metaKey(tenant: String, service: String): String = s"buffer:$tenant:$service:meta"
-
-  /** Buffer one record: its offset, or 0 when it was shed. */
-  def appendRecord(tenant: String, service: String, record: Buffer.Record): Long = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val raw = record.toJson.compactPrint
-    jedis.rpush(bufferKey(tenant, service), raw)
-    jedis.hincrBy(metaKey(tenant, service), "count", 1L)
-    jedis.hincrBy(metaKey(tenant, service), "bytes", raw.getBytes("UTF-8").length.toLong)
-    jedis.hincrBy(metaKey(tenant, service), "offset", 1L)
-  }
-
-  /** Take the buffered records, oldest first. */
-  def drainBatch(tenant: String, service: String): Seq[Buffer.Record] = {
-    val batch = jedis.lrange(bufferKey(tenant, service), 0, -1).asScala.toSeq
-    jedis.del(bufferKey(tenant, service))
-    jedis.hset(metaKey(tenant, service), Map("count" -> "0", "bytes" -> "0").asJava)
-    batch.map(_.parseJson.convertTo[Buffer.Record])
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import logindex.Buffer // Buffer.Record and its JSON format
-
-object State {
-  import Buffer.recordFormat
-
-  val MaxBufferBytes: Long = 64L << 20
-  val BatchSize = 1000
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** The cap check and the writes are one script: no other client runs between them. */
-  val AppendLua: String =
-    """${scalaLua(APPEND_LUA)}
-      |""".stripMargin
-
-  /** Read, trim and settle in one script: an append that lands meanwhile stays in the list. */
-  val DrainLua: String =
-    """${scalaLua(DRAIN_LUA)}
-      |""".stripMargin
-
-  def bufferKey(tenant: String, service: String): String = s"buffer:$tenant:$service"
-  def metaKey(tenant: String, service: String): String = s"buffer:$tenant:$service:meta"
-
-  /** Buffer one record: its offset, or 0 when it was shed. */
-  def appendRecord(tenant: String, service: String, record: Buffer.Record): Long = {
-    val keys = List(bufferKey(tenant, service), metaKey(tenant, service)).asJava
-    jedis.eval(AppendLua, keys, List(record.toJson.compactPrint, MaxBufferBytes.toString).asJava).asInstanceOf[java.lang.Long]
-  }
-
-  /** Take the oldest BatchSize records at most, oldest first. */
-  def drainBatch(tenant: String, service: String): Seq[Buffer.Record] = {
-    val keys = List(bufferKey(tenant, service), metaKey(tenant, service)).asJava
-    val raw = jedis.eval(DrainLua, keys, List(BatchSize.toString).asJava).asInstanceOf[java.util.List[String]]
-    raw.asScala.toSeq.map(_.parseJson.convertTo[Buffer.Record])
-  }
 }
 `,
     },

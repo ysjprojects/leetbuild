@@ -63,7 +63,6 @@ service Crm { rpc SyncNote(SyncNoteRequest) returns (SyncNoteReply); }  // INVAL
           none: [/function postNote\((?:(?!\n(?:export )?(?:async )?function )[\s\S])*?syncNote\(/],
         },
         go: {all: [/store\.CommitNote\(/], none: [/func postNote\((?:(?!\nfunc )[\s\S])*?syncNote\(/]},
-        scala: {all: [/Store\.commitNote\(/], none: [/def postNote\((?:(?!\n {2}(?:def|\/\*\*) )[\s\S])*?syncNote\(/]},
         cpp: {all: [/store::commitNote\(/], none: [/store::Note postNote\((?:(?!\n\})[\s\S])*?syncNote\(/]},
       },
     },
@@ -76,7 +75,6 @@ service Crm { rpc SyncNote(SyncNoteRequest) returns (SyncNoteReply); }  // INVAL
         python: {all: [/DEADLINE_S\s*=\s*3\b/, /SyncNote\([^)]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*3000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*3\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\)/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*3L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/kDeadline\{3\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -89,7 +87,6 @@ service Crm { rpc SyncNote(SyncNoteRequest) returns (SyncNoteReply); }  // INVAL
         python: {all: [/idempotency_key\s*=\s*note\[["']id["']\]/]},
         typescript: {all: [/idempotency_key:\s*note\.id\b/]},
         go: {all: [/IdempotencyKey:\s*note\.ID\b/]},
-        scala: {all: [/idempotencyKey\s*=\s*note\.id\b/]},
         cpp: {all: [/set_idempotency_key\(\s*note\.id\s*\)/]},
       },
     },
@@ -111,10 +108,6 @@ service Crm { rpc SyncNote(SyncNoteRequest) returns (SyncNoteReply); }  // INVAL
           all: [/maxAttempts\s*=\s*3\b/, /attempt\s*<\s*maxAttempts/, /codes\.Unavailable/, /codes\.DeadlineExceeded/],
           none: [/\bfor\s*\{/],
         },
-        scala: {
-          all: [/MaxAttempts\s*=\s*3\b/, /attempt\s*<\s*MaxAttempts/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
         cpp: {
           all: [/kMaxAttempts\s*=\s*3\b/, /attempt\s*<\s*kMaxAttempts/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/],
           none: [/while\s*\(\s*true\s*\)/, /for\s*\(\s*;\s*;\s*\)/],
@@ -130,7 +123,6 @@ service Crm { rpc SyncNote(SyncNoteRequest) returns (SyncNoteReply); }  // INVAL
         python: {all: [/store\.quarantine\(\s*note\[["']id["']\]/]},
         typescript: {all: [/\bquarantine\(\s*note\.id/]},
         go: {all: [/store\.Quarantine\([^\n]*note\.ID/]},
-        scala: {all: [/Store\.quarantine\(\s*note\.id/]},
         cpp: {all: [/store::quarantine\(\s*note\.id/]},
       },
     },
@@ -460,95 +452,6 @@ func drainOutbox(ctx context.Context) int {
 		}
 	}
 	return synced
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import ticketcrm.ticketing_system.{CrmGrpc, SyncNoteRequest}
-import tickets.Store // Store.appendNote, commitNote, pendingSyncs, markSynced, quarantine
-
-object CrmSync {
-  val BackoffMillis = 1000L
-
-  private val crm = CrmGrpc.blockingStub(ManagedChannelBuilder.forAddress("crm", 9000).usePlaintext().build())
-
-  /** POST /v1/tickets/{id}/notes: store the note and get it to the CRM; returns the note. */
-  def postNote(ticketId: String, author: String, visibility: String, body: String): Store.Note = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val note = Store.appendNote(ticketId, author, visibility, body)
-    syncNote(note)
-    note
-  }
-
-  /** Push one note to the CRM; true once the CRM holds it. */
-  def syncNote(note: Store.Note): Boolean = {
-    val request = SyncNoteRequest(noteId = note.id, ticketId = note.ticketId, author = note.author, body = note.body)
-    while (true) {
-      try {
-        crm.syncNote(request)
-        return true
-      } catch {
-        case _: StatusRuntimeException => Thread.sleep(BackoffMillis)
-      }
-    }
-    false
-  }
-
-  /** The worker's pass over crm:outbox; returns how many notes the CRM took. */
-  def drainOutbox(): Int =
-    Store.pendingSyncs().count { note =>
-      val synced = syncNote(note)
-      if (synced) Store.markSynced(note.id)
-      synced
-    }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import ticketcrm.ticketing_system.{CrmGrpc, SyncNoteRequest}
-import tickets.Store // Store.appendNote, commitNote, pendingSyncs, markSynced, quarantine
-
-object CrmSync {
-  val DeadlineSeconds = 3L
-  val MaxAttempts = 3
-  private val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val crm = CrmGrpc.blockingStub(ManagedChannelBuilder.forAddress("crm", 9000).usePlaintext().build())
-
-  /** POST /v1/tickets/{id}/notes: store the note and get it to the CRM; returns the note. */
-  def postNote(ticketId: String, author: String, visibility: String, body: String): Store.Note =
-    // The note and the promise to sync it commit together; the drain talks to the CRM.
-    Store.commitNote(ticketId, author, visibility, body)
-
-  /** Push one note to the CRM; true once the CRM holds it, false when it stays pending or was quarantined. */
-  def syncNote(note: Store.Note): Boolean = {
-    val request = SyncNoteRequest(noteId = note.id, ticketId = note.ticketId, author = note.author, body = note.body, idempotencyKey = note.id)
-    var attempt = 0
-    while (attempt < MaxAttempts) {
-      try {
-        crm.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).syncNote(request)
-        return true
-      } catch {
-        case e: StatusRuntimeException if !Retryable.contains(e.getStatus.getCode) =>
-          Store.quarantine(note.id, s"\${e.getStatus.getCode}: \${e.getStatus.getDescription}")
-          return false
-        case _: StatusRuntimeException => attempt += 1
-      }
-    }
-    false
-  }
-
-  /** The worker's pass over crm:outbox; returns how many notes the CRM took. */
-  def drainOutbox(): Int =
-    Store.pendingSyncs().count { note =>
-      val synced = syncNote(note)
-      if (synced) Store.markSynced(note.id)
-      synced
-    }
 }
 `,
     },

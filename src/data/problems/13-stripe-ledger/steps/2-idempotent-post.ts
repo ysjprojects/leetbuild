@@ -48,7 +48,7 @@ as \`(status, payload)\`; wrap it:
   },
   hints: [
     'Four outcomes of the SET NX: it succeeds (you own the key), or it is refused and the stored fingerprint differs (409), or it matches and a response hash exists (replay), or it matches and there is no response yet (409 in progress). Branch in that order.',
-    'Canonical JSON is `json.dumps(body, sort_keys=True, separators=(",", ":"))` in Python; in Go `json.Marshal` of a map sorts keys, in Scala use `sortedPrint`, in C++ `json::dump()` already orders keys.',
+    'Canonical JSON is `json.dumps(body, sort_keys=True, separators=(",", ":"))` in Python; in Go `json.Marshal` of a map sorts keys, in C++ `json::dump()` already orders keys.',
     'The response hash carries two fields, `status` and `body`, and gets its own EXPIRE: a hash has no NX EX form, so set it after `handle` returned and give it the same TTL as the reservation.',
   ],
   checks: [
@@ -61,7 +61,6 @@ as \`(status, payload)\`; wrap it:
         python: {all: [/idempotency-key/i, /status_code\s*=\s*400|HTTP_400/]},
         typescript: {all: [/idempotency-key/i, /code\(\s*400\s*\)|status\(\s*400\s*\)/]},
         go: {all: [/Idempotency-Key/i, /http\.StatusBadRequest|\b400\b/]},
-        scala: {all: [/Idempotency-Key/i, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/Idempotency-Key/i, /status\s*=\s*400/]},
       },
     },
@@ -90,14 +89,6 @@ as \`(status, payload)\`; wrap it:
         go: {
           all: [/"idem:"\s*\+/, /sha256\.Sum256\(/, /rdb\.SetNX\(\s*[\w.()]+\s*,\s*\w+\s*,\s*\w+\s*,\s*idemTTL\s*\)/],
         },
-        scala: {
-          all: [
-            /s"idem:\$/,
-            /MessageDigest\.getInstance\(\s*"SHA-256"\s*\)/,
-            /jedis\.set\(\s*\w+\s*,\s*\w+\s*,[^\n]*\.nx\(\)/,
-            /\.ex\(\s*IdemTtlSeconds\s*\)/,
-          ],
-        },
         cpp: {
           all: [
             /"idem:"\s*\+/,
@@ -116,7 +107,6 @@ as \`(status, payload)\`; wrap it:
         python: {all: [/\br\.get\(\s*key\s*\)\s*!=\s*digest/, /status_code\s*=\s*409/]},
         typescript: {all: [/\bredis\.get\(\s*key\s*\)\)?\s*!==\s*digest/, /code\(\s*409\s*\)|status\(\s*409\s*\)/]},
         go: {all: [/rdb\.Get\(/, /!=\s*digest/, /http\.StatusConflict|\b409\b/]},
-        scala: {all: [/jedis\.get\(/, /!=\s*digest/, /StatusCodes\.Conflict|\b409\b/]},
         cpp: {all: [/redis\.get\(/, /!=\s*digest/, /status\s*=\s*409/]},
       },
     },
@@ -129,7 +119,6 @@ as \`(status, payload)\`; wrap it:
         python: {all: [/\.hgetall\(/, /Idempotent-Replayed/]},
         typescript: {all: [/\.hgetall\(/, /Idempotent-Replayed/]},
         go: {all: [/rdb\.HGetAll\(/, /Idempotent-Replayed/]},
-        scala: {all: [/jedis\.hgetAll\(/, /Idempotent-Replayed/]},
         cpp: {all: [/redis\.hgetall\(/, /Idempotent-Replayed/]},
       },
     },
@@ -148,10 +137,6 @@ as \`(status, payload)\`; wrap it:
           all: [/\.del\(\s*key\s*\)/],
         },
         go: {order: [/:= handle\(/, /\.HSet\(/, /\.Expire\(\s*ctx\s*,\s*\w+\s*,\s*idemTTL\s*\)/], all: [/rdb\.Del\(/]},
-        scala: {
-          order: [/try handle\(|= handle\(/, /\.hset\(/, /\.expire\(\s*\w+\s*,\s*IdemTtlSeconds\s*\)/],
-          all: [/jedis\.del\(/],
-        },
         cpp: {order: [/= handle\(/, /\.hset\(/, /\.expire\(\s*\w+\s*,\s*kIdemTtl\s*\)/], all: [/redis\.del\(/]},
       },
     },
@@ -483,126 +468,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /transactions", createTransaction)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.security.MessageDigest
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import ledger.Tls // Tls.serverContext — provided
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-import scala.jdk.CollectionConverters._
-
-object IdempotentApi {
-  val jedis = new JedisPooled("redis", 6379)
-  val IdemTtlSeconds = 86400L
-
-  /** The outcome of posting \`body\`: (status, payload) — built in step 1 (LedgerApi). */
-  def handle(body: JsObject): (StatusCode, JsObject) = ???
-
-  /** SHA-256 of the canonical JSON of the body: keys sorted, no whitespace (\`sortedPrint\`). */
-  def fingerprint(body: JsObject): String = ??? // TODO: MessageDigest.getInstance("SHA-256") over body.sortedPrint, hex-encoded
-
-  private def json(status: StatusCode, body: String, headers: List[HttpHeader] = Nil): Route =
-    complete(HttpResponse(status, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-
-  val route: Route =
-    path("transactions") {
-      post {
-        entity(as[String]) { raw =>
-          val body = scala.util.Try(raw.parseJson.asJsObject).getOrElse(JsObject())
-          optionalHeaderValueByName("Idempotency-Key") { idemKey =>
-            // TODO: 400 when idemKey is None
-            // TODO: SET idem:{key} fingerprint NX EX IdemTtlSeconds
-            // TODO: refused → stored fingerprint differs: 409; same: replay idem:{key}:response (status, body) with Idempotent-Replayed: true, or 409 while in progress
-            // TODO: handle(body) (del the key and rethrow on failure), HSET idem:{key}:response status/body + EXPIRE IdemTtlSeconds, answer with the outcome
-            complete(StatusCodes.NotImplemented)
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("ledger")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import java.security.MessageDigest
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import ledger.Tls // Tls.serverContext — provided
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-import scala.jdk.CollectionConverters._
-
-object IdempotentApi {
-  val jedis = new JedisPooled("redis", 6379)
-  val IdemTtlSeconds = 86400L
-
-  /** The outcome of posting \`body\`: (status, payload) — built in step 1 (LedgerApi). */
-  def handle(body: JsObject): (StatusCode, JsObject) = ???
-
-  /** SHA-256 of the canonical JSON of the body: keys sorted, no whitespace (\`sortedPrint\`). */
-  def fingerprint(body: JsObject): String =
-    MessageDigest.getInstance("SHA-256").digest(body.sortedPrint.getBytes("UTF-8")).map("%02x".format(_)).mkString
-
-  private def json(status: StatusCode, body: String, headers: List[HttpHeader] = Nil): Route =
-    complete(HttpResponse(status, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-
-  val route: Route =
-    path("transactions") {
-      post {
-        entity(as[String]) { raw =>
-          val body = scala.util.Try(raw.parseJson.asJsObject).getOrElse(JsObject())
-          optionalHeaderValueByName("Idempotency-Key") {
-            case None => complete(StatusCodes.BadRequest -> "Idempotency-Key header is required")
-            case Some(idemKey) =>
-              val key = s"idem:$idemKey"
-              val digest = fingerprint(body)
-              val won = jedis.set(key, digest, SetParams.setParams().nx().ex(IdemTtlSeconds)) != null
-              if (!won) {
-                if (jedis.get(key) != digest)
-                  complete(StatusCodes.Conflict -> "Idempotency-Key reused with a different request body")
-                else {
-                  val stored = jedis.hgetAll(s"$key:response").asScala
-                  if (stored.isEmpty) complete(StatusCodes.Conflict -> "a request with this Idempotency-Key is in progress")
-                  else json(StatusCode.int2StatusCode(stored("status").toInt), stored("body"), List(RawHeader("Idempotent-Replayed", "true")))
-                }
-              } else {
-                val (status, payload) =
-                  try handle(body)
-                  catch { case e: Exception => jedis.del(key); throw e } // let the client retry with the same key
-                val responseKey = s"$key:response"
-                jedis.hset(responseKey, Map("status" -> status.intValue.toString, "body" -> payload.compactPrint).asJava)
-                jedis.expire(responseKey, IdemTtlSeconds)
-                json(status, payload.compactPrint)
-              }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("ledger")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

@@ -58,7 +58,6 @@ Requirements:
         python: {all: [/@app\.get\(\s*["']\/v1\/prompts\/\{name\}\/versions\/\{v\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/prompts\/:name\/versions\/:v['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/prompts\/\{name\}\/versions\/\{v\}"/]},
-        scala: {all: [/"v1"\s*\/\s*"prompts"\s*\/\s*Segment\s*\/\s*"versions"\s*\/\s*IntNumber/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/prompts\//]},
       },
     },
@@ -71,7 +70,6 @@ Requirements:
         python: {all: [/status_code\s*=\s*404/]},
         typescript: {all: [/code\(\s*404\s*\)/]},
         go: {all: [/StatusNotFound/]},
-        scala: {all: [/StatusCodes\.NotFound/]},
         cpp: {all: [/\b404\b/]},
       },
     },
@@ -84,7 +82,6 @@ Requirements:
         python: {all: [/evals\.get\(/], none: [/evals\.latest\(/]},
         typescript: {all: [/evals\.get\(/], none: [/evals\.latest\(/]},
         go: {all: [/evals\.Get\(/], none: [/evals\.Latest\(/]},
-        scala: {all: [/Evals\.get\(/], none: [/Evals\.latest\(/]},
         cpp: {all: [/evals::get\(/], none: [/evals::latest\(/]},
       },
     },
@@ -97,7 +94,6 @@ Requirements:
         python: {all: [/PLACEHOLDER\.sub\(|re\.sub\(\s*PLACEHOLDER/], none: [/\.replace\(\s*["']\{\{/]},
         typescript: {all: [/\.replace\(\s*PLACEHOLDER\s*,/], none: [/replaceAll\(\s*['"]\{\{/]},
         go: {all: [/config\.Placeholder\.ReplaceAllStringFunc\(/], none: [/strings\.Replace(All)?\(/]},
-        scala: {all: [/Config\.Placeholder\.replaceAllIn\(/], none: [/\.replace\(\s*"\{\{/]},
         cpp: {all: [/sregex_iterator\([\s\S]{0,120}?config::kPlaceholder/], none: [/rendered\.replace\(/]},
       },
     },
@@ -110,7 +106,6 @@ Requirements:
         python: {all: [/MAX_VALUE_BYTES/, /status_code\s*=\s*422/]},
         typescript: {all: [/MAX_VALUE_BYTES/, /code\(\s*422\s*\)/]},
         go: {all: [/maxValueBytes/, /StatusUnprocessableEntity/]},
-        scala: {all: [/MaxValueBytes/, /StatusCodes\.UnprocessableEntity/]},
         cpp: {all: [/kMaxValueBytes/, /\b422\b/]},
       },
     },
@@ -482,144 +477,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.{JsString, JsValue, RootJsonFormat}
-
-import prompts.{EvalRecord, Evals, Versions}
-
-/** The read's answer: the version and the eval record attached to it. */
-final case class VersionRead(name: String, version: Int, content_hash: String, template: String, variables: List[String], eval_record: Option[EvalRecord])
-final case class RenderRequest(values: Option[Map[String, JsValue]])
-final case class Rendered(name: String, version: Int, content_hash: String, rendered: String)
-
-object PromptReads {
-  implicit val system: ActorSystem = ActorSystem("prompt-registry")
-  implicit val evalFormat: RootJsonFormat[EvalRecord] = jsonFormat5(EvalRecord)
-  implicit val readFormat: RootJsonFormat[VersionRead] = jsonFormat6(VersionRead)
-  implicit val renderFormat: RootJsonFormat[RenderRequest] = jsonFormat1(RenderRequest)
-  implicit val renderedFormat: RootJsonFormat[Rendered] = jsonFormat4(Rendered)
-
-  val route: Route =
-    pathPrefix("v1" / "prompts" / Segment / "versions" / IntNumber) { (name, v) =>
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-        case Some(tenant) =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          val record = Versions.get(tenant, name, v)
-          concat(
-            pathEndOrSingleSlash {
-              get {
-                complete(
-                  VersionRead(
-                    name,
-                    v,
-                    record.map(_.content_hash).getOrElse(""),
-                    record.map(_.template).getOrElse(""),
-                    record.map(_.variables).getOrElse(Nil),
-                    Evals.latest(tenant, name)
-                  )
-                )
-              }
-            },
-            path("render") {
-              post {
-                entity(as[RenderRequest]) { body =>
-                  val values = body.values.getOrElse(Map.empty)
-                  var rendered = record.map(_.template).getOrElse("")
-                  for (variable <- record.map(_.variables).getOrElse(Nil)) {
-                    val value = values.get(variable).collect { case JsString(s) => s }.getOrElse("")
-                    rendered = rendered.replace("{{" + variable + "}}", value)
-                  }
-                  complete(Rendered(name, v, record.map(_.content_hash).getOrElse(""), rendered))
-                }
-              }
-            }
-          )
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import scala.util.matching.Regex
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.{JsString, JsValue, RootJsonFormat}
-
-import prompts.{Config, EvalRecord, Evals, Versions}
-
-/** The read's answer: the version and the eval record attached to it. */
-final case class VersionRead(name: String, version: Int, content_hash: String, template: String, variables: List[String], eval_record: Option[EvalRecord])
-final case class RenderRequest(values: Option[Map[String, JsValue]])
-final case class Rendered(name: String, version: Int, content_hash: String, rendered: String)
-
-object PromptReads {
-  implicit val system: ActorSystem = ActorSystem("prompt-registry")
-  implicit val evalFormat: RootJsonFormat[EvalRecord] = jsonFormat5(EvalRecord)
-  implicit val readFormat: RootJsonFormat[VersionRead] = jsonFormat6(VersionRead)
-  implicit val renderFormat: RootJsonFormat[RenderRequest] = jsonFormat1(RenderRequest)
-  implicit val renderedFormat: RootJsonFormat[Rendered] = jsonFormat4(Rendered)
-
-  val MaxValueBytes = 1024
-
-  val route: Route =
-    pathPrefix("v1" / "prompts" / Segment / "versions" / IntNumber) { (name, v) =>
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-        case Some(tenant) =>
-          Versions.get(tenant, name, v) match {
-            case None => complete(StatusCodes.NotFound, s"""{"error":"$name v$v not found"}""")
-            case Some(record) =>
-              concat(
-                pathEndOrSingleSlash {
-                  get {
-                    val verdict = Evals.get(tenant, name, record.content_hash)
-                    complete(VersionRead(record.name, record.version, record.content_hash, record.template, record.variables, verdict))
-                  }
-                },
-                path("render") {
-                  post {
-                    entity(as[RenderRequest]) { body =>
-                      val raw = body.values.getOrElse(Map.empty)
-                      val values = raw.collect { case (key, JsString(value)) => key -> value }
-                      val valid = raw.keySet == record.variables.toSet && values.size == raw.size &&
-                        values.values.forall(_.getBytes("UTF-8").length <= MaxValueBytes)
-                      if (!valid) {
-                        complete(StatusCodes.UnprocessableEntity, """{"error":"values must be exactly the declared variables, strings of at most 1024 bytes"}""")
-                      } else {
-                        // One pass: a value is inserted as text and never scanned for placeholders again.
-                        val rendered = Config.Placeholder.replaceAllIn(record.template, m => Regex.quoteReplacement(values(m.group(1))))
-                        complete(Rendered(record.name, record.version, record.content_hash, rendered))
-                      }
-                    }
-                  }
-                }
-              )
-          }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

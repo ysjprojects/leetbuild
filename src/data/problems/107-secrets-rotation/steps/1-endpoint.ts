@@ -50,7 +50,6 @@ without an interval is never due for rotation.
         python: {all: [/@app\.post\(\s*["']\/v1\/secrets["']/, /\b401\b/, /vault\.create_version\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/secrets['"]/, /\b401\b/, /createVersion\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/secrets"/, /StatusUnauthorized|\b401\b/, /vault\.CreateVersion\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"secrets"\s*\)/, /Unauthorized|\b401\b/, /Vault\.createVersion\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/secrets"/, /\b401\b/, /vault::createVersion\(/]},
       },
     },
@@ -69,7 +68,6 @@ without an interval is never due for rotation.
           all: [/func publicVersion\(/, /publicVersion\(\s*record\s*\)/],
           none: [/writeJSON\([^\n]*,\s*record\s*\)/],
         },
-        scala: {all: [/def publicVersion\(/, /publicVersion\(\s*record\s*\)/], none: [/Vault\.toJson\(/]},
         cpp: {all: [/publicVersion\(/, /publicVersion\(\s*record\s*\)/], none: [/json\(\s*record\s*\)/]},
       },
     },
@@ -82,7 +80,6 @@ without an interval is never due for rotation.
         python: {all: [/audit\.info\(/, /fingerprint/], none: [/audit\.\w+\([^\n]*material/]},
         typescript: {all: [/console\.info\(/, /fingerprint/], none: [/console\.\w+\([^\n]*material/]},
         go: {all: [/log\.Printf\(/, /Fingerprint/], none: [/log\.\w+\([^\n]*[Mm]aterial/]},
-        scala: {all: [/System\.err\.println\(/, /fingerprint/], none: [/println\([^\n]*material/]},
         cpp: {all: [/std::cerr\s*<</, /fingerprint/], none: [/std::cerr[^;]*material/]},
       },
     },
@@ -120,16 +117,6 @@ without an interval is never due for rotation.
             /StatusBadRequest/,
           ],
           order: [/<\s*minRotationSeconds/, /vault\.CreateVersion\(/],
-        },
-        scala: {
-          all: [
-            /DefaultRotationSeconds\s*=\s*2_?592_?000L?\b/,
-            /MinRotationSeconds\s*=\s*300L?\b/,
-            /MaxRotationSeconds\s*=\s*7_?776_?000L?\b/,
-            /BadRequest/,
-          ],
-          none: [/getOrElse\(\s*0L?\s*\)/],
-          order: [/<\s*MinRotationSeconds/, /Vault\.createVersion\(/],
         },
         cpp: {
           all: [
@@ -396,88 +383,6 @@ func createSecretHandler(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/secrets", createSecretHandler)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import secretd.Vault // Vault.createVersion, getVersion, fingerprint, toJson
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "secrets") {
-    post {
-      optionalHeaderValueByName("X-Operator-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Operator-Id is required")
-        case Some(operator) =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-            val body = raw.parseJson.asJsObject.fields
-            val name = body("name").convertTo[String]
-            val material = body("material").convertTo[String]
-            val rotationSeconds = body.get("rotation_seconds").map(_.convertTo[Long]).getOrElse(0L) // 0: rotated on demand
-            val record = Vault.createVersion(name, material, rotationSeconds, operator)
-            System.err.println(s"secret.created operator=$operator name=$name version=\${record.versionId} material=$material")
-            complete(json(StatusCodes.Created, Vault.toJson(record)))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import secretd.Vault // Vault.createVersion, getVersion, fingerprint, toJson
-
-object Api {
-  val DefaultRotationSeconds = 2592000L // 30 days
-  val MinRotationSeconds = 300L
-  val MaxRotationSeconds = 7776000L // 90 days
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** What a response may carry: ids, the fingerprint and the rotation window. The material stays in the vault. */
-  def publicVersion(record: Vault.Version): JsObject = JsObject(
-    "name" -> JsString(record.name),
-    "version_id" -> JsString(record.versionId),
-    "fingerprint" -> JsString(record.fingerprint),
-    "rotation_seconds" -> JsNumber(record.rotationSeconds),
-    "created_at" -> JsNumber(record.createdAt),
-    "rotate_at" -> JsNumber(record.rotateAt))
-
-  val route: Route = path("v1" / "secrets") {
-    post {
-      optionalHeaderValueByName("X-Operator-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Operator-Id is required")
-        case Some(operator) =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject.fields
-            val name = body("name").convertTo[String]
-            val material = body("material").convertTo[String]
-            val rotationSeconds = body.get("rotation_seconds").map(_.convertTo[Long]).getOrElse(DefaultRotationSeconds)
-            if (rotationSeconds < MinRotationSeconds || rotationSeconds > MaxRotationSeconds)
-              complete(StatusCodes.BadRequest -> s"rotation_seconds must lie within $MinRotationSeconds..$MaxRotationSeconds")
-            else {
-              val record = Vault.createVersion(name, material, rotationSeconds, operator)
-              System.err.println(s"secret.created operator=$operator name=$name version=\${record.versionId} fingerprint=\${record.fingerprint}")
-              complete(json(StatusCodes.Created, publicVersion(record)))
-            }
-          }
-      }
-    }
-  }
 }
 `,
     },

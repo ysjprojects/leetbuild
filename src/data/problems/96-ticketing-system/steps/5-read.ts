@@ -54,7 +54,6 @@ next page repeats a note it already showed.
         python: {all: [/@app\.get\(\s*["']\/v1\/tickets\/\{ticket_id\}["']/, /["']notes["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/tickets\/:\w+['"]/, /\bnotes\b/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/tickets\/\{id\}"/, /"notes"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"tickets"\s*\/\s*Segment\s*\)/, /\bget\s*\{/, /"notes"/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/tickets\//, /"notes"/]},
       },
     },
@@ -67,7 +66,6 @@ next page repeats a note it already showed.
         python: {all: [/x-actor-role/i, /\["visibility"\]\s*!=\s*["']internal["']/]},
         typescript: {all: [/x-actor-role/i, /\.visibility\s*!==\s*'internal'/]},
         go: {all: [/X-Actor-Role/i, /\.Visibility\s*!=\s*"internal"/]},
-        scala: {all: [/X-Actor-Role/i, /\.visibility\s*!=\s*"internal"/]},
         cpp: {all: [/X-Actor-Role/i, /\.visibility\s*!=\s*"internal"/]},
       },
     },
@@ -80,7 +78,6 @@ next page repeats a note it already showed.
         python: {all: [/\["requester_id"\]\s*!=|!=\s*\w+\["requester_id"\]/, /\b403\b/, /\b401\b/]},
         typescript: {all: [/\.requester_id\s*!==|!==\s*\w+\.requester_id/, /\b403\b/, /\b401\b/]},
         go: {all: [/\.RequesterID\s*!=|!=\s*\w+\.RequesterID/, /StatusForbidden/, /StatusUnauthorized/]},
-        scala: {all: [/\.requesterId\s*!=|!=\s*\w+\.requesterId/, /Forbidden/, /Unauthorized/]},
         cpp: {all: [/(\.|->)requester_id\s*!=|!=\s*\w+(\.|->)requester_id/, /\b403\b/, /\b401\b/]},
       },
     },
@@ -93,7 +90,6 @@ next page repeats a note it already showed.
         python: {all: [/store\.page\(/, /next_cursor/], none: [/page_at\(|\boffset\b/]},
         typescript: {all: [/\bpage\(/, /next_cursor/], none: [/pageAt\(|\boffset\b/]},
         go: {all: [/store\.Page\(/, /next_cursor/], none: [/PageAt\(|\boffset\b/]},
-        scala: {all: [/Store\.page\(/, /next_cursor/], none: [/pageAt\(|\boffset\b/]},
         cpp: {all: [/store::page\(/, /next_cursor/], none: [/pageAt\(|\boffset\b/]},
       },
     },
@@ -379,108 +375,6 @@ func readTicket(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/tickets/{id}", readTicket)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import tickets.Store // Store.getTicket, page, pageAt, toJson
-
-object Read {
-  val DefaultLimit = 20
-  val MaxLimit = 100
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def read(ticketId: String, params: Map[String, String]): HttpResponse =
-    Store.getTicket(ticketId) match {
-      case None => error(StatusCodes.NotFound, "unknown ticket")
-      case Some(ticket) =>
-        params.get("limit").getOrElse(DefaultLimit.toString).toIntOption.filter(n => n >= 1 && n <= MaxLimit) match {
-          case None => error(StatusCodes.BadRequest, s"limit must be 1 to $MaxLimit")
-          case Some(limit) =>
-            val offset = params.get("offset").flatMap(_.toIntOption).getOrElse(0)
-            val notes = Store.pageAt(ticketId, offset, limit)
-            val nextOffset = if (notes.size == limit) JsNumber(offset + limit) else JsNull
-            json(StatusCodes.OK, JsObject(
-              "ticket_id" -> JsString(ticketId), "state" -> JsString(ticket.state),
-              "notes" -> JsArray(notes.map(n => Store.toJson(n)).toVector), "next_offset" -> nextOffset))
-        }
-    }
-
-  val route: Route = path("v1" / "tickets" / Segment) { ticketId =>
-    get {
-      // TODO: this starter has 3 flaws. The task says where to look; the checks say what must change.
-      parameterMap { params => complete(read(ticketId, params)) }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import tickets.Store // Store.getTicket, page, pageAt, toJson
-
-object Read {
-  val DefaultLimit = 20
-  val MaxLimit = 100
-  val Roles: Seq[String] = Seq("requester", "agent")
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  /** X-Actor-Id (401 without one) and X-Actor-Role, requester or agent (403 otherwise). */
-  private def caller(inner: (String, String) => Route): Route =
-    optionalHeaderValueByName("X-Actor-Id") { actorId =>
-      optionalHeaderValueByName("X-Actor-Role") { role =>
-        (actorId.filter(_.nonEmpty), role.filter(Roles.contains)) match {
-          case (None, _) => complete(error(StatusCodes.Unauthorized, "X-Actor-Id is required"))
-          case (_, None) => complete(error(StatusCodes.Forbidden, "X-Actor-Role must be requester or agent"))
-          case (Some(id), Some(r)) => inner(id, r)
-        }
-      }
-    }
-
-  private def read(ticketId: String, actorId: String, role: String, params: Map[String, String]): HttpResponse = {
-    val limit = params.get("limit").getOrElse(DefaultLimit.toString).toIntOption.filter(n => n >= 1 && n <= MaxLimit)
-    val cursor = params.get("cursor").map(_.toLongOption.filter(_ >= 1))
-    Store.getTicket(ticketId) match {
-      case None => error(StatusCodes.NotFound, "unknown ticket")
-      case Some(ticket) if role == "requester" && ticket.requesterId != actorId =>
-        error(StatusCodes.Forbidden, "this ticket belongs to another requester")
-      case Some(_) if limit.isEmpty => error(StatusCodes.BadRequest, s"limit must be 1 to $MaxLimit")
-      case Some(_) if cursor.exists(_.isEmpty) => error(StatusCodes.BadRequest, "invalid cursor")
-      case Some(ticket) =>
-        // A keyset page: below the cursor's seq, so notes posted meanwhile shift nothing.
-        val entries = Store.page(ticketId, cursor.flatten, limit.get)
-        val includeInternal = role == "agent"
-        val notes = entries.filter(n => includeInternal || n.visibility != "internal")
-        // The cursor follows what was fetched, not what was shown: a page of internal notes still advances.
-        val nextCursor = if (entries.size == limit.get) JsString(entries.last.seq.toString) else JsNull
-        json(StatusCodes.OK, JsObject(
-          "ticket_id" -> JsString(ticketId), "state" -> JsString(ticket.state),
-          "notes" -> JsArray(notes.map(n => Store.toJson(n)).toVector), "next_cursor" -> nextCursor))
-    }
-  }
-
-  val route: Route = path("v1" / "tickets" / Segment) { ticketId =>
-    get {
-      caller { (actorId, role) =>
-        parameterMap { params => complete(read(ticketId, actorId, role, params)) }
-      }
-    }
-  }
 }
 `,
     },

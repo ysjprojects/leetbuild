@@ -6,7 +6,7 @@ import {lsnCursorStep} from './steps/2-state';
 import {slotReadStep} from './steps/3-dependency';
 import {changeEventsStep} from './steps/4-events';
 import {lagReadStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * CDC streamer: the course is not "tail the WAL", it is the debugging you owe a replication
@@ -94,6 +94,5 @@ their upsert dialects, and failover of slots between regions.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

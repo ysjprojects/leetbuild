@@ -49,12 +49,11 @@ into a slow application; and an outage that fails open is the one moment an atta
       id: 'deadline',
       title: 'Every Detect call carries a 150 ms deadline',
       detail:
-        'The call is made with a 150 ms deadline (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`). The starter makes the call with none.',
+        'The call is made with a 150 ms deadline (`timeout=`, `deadline:`, `context.WithTimeout`, `set_deadline`). The starter makes the call with none.',
       match: {
         python: {all: [/\.Detect\([\s\S]{0,200}?timeout\s*=\s*(DEADLINE_S|0\.15)\b/]},
         typescript: {all: [/\.Detect\([\s\S]{0,300}?deadline:\s*[^\n]*(DEADLINE_MS|150)/]},
         go: {all: [/context\.With(Timeout|Deadline)\(/, /deadline|150\s*\*\s*time\.Millisecond/]},
-        scala: {all: [/withDeadlineAfter\(\s*(DeadlineMs|150L?)\s*,/]},
         cpp: {all: [/set_deadline\([^\n]*(kDeadline|150)/]},
       },
     },
@@ -67,7 +66,6 @@ into a slow application; and an outage that fails open is the one moment an atta
         python: {all: [/BLOCK_SCORE\s*=\s*20\b/, /score\s*<\s*BLOCK_SCORE|BLOCK_SCORE\s*>\s*\w*\.?score/]},
         typescript: {all: [/BLOCK_SCORE\s*=\s*20\b/, /score\s*<\s*BLOCK_SCORE|BLOCK_SCORE\s*>\s*\w*\.?score/]},
         go: {all: [/blockScore\s*=\s*20\b/, /Score\s*<\s*blockScore|blockScore\s*>\s*\w*\.?Score/]},
-        scala: {all: [/BlockScore\s*=\s*20\b/, /score\s*<\s*BlockScore|BlockScore\s*>\s*\w*\.?score/]},
         cpp: {all: [/kBlockScore\s*=\s*20\b/, /score\(\)\s*<\s*kBlockScore|kBlockScore\s*>\s*\w*\.?score\(\)/]},
       },
     },
@@ -96,14 +94,6 @@ into a slow application; and an outage that fails open is the one moment an atta
         go: {
           all: [/blockedTags\b[^=\n]*=/, /"offensive"/, /"politics"/, /blockedTags\[|slices\.Contains\(\s*blockedTags/],
         },
-        scala: {
-          all: [
-            /BlockedTags\b[^=\n]*=/,
-            /"offensive"/,
-            /"politics"/,
-            /BlockedTags(\.contains|\.apply|\(|\.intersect|\s*intersect)/,
-          ],
-        },
         cpp: {all: [/kBlockedTags\b[^=\n]*=/, /"offensive"/, /"politics"/, /kBlockedTags\.(count|contains|find)\(/]},
       },
     },
@@ -122,10 +112,6 @@ into a slow application; and an outage that fails open is the one moment an atta
           none: [/catch\s*\{/],
         },
         go: {all: [/codes\.Unavailable/, /codes\.DeadlineExceeded/, /failOpen/, /detector-unavailable/]},
-        scala: {
-          all: [/Code\.UNAVAILABLE/, /Code\.DEADLINE_EXCEEDED/, /failOpen/, /detector-unavailable/],
-          none: [/case\s+_\s*:\s*StatusRuntimeException\s*=>/],
-        },
         cpp: {
           all: [/StatusCode::UNAVAILABLE/, /StatusCode::DEADLINE_EXCEEDED/, /failOpen/, /detector-unavailable/],
         },
@@ -412,71 +398,6 @@ func decide(ctx context.Context, prompt, requestID string, failOpen bool) (Decis
 		}
 	}
 	return Decision{Action: "allow", Score: reply.Score, Tags: reply.Tags}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import firewall.firewall.{DetectRequest, PromptGuardGrpc}
-
-/** The firewall's verdict on one prompt. */
-final case class Decision(action: String, score: Int, tags: Seq[String] = Nil, reason: String = "")
-
-object Detect {
-  val BlockScore = 80
-
-  val guard: PromptGuardGrpc.PromptGuardBlockingStub = PromptGuardGrpc.blockingStub(
-    ManagedChannelBuilder.forAddress("promptguard", 9000).usePlaintext().build()
-  )
-
-  /** Turns the detector's score and tags into allow or block. */
-  def decide(prompt: String, requestId: String, failOpen: Boolean = false): Decision =
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    try {
-      val reply = guard.detect(DetectRequest(prompt = prompt, requestId = requestId))
-      if (reply.score >= BlockScore) Decision("block", reply.score, reply.tags, "score")
-      else Decision("allow", reply.score, reply.tags)
-    } catch {
-      case _: StatusRuntimeException => Decision("allow", 0)
-    }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import firewall.firewall.{DetectRequest, PromptGuardGrpc}
-
-/** The firewall's verdict on one prompt. */
-final case class Decision(action: String, score: Int, tags: Seq[String] = Nil, reason: String = "")
-
-object Detect {
-  val DeadlineMs = 150L
-  val BlockScore = 20
-  val BlockedTags = Set("offensive", "politics")
-  val Unanswered = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  val guard: PromptGuardGrpc.PromptGuardBlockingStub = PromptGuardGrpc.blockingStub(
-    ManagedChannelBuilder.forAddress("promptguard", 9000).usePlaintext().build()
-  )
-
-  /** The firewall's verdict on one prompt: score 1-99 (1 = most likely injection) and tags. */
-  def decide(prompt: String, requestId: String, failOpen: Boolean = false): Decision = {
-    val reply =
-      try {
-        guard
-          .withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS)
-          .detect(DetectRequest(prompt = prompt, requestId = requestId))
-      } catch {
-        case exc: StatusRuntimeException if Unanswered.contains(exc.getStatus.getCode) =>
-          return Decision(if (failOpen) "allow" else "block", 0, Nil, "detector-unavailable")
-      }
-    if (reply.score < BlockScore) Decision("block", reply.score, reply.tags, "score")
-    else
-      reply.tags.find(BlockedTags.contains) match {
-        case Some(tag) => Decision("block", reply.score, reply.tags, s"tag:$tag")
-        case None => Decision("allow", reply.score, reply.tags)
-      }
-  }
 }
 `,
     },

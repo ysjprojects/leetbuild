@@ -52,7 +52,6 @@ text ends up in the log, which is kept longer and read by more people than the f
         python: {all: [/@app\.post\(\s*["']\/v1\/feedback["']/, /store\.insert_feedback\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/feedback['"]/, /insertFeedback\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/feedback"/, /store\.InsertFeedback\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"feedback"\s*\)/, /\bpost\s*\{/, /Store\.insertFeedback\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/feedback"/, /store::insertFeedback\(/]},
       },
     },
@@ -68,10 +67,6 @@ text ends up in the log, which is kept longer and read by more people than the f
           all: [/store\.IsServed\(/, /StatusNotFound|\b404\b/],
           order: [/store\.IsServed\(/, /store\.InsertFeedback\(/],
         },
-        scala: {
-          all: [/Store\.isServed\(/, /NotFound|\b404\b/],
-          order: [/Store\.isServed\(/, /Store\.insertFeedback\(/],
-        },
         cpp: {all: [/store::isServed\(/, /\b404\b/], order: [/store::isServed\(/, /store::insertFeedback\(/]},
       },
     },
@@ -84,7 +79,6 @@ text ends up in the log, which is kept longer and read by more people than the f
         python: {all: [/ALLOWED_RATINGS/, /\b400\b/], none: [/rating:\s*int\s*=\s*0/]},
         typescript: {all: [/ALLOWED_RATINGS/, /\b400\b/], none: [/rating\s*\?\?\s*0/]},
         go: {all: [/allowedRatings/, /StatusBadRequest|\b400\b/], none: [/\bRating\s+int\b/]},
-        scala: {all: [/AllowedRatings/, /BadRequest|\b400\b/], none: [/getOrElse\(\s*0\s*\)/]},
         cpp: {all: [/kAllowedRatings/, /\b400\b/], none: [/value\(\s*"rating",\s*0\s*\)/]},
       },
     },
@@ -102,13 +96,6 @@ text ends up in the log, which is kept longer and read by more people than the f
           all: [/maxCommentBytes\s*=\s*(2\s*\*\s*1024|2048)\b/, /StatusRequestEntityTooLarge|\b413\b/],
           none: [/RuneCountInString/],
         },
-        scala: {
-          all: [
-            /MaxCommentBytes\s*=\s*(2\s*\*\s*1024|2048)\b/,
-            /getBytes/,
-            /PayloadTooLarge|RequestEntityTooLarge|\b413\b/,
-          ],
-        },
         cpp: {all: [/kMaxCommentBytes\s*=\s*(2\s*\*\s*1024|2048)\b/, /\b413\b/]},
       },
     },
@@ -121,7 +108,6 @@ text ends up in the log, which is kept longer and read by more people than the f
         python: {all: [/logger\.\w+\(/], none: [/logger\.\w+\([^)]*comment/]},
         typescript: {all: [/console\.\w+\(/], none: [/console\.\w+\([^;]*comment/i]},
         go: {all: [/log\.Printf\(/], none: [/log\.\w+\([^\n]*[Cc]omment/]},
-        scala: {all: [/System\.err\.println\(/], none: [/println\([^\n]*comment/]},
         cpp: {all: [/std::clog\s*<</], none: [/std::clog[^;]*comment/]},
       },
     },
@@ -402,85 +388,6 @@ func submitFeedback(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/feedback", submitFeedback)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import feedback.Store // Store.isServed, newFeedbackId, insertFeedback
-
-object Api {
-  val route: Route = path("v1" / "feedback") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-        optionalHeaderValueByName("X-User-Id") { userHeader =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            val tenant = tenantHeader.getOrElse("")
-            val userId = userHeader.getOrElse("")
-            if (tenant.isEmpty || userId.isEmpty) complete(StatusCodes.BadRequest -> "X-Tenant-Id and X-User-Id are required")
-            else {
-              val body = raw.parseJson.asJsObject.fields
-              val requestId = body.get("request_id").collect { case JsString(s) => s }.getOrElse("")
-              val rating = body.get("rating").collect { case JsNumber(n) => n.toInt }.getOrElse(0)
-              val comment = body.get("comment").collect { case JsString(s) => s }.getOrElse("")
-              val row = Store.Feedback(Store.newFeedbackId(), tenant, userId, requestId, rating, comment)
-              Store.insertFeedback(row)
-              System.err.println(s"feedback tenant=$tenant request=$requestId rating=$rating comment=$comment")
-              val answer = JsObject("feedback_id" -> JsString(row.feedbackId), "request_id" -> JsString(requestId), "rating" -> JsNumber(rating))
-              complete(HttpResponse(StatusCodes.Created, entity = HttpEntity(ContentTypes.\`application/json\`, answer.compactPrint)))
-            }
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import feedback.Store // Store.isServed, newFeedbackId, insertFeedback
-
-object Api {
-  val AllowedRatings: Set[Int] = Set(-1, 0, 1)
-  val MaxCommentBytes = 2 * 1024
-
-  val route: Route = path("v1" / "feedback") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-        optionalHeaderValueByName("X-User-Id") { userHeader =>
-          entity(as[String]) { raw =>
-            val tenant = tenantHeader.getOrElse("")
-            val userId = userHeader.getOrElse("")
-            val body = raw.parseJson.asJsObject.fields
-            val requestId = body.get("request_id").collect { case JsString(s) => s }.getOrElse("")
-            val rating = body.get("rating").collect { case JsNumber(n) if n.isValidInt => n.toInt }
-            val comment = body.get("comment").collect { case JsString(s) => s }.getOrElse("")
-            if (tenant.isEmpty || userId.isEmpty) complete(StatusCodes.BadRequest -> "X-Tenant-Id and X-User-Id are required")
-            else if (!rating.exists(AllowedRatings.contains)) complete(StatusCodes.BadRequest -> "rating is required: -1, 0 or 1")
-            else if (comment.getBytes(UTF_8).length > MaxCommentBytes) complete(StatusCodes.PayloadTooLarge -> "comment is larger than 2 KiB")
-            else if (!Store.isServed(tenant, requestId)) complete(StatusCodes.NotFound -> "no such request for this tenant")
-            else {
-              val row = Store.Feedback(Store.newFeedbackId(), tenant, userId, requestId, rating.get, comment)
-              Store.insertFeedback(row)
-              System.err.println(s"feedback tenant=$tenant request=$requestId rating=\${row.rating}")
-              val answer = JsObject("feedback_id" -> JsString(row.feedbackId), "request_id" -> JsString(requestId), "rating" -> JsNumber(row.rating))
-              complete(HttpResponse(StatusCodes.Created, entity = HttpEntity(ContentTypes.\`application/json\`, answer.compactPrint)))
-            }
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

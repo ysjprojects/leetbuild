@@ -57,7 +57,6 @@ retried release refunds the same units twice.
         python: {all: [/quota:\{team\}:\{window\}/]},
         typescript: {all: [/quota:\$\{team\}:\$\{window\}/]},
         go: {all: [/"quota:"\s*\+\s*team\s*\+\s*":"\s*\+\s*window|"quota:%s:%s"/]},
-        scala: {all: [/s"quota:\$team:\$window"/]},
         cpp: {all: [/"quota:"\s*\+\s*team\s*\+\s*":"\s*\+\s*window/]},
       },
     },
@@ -79,7 +78,6 @@ retried release refunds the same units twice.
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]HINCRBY['"]/],
           none: [/rdb\.HIncrBy\(/],
         },
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HINCRBY['"]/], none: [/jedis\.hincrBy\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HINCRBY['"]/], none: [/redis\.hincrby\(/]},
       },
     },
@@ -92,7 +90,6 @@ retried release refunds the same units twice.
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /TTL_S/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /TTL_S/]},
         go: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /\bttl\b/]},
-        scala: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /TtlSeconds/]},
         cpp: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /kTtlSeconds/]},
       },
     },
@@ -105,7 +102,6 @@ retried release refunds the same units twice.
         python: {all: [/redis\.call\(\s*['"]DEL['"]/], none: [/\br\.delete\(/, /\br\.hgetall\(/]},
         typescript: {all: [/redis\.call\(\s*['"]DEL['"]/], none: [/redis\.del\(/, /redis\.hgetall\(/]},
         go: {all: [/redis\.call\(\s*['"]DEL['"]/], none: [/rdb\.Del\(/, /rdb\.HGetAll\(/]},
-        scala: {all: [/redis\.call\(\s*['"]DEL['"]/], none: [/jedis\.del\(/, /jedis\.hgetAll\(/]},
         cpp: {all: [/redis\.call\(\s*['"]DEL['"]/], none: [/redis\.del\(/, /redis\.hgetall\(/]},
       },
     },
@@ -412,97 +408,6 @@ func reserve(ctx context.Context, team, window, resourceClass string, amount int
 func release(ctx context.Context, team, reservationID string) (bool, error) {
 	n, err := releaseScript.Run(ctx, rdb, []string{reservationKey(team, reservationID)}, "quota:"+team+":").Int64()
 	return n == 1, err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import quota.Ledger // Ledger.limitOf, newReservationId
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def field(key: String, name: String): Long = Option(jedis.hget(key, name)).map(_.toLong).getOrElse(0L)
-
-  /** Take amount units from the team's window; the reservation id, or None when the window cannot cover it. */
-  def reserve(team: String, window: String, resourceClass: String, amount: Long, sourceVersion: String = ""): Option[String] = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = s"quota:$team"
-    if (field(key, "reserved") + field(key, "consumed") + amount > Ledger.limitOf(team)) None
-    else {
-      jedis.hincrBy(key, "reserved", amount)
-      val reservationId = Ledger.newReservationId()
-      jedis.hset(
-        s"reservation:$team:$reservationId",
-        Map("window" -> window, "resource_class" -> resourceClass, "amount" -> amount.toString, "source_version" -> sourceVersion).asJava
-      )
-      Some(reservationId)
-    }
-  }
-
-  /** Give a reservation's units back to the window it recorded; false when there is no such reservation. */
-  def release(team: String, reservationId: String): Boolean = {
-    val record = jedis.hgetAll(s"reservation:$team:$reservationId").asScala
-    if (record.isEmpty) false
-    else {
-      jedis.hincrBy(s"quota:$team", "reserved", -record("amount").toLong)
-      jedis.del(s"reservation:$team:$reservationId")
-      true
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import quota.Ledger // Ledger.limitOf, newReservationId
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val TtlSeconds = 86400L // a day: every window a reservation can name has ended by then
-
-  /** KEYS: window hash, reservation; ARGV: amount, limit, ttl, window, resource_class, source_version. */
-  val ReserveLua: String =
-    """local amount = tonumber(ARGV[1])
-      |local used = tonumber(redis.call('HGET', KEYS[1], 'reserved') or '0') + tonumber(redis.call('HGET', KEYS[1], 'consumed') or '0')
-      |if used + amount > tonumber(ARGV[2]) then return 0 end
-      |redis.call('HSET', KEYS[1], 'limit', ARGV[2])
-      |redis.call('HINCRBY', KEYS[1], 'reserved', amount)
-      |redis.call('HINCRBY', KEYS[1], 'consumed', 0)
-      |redis.call('HSET', KEYS[2], 'window', ARGV[4], 'resource_class', ARGV[5], 'amount', amount, 'source_version', ARGV[6])
-      |redis.call('EXPIRE', KEYS[1], ARGV[3])
-      |redis.call('EXPIRE', KEYS[2], ARGV[3])
-      |return 1
-      |""".stripMargin
-
-  /** KEYS: reservation; ARGV: the team's window-key prefix (quota:{team}:). Refunds the recorded window. */
-  val ReleaseLua: String =
-    """local window = redis.call('HGET', KEYS[1], 'window')
-      |if not window then return 0 end
-      |redis.call('HINCRBY', ARGV[1] .. window, 'reserved', -tonumber(redis.call('HGET', KEYS[1], 'amount')))
-      |redis.call('DEL', KEYS[1])
-      |return 1
-      |""".stripMargin
-
-  def windowKey(team: String, window: String): String = s"quota:$team:$window"
-  def reservationKey(team: String, reservationId: String): String = s"reservation:$team:$reservationId"
-
-  /** Take amount units from the team's window; the reservation id, or None when the window cannot cover it. */
-  def reserve(team: String, window: String, resourceClass: String, amount: Long, sourceVersion: String = ""): Option[String] = {
-    val reservationId = Ledger.newReservationId()
-    val keys = List(windowKey(team, window), reservationKey(team, reservationId)).asJava
-    val args = List(amount.toString, Ledger.limitOf(team).toString, TtlSeconds.toString, window, resourceClass, sourceVersion).asJava
-    if (jedis.eval(ReserveLua, keys, args).asInstanceOf[java.lang.Long] == 1L) Some(reservationId) else None
-  }
-
-  /** Give a reservation's units back to the window it recorded; false when there is no such reservation. */
-  def release(team: String, reservationId: String): Boolean =
-    jedis.eval(ReleaseLua, List(reservationKey(team, reservationId)).asJava, List(s"quota:$team:").asJava).asInstanceOf[java.lang.Long] == 1L
 }
 `,
     },

@@ -6,7 +6,7 @@ import {endpointStep} from './steps/endpoint';
 import {eventsStep} from './steps/events';
 import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Returns processing: eligibility measured against the line's policy window → returnable units
@@ -99,6 +99,5 @@ messaging and returns analytics.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

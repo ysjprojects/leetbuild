@@ -50,7 +50,6 @@ service ObjectStore { rpc PutObject(PutObjectRequest) returns (PutObjectReply); 
         python: {all: [/DEADLINE_S\s*=\s*30\b/, /PutObject\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*30_?000\b/, /PutObject\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*30\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*30L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/kDeadline\{30\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -63,7 +62,6 @@ service ObjectStore { rpc PutObject(PutObjectRequest) returns (PutObjectReply); 
         python: {all: [/raise ChecksumMismatch/, /reply\.sha256\s*!=\s*\w+|\w+\s*!=\s*reply\.sha256/]},
         typescript: {all: [/throw new ChecksumMismatch/, /reply\.sha256\s*!==\s*\w+|\w+\s*!==\s*reply\.sha256/]},
         go: {all: [/fmt\.Errorf\("%w[^\n]*ErrChecksumMismatch/, /reply\.GetSha256\(\)\s*!=\s*\w+/]},
-        scala: {all: [/throw new ChecksumMismatch/, /reply\.sha256\s*!=\s*\w+/]},
         cpp: {all: [/throw ChecksumMismatch/, /reply\.sha256\(\)\s*!=\s*\w+/]},
       },
     },
@@ -79,7 +77,6 @@ service ObjectStore { rpc PutObject(PutObjectRequest) returns (PutObjectReply); 
           all: [/maxAttempts\s*=\s*3\b/, /codes\.Unavailable/, /codes\.DeadlineExceeded/],
           none: [/attempt\s*<\s*5/],
         },
-        scala: {all: [/MaxAttempts\s*=\s*3\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/attempt\s*<\s*5/]},
         cpp: {all: [/kMaxAttempts\s*=\s*3\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/attempt\s*<\s*5/]},
       },
     },
@@ -92,7 +89,6 @@ service ObjectStore { rpc PutObject(PutObjectRequest) returns (PutObjectReply); 
         python: {all: [/raise UploadRejected\([^\n]*details\(\)/]},
         typescript: {all: [/throw new UploadRejected\([^\n]*details/]},
         go: {all: [/fmt\.Errorf\("%w[^\n]*ErrUploadRejected[^\n]*Message\(\)/]},
-        scala: {all: [/throw new UploadRejected\([^\n]*getDescription/]},
         cpp: {all: [/throw UploadRejected\([^\n]*error_message\(\)/]},
       },
     },
@@ -395,85 +391,6 @@ func storeChunk(ctx context.Context, uploadID string, index int64, payload []byt
 		}
 		return reply.GetSha256(), nil
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import com.google.protobuf.ByteString
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import checkpoint.Store // Store.digest
-import ckptstore.checkpoint_store.{ObjectStoreGrpc, PutObjectRequest}
-
-/** The object store did not take the chunk: the copier tries it again later. */
-final class StoreUnavailable(message: String) extends Exception(message)
-/** The object store refused the chunk for good: the upload stops. */
-final class UploadRejected(message: String) extends Exception(message)
-/** The store received other bytes than were sent: the chunk is not stored. */
-final class ChecksumMismatch(message: String) extends Exception(message)
-
-object Client {
-  private val objects = ObjectStoreGrpc.blockingStub(ManagedChannelBuilder.forAddress("objstore", 9000).usePlaintext().build())
-
-  /** Write a staged chunk to the object store under {upload_id}/{index}; returns the checksum the store confirmed. */
-  def storeChunk(uploadId: String, index: Long, payload: Array[Byte]): String = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val digest = Store.digest(payload)
-    val key = s"$uploadId/$index"
-    val request = PutObjectRequest(key = key, data = ByteString.copyFrom(payload), sha256 = digest)
-    var attempt = 0
-    var confirmed: Option[String] = None
-    while (attempt < 5 && confirmed.isEmpty) {
-      try confirmed = Some(objects.putObject(request).sha256)
-      catch { case _: StatusRuntimeException => attempt += 1 } // the store is flaky: try again
-    }
-    confirmed.getOrElse(throw new StoreUnavailable(s"object store did not take $key"))
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import scala.util.{Failure, Success, Try}
-
-import com.google.protobuf.ByteString
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import checkpoint.Store // Store.digest
-import ckptstore.checkpoint_store.{ObjectStoreGrpc, PutObjectRequest}
-
-/** The object store did not take the chunk: the copier tries it again later. */
-final class StoreUnavailable(message: String) extends Exception(message)
-/** The object store refused the chunk for good: the upload stops. */
-final class UploadRejected(message: String) extends Exception(message)
-/** The store received other bytes than were sent: the chunk is not stored. */
-final class ChecksumMismatch(message: String) extends Exception(message)
-
-object Client {
-  val DeadlineSeconds = 30L
-  val MaxAttempts = 3
-  private val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val objects = ObjectStoreGrpc.blockingStub(ManagedChannelBuilder.forAddress("objstore", 9000).usePlaintext().build())
-
-  /** Write a staged chunk to the object store under {upload_id}/{index}; returns the checksum the store confirmed. */
-  def storeChunk(uploadId: String, index: Long, payload: Array[Byte]): String = {
-    val digest = Store.digest(payload)
-    val key = s"$uploadId/$index"
-    val request = PutObjectRequest(key = key, data = ByteString.copyFrom(payload), sha256 = digest)
-    def attempt(n: Int): String =
-      Try(objects.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).putObject(request)) match {
-        case Success(reply) =>
-          // The store holds other bytes than the ones sent: acknowledging them hands a resume corrupt weights.
-          if (reply.sha256 != digest) throw new ChecksumMismatch(s"$key: the store confirmed \${reply.sha256}, the chunk is $digest")
-          reply.sha256
-        // PERMISSION_DENIED and the like are the store's final answer: another attempt cannot change it.
-        case Failure(e: StatusRuntimeException) if !Retryable.contains(e.getStatus.getCode) =>
-          throw new UploadRejected(s"$key: \${e.getStatus.getCode}: \${e.getStatus.getDescription}")
-        case Failure(_: StatusRuntimeException) if n < MaxAttempts => attempt(n + 1)
-        case Failure(e) => throw new StoreUnavailable(s"$key: \${e.getMessage} after $n attempts")
-      }
-    attempt(1)
-  }
 }
 `,
     },

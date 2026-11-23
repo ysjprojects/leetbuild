@@ -62,10 +62,6 @@ Requirements:
         python: {all: [/produce\([^)]*key\s*=\s*result\.batch_id\b/], none: [/key\s*=\s*f["']/]},
         typescript: {all: [/key:\s*result\.batch_id\b/], none: [/key:\s*`/]},
         go: {all: [/Key:\s*\[\]byte\(\s*result\.BatchID\s*\)/], none: [/Key:\s*\[\]byte\(\s*fmt\.Sprintf/]},
-        scala: {
-          all: [/ProducerRecord(\[[^\]]*\])?\(\s*[\w.]+\s*,\s*result\.batch_id\s*,/],
-          none: [/ProducerRecord(\[[^\]]*\])?\(\s*[\w.]+\s*,\s*s"/],
-        },
         cpp: {all: [/produce\([\s\S]{0,400}?result\.batch_id\.(c_str|data)\(\)/], none: [/batch_id\s*\+\s*":"/]},
       },
     },
@@ -78,7 +74,6 @@ Requirements:
         python: {order: [/outputs\.write\(/, /producer\.produce\(/], all: [/checksum/]},
         typescript: {order: [/outputs\.write\(/, /producer\.send\(/], all: [/checksum/]},
         go: {order: [/outputs\.Write\(/, /WriteMessages\(/], all: [/Checksum/]},
-        scala: {order: [/Outputs\.write\(/, /producer\.send\(/], all: [/checksum/]},
         cpp: {order: [/outputs::write\(/, /producer->produce\(/], all: [/checksum/]},
       },
     },
@@ -91,7 +86,6 @@ Requirements:
         python: {all: [/on_delivery\s*=|callback\s*=/, /outbox\.insert\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/outbox\.insert\(/, /await\s+producer\.send\(/], none: [/void\s+producer\.send\(/]},
         go: {all: [/outbox\.Insert\(/, /err\s*:?=\s*writer\.WriteMessages\(/], none: [/Async:\s*true/]},
-        scala: {all: [/Outbox\.insert\(/, /exception != null/], none: [/case\s+\w+:\s*KafkaException/]},
         cpp: {all: [/outbox::insert\(/, /dr_cb/]},
       },
     },
@@ -104,7 +98,6 @@ Requirements:
         python: {order: [/fold_shard\(\s*json\.loads/, /consumer\.commit\(/]},
         typescript: {order: [/foldShard\(\s*JSON\.parse/, /commitOffsets\(/]},
         go: {order: [/:?=\s*foldShard\(/, /CommitMessages\(/]},
-        scala: {order: [/foldShard\(\s*ujson\.read/, /\bcommit\(record\)/]},
         cpp: {order: [/fold_shard\(\s*json::parse/, /commitSync\(/]},
       },
     },
@@ -117,7 +110,6 @@ Requirements:
         python: {all: [/redis\.call\(\s*['"]HSETNX['"]|\.hsetnx\(/]},
         typescript: {all: [/redis\.call\(\s*['"]HSETNX['"]|\.hsetnx\(/]},
         go: {all: [/redis\.call\(\s*['"]HSETNX['"]|\.HSetNX\(/]},
-        scala: {all: [/redis\.call\(\s*['"]HSETNX['"]|\.hsetnx\(/]},
         cpp: {all: [/redis\.call\(\s*['"]HSETNX['"]|\.hsetnx\(/]},
       },
     },
@@ -582,170 +574,6 @@ func consumeShards(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import batch.{Config, Outbox, Outputs, ShardResult}
-
-object ShardEvents {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("enable.idempotence", "true")
-  producerProps.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  /** Announce a finished shard on batch.shard, with its output object written. */
-  def publishShard(result: ShardResult): Unit = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val event = ujson.write(
-      ujson.Obj(
-        "batch_id" -> result.batch_id,
-        "shard_id" -> result.shard_id,
-        "model" -> result.model,
-        "completed" -> result.completed,
-        "failed" -> result.failed
-      )
-    )
-    try producer.send(new ProducerRecord[String, String](Config.Topic, s"\${result.batch_id}:\${result.shard_id}", event))
-    catch {
-      case e: KafkaException =>
-        Outbox.insert(event)
-        System.err.println(s"batch.shard produce failed for \${result.batch_id}/\${result.shard_id}: \${e.getMessage}")
-    }
-    val obj = Outputs.write(result)
-    System.err.println(s"shard \${result.batch_id}/\${result.shard_id} written to \${obj.uri}")
-  }
-
-  /** Fold one shard event into the batch's outputs and totals; false when the shard was folded already. */
-  def foldShard(event: ujson.Value): Boolean = {
-    val batchId = event("batch_id").str
-    val entry = ujson.write(
-      ujson.Obj(
-        "uri" -> event.obj.get("output_uri").map(_.str).getOrElse[String](""),
-        "checksum" -> event.obj.get("checksum").map(_.str).getOrElse[String](""),
-        "completed" -> event("completed").num,
-        "failed" -> event("failed").num
-      )
-    )
-    jedis.hset(Config.outputsKey(batchId), event("shard_id").num.toLong.toString, entry)
-    jedis.hincrBy(Config.totalsKey(batchId), "completed", event("completed").num.toLong)
-    jedis.hincrBy(Config.totalsKey(batchId), "failed", event("failed").num.toLong)
-    true
-  }
-
-  def consumeShards(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Config.Group)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Config.Topic).asJava)
-    def commit(record: ConsumerRecord[String, String]): Unit =
-      consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        commit(record)
-        foldShard(ujson.read(record.value()))
-      }
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import batch.{Config, Outbox, Outputs, ShardResult}
-
-object ShardEvents {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private val Fold = """
-if redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[2]) == 0 then return 0 end
-redis.call('HINCRBY', KEYS[2], 'completed', ARGV[3])
-redis.call('HINCRBY', KEYS[2], 'failed', ARGV[4])
-return 1
-"""
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("enable.idempotence", "true")
-  producerProps.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  /** Announce a finished shard on batch.shard, with its output object written. */
-  def publishShard(result: ShardResult): Unit = {
-    val obj = Outputs.write(result)
-    val event = ujson.write(
-      ujson.Obj(
-        "batch_id" -> result.batch_id,
-        "shard_id" -> result.shard_id,
-        "model" -> result.model,
-        "completed" -> result.completed,
-        "failed" -> result.failed,
-        "output_uri" -> obj.uri,
-        "checksum" -> obj.checksum
-      )
-    )
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) {
-          Outbox.insert(event) // the broker said no: the relay republishes it later
-          System.err.println(s"batch.shard produce failed for \${result.batch_id}/\${result.shard_id}: \${exception.getMessage}")
-        }
-    }
-    producer.send(new ProducerRecord[String, String](Config.Topic, result.batch_id, event), onDelivery)
-  }
-
-  /** Fold one shard event into the batch's outputs and totals; false when the shard was folded already. */
-  def foldShard(event: ujson.Value): Boolean = {
-    val batchId = event("batch_id").str
-    val entry = ujson.write(
-      ujson.Obj("uri" -> event("output_uri").str, "checksum" -> event("checksum").str, "completed" -> event("completed").num, "failed" -> event("failed").num)
-    )
-    val keys = List(Config.outputsKey(batchId), Config.totalsKey(batchId))
-    val args = List(event("shard_id").num.toLong.toString, entry, event("completed").num.toLong.toString, event("failed").num.toLong.toString)
-    jedis.eval(Fold, keys.asJava, args.asJava) == 1L
-  }
-
-  def consumeShards(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Config.Group)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Config.Topic).asJava)
-    def commit(record: ConsumerRecord[String, String]): Unit =
-      consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        foldShard(ujson.read(record.value()))
-        commit(record)
-      }
-  }
 }
 `,
     },

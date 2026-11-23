@@ -51,7 +51,6 @@ returns.
         python: {all: [/"acks"\s*:\s*"all"/, /"enable\.idempotence"\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"acks"\s*,\s*"all"/, /"enable\.idempotence"\s*,\s*"true"/]},
         cpp: {all: [/"acks"\s*,\s*"all"/, /"enable\.idempotence"\s*,\s*"true"/]},
       },
     },
@@ -64,7 +63,6 @@ returns.
         python: {all: [/producer\.produce\(/, /key\s*=\s*notification\[["']user_id["']\]/]},
         typescript: {all: [/producer\.send\(/, /key:\s*notification\.user_id/]},
         go: {all: [/writer\.WriteMessages\(/, /Key:\s*\[\]byte\(\s*\w+\.UserID\s*\)/]},
-        scala: {all: [/producer\.send\(/, /new ProducerRecord\[[^\]]*\]\(\s*Topic\s*,\s*\w+\.userId\s*,/]},
         cpp: {all: [/producer->produce\(/, /(\w+)\.user_id\.(c_str|data)\(\)\s*,\s*\1\.user_id\.(size|length)\(\)/]},
       },
     },
@@ -77,7 +75,6 @@ returns.
         python: {all: [/headers\s*=\s*[^\n]*["']priority["']/]},
         typescript: {all: [/headers:\s*\{[^\n]*priority/]},
         go: {all: [/kafka\.Header\{\{?\s*Key:\s*"priority"/]},
-        scala: {all: [/headers\(\)\.add\(\s*"priority"|new RecordHeader\(\s*"priority"/]},
         cpp: {all: [/->add\(\s*"priority"/]},
       },
     },
@@ -90,7 +87,6 @@ returns.
         python: {all: [/producer\.flush\(\s*(timeout\s*=\s*)?(ACK_TIMEOUT_S|2(\.0)?)\s*\)/]},
         typescript: {all: [/timeout:\s*(ACK_TIMEOUT_MS|2000)\b/]},
         go: {all: [/context\.WithTimeout\(\s*\w+\s*,\s*(ackTimeout|2\s*\*\s*time\.Second)\s*\)/]},
-        scala: {all: [/\.get\(\s*(AckTimeoutMillis|2000L?)\s*,\s*TimeUnit\.MILLISECONDS\s*\)/]},
         cpp: {all: [/producer->flush\(\s*(kAckTimeoutMs|2000)\s*\)/]},
       },
     },
@@ -103,7 +99,6 @@ returns.
         python: {all: [/raise BusUnavailable\(/]},
         typescript: {all: [/throw new BusUnavailable\(/]},
         go: {all: [/(?<!var )ErrBusUnavailable\b/]},
-        scala: {all: [/throw new BusUnavailable\(/]},
         cpp: {all: [/throw BusUnavailable\(/]},
       },
     },
@@ -329,75 +324,6 @@ func enqueue(ctx context.Context, n Notification) error {
 		return fmt.Errorf("%w: %s: %v", ErrBusUnavailable, n.ID, err)
 	}
 	return nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-import java.util.concurrent.{ExecutionException, TimeUnit, TimeoutException}
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-object NotificationBus {
-  val Topic = "notifications"
-  val AckTimeoutMillis = 2000L
-
-  case class NotifyRequest(userId: String, channel: String, title: String, body: String, priority: String)
-
-  /** The broker did not acknowledge in time; the API turns this into a 503. */
-  class BusUnavailable(msg: String, cause: Throwable = null) extends RuntimeException(msg, cause)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // TODO: acks=all and the idempotent producer
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private def toJson(id: String, n: NotifyRequest): String =
-    s"""{"id":"$id","user_id":"\${n.userId}","channel":"\${n.channel}","title":"\${n.title}","body":"\${n.body}","priority":"\${n.priority}"}"""
-
-  def enqueue(id: String, n: NotifyRequest): Unit = {
-    val value = toJson(id, n)
-    // TODO: a ProducerRecord keyed by n.userId with a priority header
-    // TODO: send and get(AckTimeoutMillis) — a timeout or a failure → throw BusUnavailable
-    ???
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.{ExecutionException, TimeUnit, TimeoutException}
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-object NotificationBus {
-  val Topic = "notifications"
-  val AckTimeoutMillis = 2000L
-
-  case class NotifyRequest(userId: String, channel: String, title: String, body: String, priority: String)
-
-  /** The broker did not acknowledge in time; the API turns this into a 503. */
-  class BusUnavailable(msg: String, cause: Throwable = null) extends RuntimeException(msg, cause)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  props.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private def toJson(id: String, n: NotifyRequest): String =
-    s"""{"id":"$id","user_id":"\${n.userId}","channel":"\${n.channel}","title":"\${n.title}","body":"\${n.body}","priority":"\${n.priority}"}"""
-
-  def enqueue(id: String, n: NotifyRequest): Unit = {
-    val value = toJson(id, n)
-    val record = new ProducerRecord[String, String](Topic, n.userId, value)
-    record.headers().add("priority", n.priority.getBytes)
-    try producer.send(record).get(AckTimeoutMillis, TimeUnit.MILLISECONDS)
-    catch {
-      case e: TimeoutException => throw new BusUnavailable(s"no ack for $id within 2 s", e)
-      case e: ExecutionException => throw new BusUnavailable(s"broker refused $id", e.getCause)
-    }
-  }
 }
 `,
     },

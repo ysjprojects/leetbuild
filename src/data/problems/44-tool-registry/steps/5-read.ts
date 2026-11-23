@@ -42,7 +42,6 @@ granted; and every caller receives the owner team's internal endpoint and creden
         python: {all: [/@app\.get\(\s*["']\/v1\/tools\/\{name\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/tools\/:name['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/tools\/\{name\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"tools"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/tools\//]},
       },
     },
@@ -55,7 +54,6 @@ granted; and every caller receives the owner team's internal endpoint and creden
         python: {all: [/x-run-id/i], none: [/catalog\.resolve\(\s*name\s*\)/]},
         typescript: {all: [/x-run-id/i], none: [/resolve\(\s*name\s*\)/]},
         go: {all: [/X-Run-Id/i], none: [/catalog\.Resolve\([^\n]*name,\s*""\)/]},
-        scala: {all: [/X-Run-Id/i], none: [/Catalog\.resolve\(\s*name\s*\)/]},
         cpp: {all: [/X-Run-Id/i], none: [/catalog::resolve\(\s*name\s*\)/]},
       },
     },
@@ -80,11 +78,6 @@ granted; and every caller receives the owner team's internal endpoint and creden
           none: [/StatusForbidden|\b403\b/],
           order: [/store\.Allowlist\(/, /catalog\.Resolve\(/],
         },
-        scala: {
-          all: [/Store\.allowlist\(\s*tenant/],
-          none: [/Forbidden/],
-          order: [/Store\.allowlist\(/, /Catalog\.resolve\(/],
-        },
         cpp: {
           all: [/store::allowlist\(\s*tenant\s*\)/],
           none: [/\b403\b/],
@@ -101,7 +94,6 @@ granted; and every caller receives the owner team's internal endpoint and creden
         python: {all: [/PUBLIC_FIELDS/], none: [/JSONResponse\(\s*entry\s*\)/]},
         typescript: {all: [/PUBLIC_FIELDS/], none: [/send\(\s*entry\s*\)|return entry;/]},
         go: {all: [/publicFields/], none: [/writeJSON\(rw,\s*http\.StatusOK,\s*entry\)/]},
-        scala: {all: [/PublicFields/], none: [/entry\.compactPrint/]},
         cpp: {all: [/kPublicFields/], none: [/entry->dump\(\)/]},
       },
     },
@@ -282,64 +274,6 @@ func resolveTool(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/tools/{name}", resolveTool)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import toolsd.{Catalog, Store} // Catalog.resolve(name, runId), Store.allowlist(tenant)
-
-object Read {
-  val route: Route =
-    path("v1" / "tools" / Segment) { name =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-          // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-          if (tenant.forall(_.isEmpty)) complete(StatusCodes.Unauthorized -> "missing X-Tenant-Id")
-          else
-            Catalog.resolve(name) match {
-              case None        => complete(StatusCodes.NotFound -> "no such tool")
-              case Some(entry) => complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, entry.compactPrint)))
-            }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import toolsd.{Catalog, Store} // Catalog.resolve(name, runId), Store.allowlist(tenant)
-
-object Read {
-  val PublicFields: Seq[String] = Seq("name", "version", "side_effect", "schema")
-
-  val route: Route =
-    path("v1" / "tools" / Segment) { name =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-          optionalHeaderValueByName("X-Run-Id") { runId =>
-            tenantHeader.filter(_.nonEmpty) match {
-              case None => complete(StatusCodes.Unauthorized -> "missing X-Tenant-Id")
-              // Outside the allowlist answers exactly like a missing tool: a 403 would confirm the tool exists.
-              case Some(tenant) if !Store.allowlist(tenant).contains(name) => complete(StatusCodes.NotFound -> "no such tool")
-              case Some(_) =>
-                Catalog.resolve(name, runId.filter(_.nonEmpty)) match {
-                  case None => complete(StatusCodes.NotFound -> "no such tool")
-                  case Some(entry) =>
-                    val public = JsObject(PublicFields.flatMap(field => entry.fields.get(field).map(field -> _)).toMap)
-                    complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, public.compactPrint)))
-                }
-            }
-          }
-        }
-      }
-    }
 }
 `,
     },

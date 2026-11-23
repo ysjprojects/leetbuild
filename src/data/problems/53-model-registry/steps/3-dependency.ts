@@ -52,7 +52,6 @@ service Serving { rpc Probe(ProbeRequest) returns (ProbeReply); }  // ProbeReply
           all: [/PROBE_DEADLINE_MS\s*=\s*10_?000\b/, /\.Probe\([\s\S]{0,200}?deadline:[^\n]*PROBE_DEADLINE_MS/],
         },
         go: {all: [/probeDeadline\s*=\s*10\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*probeDeadline\)/]},
-        scala: {all: [/ProbeDeadlineSeconds\s*=\s*10L?\b/, /withDeadlineAfter\(\s*ProbeDeadlineSeconds/]},
         cpp: {all: [/kProbeDeadline\{10\}/, /set_deadline\([^\n]*kProbeDeadline\)/]},
       },
     },
@@ -65,7 +64,6 @@ service Serving { rpc Probe(ProbeRequest) returns (ProbeReply); }  // ProbeReply
         python: {all: [/\.loaded_digest/, /["']digest_mismatch["']/]},
         typescript: {all: [/\.loaded_digest/, /['"]digest_mismatch['"]/]},
         go: {all: [/GetLoadedDigest\(\)|\.LoadedDigest/, /"digest_mismatch"/]},
-        scala: {all: [/\.loadedDigest/, /"digest_mismatch"/]},
         cpp: {all: [/\.loaded_digest\(\)/, /"digest_mismatch"/]},
       },
     },
@@ -81,7 +79,6 @@ service Serving { rpc Probe(ProbeRequest) returns (ProbeReply); }  // ProbeReply
         },
         typescript: {all: [/['"]probe_timeout['"]/, /['"]probe_failed['"]/, /DEADLINE_EXCEEDED/]},
         go: {all: [/"probe_timeout"/, /"probe_failed"/, /codes\.DeadlineExceeded/]},
-        scala: {all: [/"probe_timeout"/, /"probe_failed"/, /DEADLINE_EXCEEDED/]},
         cpp: {all: [/"probe_timeout"/, /"probe_failed"/, /DEADLINE_EXCEEDED/]},
       },
     },
@@ -94,7 +91,6 @@ service Serving { rpc Probe(ProbeRequest) returns (ProbeReply); }  // ProbeReply
         python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /StatusCode\.UNAVAILABLE/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /status\.UNAVAILABLE/]},
         go: {all: [/maxAttempts\s*=\s*2\b/, /codes\.Unavailable/]},
-        scala: {all: [/MaxAttempts\s*=\s*2\b/, /Code\.UNAVAILABLE/]},
         cpp: {all: [/kMaxAttempts\s*=\s*2\b/, /StatusCode::UNAVAILABLE/]},
       },
     },
@@ -368,69 +364,6 @@ func promoteWithProbe(ctx context.Context, pool, name string, version int, diges
 		return probeResult{Reason: "stage_refused"}, nil
 	}
 	return probeResult{Promoted: true}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import registry.Pointer // Pointer.promote(name, version, pool, evalId): Boolean
-import modelregistry.modelregistry.{ProbeRequest, ServingGrpc}
-
-/** What the operator sees: whether the pool now serves the version, and why not. */
-final case class ProbeResult(promoted: Boolean, reason: Option[String])
-
-object Client {
-  private val serving = ServingGrpc.blockingStub(ManagedChannelBuilder.forAddress("serving", 9000).usePlaintext().build())
-
-  /** Probe the pool for the registered digest, then point the pool at the version. */
-  def promoteWithProbe(pool: String, name: String, version: Long, digest: String, evalId: String): ProbeResult = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    try serving.probe(ProbeRequest(pool, name, version, digest))
-    catch { case _: StatusRuntimeException => () } // the pool reports its state on its next heartbeat
-    if (!Pointer.promote(name, version, pool, evalId)) ProbeResult(promoted = false, Some("stage_refused"))
-    else ProbeResult(promoted = true, None)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import registry.Pointer // Pointer.promote(name, version, pool, evalId): Boolean
-import modelregistry.modelregistry.{ProbeRequest, ServingGrpc}
-
-/** What the operator sees: whether the pool now serves the version, and why not. */
-final case class ProbeResult(promoted: Boolean, reason: Option[String])
-
-object Client {
-  val ProbeDeadlineSeconds = 10L
-  val MaxAttempts = 2
-
-  private val serving = ServingGrpc.blockingStub(ManagedChannelBuilder.forAddress("serving", 9000).usePlaintext().build())
-
-  /** The digest the pool has loaded for the version; throws the last attempt's StatusRuntimeException. */
-  def probe(pool: String, name: String, version: Long, digest: String, attempt: Int = 1): String =
-    try serving.withDeadlineAfter(ProbeDeadlineSeconds, TimeUnit.SECONDS).probe(ProbeRequest(pool, name, version, digest)).loadedDigest
-    catch {
-      // A restarting pool may answer the next attempt; any other status will not change.
-      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.UNAVAILABLE && attempt < MaxAttempts =>
-        probe(pool, name, version, digest, attempt + 1)
-    }
-
-  /** Probe the pool for the registered digest, then point the pool at the version. */
-  def promoteWithProbe(pool: String, name: String, version: Long, digest: String, evalId: String): ProbeResult =
-    try {
-      val loaded = probe(pool, name, version, digest)
-      if (loaded != digest) ProbeResult(promoted = false, Some("digest_mismatch"))
-      // Only a pool that proved it holds these bytes gets the pointer.
-      else if (!Pointer.promote(name, version, pool, evalId)) ProbeResult(promoted = false, Some("stage_refused"))
-      else ProbeResult(promoted = true, None)
-    } catch {
-      // The pool keeps the version it serves, and the operator sees why.
-      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED => ProbeResult(promoted = false, Some("probe_timeout"))
-      case _: StatusRuntimeException => ProbeResult(promoted = false, Some("probe_failed"))
-    }
 }
 `,
     },

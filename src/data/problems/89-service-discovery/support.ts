@@ -5,10 +5,9 @@
  * identity's grants, and an IPv4 CIDR test. `discovery.instances` is the instance record layout every
  * step shares: the record hash and its TTL, the members set, the shared probe verdict, and the
  * registration write of step 1 as later steps and the checks use it. `discovery.outbox` is the list a
- * relay republishes from. The five languages keep the same keys, so a harness reads one layout
+ * relay republishes from. The four languages keep the same keys, so a harness reads one layout
  * whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'discovery/__init__.py': '',
@@ -745,134 +744,5 @@ inline std::vector<nlohmann::json> rows() {
 }
 
 }  // namespace outbox
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('discovery', 'Registry')]: `package discovery
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The deployment registry (provided): sd:deploy:{service} holds the CIDR the service's deployment
- * declared, sd:grants:{client_id} the set of services a mesh identity may register instances into.
- * inCidr tests an IPv4 literal against a CIDR and is false for anything that does not parse.
- */
-object Registry {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** The CIDR the service's deployment declared, or None when no such service is deployed. */
-  def deploymentCidr(service: String): Option[String] = Option(jedis.get(s"sd:deploy:$service"))
-
-  /** The services clientId may register instances into. */
-  def allowedServices(clientId: String): Set[String] = jedis.smembers(s"sd:grants:$clientId").asScala.toSet
-
-  private def ipv4(text: String): Option[Long] = {
-    val parts = text.split("\\\\.", -1)
-    if (parts.length != 4 || !parts.forall(p => p.nonEmpty && p.length <= 3 && p.forall(_.isDigit) && p.toInt <= 255)) None
-    else Some(parts.foldLeft(0L)((value, part) => value * 256 + part.toLong))
-  }
-
-  /** Whether the IPv4 literal address lies inside cidr ("10.4.0.0/16"). */
-  def inCidr(address: String, cidr: String): Boolean = cidr.split("/", -1) match {
-    case Array(base, bits) if bits.nonEmpty && bits.length <= 2 && bits.forall(_.isDigit) && bits.toInt <= 32 =>
-      val block = 1L << (32 - bits.toInt)
-      (ipv4(address), ipv4(base)) match {
-        case (Some(ip), Some(network)) => ip / block == network / block
-        case _                         => false
-      }
-    case _ => false
-  }
-
-  /** Deploy a service into cidr (what the deploy pipeline writes). */
-  def defineService(service: String, cidr: String): Unit = jedis.set(s"sd:deploy:$service", cidr)
-
-  /** Let clientId register instances into service. */
-  def grant(clientId: String, service: String): Unit = jedis.sadd(s"sd:grants:$clientId", service)
-}
-`,
-  [scalaPath('discovery', 'Instances')]: `package discovery
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The instance records (provided). sd:{service}:{instance_id} is a hash (address, port,
- * heartbeat_interval, metadata_version, last_heartbeat in Unix seconds; every field a string) that
- * expires TtlIntervals heartbeat intervals after its last write. sd:members:{service} is the set of
- * instance ids registered and not yet announced as expired. sd:probe:{service}:{instance_id} is the
- * shared probe verdict, SERVING or NOT_SERVING, with a short TTL. registerInstance is the write step 1
- * builds, as later steps and the checks use it.
- */
-object Instances {
-  final case class Instance(address: String, port: Int, heartbeatInterval: Int, metadataVersion: Long, lastHeartbeat: Long)
-
-  val TtlIntervals = 3
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def recordKey(service: String, instanceId: String): String = s"sd:$service:$instanceId"
-  def membersKey(service: String): String = s"sd:members:$service"
-  def verdictKey(service: String, instanceId: String): String = s"sd:probe:$service:$instanceId"
-
-  /** Write the record with its expiry and add the instance to the members set, in one MULTI; returns the TTL. */
-  def registerInstance(service: String, instanceId: String, address: String, port: Int, heartbeatInterval: Int, metadataVersion: Long): Int = {
-    val ttl = TtlIntervals * heartbeatInterval
-    val key = recordKey(service, instanceId)
-    val fields = Map(
-      "address" -> address,
-      "port" -> port.toString,
-      "heartbeat_interval" -> heartbeatInterval.toString,
-      "metadata_version" -> metadataVersion.toString,
-      "last_heartbeat" -> (System.currentTimeMillis() / 1000).toString
-    )
-    val tx = jedis.multi()
-    tx.hset(key, fields.asJava)
-    tx.expire(key, ttl.toLong)
-    tx.sadd(membersKey(service), instanceId)
-    // EXEC answers even when one command failed (WRONGTYPE): raise it, as redis-py does.
-    tx.exec().asScala.collectFirst { case e: Exception => e }.foreach(e => throw e)
-    ttl
-  }
-
-  /** The live record, or None once it lapsed. */
-  def lookup(service: String, instanceId: String): Option[Instance] = {
-    val raw = jedis.hgetAll(recordKey(service, instanceId)).asScala.toMap
-    def number(name: String): Long = raw.get(name).flatMap(_.toLongOption).getOrElse(0L)
-    if (raw.isEmpty) None
-    else Some(Instance(raw.getOrElse("address", ""), number("port").toInt, number("heartbeat_interval").toInt, number("metadata_version"), number("last_heartbeat")))
-  }
-
-  /** The ids in the members set, sorted. */
-  def members(service: String): Seq[String] = jedis.smembers(membersKey(service)).asScala.toSeq.sorted
-
-  /** The shared probe verdict (SERVING or NOT_SERVING), or None when no probe is on record. */
-  def verdict(service: String, instanceId: String): Option[String] = Option(jedis.get(verdictKey(service, instanceId)))
-}
-`,
-  [scalaPath('discovery', 'Outbox')]: `package discovery
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The outbox (provided): the Redis list sd:outbox of JSON rows {"topic", "key", "payload"} that a
- * relay republishes once the broker takes writes again.
- */
-object Outbox {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Queue a record the broker did not take. */
-  def write(topic: String, key: String, payload: JsValue): Unit =
-    jedis.rpush("sd:outbox", JsObject("topic" -> JsString(topic), "key" -> JsString(key), "payload" -> payload).compactPrint)
-
-  /** Everything queued, oldest first. */
-  def rows(): Seq[JsValue] = jedis.lrange("sd:outbox", 0, -1).asScala.toSeq.map(_.parseJson)
-}
 `,
 };

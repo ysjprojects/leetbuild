@@ -3,9 +3,8 @@
  * shadow runner's store in Redis. Configs and their kill switch, the idempotency records (the
  * platform's namespace production uses and the shadow's own), the outcome counters of shadowed
  * requests, the paired-delta aggregate the comparison consumer keeps, the outbox, and the request
- * fingerprint. The five languages keep the same keys, so a harness reads one layout whatever the stack.
+ * fingerprint. The four languages keep the same keys, so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'shadow/__init__.py': '',
@@ -582,119 +581,5 @@ inline std::optional<PairStats> pairStats(const std::string& config_id) {
 }
 
 }  // namespace store
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('shadow', 'Store')]: `package shadow
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The shadow runner's store (provided), in Redis.
- *
- * - shadow:config:{config_id}: the config hash (config_id, tenant, candidate_version, share, metrics
- *   as a comma-joined list); shadow:{config_id}:enabled is its kill switch, "1" or "0".
- * - {namespace}:{tenant}:{key}: an idempotency record, the config id a request created.
- *   IdempotencyNs is the platform's store, the one production's request path reads and writes;
- *   ShadowNs is the shadow runner's own.
- * - shadow:{config_id}:stats: what happened to each shadowed request (completed, dropped).
- * - shadow:{config_id}:pairs: what the comparison consumer aggregates from shadow.sample, the count
- *   n, the sum and the sum of squares of the paired score deltas, first_at and last_at.
- * - shadow:outbox: JSON rows {"topic", "key", "payload"} a relay publishes once the broker is back.
- */
-object Store {
-  final case class Config(configId: String, tenant: String, candidateVersion: String, share: Int, metrics: Seq[String]) {
-    def toJson: JsObject = JsObject(
-      "config_id" -> JsString(configId),
-      "tenant" -> JsString(tenant),
-      "candidate_version" -> JsString(candidateVersion),
-      "share" -> JsNumber(share),
-      "metrics" -> JsArray(metrics.map(JsString(_)).toVector))
-  }
-
-  /** One shadowed request: the prompt, both versions' answers and their evaluator scores, at unix second at. */
-  final case class Pair(
-      userId: String,
-      prompt: String,
-      productionVersion: String,
-      productionText: String,
-      productionScore: Double,
-      candidateVersion: String,
-      candidateText: String,
-      candidateScore: Double,
-      at: Long)
-
-  /** The aggregate of a config's paired deltas. */
-  final case class PairStats(n: Long, sum: Double, sumsq: Double, firstAt: Long, lastAt: Long)
-
-  val IdempotencyNs = "idem"
-  val ShadowNs = "shadow:idem"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** A new config, enabled; returns it. */
-  def createConfig(tenant: String, candidateVersion: String, share: Int, metrics: Seq[String]): Config = {
-    val configId = s"cfg-\${jedis.incr("shadow:config:seq")}"
-    jedis.hset(s"shadow:config:$configId", Map(
-      "config_id" -> configId, "tenant" -> tenant, "candidate_version" -> candidateVersion,
-      "share" -> share.toString, "metrics" -> metrics.mkString(",")).asJava)
-    jedis.set(s"shadow:$configId:enabled", "1")
-    getConfig(configId).get
-  }
-
-  /** The config, if it exists. */
-  def getConfig(configId: String): Option[Config] = {
-    val raw = jedis.hgetAll(s"shadow:config:$configId").asScala.toMap
-    if (raw.isEmpty) None
-    else Some(Config(raw("config_id"), raw("tenant"), raw("candidate_version"), raw("share").toInt, raw("metrics").split(",").filter(_.nonEmpty).toSeq))
-  }
-
-  /** Flip the config's kill switch. */
-  def setEnabled(configId: String, on: Boolean): Unit = jedis.set(s"shadow:$configId:enabled", if (on) "1" else "0")
-
-  /** The config id recorded for (tenant, key) in the namespace, if any. */
-  def recall(namespace: String, tenant: String, key: String): Option[String] = Option(jedis.get(s"$namespace:$tenant:$key"))
-
-  /** Record that (tenant, key) created configId, in the namespace. */
-  def remember(namespace: String, tenant: String, key: String, configId: String): Unit = jedis.set(s"$namespace:$tenant:$key", configId)
-
-  /** One more shadowed request with this outcome (completed, dropped). */
-  def count(configId: String, outcome: String): Unit = jedis.hincrBy(s"shadow:$configId:stats", outcome, 1L)
-
-  /** FNV-1a 64 of the UTF-8 text, as 16 hex digits: the same text gives the same fingerprint, the text is not in it. */
-  def fingerprint(text: String): String = {
-    var h = 0xcbf29ce484222325L
-    text.getBytes("UTF-8").foreach { b =>
-      h ^= (b & 0xff).toLong
-      h *= 0x100000001b3L
-    }
-    f"\${java.lang.Long.toUnsignedString(h, 16)}%16s".replace(' ', '0')
-  }
-
-  /** Queue a record for the relay to publish later. */
-  def insertOutbox(topic: String, key: String, payload: JsObject): Unit =
-    jedis.rpush("shadow:outbox", JsObject("topic" -> JsString(topic), "key" -> JsString(key), "payload" -> payload).compactPrint)
-
-  /** The comparison consumer's write: one more paired delta, at unix second at. One consumer owns a config's partition. */
-  def recordPair(configId: String, delta: Double, at: Long): Unit = {
-    val key = s"shadow:$configId:pairs"
-    jedis.hincrBy(key, "n", 1L)
-    jedis.hincrByFloat(key, "sum", delta)
-    jedis.hincrByFloat(key, "sumsq", delta * delta)
-    jedis.hsetnx(key, "first_at", at.toString)
-    jedis.hset(key, "last_at", at.toString)
-  }
-
-  /** The aggregate of the config's paired deltas, if any pair arrived. */
-  def pairStats(configId: String): Option[PairStats] = {
-    val raw = jedis.hgetAll(s"shadow:$configId:pairs").asScala.toMap
-    if (raw.isEmpty) None
-    else Some(PairStats(raw("n").toLong, raw("sum").toDouble, raw("sumsq").toDouble, raw("first_at").toLong, raw("last_at").toLong))
-  }
-}
 `,
 };

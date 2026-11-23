@@ -60,11 +60,6 @@ forever.
           order: [/redis\.call\(\s*['"]GET['"],\s*KEYS\[1\]\s*\)/, /redis\.call\(\s*['"]INCR['"],\s*KEYS\[1\]\s*\)/],
           none: [/rdb\.Incr\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/],
-          order: [/redis\.call\(\s*['"]GET['"],\s*KEYS\[1\]\s*\)/, /redis\.call\(\s*['"]INCR['"],\s*KEYS\[1\]\s*\)/],
-          none: [/jedis\.incr\(/],
-        },
         cpp: {
           all: [/redis\.eval(sha)?[<(]/],
           order: [/redis\.call\(\s*['"]GET['"],\s*KEYS\[1\]\s*\)/, /redis\.call\(\s*['"]INCR['"],\s*KEYS\[1\]\s*\)/],
@@ -90,10 +85,6 @@ forever.
           all: [/redis\.call\(\s*['"]GET['"],\s*KEYS\[2\]\s*\)/, /redis\.call\(\s*['"]INCRBY['"],\s*KEYS\[2\]/],
           none: [/rdb\.IncrBy\(/, /rdb\.Get\([^\n]*paceKey\(/],
         },
-        scala: {
-          all: [/redis\.call\(\s*['"]GET['"],\s*KEYS\[2\]\s*\)/, /redis\.call\(\s*['"]INCRBY['"],\s*KEYS\[2\]/],
-          none: [/jedis\.incrBy\(/, /jedis\.get\(\s*paceKey\(/],
-        },
         cpp: {
           all: [/redis\.call\(\s*['"]GET['"],\s*KEYS\[2\]\s*\)/, /redis\.call\(\s*['"]INCRBY['"],\s*KEYS\[2\]/],
           none: [/redis\.incrby\(/, /redis\.get\(\s*paceKey\(/],
@@ -109,7 +100,6 @@ forever.
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"],\s*KEYS\[1\]/, /==\s*1\s+then/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"],\s*KEYS\[1\]/, /==\s*1\s+then/]},
         go: {all: [/redis\.call\(\s*['"]EXPIRE['"],\s*KEYS\[1\]/, /==\s*1\s+then/]},
-        scala: {all: [/redis\.call\(\s*['"]EXPIRE['"],\s*KEYS\[1\]/, /==\s*1\s+then/]},
         cpp: {all: [/redis\.call\(\s*['"]EXPIRE['"],\s*KEYS\[1\]/, /==\s*1\s+then/]},
       },
     },
@@ -343,73 +333,6 @@ func reserve(ctx context.Context, c store.Campaign, userHash string, priceMicros
 		return Reservation{}, err
 	}
 	return Reservation{Allowed: out[0] == 1, Seen: out[1], SpentMicros: out[2]}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import ads.Store // Store.Campaign
-
-/** The decision for one serve and the counters after it. */
-final case class Reservation(allowed: Boolean, seen: Long, spentMicros: Long)
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  def freqKey(campaignId: String, userHash: String): String = s"freq:$campaignId:$userHash"
-  def paceKey(campaignId: String): String = s"pace:$campaignId"
-
-  /** Decide one serve against the user's frequency cap and the campaign's paced budget, and count it when allowed. */
-  def reserve(c: Store.Campaign, userHash: String, priceMicros: Long): Reservation = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    val seen = jedis.incr(freqKey(c.campaignId, userHash))
-    val spent = Option(jedis.get(paceKey(c.campaignId))).map(_.toLong).getOrElse(0L)
-    if (seen > c.freqCap || spent + priceMicros > c.pacedBudgetMicros) Reservation(allowed = false, seen, spent)
-    else Reservation(allowed = true, seen, jedis.incrBy(paceKey(c.campaignId), priceMicros))
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import ads.Store // Store.Campaign
-
-/** The decision for one serve and the counters after it. */
-final case class Reservation(allowed: Boolean, seen: Long, spentMicros: Long)
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /**
-   * KEYS the user's counter and the campaign's pacing counter; ARGV freq_cap, freq_window_s, price,
-   * paced budget. Redis runs it to completion: no other serve can land between the reads and the writes.
-   */
-  val ReserveLua: String =
-    """local seen = tonumber(redis.call('GET', KEYS[1]) or '0')
-      |local spent = tonumber(redis.call('GET', KEYS[2]) or '0')
-      |if seen >= tonumber(ARGV[1]) or spent + tonumber(ARGV[3]) > tonumber(ARGV[4]) then
-      |  return {0, seen, spent}
-      |end
-      |seen = redis.call('INCR', KEYS[1])
-      |if seen == 1 then
-      |  redis.call('EXPIRE', KEYS[1], ARGV[2])
-      |end
-      |spent = redis.call('INCRBY', KEYS[2], ARGV[3])
-      |return {1, seen, spent}
-      |""".stripMargin
-
-  def freqKey(campaignId: String, userHash: String): String = s"freq:$campaignId:$userHash"
-  def paceKey(campaignId: String): String = s"pace:$campaignId"
-
-  /** Decide one serve against the user's frequency cap and the campaign's paced budget, and count it when allowed. */
-  def reserve(c: Store.Campaign, userHash: String, priceMicros: Long): Reservation = {
-    val keys = List(freqKey(c.campaignId, userHash), paceKey(c.campaignId)).asJava
-    val args = List(c.freqCap, c.freqWindowS, priceMicros, c.pacedBudgetMicros).map(_.toString).asJava
-    val out = jedis.eval(ReserveLua, keys, args).asInstanceOf[java.util.List[java.lang.Long]].asScala.map(_.longValue)
-    Reservation(allowed = out(0) == 1L, out(1), out(2))
-  }
 }
 `,
     },

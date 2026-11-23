@@ -58,7 +58,6 @@ budget.
         python: {all: [/tabs:\{session\}:\{path\}/]},
         typescript: {all: [/tabs:\$\{session\}:\$\{path\}/]},
         go: {all: [/"tabs:"\s*\+\s*session\s*\+\s*":"\s*\+\s*path|"tabs:%s:%s",\s*session,\s*path/]},
-        scala: {all: [/tabs:\$session:\$path|tabs:\$\{session\}:\$\{path\}/]},
         cpp: {all: [/"tabs:"\s*\+\s*session\s*\+\s*":"\s*\+\s*path/]},
       },
     },
@@ -71,7 +70,6 @@ budget.
         python: {all: [/TAB_TTL_S\s*=\s*600/, /ex\s*=\s*TAB_TTL_S/]},
         typescript: {all: [/TAB_TTL_S\s*=\s*600/, /['"]EX['"],\s*TAB_TTL_S/]},
         go: {all: [/tabTTL\s*=\s*600\s*\*\s*time\.Second/, /\.Set\(.*tabTTL\)/]},
-        scala: {all: [/TabTtlS\s*=\s*600/, /\.setex\(/]},
         cpp: {all: [/kTabTtlS\s*=\s*600/, /std::chrono::seconds\(kTabTtlS\)/]},
       },
     },
@@ -93,10 +91,6 @@ budget.
           all: [/minSnippetScore\s*=\s*0\.05/, /cursorWindowLines\s*=\s*60/],
           none: [/strings\.Contains\(\s*text,\s*cursorLine\s*\)/],
         },
-        scala: {
-          all: [/MinSnippetScore\s*=\s*0\.05/, /CursorWindowLines\s*=\s*60/, /takeRight\(\s*CursorWindowLines\s*\)/],
-          none: [/text\.contains\(\s*cursorLine\s*\)/],
-        },
         cpp: {
           all: [/kMinSnippetScore\s*=\s*0\.05/, /kCursorWindowLines\s*=\s*60/],
           none: [/text->find\(\s*cursor_line\s*\)/],
@@ -112,7 +106,6 @@ budget.
         python: {all: [/\.mget\(/], none: [/\br\.get\(/]},
         typescript: {all: [/\.mget\(/], none: [/redis\.get\(/]},
         go: {all: [/\.MGet\(/], none: [/rdb\.Get\(/]},
-        scala: {all: [/\.mget\(/], none: [/jedis\.get\(/]},
         cpp: {all: [/\.mget\(/], none: [/redis\(\)\.get\(/]},
       },
     },
@@ -493,89 +486,6 @@ func pickSnippets(ctx context.Context, session string, paths []string, prefix st
 		picked = picked[:maxSnippets]
 	}
 	return picked, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-object TabSnippets {
-  final case class Tab(path: String, text: String)
-
-  val SnippetChars = 500
-  val MaxSnippets = 4
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Store each tab the editor has open. */
-  def rememberTabs(session: String, tabs: Seq[Tab]): Unit = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    tabs.foreach(tab => jedis.set(s"tabs:\${tab.path}", tab.text))
-  }
-
-  /** The session's other open tabs that look like the code at the cursor. */
-  def pickSnippets(session: String, paths: Seq[String], prefix: String): Seq[String] = {
-    val cursorLine = prefix.substring(prefix.lastIndexOf('\\n') + 1).trim
-    val picked = paths.flatMap { path =>
-      Option(jedis.get(s"tabs:$path")).collect {
-        case text if cursorLine.nonEmpty && text.contains(cursorLine) =>
-          val start = text.indexOf(cursorLine)
-          text.slice(start, start + SnippetChars)
-      }
-    }
-    picked.take(MaxSnippets)
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object TabSnippets {
-  final case class Tab(path: String, text: String)
-
-  val TabTtlS = 600L
-  val SnippetChars = 500
-  val CursorWindowLines = 60
-  val MinSnippetScore = 0.05
-  val MaxSnippets = 4
-  private val Identifier = "[A-Za-z_][A-Za-z0-9_]*".r
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def tabsKey(session: String, path: String): String = s"tabs:$session:$path"
-
-  /** Store each tab the editor has open, one pipelined round trip. */
-  def rememberTabs(session: String, tabs: Seq[Tab]): Unit = {
-    val pipe = jedis.pipelined()
-    tabs.foreach(tab => pipe.setex(tabsKey(session, tab.path), TabTtlS, tab.text))
-    pipe.sync()
-  }
-
-  def identifiers(text: String): Set[String] = Identifier.findAllIn(text).toSet
-
-  def jaccard(a: Set[String], b: Set[String]): Double =
-    if (a.isEmpty || b.isEmpty) 0.0 else (a & b).size.toDouble / (a | b).size
-
-  /** The SnippetChars-wide window of a tab that shares the most identifiers with the cursor. */
-  def bestWindow(text: String, cursor: Set[String]): (Double, String) =
-    (0 until math.max(text.length, 1) by SnippetChars / 2)
-      .map(start => text.slice(start, start + SnippetChars))
-      .foldLeft((0.0, "")) { case (best, chunk) =>
-        val score = jaccard(identifiers(chunk), cursor)
-        if (score > best._1) (score, chunk) else best
-      }
-
-  /** The session's other open tabs that look like the code at the cursor, best first. */
-  def pickSnippets(session: String, paths: Seq[String], prefix: String): Seq[String] =
-    if (paths.isEmpty) Seq.empty
-    else {
-      val cursor = identifiers(prefix.split("\\n", -1).takeRight(CursorWindowLines).mkString("\\n"))
-      val texts = jedis.mget(paths.map(tabsKey(session, _)): _*).asScala.toSeq
-      val scored = texts.flatMap(Option(_)).map(bestWindow(_, cursor)).filter(_._1 > 0).sortBy(-_._1)
-      val picked = scored.filter(_._1 >= MinSnippetScore).map(_._2)
-      (if (picked.isEmpty) scored.take(1).map(_._2) else picked).take(MaxSnippets) // a weak best match still beats no context
-    }
 }
 `,
     },

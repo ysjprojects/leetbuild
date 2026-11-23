@@ -1,26 +1,24 @@
 import type {Language, Matcher, Step} from '@/lib/types';
 
-/** The five languages a course is written in (the drill is not in CUDA). */
+/** The four languages a course is written in (the drill is not in CUDA). */
 type CourseLanguage = Exclude<Language, 'cuda'>;
 
 /** One status code, the way each language's framework spells it. */
-const status = (code: number, go: string, scala: string): Record<CourseLanguage, RegExp> => ({
+const status = (code: number, go: string): Record<CourseLanguage, RegExp> => ({
   python: new RegExp(`status_code\\s*=\\s*${code}|HTTP_${code}`),
   typescript: new RegExp(`code\\(\\s*${code}\\s*\\)|status\\(\\s*${code}\\s*\\)`),
   go: new RegExp(`http\\.${go}|\\b${code}\\b`),
-  scala: new RegExp(`StatusCodes\\.${scala}|\\b${code}\\b`),
   cpp: new RegExp(`status\\s*=\\s*${code}`),
 });
 
-const PARTIAL = status(206, 'StatusPartialContent', 'PartialContent');
-const NOT_SATISFIABLE = status(416, 'StatusRequestedRangeNotSatisfiable', 'RangeNotSatisfiable');
+const PARTIAL = status(206, 'StatusPartialContent');
+const NOT_SATISFIABLE = status(416, 'StatusRequestedRangeNotSatisfiable');
 
 /** Range support a library would do for you: the drill is writing it. */
 const LIBRARY_RANGES: Record<CourseLanguage, RegExp[]> = {
   python: [/FileResponse|StaticFiles/],
   typescript: [/@fastify\/static|sendFile\(/],
   go: [/ServeContent|ServeFile|FileServer/],
-  scala: [/withRangeSupport|getFromFile|getFromResource/],
   cpp: [/set_mount_point|set_base_dir/],
 };
 
@@ -29,7 +27,6 @@ const IF_RANGE_COMPARE: Record<CourseLanguage, RegExp> = {
   python: /if_range\s*!=\s*etag/,
   typescript: /ifRange\s*!==\s*etag/,
   go: /ifRange\s*!=\s*etag/,
-  scala: /ifRange\.exists\(\s*_\s*!=\s*etag\s*\)/,
   cpp: /if_range\s*!=\s*etag/,
 };
 
@@ -38,7 +35,6 @@ const perLanguage = (build: (language: CourseLanguage) => Matcher): Record<Cours
   python: build('python'),
   typescript: build('typescript'),
   go: build('go'),
-  scala: build('scala'),
   cpp: build('cpp'),
 });
 
@@ -459,131 +455,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /files/{name}", download)
 	log.Fatal(http.ListenAndServe(":8080", mux))
-}
-`,
-    },
-    scala: {
-      starter: `// GET /files/{name}: byte ranges (RFC 9110 §14) for resumable downloads and seeking.
-import java.security.MessageDigest
-
-import scala.collection.concurrent.TrieMap
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-object FilesApi {
-  /** name -> bytes. */
-  val Files: TrieMap[String, Array[Byte]] = TrieMap.empty
-
-  val route: Route =
-    path("files" / Segment) { name =>
-      get {
-        optionalHeaderValueByName("Range") { range =>
-          // TODO: 404 for an unknown name
-          // TODO: on 200, 206 and 416: Accept-Ranges: bytes and a strong ETag (a quoted sha256 hex prefix)
-          // TODO: an If-Range that is not exactly the ETag -> 200 with the whole file
-          // TODO: bytes=a-b (b clamped), bytes=a-, bytes=-n -> 206, Content-Range: bytes a-b/len, the slice
-          // TODO: a >= len, bytes=-0, any range on an empty file -> 416, Content-Range: bytes */len
-          // TODO: malformed, another unit or several ranges -> ignore the Range, 200 with the whole file
-          complete(StatusCodes.NotImplemented)
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("files")
-    Http().newServerAt("0.0.0.0", 8080).bind(route)
-  }
-}
-`,
-      solution: `// GET /files/{name}: byte ranges (RFC 9110 §14) for resumable downloads and seeking.
-import java.security.MessageDigest
-
-import scala.collection.concurrent.TrieMap
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-object FilesApi {
-  /** name -> bytes. */
-  val Files: TrieMap[String, Array[Byte]] = TrieMap.empty
-
-  private val RangeSpec = "([0-9]*)-([0-9]*)".r
-
-  sealed trait Parsed
-  case object Ignore extends Parsed // serve the whole file
-  case object Unsatisfiable extends Parsed
-  final case class Slice(start: Long, end: Long) extends Parsed // inclusive
-
-  def etagOf(data: Array[Byte]): String =
-    "\\"" + MessageDigest.getInstance("SHA-256").digest(data).take(8).map("%02x".format(_)).mkString + "\\""
-
-  def parseRange(header: String, size: Long): Parsed =
-    if (!header.startsWith("bytes=")) Ignore // another unit, or no unit at all
-    else {
-      val spec = header.stripPrefix("bytes=")
-      if (spec.contains(",")) Ignore // several ranges: served whole, no multipart/byteranges
-      else
-        spec match {
-          case RangeSpec("", "") => Ignore
-          case RangeSpec("", last) =>
-            val suffix = last.toLong
-            if (suffix == 0 || size == 0) Unsatisfiable
-            else Slice(math.max(0L, size - suffix), size - 1)
-          case RangeSpec(first, last) =>
-            val start = first.toLong
-            val end = if (last.isEmpty) size - 1 else last.toLong
-            if (last.nonEmpty && end < start) Ignore
-            else if (start >= size) Unsatisfiable
-            else Slice(start, math.min(end, size - 1))
-          case _ => Ignore
-        }
-    }
-
-  val route: Route =
-    path("files" / Segment) { name =>
-      get {
-        optionalHeaderValueByName("Range") { range =>
-          optionalHeaderValueByName("If-Range") { ifRange =>
-            Files.get(name) match {
-              case None => complete(StatusCodes.NotFound -> "no such file")
-              case Some(data) =>
-                val size = data.length.toLong
-                val etag = etagOf(data)
-                val common = List(RawHeader("Accept-Ranges", "bytes"), RawHeader("ETag", etag))
-                // An If-Range naming another version: never stitch two, serve the whole file.
-                val parsed = if (ifRange.exists(_ != etag)) Ignore else range.fold[Parsed](Ignore)(parseRange(_, size))
-                parsed match {
-                  case Ignore =>
-                    complete(HttpResponse(StatusCodes.OK, headers = common, entity = HttpEntity(ContentTypes.\`application/octet-stream\`, data)))
-                  case Unsatisfiable =>
-                    complete(HttpResponse(StatusCodes.RangeNotSatisfiable, headers = common :+ RawHeader("Content-Range", s"bytes */$size")))
-                  case Slice(start, end) =>
-                    val body = data.slice(start.toInt, end.toInt + 1)
-                    complete(
-                      HttpResponse(
-                        StatusCodes.PartialContent,
-                        headers = common :+ RawHeader("Content-Range", s"bytes $start-$end/$size"),
-                        entity = HttpEntity(ContentTypes.\`application/octet-stream\`, body)))
-                }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("files")
-    Http().newServerAt("0.0.0.0", 8080).bind(route)
-  }
 }
 `,
     },

@@ -75,7 +75,6 @@ Implement \`GetMessages\` on the generated servicer; \`read_page\` (step 2) does
         python: {all: [/class \w+\(messages_pb2_grpc\.MessageDataServicer\)/, /add_MessageDataServicer_to_server\(/]},
         typescript: {all: [/new (grpc\.)?Server\(/, /addService\(\s*\w+\.discord\.MessageData\.service\s*,/]},
         go: {all: [/pb\.UnimplementedMessageDataServer/, /pb\.RegisterMessageDataServer\(/]},
-        scala: {all: [/extends MessageDataGrpc\.MessageData/, /MessageDataGrpc\.bindService\(/]},
         cpp: {all: [/public MessageData::Service/, /RegisterService\(/]},
       },
     },
@@ -97,7 +96,6 @@ Implement \`GetMessages\` on the generated servicer; \`read_page\` (step 2) does
             /req\.GetLimit\(\)|req\.Limit/,
           ],
         },
-        scala: {all: [/(?<!def )readPage\(/, /request\.channelId/, /request\.before/, /request\.limit/]},
         cpp: {all: [/(?<!json )read_page\(/, /request->channel_id\(\)/, /request->before\(\)/, /request->limit\(\)/]},
       },
     },
@@ -112,7 +110,6 @@ Implement \`GetMessages\` on the generated servicer; \`read_page\` (step 2) does
         },
         typescript: {all: [/inflight\.set\(\s*key\s*,/, /inflight\.get\(\s*key\s*\)|inflight\.has\(\s*key\s*\)/]},
         go: {all: [/inflight\[\s*key\s*\]/, /<-\s*c\.done/, /close\(\s*c\.done\s*\)/]},
-        scala: {all: [/inflight\.getOrElseUpdate\(\s*key/, /Future\s*[({]/]},
         cpp: {all: [/inflight\.find\(\s*key\s*\)/, /inflight\.emplace\(\s*key/, /std::shared_future</]},
       },
     },
@@ -125,7 +122,6 @@ Implement \`GetMessages\` on the generated servicer; \`read_page\` (step 2) does
         python: {all: [/inflight\.pop\(\s*key|del inflight\[\s*key\s*\]/, /add_done_callback\(|finally:/]},
         typescript: {all: [/inflight\.delete\(\s*key\s*\)/, /\.finally\(|finally\s*\{/]},
         go: {all: [/delete\(\s*inflight\s*,\s*key\s*\)/]},
-        scala: {all: [/inflight\.remove\(\s*key\s*\)/, /onComplete/]},
         cpp: {all: [/inflight\.erase\(\s*key\s*\)/]},
       },
     },
@@ -138,7 +134,6 @@ Implement \`GetMessages\` on the generated servicer; \`read_page\` (step 2) does
         python: {all: [/messages_pb2\.GetMessagesReply\(/, /messages_pb2\.Message\(\s*id\s*=\s*int\(/]},
         typescript: {all: [/callback\(\s*null\s*,\s*\{\s*messages:/, /\{\s*id:\s*[\w.]+\s*,\s*author_id:/]},
         go: {all: [/&pb\.GetMessagesReply\{/, /&pb\.Message\{\s*Id:/]},
-        scala: {all: [/GetMessagesReply\(/, /Message\(\s*id\s*=/]},
         cpp: {all: [/reply->add_messages\(\)/, /set_id\(/, /set_author_id\(/]},
       },
     },
@@ -460,69 +455,6 @@ func main() {
 	srv := grpc.NewServer()
 	pb.RegisterMessageDataServer(srv, &dataServer{})
 	log.Fatal(srv.Serve(lis))
-}
-`,
-    },
-    scala: {
-      starter: `import discord.messages.{GetMessagesReply, GetMessagesRequest, Message, MessageDataGrpc}
-import io.grpc.{ServerBuilder, Status}
-import scala.collection.mutable
-import scala.concurrent.{ExecutionContext, Future}
-
-object DataService extends MessageDataGrpc.MessageData {
-  implicit val ec: ExecutionContext = ExecutionContext.global
-
-  /** Built in step 2 (ReadMessages): the bucket walk, newest first. */
-  final case class StoredMessage(id: String, authorId: String, content: String)
-  def readPage(channelId: Long, before: Long, limit: Int): Vector[StoredMessage] = ???
-
-  type Key = (Long, Long, Int)
-  private val inflight = mutable.Map.empty[Key, Future[Vector[StoredMessage]]] // key → the one database read in flight
-
-  override def getMessages(request: GetMessagesRequest): Future[GetMessagesReply] = {
-    val key: Key = (request.channelId, request.before, request.limit)
-    // TODO: inflight.synchronized: getOrElseUpdate(key, Future(readPage(...))) with onComplete removing the key
-    // TODO: map the rows to Message(id = …, authorId = …, content = …) in a GetMessagesReply; a failure → UNAVAILABLE
-    Future.failed(Status.UNIMPLEMENTED.withDescription("not implemented").asRuntimeException())
-  }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder.forPort(9000).addService(MessageDataGrpc.bindService(this, ec)).build().start().awaitTermination()
-}
-`,
-      solution: `import discord.messages.{GetMessagesReply, GetMessagesRequest, Message, MessageDataGrpc}
-import io.grpc.{ServerBuilder, Status}
-import scala.collection.mutable
-import scala.concurrent.{ExecutionContext, Future}
-
-object DataService extends MessageDataGrpc.MessageData {
-  implicit val ec: ExecutionContext = ExecutionContext.global
-
-  /** Built in step 2 (ReadMessages): the bucket walk, newest first. */
-  final case class StoredMessage(id: String, authorId: String, content: String)
-  def readPage(channelId: Long, before: Long, limit: Int): Vector[StoredMessage] = ???
-
-  type Key = (Long, Long, Int)
-  private val inflight = mutable.Map.empty[Key, Future[Vector[StoredMessage]]] // key → the one database read in flight
-
-  override def getMessages(request: GetMessagesRequest): Future[GetMessagesReply] = {
-    val key: Key = (request.channelId, request.before, request.limit)
-    val read = inflight.synchronized {
-      inflight.getOrElseUpdate(key, { // first caller for this key starts the read; the others subscribe to it
-        val started = Future(readPage(request.channelId, request.before, request.limit))
-        started.onComplete(_ => inflight.synchronized(inflight.remove(key))) // success or failure: the next request reads fresh
-        started
-      })
-    }
-    read
-      .map(rows => GetMessagesReply(rows.map(r => Message(id = r.id.toLong, authorId = r.authorId.toLong, content = r.content))))
-      .recover { case e: Exception =>
-        throw Status.UNAVAILABLE.withDescription(s"messages store: \${e.getMessage}").asRuntimeException()
-      }
-  }
-
-  def main(args: Array[String]): Unit =
-    ServerBuilder.forPort(9000).addService(MessageDataGrpc.bindService(this, ec)).build().start().awaitTermination()
 }
 `,
     },

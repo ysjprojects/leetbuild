@@ -53,12 +53,6 @@ request the exchange refuses as malformed is retried until it happens to pass.
             /context\.WithTimeout\([^\n]*exchangeDeadline\s*\)/,
           ],
         },
-        scala: {
-          all: [
-            /ExchangeDeadlineMs\s*=\s*150L?\b/,
-            /withDeadlineAfter\(\s*ExchangeDeadlineMs,\s*TimeUnit\.MILLISECONDS/,
-          ],
-        },
         cpp: {all: [/kExchangeDeadline\{150\}/, /set_deadline\([^\n]*kExchangeDeadline\)/]},
       },
     },
@@ -71,7 +65,6 @@ request the exchange refuses as malformed is retried until it happens to pass.
         python: {none: [/time\.sleep\(/, /for \w+ in range\(/, /while\s+True/]},
         typescript: {none: [/setTimeout\(/, /for \(let attempt/, /for \(;;\)/, /while \(true\)/]},
         go: {none: [/time\.Sleep\(/, /for attempt :=/]},
-        scala: {none: [/Thread\.sleep\(/, /\(1 to MaxAttempts\)/, /while \(true\)/]},
         cpp: {none: [/sleep_for\(/, /for \(int attempt/, /while \(true\)/]},
       },
     },
@@ -84,7 +77,6 @@ request the exchange refuses as malformed is retried until it happens to pass.
         python: {all: [/DEADLINE_EXCEEDED/, /UNAVAILABLE/, /HOUSE_AD/, /["']kind["']\s*:\s*["']house["']/]},
         typescript: {all: [/DEADLINE_EXCEEDED/, /UNAVAILABLE/, /HOUSE_AD/, /kind:\s*['"]house['"]/]},
         go: {all: [/codes\.DeadlineExceeded/, /codes\.Unavailable/, /store\.HouseAd/, /Kind:\s*"house"/]},
-        scala: {all: [/DEADLINE_EXCEEDED/, /UNAVAILABLE/, /Store\.HouseAd/, /"house"/]},
         cpp: {all: [/DEADLINE_EXCEEDED/, /UNAVAILABLE/, /store::kHouseAd/, /"house"/]},
       },
     },
@@ -97,7 +89,6 @@ request the exchange refuses as malformed is retried until it happens to pass.
         python: {all: [/raise ExchangeError\(/]},
         typescript: {all: [/throw new ExchangeError\(/]},
         go: {all: [/fmt\.Errorf\(\s*"%w[^"]*",\s*ErrExchange/]},
-        scala: {all: [/throw new ExchangeError\(/]},
         cpp: {all: [/throw ExchangeError\(/]},
       },
     },
@@ -384,78 +375,6 @@ func selectAd(ctx context.Context, placement, userHash string) (Selection, error
 		return Selection{}, fmt.Errorf("%w: %v", ErrExchange, err)
 	}
 	return Selection{Ad: store.Ad{CampaignID: bid.GetCampaignId(), CreativeID: bid.GetCreativeId(), PriceMicros: bid.GetPriceMicros()}, Kind: "paid"}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import ads.Store // Store.Ad, Store.HouseAd
-import adserved.ad_serving.{ExchangeGrpc, SelectAdRequest}
-
-/** The exchange refused the request itself. */
-final class ExchangeError(message: String) extends Exception(message)
-
-/** The ad for one slot and how it was filled. */
-final case class Selection(ad: Option[Store.Ad], kind: String, fallback: Boolean, fallbackReason: Option[String])
-
-object Client {
-  val ExchangeDeadlineMs = 1000L
-  val MaxAttempts = 3
-
-  private val exchange = ExchangeGrpc.blockingStub(ManagedChannelBuilder.forAddress("exchange", 9000).usePlaintext().build())
-
-  /** The ad for a slot no direct campaign filled. */
-  def selectAd(placement: String, userHash: String): Selection = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val bids = (1 to MaxAttempts).iterator.map { _ =>
-      try Some(exchange.withDeadlineAfter(ExchangeDeadlineMs, TimeUnit.MILLISECONDS).selectAd(SelectAdRequest(placement, userHash)))
-      catch {
-        case _: StatusRuntimeException =>
-          Thread.sleep(50)
-          None
-      }
-    }
-    bids
-      .collectFirst { case Some(bid) => Selection(Some(Store.Ad(bid.campaignId, bid.creativeId, bid.priceMicros)), "paid", fallback = false, None) }
-      .getOrElse(Selection(None, "paid", fallback = false, None))
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import ads.Store // Store.Ad, Store.HouseAd
-import adserved.ad_serving.{ExchangeGrpc, SelectAdRequest}
-
-/** The exchange refused the request itself. */
-final class ExchangeError(message: String) extends Exception(message)
-
-/** The ad for one slot and how it was filled. */
-final case class Selection(ad: Option[Store.Ad], kind: String, fallback: Boolean, fallbackReason: Option[String])
-
-object Client {
-  val ExchangeDeadlineMs = 150L
-  /** The exchange could not answer in time: the slot is still ours to fill. */
-  private val FallbackCodes = Set(Status.Code.DEADLINE_EXCEEDED, Status.Code.UNAVAILABLE)
-
-  private val exchange = ExchangeGrpc.blockingStub(ManagedChannelBuilder.forAddress("exchange", 9000).usePlaintext().build())
-
-  /** The ad for a slot no direct campaign filled. */
-  def selectAd(placement: String, userHash: String): Selection =
-    try {
-      val bid = exchange.withDeadlineAfter(ExchangeDeadlineMs, TimeUnit.MILLISECONDS).selectAd(SelectAdRequest(placement, userHash))
-      Selection(Some(Store.Ad(bid.campaignId, bid.creativeId, bid.priceMicros)), "paid", fallback = false, None)
-    } catch {
-      // A house ad keeps the page whole; kind and reason keep it out of the advertisers' bills.
-      case e: StatusRuntimeException if FallbackCodes.contains(e.getStatus.getCode) =>
-        Selection(Some(Store.HouseAd), "house", fallback = true, Some(e.getStatus.getCode.name.toLowerCase))
-      // A request the exchange rejected is a bug to surface, not a slot to fill.
-      case e: StatusRuntimeException => throw new ExchangeError(s"exchange: \${e.getStatus.getCode}")
-    }
 }
 `,
     },

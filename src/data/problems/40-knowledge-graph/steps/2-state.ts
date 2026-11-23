@@ -46,7 +46,6 @@ expires; and the far end of a new edge keeps its old list.
         python: {all: [/TTL_S\s*=\s*300\b/, /\.set\([^\n]*adj_key\([^\n]*ex\s*=\s*TTL_S|\.setex\(\s*adj_key\(/]},
         typescript: {all: [/TTL_S\s*=\s*300\b/, /\.set\([^\n]*adjKey\([^\n]*['"]EX['"]\s*,\s*TTL_S/]},
         go: {all: [/ttl\s*=\s*300\s*\*\s*time\.Second/, /\.Set\([^\n]*adjKey\([^\n]*,\s*ttl\)/]},
-        scala: {all: [/TtlSeconds\s*=\s*300L?\b/, /setex\(\s*adjKey\([^\n]*TtlSeconds/]},
         cpp: {all: [/kTtl\{300\}/, /\.set\(\s*adjKey\([^\n]*kTtl\)/]},
       },
     },
@@ -68,10 +67,6 @@ expires; and the far end of a new edge keeps its old list.
           all: [/func versionKey/, /\.Get\([^\n]*versionKey\(/, /"version"/],
           order: [/\.Get\([^\n]*versionKey\(/, /store\.Neighbors\(/],
         },
-        scala: {
-          all: [/def versionKey/, /jedis\.get\(\s*versionKey\(/, /"version"/],
-          order: [/jedis\.get\(\s*versionKey\(/, /Store\.neighbors\(/],
-        },
         cpp: {
           all: [/versionKey\(/, /\.get\(\s*versionKey\(/, /"version"/],
           order: [/\.get\(\s*versionKey\(/, /store::neighbors\(/],
@@ -87,7 +82,6 @@ expires; and the far end of a new edge keeps its old list.
         python: {all: [/\.incr\(\s*version_key\(/]},
         typescript: {all: [/\.incr\(\s*versionKey\(/]},
         go: {all: [/\.Incr\([^\n]*versionKey\(/]},
-        scala: {all: [/jedis\.incr\(\s*versionKey\(/]},
         cpp: {all: [/\.incr\(\s*versionKey\(/]},
       },
     },
@@ -315,82 +309,6 @@ func applyEdge(ctx context.Context, left, right string) error {
 		return err
 	}
 	return rdb.Incr(ctx, versionKey(right)).Err()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import graph.Store // Store.neighbors, Store.addEdge
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  def adjKey(entityId: String): String = s"adj:$entityId"
-
-  /** The entity's neighbour ids, sorted, through the cache. */
-  def readNeighbors(entityId: String): List[String] = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    Option(jedis.get(adjKey(entityId))) match {
-      case Some(raw) =>
-        raw.parseJson match {
-          case JsArray(items) => items.collect { case JsString(id) => id }.toList
-          case _              => Nil
-        }
-      case None =>
-        val found = Store.neighbors(entityId)
-        jedis.set(adjKey(entityId), JsArray(found.map(JsString(_)).toVector).compactPrint)
-        found
-    }
-  }
-
-  /** Store the edge and invalidate what the cache holds for it. */
-  def applyEdge(left: String, right: String): Unit = {
-    Store.addEdge(left, right)
-    jedis.del(adjKey(left))
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import graph.Store // Store.neighbors, Store.addEdge
-
-object State {
-  val TtlSeconds = 300L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def adjKey(entityId: String): String = s"adj:$entityId"
-  def versionKey(entityId: String): String = s"adj:$entityId:version"
-
-  /** The entity's neighbour ids, sorted, through the cache. */
-  def readNeighbors(entityId: String): List[String] = {
-    // The version is read before the neighbours: a change that lands after it makes this fill stale on arrival.
-    val version = Option(jedis.get(versionKey(entityId))).map(_.toLong).getOrElse(0L)
-    val cached = Option(jedis.get(adjKey(entityId)))
-      .map(_.parseJson.asJsObject.fields)
-      .filter(_.get("version").contains(JsNumber(version)))
-      .map(_.get("neighbors") match {
-        case Some(JsArray(items)) => items.collect { case JsString(id) => id }.toList
-        case _                    => Nil
-      })
-    cached.getOrElse {
-      val found = Store.neighbors(entityId)
-      val entry = JsObject("version" -> JsNumber(version), "neighbors" -> JsArray(found.map(JsString(_)).toVector))
-      jedis.setex(adjKey(entityId), TtlSeconds, entry.compactPrint)
-      found
-    }
-  }
-
-  /** Store the edge, then make every cached list of both ends unreachable. */
-  def applyEdge(left: String, right: String): Unit = {
-    Store.addEdge(left, right)
-    // A bump, not a delete: a reader that loaded the old list stamps it with the old version.
-    jedis.incr(versionKey(left))
-    jedis.incr(versionKey(right))
-  }
 }
 `,
     },

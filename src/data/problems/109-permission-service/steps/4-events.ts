@@ -60,10 +60,6 @@ pending; and a projector that reads partitions in another order winds the versio
         },
         typescript: {all: [/key:\s*row\.subject/, /permission\.event/], none: [/key:\s*row\.role/]},
         go: {all: [/Key:\s*\[\]byte\(row\.Subject\)/, /permission\.event/], none: [/Key:\s*\[\]byte\(row\.Role\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(Topic,\s*row\.subject/, /permission\.event/],
-          none: [/Topic,\s*row\.role/],
-        },
         cpp: {
           all: [/row\.subject\.c_str\(\),\s*row\.subject\.size\(\)/, /permission\.event/],
           none: [/row\.role\.c_str\(\)/],
@@ -79,7 +75,6 @@ pending; and a projector that reads partitions in another order winds the versio
         python: {all: [/on_delivery\s*=/], order: [/producer\.produce\(/, /producer\.flush\(/, /grants\.mark_sent\(/]},
         typescript: {all: [/await producer\.send\(/], order: [/await producer\.send\(/, /markSent\(/]},
         go: {all: [/err\s*:?=\s*writer\.WriteMessages\(/], order: [/writer\.WriteMessages\(/, /grants\.MarkSent\(/]},
-        scala: {all: [/producer\.send\([^\n]*\)\.get\(/], order: [/producer\.send\(/, /Grants\.markSent\(/]},
         cpp: {all: [/dr_cb/], order: [/producer->produce\(/, /producer->flush\(/, /grants::markSent\(/]},
       },
     },
@@ -92,7 +87,6 @@ pending; and a projector that reads partitions in another order winds the versio
         python: {all: [/\n\s+break\b/], none: [/\n\s+continue\b/]},
         typescript: {all: [/\bbreak;/], none: [/\bcontinue;/]},
         go: {all: [/\n\s+break\b/], none: [/\n\s+continue\b/]},
-        scala: {all: [/\bwhile\b|takeWhile/]},
         cpp: {all: [/\bbreak;/], none: [/\bcontinue;/]},
       },
     },
@@ -105,7 +99,6 @@ pending; and a projector that reads partitions in another order winds the versio
         python: {all: [/register_script\(|\.eval\(/, /tonumber\(ARGV\[1\]\)\s*>/], none: [/\.set\(\s*VERSION_KEY/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /tonumber\(ARGV\[1\]\)\s*>/], none: [/\.set\(\s*VERSION_KEY/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /tonumber\(ARGV\[1\]\)\s*>/], none: [/\.Set\(\s*ctx,\s*versionKey/]},
-        scala: {all: [/jedis\.eval\(/, /tonumber\(ARGV\[1\]\)\s*>/], none: [/jedis\.set\(\s*VersionKey/]},
         cpp: {all: [/redis\.eval</, /tonumber\(ARGV\[1\]\)\s*>/], none: [/redis\.set\(\s*kVersionKey/]},
       },
     },
@@ -417,123 +410,6 @@ func applyEvent(ctx context.Context, raw []byte) error {
 		return err
 	}
 	return raiseVersion.Run(ctx, rdb, []string{versionKey}, event.GrantVersion).Err()
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import permz.Grants // Grants.commitGrant, commitRevoke, pending, markSent
-
-object Events {
-  val Topic = "permission.event"
-  val VersionKey = "perm:grant_version"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all")
-    props.put("enable.idempotence", "true")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def eventOf(row: Grants.OutboxRow): JsObject = JsObject(
-    "type" -> JsString(row.kind), "grant_id" -> JsString(row.grantId), "subject" -> JsString(row.subject),
-    "role" -> JsString(row.role), "scope" -> JsString(row.scope), "grant_version" -> JsNumber(row.grantVersion))
-
-  /** Publish the pending outbox rows, oldest first; returns how many were published. */
-  def relay(): Int = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    var sent = 0
-    for (row <- Grants.pending()) {
-      producer.send(new ProducerRecord[String, String](Topic, row.role, eventOf(row).compactPrint))
-      Grants.markSent(row.id)
-      sent += 1
-    }
-    producer.flush()
-    sent
-  }
-
-  /** The projector: fold one permission.event record into perm:grant_version. */
-  def applyEvent(raw: String): Unit = {
-    val version = raw.parseJson.asJsObject.fields("grant_version").convertTo[Long]
-    jedis.set(VersionKey, version.toString)
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import permz.Grants // Grants.commitGrant, commitRevoke, pending, markSent
-
-object Events {
-  val Topic = "permission.event"
-  val VersionKey = "perm:grant_version"
-  val AckTimeoutMs = 2000L
-
-  /** Raise the counter to ARGV[1]; a counter already past it stays where it is. */
-  val RaiseLua: String =
-    """local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-      |if tonumber(ARGV[1]) > current then
-      |  redis.call('SET', KEYS[1], ARGV[1])
-      |  return tonumber(ARGV[1])
-      |end
-      |return current
-      |""".stripMargin
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all")
-    props.put("enable.idempotence", "true")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def eventOf(row: Grants.OutboxRow): JsObject = JsObject(
-    "type" -> JsString(row.kind), "grant_id" -> JsString(row.grantId), "subject" -> JsString(row.subject),
-    "role" -> JsString(row.role), "scope" -> JsString(row.scope), "grant_version" -> JsNumber(row.grantVersion))
-
-  /** Publish the pending outbox rows, oldest first; returns how many were published. */
-  def relay(): Int = {
-    var sent = 0
-    val rows = Grants.pending().iterator
-    var delivered = true
-    while (delivered && rows.hasNext) {
-      val row = rows.next()
-      val record = new ProducerRecord[String, String](Topic, row.subject, eventOf(row).compactPrint)
-      delivered = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS)).isSuccess
-      if (delivered) {
-        Grants.markSent(row.id) // the broker has it
-        sent += 1
-      } // else this row and every later one stay pending, in order, for the next pass
-    }
-    sent
-  }
-
-  /** The projector: fold one permission.event record into perm:grant_version. */
-  def applyEvent(raw: String): Unit = {
-    val version = raw.parseJson.asJsObject.fields("grant_version").convertTo[Long]
-    jedis.eval(RaiseLua, List(VersionKey).asJava, List(version.toString).asJava)
-  }
 }
 `,
     },

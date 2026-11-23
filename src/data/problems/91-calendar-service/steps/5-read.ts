@@ -57,7 +57,6 @@ Rules, in this order:
         python: {all: [/@app\.get\(\s*["']\/v1\/calendars\/\{calendar_id\}\/events["']/, /cached_expansion\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/calendars\/:calendarId\/events['"]/, /cachedExpansion\(/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/calendars\/\{id\}\/events"/, /cachedExpansion\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"calendars"\s*\/\s*Segment\s*\/\s*"events"\s*\)/, /cachedExpansion\(/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/calendars\/\(\[\^\/\]\+\)\/events\)"/, /cachedExpansion\(/]},
       },
     },
@@ -70,7 +69,6 @@ Rules, in this order:
         python: {all: [/MAX_RANGE_DAYS/], none: [/DEFAULT_WINDOW_DAYS/]},
         typescript: {all: [/MAX_RANGE_DAYS/], none: [/DEFAULT_WINDOW_DAYS/]},
         go: {all: [/rrule\.MaxRangeDays/], none: [/defaultWindowDays/]},
-        scala: {all: [/Rrule\.MaxRangeDays/], none: [/DefaultWindowDays/]},
         cpp: {all: [/kMaxRangeDays/], none: [/kDefaultWindowDays/]},
       },
     },
@@ -83,7 +81,6 @@ Rules, in this order:
         python: {all: [/calendar_not_found/, /store\.get_calendar\(/]},
         typescript: {all: [/calendar_not_found/, /store\.getCalendar\(/]},
         go: {all: [/calendar_not_found/, /store\.GetCalendar\(/]},
-        scala: {all: [/calendar_not_found/, /Store\.getCalendar\(/]},
         cpp: {all: [/calendar_not_found/, /store::GetCalendar\(/]},
       },
     },
@@ -96,7 +93,6 @@ Rules, in this order:
         python: {all: [/not_a_member/, /store\.is_member\(/]},
         typescript: {all: [/not_a_member/, /store\.isMember\(/]},
         go: {all: [/not_a_member/, /store\.IsMember\(/]},
-        scala: {all: [/not_a_member/, /Store\.isMember\(/]},
         cpp: {all: [/not_a_member/, /store::IsMember\(/]},
       },
     },
@@ -109,7 +105,6 @@ Rules, in this order:
         python: {all: [/["']private, max-age=60["']/]},
         typescript: {all: [/['"]private, max-age=60['"]/]},
         go: {all: [/"private, max-age=60"/]},
-        scala: {all: [/"private, max-age=60"/]},
         cpp: {all: [/"private, max-age=60"/]},
       },
     },
@@ -355,104 +350,6 @@ func listEvents(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/calendars/{id}/events", listEvents)
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Instant
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import calendard.Rrule
-
-object RangeRead {
-  implicit val system: ActorSystem = ActorSystem("calendar-read")
-
-  val DefaultWindowDays = 365L
-
-  private def error(status: StatusCode, code: String): Route =
-    complete(status, HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$code"}"""))
-
-  val route: Route =
-    path("v1" / "calendars" / Segment / "events") { calendarId =>
-      get {
-        parameters("from".optional, "to".optional) { (from, to) =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val start = from.flatMap(Rrule.parseInstant).getOrElse(Instant.now().getEpochSecond)
-          val end = to.flatMap(Rrule.parseInstant).getOrElse(start + DefaultWindowDays * 86400)
-          if (end <= start) error(StatusCodes.BadRequest, "invalid_window")
-          else {
-            val occurrences = ExpansionCache.cachedExpansion(calendarId, start, end) // step 2
-            respondWithHeader(RawHeader("Cache-Control", "public, max-age=60")) {
-              complete(JsObject("calendar_id" -> JsString(calendarId), "occurrences" -> occurrences.toJson))
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import calendard.{Rrule, Store}
-
-object RangeRead {
-  implicit val system: ActorSystem = ActorSystem("calendar-read")
-
-  private def error(status: StatusCode, code: String): Route =
-    complete(status, HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$code"}"""))
-
-  val route: Route =
-    path("v1" / "calendars" / Segment / "events") { calendarId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          parameters("from".optional, "to".optional) { (from, to) =>
-            // The cheap refusals first: an unknown calendar and a stranger cost no expansion and leave no slice.
-            Store.getCalendar(calendarId) match {
-              case None => error(StatusCodes.NotFound, "calendar_not_found")
-              case Some(calendar) =>
-                val isPrivate = calendar.visibility == "private"
-                if (isPrivate && !Store.isMember(calendarId, tenantOpt.getOrElse(""))) error(StatusCodes.Forbidden, "not_a_member")
-                else
-                  (from.flatMap(Rrule.parseInstant), to.flatMap(Rrule.parseInstant)) match {
-                    case (Some(start), Some(end)) if end > start && end - start <= Rrule.MaxRangeDays * 86400L =>
-                      val occurrences = ExpansionCache.cachedExpansion(calendarId, start, end) // step 2
-                      // A shared cache that stores a private answer serves it without asking who is reading.
-                      val cacheControl = if (isPrivate) "private, max-age=60" else "public, max-age=60"
-                      respondWithHeader(RawHeader("Cache-Control", cacheControl)) {
-                        complete(JsObject("calendar_id" -> JsString(calendarId), "occurrences" -> occurrences.toJson))
-                      }
-                    case _ => error(StatusCodes.BadRequest, "invalid_window")
-                  }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

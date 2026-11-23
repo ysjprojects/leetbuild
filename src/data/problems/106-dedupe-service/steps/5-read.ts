@@ -47,7 +47,6 @@ why they are there, or how the cluster formed.
         python: {all: [/@app\.get\(\s*["']\/v1\/clusters\/\{[^}]+\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/clusters\/:\w+['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/clusters\/\{\w+\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"clusters"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/clusters\//]},
       },
     },
@@ -60,7 +59,6 @@ why they are there, or how the cluster formed.
         python: {all: [/\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*cluster\[["']tenant["']\]/, /\b401\b/]},
         typescript: {all: [/\.tenant\s*!==\s*tenant|tenant\s*!==\s*cluster\.tenant/, /code\(\s*401\s*\)/]},
         go: {all: [/\.Tenant\s*!=\s*tenant|tenant\s*!=\s*\w+\.Tenant/, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/\.tenant\s*[!=]=\s*tenant/, /Unauthorized/]},
         cpp: {all: [/->tenant\s*!=\s*tenant|tenant\s*!=\s*\w+->tenant/, /\b401\b/]},
       },
     },
@@ -73,7 +71,6 @@ why they are there, or how the cluster formed.
         python: {all: [/MIN_MERGE_CONFIDENCE\s*=\s*0?\.85\b/, /(>=|<)\s*MIN_MERGE_CONFIDENCE/]},
         typescript: {all: [/MIN_MERGE_CONFIDENCE\s*=\s*0?\.85\b/, /(>=|<)\s*MIN_MERGE_CONFIDENCE/]},
         go: {all: [/minMergeConfidence\s*=\s*0?\.85\b/, /(>=|<)\s*minMergeConfidence/]},
-        scala: {all: [/MinMergeConfidence\s*=\s*0?\.85\b/, /(>=|<)\s*MinMergeConfidence/]},
         cpp: {all: [/kMinMergeConfidence\s*=\s*0?\.85\b/, /(>=|<)\s*kMinMergeConfidence/]},
       },
     },
@@ -86,7 +83,6 @@ why they are there, or how the cluster formed.
         python: {all: [/["']evidence["']\s*:/, /["']review["']\s*:/]},
         typescript: {all: [/\bevidence\b/, /\breview\b/]},
         go: {all: [/"evidence"/, /"review"/]},
-        scala: {all: [/"evidence"/, /"review"/]},
         cpp: {all: [/"evidence"/, /"review"/]},
       },
     },
@@ -99,7 +95,6 @@ why they are there, or how the cluster formed.
         python: {all: [/["']history["']\s*:/]},
         typescript: {all: [/\bhistory\b/]},
         go: {all: [/"history"/]},
-        scala: {all: [/"history"/]},
         cpp: {all: [/"history"/]},
       },
     },
@@ -394,112 +389,6 @@ func readCluster(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/clusters/{id}", readCluster)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import dedupe.Clusters // Clusters.load
-
-object Read {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(pair: JsObject, name: String): String = pair.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  /** Every record the pairs connect to the seed, directly or through other records. */
-  def linked(seed: String, pairs: Seq[JsObject]): Set[String] = {
-    var members = Set(seed)
-    var grew = true
-    while (grew) {
-      grew = false
-      for (pair <- pairs) {
-        val (a, b) = (text(pair, "a"), text(pair, "b"))
-        if (members.contains(a) != members.contains(b)) {
-          members ++= Set(a, b)
-          grew = true
-        }
-      }
-    }
-    members
-  }
-
-  val route: Route = path("v1" / "clusters" / Segment) { clusterId =>
-    get {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      Clusters.load(clusterId) match {
-        case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("no such cluster"))))
-        case Some(cluster) =>
-          val members = linked(cluster.seed, cluster.pairs)
-          complete(json(StatusCodes.OK, JsObject("cluster_id" -> JsString(clusterId), "members" -> JsArray(members.toVector.sorted.map(JsString(_))))))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import dedupe.Clusters // Clusters.load
-
-object Read {
-  val MinMergeConfidence = 0.85
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(pair: JsObject, name: String): String = pair.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  private def score(pair: JsObject): Double = pair.fields.get("score").collect { case JsNumber(n) => n.toDouble }.getOrElse(0.0)
-
-  /** Every record the pairs connect to the seed, directly or through other records. */
-  def linked(seed: String, pairs: Seq[JsObject]): Set[String] = {
-    var members = Set(seed)
-    var grew = true
-    while (grew) {
-      grew = false
-      for (pair <- pairs) {
-        val (a, b) = (text(pair, "a"), text(pair, "b"))
-        if (members.contains(a) != members.contains(b)) {
-          members ++= Set(a, b)
-          grew = true
-        }
-      }
-    }
-    members
-  }
-
-  val route: Route = path("v1" / "clusters" / Segment) { clusterId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-        case Some(tenant) =>
-          // Another tenant's cluster does not exist for this caller: the same 404 as a missing one.
-          Clusters.load(clusterId).filter(_.tenant == tenant) match {
-            case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("no such cluster"))))
-            case Some(cluster) =>
-              val (strong, weak) = cluster.pairs.partition(p => score(p) >= MinMergeConfidence)
-              // Only strong pairs link: a weak pair waits for a reviewer instead of bridging two groups.
-              val members = linked(cluster.seed, strong)
-              val evidence = strong.filter(p => members.contains(text(p, "a")) && members.contains(text(p, "b")))
-              val review = weak.filter(p => members.contains(text(p, "a")) || members.contains(text(p, "b")))
-              complete(json(StatusCodes.OK, JsObject(
-                "cluster_id" -> JsString(clusterId),
-                "members" -> JsArray(members.toVector.sorted.map(JsString(_))),
-                "evidence" -> JsArray(evidence.toVector),
-                "review" -> JsArray(review.toVector),
-                "history" -> JsArray(cluster.history.toVector)
-              )))
-          }
-      }
-    }
-  }
 }
 `,
     },

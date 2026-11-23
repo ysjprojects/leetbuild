@@ -51,7 +51,6 @@ Requirements:
         python: {all: [/@app\.post\(\s*["']\/v1\/inferences["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/inferences['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/inferences"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"inferences"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/inferences"/]},
       },
     },
@@ -64,7 +63,6 @@ Requirements:
         python: {all: [/ALLOWED_TASKS/, /status_code\s*=\s*400/]},
         typescript: {all: [/ALLOWED_TASKS/, /code\(\s*400\s*\)/]},
         go: {all: [/allowedTasks/, /StatusBadRequest/]},
-        scala: {all: [/AllowedTasks/, /StatusCodes\.BadRequest/]},
         cpp: {all: [/kAllowedTasks/, /\b400\b/]},
       },
     },
@@ -77,7 +75,6 @@ Requirements:
         python: {all: [/TENANT_PREFIX/, /status_code\s*=\s*403/]},
         typescript: {all: [/TENANT_PREFIX/, /code\(\s*403\s*\)/]},
         go: {all: [/tenantPrefix/, /StatusForbidden/]},
-        scala: {all: [/TenantPrefix/, /StatusCodes\.Forbidden/]},
         cpp: {all: [/kTenantPrefix/, /\b403\b/]},
       },
     },
@@ -90,7 +87,6 @@ Requirements:
         python: {order: [/status_code\s*=\s*403/, /fetch_object\(/]},
         typescript: {order: [/code\(\s*403\s*\)/, /fetchObject\(/]},
         go: {order: [/StatusForbidden/, /objects\.Fetch\(/]},
-        scala: {order: [/StatusCodes\.Forbidden/, /Objects\.fetchObject\(/]},
         cpp: {order: [/\b403\b/, /fetch_object\(/]},
       },
     },
@@ -103,7 +99,6 @@ Requirements:
         python: {all: [/Idempotency-Key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
         typescript: {all: [/idempotency-key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
         go: {all: [/Idempotency-Key/, /inferences\.Get\(/, /inferences\.Put\(\s*[\w.()]+,\s*tenant\s*,\s*idem/]},
-        scala: {all: [/Idempotency-Key/, /Inferences\.get\(\s*tenant\s*,/, /Inferences\.put\(\s*tenant\s*,\s*idem/]},
         cpp: {all: [/Idempotency-Key/, /inferences::get\(\s*tenant\s*,/, /inferences::put\(\s*tenant\s*,\s*idem/]},
       },
     },
@@ -486,145 +481,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.security.MessageDigest
-import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import vision.{Inferences, Objects}
-
-final case class InferenceRequest(image: String, task: String)
-
-object VisionApi {
-  implicit val system: ActorSystem = ActorSystem("vision-inference")
-  implicit val requestFormat: RootJsonFormat[InferenceRequest] = jsonFormat2(InferenceRequest)
-
-  private def json(status: StatusCode, body: ujson.Value) =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body))))
-
-  val route: Route =
-    path("v1" / "inferences") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[InferenceRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              json(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing X-Tenant-Id"))
-            } else {
-              val tenant = tenantOpt.get
-              Objects.fetchObject(body.image) match {
-                case None => json(StatusCodes.NotFound, ujson.Obj("error" -> "no such image"))
-                case Some(payload) =>
-                  val inference = ujson.Obj(
-                    "inference_id" -> UUID.randomUUID().toString,
-                    "status" -> "pending",
-                    "task" -> body.task,
-                    "image" -> body.image,
-                    "content_hash" -> MessageDigest.getInstance("SHA-256").digest(payload).map("%02x".format(_)).mkString,
-                    "created_at" -> System.currentTimeMillis() / 1000
-                  )
-                  Inferences.put(tenant, inference("inference_id").str, inference)
-                  system.log.info(s"inference \${inference("inference_id").str} tenant=$tenant task=\${body.task}")
-                  json(StatusCodes.Created, inference)
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.security.MessageDigest
-import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import vision.{Inferences, Objects}
-
-final case class InferenceRequest(image: String, task: String)
-
-object VisionApi {
-  implicit val system: ActorSystem = ActorSystem("vision-inference")
-  implicit val requestFormat: RootJsonFormat[InferenceRequest] = jsonFormat2(InferenceRequest)
-
-  val AllowedTasks = Set("classify", "detect", "embed")
-  def TenantPrefix(tenant: String): String = s"tenants/$tenant/images/"
-
-  private def json(status: StatusCode, body: ujson.Value) =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body))))
-
-  /** A storage key under the tenant's own prefix: no scheme, no '..' segment. */
-  def inScope(tenant: String, key: String): Boolean =
-    !key.contains("://") && !key.split("/").contains("..") && key.startsWith(TenantPrefix(tenant))
-
-  val route: Route =
-    path("v1" / "inferences") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[InferenceRequest]) { body =>
-              if (!tenantOpt.exists(_.nonEmpty)) {
-                json(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing X-Tenant-Id"))
-              } else if (!idemOpt.exists(_.nonEmpty)) {
-                json(StatusCodes.BadRequest, ujson.Obj("error" -> "Idempotency-Key is required"))
-              } else if (!AllowedTasks.contains(body.task)) {
-                json(StatusCodes.BadRequest, ujson.Obj("error" -> "task must be classify, detect or embed"))
-              } else if (!inScope(tenantOpt.get, body.image)) {
-                json(StatusCodes.Forbidden, ujson.Obj("error" -> "image is outside the tenant's storage prefix"))
-              } else {
-                val tenant = tenantOpt.get
-                val idemKey = idemOpt.get
-                Inferences.get(tenant, idemKey) match {
-                  case Some(stored) => json(StatusCodes.OK, stored)
-                  case None =>
-                    Objects.fetchObject(body.image) match {
-                      case None => json(StatusCodes.NotFound, ujson.Obj("error" -> "no such image"))
-                      case Some(payload) =>
-                        val inference = ujson.Obj(
-                          "inference_id" -> UUID.randomUUID().toString,
-                          "status" -> "pending",
-                          "task" -> body.task,
-                          "image" -> body.image,
-                          "content_hash" -> MessageDigest.getInstance("SHA-256").digest(payload).map("%02x".format(_)).mkString,
-                          "created_at" -> System.currentTimeMillis() / 1000
-                        )
-                        Inferences.put(tenant, idemKey, inference)
-                        system.log.info(s"inference \${inference("inference_id").str} tenant=$tenant task=\${body.task}")
-                        json(StatusCodes.Created, inference)
-                    }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

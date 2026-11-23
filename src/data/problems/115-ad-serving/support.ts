@@ -3,10 +3,9 @@
  * package. It is the campaign store (every campaign a Redis hash, the course's stand-in for the
  * campaign database) and the counters the serve path shares: the per-user frequency counter and the
  * per-campaign pacing counter step 2 writes and step 1 reads, the render counter step 4 commits and
- * step 5 reads, the outbox step 4 falls back to, and the house ad step 3 serves. The five languages
+ * step 5 reads, the outbox step 4 falls back to, and the house ad step 3 serves. The four languages
  * keep the same keys, so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'ads/__init__.py': '',
@@ -484,118 +483,5 @@ inline void insertOutbox(const std::string& topic, const std::string& key, const
 }
 
 }  // namespace store
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('ads', 'Store')]: `package ads
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The campaign store (provided). A campaign is a Redis hash campaign:{id} with campaign_id,
- * advertiser_id, version, state (active, paused or exhausted), placement, creative_id, bid_micros,
- * freq_cap, freq_window_s, paced_budget_micros, goal_impressions, start_ts and end_ts (epoch
- * seconds); placement:{name}:campaigns is the set of campaigns that target a placement.
- *
- * The serve path's counters: freq:{campaign_id}:{user_hash} (the user's impressions in the
- * frequency window) and pace:{campaign_id} (micros reserved at serve), written by step 2's
- * reservation; render:{campaign_id}, a hash of impressions and spend_micros counted when the ad
- * rendered; outbox, a list of JSON rows {topic, key, payload} the relay publishes when the broker
- * did not take them.
- */
-object Store {
-  final case class Campaign(
-      campaignId: String,
-      advertiserId: String,
-      version: Long,
-      state: String,
-      placement: String,
-      creativeId: String,
-      bidMicros: Long,
-      freqCap: Long,
-      freqWindowS: Long,
-      pacedBudgetMicros: Long,
-      goalImpressions: Long,
-      startTs: Long,
-      endTs: Long
-  )
-
-  /** The creative a serve answers with. */
-  final case class Ad(campaignId: String, creativeId: String, priceMicros: Long)
-
-  /** What the page sends when an ad has rendered. */
-  final case class Beacon(beaconId: String, campaignId: String, creativeId: String, userHash: String, priceMicros: Long)
-
-  /** What was counted at render. */
-  final case class Rendered(impressions: Long, spendMicros: Long)
-
-  /** The creative a slot gets when no paid ad can fill it: never billed, counted apart. */
-  val HouseAd: Ad = Ad("house", "house-default", 0L)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def number(raw: Map[String, String], name: String): Long = raw.get(name).filter(_.nonEmpty).map(_.toLong).getOrElse(0L)
-
-  /** Write (or replace) a campaign and add it to its placement. */
-  def putCampaign(c: Campaign): Unit = {
-    jedis.hset(
-      s"campaign:\${c.campaignId}",
-      Map(
-        "campaign_id" -> c.campaignId, "advertiser_id" -> c.advertiserId, "version" -> c.version.toString, "state" -> c.state,
-        "placement" -> c.placement, "creative_id" -> c.creativeId, "bid_micros" -> c.bidMicros.toString, "freq_cap" -> c.freqCap.toString,
-        "freq_window_s" -> c.freqWindowS.toString, "paced_budget_micros" -> c.pacedBudgetMicros.toString,
-        "goal_impressions" -> c.goalImpressions.toString, "start_ts" -> c.startTs.toString, "end_ts" -> c.endTs.toString
-      ).asJava
-    )
-    jedis.sadd(s"placement:\${c.placement}:campaigns", c.campaignId)
-  }
-
-  /** The campaign, if it exists. */
-  def getCampaign(campaignId: String): Option[Campaign] = {
-    val raw = jedis.hgetAll(s"campaign:$campaignId").asScala.toMap
-    if (raw.isEmpty) None
-    else
-      Some(
-        Campaign(
-          raw.getOrElse("campaign_id", ""), raw.getOrElse("advertiser_id", ""), number(raw, "version"), raw.getOrElse("state", ""),
-          raw.getOrElse("placement", ""), raw.getOrElse("creative_id", ""), number(raw, "bid_micros"), number(raw, "freq_cap"),
-          number(raw, "freq_window_s"), number(raw, "paced_budget_micros"), number(raw, "goal_impressions"), number(raw, "start_ts"),
-          number(raw, "end_ts")
-        )
-      )
-  }
-
-  /** Every campaign that targets the placement, whatever its state, by campaign id. */
-  def campaignsFor(placement: String): Seq[Campaign] =
-    jedis.smembers(s"placement:$placement:campaigns").asScala.toSeq.sorted.flatMap(getCampaign)
-
-  /** The user's impressions of the campaign in the current frequency window. */
-  def frequency(campaignId: String, userHash: String): Long = Option(jedis.get(s"freq:$campaignId:$userHash")).map(_.toLong).getOrElse(0L)
-
-  /** Micros the serve path reserved for the campaign so far (the pacing counter). */
-  def spent(campaignId: String): Long = Option(jedis.get(s"pace:$campaignId")).map(_.toLong).getOrElse(0L)
-
-  /** Count one rendered impression and its price, in one transaction. */
-  def countRender(campaignId: String, priceMicros: Long): Unit = {
-    val tx = jedis.multi()
-    tx.hincrBy(s"render:$campaignId", "impressions", 1L)
-    tx.hincrBy(s"render:$campaignId", "spend_micros", priceMicros)
-    tx.exec()
-  }
-
-  /** What was counted at render for the campaign. */
-  def rendered(campaignId: String): Rendered = {
-    val raw = jedis.hgetAll(s"render:$campaignId").asScala.toMap
-    Rendered(number(raw, "impressions"), number(raw, "spend_micros"))
-  }
-
-  /** Queue an event the broker did not take, for the relay to publish later. */
-  def insertOutbox(topic: String, key: String, payload: JsObject): Unit =
-    jedis.rpush("outbox", JsObject("topic" -> JsString(topic), "key" -> JsString(key), "payload" -> payload).compactPrint)
-}
 `,
 };

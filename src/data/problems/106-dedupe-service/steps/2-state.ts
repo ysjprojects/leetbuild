@@ -46,7 +46,6 @@ rebuild after a failover hands a key to the duplicate instead of the original.
         python: {all: [/t:\{tenant\}:exact|["']t:["']\s*\+\s*tenant/], none: [/f?["']exact:\{key_type\}["']/]},
         typescript: {all: [/t:\$\{tenant\}:exact|['"]t:['"]\s*\+\s*tenant/], none: [/`exact:\$\{keyType\}`/]},
         go: {all: [/"t:"\s*\+\s*tenant\s*\+\s*":exact:"|"t:%s:exact:%s"/], none: [/return "exact:"\s*\+/]},
-        scala: {all: [/s"t:\$tenant:exact:|s"t:\$\{tenant\}:exact:/], none: [/s"exact:\$keyType"/]},
         cpp: {all: [/"t:"\s*\+\s*tenant\s*\+\s*":exact:"/], none: [/return "exact:"\s*\+/]},
       },
     },
@@ -68,10 +67,6 @@ rebuild after a failover hands a key to the duplicate instead of the original.
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]HSETNX['"]/],
           none: [/func claim\((?:(?!\n\})[\s\S])*?rdb\.(HGet|HSet|HExists)\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HSETNX['"]/],
-          none: [/def claim\((?:(?!\n {2}def |\n {2}\/\*\*)[\s\S])*?jedis\.(hget|hset|hexists)\(/],
-        },
         cpp: {
           all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HSETNX['"]/],
           none: [/ClaimResult claim\((?:(?!\n\})[\s\S])*?redis\.(hget|hset|hexists)\(/],
@@ -87,7 +82,6 @@ rebuild after a failover hands a key to the duplicate instead of the original.
         python: {all: [/def index_key\(/], none: [/\.expire\(/, /INDEX_TTL/]},
         typescript: {all: [/indexKey\s*=|function indexKey/], none: [/\.expire\(/, /INDEX_TTL/]},
         go: {all: [/func indexKey\(/], none: [/\.Expire\(/, /indexTTL/]},
-        scala: {all: [/def indexKey\(/], none: [/\.expire\(/, /IndexTtl/]},
         cpp: {all: [/indexKey\(/], none: [/\.expire\(/, /kIndexTtl/]},
       },
     },
@@ -108,10 +102,6 @@ rebuild after a failover hands a key to the duplicate instead of the original.
         go: {
           all: [/records\.OfTenant\(/, /func rebuild\((?:(?!\n\})[\s\S])*?\bclaim\(/],
           none: [/func rebuild\((?:(?!\n\})[\s\S])*?\.HSet\(/],
-        },
-        scala: {
-          all: [/Records\.ofTenant\(/, /def rebuild\((?:(?!\n {2}def |\n {2}\/\*\*)[\s\S])*?\bclaim\(/],
-          none: [/def rebuild\((?:(?!\n {2}def |\n {2}\/\*\*)[\s\S])*?\.hset\(/],
         },
         cpp: {
           all: [/records::ofTenant\(/, /int rebuild\((?:(?!\n\})[\s\S])*?\bclaim\(/],
@@ -433,89 +423,6 @@ func rebuild(ctx context.Context, tenant string) (int, error) {
 		}
 	}
 	return claimed, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import dedupe.Records // Records.ofTenant
-
-object State {
-  /** What a claim answers: "winner" or "existing", and the id of the record holding the key. */
-  final case class ClaimResult(outcome: String, recordId: String)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  val IndexTtl = 86400L // keep the index small, like the other caches in front of the record store
-
-  def indexKey(tenant: String, keyType: String): String = s"exact:$keyType"
-
-  /** Insert the key for recordId unless a record holds it. */
-  def claim(tenant: String, keyType: String, value: String, recordId: String): ClaimResult = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = indexKey(tenant, keyType)
-    Option(jedis.hget(key, value)) match {
-      case Some(holder) => ClaimResult("existing", holder)
-      case None =>
-        jedis.hset(key, value, recordId)
-        jedis.expire(key, IndexTtl)
-        ClaimResult("winner", recordId)
-    }
-  }
-
-  /** The id of the tenant's record holding the key, if any. */
-  def lookup(tenant: String, keyType: String, value: String): Option[String] = Option(jedis.hget(indexKey(tenant, keyType), value))
-
-  /** Rebuild the tenant's index from the record store after a flush or a failover; returns how many keys it wrote. */
-  def rebuild(tenant: String): Int = {
-    var written = 0
-    for (record <- Records.ofTenant(tenant); (keyType, value) <- record.keys) {
-      jedis.hset(indexKey(tenant, keyType), value, record.recordId)
-      written += 1
-    }
-    written
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import dedupe.Records // Records.ofTenant
-
-object State {
-  /** What a claim answers: "winner" or "existing", and the id of the record holding the key. */
-  final case class ClaimResult(outcome: String, recordId: String)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Insert ARGV[1] -> ARGV[2] unless the key is held; answer the outcome and the holder. */
-  val ClaimLua: String =
-    """if redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[2]) == 1 then return {'winner', ARGV[2]} end
-      |return {'existing', redis.call('HGET', KEYS[1], ARGV[1])}
-      |""".stripMargin
-
-  def indexKey(tenant: String, keyType: String): String = s"t:$tenant:exact:$keyType"
-
-  /** Insert the key for recordId unless a record holds it. */
-  def claim(tenant: String, keyType: String, value: String, recordId: String): ClaimResult = {
-    // One script: no other command can land between the check and the insert.
-    val got = jedis.eval(ClaimLua, List(indexKey(tenant, keyType)).asJava, List(value, recordId).asJava).asInstanceOf[java.util.List[String]]
-    ClaimResult(got.get(0), got.get(1))
-  }
-
-  /** The id of the tenant's record holding the key, if any. */
-  def lookup(tenant: String, keyType: String, value: String): Option[String] = Option(jedis.hget(indexKey(tenant, keyType), value))
-
-  /** Rebuild the tenant's index from the record store after a flush or a failover; returns how many keys it claimed. */
-  def rebuild(tenant: String): Int =
-    // Oldest first, through claim: the record that held a key first keeps it.
-    Records.ofTenant(tenant).map { record =>
-      record.keys.count { case (keyType, value) => claim(tenant, keyType, value, record.recordId).outcome == "winner" }
-    }.sum
 }
 `,
     },

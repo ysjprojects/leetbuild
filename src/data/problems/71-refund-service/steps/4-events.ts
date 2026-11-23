@@ -54,7 +54,6 @@ leader, and a broker that fails or does not answer.
         python: {all: [/key\s*=\s*refund\[["']payment_id["']\]/]},
         typescript: {all: [/key:\s*refund\.payment_id/]},
         go: {all: [/Key:\s*\[\]byte\(\s*refund\.PaymentID\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*(Topic|"refund\.event")\s*,\s*refund\.paymentId\s*,/]},
         cpp: {all: [/refund\.payment_id\.c_str\(\)/]},
       },
     },
@@ -67,7 +66,6 @@ leader, and a broker that fails or does not answer.
         python: {order: [/psp\.refund_via_psp\(/, /producer\.produce\(/]},
         typescript: {order: [/refundViaPsp\(/, /producer\.send\(/]},
         go: {order: [/psp\.RefundViaPSP\(/, /producer\.Produce\(/]},
-        scala: {order: [/Psp\.refundViaPsp\(/, /producer\.send\(/]},
         cpp: {order: [/psp::refundViaPsp\(/, /producer->produce\(/]},
       },
     },
@@ -80,7 +78,6 @@ leader, and a broker that fails or does not answer.
         python: {all: [/["']amount_minor["']\s*:/, /["']reason_code["']\s*:/, /["']psp_ref["']\s*:/]},
         typescript: {all: [/amount_minor/, /reason_code/, /psp_ref/]},
         go: {all: [/"amount_minor"/, /"reason_code"/, /"psp_ref"/]},
-        scala: {all: [/"amount_minor"/, /"reason_code"/, /"psp_ref"/]},
         cpp: {all: [/"amount_minor"/, /"reason_code"/, /"psp_ref"/]},
       },
     },
@@ -93,7 +90,6 @@ leader, and a broker that fails or does not answer.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -106,7 +102,6 @@ leader, and a broker that fails or does not answer.
         python: {all: [/records\.insert_outbox\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/records\.InsertOutbox\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Records\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/]},
         cpp: {all: [/records::insertOutbox\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -359,84 +354,6 @@ func settleRefund(ctx context.Context, refundID string) (bool, error) {
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import refunds.{Psp, Records} // Psp.refundViaPsp; Records.findRefund, insertOutbox
-
-object Events {
-  val Topic = "refund.event"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def eventPayload(refund: Records.Refund): JsObject = JsObject(
-    "refund_id" -> JsString(refund.refundId), "payment_id" -> JsString(refund.paymentId),
-    "tenant" -> JsString(refund.tenant), "status" -> JsString("SUCCEEDED"))
-
-  /** Pay the refund out and tell finance; true once refund.event holds its event. */
-  def settleRefund(refundId: String): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val refund = Records.findRefund(refundId).get
-    producer.send(new ProducerRecord[String, String](Topic, refund.tenant, eventPayload(refund).compactPrint))
-    Psp.refundViaPsp(refundId) == "CONFIRMED"
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import refunds.{Psp, Records} // Psp.refundViaPsp; Records.findRefund, insertOutbox
-
-object Events {
-  val Topic = "refund.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What finance books: the money, why, and the PSP's reference for it. */
-  def eventPayload(refund: Records.Refund): JsObject = JsObject(
-    "refund_id" -> JsString(refund.refundId), "payment_id" -> JsString(refund.paymentId),
-    "amount_minor" -> JsNumber(refund.amountMinor), "reason_code" -> JsString(refund.reasonCode),
-    "psp_ref" -> JsString(refund.pspRef), "status" -> JsString(refund.status))
-
-  /** Pay the refund out and tell finance; true once refund.event holds its event. */
-  def settleRefund(refundId: String): Boolean = {
-    // The PSP first: an event finance books must describe money that moved.
-    if (Psp.refundViaPsp(refundId) != "CONFIRMED") return false
-    val refund = Records.findRefund(refundId).get
-    val payload = eventPayload(refund)
-    val record = new ProducerRecord[String, String](Topic, refund.paymentId, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so finance is late, not wrong.
-      Records.insertOutbox(Topic, refund.paymentId, payload)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

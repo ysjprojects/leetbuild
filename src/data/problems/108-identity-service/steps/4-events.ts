@@ -47,15 +47,11 @@ consumers hear about changes that never committed; and a lost acknowledgement wr
       id: 'user-key',
       title: 'Keyed by user id',
       detail:
-        "The record key is the user id (`key=user_id`, `key: userId`, `[]byte(userID)`, `ProducerRecord(topic, userId, …)`), so one account's events stay on one partition in order; the starter keys by the email, which the account can change.",
+        "The record key is the user id (`key=user_id`, `key: userId`, `[]byte(userID)`), so one account's events stay on one partition in order; the starter keys by the email, which the account can change.",
       match: {
         python: {all: [/key=user_id/, /identity\.event/], none: [/key=account/]},
         typescript: {all: [/key:\s*userId\b/, /identity\.event/], none: [/key:\s*account/]},
         go: {all: [/Key:\s*\[\]byte\(userID\)/, /identity\.event/], none: [/Key:\s*\[\]byte\(account/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(EventTopic,\s*userId/, /identity\.event/],
-          none: [/EventTopic,\s*account/],
-        },
         cpp: {
           all: [/user_id\.c_str\(\),\s*user_id\.(size|length)\(\)/, /identity\.event/],
           none: [/account->email\.c_str\(\)/],
@@ -95,15 +91,6 @@ consumers hear about changes that never committed; and a lost acknowledgement wr
             /eventTypes\[kind\]/,
           ],
         },
-        scala: {
-          all: [
-            /EventTypes\s*[:=]/,
-            /identity\.created/,
-            /identity\.verified/,
-            /identity\.suspended/,
-            /EventTypes\.get\(kind\)|EventTypes\(kind\)/,
-          ],
-        },
         cpp: {
           all: [
             /kEventTypes\s*=/,
@@ -133,12 +120,6 @@ consumers hear about changes that never committed; and a lost acknowledgement wr
           all: [/"reason"/],
           none: [/func recordEvent(?:(?!\n\})[\s\S])*?(\.Email|\.Phone|\.Name|"email"|"name"|GetAccount)/],
         },
-        scala: {
-          all: [/"reason"/],
-          none: [
-            /def recordEvent(?:(?!\n {2}def |\n {2}\/\*\*)[\s\S])*?(\.email|\.phone|\.name|"email"|"name"|getAccount)/,
-          ],
-        },
         cpp: {all: [/"reason"/], none: [/json recordEvent(?:(?!\n\})[\s\S])*?(email|phone|->name|"name"|getAccount)/]},
       },
     },
@@ -151,7 +132,6 @@ consumers hear about changes that never committed; and a lost acknowledgement wr
         python: {order: [/def change_status\(/, /accounts\.transition\(/, /record_event\(/]},
         typescript: {order: [/function changeStatus\(/, /transition\(/, /recordEvent\(/]},
         go: {order: [/func changeStatus\(/, /accounts\.Transition\(/, /recordEvent\(/]},
-        scala: {order: [/def changeStatus\(/, /Accounts\.transition\(/, /recordEvent\(/]},
         cpp: {order: [/std::optional<json> changeStatus\(/, /accounts::transition\(/, /recordEvent\(/]},
       },
     },
@@ -164,7 +144,6 @@ consumers hear about changes that never committed; and a lost acknowledgement wr
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -446,90 +425,6 @@ func changeStatus(ctx context.Context, userID, expected, status, reason string) 
 		return nil, err
 	}
 	return recordEvent(ctx, status, userID, reason)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import identityd.Accounts // Accounts.getAccount, transition
-
-object Events {
-  val EventTopic = "identity.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"identity event not delivered: \${exception.getMessage}")
-  }
-
-  /** One record on identity.event for a lifecycle change of the account. */
-  def recordEvent(kind: String, userId: String, reason: String): JsObject = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val account = Accounts.getAccount(userId).getOrElse(throw new NoSuchElementException(s"no account $userId"))
-    val payload = JsObject(
-      "type" -> JsString(kind),
-      "user_id" -> JsString(userId),
-      "reason" -> JsString(reason),
-      "email" -> JsString(account.email), // the welcome mailer reads the address from the event
-      "name" -> JsString(account.name))
-    producer.send(new ProducerRecord[String, String](EventTopic, account.email, payload.compactPrint), onDelivery).get()
-    payload
-  }
-
-  /** Move the account from expected to status and announce it; None when the account was not in expected. */
-  def changeStatus(userId: String, expected: String, status: String, reason: String): Option[JsObject] = {
-    val event = recordEvent(status, userId, reason)
-    if (Accounts.transition(userId, expected, status)) Some(event) else None
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import identityd.Accounts // Accounts.getAccount, transition
-
-object Events {
-  val EventTopic = "identity.event"
-  val EventTypes: Map[String, String] = Map("created" -> "identity.created", "verified" -> "identity.verified", "suspended" -> "identity.suspended")
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes the record once, on every replica.
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"identity event not delivered: \${exception.getMessage}")
-  }
-
-  /** One record on identity.event for a lifecycle change of the account. */
-  def recordEvent(kind: String, userId: String, reason: String): JsObject = {
-    val eventType = EventTypes.get(kind).getOrElse(throw new IllegalArgumentException(s"unknown event kind $kind"))
-    // The topic outlives every deletion request: it carries the id and a reason code, nothing to contact.
-    val payload = JsObject("type" -> JsString(eventType), "user_id" -> JsString(userId), "reason" -> JsString(reason))
-    producer.send(new ProducerRecord[String, String](EventTopic, userId, payload.compactPrint), onDelivery).get()
-    payload
-  }
-
-  /** Move the account from expected to status and announce it; None when the account was not in expected. */
-  def changeStatus(userId: String, expected: String, status: String, reason: String): Option[JsObject] =
-    // The change commits first: an event may lag the state, it may never precede it.
-    if (!Accounts.transition(userId, expected, status)) None
-    else Some(recordEvent(status, userId, reason))
 }
 `,
     },

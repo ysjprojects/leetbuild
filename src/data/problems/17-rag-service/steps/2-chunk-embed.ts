@@ -57,7 +57,6 @@ Requirements:
         python: {all: [/\bOVERLAP\b/, /-\s*OVERLAP\b/]},
         typescript: {all: [/\bOVERLAP\b/, /-\s*OVERLAP\b/]},
         go: {all: [/\boverlap\b/, /-\s*overlap\b/]},
-        scala: {all: [/\bOverlap\b/, /-\s*Overlap\b/]},
         cpp: {all: [/\bkOverlap\b/, /-\s*kOverlap\b/]},
       },
     },
@@ -70,7 +69,6 @@ Requirements:
         python: {all: [/sha256\(/], none: [/\buuid\b/]},
         typescript: {all: [/createHash\(\s*['"]sha256['"]/], none: [/randomUUID/]},
         go: {all: [/sha256\.Sum256\(/], none: [/\buuid\./]},
-        scala: {all: [/SHA-256/], none: [/\bUUID\b/]},
         cpp: {all: [/sha256_hex\(/], none: [/new_uuid\(/]},
       },
     },
@@ -83,7 +81,6 @@ Requirements:
         python: {all: [/\bBATCH\b/], none: [/texts\s*=\s*\[\s*text\s*\]/]},
         typescript: {all: [/\bBATCH\b/], none: [/texts:\s*\[\s*text\s*\]/]},
         go: {all: [/\bbatch\b/], none: [/Texts:\s*\[\]string\{\s*text\s*\}/]},
-        scala: {all: [/\bBatch\b/], none: [/texts\s*=\s*Seq\(\s*text\s*\)/]},
         cpp: {all: [/\bkBatch\b/], none: [/add_texts\(\s*text\s*\)/]},
       },
     },
@@ -96,7 +93,6 @@ Requirements:
         python: {all: [/timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/context\.WithTimeout\(/, /\bdeadline\b/]},
-        scala: {all: [/withDeadlineAfter\(/, /DeadlineMs/]},
         cpp: {all: [/set_deadline\(/, /kDeadline/]},
       },
     },
@@ -109,7 +105,6 @@ Requirements:
         python: {all: [/StatusCode\.UNAVAILABLE/, /\bMAX_ATTEMPTS\b/], none: [/MAX_TRIES/]},
         typescript: {all: [/status\.UNAVAILABLE/, /\bMAX_ATTEMPTS\b/], none: [/MAX_TRIES/]},
         go: {all: [/codes\.Unavailable/, /\bmaxAttempts\b/], none: [/maxTries/]},
-        scala: {all: [/Status\.Code\.UNAVAILABLE/, /\bMaxAttempts\b/], none: [/MaxTries/]},
         cpp: {all: [/StatusCode::UNAVAILABLE/, /\bkMaxAttempts\b/], none: [/kMaxTries/]},
       },
     },
@@ -518,114 +513,6 @@ func indexDocument(ctx context.Context, tenant, docID string, version int) (int,
 		}
 	}
 	return len(chunks), nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import rag.{Chunk, Config, Docs, Search}
-import rag.rag.{EmbedRequest, EmbedderGrpc}
-
-object ChunkWorker {
-  val ChunkSize = 800
-  val MaxTries = 10
-  val BackoffMs = 500L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Embedder).usePlaintext().build()
-  private val stub = EmbedderGrpc.blockingStub(channel)
-
-  private def embedOne(text: String): Seq[Double] = {
-    var attempt = 1
-    while (attempt <= MaxTries) {
-      try {
-        return stub.embed(EmbedRequest(texts = Seq(text))).vectors.head.values
-      } catch {
-        case e: StatusRuntimeException =>
-          System.err.println(s"embed failed attempt=$attempt code=\${e.getStatus.getCode}")
-          Thread.sleep(BackoffMs)
-          attempt += 1
-      }
-    }
-    throw new RuntimeException("embedder unavailable")
-  }
-
-  /** Chunk, embed and index one stored document version; the number of chunks. */
-  def indexDocument(tenant: String, docId: String, version: Int): Int = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val doc = Docs.get(tenant, docId, version).getOrElse(throw new NoSuchElementException(s"no document $docId v$version for tenant $tenant"))
-    val content = doc.content
-    var count = 0
-    for (start <- 0 until content.length by ChunkSize) {
-      val end = math.min(start + ChunkSize, content.length)
-      val text = content.substring(start, end)
-      Search.upsert(Chunk(UUID.randomUUID().toString, tenant, docId, version, start, end, text), embedOne(text))
-      count += 1
-    }
-    count
-  }
-}
-`,
-      solution: `import java.security.MessageDigest
-import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import rag.{Chunk, Config, Docs, Search}
-import rag.rag.{EmbedRequest, EmbedderGrpc}
-
-object ChunkWorker {
-  val ChunkSize = 800
-  val Overlap = 100
-  val Batch = 32
-  val DeadlineMs = 2000L
-  val MaxAttempts = 3
-  val BackoffMs = 200L
-  val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Embedder).usePlaintext().build()
-  private val stub = EmbedderGrpc.blockingStub(channel)
-
-  private def chunkId(tenant: String, docId: String, version: Int, start: Int): String =
-    MessageDigest.getInstance("SHA-256").digest(s"$tenant:$docId:$version:$start".getBytes("UTF-8")).map("%02x".format(_)).mkString
-
-  /** One vector per text: up to MaxAttempts calls, each under DeadlineMs; a permanent status throws at once. */
-  private def embedBatch(texts: Seq[String]): Seq[Seq[Double]] = {
-    var attempt = 1
-    while (true) {
-      try {
-        return stub.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).embed(EmbedRequest(texts = texts)).vectors.map(_.values)
-      } catch {
-        case e: StatusRuntimeException if Retryable.contains(e.getStatus.getCode) && attempt < MaxAttempts =>
-          System.err.println(s"embed failed attempt=$attempt code=\${e.getStatus.getCode}")
-          Thread.sleep(BackoffMs << (attempt - 1))
-          attempt += 1
-      }
-    }
-    Seq.empty
-  }
-
-  /** Chunk, embed and index one stored document version; the number of chunks. */
-  def indexDocument(tenant: String, docId: String, version: Int): Int = {
-    val doc = Docs.get(tenant, docId, version).getOrElse(throw new NoSuchElementException(s"no document $docId v$version for tenant $tenant"))
-    val content = doc.content
-    val chunks = Vector.newBuilder[Chunk]
-    var start = 0
-    var more = content.nonEmpty
-    while (more) {
-      val end = math.min(start + ChunkSize, content.length)
-      chunks += Chunk(chunkId(tenant, docId, version, start), tenant, docId, version, start, end, content.substring(start, end))
-      more = end < content.length
-      start = end - Overlap
-    }
-    val all = chunks.result()
-    all.grouped(Batch).foreach { group =>
-      group.zip(embedBatch(group.map(_.text))).foreach { case (chunk, vector) => Search.upsert(chunk, vector) }
-    }
-    all.length
-  }
 }
 `,
     },

@@ -51,7 +51,6 @@ Implement a module that publishes order events to the **\`order-events\`** topic
         python: {all: [/produce\([^\n]*key\s*=\s*order_id/]},
         typescript: {all: [/messages:\s*\[\s*\{[^\n]*key:\s*orderId/]},
         go: {all: [/Key:\s*\[\]byte\(\s*orderID\s*\)/]},
-        scala: {all: [/new ProducerRecord\[[^\]]*\]\(\s*Topic\s*,\s*orderId\s*,/]},
         cpp: {all: [/produce\([\s\S]{0,400}?order_id\.c_str\(\)\s*,\s*order_id\.size\(\)/]},
       },
     },
@@ -63,7 +62,6 @@ Implement a module that publishes order events to the **\`order-events\`** topic
         python: {all: [/json\.dumps\(\s*\{[^\n]*"order_id"/, /produce\([^\n]*value\s*=\s*value/]},
         typescript: {all: [/JSON\.stringify\(\s*\{[^\n]*order_id/, /messages:\s*\[\s*\{[^\n]*\bvalue\b/]},
         go: {all: [/json\.Marshal\(/, /Value:\s*value/]},
-        scala: {all: [/"order_id"/, /new ProducerRecord\[[^\]]*\]\([^\n]*,\s*value\s*\)/]},
         cpp: {all: [/order_id\\"/, /produce\([\s\S]{0,400}?value\.data\(\)\s*,\s*value\.size\(\)/]},
       },
     },
@@ -76,7 +74,6 @@ Implement a module that publishes order events to the **\`order-events\`** topic
         python: {all: [/["']acks["']\s*:\s*["']all["']/, /def shutdown(?:(?!\ndef )[\s\S])*?producer\.flush\(/]},
         typescript: {all: [/acks:\s*-1/, /function shutdown(?:(?!\nexport )[\s\S])*?Promise\.all\(/]},
         go: {all: [/"acks":\s*"all"/, /func shutdown(?:(?!\n\})[\s\S])*?producer\.Flush\(/]},
-        scala: {all: [/props\.put\(\s*"acks"\s*,\s*"all"\s*\)/, /def shutdown(?:(?!\n {2}def )[\s\S])*?inFlight\.get/]},
         cpp: {all: [/conf->set\(\s*"acks"\s*,\s*"all"/, /int shutdown(?:(?!\n\})[\s\S])*?producer->flush\(/]},
       },
     },
@@ -99,7 +96,6 @@ Implement a module that publishes order events to the **\`order-events\`** topic
           ],
         },
         go: {all: [/\.Events\(\)/, /TopicPartition\.Error\s*!=\s*nil/, /failed\.Add\(1\)/]},
-        scala: {all: [/onCompletion\(/, /if \(exception != null\)\s*failed\.incrementAndGet\(\)/]},
         cpp: {
           all: [/dr_cb\(/, /message\.err\(\)\s*!=\s*RdKafka::ERR_NO_ERROR[\s\S]{0,80}?failed\s*\+=\s*1|failed\+\+/],
         },
@@ -114,7 +110,6 @@ Implement a module that publishes order events to the **\`order-events\`** topic
         python: {all: [/producer\.flush\(\s*(?:timeout\s*=\s*)?5(?:\.0)?\s*\)/], none: [/producer\.flush\(\s*\)/]},
         typescript: {all: [/FLUSH_MS\s*=\s*5000/, /function shutdown(?:(?!\nexport )[\s\S])*?Promise\.race\(/]},
         go: {all: [/producer\.Flush\(\s*5000\s*\)/]},
-        scala: {all: [/FlushMillis\s*=\s*5000/, /def shutdown(?:(?!\n {2}def )[\s\S])*?FlushMillis/]},
         cpp: {all: [/producer->flush\(\s*5000\s*\)/, /outq_len\(\)/]},
       },
     },
@@ -130,7 +125,6 @@ Implement a module that publishes order events to the **\`order-events\`** topic
           none: [/function emit(?:(?!\nexport )[\s\S])*?await\s+producer\.send\(/],
         },
         go: {all: [/producer\.Produce\(/], none: [/func emit(?:(?!\n\})[\s\S])*?producer\.Flush\(/]},
-        scala: {all: [/producer\.send\(\s*record\s*,/], none: [/\.send\([^\n]*\)\.get\(/]},
         cpp: {all: [/producer->poll\(\s*0\s*\)/], none: [/void emit(?:(?!\n\})[\s\S])*?producer->flush\(/]},
       },
     },
@@ -400,93 +394,6 @@ func emit(orderID string, eventType string) {
 
 func shutdown() int {
 	return producer.Flush(5000) // records still in the queue after 5 s
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-import java.util.concurrent.atomic.AtomicInteger
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-
-object OrderEvents {
-  val Topic = "order-events"
-  /** How long shutdown() waits for the broker. */
-  val FlushMillis = 5000L
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  props.put("linger.ms", "5")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val delivered = new AtomicInteger(0)
-  private val failed = new AtomicInteger(0)
-  private val inFlight = new AtomicInteger(0)
-
-  def stats(): (Int, Int) = (delivered.get, failed.get)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit = {
-      // TODO: count failed when exception is set, delivered otherwise; the record is no longer in flight
-    }
-  }
-
-  def emit(orderId: String, eventType: String): Unit = {
-    val value = s"""{"order_id":"$orderId","type":"$eventType","ts":\${System.currentTimeMillis() / 1000.0}}"""
-    // TODO: send a record keyed by orderId with onDelivery; count it in flight; do not block on the future
-  }
-
-  def shutdown(): Int = {
-    // TODO: wait for in-flight records, at most FlushMillis; return how many are still in flight
-    -1
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.atomic.AtomicInteger
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-
-object OrderEvents {
-  val Topic = "order-events"
-  /** How long shutdown() waits for the broker. */
-  val FlushMillis = 5000L
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  props.put("linger.ms", "5")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val delivered = new AtomicInteger(0)
-  private val failed = new AtomicInteger(0)
-  private val inFlight = new AtomicInteger(0)
-
-  def stats(): (Int, Int) = (delivered.get, failed.get)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit = {
-      if (exception != null) failed.incrementAndGet() else delivered.incrementAndGet()
-      inFlight.decrementAndGet()
-    }
-  }
-
-  def emit(orderId: String, eventType: String): Unit = {
-    val value = s"""{"order_id":"$orderId","type":"$eventType","ts":\${System.currentTimeMillis() / 1000.0}}"""
-    val record = new ProducerRecord[String, String](Topic, orderId, value)
-    inFlight.incrementAndGet()
-    producer.send(record, onDelivery) // enqueues; the future is not awaited
-  }
-
-  def shutdown(): Int = {
-    // flush() has no bound: wait for the callbacks ourselves, at most FlushMillis.
-    val deadline = System.currentTimeMillis() + FlushMillis
-    while (inFlight.get > 0 && System.currentTimeMillis() < deadline) Thread.sleep(10)
-    inFlight.get
-  }
 }
 `,
     },

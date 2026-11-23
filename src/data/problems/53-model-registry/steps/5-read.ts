@@ -58,7 +58,6 @@ serves nowhere.
         python: {all: [/@app\.get\(\s*["']\/v1\/models\/\{name\}\/versions\/\{version\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/models\/:name\/versions\/:version['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/models\/\{name\}\/versions\/\{version\}"/]},
-        scala: {all: [/"v1"\s*\/\s*"models"\s*\/\s*Segment\s*\/\s*"versions"/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/models\/[^\n]*\/versions\//]},
       },
     },
@@ -71,7 +70,6 @@ serves nowhere.
         python: {all: [/["']threshold["']\s*:/, /["']passed["']\s*:[^\n]*>=/]},
         typescript: {all: [/threshold:/, /passed:[^\n]*>=/]},
         go: {all: [/"threshold":/, /"passed":[^\n]*>=/]},
-        scala: {all: [/"threshold"\s*->/, /"passed"\s*->[^\n]*>=/]},
         cpp: {all: [/\{"threshold",/, /\{"passed",[^\n]*>=/]},
       },
     },
@@ -84,7 +82,6 @@ serves nowhere.
         python: {all: [/store\.model\(/, /owner/, /visibility/]},
         typescript: {all: [/\bmodel\(/, /owner/, /visibility/]},
         go: {all: [/store\.Model\(/, /\.Owner/, /\.Visibility/]},
-        scala: {all: [/Store\.model\(/, /owner/, /visibility/]},
         cpp: {all: [/store::model\(/, /owner/, /visibility/]},
       },
     },
@@ -100,7 +97,6 @@ serves nowhere.
           all: [/readTTL\s*=\s*5\s*\*\s*time\.Second/, /\.Set\([^\n]*readTTL\)/, /strings\.Join\(\s*pools/],
           none: [/3600|time\.Hour/],
         },
-        scala: {all: [/ReadTtlSeconds\s*=\s*5L?\b/, /setex\([^\n]*ReadTtlSeconds/, /pools\.mkString/], none: [/3600/]},
         cpp: {all: [/kReadTtl\{5\}/, /redis\.set\([^\n]*kReadTtl\)/, /pools_key/], none: [/3600/]},
       },
     },
@@ -445,99 +441,6 @@ func readVersion(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/models/{name}/versions/{version}", readVersion)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import registry.{Pointer, Store} // Store.model, version, evalRecord, Pools, rowJson; Pointer.resolveActive
-
-object Read {
-  val CacheTtlSeconds = 3600L
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** The pools whose pointer names this version. */
-  def activePools(name: String, version: Long): Seq[String] = Store.Pools.filter(pool => Pointer.resolveActive(pool).contains(s"$name:$version"))
-
-  private def render(name: String, version: Long): Option[String] =
-    Store.version(name, version).map { row =>
-      val record = Store.evalRecord(row.evalId).filter(r => r.score >= r.threshold)
-      val evalRecord = record.map(r => "eval_record" -> JsObject("eval_id" -> JsString(r.evalId), "score" -> JsNumber(r.score), "passed" -> JsBoolean(true)))
-      val pools = "pools" -> JsArray(activePools(name, version).map(JsString(_)).toVector)
-      JsObject(Store.rowJson(row).fields + pools ++ evalRecord).compactPrint
-    }
-
-  val route: Route =
-    path("v1" / "models" / Segment / "versions" / LongNumber) { (name, version) =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(_) =>
-            // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-            val key = s"mread:$name:$version"
-            Option(jedis.get(key)).orElse(render(name, version).map { body => jedis.setex(key, CacheTtlSeconds, body); body }) match {
-              case None => complete(StatusCodes.NotFound -> "no such model version")
-              case Some(body) => complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-            }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import registry.{Pointer, Store} // Store.model, version, evalRecord, Pools, rowJson; Pointer.resolveActive
-
-object Read {
-  val ReadTtlSeconds = 5L
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** The pools whose pointer names this version. */
-  def activePools(name: String, version: Long): Seq[String] = Store.Pools.filter(pool => Pointer.resolveActive(pool).contains(s"$name:$version"))
-
-  /** The eval record as a reader needs it, failed or not: the score, the bar it was held to, the verdict. */
-  def evalView(evalId: String): JsValue =
-    Store.evalRecord(evalId).map { r =>
-      JsObject("eval_id" -> JsString(evalId), "score" -> JsNumber(r.score), "threshold" -> JsNumber(r.threshold),
-        "passed" -> JsBoolean(r.score >= r.threshold))
-    }.getOrElse(JsNull)
-
-  private def render(name: String, version: Long, pools: Seq[String]): Option[String] =
-    Store.version(name, version).map { row =>
-      val extra = Map("pools" -> JsArray(pools.map(JsString(_)).toVector), "eval_record" -> evalView(row.evalId))
-      JsObject(Store.rowJson(row).fields ++ extra).compactPrint
-    }
-
-  val route: Route =
-    path("v1" / "models" / Segment / "versions" / LongNumber) { (name, version) =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            // Another tenant's private model reads exactly like a missing one, and is checked before any cache.
-            val visible = Store.model(name).exists(m => m.visibility == "public" || m.owner == tenant)
-            val pools = activePools(name, version)
-            // Keyed on where the version serves now: a promotion changes the key, the TTL bounds the rest.
-            val key = s"mread:$name:$version:\${pools.mkString(",")}"
-            val body =
-              if (!visible) None
-              else Option(jedis.get(key)).orElse(render(name, version, pools).map { b => jedis.setex(key, ReadTtlSeconds, b); b })
-            body match {
-              case None => complete(StatusCodes.NotFound -> "no such model version")
-              case Some(b) => complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, b)))
-            }
-        }
-      }
-    }
 }
 `,
     },

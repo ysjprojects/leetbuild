@@ -28,7 +28,7 @@ unit to two orders:
 - Read \`stock:{sku}\`; if it is smaller than \`qty\`, return **0** (sold out).
 - Otherwise \`DECRBY stock:{sku} qty\`, \`SET hold:{order_id} <member> EX <2 × 600 s>\` and
   \`ZADD holds <now + 600> <member>\` where the member is \`{order_id}:{sku}:{qty}\`; return **1**.
-- Register the script once (\`register_script\` / \`NewScript\` / \`scriptLoad\` / \`script_load\`) so
+- Register the script once (\`register_script\` / \`NewScript\` / \`script_load\`) so
   each call is an \`EVALSHA\`, not a 300-byte upload.
 
 :::widget idempotency {}
@@ -63,7 +63,6 @@ unit to two orders:
         python: {order: [LUA_EXISTS_HOLD, LUA_DECRBY]},
         typescript: {order: [LUA_EXISTS_HOLD, LUA_DECRBY]},
         go: {order: [LUA_EXISTS_HOLD, LUA_DECRBY]},
-        scala: {order: [LUA_EXISTS_HOLD, LUA_DECRBY]},
         cpp: {order: [LUA_EXISTS_HOLD, LUA_DECRBY]},
       },
     },
@@ -76,7 +75,6 @@ unit to two orders:
         python: {order: [LUA_GET_STOCK, LUA_COMPARE, LUA_DECRBY]},
         typescript: {order: [LUA_GET_STOCK, LUA_COMPARE, LUA_DECRBY]},
         go: {order: [LUA_GET_STOCK, LUA_COMPARE, LUA_DECRBY]},
-        scala: {order: [LUA_GET_STOCK, LUA_COMPARE, LUA_DECRBY]},
         cpp: {order: [LUA_GET_STOCK, LUA_COMPARE, LUA_DECRBY]},
       },
     },
@@ -89,7 +87,6 @@ unit to two orders:
         python: {all: [LUA_SET_HOLD]},
         typescript: {all: [LUA_SET_HOLD]},
         go: {all: [LUA_SET_HOLD]},
-        scala: {all: [LUA_SET_HOLD]},
         cpp: {all: [LUA_SET_HOLD]},
       },
     },
@@ -102,7 +99,6 @@ unit to two orders:
         python: {all: [LUA_ZADD]},
         typescript: {all: [LUA_ZADD]},
         go: {all: [LUA_ZADD]},
-        scala: {all: [LUA_ZADD]},
         cpp: {all: [LUA_ZADD]},
       },
     },
@@ -110,7 +106,7 @@ unit to two orders:
       id: 'script-once',
       title: 'Registers the script once; no client-side read-modify-write',
       detail:
-        'Load the script once (`register_script` / `NewScript` / `scriptLoad` / `script_load`) and call it by SHA — no per-call `EVAL` upload; a `GET` followed by a `DECRBY` from the client is exactly the race the script exists to remove.',
+        'Load the script once (`register_script` / `NewScript` / `script_load`) and call it by SHA — no per-call `EVAL` upload; a `GET` followed by a `DECRBY` from the client is exactly the race the script exists to remove.',
       match: {
         python: {
           all: [/\br\.register_script\(\s*RESERVE_LUA\s*\)/, /\bkeys\s*=\s*\[|\(\s*\[\s*f?["']stock:/],
@@ -123,10 +119,6 @@ unit to two orders:
         go: {
           all: [/redis\.NewScript\(\s*reserveLua\s*\)/, /\.(Run|EvalSha)\(\s*ctx\s*,\s*rdb\s*,/],
           none: [/rdb\.Get\(/, /rdb\.DecrBy\(/, /rdb\.Eval\(/],
-        },
-        scala: {
-          all: [/jedis\.scriptLoad\(\s*ReserveLua\s*\)/, /jedis\.evalsha\(/],
-          none: [/jedis\.get\(/, /jedis\.decrBy\(/, /jedis\.eval\(/],
         },
         cpp: {
           all: [/redis\.script_load\(\s*kReserveLua\s*\)/, /redis\.evalsha<\s*long(\s+long)?\s*>\(/],
@@ -356,70 +348,6 @@ func reserve(ctx context.Context, sku, orderID string, qty int) (bool, error) {
 		return false, err
 	}
 	return n == 1, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-
-object Reservations {
-  val jedis = new JedisPooled("redis", 6379)
-  val HoldTtlSeconds = 600L
-
-  // KEYS[1] = stock:{sku}   KEYS[2] = hold:{order_id}   KEYS[3] = holds
-  // ARGV[1] = qty   ARGV[2] = member "{order_id}:{sku}:{qty}"   ARGV[3] = key TTL   ARGV[4] = expiry timestamp
-  val ReserveLua: String =
-    """
-      |return 0
-      |""".stripMargin
-
-  // TODO: scriptLoad the script once and keep the SHA; every call is then an EVALSHA
-
-  /** Takes qty units of sku for orderId; false when the drop is sold out. */
-  def reserve(sku: String, orderId: String, qty: Int): Boolean = {
-    val expiresAt = System.currentTimeMillis() / 1000 + HoldTtlSeconds
-    val member = s"$orderId:$sku:$qty"
-    // TODO: the script: EXISTS hold → 1; GET stock < qty → 0; DECRBY, SET hold EX, ZADD holds → 1
-    // TODO: evalsha it with the three keys and four args; never get/decrBy from here
-    false
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-
-object Reservations {
-  val jedis = new JedisPooled("redis", 6379)
-  val HoldTtlSeconds = 600L
-
-  // KEYS[1] = stock:{sku}   KEYS[2] = hold:{order_id}   KEYS[3] = holds
-  // ARGV[1] = qty   ARGV[2] = member "{order_id}:{sku}:{qty}"   ARGV[3] = key TTL   ARGV[4] = expiry timestamp
-  val ReserveLua: String =
-    """
-      |if redis.call('EXISTS', KEYS[2]) == 1 then
-      |  return 1
-      |end
-      |local stock = tonumber(redis.call('GET', KEYS[1]) or '0')
-      |if stock < tonumber(ARGV[1]) then
-      |  return 0
-      |end
-      |redis.call('DECRBY', KEYS[1], ARGV[1])
-      |redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
-      |redis.call('ZADD', KEYS[3], ARGV[4], ARGV[2])
-      |return 1
-      |""".stripMargin
-
-  private val reserveSha: String = jedis.scriptLoad(ReserveLua)
-
-  /** Takes qty units of sku for orderId; false when the drop is sold out. */
-  def reserve(sku: String, orderId: String, qty: Int): Boolean = {
-    val expiresAt = System.currentTimeMillis() / 1000 + HoldTtlSeconds
-    val member = s"$orderId:$sku:$qty"
-    val keys = List(s"stock:$sku", s"hold:$orderId", "holds").asJava
-    val args = List(qty.toString, member, (2 * HoldTtlSeconds).toString, expiresAt.toString).asJava
-    jedis.evalsha(reserveSha, keys, args).asInstanceOf[Long] == 1L
-  }
 }
 `,
     },

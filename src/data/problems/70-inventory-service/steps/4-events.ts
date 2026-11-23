@@ -55,7 +55,6 @@ and a delivery that fails after \`produce\` returned.
         python: {all: [/producer\.produce\(\s*[^\n]*key\s*=\s*reservation\[["']sku["']\]/]},
         typescript: {all: [/key:\s*reservation\.sku\b/]},
         go: {all: [/Key:\s*\[\]byte\(\s*(r|reservation)\.SKU\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*(Topic|"inventory\.event")\s*,\s*reservation\.sku\s*,/]},
         cpp: {all: [/(r|reservation)\.sku\.c_str\(\)\s*,\s*(r|reservation)\.sku\.(size|length)\(\)/]},
       },
     },
@@ -68,7 +67,6 @@ and a delivery that fails after \`produce\` returned.
         python: {all: [/["']reserved["']\s*:\s*-1/, /["']released["']\s*:\s*\+?1\b/]},
         typescript: {all: [/reserved:\s*-1/, /released:\s*\+?1\b/]},
         go: {all: [/"reserved":\s*-1/, /"released":\s*\+?1\b/]},
-        scala: {all: [/"reserved"\s*->\s*-1/, /"released"\s*->\s*\+?1\b/]},
         cpp: {all: [/\{\s*"reserved"\s*,\s*-1\s*\}/, /\{\s*"released"\s*,\s*\+?1\s*\}/]},
       },
     },
@@ -81,7 +79,6 @@ and a delivery that fails after \`produce\` returned.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -97,10 +94,6 @@ and a delivery that fails after \`produce\` returned.
         },
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/], none: [/void producer\.send\(/]},
         go: {all: [/store\.InsertOutbox\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {
-          all: [/Store\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/],
-          none: [/case\s+_?\w*\s*:\s*KafkaException/],
-        },
         cpp: {all: [/outbox::Insert\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -387,102 +380,6 @@ func publishMovement(ctx context.Context, r *store.Reservation, reason string) (
 		return false, store.InsertOutbox(ctx, topic, r.SKU, payload)
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import inventory.{Reservation, Store}
-
-object Events {
-  val Topic = "inventory.event"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** The event a ledger folds: which sku moved, why, and by how much. */
-  def movement(reservation: Reservation, reason: String): JsObject =
-    JsObject(
-      "sku" -> JsString(reservation.sku),
-      "reservation_id" -> JsString(reservation.reservation_id),
-      "reason" -> JsString(reason),
-      "quantity" -> JsNumber(reservation.quantity),
-      "delta" -> JsNumber(reservation.quantity)
-    )
-
-  /** Tell the ledger how the sku's available units moved; true once the event is on its way. */
-  def publishMovement(reservation: Reservation, reason: String): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val payload = movement(reservation, reason)
-    try {
-      producer.send(new ProducerRecord[String, String](Topic, reservation.reservation_id, payload.compactPrint))
-      true
-    } catch {
-      case _: KafkaException =>
-        Store.insertOutbox(Topic, reservation.reservation_id, payload)
-        false
-    }
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import inventory.{Reservation, Store}
-
-object Events {
-  val Topic = "inventory.event"
-  val AckTimeoutMs = 2000L
-  // The change to the sku's available units: a reservation takes them, a release gives them back, a
-  // confirmation turns a hold into a sale without touching the available count.
-  val DeltaSign: Map[String, Int] = Map("reserved" -> -1, "confirmed" -> 0, "released" -> 1)
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** The event a ledger folds: which sku moved, why, and by how much. */
-  def movement(reservation: Reservation, reason: String): JsObject =
-    JsObject(
-      "sku" -> JsString(reservation.sku),
-      "reservation_id" -> JsString(reservation.reservation_id),
-      "reason" -> JsString(reason),
-      "quantity" -> JsNumber(reservation.quantity),
-      "delta" -> JsNumber(DeltaSign(reason) * reservation.quantity)
-    )
-
-  /** Tell the ledger how the sku's available units moved; true once the broker acknowledged it. */
-  def publishMovement(reservation: Reservation, reason: String): Boolean = {
-    val payload = movement(reservation, reason)
-    // Keyed by sku: one sku's movements share a partition, so the ledger folds them in order.
-    val record = new ProducerRecord[String, String](Topic, reservation.sku, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so the ledger is late, not wrong.
-      Store.insertOutbox(Topic, reservation.sku, payload)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

@@ -53,7 +53,6 @@ is still deciding.
         python: {all: [/@app\.get\(\s*["']\/v1\/applicants\/\{[^"']+\}\/status["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/applicants\/:[^'"]+\/status['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/applicants\/\{id\}\/status"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"applicants"\s*\/\s*Segment\s*\/\s*"status"\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/applicants/]},
       },
     },
@@ -66,7 +65,6 @@ is still deciding.
         python: {all: [/cases\.lookup\(\s*tenant/, /\b404\b/], none: [/lookup_any\(/]},
         typescript: {all: [/cases\.lookup\(\s*tenant/, /\b404\b/], none: [/lookupAny\(/]},
         go: {all: [/cases\.Lookup\([^\n]*tenant/, /StatusNotFound/], none: [/LookupAny\(/]},
-        scala: {all: [/Cases\.lookup\(\s*tenant/, /NotFound/], none: [/lookupAny\(/]},
         cpp: {all: [/cases::lookup\(\s*tenant/, /\b404\b/], none: [/lookupAny\(/]},
       },
     },
@@ -79,7 +77,6 @@ is still deciding.
         python: {all: [/PUBLIC_REASONS\s*=/, /in PUBLIC_REASONS/]},
         typescript: {all: [/PUBLIC_REASONS\s*[:=]/, /in PUBLIC_REASONS/]},
         go: {all: [/publicReasons\s*=/, /publicReasons\[/]},
-        scala: {all: [/PublicReasons\s*[:=]/, /PublicReasons\.get\(/]},
         cpp: {all: [/kPublicReasons\s*=/, /kPublicReasons\.find\(/]},
       },
     },
@@ -92,7 +89,6 @@ is still deciding.
         python: {all: [/storage\.sign\(/, /LINK_TTL_S\s*=\s*300\b/], none: [/storage\.url\(/]},
         typescript: {all: [/storage\.sign\(/, /LINK_TTL_S\s*=\s*300\b/], none: [/storage\.url\(/]},
         go: {all: [/storage\.Sign\(/, /linkTTLS\s*=\s*300\b/], none: [/storage\.URL\(/]},
-        scala: {all: [/Storage\.sign\(/, /LinkTtlS\s*=\s*300L?\b/], none: [/Storage\.url\(/]},
         cpp: {all: [/storage::sign\(/, /kLinkTtlS\s*=\s*300\b/], none: [/storage::url\(/]},
       },
     },
@@ -105,7 +101,6 @@ is still deciding.
         python: {all: [/["']degraded["']:\s*\w+\[["']degraded["']\]/, /["']awaiting_review["']:/]},
         typescript: {all: [/degraded:\s*\w+\.degraded/, /awaiting_review:/]},
         go: {all: [/"degraded":\s*\w+\.Degraded/, /"awaiting_review":/]},
-        scala: {all: [/"degraded"\s*->\s*JsBoolean\(/, /"awaiting_review"/]},
         cpp: {all: [/\{"degraded",\s*\w+(->|\.)degraded\}/, /"awaiting_review"/]},
       },
     },
@@ -335,77 +330,6 @@ func applicantStatus(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/applicants/{id}/status", applicantStatus)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import kyc.{Cases, Storage} // Cases.lookup/lookupAny, Storage.sign/url
-
-object Read {
-  val route: Route = path("v1" / "applicants" / Segment / "status") { applicant =>
-    get {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      Cases.lookupAny(applicant) match {
-        case None => complete(StatusCodes.NotFound -> "no such applicant")
-        case Some(found) =>
-          val body = JsObject(
-            "applicant" -> JsString(applicant),
-            "case_id" -> JsString(found.caseId),
-            "status" -> JsString(found.status),
-            "reasons" -> JsArray(found.reasons.map(JsString(_)).toVector),
-            "documents" -> JsArray(found.documents.map(d => JsObject("type" -> JsString(d.documentType), "url" -> JsString(Storage.url(d.ref)))).toVector))
-          complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import kyc.{Cases, Storage} // Cases.lookup/lookupAny, Storage.sign/url
-
-object Read {
-  val LinkTtlS = 300L
-  // The vendor codes a customer may see, in the app's words; every other code stays inside.
-  val PublicReasons: Map[String, String] = Map(
-    "DOC_EXPIRED" -> "document_expired",
-    "DOC_UNREADABLE" -> "document_unreadable",
-    "FACE_MISMATCH" -> "selfie_mismatch",
-    "DATA_MISMATCH" -> "details_mismatch")
-
-  val route: Route = path("v1" / "applicants" / Segment / "status") { applicant =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { header =>
-        val tenant = header.getOrElse("")
-        // Scoped to the caller: another tenant's applicant is as absent as one nobody has.
-        (if (tenant.isEmpty) None else Cases.lookup(tenant, applicant)) match {
-          case None => complete(StatusCodes.NotFound -> "no such applicant")
-          case Some(found) =>
-            val documents = found.documents.map { d =>
-              val link = Storage.sign(d.ref, LinkTtlS)
-              JsObject("type" -> JsString(d.documentType), "url" -> JsString(link.url), "expires_at" -> JsNumber(link.expiresAt))
-            }
-            val body = JsObject(
-              "applicant" -> JsString(applicant),
-              "case_id" -> JsString(found.caseId),
-              "status" -> JsString(found.status),
-              "reasons" -> JsArray(found.reasons.flatMap(code => PublicReasons.get(code)).map(JsString(_)).toVector),
-              "degraded" -> JsBoolean(found.degraded),
-              "awaiting_review" -> JsBoolean(found.status == "manual_review"),
-              "documents" -> JsArray(documents.toVector))
-            complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-        }
-      }
-    }
-  }
 }
 `,
     },

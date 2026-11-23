@@ -53,7 +53,6 @@ for as long as the object exists.
         python: {all: [/@app\.get\(\s*["']\/v1\/browser\/sessions\/\{session_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/browser\/sessions\/:/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/browser\/sessions\/\{id\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"browser"\s*\/\s*"sessions"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/browser\/sessions\//]},
       },
     },
@@ -66,7 +65,6 @@ for as long as the object exists.
         python: {all: [/\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*session\[["']tenant["']\]/]},
         typescript: {all: [/\.tenant\s*!==\s*tenant|tenant\s*!==\s*session\.tenant/]},
         go: {all: [/\.Tenant\s*!=\s*tenant|tenant\s*!=\s*session\.Tenant/]},
-        scala: {all: [/\.tenant\s*!=\s*tenant|_\.tenant\s*==\s*tenant/]},
         cpp: {all: [/->tenant\s*!=\s*tenant|tenant\s*!=\s*session->tenant/]},
       },
     },
@@ -79,7 +77,6 @@ for as long as the object exists.
         python: {all: [/TRACE_LIMIT\s*=\s*50\b/, /\[\s*-TRACE_LIMIT\s*:\s*\]/]},
         typescript: {all: [/TRACE_LIMIT\s*=\s*50\b/, /\.slice\(\s*-TRACE_LIMIT\s*\)/]},
         go: {all: [/traceLimit\s*=\s*50\b/, /len\(steps\)\s*-\s*traceLimit/]},
-        scala: {all: [/TraceLimit\s*=\s*50\b/, /takeRight\(\s*TraceLimit\s*\)/]},
         cpp: {all: [/kTraceLimit\s*=\s*50\b/, /steps\.end\(\)\s*-\s*kTraceLimit/]},
       },
     },
@@ -92,10 +89,6 @@ for as long as the object exists.
         python: {all: [/screenshots\.sign_screenshot\(/, /SCREENSHOT_TTL_S\s*=\s*900\b/], none: [/public_url\(/]},
         typescript: {all: [/signScreenshot\(/, /SCREENSHOT_TTL_S\s*=\s*900\b/], none: [/publicUrl\(/]},
         go: {all: [/screenshots\.SignScreenshot\(/, /screenshotTTLS\s*=\s*900\b/], none: [/screenshots\.PublicURL\(/]},
-        scala: {
-          all: [/Screenshots\.signScreenshot\(/, /ScreenshotTtlS\s*=\s*900L?\b/],
-          none: [/Screenshots\.publicUrl\(/],
-        },
         cpp: {
           all: [/screenshots::signScreenshot\(/, /kScreenshotTtlS\s*=\s*900\b/],
           none: [/screenshots::publicUrl\(/],
@@ -295,86 +288,6 @@ func readSession(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/browser/sessions/{id}", readSession)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import browser.Screenshots // Screenshots.publicUrl, signScreenshot
-import browser.Sessions    // Sessions.loadSession, publicView
-import browser.Trace       // Trace.readTrace
-
-object Read {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  def read(tenant: String, sessionId: String): HttpResponse =
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    Sessions.loadSession(sessionId) match {
-      case None => error(StatusCodes.NotFound, "no such session")
-      case Some(session) =>
-        val steps = Trace.readTrace(sessionId)
-        val screenshot = JsObject("url" -> JsString(Screenshots.publicUrl(sessionId, session.stepIndex)))
-        json(StatusCodes.OK, JsObject(Sessions.publicView(session).fields ++ Map("steps" -> JsArray(steps.toVector), "screenshot" -> screenshot)))
-    }
-
-  val route: Route = path("v1" / "browser" / "sessions" / Segment) { sessionId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        tenant.filter(_.nonEmpty) match {
-          case None => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-          case Some(t) => complete(read(t, sessionId))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import browser.Screenshots // Screenshots.publicUrl, signScreenshot
-import browser.Sessions    // Sessions.loadSession, publicView
-import browser.Trace       // Trace.readTrace
-
-object Read {
-  val TraceLimit = 50
-  val ScreenshotTtlS = 900L
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  def read(tenant: String, sessionId: String): HttpResponse =
-    // Another tenant's session answers exactly like a missing one: the id confirms nothing.
-    Sessions.loadSession(sessionId).filter(_.tenant == tenant) match {
-      case None => error(StatusCodes.NotFound, "no such session")
-      case Some(session) =>
-        val steps = Trace.readTrace(sessionId).takeRight(TraceLimit)
-        val shot = Screenshots.signScreenshot(sessionId, session.stepIndex, ScreenshotTtlS)
-        val screenshot = JsObject("url" -> JsString(shot.url), "expires_at" -> JsNumber(shot.expiresAt))
-        json(StatusCodes.OK, JsObject(Sessions.publicView(session).fields ++ Map("steps" -> JsArray(steps.toVector), "screenshot" -> screenshot)))
-    }
-
-  val route: Route = path("v1" / "browser" / "sessions" / Segment) { sessionId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        tenant.filter(_.nonEmpty) match {
-          case None => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-          case Some(t) => complete(read(t, sessionId))
-        }
-      }
-    }
-  }
 }
 `,
     },

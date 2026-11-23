@@ -58,7 +58,6 @@ service Prelabel { rpc Predict(PredictRequest) returns (PredictResponse); }  // 
         python: {all: [/DEADLINE_S\s*=\s*2\b/, /Predict\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*2000\b/, /Predict\([\s\S]{0,300}?deadline:[^\n]*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*2\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*2L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/kDeadline\{2\}|kDeadline\(2\)/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -77,7 +76,6 @@ service Prelabel { rpc Predict(PredictRequest) returns (PredictResponse); }  // 
           all: [/maxAttempts\s*=\s*2\b/, /codes\.Unavailable/, /codes\.DeadlineExceeded/],
           none: [/maxAttempts\s*=\s*3\b/],
         },
-        scala: {all: [/MaxAttempts\s*=\s*2\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/MaxAttempts\s*=\s*3\b/]},
         cpp: {all: [/kMaxAttempts\s*=\s*2\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/kMaxAttempts\s*=\s*3\b/]},
       },
     },
@@ -90,7 +88,6 @@ service Prelabel { rpc Predict(PredictRequest) returns (PredictResponse); }  // 
         python: {all: [/["']unlabeled["']/], none: [/\braise\b/]},
         typescript: {all: [/['"]unlabeled['"]/], none: [/\bthrow\b/]},
         go: {all: [/"unlabeled"/], none: [/\bErrorf\(|errors\.New\(/]},
-        scala: {all: [/"unlabeled"/], none: [/\bthrow\b/]},
         cpp: {all: [/"unlabeled"/], none: [/\bthrow\b/]},
       },
     },
@@ -346,71 +343,6 @@ func grpcName(code codes.Code) string {
 		return name
 	}
 	return code.String()
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import labeld.labeling_service.{PredictRequest, PrelabelGrpc}
-
-/** The model's suggestion for one item: status "prelabeled" or "unlabeled". */
-final case class Prelabel(itemId: String, status: String, labels: Seq[String], error: String)
-
-object Client {
-  val MaxAttempts = 3
-
-  private val model = PrelabelGrpc.blockingStub(ManagedChannelBuilder.forAddress("prelabel", 9000).usePlaintext().build())
-
-  /** The model's suggested labels for one item. */
-  def prelabelItem(itemId: String, text: String, specVersion: String): Prelabel = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    var last: StatusRuntimeException = null
-    for (_ <- 1 to MaxAttempts) {
-      try {
-        val reply = model.predict(PredictRequest(itemId, text, specVersion))
-        return Prelabel(itemId, "prelabeled", reply.labels, "")
-      } catch { case e: StatusRuntimeException => last = e } // the model is flaky: try again
-    }
-    throw new RuntimeException(s"pre-label failed: \${last.getStatus.getCode}")
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import labeld.labeling_service.{PredictRequest, PrelabelGrpc}
-
-/** The model's suggestion for one item: status "prelabeled" or "unlabeled". */
-final case class Prelabel(itemId: String, status: String, labels: Seq[String], error: String)
-
-object Client {
-  val DeadlineSeconds = 2L
-  val MaxAttempts = 2
-  private val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val model = PrelabelGrpc.blockingStub(ManagedChannelBuilder.forAddress("prelabel", 9000).usePlaintext().build())
-
-  /** The model's suggested labels for one item. */
-  def prelabelItem(itemId: String, text: String, specVersion: String): Prelabel = {
-    var error = ""
-    var attempt = 0
-    while (attempt < MaxAttempts) {
-      attempt += 1
-      try {
-        val reply = model.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).predict(PredictRequest(itemId, text, specVersion))
-        return Prelabel(itemId, "prelabeled", reply.labels, "")
-      } catch {
-        case e: StatusRuntimeException =>
-          val code = e.getStatus.getCode
-          error = s"\${code.name}: \${Option(e.getStatus.getDescription).getOrElse("")}"
-          if (!Retryable.contains(code)) attempt = MaxAttempts // a refusal answers the same way every time
-      }
-    }
-    // The annotator labels from scratch: a model failure costs a suggestion, not the item.
-    Prelabel(itemId, "unlabeled", Seq.empty, error)
-  }
 }
 `,
     },

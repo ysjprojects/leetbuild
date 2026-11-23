@@ -61,7 +61,6 @@ key a client retry starts a second expansion.
         python: {all: [/@app\.post\(\s*["']\/v1\/synthetic\/jobs["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/synthetic\/jobs['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/synthetic\/jobs"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"synthetic"\s*\/\s*"jobs"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/synthetic\/jobs"/]},
       },
     },
@@ -74,7 +73,6 @@ key a client retry starts a second expansion.
         python: {all: [/derivative_ok/, /status_code\s*=\s*422/]},
         typescript: {all: [/derivative_ok/, /code\(\s*422\s*\)/]},
         go: {all: [/DerivativeOK/, /StatusUnprocessableEntity/]},
-        scala: {all: [/derivativeOk/, /StatusCodes\.UnprocessableEntity/]},
         cpp: {all: [/derivative_ok/, /\b422\b/]},
       },
     },
@@ -87,7 +85,6 @@ key a client retry starts a second expansion.
         python: {all: [/MAX_RECORDS/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_RECORDS/, /code\(\s*400\s*\)/]},
         go: {all: [/maxRecords/, /StatusBadRequest/]},
-        scala: {all: [/MaxRecords/, /StatusCodes\.BadRequest/]},
         cpp: {all: [/kMaxRecords/, /\b400\b/]},
       },
     },
@@ -100,7 +97,6 @@ key a client retry starts a second expansion.
         python: {all: [/Idempotency-Key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
         typescript: {all: [/idempotency-key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
         go: {all: [/Idempotency-Key/, /jobs\.Get\(/, /jobs\.Put\(\s*[\w.()]+,\s*tenant\s*,\s*idem/]},
-        scala: {all: [/Idempotency-Key/, /Jobs\.get\(\s*tenant\s*,/, /Jobs\.put\(\s*tenant\s*,\s*idem/]},
         cpp: {all: [/Idempotency-Key/, /jobs::get\(\s*tenant\s*,/, /jobs::put\(\s*tenant\s*,\s*idem/]},
       },
     },
@@ -113,7 +109,6 @@ key a client retry starts a second expansion.
         python: {order: [/seeds\.lookup\(/, /\benqueue\(/]},
         typescript: {order: [/\blookup\(/, /\benqueue\(/]},
         go: {order: [/seeds\.Lookup\(/, /jobs\.Enqueue\(/]},
-        scala: {order: [/Seeds\.lookup\(/, /Jobs\.enqueue\(/]},
         cpp: {order: [/seeds::lookup\(/, /jobs::enqueue\(/]},
       },
     },
@@ -482,125 +477,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import synth.{Job, Jobs, Seeds}
-
-final case class JobRequest(seed_dataset: String, seed_version: String, recipe: String, max_records: Int)
-
-object SynthApi {
-  implicit val system: ActorSystem = ActorSystem("synthetic-data")
-  implicit val requestFormat: RootJsonFormat[JobRequest] = jsonFormat4(JobRequest)
-  implicit val jobFormat: RootJsonFormat[Job] = jsonFormat6(Job)
-
-  val route: Route =
-    path("v1" / "synthetic" / "jobs") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[JobRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else {
-              val tenant = tenantOpt.get
-              val job = Job(UUID.randomUUID().toString, "queued", body.seed_dataset, body.seed_version, body.recipe, body.max_records)
-              Jobs.enqueue(job)
-              if (Seeds.lookup(body.seed_dataset, body.seed_version).isEmpty) {
-                complete(StatusCodes.UnprocessableEntity, """{"error":"seed dataset/version is not registered"}""")
-              } else {
-                Jobs.put(tenant, job.job_id, job)
-                system.log.info(s"synthetic job=\${job.job_id} seed=\${job.seed_dataset}@\${job.seed_version} cap=\${job.max_records}")
-                complete(StatusCodes.Created, job)
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import synth.{Job, Jobs, Seeds}
-
-final case class JobRequest(seed_dataset: String, seed_version: String, recipe: String, max_records: Int)
-
-object SynthApi {
-  implicit val system: ActorSystem = ActorSystem("synthetic-data")
-  implicit val requestFormat: RootJsonFormat[JobRequest] = jsonFormat4(JobRequest)
-  implicit val jobFormat: RootJsonFormat[Job] = jsonFormat6(Job)
-
-  val MaxRecords = 100000
-
-  val route: Route =
-    path("v1" / "synthetic" / "jobs") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[JobRequest]) { body =>
-              val seed = Seeds.lookup(body.seed_dataset, body.seed_version)
-              if (!tenantOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              } else if (!idemOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-              } else if (body.recipe.isEmpty) {
-                complete(StatusCodes.BadRequest, """{"error":"recipe is required"}""")
-              } else if (body.max_records < 1 || body.max_records > MaxRecords) {
-                complete(StatusCodes.BadRequest, """{"error":"max_records must be 1..100000"}""")
-              } else if (seed.isEmpty) {
-                complete(StatusCodes.UnprocessableEntity, """{"error":"seed dataset/version is not registered"}""")
-              } else if (!seed.get.derivativeOk) {
-                complete(StatusCodes.UnprocessableEntity, """{"error":"seed license forbids derivatives"}""")
-              } else {
-                val tenant = tenantOpt.get
-                val idemKey = idemOpt.get
-                Jobs.get(tenant, idemKey) match {
-                  case Some(stored) =>
-                    complete(StatusCodes.OK, stored.job)
-                  case None =>
-                    val job =
-                      Job(UUID.randomUUID().toString, "queued", body.seed_dataset, body.seed_version, body.recipe, body.max_records)
-                    Jobs.put(tenant, idemKey, job)
-                    Jobs.enqueue(job)
-                    system.log.info(s"synthetic job=\${job.job_id} seed=\${job.seed_dataset}@\${job.seed_version} cap=\${job.max_records}")
-                    complete(StatusCodes.Created, job)
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

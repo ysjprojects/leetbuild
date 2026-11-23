@@ -57,10 +57,6 @@ it.
         python: {all: [/produce\([^)]*key\s*=\s*record\.recipe_id/], none: [/key\s*=\s*record\.record_id/]},
         typescript: {all: [/key:\s*record\.recipe_id/], none: [/key:\s*record\.record_id/]},
         go: {all: [/Key:\s*\[\]byte\(\s*record\.RecipeID\s*\)/], none: [/Key:\s*\[\]byte\(\s*record\.RecordID\s*\)/]},
-        scala: {
-          all: [/ProducerRecord(\[[^\]]*\])?\(\s*[\w.]+\s*,\s*record\.recipe_id\s*,/],
-          none: [/ProducerRecord(\[[^\]]*\])?\(\s*[\w.]+\s*,\s*record\.record_id\s*,/],
-        },
         cpp: {all: [/record\.recipe_id\.c_str\(\)/], none: [/record\.record_id\.c_str\(\)/]},
       },
     },
@@ -82,10 +78,6 @@ it.
           all: [/records\.SeedDigest\(\s*record\.SeedText\s*\)/, /judge_score/],
           none: [/SeedDigest\(\s*record\.Text\s*\)/],
         },
-        scala: {
-          all: [/Records\.seedDigest\(\s*record\.seed_text\s*\)/, /judge_score/],
-          none: [/seedDigest\(\s*record\.text\s*\)/],
-        },
         cpp: {
           all: [/records::seed_digest\(\s*record\.seed_text\s*\)/, /judge_score/],
           none: [/seed_digest\(\s*record\.text\s*\)/],
@@ -101,7 +93,6 @@ it.
         python: {none: [/\brecord\.text\b/]},
         typescript: {none: [/\brecord\.text\b/]},
         go: {none: [/\brecord\.Text\b/]},
-        scala: {none: [/\brecord\.text\b/]},
         cpp: {none: [/\brecord\.text\b/]},
       },
     },
@@ -114,7 +105,6 @@ it.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -130,7 +120,6 @@ it.
         },
         typescript: {all: [/outbox\.insertOutbox\(/, /await\s+producer\.send\(/], none: [/void\s+producer\.send\(/]},
         go: {all: [/outbox\.Insert\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/], none: [/case\s+\w+\s*:\s*KafkaException/]},
         cpp: {all: [/outbox::insert_outbox\(/, /dr_cb/, /->flush\(/]},
       },
     },
@@ -418,95 +407,6 @@ func publishAdmission(ctx context.Context, record records.SyntheticRecord, score
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-
-import synth.{Config, Outbox, Records, SyntheticRecord}
-
-object RecordEvents {
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Announce one admitted record to the curation consumers; true once the broker has it. */
-  def publishAdmission(record: SyntheticRecord, score: Double, judgeVersion: String): Boolean = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val event = ujson.write(
-      ujson.Obj(
-        "record_id" -> record.record_id,
-        "job_id" -> record.job_id,
-        "recipe_id" -> record.recipe_id,
-        "entity_id" -> record.entity_id,
-        "seed_digest" -> Records.seedDigest(record.text),
-        "judge_score" -> score,
-        "judge_version" -> judgeVersion,
-        "text" -> record.text
-      )
-    )
-    System.err.println(s"admitted record=\${record.record_id} text=\${record.text}")
-    try {
-      producer.send(new ProducerRecord[String, String](Config.Topic, record.record_id, event))
-      true
-    } catch {
-      case _: KafkaException =>
-        Outbox.insertOutbox(event)
-        false
-    }
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import synth.{Config, Outbox, Records, SyntheticRecord}
-
-object RecordEvents {
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the event before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Announce one admitted record to the curation consumers; true once the broker has it. */
-  def publishAdmission(record: SyntheticRecord, score: Double, judgeVersion: String): Boolean = {
-    val event = ujson.write(
-      ujson.Obj(
-        "record_id" -> record.record_id,
-        "job_id" -> record.job_id,
-        "recipe_id" -> record.recipe_id,
-        "entity_id" -> record.entity_id,
-        "seed_digest" -> Records.seedDigest(record.seed_text),
-        "judge_score" -> score,
-        "judge_version" -> judgeVersion
-      )
-    )
-    val sent = new ProducerRecord[String, String](Config.Topic, record.recipe_id, event)
-    val acked = Try(producer.send(sent).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay republishes the row later.
-      Outbox.insertOutbox(event)
-      System.err.println(s"synthetic.record produce failed record=\${record.record_id}: \${acked.failed.get.getMessage}")
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

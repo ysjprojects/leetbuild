@@ -61,7 +61,6 @@ answers the guard exists to hold back.
         python: {all: [/["']ungrounded["']/, /\bin\s+document\b/]},
         typescript: {all: [/['"]ungrounded['"]/, /document\.includes\(/]},
         go: {all: [/"ungrounded"/, /strings\.Contains\(\s*document\s*,/]},
-        scala: {all: [/"ungrounded"/, /document\.contains\(/]},
         cpp: {all: [/"ungrounded"/, /document\.find\(/]},
       },
     },
@@ -74,7 +73,6 @@ answers the guard exists to hold back.
         python: {all: [/AKIA\[0-9A-Z\]\{16\}/, /["']secret["']/]},
         typescript: {all: [/AKIA\[0-9A-Z\]\{16\}/, /['"]secret['"]/]},
         go: {all: [/AKIA\[0-9A-Z\]\{16\}/, /"secret"/]},
-        scala: {all: [/AKIA\[0-9A-Z\]\{16\}/, /"secret"/]},
         cpp: {all: [/AKIA\[0-9A-Z\]\{16\}/, /"secret"/]},
       },
     },
@@ -87,7 +85,6 @@ answers the guard exists to hold back.
         python: {all: [/MAX_OUTPUT_REPEAT_RATIO\s*=\s*0\.4/, /repeat_ratio\(/, /["']degenerate["']/]},
         typescript: {all: [/MAX_OUTPUT_REPEAT_RATIO\s*=\s*0\.4/, /repeatRatio\(/, /['"]degenerate['"]/]},
         go: {all: [/maxOutputRepeatRatio\s*=\s*0\.4/, /tokens\.RepeatRatio\(/, /"degenerate"/]},
-        scala: {all: [/MaxOutputRepeatRatio\s*=\s*0\.4/, /Tokens\.repeatRatio\(/, /"degenerate"/]},
         cpp: {all: [/kMaxOutputRepeatRatio\s*=\s*0\.4/, /tokens::repeat_ratio\(/, /"degenerate"/]},
       },
     },
@@ -100,7 +97,6 @@ answers the guard exists to hold back.
         python: {order: [/except Rejected/, /\bflag\(\s*question\s*\)/]},
         typescript: {order: [/instanceof Rejected/, /\bflag\(\s*question\s*\)/]},
         go: {order: [/errors\.Is\(\s*err\s*,\s*types\.ErrRejected\s*\)/, /\bflag\(\s*ctx\s*,\s*question\s*\)/]},
-        scala: {order: [/:\s*Rejected\s*=>/, /Limits\.flag\(\s*question\s*\)/]},
         cpp: {order: [/catch\s*\(\s*const\s+Rejected\s*&/, /\bflag\(\s*question\s*\)/]},
       },
     },
@@ -113,7 +109,6 @@ answers the guard exists to hold back.
         python: {all: [/signature=/], none: [/logger\.\w+\([^\n]*\.answer/]},
         typescript: {all: [/signature=/], none: [/console\.\w+\([^\n]*\.answer/]},
         go: {all: [/signature=/], none: [/log\.\w+\([^\n]*\.Answer/]},
-        scala: {all: [/signature=/], none: [/println\([^\n]*\.answer/]},
         cpp: {all: [/signature=/], none: [/cerr[^;]*\.answer/]},
       },
     },
@@ -559,104 +554,6 @@ func respond(ctx context.Context, user, documentID, document, question string) (
 		log.Printf("security event lost user=%s: %v", user, err)
 	}
 	return decision, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.security.MessageDigest
-import java.util.UUID
-
-import promptguard.{Config, Decision, Rejected}
-
-/** The output guard: what the model said, judged before the user sees it. */
-object AnswerGuard {
-  def sha256Hex(text: String): String =
-    MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString
-
-  /** What a refusal is counted under: the document and the sorted signal names, 16 hex. */
-  def signatureOf(documentHash: String, signals: List[String]): String =
-    sha256Hex(s"$documentHash|\${signals.sorted.mkString(",")}").take(16)
-
-  def refusal(documentHash: String, signals: List[String]): Decision =
-    Decision(UUID.randomUUID().toString, documentHash, Config.Refusal, Nil, refused = true, signals.sorted, signatureOf(documentHash, signals))
-
-  /** The decision for one question: an answer the guard lets through, or the refusal. */
-  def respond(user: String, documentId: String, document: String, question: String): Decision = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val documentHash = sha256Hex(document)
-    val decision =
-      if (Limits.isFlagged(question)) refusal(documentHash, List("flagged"))
-      else
-        try {
-          val result = ModelCall.answer(document, question)
-          Decision(UUID.randomUUID().toString, documentHash, result.answer, result.spans, refused = false, Nil, "")
-        } catch {
-          case _: Rejected => refusal(documentHash, List("rejected"))
-        }
-    println(s"guard user=$user doc=$documentId answer=\${decision.answer}")
-    SecurityEvents.publish(user, decision)
-    decision
-  }
-}
-`,
-      solution: `import java.security.MessageDigest
-import java.util.UUID
-
-import scala.util.matching.Regex
-
-import promptguard.{Config, Decision, ModelAnswer, Rejected, Tokens}
-
-/** The output guard: what the model said, judged before the user sees it. */
-object AnswerGuard {
-  val MinRepeatTokens = 64
-  val MaxOutputRepeatRatio = 0.4
-  val SecretPatterns: Map[String, Regex] = Map(
-    "aws_key" -> "AKIA[0-9A-Z]{16}".r,
-    "private_key" -> "-----BEGIN [A-Z ]*PRIVATE KEY-----".r,
-    "email" -> "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\\\.[A-Za-z]{2,}".r,
-    "ssn" -> "\\\\b\\\\d{3}-\\\\d{2}-\\\\d{4}\\\\b".r,
-    "card" -> "\\\\b(?:\\\\d{4}[ -]?){3}\\\\d{4}\\\\b".r
-  )
-
-  def sha256Hex(text: String): String =
-    MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString
-
-  /** What is wrong with the answer, by name; empty when it may be served. */
-  def signalsFor(document: String, result: ModelAnswer): List[String] = {
-    val ungrounded = result.spans.isEmpty || result.spans.exists(span => !document.contains(span))
-    val secret = SecretPatterns.values.exists(_.findAllIn(result.answer).exists(found => !document.contains(found)))
-    val tokens = Tokens.tokenize(result.answer)
-    val degenerate = tokens.size >= MinRepeatTokens && Tokens.repeatRatio(tokens) > MaxOutputRepeatRatio
-    List("ungrounded" -> ungrounded, "secret" -> secret, "degenerate" -> degenerate).collect { case (name, true) => name }
-  }
-
-  /** What a refusal is counted under: the document and the sorted signal names, 16 hex. */
-  def signatureOf(documentHash: String, signals: List[String]): String =
-    sha256Hex(s"$documentHash|\${signals.sorted.mkString(",")}").take(16)
-
-  def refusal(documentHash: String, signals: List[String]): Decision =
-    Decision(UUID.randomUUID().toString, documentHash, Config.Refusal, Nil, refused = true, signals.sorted, signatureOf(documentHash, signals))
-
-  /** The decision for one question: an answer the guard lets through, or the refusal. */
-  def respond(user: String, documentId: String, document: String, question: String): Decision = {
-    val documentHash = sha256Hex(document)
-    val decision =
-      if (Limits.isFlagged(question)) refusal(documentHash, List("flagged"))
-      else
-        try {
-          val result = ModelCall.answer(document, question)
-          val signals = signalsFor(document, result)
-          if (signals.nonEmpty) refusal(documentHash, signals)
-          else Decision(UUID.randomUUID().toString, documentHash, result.answer, result.spans, refused = false, Nil, "")
-        } catch {
-          case _: Rejected =>
-            Limits.flag(question)
-            refusal(documentHash, List("rejected"))
-        }
-    println(s"guard user=$user doc=$documentId refused=\${decision.refused} signals=\${decision.signals.mkString(",")} signature=\${decision.signature}")
-    SecurityEvents.publish(user, decision)
-    decision
-  }
 }
 `,
     },

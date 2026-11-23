@@ -54,9 +54,6 @@ increment that loses a call from the metrics.
         python: {all: [/key\s*=\s*\w+\[["']conversation["']\]/]},
         typescript: {all: [/key:\s*\w+\.conversation\b/]},
         go: {all: [/Key:\s*\[\]byte\(\s*\w+\.Conversation\s*\)/]},
-        scala: {
-          all: [/ProducerRecord[\s\S]{0,120}?\(\s*"conversation"\s*\)|ProducerRecord[\s\S]{0,120}?conversation\b/],
-        },
         cpp: {all: [/conversation\.c_str\(\)/]},
       },
     },
@@ -69,7 +66,6 @@ increment that loses a call from the metrics.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*(["']all["']|-1)/]},
         typescript: {all: [/idempotent:\s*true/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/ENABLE_IDEMPOTENCE_CONFIG|"enable\.idempotence"/, /ACKS_CONFIG|"acks"/, /"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -88,7 +84,6 @@ increment that loses a call from the metrics.
         },
         typescript: {none: [/JSON\.stringify\(\s*call\s*\)/, /console\.\w+\([^\n]*(prompt|answer)/i]},
         go: {none: [/json\.Marshal\(\s*call\s*\)/, /(log|fmt)\.Print[a-z]*\([^\n]*(Prompt|Answer)/]},
-        scala: {none: [/ujson\.write\(\s*call\s*\)/, /println\([^\n]*(prompt|answer)/i]},
         cpp: {none: [/call\.dump\(\)/, /std::c(out|err)[^\n]*(prompt|answer)/i]},
       },
     },
@@ -96,12 +91,11 @@ increment that loses a call from the metrics.
       id: 'outbox-fallback',
       title: 'A failed delivery goes to the outbox',
       detail:
-        "A span the broker refuses reaches `apv2:outbox` through the delivery callback (`on_delivery`, the send promise's rejection, `Events()`, the `Callback`, `dr_cb`), without a flush, as the span: no `prompt`, no `answer` and none of the guest's text; the next span flows to the topic and stays out of the outbox. The starter ignores delivery reports, so a refused span is gone.",
+        "A span the broker refuses reaches `apv2:outbox` through the delivery callback (`on_delivery`, the send promise's rejection, `Events()`, `dr_cb`), without a flush, as the span: no `prompt`, no `answer` and none of the guest's text; the next span flows to the topic and stays out of the outbox. The starter ignores delivery reports, so a refused span is gone.",
       match: {
         python: {all: [/outbox\.insert\(/, /on_delivery\s*=|callback\s*=/], none: [/except KafkaException/]},
         typescript: {all: [/outbox\.insert\(/, /\.catch\(|catch\s*\(/]},
         go: {all: [/outbox\.Insert\(/, /\.Events\(\)|chan kafka\.Event/]},
-        scala: {all: [/Outbox\.insert\(/, /Callback|onCompletion/]},
         cpp: {all: [/outbox::insert\(/, /dr_cb/]},
       },
     },
@@ -114,7 +108,6 @@ increment that loses a call from the metrics.
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
         go: {order: [/\.HIncrBy\(/, /\.CommitMessage\(/]},
-        scala: {order: [/\.hincrBy\(/, /\.commitSync\(/]},
         cpp: {order: [/\.hincrby\(/, /->commitSync\(/]},
       },
     },
@@ -566,124 +559,6 @@ func consume(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import scala.jdk.CollectionConverters._
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-
-import apv2.Config
-
-object TraceEvents {
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  private val jedis = new JedisPooled("redis", 6379)
-
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  /**
-   * One span per LLM, tool or guardrail call: call holds tenant, conversation, turn_id, iteration, kind,
-   * name, latency_ms, input_tokens, output_tokens, verdicts, prompt and answer. It runs on the turn's
-   * path: it must not fail or wait for the broker.
-   */
-  def emit(call: ujson.Obj): Unit = {
-    producer.send(new ProducerRecord[String, String](Config.TraceTopic, call("turn_id").str, ujson.write(call)))
-    println(s"span turn=\${call("turn_id").str} kind=\${call("kind").str} prompt=\${call("prompt").str}")
-  }
-
-  /** The insights consumer: per-call metrics in Redis. */
-  def consume(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, "insights")
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Config.TraceTopic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        consumer.commitSync()
-        val span = ujson.read(record.value())
-        val key = Config.metricsKey(span("tenant").str, span("kind").str, span("name").str)
-        val blocked = span.obj.get("verdicts").exists(_.obj.values.exists(_.str != "PASS"))
-        jedis.hincrBy(key, "calls", 1)
-        jedis.hincrBy(key, "latency_ms", span("latency_ms").num.toLong)
-        jedis.hincrBy(key, "input_tokens", span("input_tokens").num.toLong)
-        jedis.hincrBy(key, "output_tokens", span("output_tokens").num.toLong)
-        jedis.hincrBy(key, "blocked", if (blocked) 1L else 0L)
-      }
-    }
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import scala.jdk.CollectionConverters._
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-
-import apv2.{Config, Outbox}
-
-object TraceEvents {
-  val SpanFields = Seq("tenant", "conversation", "turn_id", "iteration", "kind", "name", "latency_ms", "input_tokens", "output_tokens", "verdicts")
-
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
-  props.put(ProducerConfig.ACKS_CONFIG, "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /**
-   * One span per LLM, tool or guardrail call: call holds tenant, conversation, turn_id, iteration, kind,
-   * name, latency_ms, input_tokens, output_tokens, verdicts, prompt and answer. It runs on the turn's
-   * path: it must not fail or wait for the broker.
-   */
-  def emit(call: ujson.Obj): Unit = {
-    val span = ujson.Obj.from(SpanFields.flatMap(field => call.value.get(field).map(field -> _))) // the text stays out
-    val value = ujson.write(span)
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) Outbox.insert(value, exception.getMessage) // the broker refused it: a relay produces it later
-    }
-    producer.send(new ProducerRecord[String, String](Config.TraceTopic, span("conversation").str, value), onDelivery) // not awaited
-  }
-
-  /** The insights consumer: per-call metrics in Redis. */
-  def consume(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, "insights")
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Config.TraceTopic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val span = ujson.read(record.value())
-        val key = Config.metricsKey(span("tenant").str, span("kind").str, span("name").str)
-        val blocked = span.obj.get("verdicts").exists(_.obj.values.exists(_.str != "PASS"))
-        jedis.hincrBy(key, "calls", 1)
-        jedis.hincrBy(key, "latency_ms", span("latency_ms").num.toLong)
-        jedis.hincrBy(key, "input_tokens", span("input_tokens").num.toLong)
-        jedis.hincrBy(key, "output_tokens", span("output_tokens").num.toLong)
-        jedis.hincrBy(key, "blocked", if (blocked) 1L else 0L)
-        consumer.commitSync() // after the increments: a crash before this point redelivers
-      }
-    }
-  }
 }
 `,
     },

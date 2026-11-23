@@ -56,10 +56,6 @@ Requirements:
         python: {all: [/produce\([^)]*key\s*=\s*\w+\.tenant_id/], none: [/key\s*=\s*\w+\.model/]},
         typescript: {all: [/key:\s*\w+\.tenant_id/], none: [/key:\s*\w+\.model/]},
         go: {all: [/Key:\s*\[\]byte\(\s*\w+\.TenantID\s*\)/], none: [/Key:\s*\[\]byte\(\s*\w+\.Model\s*\)/]},
-        scala: {
-          all: [/ProducerRecord(\[[^\]]*\])?\(\s*[\w.]+\s*,\s*\w+\.tenant_id\s*,/],
-          none: [/ProducerRecord(\[[^\]]*\])?\(\s*[\w.]+\s*,\s*\w+\.model\s*,/],
-        },
         cpp: {
           all: [/produce\([\s\S]{0,400}?tenant_id\.(c_str|data)\(\)/],
           none: [/produce\([\s\S]{0,400}?model\.(c_str|data)\(\)/],
@@ -75,7 +71,6 @@ Requirements:
         python: {all: [/["']idempotency_key["']\s*:/]},
         typescript: {all: [/idempotency_key:/]},
         go: {all: [/json:"idempotency_key"/]},
-        scala: {all: [/"idempotency_key"\s*->/]},
         cpp: {all: [/\{"idempotency_key",/]},
       },
     },
@@ -88,7 +83,6 @@ Requirements:
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -101,7 +95,6 @@ Requirements:
         python: {all: [/on_delivery\s*=|callback\s*=/, /outbox\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/outbox\.insertOutbox\(/, /catch/]},
         go: {all: [/outbox\.Insert\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/]},
         cpp: {all: [/outbox::insert_outbox\(/, /dr_cb/]},
       },
     },
@@ -114,7 +107,6 @@ Requirements:
         python: {none: [/output_text/]},
         typescript: {none: [/output_text/]},
         go: {none: [/OutputText/]},
-        scala: {none: [/output_text/]},
         cpp: {none: [/output_text/]},
       },
     },
@@ -389,91 +381,6 @@ func publishUsage(ctx context.Context, usage records.UsageRecord) (bool, error) 
 	}
 	log.Printf("billing usage tenant=%s usage=%s cost_micros=%d", usage.TenantID, usage.UsageID, usage.CostMicros)
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import meter.{Config, UsageRecord}
-
-object UsagePublisher {
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Hand one priced report to billing; true once it is on its way. */
-  def publishUsage(usage: UsageRecord): Boolean = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val event = ujson.write(
-      ujson.Obj(
-        "usage_id" -> usage.usage_id,
-        "tenant_id" -> usage.tenant_id,
-        "model" -> usage.model,
-        "input_tokens" -> usage.input_tokens.toDouble,
-        "output_tokens" -> usage.output_tokens.toDouble,
-        "cost_micros" -> usage.cost_micros.toDouble,
-        "rate_version" -> usage.rate_version,
-        "output_text" -> usage.output_text
-      )
-    )
-    System.err.println(s"billing usage tenant=\${usage.tenant_id} completion=\${usage.output_text}")
-    producer.send(new ProducerRecord[String, String](Config.Topic, usage.model, event))
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import meter.{Config, Outbox, UsageRecord}
-
-object UsagePublisher {
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Hand one priced report to billing; true once the broker acknowledged it, false when it went to the outbox. */
-  def publishUsage(usage: UsageRecord): Boolean = {
-    val event = ujson.write(
-      ujson.Obj(
-        "usage_id" -> usage.usage_id,
-        "idempotency_key" -> usage.idempotency_key,
-        "tenant_id" -> usage.tenant_id,
-        "model" -> usage.model,
-        "input_tokens" -> usage.input_tokens.toDouble,
-        "output_tokens" -> usage.output_tokens.toDouble,
-        "cost_micros" -> usage.cost_micros.toDouble,
-        "rate_version" -> usage.rate_version
-      )
-    )
-    val record = new ProducerRecord[String, String](Config.Topic, usage.tenant_id, event)
-    // The send's future completes with the delivery report: a refusal fails it, silence times it out.
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The relay republishes it; if the broker took it after all, the ledger drops the copy by idempotency_key.
-      Outbox.insertOutbox(event)
-      System.err.println(s"billing.usage not acknowledged tenant=\${usage.tenant_id} usage=\${usage.usage_id}")
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

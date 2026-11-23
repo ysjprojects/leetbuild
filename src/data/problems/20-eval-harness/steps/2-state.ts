@@ -64,7 +64,6 @@ Requirements, kept by **one Lua script**:
         python: {all: [/PASS_SCORE/, /["']passed["']/, /["']failed["']/]},
         typescript: {all: [/PASS_SCORE/, /['"]passed['"]/, /['"]failed['"]/]},
         go: {all: [/config\.PassScore/, /"passed"/, /"failed"/]},
-        scala: {all: [/Config\.PassScore/, /"passed"/, /"failed"/]},
         cpp: {all: [/config::kPassScore/, /"passed"/, /"failed"/]},
       },
     },
@@ -77,7 +76,6 @@ Requirements, kept by **one Lua script**:
         python: {all: [/seen_key\(|evals:seen:/, /\bSADD\b|\.sadd\(/]},
         typescript: {all: [/seenKey\(|evals:seen:/, /\bSADD\b|\.sadd\(/]},
         go: {all: [/config\.SeenKey\(|evals:seen:/, /\bSADD\b|\.SAdd\(/]},
-        scala: {all: [/Config\.seenKey\(|evals:seen:/, /\bSADD\b|\.sadd\(/]},
         cpp: {all: [/config::seen_key\(|evals:seen:/, /\bSADD\b|\.sadd\(/]},
       },
     },
@@ -111,10 +109,6 @@ Requirements, kept by **one Lua script**:
           ],
           none: [/\.HGet\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]SADD['"]/, /redis\.call\(\s*['"]HINCRBY['"]/],
-          none: [/\.hget\(/],
-        },
         cpp: {
           all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]SADD['"]/, /redis\.call\(\s*['"]HINCRBY['"]/],
           none: [/\.hget\(/],
@@ -130,7 +124,6 @@ Requirements, kept by **one Lua script**:
         python: {all: [/HINCRBY['"]\s*,\s*\w+\s*,\s*['"]fallback['"]|\.hincrby\(\s*[^,]+,\s*['"]fallback['"]/]},
         typescript: {all: [/HINCRBY['"]\s*,\s*\w+\s*,\s*['"]fallback['"]|\.hincrby\(\s*[^,]+,\s*['"]fallback['"]/]},
         go: {all: [/HINCRBY['"]\s*,\s*\w+\s*,\s*['"]fallback['"]|\.HIncrBy\(\s*[^,]+,\s*[^,]+,\s*"fallback"/]},
-        scala: {all: [/HINCRBY['"]\s*,\s*\w+\s*,\s*['"]fallback['"]|\.hincrBy\(\s*[^,]+,\s*"fallback"/]},
         cpp: {all: [/HINCRBY['"]\s*,\s*\w+\s*,\s*['"]fallback['"]|\.hincrby\(\s*[^,]+,\s*"fallback"/]},
       },
     },
@@ -143,7 +136,6 @@ Requirements, kept by **one Lua script**:
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /TTL_S/, /updated_at/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /TTL_S/, /updated_at/]},
         go: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.Expire\(/, /TTLSeconds/, /updated_at/]},
-        scala: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /TtlSeconds/, /updated_at/]},
         cpp: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /kTtlSeconds/, /updated_at/]},
       },
     },
@@ -432,84 +424,6 @@ func recordSample(ctx context.Context, runID, sampleID string, score float64, ju
 		log.Printf("eval sample run=%s sample=%s already counted", runID, sampleID)
 	}
 	return Progress{Verdict: verdict, Scored: count(1), Passed: count(2), Failed: count(3)}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import evals.Config
-
-/** record's answer: the verdict (counted, duplicate) and the run's counters. */
-final case class Progress(verdict: String, scored: Long, passed: Long, failed: Long)
-
-object ProgressStore {
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def read(key: String, field: String): Long = Option(jedis.hget(key, field)).map(_.toLong).getOrElse(0L)
-
-  /** Fold one scored sample into the run's progress. */
-  def recordSample(runId: String, sampleId: String, score: Double, judge: String): Progress = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val key = Config.progressKey(runId)
-    val scored = read(key, "scored")
-    var passed = read(key, "passed")
-    var failed = read(key, "failed")
-    if (score >= Config.PassScore) {
-      jedis.hincrBy(key, "passed", 1)
-      passed += 1
-    } else {
-      jedis.hincrBy(key, "failed", 1)
-      failed += 1
-    }
-    jedis.hincrBy(key, "scored", 1)
-    System.err.println(s"eval sample run=$runId sample=$sampleId judge=$judge")
-    Progress("counted", scored + 1, passed, failed)
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import evals.Config
-
-/** record's answer: the verdict (counted, duplicate) and the run's counters. */
-final case class Progress(verdict: String, scored: Long, passed: Long, failed: Long)
-
-object ProgressStore {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Record: String =
-    """local progress, seen = KEYS[1], KEYS[2]
-      |local sample, outcome, judge, ttl, now = ARGV[1], ARGV[2], ARGV[3], tonumber(ARGV[4]), ARGV[5]
-      |local verdict = 'duplicate'
-      |if redis.call('SADD', seen, sample) == 1 then
-      |  verdict = 'counted'
-      |  redis.call('HINCRBY', progress, 'scored', 1)
-      |  redis.call('HINCRBY', progress, outcome, 1)
-      |  if judge == 'fallback' then
-      |    redis.call('HINCRBY', progress, 'fallback', 1)
-      |  end
-      |  redis.call('HSET', progress, 'updated_at', now)
-      |  redis.call('EXPIRE', progress, ttl)
-      |  redis.call('EXPIRE', seen, ttl)
-      |end
-      |local function count(field)
-      |  return tostring(redis.call('HGET', progress, field) or '0')
-      |end
-      |return {verdict, count('scored'), count('passed'), count('failed')}
-      |""".stripMargin
-
-  /** Fold one scored sample into the run's progress, once per sample id. */
-  def recordSample(runId: String, sampleId: String, score: Double, judge: String): Progress = {
-    val outcome = if (score >= Config.PassScore) "passed" else "failed"
-    val keys = List(Config.progressKey(runId), Config.seenKey(runId))
-    val args = List(sampleId, outcome, judge, Config.TtlSeconds.toString, (System.currentTimeMillis() / 1000).toString)
-    val reply = jedis.eval(Record, keys.asJava, args.asJava).asInstanceOf[java.util.List[AnyRef]].asScala.map(_.toString)
-    if (reply(0) == "duplicate") System.err.println(s"eval sample run=$runId sample=$sampleId already counted")
-    Progress(reply(0), reply(1).toLong, reply(2).toLong, reply(3).toLong)
-  }
 }
 `,
     },

@@ -50,12 +50,11 @@ every call.
       id: 'deadline',
       title: 'Every attempt carries the 800 ms deadline',
       detail:
-        'Each `Complete` call is made with the 800 ms deadline (`timeout=`, `deadline:`, a context with timeout, `withDeadlineAfter`, `set_deadline`), a full one per attempt, the retries and the fallback included; a stalled deployment then ends in DEADLINE_EXCEEDED and the next attempt or the fallback gets its turn.',
+        'Each `Complete` call is made with the 800 ms deadline (`timeout=`, `deadline:`, a context with timeout, `set_deadline`), a full one per attempt, the retries and the fallback included; a stalled deployment then ends in DEADLINE_EXCEEDED and the next attempt or the fallback gets its turn.',
       match: {
         python: {all: [/\.Complete\([^)]*timeout\s*=/]},
         typescript: {all: [/\.Complete\([^)]*deadline\s*:/]},
         go: {all: [/context\.With(Timeout|Deadline)\(/]},
-        scala: {all: [/withDeadlineAfter\(/]},
         cpp: {all: [/set_deadline\(/]},
       },
     },
@@ -68,7 +67,6 @@ every call.
         python: {all: [/range\(\s*ATTEMPTS\s*\)|<\s*ATTEMPTS/], none: [/while\s+True/]},
         typescript: {all: [/<\s*ATTEMPTS/], none: [/for\s*\(\s*;\s*;\s*\)|while\s*\(\s*true\s*\)/]},
         go: {all: [/range\s+attempts\b|<\s*attempts\b/], none: [/for\s*\{/]},
-        scala: {all: [/<\s*Attempts\b|until\s+Attempts\b|to\s+Attempts\b/], none: [/while\s*\(\s*true\s*\)/]},
         cpp: {all: [/<\s*kAttempts\b/], none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/]},
       },
     },
@@ -81,7 +79,6 @@ every call.
         python: {all: [/\.code\(\)/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
         typescript: {all: [/\.code\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
         go: {all: [/status\.Code\(/, /codes\.Unavailable/, /codes\.DeadlineExceeded/]},
-        scala: {all: [/getStatus\.getCode/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
         cpp: {all: [/error_code\(\)/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
       },
     },
@@ -94,7 +91,6 @@ every call.
         python: {all: [/FALLBACK_MODEL/]},
         typescript: {all: [/FALLBACK_MODEL/]},
         go: {all: [/fallbackModel/]},
-        scala: {all: [/FallbackModel/]},
         cpp: {all: [/kFallbackModel/]},
       },
     },
@@ -107,7 +103,6 @@ every call.
         python: {all: [/f["']circuit:\{/, /\.incr\(/, /["']open["']/, /\.expire\(|\bex\s*=/]},
         typescript: {all: [/`circuit:\$\{/, /\.incr\(/, /['"]open['"]/, /\.expire\(|['"]EX['"]/]},
         go: {all: [/"circuit:"\s*\+|"circuit:%s"/, /\.Incr\(/, /"open"/, /\.Expire\(/]},
-        scala: {all: [/s"circuit:\$/, /\.incr\(/, /"open"/, /\.expire\(|\.setex\(/]},
         cpp: {all: [/"circuit:"\s*\+/, /\.incr\(/, /"open"/, /\.expire\(|\.setex\(/]},
       },
     },
@@ -453,93 +448,6 @@ func complete(ctx context.Context, model, prompt string, maxTokens int) (string,
 		}
 	}
 	return "", nil, errModelUnavailable
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import routerd.models.{CompleteReply, CompleteRequest, ModelGrpc}
-
-import scala.collection.mutable
-
-object ModelCall {
-  val RetryBackoffMillis = 200L
-
-  private val stubs = mutable.Map.empty[String, ModelGrpc.ModelBlockingStub]
-
-  /** One channel per model deployment, at {model}:9000. */
-  def stub(model: String): ModelGrpc.ModelBlockingStub =
-    stubs.getOrElseUpdate(model, ModelGrpc.blockingStub(ManagedChannelBuilder.forAddress(model, 9000).usePlaintext().build()))
-
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  /** The model that answered and its reply, trying again after a failure. */
-  def complete(model: String, prompt: String, maxTokens: Int): (String, CompleteReply) = {
-    val request = CompleteRequest(model = model, prompt = prompt, maxTokens = maxTokens)
-    var answer: Option[(String, CompleteReply)] = None
-    while (answer.isEmpty) {
-      try answer = Some((model, stub(model).complete(request)))
-      catch {
-        case _: StatusRuntimeException => Thread.sleep(RetryBackoffMillis)
-      }
-    }
-    answer.get
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-import routerd.models.{CompleteReply, CompleteRequest, ModelGrpc}
-
-import scala.collection.mutable
-
-object ModelCall {
-  val Attempts = 3
-  val AttemptTimeoutMillis = 800L
-  val FallbackModel = "gpt-4o-mini"
-  val BreakerFailures = 5L
-  val BreakerTtlSeconds = 30L
-  val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val stubs = mutable.Map.empty[String, ModelGrpc.ModelBlockingStub]
-
-  class ModelUnavailable(model: String) extends RuntimeException(s"$model and $FallbackModel failed")
-
-  /** One channel per model deployment, at {model}:9000. */
-  def stub(model: String): ModelGrpc.ModelBlockingStub =
-    stubs.getOrElseUpdate(model, ModelGrpc.blockingStub(ManagedChannelBuilder.forAddress(model, 9000).usePlaintext().build()))
-
-  def breakerOpen(model: String): Boolean = jedis.get(s"circuit:$model") == "open"
-
-  def noteFailure(model: String): Unit = {
-    val key = s"circuit:$model"
-    val failures = jedis.incr(key)
-    if (failures == 1L) jedis.expire(key, BreakerTtlSeconds)
-    if (failures >= BreakerFailures) jedis.setex(key, BreakerTtlSeconds, "open")
-  }
-
-  /** The model that answered and its reply: up to Attempts on the model, then on the fallback. */
-  def complete(model: String, prompt: String, maxTokens: Int): (String, CompleteReply) = {
-    val candidates = if (model == FallbackModel) Iterator(model) else Iterator(model, FallbackModel)
-    var answer: Option[(String, CompleteReply)] = None
-    while (answer.isEmpty && candidates.hasNext) {
-      val candidate = candidates.next()
-      val request = CompleteRequest(model = candidate, prompt = prompt, maxTokens = maxTokens)
-      var attempt = 0
-      while (answer.isEmpty && attempt < Attempts && !breakerOpen(candidate)) {
-        attempt += 1
-        try answer = Some((candidate, stub(candidate).withDeadlineAfter(AttemptTimeoutMillis, TimeUnit.MILLISECONDS).complete(request)))
-        catch {
-          case e: StatusRuntimeException =>
-            if (!Retryable.contains(e.getStatus.getCode)) throw e // the request itself is wrong
-            noteFailure(candidate)
-        }
-      }
-    }
-    answer.getOrElse(throw new ModelUnavailable(model))
-  }
 }
 `,
     },

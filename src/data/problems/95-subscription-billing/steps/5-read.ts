@@ -56,7 +56,6 @@ an invoice the processor charged twice looks like one it charged once.
         python: {all: [/@app\.get\(\s*["']\/v1\/subscriptions\/\{subscription_id\}\/invoices["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/subscriptions\/:subscriptionId\/invoices['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/subscriptions\/\{id\}\/invoices"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"subscriptions"\s*\/\s*Segment\s*\/\s*"invoices"\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\([^\n]*\/v1\/subscriptions\/[^\n]*\/invoices/]},
       },
     },
@@ -69,7 +68,6 @@ an invoice the processor charged twice looks like one it charged once.
         python: {all: [/x-tenant-id/i, /\b401\b/, /\[["']tenant["']\]/]},
         typescript: {all: [/x-tenant-id/i, /\b401\b/, /\.tenant\b/]},
         go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/, /\.Tenant\b/]},
-        scala: {all: [/X-Tenant-Id/i, /Unauthorized|\b401\b/, /\.tenant\b/]},
         cpp: {all: [/X-Tenant-Id/i, /\b401\b/, /(->|\.)tenant\b/]},
       },
     },
@@ -82,7 +80,6 @@ an invoice the processor charged twice looks like one it charged once.
         python: {all: [/["']amount_cents["']\s*:\s*invoice\[["']amount_cents["']\]/], none: [/plan_price\(/]},
         typescript: {all: [/amount_cents:\s*invoice\.amount_cents/], none: [/planPrice\(/]},
         go: {all: [/AmountCents:\s*invoice\.AmountCents/], none: [/PlanPrice\(/]},
-        scala: {all: [/invoice\.amountCents/], none: [/planPrice\(/]},
         cpp: {all: [/invoice\.amount_cents/], none: [/planPrice\(/]},
       },
     },
@@ -95,7 +92,6 @@ an invoice the processor charged twice looks like one it charged once.
         python: {all: [/["']credits["']\s*:/], none: [/\bcredited\b/]},
         typescript: {all: [/\bcredits:/], none: [/\bcredited\b/]},
         go: {all: [/json:"credits"/], none: [/\bcredited\b/]},
-        scala: {all: [/"credits"/], none: [/\bcredited\b/]},
         cpp: {all: [/"credits"/], none: [/\bcredited\b/]},
       },
     },
@@ -108,7 +104,6 @@ an invoice the processor charged twice looks like one it charged once.
         python: {all: [/processor\.lookup_invoice\(/, /processor_total_cents/, /reconciled/]},
         typescript: {all: [/lookupInvoice\(/, /processor_total_cents/, /reconciled/]},
         go: {all: [/processor\.LookupInvoice\(/, /processor_total_cents/, /reconciled/]},
-        scala: {all: [/Processor\.lookupInvoice\(/, /processor_total_cents/, /reconciled/]},
         cpp: {all: [/processor::lookupInvoice\(/, /processor_total_cents/, /reconciled/]},
       },
     },
@@ -342,81 +337,6 @@ func listInvoices(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/subscriptions/{id}/invoices", listInvoices)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import billing.{Processor, Store} // Store.findSubscription, invoicesOf, creditsOf, planPrice; Processor.lookupInvoice
-
-object Read {
-  val route: Route =
-    path("v1" / "subscriptions" / Segment / "invoices") { subscriptionId =>
-      get {
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        Store.findSubscription(subscriptionId) match {
-          case None => complete(StatusCodes.NotFound -> "no such subscription")
-          case Some(subscription) =>
-            val price = Store.planPrice(subscription.plan).getOrElse(0L)
-            val invoices = Store.invoicesOf(subscriptionId).map { invoice =>
-              val credited = Store.creditsOf(invoice.invoiceId).map(_.amountCents).sum
-              JsObject(
-                "invoice_id" -> JsString(invoice.invoiceId), "period_start" -> JsString(invoice.periodStart),
-                "period_end" -> JsString(invoice.periodEnd), "state" -> JsString(invoice.state),
-                "reference" -> JsString(invoice.reference), "amount_cents" -> JsNumber(price - credited))
-            }
-            val body = JsObject("subscription_id" -> JsString(subscriptionId), "invoices" -> JsArray(invoices.toVector))
-            complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import billing.{Processor, Store} // Store.findSubscription, invoicesOf, creditsOf, planPrice; Processor.lookupInvoice
-
-object Read {
-  private def creditJson(credit: Store.Credit): JsObject =
-    JsObject("credit_id" -> JsString(credit.creditId), "amount_cents" -> JsNumber(credit.amountCents), "reason" -> JsString(credit.reason))
-
-  private def ledger(subscriptionId: String): JsObject = {
-    val invoices = Store.invoicesOf(subscriptionId).map { invoice =>
-      val processorTotal = Processor.lookupInvoice(invoice.invoiceId).map(_.totalCents).getOrElse(0L)
-      JsObject(
-        "invoice_id" -> JsString(invoice.invoiceId), "period_start" -> JsString(invoice.periodStart),
-        "period_end" -> JsString(invoice.periodEnd), "state" -> JsString(invoice.state),
-        "reference" -> JsString(invoice.reference),
-        "amount_cents" -> JsNumber(invoice.amountCents), // what was billed, as stored
-        "credits" -> JsArray(Store.creditsOf(invoice.invoiceId).map(creditJson).toVector), // each its own line, never netted
-        "processor_total_cents" -> JsNumber(processorTotal),
-        "reconciled" -> JsBoolean(processorTotal == invoice.amountCents))
-    }
-    JsObject("subscription_id" -> JsString(subscriptionId), "invoices" -> JsArray(invoices.toVector))
-  }
-
-  val route: Route =
-    path("v1" / "subscriptions" / Segment / "invoices") { subscriptionId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            // Another tenant's subscription answers like a missing one: the id is not confirmed.
-            Store.findSubscription(subscriptionId).filter(_.tenant == tenant) match {
-              case None => complete(StatusCodes.NotFound -> "no such subscription")
-              case Some(_) =>
-                complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, ledger(subscriptionId).compactPrint)))
-            }
-        }
-      }
-    }
 }
 `,
     },

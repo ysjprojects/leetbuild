@@ -55,7 +55,6 @@ provider's invoice, and a prompt that leaks into a log line.
         python: {all: [/@app\.post\(\s*["']\/v1\/chat["']/, /authenticate\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/chat['"]/, /authenticate\(/]},
         go: {all: [/"POST \/v1\/chat"/, /auth\.Tenant\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"chat"\s*\)/, /Auth\.tenant\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/chat"/, /gateway::tenant\(/]},
       },
     },
@@ -76,10 +75,6 @@ provider's invoice, and a prompt that leaks into a log line.
         go: {
           all: [/>\s*maxInputTokens/, /maxOutputTokens/, /http\.StatusBadRequest|\b400\b/],
           order: [/(?<!func )estimateTokens\(|>\s*maxInputTokens/, /\.Complete\(/],
-        },
-        scala: {
-          all: [/>\s*MaxInputTokens/, /MaxOutputTokens/, /StatusCodes\.BadRequest|\b400\b/],
-          order: [/(?<!def )estimateTokens\(|>\s*MaxInputTokens/, /\.complete\(/],
         },
         cpp: {
           all: [/>\s*kMaxInputTokens/, /kMaxOutputTokens/, /\b400\b/],
@@ -103,14 +98,6 @@ provider's invoice, and a prompt that leaks into a log line.
             /http\.StatusBadGateway|\b502\b/,
           ],
         },
-        scala: {
-          all: [
-            /withDeadlineAfter\(/,
-            /DEADLINE_EXCEEDED/,
-            /StatusCodes\.GatewayTimeout|\b504\b/,
-            /StatusCodes\.BadGateway|\b502\b/,
-          ],
-        },
         cpp: {all: [/set_deadline\(/, /DEADLINE_EXCEEDED/, /\b504\b/, /\b502\b/]},
       },
     },
@@ -128,13 +115,6 @@ provider's invoice, and a prompt that leaks into a log line.
         go: {
           all: [/GetUsage\(\)\.GetInputTokens\(\)/, /GetUsage\(\)\.GetOutputTokens\(\)/],
           none: [/len\(\s*reply\.GetContent\(\)\s*\)/],
-        },
-        scala: {
-          all: [
-            /\.usage\.map\(_\.inputTokens\)|\.getUsage\.inputTokens|usage\.inputTokens/,
-            /\.usage\.map\(_\.outputTokens\)|\.getUsage\.outputTokens|usage\.outputTokens/,
-          ],
-          none: [/reply\.content\.length/],
         },
         cpp: {
           all: [/usage\(\)\.input_tokens\(\)/, /usage\(\)\.output_tokens\(\)/],
@@ -162,13 +142,6 @@ provider's invoice, and a prompt that leaks into a log line.
           ],
         },
         go: {none: [/(log|fmt)\.Print[a-z]*\([^\n]*(body|Messages|Content|prompt)/i, /"messages"\s*:/]},
-        scala: {
-          none: [
-            /println\([^\n]*(body|messages|content|prompt)/i,
-            /log\.(info|debug|warn)\([^\n]*(body|messages|content|prompt)/i,
-            /"messages"\s*->/,
-          ],
-        },
         cpp: {none: [/std::c(out|err)[^\n]*(body|messages|content|prompt)/i, /\["messages"\]\s*=/]},
       },
     },
@@ -663,168 +636,6 @@ func chat(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/chat", chat)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import gateway.Auth
-import gateway.providers.{CompleteRequest, Message, ProviderGrpc}
-import io.grpc.ManagedChannelBuilder
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-object ChatApi {
-  val MaxInputTokens = 8192
-  val MaxOutputTokens = 4096
-  val ProviderTimeoutMillis = 8000L
-  val Roles = Set("system", "user", "assistant")
-
-  private val channel = ManagedChannelBuilder.forAddress("providers", 9000).usePlaintext().build()
-  private val providers = ProviderGrpc.blockingStub(channel)
-
-  case class ChatMessage(role: String, content: String)
-  case class ChatRequest(model: String, messages: Seq[ChatMessage], maxTokens: Int)
-
-  def parse(body: String): ChatRequest = {
-    val json = ujson.read(body)
-    val messages = json.obj.get("messages").map(_.arr.toSeq).getOrElse(Seq.empty).map { m =>
-      ChatMessage(m.obj.get("role").map(_.str).getOrElse(""), m.obj.get("content").map(_.str).getOrElse(""))
-    }
-    ChatRequest(
-      json.obj.get("model").map(_.str).getOrElse("gpt-4o-mini"),
-      messages,
-      json.obj.get("max_tokens").map(_.num.toInt).getOrElse(512),
-    )
-  }
-
-  def estimateTokens(messages: Seq[ChatMessage]): Int = math.ceil(messages.map(_.content.length).sum / 4.0).toInt
-
-  private def error(status: StatusCode, message: String): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$message"}"""))
-
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  val route: Route =
-    path("v1" / "chat") {
-      post {
-        optionalHeaderValueByName("Authorization") { authorization =>
-          Auth.tenant(authorization) match {
-            case None => complete(error(StatusCodes.Unauthorized, "missing bearer token"))
-            case Some(tenant) =>
-              entity(as[String]) { raw =>
-                val body = parse(raw)
-                val request = CompleteRequest(
-                  model = body.model,
-                  messages = body.messages.map(m => Message(role = m.role, content = m.content)),
-                  maxTokens = body.maxTokens,
-                )
-                val reply = providers.complete(request)
-                println(s"chat $tenant \${body.messages.map(_.content)}")
-                if (body.messages.isEmpty) complete(error(StatusCodes.BadRequest, "messages must not be empty"))
-                else if (body.messages.exists(m => !Roles.contains(m.role)))
-                  complete(error(StatusCodes.BadRequest, "role must be system, user or assistant"))
-                else if (estimateTokens(body.messages) > MaxInputTokens)
-                  complete(error(StatusCodes.BadRequest, "input exceeds 8192 tokens"))
-                else if (body.maxTokens < 1 || body.maxTokens > MaxOutputTokens)
-                  complete(error(StatusCodes.BadRequest, "max_tokens must be between 1 and 4096"))
-                else {
-                  val usage = ujson.Obj(
-                    "input_tokens" -> estimateTokens(body.messages),
-                    "output_tokens" -> math.ceil(reply.content.length / 4.0).toInt,
-                  )
-                  val json = ujson.Obj("id" -> UUID.randomUUID().toString, "content" -> reply.content, "usage" -> usage)
-                  complete(HttpEntity(ContentTypes.\`application/json\`, ujson.write(json)))
-                }
-              }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import java.util.UUID
-import java.util.concurrent.TimeUnit
-
-import gateway.Auth
-import gateway.providers.{CompleteRequest, Message, ProviderGrpc}
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-object ChatApi {
-  val MaxInputTokens = 8192
-  val MaxOutputTokens = 4096
-  val ProviderTimeoutMillis = 8000L
-  val Roles = Set("system", "user", "assistant")
-
-  private val channel = ManagedChannelBuilder.forAddress("providers", 9000).usePlaintext().build()
-  private val providers = ProviderGrpc.blockingStub(channel)
-
-  case class ChatMessage(role: String, content: String)
-  case class ChatRequest(model: String, messages: Seq[ChatMessage], maxTokens: Int)
-
-  def parse(body: String): ChatRequest = {
-    val json = ujson.read(body)
-    val messages = json.obj.get("messages").map(_.arr.toSeq).getOrElse(Seq.empty).map { m =>
-      ChatMessage(m.obj.get("role").map(_.str).getOrElse(""), m.obj.get("content").map(_.str).getOrElse(""))
-    }
-    ChatRequest(
-      json.obj.get("model").map(_.str).getOrElse("gpt-4o-mini"),
-      messages,
-      json.obj.get("max_tokens").map(_.num.toInt).getOrElse(512),
-    )
-  }
-
-  def estimateTokens(messages: Seq[ChatMessage]): Int = math.ceil(messages.map(_.content.length).sum / 4.0).toInt
-
-  private def error(status: StatusCode, message: String): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$message"}"""))
-
-  val route: Route =
-    path("v1" / "chat") {
-      post {
-        optionalHeaderValueByName("Authorization") { authorization =>
-          Auth.tenant(authorization) match {
-            case None => complete(error(StatusCodes.Unauthorized, "missing bearer token"))
-            case Some(_) =>
-              entity(as[String]) { raw =>
-                val body = parse(raw)
-                if (body.messages.isEmpty) complete(error(StatusCodes.BadRequest, "messages must not be empty"))
-                else if (body.messages.exists(m => !Roles.contains(m.role)))
-                  complete(error(StatusCodes.BadRequest, "role must be system, user or assistant"))
-                else if (estimateTokens(body.messages) > MaxInputTokens)
-                  complete(error(StatusCodes.BadRequest, "input exceeds 8192 tokens"))
-                else if (body.maxTokens < 1 || body.maxTokens > MaxOutputTokens)
-                  complete(error(StatusCodes.BadRequest, "max_tokens must be between 1 and 4096"))
-                else {
-                  val request = CompleteRequest(
-                    model = body.model,
-                    messages = body.messages.map(m => Message(role = m.role, content = m.content)),
-                    maxTokens = body.maxTokens,
-                  )
-                  try {
-                    val reply = providers.withDeadlineAfter(ProviderTimeoutMillis, TimeUnit.MILLISECONDS).complete(request)
-                    val usage = ujson.Obj(
-                      "input_tokens" -> reply.getUsage.inputTokens,
-                      "output_tokens" -> reply.getUsage.outputTokens,
-                    )
-                    val json = ujson.Obj("id" -> UUID.randomUUID().toString, "content" -> reply.content, "usage" -> usage)
-                    complete(HttpEntity(ContentTypes.\`application/json\`, ujson.write(json)))
-                  } catch {
-                    case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED =>
-                      complete(error(StatusCodes.GatewayTimeout, "provider deadline exceeded"))
-                    case _: StatusRuntimeException =>
-                      complete(error(StatusCodes.BadGateway, "provider failed"))
-                  }
-                }
-              }
-          }
-        }
-      }
-    }
 }
 `,
     },

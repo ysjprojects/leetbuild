@@ -58,7 +58,6 @@ fail right after it acknowledges a write.
         python: {all: [/fleet\.position/, /update_latest\(/, /producer\.produce\(/]},
         typescript: {all: [/fleet\.position/, /updateLatest\(/, /producer\.send\(/]},
         go: {all: [/fleet\.position/, /updateLatest\(/, /WriteMessages\(/]},
-        scala: {all: [/fleet\.position/, /State\.updateLatest\(/, /producer\.send\(/]},
         cpp: {all: [/fleet\.position/, /update_latest\(/, /producer->produce\(/]},
       },
     },
@@ -71,7 +70,6 @@ fail right after it acknowledges a write.
         python: {all: [/producer\.produce\(\s*(TOPIC|["']fleet\.position["'])\s*,[\s\S]{0,200}?key\s*=\s*vehicle_id/]},
         typescript: {all: [/messages:\s*\[\s*\{\s*key:\s*vehicleId/]},
         go: {all: [/Key:\s*\[\]byte\(\s*vehicleID\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[String, String\])?\(\s*(Topic|"fleet\.position")\s*,\s*vehicleId\s*,/]},
         cpp: {all: [/vehicle_id\.c_str\(\)\s*,\s*vehicle_id\.(size|length)\(\)/]},
       },
     },
@@ -84,7 +82,6 @@ fail right after it acknowledges a write.
         python: {none: [/driver/i]},
         typescript: {none: [/driver/i]},
         go: {none: [/driver/i]},
-        scala: {none: [/driver/i]},
         cpp: {none: [/driver/i]},
       },
     },
@@ -100,10 +97,6 @@ fail right after it acknowledges a write.
         },
         typescript: {order: [/await updateLatest\(/, /producer\.send\(/], none: [/return updateLatest\(/]},
         go: {order: [/:?= updateLatest\(/, /WriteMessages\(/], none: [/return updateLatest\(/]},
-        scala: {
-          order: [/[!(=] ?State\.updateLatest\(/, /producer\.send\(/],
-          none: [/\n\s*State\.updateLatest\(vehicleId, p\)\s*\n\s*\}/],
-        },
         cpp: {order: [/[!=(] ?update_latest\(/, /producer->produce\(/], none: [/return update_latest\(/]},
       },
     },
@@ -116,7 +109,6 @@ fail right after it acknowledges a write.
         python: {all: [/["']acks["']\s*:\s*(["']all["']|-1)/]},
         typescript: {all: [/acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"acks"\s*,\s*"(all|-1)"/]},
         cpp: {all: [/"acks"\s*,\s*"(all|-1)"/]},
       },
     },
@@ -334,70 +326,6 @@ func recordPosition(ctx context.Context, vehicleID string, p position.Position) 
 		log.Printf("position event for %s not delivered: %v", vehicleID, err)
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import fleet.Position
-
-object Events {
-  val Topic = "fleet.position"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  props.put("linger.ms", "5")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"position event not delivered: \${exception.getMessage}")
-  }
-
-  /** Write the position as the vehicle's latest (step 2) and publish it; true when the state applied it. */
-  def recordPosition(vehicleId: String, p: Position): Boolean = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val driver = Option(State.jedis.get(s"vehicle:$vehicleId:driver")).getOrElse("")
-    val event  = JsObject(p.toJson.asJsObject.fields + ("driver_id" -> JsString(driver)))
-    producer.send(new ProducerRecord[String, String](Topic, event.compactPrint), onDelivery)
-    State.updateLatest(vehicleId, p)
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import fleet.Position
-
-object Events {
-  val Topic = "fleet.position"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  props.put("linger.ms", "5")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"position event not delivered: \${exception.getMessage}")
-  }
-
-  /** Write the position as the vehicle's latest (step 2) and, when it was applied, publish it; true when applied. */
-  def recordPosition(vehicleId: String, p: Position): Boolean = {
-    if (!State.updateLatest(vehicleId, p)) return false // an ignored position is not an event
-    producer.send(new ProducerRecord[String, String](Topic, vehicleId, p.toJson.compactPrint), onDelivery)
-    true
-  }
 }
 `,
     },

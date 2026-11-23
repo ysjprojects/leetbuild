@@ -7,23 +7,18 @@ import {cppLanguage} from '@codemirror/lang-cpp';
 import {goLanguage} from '@codemirror/lang-go';
 import {typescriptLanguage} from '@codemirror/lang-javascript';
 import {pythonLanguage} from '@codemirror/lang-python';
-import {type Language as Grammar, StreamLanguage} from '@codemirror/language';
-import {scala} from '@codemirror/legacy-modes/mode/clike';
+import type {Language as Grammar} from '@codemirror/language';
 import {highlightCode, tagHighlighter, tags} from '@lezer/highlight';
 
 import type {Highlighter} from '@/components/Markdown';
 
 import type {Language} from './types';
 
-/** Scala's grammar, a legacy stream mode; the editor uses this one too. */
-export const scalaLanguage = StreamLanguage.define(scala);
-
 /** The parsers the editor's language support wraps, one per language. */
 const grammars: Record<Language, Grammar> = {
   python: pythonLanguage,
   typescript: typescriptLanguage,
   go: goLanguage,
-  scala: scalaLanguage,
   cpp: cppLanguage,
   cuda: cppLanguage,
 };
@@ -88,7 +83,6 @@ const FENCE_LANGUAGE: Record<string, Language> = {
   python: 'python',
   py: 'python',
   go: 'go',
-  scala: 'scala',
   cpp: 'cpp',
   'c++': 'cpp',
   c: 'cpp',

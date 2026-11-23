@@ -62,7 +62,6 @@ provider cannot decode is sent five times.
         python: {all: [/offset_ms\s*=/, /duration_ms\s*=/, /index\s*\*\s*CHUNK_MS/]},
         typescript: {all: [/offset_ms\s*:/, /duration_ms\s*:/, /index\s*\*\s*CHUNK_MS/]},
         go: {all: [/OffsetMs\s*:/, /DurationMs\s*:/, /index\s*\*\s*chunkMs/]},
-        scala: {all: [/offsetMs\s*=/, /durationMs\s*=/, /index\s*\*\s*ChunkMs/]},
         cpp: {all: [/set_offset_ms\(/, /set_duration_ms\(/, /index\s*\*\s*kChunkMs/]},
       },
     },
@@ -70,12 +69,11 @@ provider cannot decode is sent five times.
       id: 'deadline',
       title: 'Every attempt carries a 60-second deadline',
       detail:
-        'Each `TranscribeChunk` stream is opened with a `DEADLINE_S` (60 s) deadline of its own (`timeout=`, `deadline:`, a context with timeout, `withDeadlineAfter`, `set_deadline`), the retry included, even when the first attempt took 59 s; the starter sets none, so a stalled provider holds the worker and the chunk indefinitely.',
+        'Each `TranscribeChunk` stream is opened with a `DEADLINE_S` (60 s) deadline of its own (`timeout=`, `deadline:`, a context with timeout, `set_deadline`), the retry included, even when the first attempt took 59 s; the starter sets none, so a stalled provider holds the worker and the chunk indefinitely.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*60\b/, /TranscribeChunk\([^)]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*60_?000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*60\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*60L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/kDeadline\{60\}|kDeadline\(60\)/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -91,7 +89,6 @@ provider cannot decode is sent five times.
         },
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /<\s*MAX_ATTEMPTS/], none: [/<\s*5\b/, /while\s*\(true\)/]},
         go: {all: [/maxAttempts\s*=\s*2\b/, /<\s*maxAttempts/], none: [/<\s*5\b/]},
-        scala: {all: [/MaxAttempts\s*=\s*2\b/, /<\s*MaxAttempts|until\s+MaxAttempts/], none: [/<\s*5\b|until\s+5\b/]},
         cpp: {all: [/kMaxAttempts\s*=\s*2\b/, /<\s*kMaxAttempts/], none: [/<\s*5\b/, /while\s*\(true\)/]},
       },
     },
@@ -104,7 +101,6 @@ provider cannot decode is sent five times.
         python: {all: [/=\s*\w+\.end_ms\b/, /duration_ms\s*=\s*\w+\s*-\s*\w+/]},
         typescript: {all: [/=\s*\w+\.end_ms\b/, /duration_ms:\s*\w+\s*-\s*\w+/]},
         go: {all: [/=\s*(?:int\(\s*)?\w+\.(?:GetEndMs\(\)|EndMs)/, /DurationMs:\s*(?:int32\(\s*)?\w+\s*-\s*\w+/]},
-        scala: {all: [/=\s*\w+\.endMs\b/, /durationMs\s*=\s*\w+\s*-\s*\w+/]},
         cpp: {all: [/=\s*\w+\.end_ms\(\)/, /set_duration_ms\(\s*\w+\s*-\s*\w+/]},
       },
     },
@@ -117,7 +113,6 @@ provider cannot decode is sent five times.
         python: {all: [/StatusCode\.INVALID_ARGUMENT/, /raise CorruptAudio/]},
         typescript: {all: [/status\.INVALID_ARGUMENT/, /throw new CorruptAudio/]},
         go: {all: [/codes\.InvalidArgument/, /return[^\n]*ErrCorruptAudio/]},
-        scala: {all: [/INVALID_ARGUMENT/, /throw new CorruptAudio/]},
         cpp: {all: [/StatusCode::INVALID_ARGUMENT/, /throw CorruptAudio/]},
       },
     },
@@ -466,87 +461,6 @@ func transcribeChunk(ctx context.Context, jobID, audioRef string, index int) ([]
 		offset = reached // Unavailable, DeadlineExceeded: the next attempt resumes here
 	}
 	return nil, fmt.Errorf("%w: chunk %d of %s after %d attempts", ErrAsrUnavailable, index, jobID, maxAttempts)
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import scala.collection.mutable.ListBuffer
-
-import transcribe.Jobs // Jobs.Segment
-import transcribe.transcription.{AsrGrpc, ChunkRequest}
-
-/** The provider cannot decode this span: another attempt fails the same way. */
-final class CorruptAudio(message: String) extends Exception(message)
-/** The provider did not transcribe the chunk within the attempts: a later redelivery may. */
-final class AsrUnavailable(message: String) extends Exception(message)
-
-object AsrClient {
-  private val asr = AsrGrpc.blockingStub(ManagedChannelBuilder.forAddress("asr", 9000).usePlaintext().build())
-
-  /** The segments of chunk index (30 s of audio from index * 30 s), in order. */
-  def transcribeChunk(jobId: String, audioRef: String, index: Int): Seq[Jobs.Segment] = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val request = ChunkRequest(jobId = jobId, audioRef = audioRef, chunkIndex = index)
-    val segments = ListBuffer.empty[Jobs.Segment]
-    var attempt = 0
-    while (attempt < 5) {
-      try {
-        asr.transcribeChunk(request).foreach(s => segments += Jobs.Segment(index, s.startMs, s.endMs, s.speaker, s.text))
-        return segments.toList
-      } catch {
-        case _: StatusRuntimeException => attempt += 1 // the provider hiccupped: send it again
-      }
-    }
-    throw new AsrUnavailable(s"chunk $index of $jobId: the provider kept failing")
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import scala.collection.mutable.ListBuffer
-
-import transcribe.Jobs // Jobs.Segment
-import transcribe.transcription.{AsrGrpc, ChunkRequest}
-
-/** The provider cannot decode this span: another attempt fails the same way. */
-final class CorruptAudio(message: String) extends Exception(message)
-/** The provider did not transcribe the chunk within the attempts: a later redelivery may. */
-final class AsrUnavailable(message: String) extends Exception(message)
-
-object AsrClient {
-  val ChunkMs = 30000
-  val DeadlineSeconds = 60L
-  val MaxAttempts = 2
-
-  private val asr = AsrGrpc.blockingStub(ManagedChannelBuilder.forAddress("asr", 9000).usePlaintext().build())
-
-  /** The segments of chunk index (30 s of audio from index * 30 s), in order. */
-  def transcribeChunk(jobId: String, audioRef: String, index: Int): Seq[Jobs.Segment] = {
-    val end = (index + 1) * ChunkMs
-    var offset = index * ChunkMs
-    val segments = ListBuffer.empty[Jobs.Segment]
-    var attempt = 0
-    while (attempt < MaxAttempts) {
-      // One stream for this chunk only, from where the last attempt stopped.
-      val request = ChunkRequest(jobId = jobId, audioRef = audioRef, chunkIndex = index, offsetMs = offset, durationMs = end - offset)
-      try {
-        asr.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).transcribeChunk(request).foreach { s =>
-          segments += Jobs.Segment(index, s.startMs, s.endMs, s.speaker, s.text)
-          offset = s.endMs
-        }
-        return segments.toList
-      } catch {
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.INVALID_ARGUMENT =>
-          throw new CorruptAudio(s"chunk $index of $jobId: \${e.getStatus.getDescription}")
-        case _: StatusRuntimeException => attempt += 1 // UNAVAILABLE, DEADLINE_EXCEEDED: the next attempt resumes at offset
-      }
-    }
-    throw new AsrUnavailable(s"chunk $index of $jobId: no transcript after $MaxAttempts attempts")
-  }
 }
 `,
     },

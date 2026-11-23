@@ -45,12 +45,6 @@ Implement the analytics consumer: a member of consumer group **\`view-counter\`*
         python: {all: [/"group\.id"\s*:\s*"view-counter"/, /subscribe\(\s*\[\s*"image-views"\s*\]\s*\)/]},
         typescript: {all: [/groupId:\s*['"]view-counter['"]/, /subscribe\(\s*\{[^\n]*['"]image-views['"]/]},
         go: {all: [/GroupID:\s*"view-counter"/, /Topic:\s*"image-views"/]},
-        scala: {
-          all: [
-            /"group\.id"\s*,\s*"view-counter"|GROUP_ID_CONFIG\s*,\s*"view-counter"/,
-            /subscribe\([^\n]*"image-views"/,
-          ],
-        },
         cpp: {all: [/"group\.id"\s*,\s*"view-counter"/, /subscribe\([^\n]*"image-views"/]},
       },
     },
@@ -62,7 +56,6 @@ Implement the analytics consumer: a member of consumer group **\`view-counter\`*
         python: {all: [/"enable\.auto\.commit"\s*:\s*False/]},
         typescript: {all: [/autoCommit:\s*false/]},
         go: {all: [/reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
-        scala: {all: [/"enable\.auto\.commit"\s*,\s*"false"|ENABLE_AUTO_COMMIT_CONFIG\s*,\s*"false"/]},
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/]},
       },
     },
@@ -75,7 +68,6 @@ Implement the analytics consumer: a member of consumer group **\`view-counter\`*
         python: {all: [/\br\.incr\(\s*f"views:\{[^}]+\}"\s*\)/]},
         typescript: {all: [/\bredis\.incr\(\s*`views:\$\{[^}]+\}`\s*\)/]},
         go: {all: [/rdb\.Incr\(\s*ctx\s*,\s*"views:"\s*\+/]},
-        scala: {all: [/jedis\.incr\(\s*s"views:\$/]},
         cpp: {all: [/redis\.incr\(\s*"views:"\s*\+/]},
       },
     },
@@ -87,7 +79,6 @@ Implement the analytics consumer: a member of consumer group **\`view-counter\`*
         python: {order: [/\br\.incr\(/, /consumer\.commit\(/]},
         typescript: {order: [/\bredis\.incr\(/, /consumer\.commitOffsets\(/]},
         go: {order: [/rdb\.Incr\(/, /reader\.CommitMessages\(/]},
-        scala: {order: [/jedis\.incr\(/, /consumer\.commitSync\(/]},
         cpp: {order: [/redis\.incr\(/, /consumer->commitSync\(/]},
       },
     },
@@ -294,74 +285,6 @@ func run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.common.serialization.StringDeserializer
-import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-
-object ViewCounter {
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "view-counter")
-  props.put("auto.offset.reset", "earliest")
-  // TODO: disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("image-views").asJava)
-
-  private val IdField = """"id"\\s*:\\s*"([^"]+)"""".r
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        // TODO: extract the id (skip malformed records)
-        // TODO: INCR views:{id}
-      }
-      // TODO: commit synchronously after the batch is processed
-    }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.common.serialization.StringDeserializer
-import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-
-object ViewCounter {
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "view-counter")
-  props.put("auto.offset.reset", "earliest")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("image-views").asJava)
-
-  private val IdField = """"id"\\s*:\\s*"([^"]+)"""".r
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        IdField.findFirstMatchIn(record.value()) match {
-          case Some(m) => jedis.incr(s"views:\${m.group(1)}")
-          case None => System.err.println(s"skipping malformed record at offset \${record.offset()}")
-        }
-      }
-      consumer.commitSync() // after every record of the batch has been counted
-    }
 }
 `,
     },

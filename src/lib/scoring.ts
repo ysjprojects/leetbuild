@@ -23,7 +23,8 @@ export interface SubmissionCheck {
 /** One judged submission, kept per step (newest last, capped) for the Submissions list. */
 export interface Submission {
   at: number;
-  language: Language;
+  /** Null when it was a language the site no longer offers (saved records are repaired, not dropped). */
+  language: Language | null;
   passed: number;
   total: number;
   accepted: boolean;

@@ -59,10 +59,6 @@ empty or cut off.
         },
         typescript: {all: [/\{\s*prefix,\s*suffix,\s*snippets/], none: [/prefix\s*\+\s*suffix/]},
         go: {all: [/Prefix:\s*prefix/, /Suffix:\s*suffix/, /Snippets:\s*snippets/], none: [/prefix\s*\+\s*suffix/]},
-        scala: {
-          all: [/prefix\s*=\s*prefix/, /suffix\s*=\s*suffix/, /snippets\s*=\s*snippets/],
-          none: [/prefix\s*\+\s*suffix/],
-        },
         cpp: {
           all: [/set_prefix\(\s*prefix\s*\)/, /set_suffix\(\s*suffix\s*\)/, /add_snippets\(/],
           none: [/prefix\s*\+\s*suffix/],
@@ -78,7 +74,6 @@ empty or cut off.
         python: {all: [/DEADLINE_S\s*=\s*0\.3/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*300/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*300\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^)]*deadline\)/]},
-        scala: {all: [/DeadlineMs\s*=\s*300/, /withDeadlineAfter\(\s*DeadlineMs/]},
         cpp: {all: [/kDeadline\{300\}|kDeadline\s*=\s*std::chrono::milliseconds\(300\)/, /set_deadline\(/]},
       },
     },
@@ -91,7 +86,6 @@ empty or cut off.
         python: {all: [/MAX_ATTEMPTS\s*=\s*2/, /StatusCode\.UNAVAILABLE/], none: [/range\(\s*5\s*\)/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2/, /status\.UNAVAILABLE/], none: [/attempt\s*<\s*5/]},
         go: {all: [/maxAttempts\s*=\s*2/, /codes\.Unavailable/], none: [/attempt\s*<\s*5/]},
-        scala: {all: [/MaxAttempts\s*=\s*2/, /Code\.UNAVAILABLE/], none: [/attempt\s*<\s*5/]},
         cpp: {all: [/kMaxAttempts\s*=\s*2/, /StatusCode::UNAVAILABLE/], none: [/attempt\s*<\s*5/]},
       },
     },
@@ -110,7 +104,6 @@ empty or cut off.
           all: [/nCandidates\s*=\s*3/, /func filterCandidates\(/, /GetTruncated\(\)/],
           none: [/Candidates\(\)\[0\]|Candidates\[0\]/],
         },
-        scala: {all: [/NCandidates\s*=\s*3/, /def filterCandidates\(/, /\.truncated/], none: [/candidates\.head/]},
         cpp: {all: [/kNCandidates\s*=\s*3/, /filterCandidates\(/, /\.truncated\(\)/], none: [/candidates\(0\)/]},
       },
     },
@@ -369,74 +362,6 @@ func complete(ctx context.Context, prefix, suffix string, snippets []string, lan
 		return []string{}
 	}
 	return []string{}
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import copilotctx.copilot_context.{CompleteRequest, ModelGrpc}
-
-object FimCall {
-  private val stub = ModelGrpc.blockingStub(ManagedChannelBuilder.forTarget("model:9000").usePlaintext().build())
-
-  /** The candidates to show as ghost text; none when the model gives none. */
-  def complete(prefix: String, suffix: String, snippets: Seq[String], language: String): Seq[String] = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val prompt = snippets.mkString("\\n") + "\\n" + prefix + suffix
-    val request = CompleteRequest(prefix = prompt, suffix = "", language = language, n = 1)
-    var attempt = 0
-    while (attempt < 5) {
-      try {
-        val reply = stub.complete(request)
-        return Seq(reply.candidates.head.text)
-      } catch {
-        case _: StatusRuntimeException => attempt += 1
-      }
-    }
-    Seq.empty
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import copilotctx.copilot_context.{Candidate, CompleteRequest, ModelGrpc}
-
-object FimCall {
-  val DeadlineMs = 300L
-  val MaxAttempts = 2
-  val NCandidates = 3
-
-  private val stub = ModelGrpc.blockingStub(ManagedChannelBuilder.forTarget("model:9000").usePlaintext().build())
-
-  /** n generated, at most n shown: empty, truncated and duplicate candidates dropped, the order kept. */
-  def filterCandidates(candidates: Seq[Candidate]): Seq[String] =
-    candidates
-      .filter(c => c.text.trim.nonEmpty && !c.truncated)
-      .foldLeft((Vector.empty[String], Set.empty[String])) { case ((shown, seen), c) =>
-        if (seen(c.text.trim)) (shown, seen) else (shown :+ c.text, seen + c.text.trim)
-      }
-      ._1
-
-  /** The candidates to show as ghost text; none when the model gives none. */
-  def complete(prefix: String, suffix: String, snippets: Seq[String], language: String): Seq[String] = {
-    val request = CompleteRequest(prefix = prefix, suffix = suffix, snippets = snippets, language = language, n = NCandidates)
-    var attempt = 1
-    while (attempt <= MaxAttempts) {
-      try {
-        return filterCandidates(stub.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).complete(request).candidates)
-      } catch {
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.UNAVAILABLE && attempt < MaxAttempts =>
-          attempt += 1
-        case e: StatusRuntimeException =>
-          System.err.println(s"model call failed code=\${e.getStatus.getCode} attempt=$attempt")
-          return Seq.empty
-      }
-    }
-    Seq.empty
-  }
 }
 `,
     },

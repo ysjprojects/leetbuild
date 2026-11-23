@@ -53,7 +53,6 @@ defaults, a 413 that quotes the prompt into error logs.
         python: {all: [/@app\.post\(\s*["']\/v1\/completions\/cached["']/, /lookup\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/completions\/cached['"]/, /lookup\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/completions\/cached"/, /lookup\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"completions"\s*\/\s*"cached"\s*\)/, /EntryCache\.lookup\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/completions\/cached"/, /lookup\(/]},
       },
     },
@@ -66,7 +65,6 @@ defaults, a 413 that quotes the prompt into error logs.
         python: {all: [/x-tenant-id/i], none: [/body\.get\(\s*["']tenant["']/]},
         typescript: {all: [/x-tenant-id/i], none: [/body\.tenant\b/]},
         go: {all: [/X-Tenant-Id/], none: [/body\.Tenant\b/]},
-        scala: {all: [/X-Tenant-Id/], none: [/get\("tenant"\)/]},
         cpp: {all: [/X-Tenant-Id/], none: [/body\.value\("tenant"/]},
       },
     },
@@ -79,7 +77,6 @@ defaults, a 413 that quotes the prompt into error logs.
         python: {all: [/f["']pc:\{tenant\}:\{version\}:/]},
         typescript: {all: [/pc:\$\{tenant\}:\$\{version\}:/]},
         go: {all: [/"pc:"\s*\+\s*tenant\s*\+\s*":"\s*\+\s*strconv\.Itoa\(\s*version\s*\)|"pc:%s:%d:%s"/]},
-        scala: {all: [/s"pc:\$tenant:\$version:/]},
         cpp: {all: [/"pc:"\s*\+\s*tenant\s*\+\s*":"\s*\+\s*std::to_string\(\s*version\s*\)/]},
       },
     },
@@ -92,7 +89,6 @@ defaults, a 413 that quotes the prompt into error logs.
         python: {all: [/status_code\s*=\s*400/], none: [/["']prompt_version["']\s*,\s*1\s*\)/]},
         typescript: {all: [/code\(\s*400\s*\)/], none: [/prompt_version:\s*version\s*=\s*1\b/]},
         go: {all: [/StatusBadRequest/], none: [/version\s*:=\s*1\b/]},
-        scala: {all: [/StatusCodes\.BadRequest/], none: [/getOrElse\(1\)/]},
         cpp: {all: [/\b400\b/], none: [/value\("prompt_version",\s*1\)/]},
       },
     },
@@ -105,7 +101,6 @@ defaults, a 413 that quotes the prompt into error logs.
         python: {all: [/8 \* 1024/, /status_code\s*=\s*413/], none: [/prefix\[:\s*64\]/]},
         typescript: {all: [/8 \* 1024/, /code\(\s*413\s*\)/], none: [/prefix\.slice\(\s*0,\s*64\s*\)/]},
         go: {all: [/8 \* 1024/, /StatusRequestEntityTooLarge/], none: [/Prefix\[:64\]/]},
-        scala: {all: [/8 \* 1024/, /StatusCodes\.PayloadTooLarge/], none: [/take\(64\)/]},
         cpp: {all: [/8 \* 1024/, /\b413\b/], none: [/substr\(0,\s*64\)/]},
       },
     },
@@ -515,143 +510,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import scala.util.Try
-
-object CompletionsApi {
-  implicit val system: ActorSystem = ActorSystem("prompt-cache")
-
-  val PrefixLimitBytes: Int = 8 * 1024
-
-  private def answer(status: StatusCode, body: ujson.Value): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body))))
-
-  val route: Route =
-    path("v1" / "completions" / "cached") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { headerTenant =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val body = Try(ujson.read(raw)).toOption.flatMap(_.objOpt)
-            val tenant = body.flatMap(_.get("tenant")).flatMap(_.strOpt).orElse(headerTenant).filter(_.nonEmpty)
-            val prefix = body.flatMap(_.get("prefix")).flatMap(_.strOpt).filter(_.nonEmpty)
-            val version = body.flatMap(_.get("prompt_version")).flatMap(_.numOpt).filter(n => n == n.toInt).map(_.toInt).getOrElse(1)
-            val temperature = body.flatMap(_.get("temperature")).flatMap(_.numOpt).getOrElse(0.0)
-            (tenant, prefix) match {
-              case (None, _) => answer(StatusCodes.Unauthorized, ujson.Obj("error" -> "tenant_required"))
-              case (_, None) => answer(StatusCodes.BadRequest, ujson.Obj("error" -> "invalid_body"))
-              case (Some(t), Some(p)) if p.getBytes(StandardCharsets.UTF_8).length > PrefixLimitBytes =>
-                answer(StatusCodes.PayloadTooLarge, ujson.Obj("error" -> "prefix_too_large", "prefix" -> p.take(64)))
-              case (Some(t), Some(p)) =>
-                val digest =
-                  MessageDigest.getInstance("SHA-256").digest(p.getBytes(StandardCharsets.UTF_8)).map("%02x".format(_)).mkString
-                serve(s"pc:$digest", t, version, p, temperature)
-            }
-          }
-        }
-      }
-    }
-
-  private def serve(key: String, tenant: String, version: Int, prefix: String, temperature: Double): Route = {
-    val started = System.nanoTime()
-    def elapsedMs: Long = (System.nanoTime() - started) / 1000000
-    EntryCache.lookup(key) match {
-      case Some(hit) =>
-        CacheEvents.emitDecision(tenant, version, prefix, "hit", elapsedMs, hit.tokens)
-        answer(StatusCodes.OK, ujson.Obj("status" -> "hit", "completion" -> hit.completion))
-      case None =>
-        val miss = MissPath.completeMiss(key, tenant, version, prefix, temperature)
-        CacheEvents.emitDecision(tenant, version, prefix, "miss", elapsedMs, miss.tokens)
-        if (miss.status == "error") answer(StatusCodes.ServiceUnavailable, ujson.Obj("error" -> "model_unavailable"))
-        else if (miss.status == "refused") answer(StatusCodes.UnprocessableEntity, ujson.Obj("error" -> "refused"))
-        else answer(StatusCodes.OK, ujson.Obj("status" -> "miss", "completion" -> miss.completion))
-    }
-  }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import scala.util.Try
-
-object CompletionsApi {
-  implicit val system: ActorSystem = ActorSystem("prompt-cache")
-
-  val PrefixLimitBytes: Int = 8 * 1024
-
-  /** Everything a completion depends on: the tenant, the prompt version, the prefix (as its digest). */
-  def cacheKey(tenant: String, version: Int, prefix: String): String = {
-    val digest =
-      MessageDigest.getInstance("SHA-256").digest(prefix.getBytes(StandardCharsets.UTF_8)).map("%02x".format(_)).mkString
-    s"pc:$tenant:$version:$digest"
-  }
-
-  private def answer(status: StatusCode, body: ujson.Value): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body))))
-
-  val route: Route =
-    path("v1" / "completions" / "cached") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { headerTenant =>
-          entity(as[String]) { raw =>
-            val body = Try(ujson.read(raw)).toOption.flatMap(_.objOpt)
-            val prefix = body.flatMap(_.get("prefix")).flatMap(_.strOpt).filter(_.nonEmpty)
-            val version = body.flatMap(_.get("prompt_version")).flatMap(_.numOpt).filter(n => n == n.toInt).map(_.toInt)
-            val temperature = body.flatMap(_.get("temperature")).flatMap(_.numOpt).getOrElse(0.0)
-            (headerTenant.filter(_.nonEmpty), prefix, version) match {
-              case (None, _, _) => answer(StatusCodes.Unauthorized, ujson.Obj("error" -> "tenant_required"))
-              case (Some(t), Some(p), Some(v)) =>
-                if (p.getBytes(StandardCharsets.UTF_8).length > PrefixLimitBytes)
-                  answer(StatusCodes.PayloadTooLarge, ujson.Obj("error" -> "prefix_too_large", "limit_bytes" -> PrefixLimitBytes))
-                else serve(cacheKey(t, v, p), t, v, p, temperature)
-              case _ => answer(StatusCodes.BadRequest, ujson.Obj("error" -> "invalid_body"))
-            }
-          }
-        }
-      }
-    }
-
-  private def serve(key: String, tenant: String, version: Int, prefix: String, temperature: Double): Route = {
-    val started = System.nanoTime()
-    def elapsedMs: Long = (System.nanoTime() - started) / 1000000
-    EntryCache.lookup(key) match {
-      case Some(hit) =>
-        CacheEvents.emitDecision(tenant, version, prefix, "hit", elapsedMs, hit.tokens)
-        answer(StatusCodes.OK, ujson.Obj("status" -> "hit", "completion" -> hit.completion))
-      case None =>
-        val miss = MissPath.completeMiss(key, tenant, version, prefix, temperature)
-        CacheEvents.emitDecision(tenant, version, prefix, "miss", elapsedMs, miss.tokens)
-        if (miss.status == "error") answer(StatusCodes.ServiceUnavailable, ujson.Obj("error" -> "model_unavailable"))
-        else if (miss.status == "refused") answer(StatusCodes.UnprocessableEntity, ujson.Obj("error" -> "refused"))
-        else answer(StatusCodes.OK, ujson.Obj("status" -> "miss", "completion" -> miss.completion))
-    }
-  }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

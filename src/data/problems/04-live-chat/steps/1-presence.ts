@@ -67,11 +67,6 @@ presence functions the chat server calls:
             /rdb\.Set\(\s*ctx\s*,\s*(?:"presence:"\s*\+\s*user|fmt\.Sprintf\(\s*"presence:%s"\s*,\s*user\s*\))\s*,\s*server\s*,\s*(?:presenceTTL|30\s*\*\s*time\.Second)\s*\)/,
           ],
         },
-        scala: {
-          all: [
-            /jedis\.setex\(\s*s"presence:\$\{?user\}?"\s*,\s*(?:PresenceTtlSeconds|30L?)\s*,\s*server\s*\)|jedis\.set\(\s*s"presence:\$\{?user\}?"\s*,\s*server\s*,\s*SetParams[^\n]*\.ex\(\s*(?:PresenceTtlSeconds|30L?)\s*\)/,
-          ],
-        },
         cpp: {
           all: [
             /redis\.set\(\s*"presence:"\s*\+\s*user\s*,\s*server\s*,\s*(?:kPresenceTtl|std::chrono::seconds\{?\(?\s*30\s*[)}]|30s)\s*\)|redis\.setex\(\s*"presence:"\s*\+\s*user\s*,\s*(?:kPresenceTtl|std::chrono::seconds\{?\(?\s*30\s*[)}]|30s?)\s*,\s*server\s*\)/,
@@ -102,12 +97,6 @@ presence functions the chat server calls:
             /rdb\.SRem\(\s*ctx\s*,\s*(?:"room:"\s*\+\s*room\s*\+\s*":members"|fmt\.Sprintf\(\s*"room:%s:members"\s*,\s*room\s*\))\s*,\s*user\s*\)/,
           ],
         },
-        scala: {
-          all: [
-            /jedis\.sadd\(\s*s"room:\$\{?room\}?:members"\s*,\s*user\s*\)/,
-            /jedis\.srem\(\s*s"room:\$\{?room\}?:members"\s*,\s*user\s*\)/,
-          ],
-        },
         cpp: {
           all: [
             /redis\.sadd\(\s*"room:"\s*\+\s*room\s*\+\s*":members"\s*,\s*user\s*\)/,
@@ -129,7 +118,6 @@ presence functions the chat server calls:
             /rdb\.Del\(\s*ctx\s*,\s*(?:"presence:"\s*\+\s*user|fmt\.Sprintf\(\s*"presence:%s"\s*,\s*user\s*\))\s*\)/,
           ],
         },
-        scala: {order: [/jedis\.srem\(/, /jedis\.del\(\s*s"presence:\$\{?user\}?"\s*\)/]},
         cpp: {order: [/redis\.srem\(/, /redis\.del\(\s*"presence:"\s*\+\s*user\s*\)/]},
       },
     },
@@ -149,10 +137,6 @@ presence functions the chat server calls:
         go: {
           all: [/rdb\.SMembers\(/, /rdb\.MGet\(|Pipelined\(|Pipeline\(\)/],
           none: [/func onlineMembers(?:(?!\n\})[\s\S])*?rdb\.Get\(/],
-        },
-        scala: {
-          all: [/jedis\.smembers\(/, /jedis\.mget\(|\.pipelined\(\)/],
-          none: [/def onlineMembers(?:(?!\n {2}def )[\s\S])*?jedis\.get\(/],
         },
         cpp: {
           all: [/redis\.smembers\(/, /redis\.mget\(|redis\.pipeline\(/],
@@ -373,69 +357,6 @@ func onlineMembers(ctx context.Context, room string) (map[string]string, error) 
 		}
 	}
 	return online, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-
-object Presence {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Clients heartbeat every 10 s: three missed beats and the user is gone. */
-  val PresenceTtlSeconds = 30L
-
-  /** Called every 10 s while the client's stream is open on \`server\`. */
-  def heartbeat(user: String, server: String): Unit = {
-    // TODO: SETEX presence:{user} PresenceTtlSeconds server
-  }
-
-  def joinRoom(room: String, user: String): Unit = {
-    // TODO: SADD room:{room}:members
-  }
-
-  def leave(room: String, user: String): Unit = {
-    // TODO: SREM from the room set, then DEL the presence key
-  }
-
-  /** Members whose presence key is alive, mapped to the server holding their stream. */
-  def onlineMembers(room: String): Map[String, String] = {
-    // TODO: SMEMBERS, then one MGET of every presence:{user} — not one GET per member
-    Map.empty
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-
-object Presence {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Clients heartbeat every 10 s: three missed beats and the user is gone. */
-  val PresenceTtlSeconds = 30L
-
-  /** Called every 10 s while the client's stream is open on \`server\`. */
-  def heartbeat(user: String, server: String): Unit =
-    jedis.setex(s"presence:$user", PresenceTtlSeconds, server)
-
-  def joinRoom(room: String, user: String): Unit =
-    jedis.sadd(s"room:$room:members", user)
-
-  def leave(room: String, user: String): Unit = {
-    jedis.srem(s"room:$room:members", user)
-    jedis.del(s"presence:$user")
-  }
-
-  /** Members whose presence key is alive, mapped to the server holding their stream. */
-  def onlineMembers(room: String): Map[String, String] = {
-    val members = jedis.smembers(s"room:$room:members").asScala.toVector.sorted
-    if (members.isEmpty) Map.empty
-    else {
-      val servers = jedis.mget(members.map(u => s"presence:$u"): _*).asScala
-      members.zip(servers).collect { case (u, server) if server != null => u -> server }.toMap
-    }
-  }
 }
 `,
     },

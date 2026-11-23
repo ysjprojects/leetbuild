@@ -64,7 +64,6 @@ Requirements:
         python: {all: [/DEADLINE_S/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/context\.WithTimeout\(/]},
-        scala: {all: [/withDeadlineAfter\(/]},
         cpp: {all: [/set_deadline\(/]},
       },
     },
@@ -80,7 +79,6 @@ Requirements:
         },
         typescript: {all: [/MAX_ATTEMPTS/, /status\.UNAVAILABLE/, /status\.DEADLINE_EXCEEDED/], none: [/MAX_TRIES/]},
         go: {all: [/maxAttempts/, /codes\.Unavailable/, /codes\.DeadlineExceeded/], none: [/maxTries/]},
-        scala: {all: [/MaxAttempts/, /Code\.UNAVAILABLE/, /Code\.DEADLINE_EXCEEDED/], none: [/MaxTries/]},
         cpp: {all: [/kMaxAttempts/, /StatusCode::UNAVAILABLE/, /StatusCode::DEADLINE_EXCEEDED/], none: [/kMaxTries/]},
       },
     },
@@ -93,10 +91,6 @@ Requirements:
         python: {all: [/downgrade_reason/, /small\.Predict\(/], none: [/["']unknown["']/, /attempt\s*%\s*2/]},
         typescript: {all: [/downgrade_reason/, /small\.Predict\(/], none: [/['"]unknown['"]/, /attempt\s*%\s*2/]},
         go: {all: [/DowngradeReason/, /small\.Predict\(/], none: [/Label:\s*"unknown"/, /attempt\s*%\s*2/]},
-        scala: {
-          all: [/downgradeReason/, /small(\.withDeadlineAfter\([^)]*\))?\.predict\(/],
-          none: [/"unknown"/, /attempt\s*%\s*2/],
-        },
         cpp: {
           all: [/downgrade_reason/, /small->Predict\(|call\(\s*\*small\b/],
           none: [/label\s*=\s*"unknown"/, /attempt\s*%\s*2/],
@@ -112,7 +106,6 @@ Requirements:
         python: {all: [/["']throttled["']/], order: [/["']throttled["']/, /\.Predict\(/]},
         typescript: {all: [/['"]throttled['"]/], order: [/['"]throttled['"]/, /\.Predict\(/]},
         go: {all: [/"throttled"/], order: [/"throttled"/, /\.Predict\(/]},
-        scala: {all: [/"throttled"/], order: [/"throttled"/, /\.predict\(/]},
         cpp: {all: [/"throttled"/], order: [/"throttled"/, /->Predict\(|call\(\s*\*large\b/]},
       },
     },
@@ -125,7 +118,6 @@ Requirements:
         python: {all: [/finally\s*:[\s\S]*pool\.release\(/]},
         typescript: {all: [/finally\s*\{[\s\S]*pool\.release\(/]},
         go: {all: [/defer\s+(func\s*\(\)\s*\{[\s\S]*?)?pool\.Release\(/]},
-        scala: {all: [/finally\s*\{?[\s\S]*pool\.release\(/]},
         cpp: {all: [/~\w+\(\)\s*\{[^}]*\.release\(/]},
       },
     },
@@ -589,133 +581,6 @@ func predict(ctx context.Context, pool Pool, tenant, inferenceID, imageKey, task
 	result := complete(reply, maxAttempts+1, true)
 	result.DowngradeReason = reason
 	return result, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import vision.Config
-import vision.predictor.{PredictRequest, PredictorGrpc}
-
-/** The step-2 GPU pool the worker hands in: admit before a call, release after. */
-trait GpuSlots {
-  def admit(tenant: String): Admission
-  def release(tenant: String, ticket: String): Boolean
-}
-
-/** One inference's outcome. */
-final case class Prediction(
-    status: String,
-    reason: String = "",
-    label: String = "",
-    confidence: Double = 0,
-    modelVersion: String = "",
-    downgraded: Boolean = false,
-    downgradeReason: String = "",
-    retryAfter: Long = 0,
-    attempts: Int = 0
-)
-
-object ModelClient {
-  val MaxTries = 5
-  val BackoffMs = 200L
-
-  private val large = PredictorGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.LargeModel).usePlaintext().build())
-  private val small = PredictorGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.SmallModel).usePlaintext().build())
-
-  /** One inference on a GPU slot: the label, its confidence and the model that produced it. */
-  def predict(pool: GpuSlots, tenant: String, inferenceId: String, imageKey: String, task: String): Prediction = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val admission = pool.admit(tenant)
-    val request = PredictRequest(inferenceId = inferenceId, imageKey = imageKey, task = task)
-    for (attempt <- 1 to MaxTries) {
-      val stub = if (attempt % 2 == 1) large else small
-      try {
-        val reply = stub.predict(request)
-        pool.release(tenant, admission.ticket.getOrElse(""))
-        return Prediction("complete", label = reply.label, confidence = reply.confidence, attempts = attempt)
-      } catch {
-        case e: StatusRuntimeException =>
-          System.err.println(s"predict failed inference=$inferenceId code=\${e.getStatus.getCode}")
-          Thread.sleep(BackoffMs)
-      }
-    }
-    Prediction("complete", label = "unknown", attempts = MaxTries)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import vision.Config
-import vision.predictor.{PredictReply, PredictRequest, PredictorGrpc}
-
-/** The step-2 GPU pool the worker hands in: admit before a call, release after. */
-trait GpuSlots {
-  def admit(tenant: String): Admission
-  def release(tenant: String, ticket: String): Boolean
-}
-
-/** One inference's outcome. */
-final case class Prediction(
-    status: String,
-    reason: String = "",
-    label: String = "",
-    confidence: Double = 0,
-    modelVersion: String = "",
-    downgraded: Boolean = false,
-    downgradeReason: String = "",
-    retryAfter: Long = 0,
-    attempts: Int = 0
-)
-
-object ModelClient {
-  val DeadlineMs = 2000L
-  val MaxAttempts = 3
-  val BackoffMs = 200L
-
-  private val large = PredictorGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.LargeModel).usePlaintext().build())
-  private val small = PredictorGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.SmallModel).usePlaintext().build())
-
-  private def reasonOf(code: Status.Code): String =
-    if (code == Status.Code.DEADLINE_EXCEEDED) "deadline" else code.name.toLowerCase
-
-  private def complete(reply: PredictReply, attempts: Int, downgraded: Boolean): Prediction =
-    Prediction("complete", label = reply.label, confidence = reply.confidence, modelVersion = reply.modelVersion, downgraded = downgraded, attempts = attempts)
-
-  /** One inference on a GPU slot: the label, its confidence and the model that produced it. */
-  def predict(pool: GpuSlots, tenant: String, inferenceId: String, imageKey: String, task: String): Prediction = {
-    val admission = pool.admit(tenant)
-    if (admission.ticket.isEmpty) return Prediction("throttled", retryAfter = admission.retryAfter)
-    val ticket = admission.ticket.get
-    val request = PredictRequest(inferenceId = inferenceId, imageKey = imageKey, task = task)
-    try {
-      var reason = ""
-      for (attempt <- 1 to MaxAttempts) {
-        try {
-          return complete(large.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).predict(request), attempt, downgraded = false)
-        } catch {
-          case e: StatusRuntimeException =>
-            val code = e.getStatus.getCode
-            if (code != Status.Code.UNAVAILABLE && code != Status.Code.DEADLINE_EXCEEDED)
-              return Prediction("failed", reason = reasonOf(code), attempts = attempt)
-            reason = reasonOf(code)
-            System.err.println(s"large model attempt $attempt failed inference=$inferenceId: $reason")
-            if (attempt < MaxAttempts) Thread.sleep(BackoffMs * attempt)
-        }
-      }
-      try {
-        val reply = small.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).predict(request)
-        complete(reply, MaxAttempts + 1, downgraded = true).copy(downgradeReason = reason)
-      } catch {
-        case e: StatusRuntimeException => Prediction("failed", reason = reasonOf(e.getStatus.getCode), attempts = MaxAttempts + 1)
-      }
-    } finally {
-      pool.release(tenant, ticket)
-    }
-  }
 }
 `,
     },

@@ -6,7 +6,7 @@ import {transcriptionStateStep} from './steps/2-state';
 import {transcriptionDependencyStep} from './steps/3-dependency';
 import {transcriptionEventsStep} from './steps/4-events';
 import {transcriptionReadStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Transcription service: the course is not "send audio to an ASR model", it is the debugging you
@@ -110,6 +110,5 @@ transcript is billed once, kept private and reported honestly.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

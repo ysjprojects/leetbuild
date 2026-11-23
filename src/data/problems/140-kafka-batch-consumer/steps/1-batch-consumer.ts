@@ -66,9 +66,6 @@ earliest offset with **auto-commit off**, that hands the sink one batch at a tim
           all: [/groupId:\s*['"]rollup['"]/, /subscribe\(\s*\{[^\n]*['"]metrics['"]/, /autoCommit:\s*false/],
         },
         go: {all: [/GroupID:\s*"rollup"/, /Topic:\s*"metrics"/, /reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
-        scala: {
-          all: [/"group\.id"\s*,\s*"rollup"/, /subscribe\([^\n]*"metrics"/, /"enable\.auto\.commit"\s*,\s*"false"/],
-        },
         cpp: {
           all: [/"group\.id"\s*,\s*"rollup"/, /subscribe\([^\n]*"metrics"/, /"enable\.auto\.commit"\s*,\s*"false"/],
         },
@@ -83,7 +80,6 @@ earliest offset with **auto-commit off**, that hands the sink one batch at a tim
         python: {all: [/consumer\.consume\(\s*BATCH_SIZE\s*,/]},
         typescript: {all: [/batch\.length\s*>=\s*BATCH_SIZE/]},
         go: {all: [/len\(batch\)\s*<\s*BatchSize/]},
-        scala: {all: [/pending\.size\s*<\s*BatchSize/]},
         cpp: {all: [/batch\.size\(\)\s*<\s*kBatchSize/]},
       },
     },
@@ -101,7 +97,6 @@ earliest offset with **auto-commit off**, that hands the sink one batch at a tim
             /context\.DeadlineExceeded/,
           ],
         },
-        scala: {all: [/\+\s*BatchWaitMs/, /Duration\.ofMillis\(\s*remaining\s*\)/]},
         cpp: {all: [/std::chrono::milliseconds\(\s*kBatchWaitMs\s*\)/, /ERR__TIMED_OUT/]},
       },
     },
@@ -120,10 +115,6 @@ earliest offset with **auto-commit off**, that hands the sink one batch at a tim
           all: [/Number\(message\.offset\)\s*\+\s*1/],
         },
         go: {order: [/flush\(batch\)/, /reader\.CommitMessages\(\s*ctx\s*,\s*batch\.\.\.\s*\)/]},
-        scala: {
-          order: [/flush\(batch\)/, /consumer\.commitSync\(\s*nextOffsets\(batch\)\s*\)/],
-          all: [/\.max\s*\+\s*1/],
-        },
         cpp: {order: [/flush\(batch\)/, /consumer->commitSync\(\s*offsets\s*\)/], all: [/msg->offset\(\)\s*\+\s*1/]},
       },
     },
@@ -136,7 +127,6 @@ earliest offset with **auto-commit off**, that hands the sink one batch at a tim
         python: {all: [/if not batch:/]},
         typescript: {all: [/if \(batch\.length === 0\) return;/]},
         go: {all: [/if len\(batch\) == 0 \{/]},
-        scala: {all: [/if \(batch\.nonEmpty\)/]},
         cpp: {all: [/if \(batch\.empty\(\)\) continue;/]},
       },
     },
@@ -381,111 +371,6 @@ func run(ctx context.Context, flush func([]kafka.Message) error) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.collection.mutable.ArrayBuffer
-import scala.jdk.CollectionConverters._
-
-object BatchConsumer {
-  val BatchSize = 50
-  val BatchWaitMs = 500L
-
-  type Record = ConsumerRecord[String, String]
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "rollup")
-  props.put("auto.offset.reset", "earliest")
-  // TODO: disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("metrics").asJava)
-
-  /** Records a poll returned beyond the batch that closed: they open the next one. */
-  private val pending = ArrayBuffer.empty[Record]
-
-  /** One past the last offset of the batch on each partition it touches. */
-  def nextOffsets(batch: Seq[Record]): java.util.Map[TopicPartition, OffsetAndMetadata] = {
-    // TODO: group by (topic, partition); each -> OffsetAndMetadata(highest offset + 1)
-    Map.empty[TopicPartition, OffsetAndMetadata].asJava
-  }
-
-  /** Up to BatchSize records, or whatever arrived BatchWaitMs after collecting started. */
-  private def collect(): Seq[Record] = {
-    // TODO: poll with the time left in the window into pending until BatchSize or the window closes
-    // TODO: take BatchSize from pending (the rest stays for the next batch)
-    Seq.empty
-  }
-
-  def run(flush: Seq[Record] => Unit): Unit =
-    while (true) {
-      val batch = collect()
-      // TODO: skip an empty batch; otherwise flush, then commitSync(nextOffsets(batch))
-      throw new NotImplementedError()
-    }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.collection.mutable.ArrayBuffer
-import scala.jdk.CollectionConverters._
-
-object BatchConsumer {
-  val BatchSize = 50
-  val BatchWaitMs = 500L
-
-  type Record = ConsumerRecord[String, String]
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "rollup")
-  props.put("auto.offset.reset", "earliest")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("metrics").asJava)
-
-  /** Records a poll returned beyond the batch that closed: they open the next one. */
-  private val pending = ArrayBuffer.empty[Record]
-
-  /** One past the last offset of the batch on each partition it touches. */
-  def nextOffsets(batch: Seq[Record]): java.util.Map[TopicPartition, OffsetAndMetadata] =
-    batch
-      .groupBy(r => new TopicPartition(r.topic(), r.partition()))
-      .map { case (tp, records) => tp -> new OffsetAndMetadata(records.map(_.offset()).max + 1) }
-      .asJava
-
-  /** Up to BatchSize records, or whatever arrived BatchWaitMs after collecting started. */
-  private def collect(): Seq[Record] = {
-    val deadline = System.currentTimeMillis() + BatchWaitMs
-    var remaining = BatchWaitMs
-    while (pending.size < BatchSize && remaining > 0) {
-      pending ++= consumer.poll(Duration.ofMillis(remaining)).asScala
-      remaining = deadline - System.currentTimeMillis()
-    }
-    val batch = pending.take(BatchSize).toSeq
-    pending.remove(0, batch.size)
-    batch
-  }
-
-  def run(flush: Seq[Record] => Unit): Unit =
-    while (true) {
-      val batch = collect()
-      if (batch.nonEmpty) {
-        flush(batch)
-        consumer.commitSync(nextOffsets(batch))
-      }
-    }
 }
 `,
     },

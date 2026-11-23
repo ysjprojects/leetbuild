@@ -46,7 +46,6 @@ version and no changes; and a record names whatever version was current when it 
         python: {all: [/@app\.get\(\s*["']\/v1\/taxonomies\/\{taxonomy_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/taxonomies\/:taxonomyId['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/taxonomies\/\{id\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"taxonomies"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/taxonomies\//]},
       },
     },
@@ -62,7 +61,6 @@ version and no changes; and a record names whatever version was current when it 
           all: [/taxonomies\.Load\(r\.Context\(\),\s*tenant/, /StatusUnauthorized|\b401\b/],
           none: [/taxonomies\.ByID\(/],
         },
-        scala: {all: [/Taxonomies\.load\(\s*tenant/, /Unauthorized|\b401\b/], none: [/Taxonomies\.byId\(/]},
         cpp: {all: [/taxonomies::load\(\s*tenant/, /\b401\b/], none: [/taxonomies::byId\(/]},
       },
     },
@@ -75,7 +73,6 @@ version and no changes; and a record names whatever version was current when it 
         python: {all: [/taxonomies\.put_version\(/], none: [/update_labels\(/]},
         typescript: {all: [/taxonomies\.putVersion\(/], none: [/updateLabels\(/]},
         go: {all: [/taxonomies\.PutVersion\(/], none: [/UpdateLabels\(/]},
-        scala: {all: [/Taxonomies\.putVersion\(/], none: [/updateLabels\(/]},
         cpp: {all: [/taxonomies::putVersion\(/], none: [/updateLabels\(/]},
       },
     },
@@ -88,7 +85,6 @@ version and no changes; and a record names whatever version was current when it 
         python: {all: [/taxonomies\.changelog\(/, /["']version["']\s*:\s*taxonomy\[/]},
         typescript: {all: [/taxonomies\.changelog\(/, /version:\s*taxonomy\.version/]},
         go: {all: [/taxonomies\.Changelog\(/, /Version:\s*taxonomy\.Version/]},
-        scala: {all: [/Taxonomies\.changelog\(/, /"version"\s*->\s*JsNumber\(taxonomy\.version\)/]},
         cpp: {all: [/taxonomies::changelog\(/, /\{"version",\s*taxonomy->version\}/]},
       },
     },
@@ -101,7 +97,6 @@ version and no changes; and a record names whatever version was current when it 
         python: {all: [/["']taxonomy_version["']\s*:\s*taxonomy_version\b/]},
         typescript: {all: [/taxonomy_version:\s*taxonomyVersion\b/]},
         go: {all: [/TaxonomyVersion:\s*taxonomyVersion\b/]},
-        scala: {all: [/"taxonomy_version"\s*->\s*JsNumber\(taxonomyVersion\)/]},
         cpp: {all: [/\{"taxonomy_version",\s*taxonomy_version\}/]},
       },
     },
@@ -388,110 +383,6 @@ func recordClassification(ctx context.Context, tenant, taxonomyID string, taxono
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/taxonomies/{id}", readTaxonomy)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import classifier.{Config, Taxonomies}
-
-object TaxonomyApi {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private def json(body: JsValue): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "taxonomies" / Segment) { taxonomyId =>
-    get {
-      // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-      Taxonomies.byId(taxonomyId) match {
-        case None => complete(StatusCodes.NotFound -> "unknown taxonomy")
-        case Some(taxonomy) => complete(json(JsObject("taxonomy_id" -> JsString(taxonomyId), "labels" -> taxonomy.labels.toJson)))
-      }
-    }
-  }
-
-  /** Apply an edit to the taxonomy; returns the version that now holds the labels. */
-  def publishVersion(tenant: String, taxonomyId: String, labels: Seq[String]): Long =
-    Taxonomies.updateLabels(tenant, taxonomyId, labels)
-
-  /** Keep the classification so it can be explained later. */
-  def recordClassification(tenant: String, taxonomyId: String, taxonomyVersion: Long, labels: Seq[String]): JsObject = {
-    val current = Taxonomies.byId(taxonomyId).map(_.version).getOrElse(0L)
-    val record = JsObject(
-      "tenant" -> JsString(tenant),
-      "taxonomy_id" -> JsString(taxonomyId),
-      "taxonomy_version" -> JsNumber(current),
-      "labels" -> labels.toJson
-    )
-    jedis.rpush(Config.classificationsKey(tenant), record.compactPrint)
-    record
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import classifier.{Config, Taxonomies}
-
-object TaxonomyApi {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private def json(body: JsValue): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "taxonomies" / Segment) { taxonomyId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "missing X-Tenant-Id")
-        case Some(tenant) =>
-          parameters("version".optional, "since".optional) { (version, since) =>
-            // Scoped to the tenant: another tenant's taxonomy does not exist here.
-            Taxonomies.load(tenant, taxonomyId, version.map(_.toLong).getOrElse(0L)) match {
-              case None => complete(StatusCodes.NotFound -> "unknown taxonomy")
-              case Some(taxonomy) =>
-                val changelog = since.map(n => Taxonomies.changelog(tenant, taxonomyId, n.toLong, taxonomy.version)).getOrElse(Seq.empty)
-                complete(
-                  json(
-                    JsObject(
-                      "taxonomy_id" -> JsString(taxonomyId),
-                      "version" -> JsNumber(taxonomy.version),
-                      "labels" -> taxonomy.labels.toJson,
-                      "changelog" -> JsArray(changelog.map(c => JsObject("version" -> JsNumber(c.version), "added" -> c.added.toJson, "removed" -> c.removed.toJson)).toVector)
-                    )
-                  )
-                )
-            }
-          }
-      }
-    }
-  }
-
-  /** An edit is a new immutable version: what was classified against the old one stays explainable. */
-  def publishVersion(tenant: String, taxonomyId: String, labels: Seq[String]): Long =
-    Taxonomies.putVersion(tenant, taxonomyId, labels)
-
-  /** The record names the version that classified the text, not the one current when it is written. */
-  def recordClassification(tenant: String, taxonomyId: String, taxonomyVersion: Long, labels: Seq[String]): JsObject = {
-    val record = JsObject(
-      "tenant" -> JsString(tenant),
-      "taxonomy_id" -> JsString(taxonomyId),
-      "taxonomy_version" -> JsNumber(taxonomyVersion),
-      "labels" -> labels.toJson
-    )
-    jedis.rpush(Config.classificationsKey(tenant), record.compactPrint)
-    record
-  }
 }
 `,
     },

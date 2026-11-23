@@ -48,7 +48,6 @@ Requirements:
         python: {all: [/sha256\(/, /\.lower\(\)/, /decision:\{workspace\}:/]},
         typescript: {all: [/createHash\(\s*['"]sha256['"]/, /toLowerCase\(\)/, /decision:\$\{workspace\}:/]},
         go: {all: [/sha256\.Sum256\(/, /strings\.ToLower\(/, /"decision:"\s*\+\s*workspace/]},
-        scala: {all: [/SHA-256/, /toLowerCase/, /s"decision:\$workspace:/]},
         cpp: {all: [/sha256_hex\(/, /tolower/, /"decision:"\s*\+\s*workspace/]},
       },
     },
@@ -61,7 +60,6 @@ Requirements:
         python: {all: [/ex\s*=\s*DECISION_TTL_S/]},
         typescript: {all: [/['"]EX['"]\s*,\s*DECISION_TTL_S/]},
         go: {all: [/rdb\.Set\([^\n]*decisionTTL\)/]},
-        scala: {all: [/ex\(\s*DecisionTtlSeconds\s*\)/]},
         cpp: {all: [/redis\.set\([^\n]*kDecisionTtl/]},
       },
     },
@@ -74,7 +72,6 @@ Requirements:
         python: {all: [/register_script\(|\.eval\(/, /EXPIRE/], none: [/\br\.incr\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /EXPIRE/], none: [/redis\.incr\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /EXPIRE/], none: [/rdb\.Incr\(/]},
-        scala: {all: [/jedis\s*\.eval\(/, /EXPIRE/], none: [/jedis\.incr\(/]},
         cpp: {all: [/redis\.eval</, /EXPIRE/], none: [/redis\.incr\(/]},
       },
     },
@@ -87,7 +84,6 @@ Requirements:
         python: {order: [/=\s*reserve\(\s*user\s*\)/, /tables_for\(/]},
         typescript: {order: [/await reserve\(\s*user\s*\)/, /tablesFor\(/]},
         go: {order: [/=\s*reserve\(\s*ctx\s*,\s*user\s*\)/, /tablesFor\(/]},
-        scala: {order: [/=\s*reserve\(\s*user\s*\)/, /tablesFor\(/]},
         cpp: {order: [/=\s*reserve\(\s*user\s*\)/, /tables_for\(/]},
       },
     },
@@ -482,120 +478,6 @@ func propose(ctx context.Context, user, workspace, question string, pick TablePi
 		return Proposal{}, err
 	}
 	return Proposal{Status: "proposed", Tables: tables}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-/** propose's answer: proposed with the tables, or over_budget with when to come back. */
-final case class Proposal(status: String, tables: List[String] = Nil, retryAfter: Long = 0)
-
-object Decisions {
-  val QueryBudget = 50L
-  val WindowSeconds = 3600L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** The tables proposed for a question: the cached decision, or the table agent's pick. */
-  def tablesFor(workspace: String, question: String, pickTables: (String, String) => List[String]): List[String] = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val key = s"decision:$question"
-    Option(jedis.get(key)) match {
-      case Some(cached) => ujson.read(cached).arr.map(_.str).toList
-      case None =>
-        val tables = pickTables(question, workspace)
-        jedis.set(key, ujson.write(ujson.Arr.from(tables.map(ujson.Str(_)))))
-        tables
-    }
-  }
-
-  /** One query out of the user's hourly budget: (allowed, retry-after seconds). */
-  def reserve(user: String): (Boolean, Long) = {
-    val key = s"budget:$user"
-    val used = Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
-    if (used >= QueryBudget) (false, WindowSeconds)
-    else {
-      jedis.incr(key)
-      (true, 0L)
-    }
-  }
-
-  /** The proposal for one question, or over_budget with when to come back. */
-  def propose(user: String, workspace: String, question: String, pickTables: (String, String) => List[String]): Proposal = {
-    val tables = tablesFor(workspace, question, pickTables)
-    val (allowed, retryAfter) = reserve(user)
-    if (!allowed) Proposal("over_budget", retryAfter = retryAfter)
-    else Proposal("proposed", tables = tables)
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-import java.security.MessageDigest
-
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import scala.jdk.CollectionConverters._
-
-/** propose's answer: proposed with the tables, or over_budget with when to come back. */
-final case class Proposal(status: String, tables: List[String] = Nil, retryAfter: Long = 0)
-
-object Decisions {
-  val DecisionTtlSeconds = 86400L
-  val QueryBudget = 50L
-  val WindowSeconds = 3600L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  // Redis runs a script alone: no other server's command lands between the read and the increment.
-  private val Reserve = """
-local used = tonumber(redis.call('GET', KEYS[1]) or '0')
-if used >= tonumber(ARGV[1]) then
-  return {0, redis.call('TTL', KEYS[1])}
-end
-used = redis.call('INCR', KEYS[1])
-if used == 1 then
-  redis.call('EXPIRE', KEYS[1], ARGV[2])
-end
-return {1, 0}
-"""
-
-  def decisionKey(workspace: String, question: String): String = {
-    val normalised = question.trim.toLowerCase.split("\\\\s+").mkString(" ")
-    val digest = MessageDigest.getInstance("SHA-256").digest(normalised.getBytes(UTF_8))
-    s"decision:$workspace:\${digest.map("%02x".format(_)).mkString}"
-  }
-
-  /** The tables proposed for a question: the cached decision, or the table agent's pick. */
-  def tablesFor(workspace: String, question: String, pickTables: (String, String) => List[String]): List[String] = {
-    val key = decisionKey(workspace, question)
-    Option(jedis.get(key)) match {
-      case Some(cached) => ujson.read(cached).arr.map(_.str).toList
-      case None =>
-        val tables = pickTables(question, workspace)
-        jedis.set(key, ujson.write(ujson.Arr.from(tables.map(ujson.Str(_)))), SetParams.setParams().ex(DecisionTtlSeconds))
-        tables
-    }
-  }
-
-  /** One query out of the user's hourly budget: (allowed, retry-after seconds). */
-  def reserve(user: String): (Boolean, Long) = {
-    val reply = jedis
-      .eval(Reserve, List(s"budget:$user").asJava, List(QueryBudget.toString, WindowSeconds.toString).asJava)
-      .asInstanceOf[java.util.List[java.lang.Long]]
-      .asScala
-      .map(_.longValue)
-      .toList
-    (reply.head == 1L, reply(1))
-  }
-
-  /** The proposal for one question, or over_budget with when to come back. */
-  def propose(user: String, workspace: String, question: String, pickTables: (String, String) => List[String]): Proposal = {
-    val (allowed, retryAfter) = reserve(user)
-    if (!allowed) Proposal("over_budget", retryAfter = retryAfter)
-    else Proposal("proposed", tables = tablesFor(workspace, question, pickTables))
-  }
 }
 `,
     },

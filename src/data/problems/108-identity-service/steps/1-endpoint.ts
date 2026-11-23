@@ -49,7 +49,6 @@ account owns it.
         python: {all: [/@app\.post\(\s*["']\/v1\/users["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/users['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/users"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"users"\s*\)/, /\bpost\b/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/users"/]},
       },
     },
@@ -75,10 +74,6 @@ account owns it.
             /StatusUnprocessableEntity|\b422\b/,
           ],
           order: [/=\s*normalizeEmail\(/, /handles\.ClaimHandles\(/],
-        },
-        scala: {
-          all: [/def normalizeEmail\(/, /def normalizePhone\(/, /FoldAliasDomains/, /UnprocessableEntity|\b422\b/],
-          order: [/normalizeEmail\(field/, /Handles\.claimHandles\(/],
         },
         cpp: {
           all: [
@@ -109,10 +104,6 @@ account owns it.
           all: [/Idempotency-Key/, /accounts\.RecordSignup\(/, /StatusBadRequest|\b400\b/],
           order: [/accounts\.SignupResult\(/, /handles\.ClaimHandles\(/, /accounts\.RecordSignup\(/],
         },
-        scala: {
-          all: [/Idempotency-Key/, /Accounts\.recordSignup\(/, /BadRequest|\b400\b/],
-          order: [/Accounts\.signupResult\(/, /Handles\.claimHandles\(/, /Accounts\.recordSignup\(/],
-        },
         cpp: {
           all: [/Idempotency-Key/, /accounts::recordSignup\(/, /\b400\b/],
           order: [/accounts::signupResult\(/, /handles::claimHandles\(/, /accounts::recordSignup\(/],
@@ -136,10 +127,6 @@ account owns it.
         go: {
           all: [/signupConflict\s*=/, /StatusConflict,\s*signupConflict/],
           none: [/already registered/i, /handles\.OwnerOf\(/],
-        },
-        scala: {
-          all: [/SignupConflict\s*[:=]/, /StatusCodes\.Conflict,\s*SignupConflict/],
-          none: [/already registered/i, /Handles\.ownerOf\(/],
         },
         cpp: {
           all: [/kSignupConflict\s*=/, /kSignupConflict\.dump\(\)/],
@@ -486,106 +473,6 @@ func signup(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/users", signup)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import identityd.{Accounts, Handles} // Accounts.newUserId, createAccount, signupResult, recordSignup; Handles.claimHandles, ownerOf
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def field(body: JsObject, name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  val route: Route = path("v1" / "users") {
-    post {
-      entity(as[String]) { raw =>
-        // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-        val body = raw.parseJson.asJsObject
-        val email = field(body, "email").trim
-        val phone = field(body, "phone").trim
-        val userId = Accounts.newUserId()
-        if (!Handles.claimHandles(userId, Map("email" -> email, "phone" -> phone))) {
-          val owner = Handles.ownerOf("email", email).orElse(Handles.ownerOf("phone", phone)).getOrElse("")
-          // Tell the client which account holds the address, so the app can offer "log in instead".
-          complete(json(StatusCodes.Conflict, JsObject("error" -> JsString(s"$email is already registered"), "user_id" -> JsString(owner))))
-        } else {
-          Accounts.createAccount(userId, email, phone, field(body, "name"))
-          complete(json(StatusCodes.Created, JsObject("user_id" -> JsString(userId), "status" -> JsString("unverified"))))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import identityd.{Accounts, Handles} // Accounts.newUserId, createAccount, signupResult, recordSignup; Handles.claimHandles, ownerOf
-
-object Api {
-  val FoldAliasDomains: Set[String] = Set("gmail.com", "googlemail.com")
-  val SignupConflict: JsObject = JsObject("error" -> JsString("signup_conflict"))
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def field(body: JsObject, name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  /** Lowercase; for a domain in FoldAliasDomains also drop the dots and the +tag of the local part. */
-  def normalizeEmail(raw: String): Option[String] = {
-    val address = raw.trim.toLowerCase
-    val at = address.lastIndexOf('@')
-    val domain = address.substring(at + 1)
-    if (at <= 0 || !domain.contains('.')) None
-    else {
-      val local = address.substring(0, at)
-      Some((if (FoldAliasDomains.contains(domain)) local.takeWhile(_ != '+').replace(".", "") else local) + "@" + domain)
-    }
-  }
-
-  /** E.164: + and 8 to 15 digits. Spaces, dashes, dots and parentheses go; a leading 00 is +. */
-  def normalizePhone(raw: String): Option[String] = {
-    val compact = raw.replaceAll("""[\\s\\-.()]""", "")
-    Some(if (compact.startsWith("00")) "+" + compact.substring(2) else compact).filter(_.matches("""\\+\\d{8,15}"""))
-  }
-
-  val route: Route = path("v1" / "users") {
-    post {
-      optionalHeaderValueByName("Idempotency-Key") {
-        case None | Some("") => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
-        case Some(key) =>
-          entity(as[String]) { raw =>
-            Accounts.signupResult(key) match {
-              case Some(recorded) => complete(json(StatusCodes.Created, recorded)) // a retry answers what the first attempt answered
-              case None =>
-                val body = raw.parseJson.asJsObject
-                (normalizeEmail(field(body, "email")), normalizePhone(field(body, "phone"))) match {
-                  case (Some(email), Some(phone)) =>
-                    val userId = Accounts.newUserId()
-                    // One body for every collision: it names no address, no field and no account.
-                    if (!Handles.claimHandles(userId, Map("email" -> email, "phone" -> phone))) complete(json(StatusCodes.Conflict, SignupConflict))
-                    else {
-                      Accounts.createAccount(userId, email, phone, field(body, "name"))
-                      val result = JsObject("user_id" -> JsString(userId), "status" -> JsString("unverified"))
-                      Accounts.recordSignup(key, result)
-                      complete(json(StatusCodes.Created, result))
-                    }
-                  case _ => complete(StatusCodes.UnprocessableEntity -> "email or phone is not valid")
-                }
-            }
-          }
-      }
-    }
-  }
 }
 `,
     },

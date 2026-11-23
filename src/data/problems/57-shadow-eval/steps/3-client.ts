@@ -73,7 +73,6 @@ service Model { rpc Complete(CompleteRequest) returns (CompleteReply); }
         go: {
           all: [/shadowDeadline\s*=\s*300\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*shadowDeadline\)/],
         },
-        scala: {all: [/ShadowDeadlineMs\s*=\s*300L?\b/, /withDeadlineAfter\(\s*ShadowDeadlineMs/]},
         cpp: {all: [/kShadowDeadline\{300\}/, /set_deadline\([^\n]*kShadowDeadline\)/]},
       },
     },
@@ -86,7 +85,6 @@ service Model { rpc Complete(CompleteRequest) returns (CompleteReply); }
         python: {all: [/except grpc\.RpcError/], none: [/^\s*raise\b/m]},
         typescript: {all: [/catch/], none: [/^\s*throw\b/m]},
         go: {all: [/candidate\.Complete\(/], none: [/candidate\.Complete\([\s\S]{0,300}?return "", err/]},
-        scala: {all: [/catch/], none: [/^\s*throw\b|case e: StatusRuntimeException => throw/m]},
         cpp: {all: [/candidate->Complete\(/], none: [/^\s*throw\b/m]},
       },
     },
@@ -99,7 +97,6 @@ service Model { rpc Complete(CompleteRequest) returns (CompleteReply); }
         python: {none: [/CANDIDATE_ATTEMPTS/, /for attempt in/]},
         typescript: {none: [/CANDIDATE_ATTEMPTS/, /for \(let attempt/]},
         go: {none: [/candidateAttempts/, /for attempt :=/]},
-        scala: {none: [/CandidateAttempts/, /while \(attempt/]},
         cpp: {none: [/kCandidateAttempts/, /for \(int attempt/]},
       },
     },
@@ -112,7 +109,6 @@ service Model { rpc Complete(CompleteRequest) returns (CompleteReply); }
         python: {all: [/store\.count\([^\n]*["']dropped["']/]},
         typescript: {all: [/count\([^\n]*['"]dropped['"]/]},
         go: {all: [/store\.Count\([^\n]*"dropped"/]},
-        scala: {all: [/Store\.count\([^\n]*"dropped"/]},
         cpp: {all: [/store::count\([^\n]*"dropped"/]},
       },
     },
@@ -125,7 +121,6 @@ service Model { rpc Complete(CompleteRequest) returns (CompleteReply); }
         python: {all: [/:breaker/, /BREAKER_FAILURES\s*=\s*5\b/, /BREAKER_OPEN_S\s*=\s*30\b/]},
         typescript: {all: [/:breaker/, /BREAKER_FAILURES\s*=\s*5\b/, /BREAKER_OPEN_S\s*=\s*30\b/]},
         go: {all: [/:breaker/, /breakerFailures\s*=\s*5\b/, /breakerOpen\s*=\s*30\s*\*\s*time\.Second/]},
-        scala: {all: [/:breaker/, /BreakerFailures\s*=\s*5L?\b/, /BreakerOpenS\s*=\s*30L?\b/]},
         cpp: {all: [/:breaker/, /kBreakerFailures\s*=\s*5\b/, /kBreakerOpen\{30\}/]},
       },
     },
@@ -426,92 +421,6 @@ func shadow(ctx context.Context, configID, prompt string) {
 	}
 	rdb.Del(ctx, "shadow:"+configID+":failures")
 	store.Count(ctx, configID, "completed")
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import shadow.Store // Store.getConfig, count
-import shadoweval.shadow_eval.{CompleteRequest, ModelGrpc}
-
-object ShadowClient {
-  val ProductionVersion = "prod-2026-03"
-  val ProductionDeadlineMs = 5000L
-  val CandidateAttempts = 3
-
-  private val production = ModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("production-model", 9000).usePlaintext().build())
-  private val candidate = ModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("candidate-model", 9000).usePlaintext().build())
-
-  /** Answer the request from production, then shadow it on the config's candidate version. */
-  def complete(configId: String, prompt: String): String = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val reply = production.withDeadlineAfter(ProductionDeadlineMs, TimeUnit.MILLISECONDS).complete(CompleteRequest(ProductionVersion, prompt))
-    val request = CompleteRequest(Store.getConfig(configId).map(_.candidateVersion).getOrElse(""), prompt)
-    var attempt = 0
-    var done = false
-    while (attempt < CandidateAttempts && !done) {
-      try {
-        candidate.complete(request)
-        done = true
-      } catch {
-        case e: StatusRuntimeException =>
-          attempt += 1
-          if (attempt == CandidateAttempts) throw e
-      }
-    }
-    Store.count(configId, "completed")
-    reply.text
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import shadow.Store // Store.getConfig, count
-import shadoweval.shadow_eval.{CompleteRequest, ModelGrpc}
-
-object ShadowClient {
-  val ProductionVersion = "prod-2026-03"
-  val ProductionDeadlineMs = 5000L
-  val ShadowDeadlineMs = 300L
-  val BreakerFailures = 5L
-  val BreakerOpenS = 30L
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val production = ModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("production-model", 9000).usePlaintext().build())
-  private val candidate = ModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("candidate-model", 9000).usePlaintext().build())
-
-  /** Run the candidate on the prompt once; whatever happens here, production's answer stands. */
-  private def shadow(configId: String, prompt: String): Unit =
-    if (jedis.exists(s"shadow:$configId:breaker")) Store.count(configId, "dropped") // the candidate is failing: leave it alone
-    else {
-      val request = CompleteRequest(Store.getConfig(configId).map(_.candidateVersion).getOrElse(""), prompt)
-      try {
-        candidate.withDeadlineAfter(ShadowDeadlineMs, TimeUnit.MILLISECONDS).complete(request)
-        jedis.del(s"shadow:$configId:failures")
-        Store.count(configId, "completed")
-      } catch {
-        case _: StatusRuntimeException =>
-          Store.count(configId, "dropped")
-          if (jedis.incr(s"shadow:$configId:failures") >= BreakerFailures) {
-            jedis.set(s"shadow:$configId:breaker", "open", SetParams.setParams().ex(BreakerOpenS))
-            jedis.del(s"shadow:$configId:failures")
-          }
-      }
-    }
-
-  /** Answer the request from production, then shadow it on the config's candidate version. */
-  def complete(configId: String, prompt: String): String = {
-    val reply = production.withDeadlineAfter(ProductionDeadlineMs, TimeUnit.MILLISECONDS).complete(CompleteRequest(ProductionVersion, prompt))
-    shadow(configId, prompt)
-    reply.text
-  }
 }
 `,
     },

@@ -46,7 +46,6 @@ the promotion gate; and a client that times out and retries minting a second ver
         python: {all: [/@app\.post\(\s*["']\/v1\/models["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/models['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/models"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"models"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/models"/]},
       },
     },
@@ -59,7 +58,6 @@ the promotion gate; and a client that times out and retries minting a second ver
         python: {all: [/store\.artifact\(/, /store\.training_run\(/, /\b422\b/]},
         typescript: {all: [/\bartifact\(/, /\btrainingRun\(/, /\b422\b/]},
         go: {all: [/store\.Artifact\(/, /store\.TrainingRun\(/, /StatusUnprocessableEntity|\b422\b/]},
-        scala: {all: [/Store\.artifact\(/, /Store\.trainingRun\(/, /UnprocessableEntity|\b422\b/]},
         cpp: {all: [/store::artifact\(/, /store::trainingRun\(/, /\b422\b/]},
       },
     },
@@ -72,7 +70,6 @@ the promotion gate; and a client that times out and retries minting a second ver
         python: {all: [/store\.eval_record\(/, /\[["']artifact_digest["']\]/]},
         typescript: {all: [/\bevalRecord\(/, /\.artifact_digest\s*(!==|===)/]},
         go: {all: [/store\.EvalRecord\(/, /\.ArtifactDigest\s*(!=|==)/]},
-        scala: {all: [/Store\.evalRecord\(/, /\.artifactDigest\s*(!=|==)/]},
         cpp: {all: [/store::evalRecord\(/, /->artifact_digest\s*(!=|==)/]},
       },
     },
@@ -93,10 +90,6 @@ the promotion gate; and a client that times out and retries minting a second ver
         go: {
           all: [/Idempotency-Key/i, /store\.Registration\(/, /store\.RecordRegistration\(/, /StatusBadRequest|\b400\b/],
           order: [/store\.Registration\(/, /store\.RegisterVersion\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Store\.registration\(/, /Store\.recordRegistration\(/, /BadRequest|\b400\b/],
-          order: [/Store\.registration\(/, /Store\.registerVersion\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /store::registration\(/, /store::recordRegistration\(/, /\b400\b/],
@@ -345,94 +338,6 @@ func registerModel(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/models", registerModel)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import registry.Store // Store.artifact, trainingRun, evalRecord, registerVersion, registration, recordRegistration, rowJson
-
-object Api {
-  private def created(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.Created, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** A string field of the request body ("" when absent). */
-  private def text(body: JsObject, name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  val route: Route =
-    path("v1" / "models") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            entity(as[String]) { raw =>
-              // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-              val body = raw.parseJson.asJsObject
-              val row = Store.registerVersion(tenant, text(body, "name"), text(body, "artifact_digest"), text(body, "training_run_id"), text(body, "eval_id"))
-              complete(created(Store.rowJson(row)))
-            }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import registry.Store // Store.artifact, trainingRun, evalRecord, registerVersion, registration, recordRegistration, rowJson
-
-object Api {
-  private def created(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.Created, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** A string field of the request body ("" when absent). */
-  private def text(body: JsObject, name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  /** Why the lineage or the eval binding refuses this registration, if it does. */
-  private def refusal(name: String, digest: String, runId: String, evalId: String): Option[String] =
-    if (Store.artifact(digest).isEmpty) Some(s"artifact $digest does not resolve")
-    else if (!Store.trainingRun(runId).exists(_.model == name)) Some(s"training run $runId did not train $name")
-    else
-      Store.evalRecord(evalId) match {
-        // The score that opens the gate must have been measured on exactly these bytes.
-        case Some(record) if record.model == name && record.artifactDigest == digest => None
-        case _ => Some(s"eval $evalId did not score $name at $digest")
-      }
-
-  val route: Route =
-    path("v1" / "models") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            optionalHeaderValueByName("Idempotency-Key") {
-              case None | Some("") => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
-              case Some(key) =>
-                entity(as[String]) { raw =>
-                  Store.registration(tenant, key) match {
-                    case Some(recorded) => complete(created(recorded)) // a retry answers what the first attempt answered
-                    case None =>
-                      val body = raw.parseJson.asJsObject
-                      val (name, digest, runId, evalId) = (text(body, "name"), text(body, "artifact_digest"), text(body, "training_run_id"), text(body, "eval_id"))
-                      refusal(name, digest, runId, evalId) match {
-                        case Some(reason) => complete(StatusCodes.UnprocessableEntity -> reason)
-                        case None =>
-                          val row = Store.rowJson(Store.registerVersion(tenant, name, digest, runId, evalId))
-                          Store.recordRegistration(tenant, key, row)
-                          complete(created(row))
-                      }
-                  }
-                }
-            }
-        }
-      }
-    }
 }
 `,
     },

@@ -46,7 +46,6 @@ asks for a million entries gets them.
         python: {all: [/@app\.get\(\s*["']\/v1\/sync\/pull["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/sync\/pull['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/sync\/pull"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"sync"\s*\/\s*"pull"\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*"\/v1\/sync\/pull"/]},
       },
     },
@@ -59,7 +58,6 @@ asks for a million entries gets them.
         python: {all: [/zrangebyscore\(/], none: [/\.zrange\(/]},
         typescript: {all: [/zrangebyscore\(/], none: [/\.zrange\(/]},
         go: {all: [/ZRangeByScore/], none: [/\.ZRange\(/]},
-        scala: {all: [/zrangeByScore/], none: [/\.zrange\(/]},
         cpp: {all: [/zrangebyscore\(/], none: [/\.zrange\(/]},
       },
     },
@@ -72,7 +70,6 @@ asks for a million entries gets them.
         python: {all: [/limit\s*\+\s*1|zcount/i], none: [/REVISION_KEY/]},
         typescript: {all: [/limit\s*\+\s*1|zcount/i], none: [/REVISION_KEY/]},
         go: {all: [/limit\s*\+\s*1|ZCount/], none: [/RevisionKey/]},
-        scala: {all: [/limit\s*\+\s*1|zcount/i], none: [/RevisionKey/]},
         cpp: {all: [/limit\s*\+\s*1|zcount/i], none: [/kRevisionKey/]},
       },
     },
@@ -85,7 +82,6 @@ asks for a million entries gets them.
         python: {all: [/MAX_LIMIT/, /min\(/]},
         typescript: {all: [/MAX_LIMIT/, /Math\.min\(/]},
         go: {all: [/maxLimit/, /limit\s*>\s*maxLimit|min\(/]},
-        scala: {all: [/MaxLimit/, /min\(/]},
         cpp: {all: [/kMaxLimit/, /std::min\(/]},
       },
     },
@@ -348,91 +344,6 @@ func pull(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/sync/pull", pull)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import docsync.Store // Store.head, ChangesKey, RevisionKey
-
-object Read {
-  val DefaultLimit = 100
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def entry(doc: Store.Doc): JsObject =
-    JsObject("doc_id" -> JsString(doc.docId), "revision" -> JsNumber(doc.revision), "content_hash" -> JsString(doc.contentHash), "body" -> JsString(doc.body))
-
-  val route: Route = path("v1" / "sync" / "pull") {
-    get {
-      optionalHeaderValueByName("X-Device-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("missing_device"))))
-        case Some(_) =>
-          parameterMap { params =>
-            // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-            val cursor = params.get("cursor").flatMap(_.toLongOption).getOrElse(0L)
-            val limit = params.get("limit").flatMap(_.toIntOption).getOrElse(DefaultLimit)
-            val entries = jedis.zrange(Store.ChangesKey, cursor, cursor + limit - 1).asScala.toVector.flatMap(Store.head).map(entry)
-            val latest = Option(jedis.get(Store.RevisionKey)).map(_.toLong).getOrElse(0L)
-            complete(json(StatusCodes.OK, JsObject("entries" -> JsArray(entries), "cursor" -> JsNumber(latest), "has_more" -> JsBoolean(entries.size == limit))))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import docsync.Store // Store.head, ChangesKey
-
-object Read {
-  val DefaultLimit = 100
-  val MaxLimit = 1000
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def entry(doc: Store.Doc): JsObject =
-    JsObject("doc_id" -> JsString(doc.docId), "revision" -> JsNumber(doc.revision), "content_hash" -> JsString(doc.contentHash), "body" -> JsString(doc.body))
-
-  val route: Route = path("v1" / "sync" / "pull") {
-    get {
-      optionalHeaderValueByName("X-Device-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("missing_device"))))
-        case Some(_) =>
-          parameterMap { params =>
-            val cursor = params.get("cursor").flatMap(_.toLongOption).getOrElse(0L)
-            val limit = math.max(1, math.min(params.get("limit").flatMap(_.toIntOption).getOrElse(DefaultLimit), MaxLimit))
-            // By revision, not by position: an edit moves a document to the end of the log, a revision stays put.
-            // One row past the page says whether there is more.
-            val rows = jedis.zrangeByScoreWithScores(Store.ChangesKey, s"($cursor", "+inf", 0, limit + 1).asScala.toVector
-            val page = rows.take(limit)
-            val entries = page.flatMap(row => Store.head(row.getElement)).map(entry)
-            // The cursor covers exactly the page: resuming from it misses nothing and repeats nothing.
-            val next = page.lastOption.map(_.getScore.toLong).getOrElse(cursor)
-            complete(json(StatusCodes.OK, JsObject("entries" -> JsArray(entries), "cursor" -> JsNumber(next), "has_more" -> JsBoolean(rows.size > limit))))
-          }
-      }
-    }
-  }
 }
 `,
     },

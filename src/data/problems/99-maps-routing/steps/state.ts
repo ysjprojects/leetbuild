@@ -56,7 +56,6 @@ served after it recovers.
         python: {all: [/\/\s*CELL_DEGREES/, /math\.floor\(/]},
         typescript: {all: [/\/\s*CELL_DEGREES/, /Math\.floor\(/]},
         go: {all: [/\/\s*cellDegrees/, /math\.Floor\(/]},
-        scala: {all: [/\/\s*CellDegrees/, /math\.floor\(/]},
         cpp: {all: [/\/\s*kCellDegrees/, /std::floor\(/]},
       },
     },
@@ -69,7 +68,6 @@ served after it recovers.
         python: {all: [/def route_key\([^)]*waypoints/, /route_key\([^)]*waypoints\)/]},
         typescript: {all: [/routeKey\s*=\s*\([^)]*waypoints|function routeKey\([^)]*waypoints/]},
         go: {all: [/func routeKey\([^)]*waypoints/]},
-        scala: {all: [/def routeKey\([^)]*waypoints/]},
         cpp: {all: [/std::string routeKey\([^)]*waypoints/]},
       },
     },
@@ -82,7 +80,6 @@ served after it recovers.
         python: {all: [/route:\{epoch\}/]},
         typescript: {all: [/route:\$\{epoch\}/]},
         go: {all: [/"route:%d:|"route:"\s*\+\s*strconv\.FormatInt\(epoch/]},
-        scala: {all: [/s"route:\$epoch|s"route:\$\{epoch\}/]},
         cpp: {all: [/"route:"\s*\+\s*std::to_string\(epoch\)/]},
       },
     },
@@ -100,7 +97,6 @@ served after it recovers.
             /rdb\.Set\([^\n]*,\s*ttl\)/,
           ],
         },
-        scala: {all: [/TtlS\s*(:\s*Long\s*)?=\s*(2\s*\*\s*Geo\.EpochS|600)/, /\.ex\(\s*TtlS\s*\)/]},
         cpp: {all: [/kTtl\{2\s*\*\s*geo::kEpochS\}|kTtl\{600\}/, /redis\.set\([^\n]*kTtl\)/]},
       },
     },
@@ -113,7 +109,6 @@ served after it recovers.
         python: {order: [/route\["degraded"\]/, /r\.set\(/]},
         typescript: {order: [/route\.degraded/, /redis\.set\(/]},
         go: {order: [/route\.Degraded/, /rdb\.Set\(/]},
-        scala: {order: [/route\.degraded/, /jedis\.set\(/]},
         cpp: {order: [/route\.degraded/, /redis\.set\(/]},
       },
     },
@@ -326,65 +321,6 @@ func cachedRoute(ctx context.Context, origin, destination geo.Point, waypoints [
 		rdb.Set(ctx, key, string(value), ttl)
 	}
 	return route, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import mapsd.{Engine, Geo} // Engine.computeRoute(origin, destination, waypoints, epoch), Geo.currentEpoch
-
-object Cache {
-  val jedis = new JedisPooled("redis", 6379)
-
-  def routeKey(origin: Geo.Point, destination: Geo.Point): String =
-    s"route:\${origin.lat},\${origin.lng}:\${destination.lat},\${destination.lng}"
-
-  /** The route for the trip at the current traffic epoch, from the cache or the engine. */
-  def cachedRoute(origin: Geo.Point, destination: Geo.Point, waypoints: Seq[Geo.Point]): Geo.Route = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val key = routeKey(origin, destination)
-    Option(jedis.get(key)) match {
-      case Some(raw) => Geo.routeFromJson(raw.parseJson.asJsObject)
-      case None =>
-        val route = Engine.computeRoute(origin, destination, waypoints, Geo.currentEpoch())
-        jedis.set(key, Geo.toJson(route).compactPrint)
-        route
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-
-import mapsd.{Engine, Geo} // Engine.computeRoute(origin, destination, waypoints, epoch), Geo.currentEpoch
-
-object Cache {
-  val CellDegrees = 0.001
-  val TtlS: Long = 2 * Geo.EpochS
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def cell(p: Geo.Point): String = s"\${math.floor(p.lat / CellDegrees).toLong},\${math.floor(p.lng / CellDegrees).toLong}"
-
-  def routeKey(epoch: Long, origin: Geo.Point, destination: Geo.Point, waypoints: Seq[Geo.Point]): String =
-    s"route:$epoch:" + (origin +: waypoints :+ destination).map(cell).mkString(";")
-
-  /** The route for the trip at the current traffic epoch, from the cache or the engine. */
-  def cachedRoute(origin: Geo.Point, destination: Geo.Point, waypoints: Seq[Geo.Point]): Geo.Route = {
-    val epoch = Geo.currentEpoch()
-    val key = routeKey(epoch, origin, destination, waypoints)
-    Option(jedis.get(key)) match {
-      case Some(raw) => Geo.routeFromJson(raw.parseJson.asJsObject)
-      case None =>
-        val route = Engine.computeRoute(origin, destination, waypoints, epoch)
-        // An estimate is for this request only: the next one should reach the recovered engine.
-        if (!route.degraded) jedis.set(key, Geo.toJson(route).compactPrint, SetParams.setParams().ex(TtlS))
-        route
-    }
-  }
 }
 `,
     },

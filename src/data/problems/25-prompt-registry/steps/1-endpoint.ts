@@ -53,7 +53,6 @@ Requirements:
         python: {all: [/@app\.post\(\s*["']\/v1\/prompts["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/prompts['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/prompts"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"prompts"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/prompts"/]},
       },
     },
@@ -66,7 +65,6 @@ Requirements:
         python: {all: [/MAX_TEMPLATE_BYTES/, /status_code\s*=\s*413/]},
         typescript: {all: [/MAX_TEMPLATE_BYTES/, /code\(\s*413\s*\)/]},
         go: {all: [/maxTemplateBytes/, /StatusRequestEntityTooLarge/]},
-        scala: {all: [/MaxTemplateBytes/, /StatusCodes\.(PayloadTooLarge|RequestEntityTooLarge)/]},
         cpp: {all: [/kMaxTemplateBytes/, /\b413\b/]},
       },
     },
@@ -79,7 +77,6 @@ Requirements:
         python: {all: [/ALLOWED_VARIABLES/, /PLACEHOLDER/, /status_code\s*=\s*422/]},
         typescript: {all: [/ALLOWED_VARIABLES/, /PLACEHOLDER/, /code\(\s*422\s*\)/]},
         go: {all: [/allowedVariables/, /config\.Placeholder/, /StatusUnprocessableEntity/]},
-        scala: {all: [/AllowedVariables/, /Config\.Placeholder/, /StatusCodes\.UnprocessableEntity/]},
         cpp: {all: [/kAllowedVariables/, /config::kPlaceholder/, /\b422\b/]},
       },
     },
@@ -94,7 +91,6 @@ Requirements:
           all: [/code\(\s*409\s*\)/, /(if\s*\(\s*!?\s*(await\s+)?|=\s*(await\s+)?)versions\.put\(|versions\.get\(/],
         },
         go: {all: [/StatusConflict/, /[A-Za-z]\w*,\s*err\s*:?=\s*versions\.Put\(|versions\.Get\(/]},
-        scala: {all: [/StatusCodes\.Conflict/, /(if\s*\(\s*!?\s*|=\s*)Versions\.put\(|Versions\.get\(/]},
         cpp: {all: [/\b409\b/, /(if\s*\(\s*!?\s*|=\s*)versions::put\(|versions::get\(/]},
       },
     },
@@ -107,7 +103,6 @@ Requirements:
         python: {order: [/versions\.by_hash\(/, /versions\.put\(/]},
         typescript: {order: [/versions\.byHash\(/, /versions\.put\(/]},
         go: {order: [/versions\.ByHash\(/, /versions\.Put\(/]},
-        scala: {order: [/Versions\.byHash\(/, /Versions\.put\(/]},
         cpp: {order: [/versions::by_hash\(/, /versions::put\(/]},
       },
     },
@@ -502,134 +497,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.security.MessageDigest
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import prompts.{PromptVersion, Versions}
-
-final case class PromptRequest(name: String, version: Int, template: String, variables: Option[List[String]])
-
-/** The answer: the version without its template. */
-final case class Registration(name: String, version: Int, content_hash: String, variables: List[String], created: Boolean)
-
-object PromptApi {
-  implicit val system: ActorSystem = ActorSystem("prompt-registry")
-  implicit val requestFormat: RootJsonFormat[PromptRequest] = jsonFormat4(PromptRequest)
-  implicit val registrationFormat: RootJsonFormat[Registration] = jsonFormat5(Registration)
-
-  private def sha256Hex(text: String): String =
-    MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString
-
-  val route: Route =
-    path("v1" / "prompts") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[PromptRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else {
-              val tenant = tenantOpt.get
-              val record =
-                PromptVersion(body.name, body.version, sha256Hex(body.template), body.template, body.variables.getOrElse(Nil).sorted)
-              Versions.put(tenant, record)
-              system.log.info(s"prompt registered tenant=$tenant name=\${record.name} version=\${record.version}")
-              complete(StatusCodes.Created, Registration(record.name, record.version, record.content_hash, record.variables, created = true))
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.security.MessageDigest
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import prompts.{Config, PromptVersion, Versions}
-
-final case class PromptRequest(name: String, version: Int, template: String, variables: Option[List[String]])
-
-/** The answer: the version without its template. */
-final case class Registration(name: String, version: Int, content_hash: String, variables: List[String], created: Boolean)
-
-object PromptApi {
-  implicit val system: ActorSystem = ActorSystem("prompt-registry")
-  implicit val requestFormat: RootJsonFormat[PromptRequest] = jsonFormat4(PromptRequest)
-  implicit val registrationFormat: RootJsonFormat[Registration] = jsonFormat5(Registration)
-
-  val MaxTemplateBytes: Int = 32 * 1024
-  val AllowedVariables = Set("customer_name", "product", "tone", "locale", "question")
-
-  private def sha256Hex(text: String): String =
-    MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString
-
-  private def answer(v: PromptVersion, created: Boolean): Registration =
-    Registration(v.name, v.version, v.content_hash, v.variables, created)
-
-  val route: Route =
-    path("v1" / "prompts") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[PromptRequest]) { body =>
-            val declared = body.variables.getOrElse(Nil).toSet
-            val placeholders = Config.Placeholder.findAllMatchIn(body.template).map(_.group(1)).toSet
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else if (body.template.getBytes("UTF-8").length > MaxTemplateBytes) {
-              complete(StatusCodes.PayloadTooLarge, """{"error":"template exceeds 32 KiB"}""")
-            } else if (placeholders != declared || !declared.subsetOf(AllowedVariables)) {
-              complete(StatusCodes.UnprocessableEntity, """{"error":"placeholders must be exactly the declared variables, all allowed"}""")
-            } else {
-              val tenant = tenantOpt.get
-              val contentHash = sha256Hex(body.template)
-              // These bytes registered under another version answer that version: no second one.
-              Versions.byHash(tenant, body.name, contentHash).filter(_.version != body.version) match {
-                case Some(same) => complete(StatusCodes.OK, answer(same, created = false))
-                case None =>
-                  val record = PromptVersion(body.name, body.version, contentHash, body.template, declared.toList.sorted)
-                  if (Versions.put(tenant, record)) {
-                    system.log.info(s"prompt registered tenant=$tenant name=\${record.name} version=\${record.version}")
-                    complete(StatusCodes.Created, answer(record, created = true))
-                  } else {
-                    Versions.get(tenant, body.name, body.version) match {
-                      case Some(existing) if existing.content_hash == contentHash => complete(StatusCodes.OK, answer(existing, created = false))
-                      case _ => complete(StatusCodes.Conflict, """{"error":"this version holds other bytes"}""")
-                    }
-                  }
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

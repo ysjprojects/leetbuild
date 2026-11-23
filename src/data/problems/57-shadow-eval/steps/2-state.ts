@@ -45,7 +45,6 @@ instances read the same counter and both take the last unit; and a disabled shad
         python: {all: [/shadow:\{config_id\}:enabled/], none: [/flag_cache\[/]},
         typescript: {all: [/shadow:\$\{configId\}:enabled/], none: [/flagCache\.(get|set|has)\(/]},
         go: {all: [/":enabled"/], none: [/flagCache\[/]},
-        scala: {all: [/shadow:\$configId:enabled/], none: [/flagCache\.(getOrElseUpdate|get|put|update)\(/]},
         cpp: {all: [/":enabled"/], none: [/flag_cache\[|flag_cache\.(find|emplace|insert)\(/]},
       },
     },
@@ -58,7 +57,6 @@ instances read the same counter and both take the last unit; and a disabled shad
         python: {all: [/:budget/, /BUDGET_LIMIT\s*=\s*1000\b/], none: [/quota:/]},
         typescript: {all: [/:budget/, /BUDGET_LIMIT\s*=\s*1000\b/], none: [/quota:/]},
         go: {all: [/:budget/, /budgetLimit\s*=\s*1000\b/], none: [/quota:/]},
-        scala: {all: [/:budget/, /BudgetLimit\s*=\s*1000L?\b/], none: [/quota:/]},
         cpp: {all: [/:budget/, /kBudgetLimit\s*=\s*1000\b/], none: [/quota:/]},
       },
     },
@@ -80,10 +78,6 @@ instances read the same counter and both take the last unit; and a disabled shad
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]INCR['"]/, /redis\.call\(\s*['"]EXPIRE['"]/],
           none: [/rdb\.Incr\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]INCR['"]/, /redis\.call\(\s*['"]EXPIRE['"]/],
-          none: [/jedis\.incr\(/],
-        },
         cpp: {
           all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]INCR['"]/, /redis\.call\(\s*['"]EXPIRE['"]/],
           none: [/redis\.incr\(/],
@@ -99,7 +93,6 @@ instances read the same counter and both take the last unit; and a disabled shad
         python: {order: [/def admit/, /if not enabled\(config_id\)/, /\.eval\(|register_script|reserve\(/]},
         typescript: {order: [/function admit/, /if \(!\(await enabled\(configId\)\)\)/, /\.eval\(|reserve\(/]},
         go: {order: [/func admit/, /if !enabled\(ctx, configID\)/, /\.Run\(|\.Eval\(/]},
-        scala: {order: [/def admit/, /if \(!enabled\(configId\)\)/, /jedis\.eval/]},
         cpp: {order: [/bool admit\(/, /if \(!enabled\(config_id\)\)/, /redis\.eval/]},
       },
     },
@@ -310,72 +303,6 @@ func admit(ctx context.Context, configID string) (bool, error) {
 	}
 	n, err := reserve.Run(ctx, rdb, []string{"shadow:" + configID + ":budget"}, budgetLimit, budgetWindowS).Int64()
 	return n == 1, err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.collection.concurrent.TrieMap
-
-import shadow.Store // Store.getConfig
-
-object ShadowState {
-  val TenantQuota = 10000L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  // A config's switch is read once per process and kept here.
-  private val flagCache = TrieMap.empty[String, Boolean]
-
-  /** Whether the config's kill switch is on. */
-  def enabled(configId: String): Boolean = flagCache.getOrElseUpdate(configId, jedis.get(s"shadow:$configId:enabled") == "1")
-
-  /** Whether this request may be shadowed; true has reserved one unit of budget. */
-  def admit(configId: String): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val quota = s"quota:\${Store.getConfig(configId).map(_.tenant).getOrElse("")}"
-    val used = Option(jedis.get(quota)).map(_.toLong).getOrElse(0L)
-    if (used >= TenantQuota) false
-    else {
-      jedis.incr(quota)
-      enabled(configId)
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object ShadowState {
-  val BudgetLimit = 1000L
-  val BudgetWindowS = 3600L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  // One script: count the reservation, start the window with the first one, refund past the limit.
-  val ReserveLua: String =
-    """local used = redis.call('INCR', KEYS[1])
-      |if used == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
-      |if used > tonumber(ARGV[1]) then
-      |  redis.call('DECR', KEYS[1])
-      |  return 0
-      |end
-      |return 1
-      |""".stripMargin
-
-  /** Whether the config's kill switch is on, read now. */
-  def enabled(configId: String): Boolean = jedis.get(s"shadow:$configId:enabled") == "1"
-
-  /** Whether this request may be shadowed; true has reserved one unit of budget. */
-  def admit(configId: String): Boolean = {
-    if (!enabled(configId)) false // a disabled shadow writes nothing
-    else {
-      val args = List(BudgetLimit.toString, BudgetWindowS.toString).asJava
-      jedis.eval(ReserveLua, List(s"shadow:$configId:budget").asJava, args).asInstanceOf[java.lang.Long] == 1L
-    }
-  }
 }
 `,
     },

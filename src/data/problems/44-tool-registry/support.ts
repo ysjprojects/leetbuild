@@ -3,10 +3,9 @@
  * package. `toolsd.store` is the tool store (every registered tool version is a Redis hash, the
  * course's stand-in for the registry database), the tenants' allowlists and the lifecycle outbox.
  * `toolsd.catalog` is the catalog of step 2 as later steps use it (promote, rollback, pin_run,
- * resolve) plus the sandbox verdicts step 3 records and step 4 reads. The five languages keep the
+ * resolve) plus the sandbox verdicts step 3 records and step 4 reads. The four languages keep the
  * same keys, so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'toolsd/__init__.py': '',
@@ -700,134 +699,5 @@ inline std::optional<std::map<std::string, std::string>> validation(const std::s
 }
 
 }  // namespace catalog
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('toolsd', 'Store')]: `package toolsd
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The tool store (provided): every registered tool version is a Redis hash tool:{name}:{version}
- * with name, version, side_effect, owner, schema (a JSON document), endpoint and credential_ref.
- * tenant:{tenant}:tools is the set of tool names a tenant's agents may resolve; tools:outbox holds
- * the lifecycle records ({topic, key, value}) a relay republishes after the broker refused them. A
- * row is a JSON object: schema decoded, the other fields strings.
- */
-object Store {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val OutboxKey = "tools:outbox"
-  val Fields: Seq[String] = Seq("name", "version", "side_effect", "owner", "schema", "endpoint", "credential_ref")
-
-  def toolKey(name: String, version: String): String = s"tool:$name:$version"
-
-  private def encode(name: String, version: String, row: JsObject): Map[String, String] =
-    Fields.map {
-      case "name"    => "name" -> name
-      case "version" => "version" -> version
-      case "schema"  => "schema" -> row.fields.getOrElse("schema", JsObject.empty).compactPrint
-      case f         => f -> (row.fields.get(f) match { case Some(JsString(s)) => s; case _ => "" })
-    }.toMap
-
-  /** The tool version stored under (name, version), if any. */
-  def get(name: String, version: String): Option[JsObject] = {
-    val raw = jedis.hgetAll(toolKey(name, version)).asScala.toMap
-    if (raw.isEmpty) None
-    else Some(JsObject(raw.map { case (k, v) => k -> (if (k == "schema") v.parseJson else JsString(v)) }))
-  }
-
-  /** The bulk importer's writer: stores row under (name, version), replacing whatever is there. */
-  def put(name: String, version: String, row: JsObject): Unit = jedis.hset(toolKey(name, version), encode(name, version, row).asJava)
-
-  /** Stores row under (name, version) only if that version is new; false when it already exists. */
-  def insert(name: String, version: String, row: JsObject): Boolean =
-    if (jedis.hsetnx(toolKey(name, version), "name", name) == 0L) false
-    else {
-      jedis.hset(toolKey(name, version), encode(name, version, row).asJava)
-      true
-    }
-
-  /** The tool names the tenant's agents may resolve. */
-  def allowlist(tenant: String): Set[String] = jedis.smembers(s"tenant:$tenant:tools").asScala.toSet
-
-  /** Add tools to the tenant's allowlist. */
-  def grant(tenant: String, names: String*): Unit = jedis.sadd(s"tenant:$tenant:tools", names: _*)
-
-  /** Park a record the broker refused; the relay republishes it. */
-  def toOutbox(topic: String, key: String, value: String): Unit =
-    jedis.rpush(OutboxKey, JsObject("topic" -> JsString(topic), "key" -> JsString(key), "value" -> JsString(value)).compactPrint)
-}
-`,
-  [scalaPath('toolsd', 'Catalog')]: `package toolsd
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The catalog (provided; step 2 builds promote, rollback, pinRun and resolve the same way):
- * catalog:version:{cv} is one hash per catalog version, one field per tool holding its entry (the
- * stored tool row) as JSON. catalog:active names the version agents resolve, catalog:previous the
- * one the last promotion replaced, catalog:pin:{run_id} the version a run started on (6-hour TTL).
- * catalog:validation:{cv} is the sandbox's verdict on a candidate version: outcome (passed,
- * rejected or unavailable) and reason. promote refuses a version whose outcome is not passed.
- */
-object Catalog {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val ActiveKey = "catalog:active"
-  val PreviousKey = "catalog:previous"
-  val PinTtlSeconds: Long = 6L * 3600
-
-  /** The candidate has no passing validation: nothing was written. */
-  final class NotValidated(message: String) extends Exception(message)
-
-  def versionKey(cv: String): String = s"catalog:version:$cv"
-  def pinKey(runId: String): String = s"catalog:pin:$runId"
-  def validationKey(cv: String): String = s"catalog:validation:$cv"
-
-  /** Make catalog version cv (tool name -> entry) the one agents resolve. */
-  def promote(cv: String, entries: Map[String, JsObject]): Unit = {
-    if (!Option(jedis.hget(validationKey(cv), "outcome")).contains("passed"))
-      throw new NotValidated(s"catalog version $cv has no passing validation")
-    jedis.hset(versionKey(cv), entries.map { case (name, entry) => name -> entry.compactPrint }.asJava)
-    Option(jedis.get(ActiveKey)).filter(_ != cv).foreach(current => jedis.set(PreviousKey, current))
-    jedis.set(ActiveKey, cv)
-  }
-
-  /** Point the catalog back at the version the last promotion replaced; that version, if any. */
-  def rollback(): Option[String] =
-    Option(jedis.get(PreviousKey)).map { previous =>
-      jedis.set(ActiveKey, previous)
-      previous
-    }
-
-  /** Keep the run on catalog version cv for the rest of its plan. */
-  def pinRun(runId: String, cv: String): Unit = jedis.setex(pinKey(runId), PinTtlSeconds, cv)
-
-  /** The entry of tool name in the run's pinned version, else in the active one. */
-  def resolve(name: String, runId: Option[String] = None): Option[JsObject] =
-    runId
-      .flatMap(id => Option(jedis.get(pinKey(id))))
-      .orElse(Option(jedis.get(ActiveKey)))
-      .flatMap(cv => Option(jedis.hget(versionKey(cv), name)))
-      .map(_.parseJson.asJsObject)
-
-  /** Record the sandbox's verdict on candidate cv. */
-  def recordValidation(cv: String, outcome: String, reason: String): Unit =
-    jedis.hset(validationKey(cv), Map("outcome" -> outcome, "reason" -> reason).asJava)
-
-  /** The recorded verdict on cv (outcome, reason), if any. */
-  def validation(cv: String): Option[Map[String, String]] = {
-    val raw = jedis.hgetAll(validationKey(cv)).asScala.toMap
-    if (raw.isEmpty) None else Some(raw)
-  }
-}
 `,
 };

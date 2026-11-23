@@ -6,7 +6,7 @@ import {endpointStep} from './steps/endpoint';
 import {eventsStep} from './steps/events';
 import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Sandbox runner: the debugging an execution path needs before it runs model-authored code on a
@@ -99,6 +99,5 @@ delivery guarantees, and any UI.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

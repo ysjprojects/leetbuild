@@ -76,12 +76,6 @@ never hangs.
           ],
         },
         go: {all: [/Key:\s*msg\.Key/, /reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
-        scala: {
-          all: [
-            /new ProducerRecord(\[[^\]]*\])?\(\s*(Outbox|"outbox")\s*,\s*record\.key\(\)/,
-            /"enable\.auto\.commit"\s*,\s*"false"|ENABLE_AUTO_COMMIT_CONFIG\s*,\s*"false"/,
-          ],
-        },
         cpp: {
           all: [/producer->produce\(\s*(kOutbox|"outbox")\s*,/, /msg->key\(\)/, /"enable\.auto\.commit"\s*,\s*"false"/],
         },
@@ -107,13 +101,6 @@ never hangs.
         go: {
           all: [/func shutdown(?:(?!\n\})[\s\S])*?time\.After\(|context\.WithTimeout\(/, /Undelivered/, /Uncommitted/],
         },
-        scala: {
-          all: [
-            /def shutdown(?:(?!\n {2}def )[\s\S])*?producer\.close\(\s*(remaining|Duration)/,
-            /undelivered/,
-            /uncommitted/,
-          ],
-        },
         cpp: {all: [/void shutdown|Report shutdown/, /producer->flush\(\s*(?!\s*\))/, /undelivered/, /uncommitted/]},
       },
     },
@@ -126,12 +113,6 @@ never hangs.
         python: {all: [/"auto\.offset\.reset"\s*:\s*"earliest"/, /"group\.id"\s*:\s*(GROUP|"forwarder")/]},
         typescript: {all: [/fromBeginning:\s*true/, /groupId:\s*(GROUP|'forwarder')/]},
         go: {all: [/StartOffset:\s*kafka\.FirstOffset/, /GroupID:\s*(groupID|"forwarder")/]},
-        scala: {
-          all: [
-            /"auto\.offset\.reset"\s*,\s*"earliest"|AUTO_OFFSET_RESET_CONFIG\s*,\s*"earliest"/,
-            /"group\.id"\s*,\s*(Group|"forwarder")|GROUP_ID_CONFIG\s*,\s*(Group|"forwarder")/,
-          ],
-        },
         cpp: {all: [/"auto\.offset\.reset"\s*,\s*"earliest"/, /"group\.id"\s*,\s*(kGroup|"forwarder")/]},
       },
     },
@@ -144,7 +125,6 @@ never hangs.
         python: {all: [/producer\.produce\([\s\S]{0,500}?producer\.poll\(\s*0\s*\)[\s\S]{0,300}?commit\(/]},
         typescript: {all: [/await\s+(send|producer\.send\()[\s\S]{0,400}?commit\(/]},
         go: {order: [/writer\.WriteMessages\(/, /reader\.CommitMessages\(/]},
-        scala: {all: [/producer\.send\([\s\S]{0,600}?commit\(\)/]},
         cpp: {all: [/producer->produce\([\s\S]{0,500}?producer->poll\(\s*0\s*\)[\s\S]{0,300}?commit\(\)/]},
       },
     },
@@ -157,7 +137,6 @@ never hangs.
         python: {all: [/def shutdown\(\s*deadline_s/, /producer\.flush\(\s*[^)\n]*deadline_s/]},
         typescript: {all: [/function shutdown\(\s*deadlineS/, /Date\.now\(\)/, /clearTimeout\(/]},
         go: {all: [/func shutdown\(\s*deadline\s+time\.Duration/, /time\.Until\(|time\.Since\(/]},
-        scala: {all: [/def shutdown\(\s*deadline:\s*Duration/, /System\.nanoTime\(\)|Instant\.now\(\)/]},
         cpp: {all: [/shutdown\(\s*int\s+deadline_ms/, /steady_clock::now\(\)/]},
       },
     },
@@ -179,7 +158,6 @@ never hangs.
           ],
         },
         go: {order: [/reader\.CommitMessages\(/, /reader\.Close\(\)/, /writer\.Close\(\)/]},
-        scala: {order: [/consumer\.commitSync\(/, /consumer\.close\(\)/]},
         cpp: {order: [/consumer->commitSync\(/, /consumer->close\(\)/]},
       },
     },
@@ -704,172 +682,6 @@ func shutdown(deadline time.Duration) Report {
 		log.Printf("shutdown: %d forwards undelivered, %d records uncommitted — a restart forwards them again", report.Undelivered, report.Uncommitted)
 	}
 	return report
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.{Duration, Instant}
-import java.util.Properties
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.errors.WakeupException
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-/** Forwarder: inbox → handler → outbox, committed after the forward's ack; shutdown drains, commits and closes under a deadline. */
-object Forwarder {
-  val Inbox = "inbox"
-  val Outbox = "outbox"
-  val Group = "forwarder"
-
-  case class Report(forwarded: Int, committedOffsets: Map[Int, Long], undelivered: Int, uncommitted: Int)
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", Group)
-  // TODO: start at the earliest offset when the group has none; commit by hand, never on a timer
-  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  producerProps.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-  consumer.subscribe(List(Inbox).asJava)
-
-  private final class Entry(val partition: Int, val offset: Long) { @volatile var acked = false }
-
-  @volatile private var stopping = false
-  @volatile var forwarded = 0 // forwards the broker acknowledged since run() started
-  private val stopped = new CountDownLatch(1)
-  /** Per inbox partition: the records taken and not yet committed, in offset order. */
-  private val pending = mutable.Map[Int, mutable.Queue[Entry]]()
-  /** Per inbox partition: the next offset that is safe to commit (every earlier forward acknowledged). */
-  private val watermark = mutable.Map[Int, Long]()
-  private val committed = mutable.Map[Int, Long]()
-
-  /** Consume inbox until shutdown() stops it: handler → send to outbox (same key) → commit after the ack. */
-  def run(handler: ConsumerRecord[String, String] => String): Unit = {
-    stopping = false
-    try while (!stopping) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        // TODO: remember the record as pending, send handler(record) to Outbox keyed by record.key() with a callback that
-        //       marks it acknowledged, then commit the partition's watermark
-      }
-    } catch { case _: WakeupException => } // shutdown() woke the poll
-    finally stopped.countDown()
-  }
-
-  /** Stop taking records, flush with the time left, commit synchronously what is safe, close both clients; back within deadline. */
-  def shutdown(deadline: Duration): Report = {
-    ??? // TODO
-  }
-}
-`,
-      solution: `import java.time.{Duration, Instant}
-import java.util.Properties
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.errors.WakeupException
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-/** Forwarder: inbox → handler → outbox, committed after the forward's ack; shutdown drains, commits and closes under a deadline. */
-object Forwarder {
-  val Inbox = "inbox"
-  val Outbox = "outbox"
-  val Group = "forwarder"
-
-  case class Report(forwarded: Int, committedOffsets: Map[Int, Long], undelivered: Int, uncommitted: Int)
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", Group)
-  consumerProps.put("auto.offset.reset", "earliest")
-  consumerProps.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  producerProps.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-  consumer.subscribe(List(Inbox).asJava)
-
-  private final class Entry(val partition: Int, val offset: Long) { @volatile var acked = false }
-
-  @volatile private var stopping = false
-  @volatile var forwarded = 0 // forwards the broker acknowledged since run() started
-  private val stopped = new CountDownLatch(1)
-  /** Per inbox partition: the records taken and not yet committed, in offset order. */
-  private val pending = mutable.Map[Int, mutable.Queue[Entry]]()
-  /** Per inbox partition: the next offset that is safe to commit (every earlier forward acknowledged). */
-  private val watermark = mutable.Map[Int, Long]()
-  private val committed = mutable.Map[Int, Long]()
-
-  /** Move the partition's watermark over the leading run of acknowledged records; the first unacked one blocks it. */
-  private def advance(partition: Int): Unit = pending.synchronized {
-    val queue = pending(partition)
-    while (queue.nonEmpty && queue.head.acked) watermark(partition) = queue.dequeue().offset + 1
-  }
-
-  private def commit(): Unit = {
-    val due = watermark.filter { case (p, off) => !committed.get(p).contains(off) }
-    if (due.nonEmpty) {
-      consumer.commitSync(due.map { case (p, off) => new TopicPartition(Inbox, p) -> new OffsetAndMetadata(off) }.asJava)
-      committed ++= due
-    }
-  }
-
-  /** Consume inbox until shutdown() stops it: handler → send to outbox (same key) → commit after the ack. */
-  def run(handler: ConsumerRecord[String, String] => String): Unit = {
-    stopping = false
-    try while (!stopping) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        val entry = new Entry(record.partition(), record.offset())
-        pending.synchronized(pending.getOrElseUpdate(entry.partition, mutable.Queue()).enqueue(entry))
-        val value = handler(record)
-        producer.send(new ProducerRecord[String, String](Outbox, record.key(), value), new Callback {
-          override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-            if (exception == null) { entry.acked = true; forwarded += 1 }
-            else System.err.println(s"inbox[\${entry.partition}]@\${entry.offset} not forwarded: \${exception.getMessage}")
-        })
-        advance(entry.partition)
-        commit()
-      }
-    } catch { case _: WakeupException => } // shutdown() woke the poll
-    finally stopped.countDown()
-  }
-
-  /** Stop taking records, flush with the time left, commit synchronously what is safe, close both clients; back within deadline. */
-  def shutdown(deadline: Duration): Report = {
-    val deadlineAt = Instant.now().plus(deadline)
-    def remaining: Duration = { val left = Duration.between(Instant.now(), deadlineAt); if (left.isNegative) Duration.ZERO else left }
-    stopping = true
-    consumer.wakeup() // no more records; the one in hand runs on
-    stopped.await(remaining.toMillis, TimeUnit.MILLISECONDS)
-    producer.close(remaining) // the timed flush: a dead broker costs the deadline, not delivery.timeout.ms
-    pending.keys.foreach(advance)
-    commit()
-    val undelivered = pending.synchronized(pending.values.map(_.count(!_.acked)).sum)
-    val uncommitted = pending.synchronized(pending.values.map(_.size).sum)
-    consumer.close()
-    if (undelivered > 0 || uncommitted > 0)
-      System.err.println(s"shutdown: $undelivered forwards undelivered, $uncommitted records uncommitted — a restart forwards them again")
-    Report(forwarded, watermark.toMap, undelivered, uncommitted)
-  }
 }
 `,
     },

@@ -56,7 +56,6 @@ service Notifier {
           all: [/\.NotifyAttendees\([\s\S]{0,200}?deadline:\s*Date\.now\(\)\s*\+\s*(NOTIFY_DEADLINE_MS|3000)\b/],
         },
         go: {all: [/context\.WithTimeout\([^\n]*(notifyDeadline|3\s*\*\s*time\.Second|3000\s*\*\s*time\.Millisecond)/]},
-        scala: {all: [/withDeadlineAfter\(\s*(NotifyDeadlineMs|3000L?|3L?\s*,\s*TimeUnit\.SECONDS)/]},
         cpp: {
           all: [
             /set_deadline\([^\n]*(kNotifyDeadline|std::chrono::seconds[({]\s*3\s*[)}]|std::chrono::milliseconds[({]\s*3000\s*[)}])/,
@@ -82,10 +81,6 @@ service Notifier {
           all: [/Sprintf\(\s*"%s:%d:%s"\s*,\s*\w+\.EventID\s*,\s*\w+\.Revision\s*,\s*kind\s*\)/],
           none: [/IdempotencyToken:\s*store\.NewID\(\)/],
         },
-        scala: {
-          all: [/s"\$\{\w+\.event_id\}:\$\{\w+\.revision\}:\$kind"/],
-          none: [/idempotencyToken\s*=\s*Store\.newId\(\)/],
-        },
         cpp: {
           all: [/event_id\s*\+\s*":"\s*\+\s*std::to_string\(\s*\w+\.revision\s*\)\s*\+\s*":"\s*\+\s*kind/],
           none: [/set_idempotency_token\(\s*calendard::NewId\(\)\s*\)/],
@@ -101,7 +96,6 @@ service Notifier {
         python: {all: [/["']update["']/, /in before\[["']attendees["']\]/]},
         typescript: {all: [/['"]update['"]/, /before\.attendees\.includes\(/]},
         go: {all: [/"update"/, /before\.Attendees/]},
-        scala: {all: [/"update"/, /\.attendees\.contains/]},
         cpp: {all: [/"update"/, /before->attendees/]},
       },
     },
@@ -114,7 +108,6 @@ service Notifier {
         python: {all: [/["']cancel["']/, /not in after\[["']attendees["']\]/]},
         typescript: {all: [/['"]cancel['"]/, /!after\.attendees\.includes\(/]},
         go: {all: [/"cancel"/, /range before\.Attendees/]},
-        scala: {all: [/"cancel"/, /filterNot\(\s*after\.attendees\.contains/]},
         cpp: {all: [/"cancel"/, /:\s*before->attendees/]},
       },
     },
@@ -481,110 +474,6 @@ func notifyChange(ctx context.Context, before *store.Event, after store.Event) (
 		}
 	}
 	return len(plan), nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import calendard.{Event, Store}
-import calnotify.calendar_service.{NotifierGrpc, NotifyRequest}
-
-object NotifyClient {
-  val MaxAttempts = 3
-  private val Retryable = Set(Status.Code.DEADLINE_EXCEEDED, Status.Code.UNAVAILABLE)
-
-  private val channel = ManagedChannelBuilder.forAddress("notifier", 9000).usePlaintext().build()
-  private val stub = NotifierGrpc.blockingStub(channel)
-
-  /** One notification, retried while the notifier times out or is unavailable. */
-  def sendNotice(event: Event, kind: String, attendees: Seq[String]): Unit = {
-    var attempt = 0
-    var sent = false
-    while (!sent) {
-      attempt += 1
-      val request = NotifyRequest(
-        eventId = event.event_id,
-        revision = event.revision,
-        kind = kind,
-        attendees = attendees,
-        idempotencyToken = Store.newId(),
-        title = event.title,
-        dtstart = event.dtstart
-      )
-      try {
-        stub.notifyAttendees(request)
-        sent = true
-      } catch {
-        case e: StatusRuntimeException if Retryable(e.getStatus.getCode) && attempt < MaxAttempts => ()
-      }
-    }
-  }
-
-  /** Tell the attendees about a committed change (before is None for a create); the number of notifications sent. */
-  def notifyChange(before: Option[Event], after: Event): Int = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    sendNotice(after, "create", after.attendees)
-    1
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import calendard.Event
-import calnotify.calendar_service.{NotifierGrpc, NotifyRequest}
-
-object NotifyClient {
-  val NotifyDeadlineMs = 3000L
-  val MaxAttempts = 3
-  private val Retryable = Set(Status.Code.DEADLINE_EXCEEDED, Status.Code.UNAVAILABLE)
-
-  private val channel = ManagedChannelBuilder.forAddress("notifier", 9000).usePlaintext().build()
-  private val stub = NotifierGrpc.blockingStub(channel)
-
-  /** One notification, retried while the notifier times out or is unavailable. */
-  def sendNotice(event: Event, kind: String, attendees: Seq[String]): Unit = {
-    // The token names the change, not the attempt: a retry after a lost reply is the same mail.
-    val request = NotifyRequest(
-      eventId = event.event_id,
-      revision = event.revision,
-      kind = kind,
-      attendees = attendees,
-      idempotencyToken = s"\${event.event_id}:\${event.revision}:$kind",
-      title = event.title,
-      dtstart = event.dtstart
-    )
-    var attempt = 0
-    var sent = false
-    while (!sent) {
-      attempt += 1
-      try {
-        stub.withDeadlineAfter(NotifyDeadlineMs, TimeUnit.MILLISECONDS).notifyAttendees(request)
-        sent = true
-      } catch {
-        case e: StatusRuntimeException if Retryable(e.getStatus.getCode) && attempt < MaxAttempts => ()
-      }
-    }
-  }
-
-  /** Who hears what: an invitation for a new attendee, an update for one who stays, a cancel for one removed. */
-  def changePlan(before: Option[Event], after: Event): Seq[(String, Seq[String])] = before match {
-    case None => Seq("create" -> after.attendees)
-    case Some(previous) =>
-      val kept = after.attendees.filter(previous.attendees.contains)
-      val added = after.attendees.filterNot(previous.attendees.contains)
-      val removed = previous.attendees.filterNot(after.attendees.contains)
-      Seq("update" -> kept, "create" -> added, "cancel" -> removed).filter(_._2.nonEmpty)
-  }
-
-  /** Tell the attendees about a committed change (before is None for a create); the number of notifications sent. */
-  def notifyChange(before: Option[Event], after: Event): Int = {
-    val plan = changePlan(before, after)
-    for ((kind, attendees) <- plan) sendNotice(after, kind, attendees)
-    plan.size
-  }
 }
 `,
     },

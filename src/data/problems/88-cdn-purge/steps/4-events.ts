@@ -57,7 +57,6 @@ failover loses one; and a delivery the broker refuses after \`produce\` returned
         python: {all: [/key\s*=\s*domain\b/], none: [/key\s*=\s*purge_id\b/]},
         typescript: {all: [/key:\s*domain\b/], none: [/key:\s*purgeId\b/]},
         go: {all: [/Key:\s*\[\]byte\(domain\)/], none: [/Key:\s*\[\]byte\(purgeID\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*domain\b/], none: [/Topic,\s*purgeId\b/]},
         cpp: {all: [/domain\.c_str\(\),\s*domain\.size\(\)/], none: [/purge_id\.c_str\(\),\s*purge_id\.size\(\)/]},
       },
     },
@@ -70,7 +69,6 @@ failover loses one; and a delivery the broker refuses after \`produce\` returned
         python: {all: [/hashlib\.sha256\(/], none: [/uuid/]},
         typescript: {all: [/createHash\(\s*['"]sha256['"]\s*\)/], none: [/randomUUID/]},
         go: {all: [/sha256\.Sum256\(/], none: [/uuid\./]},
-        scala: {all: [/MessageDigest\.getInstance\(\s*"SHA-256"\s*\)/], none: [/UUID\.randomUUID/]},
         cpp: {all: [/SHA256\(/], none: [/uuid_generate/]},
       },
     },
@@ -83,7 +81,6 @@ failover loses one; and a delivery the broker refuses after \`produce\` returned
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["'](all|-1)["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"(all|-1)"/]},
-        scala: {all: [/put\("enable\.idempotence",\s*"true"\)/, /put\("acks",\s*"(all|-1)"\)/]},
         cpp: {all: [/set\("enable\.idempotence",\s*"true"/, /set\("acks",\s*"(all|-1)"/]},
       },
     },
@@ -96,7 +93,6 @@ failover loses one; and a delivery the broker refuses after \`produce\` returned
         python: {all: [/records\.insert_outbox\(/, /on_delivery\s*=/, /\.flush\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/], none: [/void producer\.send\(/]},
         go: {all: [/records\.InsertOutbox\(/, /TopicPartition\.Error/, /time\.After\(/]},
-        scala: {all: [/Records\.insertOutbox\(/, /\.get\([^\n]*TimeUnit/]},
         cpp: {all: [/records::insertOutbox\(/, /dr_cb/, /->flush\(/]},
       },
     },
@@ -407,108 +403,6 @@ func publishOutcomes(ctx context.Context, purgeID, domain string, outcomes map[s
 		}
 	}
 	return len(acked), nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.{Properties, UUID}
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import purge.Records // Records.insertOutbox
-
-object PurgeEvents {
-  val Topic = "cdn.purged"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** One cdn.purged event: what became of one path of one purge. */
-  def purgeEvent(purgeId: String, domain: String, path: String, outcome: String): JsObject = JsObject(
-    "event_id" -> JsString(UUID.randomUUID().toString),
-    "purge_id" -> JsString(purgeId),
-    "domain" -> JsString(domain),
-    "path" -> JsString(path),
-    "outcome" -> JsString(outcome)
-  )
-
-  /** Publish one event per path of the purge; the number of events the broker acknowledged. */
-  def publishOutcomes(purgeId: String, domain: String, outcomes: Map[String, String]): Int = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    outcomes.toSeq.count { case (path, outcome) =>
-      val event = purgeEvent(purgeId, domain, path, outcome)
-      try {
-        producer.send(new ProducerRecord[String, String](Topic, purgeId, event.compactPrint))
-        true
-      } catch {
-        case _: KafkaException =>
-          Records.insertOutbox(Topic, purgeId, event)
-          false
-      }
-    }
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
-import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import purge.Records // Records.insertOutbox
-
-object PurgeEvents {
-  val Topic = "cdn.purged"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def pathDigest(path: String): String =
-    MessageDigest.getInstance("SHA-256").digest(path.getBytes(StandardCharsets.UTF_8)).map("%02x".format(_)).mkString
-
-  /** One cdn.purged event: what became of one path of one purge, with the same id however often it is published. */
-  def purgeEvent(purgeId: String, domain: String, path: String, outcome: String): JsObject = {
-    val digest = pathDigest(path)
-    JsObject(
-      "event_id" -> JsString(s"$purgeId:$digest"),
-      "purge_id" -> JsString(purgeId),
-      "domain" -> JsString(domain),
-      "path" -> JsString(path),
-      "path_digest" -> JsString(digest),
-      "outcome" -> JsString(outcome)
-    )
-  }
-
-  /** Publish one event per path of the purge; the number of events the broker acknowledged. */
-  def publishOutcomes(purgeId: String, domain: String, outcomes: Map[String, String]): Int = {
-    val events = outcomes.toSeq.map { case (path, outcome) => purgeEvent(purgeId, domain, path, outcome) }
-    val sends = events.map(event => event -> producer.send(new ProducerRecord[String, String](Topic, domain, event.compactPrint)))
-    val deadline = System.currentTimeMillis() + AckTimeoutMs
-    sends.count { case (event, sent) =>
-      val acked = Try(sent.get(math.max(0L, deadline - System.currentTimeMillis()), TimeUnit.MILLISECONDS)).isSuccess
-      // The broker did not take it: the relay publishes it later, and the projector dedupes on event_id.
-      if (!acked) Records.insertOutbox(Topic, domain, event)
-      acked
-    }
-  }
 }
 `,
     },

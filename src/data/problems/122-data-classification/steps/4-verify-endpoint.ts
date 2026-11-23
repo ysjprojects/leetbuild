@@ -51,7 +51,6 @@ the library is a tier nobody defined; and a verification with no audit entry can
         python: {all: [/@app\.post\(\s*["']\/v1\/entities\/\{entity_id\}\/verify["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/entities\/:entityId\/verify['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/entities\/\{entity_id\}\/verify"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"entities"\s*\/\s*Segment\s*\/\s*"verify"\s*\)/]},
         cpp: {all: [/svr\.Post\(\s*R"\(\/v1\/entities\/\(\[\^\/\]\+\)\/verify\)"/]},
       },
     },
@@ -64,7 +63,6 @@ the library is a tier nobody defined; and a verification with no audit entry can
         python: {all: [/\b403\b/, /\[["']owner["']\]/]},
         typescript: {all: [/\b403\b/, /\.owner\b/]},
         go: {all: [/StatusForbidden/, /\.Owner\b/]},
-        scala: {all: [/StatusCodes\.Forbidden/, /\.owner\b/]},
         cpp: {all: [/\b403\b/, /->owner\b/]},
       },
     },
@@ -77,7 +75,6 @@ the library is a tier nobody defined; and a verification with no audit entry can
         python: {all: [/PRIVACY_RULES/, /derive_tier\(/], none: [/body\.get\(\s*["']tier["']/, /body\[["']tier["']\]/]},
         typescript: {all: [/PRIVACY_RULES/, /deriveTier\(/], none: [/body\.tier\b/, /\[['"]tier['"]\]/]},
         go: {all: [/privacyRules/, /deriveTier\(/], none: [/body\.Tier\b/]},
-        scala: {all: [/PrivacyRules/, /deriveTier\(/], none: [/body\.get\("tier"\)/, /body\("tier"\)/]},
         cpp: {all: [/kPrivacyRules/, /deriveTier\(/], none: [/value\("tier"/, /body\["tier"\]/]},
       },
     },
@@ -90,7 +87,6 @@ the library is a tier nobody defined; and a verification with no audit entry can
         python: {all: [/taxonomy\.known\(/, /\b400\b/]},
         typescript: {all: [/\bknown\(/, /\b400\b/]},
         go: {all: [/taxonomy\.Known\(/, /StatusBadRequest/]},
-        scala: {all: [/Taxonomy\.known\b/, /StatusCodes\.BadRequest/]},
         cpp: {all: [/taxonomy::known\(/, /\b400\b/]},
       },
     },
@@ -103,7 +99,6 @@ the library is a tier nobody defined; and a verification with no audit entry can
         python: {all: [/store\.audit\(/, /["']verified_by["']/]},
         typescript: {all: [/\baudit\(/, /verified_by/]},
         go: {all: [/store\.Audit\(/, /"verified_by"/]},
-        scala: {all: [/Store\.audit\(/, /"verified_by"/]},
         cpp: {all: [/store::audit\(/, /"verified_by"/]},
       },
     },
@@ -415,115 +410,6 @@ func verifyEntity(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/entities/{entity_id}/verify", verifyEntity)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import metasense.{Store, Taxonomy} // Store.pending, recordVerification, audit; Taxonomy.known
-
-object VerifyApi {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def tagsOf(value: Option[JsValue]): Map[String, String] = value match {
-    case Some(JsObject(fields)) => fields.collect { case (c, JsString(t)) => c -> t }
-    case _                      => Map.empty
-  }
-
-  val route: Route = path("v1" / "entities" / Segment / "verify") { entityId =>
-    post {
-      optionalHeaderValueByName("X-User-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-User-Id is required")
-        case Some(user) =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            Store.pending(entityId) match {
-              case None => complete(StatusCodes.NotFound -> "nothing waits for verification")
-              case Some(open) =>
-                val body = raw.parseJson.asJsObject.fields
-                val tags = if (body.get("action").contains(JsString("edit"))) open.tags ++ tagsOf(body.get("tags")) else open.tags
-                val tier = body.get("tier").collect { case JsNumber(n) => n.toInt }.getOrElse(4)
-                val version = Store.recordVerification(entityId, tags, tier, user)
-                val answer = JsObject(
-                  "entity" -> JsString(entityId),
-                  "tier" -> JsNumber(tier),
-                  "tags" -> JsObject(tags.map { case (c, t) => c -> JsString(t) }),
-                  "version" -> JsNumber(version)
-                )
-                complete(json(StatusCodes.OK, answer))
-            }
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import metasense.{Store, Taxonomy} // Store.pending, recordVerification, audit; Taxonomy.known
-
-object VerifyApi {
-  /** The privacy office's rules, most sensitive first: the first tier whose tags appear wins. */
-  val PrivacyRules: Seq[(Int, Set[String])] = Seq(
-    1 -> Set("Personal.ID"),
-    2 -> Set("Personal.Name", "Personal.Contact_Info"),
-    3 -> Set("Geo.Geohash")
-  )
-  val LeastSensitiveTier = 4
-  val Actions = Set("ack", "edit")
-
-  def deriveTier(tags: Map[String, String]): Int =
-    PrivacyRules.collectFirst { case (tier, sensitive) if tags.values.exists(sensitive.contains) => tier }.getOrElse(LeastSensitiveTier)
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "entities" / Segment / "verify") { entityId =>
-    post {
-      optionalHeaderValueByName("X-User-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-User-Id is required")
-        case Some(user) =>
-          entity(as[String]) { raw =>
-            Store.pending(entityId) match {
-              case None                             => complete(StatusCodes.NotFound -> "nothing waits for verification")
-              case Some(open) if open.owner != user => complete(StatusCodes.Forbidden -> "only the owner verifies an entity")
-              case Some(open) =>
-                val body = raw.parseJson.asJsObject.fields
-                val action = body.get("action").collect { case JsString(a) => a }.getOrElse("")
-                val edits = body.get("tags") match {
-                  case Some(JsObject(fields)) if action == "edit" => fields.toSeq.map { case (c, t) => c -> t }
-                  case _                                          => Seq.empty
-                }
-                val known = edits.collect { case (c, JsString(t)) if Taxonomy.known(t) => c -> t }
-                if (!Actions.contains(action)) complete(StatusCodes.BadRequest -> "action is ack or edit")
-                else if (known.size != edits.size) complete(StatusCodes.BadRequest -> "every tag must be in the tag library")
-                else {
-                  val tags = open.tags ++ known
-                  val tier = deriveTier(tags) // access control reads the tier: it is computed, never taken from the caller
-                  val version = Store.recordVerification(entityId, tags, tier, user)
-                  Store.audit(entityId, user, action)
-                  val answer = JsObject(
-                    "entity" -> JsString(entityId),
-                    "tier" -> JsNumber(tier),
-                    "tags" -> JsObject(tags.map { case (c, t) => c -> JsString(t) }),
-                    "verified_by" -> JsString(user),
-                    "version" -> JsNumber(version)
-                  )
-                  complete(json(StatusCodes.OK, answer))
-                }
-            }
-          }
-      }
-    }
-  }
 }
 `,
     },

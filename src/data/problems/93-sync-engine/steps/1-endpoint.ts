@@ -48,7 +48,6 @@ client with no device id is accepted.
         python: {all: [/@app\.post\(\s*["']\/v1\/sync\/push["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/sync\/push['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/sync\/push"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"sync"\s*\/\s*"push"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/sync\/push"/]},
       },
     },
@@ -61,7 +60,6 @@ client with no device id is accepted.
         python: {all: [/apply_change\(/, /current_revision/], none: [/store\.overwrite\(/]},
         typescript: {all: [/applyChange\(/, /current_revision/], none: [/\boverwrite\(/]},
         go: {all: [/revisions\.ApplyChange\(/, /current_revision/], none: [/store\.Overwrite\(/]},
-        scala: {all: [/Revisions\.applyChange\(/, /current_revision/], none: [/Store\.overwrite\(/]},
         cpp: {all: [/revisions::applyChange\(/, /current_revision/], none: [/store::overwrite\(/]},
       },
     },
@@ -77,10 +75,6 @@ client with no device id is accepted.
           all: [/store\.ContentHash\(/, /StatusBadRequest|\b400\b/],
           order: [/store\.ContentHash\(/, /revisions\.ApplyChange\(/],
         },
-        scala: {
-          all: [/Store\.contentHash\(/, /BadRequest|\b400\b/],
-          order: [/Store\.contentHash\(/, /Revisions\.applyChange\(/],
-        },
         cpp: {all: [/store::contentHash\(/, /\b400\b/], order: [/store::contentHash\(/, /revisions::applyChange\(/]},
       },
     },
@@ -92,7 +86,6 @@ client with no device id is accepted.
         python: {all: [/MAX_CHANGES/, /\b413\b/]},
         typescript: {all: [/MAX_CHANGES/, /\b413\b/]},
         go: {all: [/maxChanges/, /StatusRequestEntityTooLarge|\b413\b/]},
-        scala: {all: [/MaxChanges/, /PayloadTooLarge|RequestEntityTooLarge|\b413\b/]},
         cpp: {all: [/kMaxChanges/, /\b413\b/]},
       },
     },
@@ -105,7 +98,6 @@ client with no device id is accepted.
         python: {all: [/\b401\b/]},
         typescript: {all: [/\b401\b/]},
         go: {all: [/StatusUnauthorized|\b401\b/]},
-        scala: {all: [/Unauthorized|\b401\b/]},
         cpp: {all: [/\b401\b/]},
       },
     },
@@ -404,113 +396,6 @@ func push(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/sync/push", push)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import docsync.{Revisions, Store} // Store.contentHash, overwrite; Revisions.applyChange (step 2) applies a change only against the revision it edited
-
-object Api {
-  final case class Change(docId: String, baseRevision: Long, contentHash: String, body: String)
-
-  private val HashPattern = "^[0-9a-f]{64}$".r
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def changesOf(raw: String): Vector[Change] =
-    raw.parseJson.asJsObject.fields.get("changes") match {
-      case Some(JsArray(items)) =>
-        items.map { item =>
-          val fields = item.asJsObject.fields
-          def text(name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-          Change(text("doc_id"), fields.get("base_revision").collect { case JsNumber(n) => n.toLong }.getOrElse(0L), text("content_hash"), text("body"))
-        }
-      case _ => Vector.empty
-    }
-
-  val route: Route = path("v1" / "sync" / "push") {
-    post {
-      headerValueByName("X-Device-Id") { device =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val applied = Vector.newBuilder[JsObject]
-          var badHash: Option[String] = None
-          for (c <- changesOf(raw) if badHash.isEmpty) {
-            if (HashPattern.findFirstIn(c.contentHash).isEmpty) badHash = Some(c.docId)
-            else applied += JsObject("doc_id" -> JsString(c.docId), "revision" -> JsNumber(Store.overwrite(c.docId, c.contentHash, c.body, device)))
-          }
-          badHash match {
-            case Some(docId) => complete(json(StatusCodes.BadRequest, JsObject("error" -> JsString("bad_hash"), "doc_id" -> JsString(docId))))
-            case None => complete(json(StatusCodes.OK, JsObject("applied" -> JsArray(applied.result()), "conflicts" -> JsArray())))
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import docsync.{Revisions, Store} // Store.contentHash, overwrite; Revisions.applyChange (step 2) applies a change only against the revision it edited
-
-object Api {
-  final case class Change(docId: String, baseRevision: Long, contentHash: String, body: String)
-
-  val MaxChanges = 500
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def changesOf(raw: String): Vector[Change] =
-    raw.parseJson.asJsObject.fields.get("changes") match {
-      case Some(JsArray(items)) =>
-        items.map { item =>
-          val fields = item.asJsObject.fields
-          def text(name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-          Change(text("doc_id"), fields.get("base_revision").collect { case JsNumber(n) => n.toLong }.getOrElse(0L), text("content_hash"), text("body"))
-        }
-      case _ => Vector.empty
-    }
-
-  val route: Route = path("v1" / "sync" / "push") {
-    post {
-      optionalHeaderValueByName("X-Device-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("missing_device"))))
-        case Some(device) =>
-          entity(as[String]) { raw =>
-            val changes = changesOf(raw)
-            if (changes.size > MaxChanges) {
-              complete(json(StatusCodes.PayloadTooLarge, JsObject("error" -> JsString("too_many_changes"), "max" -> JsNumber(MaxChanges))))
-            } else {
-              // Every hash is checked before anything is written: a batch is accepted whole or not at all.
-              changes.find(c => Store.contentHash(c.body) != c.contentHash) match {
-                case Some(corrupt) => complete(json(StatusCodes.BadRequest, JsObject("error" -> JsString("hash_mismatch"), "doc_id" -> JsString(corrupt.docId))))
-                case None => complete(json(StatusCodes.OK, applyAll(changes, device)))
-              }
-            }
-          }
-      }
-    }
-  }
-
-  private def applyAll(changes: Vector[Change], device: String): JsObject = {
-    val outcomes = changes.map(c => c -> Revisions.applyChange(c.docId, c.baseRevision, c.contentHash, c.body, device))
-    val applied = outcomes.collect { case (c, o) if o.status != "conflict" => JsObject("doc_id" -> JsString(c.docId), "revision" -> JsNumber(o.revision)) }
-    val conflicts = outcomes.collect {
-      case (c, o) if o.status == "conflict" =>
-        JsObject("doc_id" -> JsString(c.docId), "base_revision" -> JsNumber(c.baseRevision), "current_revision" -> JsNumber(o.revision))
-    }
-    JsObject("applied" -> JsArray(applied), "conflicts" -> JsArray(conflicts))
-  }
 }
 `,
     },

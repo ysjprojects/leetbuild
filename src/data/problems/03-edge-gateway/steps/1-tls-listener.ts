@@ -34,8 +34,8 @@ Stand up the gateway process itself: the TLS listener every other step plugs int
   },
   hints: [
     'Three independent pieces: the TLS settings live on the server/engine configuration, HSTS is a middleware (or post-routing hook) so no route can forget it, and shutdown is a signal handler that calls the server’s own graceful stop.',
-    'Minimum TLS version is a property of the TLS context (`MinVersion`, `minimum_version`, enabled protocols on the `SSLEngine`, `SSL_CTX_set_min_proto_version`) — not something you check per request.',
-    'Graceful stop = close the listening socket, then wait for open connections with a deadline: `srv.Shutdown(ctx)` with a 10 s context, uvicorn’s `timeout_graceful_shutdown` + `handle_exit`, Pekko’s `addToCoordinatedShutdown(hardTerminationDeadline)`, or `svr.stop()` plus a bounded `wait_for` on the serving thread.',
+    'Minimum TLS version is a property of the TLS context (`MinVersion`, `minimum_version`, `SSL_CTX_set_min_proto_version`) — not something you check per request.',
+    'Graceful stop = close the listening socket, then wait for open connections with a deadline: `srv.Shutdown(ctx)` with a 10 s context, uvicorn’s `timeout_graceful_shutdown` + `handle_exit`, or `svr.stop()` plus a bounded `wait_for` on the serving thread.',
   ],
   checks: [
     {
@@ -47,7 +47,6 @@ Stand up the gateway process itself: the TLS listener every other step plugs int
         python: {all: [/@app\.get\(\s*["']\/healthz["']\s*\)/, /"ok":\s*True/]},
         typescript: {all: [/\.get\(\s*['"]\/healthz['"]/, /ok:\s*true/]},
         go: {all: [/HandleFunc\(\s*"GET \/healthz"/, /"ok":\s*true/]},
-        scala: {all: [/path\(\s*"healthz"\s*\)/, /"ok":\s*true/]},
         cpp: {all: [/svr\.Get\(\s*"\/healthz"/, /"ok":\s*true/]},
       },
     },
@@ -60,7 +59,6 @@ Stand up the gateway process itself: the TLS listener every other step plugs int
         python: {all: [/minimum_version\s*=\s*ssl\.TLSVersion\.TLSv1_2/]},
         typescript: {all: [/minVersion:\s*['"]TLSv1\.2['"]/]},
         go: {all: [/MinVersion:\s*tls\.VersionTLS12/]},
-        scala: {all: [/setEnabledProtocols\([^\n]*"TLSv1\.2"/], none: [/"TLSv1"|"TLSv1\.1"|"SSLv3"/]},
         cpp: {all: [/SSL_CTX_set_min_proto_version\([^\n]*TLS1_2_VERSION/]},
       },
     },
@@ -73,7 +71,6 @@ Stand up the gateway process itself: the TLS listener every other step plugs int
         python: {all: [/@app\.middleware\(\s*["']http["']\s*\)/, /Strict-Transport-Security/i, /max-age=63072000/]},
         typescript: {all: [/addHook\(\s*['"]onSend['"]/, /Strict-Transport-Security/i, /max-age=63072000/]},
         go: {all: [/Handler:\s*hsts\(\s*mux\s*\)/, /Strict-Transport-Security/i, /max-age=63072000/]},
-        scala: {all: [/respondWithHeaders?\(/, /Strict-Transport-Security/i, /max-age=63072000/]},
         cpp: {all: [/set_post_routing_handler\(/, /Strict-Transport-Security/i, /max-age=63072000/]},
       },
     },
@@ -86,7 +83,6 @@ Stand up the gateway process itself: the TLS listener every other step plugs int
         python: {all: [/signal\.SIGTERM/, /handle_exit/]},
         typescript: {all: [/process\.(on|once)\(\s*['"]SIGTERM['"]/, /app\.close\(\)/]},
         go: {all: [/signal\.Notify(Context)?\([^\n]*syscall\.SIGTERM/, /srv\.Shutdown\(/]},
-        scala: {all: [/addToCoordinatedShutdown\(|sys\.addShutdownHook/]},
         cpp: {all: [/SIGTERM/, /svr\.stop\(\)/]},
       },
     },
@@ -99,11 +95,6 @@ Stand up the gateway process itself: the TLS listener every other step plugs int
         python: {all: [/timeout_graceful_shutdown\s*=\s*(DRAIN_S|10)\b/]},
         typescript: {all: [/setTimeout\([^\n]*(DRAIN_MS|10_?000)\s*\)/]},
         go: {all: [/context\.WithTimeout\([^\n]*(drainTimeout|10\s*\*\s*time\.Second)\s*\)/]},
-        scala: {
-          all: [
-            /hardTerminationDeadline\s*=\s*(DrainTimeout|10\.seconds)|terminate\(\s*(DrainTimeout|10\.seconds)\s*\)/,
-          ],
-        },
         cpp: {all: [/wait_for\(\s*(kDrainTimeout|std::chrono::seconds[({]\s*10\s*[)}]|10s)\s*\)/]},
       },
     },
@@ -335,89 +326,6 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Printf("drain incomplete: %v", err)
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import gateway.Tls
-import javax.net.ssl.SSLContext
-
-import scala.concurrent.duration._
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-object GatewayServer {
-  val Port = 8443
-  val DrainTimeout: FiniteDuration = 10.seconds
-
-  /** SSLContext loaded from the PEM files (provided). */
-  def serverContext(cert: String, key: String): SSLContext = Tls.serverContext(cert, key)
-
-  val route: Route =
-    // TODO: respondWithHeader Strict-Transport-Security: max-age=63072000 around every route
-    // TODO: GET /healthz → {"ok":true}
-    complete(StatusCodes.NotImplemented)
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("gateway")
-    import system.dispatcher
-    val ctx = serverContext("cert.pem", "key.pem")
-    // TODO: build the HttpsConnectionContext from an SSLEngine limited to TLSv1.2 and TLSv1.3
-    val https = ConnectionContext.httpsServer(ctx)
-    val binding = Http().newServerAt("0.0.0.0", Port).enableHttps(https).bind(route)
-    // TODO: on SIGTERM unbind and drain for at most DrainTimeout (coordinated shutdown)
-    binding.foreach(_ => println(s"listening on $Port"))
-  }
-}
-`,
-      solution: `import gateway.Tls
-import javax.net.ssl.SSLContext
-
-import scala.concurrent.duration._
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-object GatewayServer {
-  val Port = 8443
-  val DrainTimeout: FiniteDuration = 10.seconds
-
-  /** SSLContext loaded from the PEM files (provided). */
-  def serverContext(cert: String, key: String): SSLContext = Tls.serverContext(cert, key)
-
-  val route: Route =
-    respondWithHeader(RawHeader("Strict-Transport-Security", "max-age=63072000")) {
-      path("healthz") {
-        get {
-          complete(HttpEntity(ContentTypes.\`application/json\`, """{"ok":true}"""))
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("gateway")
-    import system.dispatcher
-    val ctx = serverContext("cert.pem", "key.pem")
-    val https = ConnectionContext.httpsServer { () =>
-      val engine = ctx.createSSLEngine()
-      engine.setUseClientMode(false)
-      engine.setEnabledProtocols(Array("TLSv1.2", "TLSv1.3"))
-      engine
-    }
-    val binding = Http().newServerAt("0.0.0.0", Port).enableHttps(https).bind(route)
-    // SIGTERM runs the JVM shutdown hook → CoordinatedShutdown: unbind first, then terminate
-    // once in-flight requests are done or DrainTimeout has passed.
-    binding.foreach(_.addToCoordinatedShutdown(hardTerminationDeadline = DrainTimeout))
-  }
 }
 `,
     },

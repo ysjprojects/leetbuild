@@ -73,7 +73,6 @@ bypasses the check.
         python: {all: [/CheckGuardrails\([\s\S]{0,200}?timeout\s*=/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+/]},
         go: {all: [/context\.WithTimeout\(/]},
-        scala: {all: [/withDeadlineAfter\(/]},
         cpp: {all: [/set_deadline\(/]},
       },
     },
@@ -86,7 +85,6 @@ bypasses the check.
         python: {all: [/\b503\b/], none: [/verdict\s*=\s*None/]},
         typescript: {all: [/\b503\b/], none: [/verdict\s*=\s*null/]},
         go: {all: [/StatusServiceUnavailable|\b503\b/], none: [/verdict\s*=\s*nil/]},
-        scala: {all: [/ServiceUnavailable|\b503\b/]},
         cpp: {all: [/\b503\b/]},
       },
     },
@@ -99,7 +97,6 @@ bypasses the check.
         python: {all: [/set_status\([^\n]*["']paused["']/, /observed/]},
         typescript: {all: [/setStatus\([^\n]*['"]paused['"]/, /observed/]},
         go: {all: [/SetStatus\([^\n]*"paused"/, /observed/]},
-        scala: {all: [/setStatus\([^\n]*"paused"/, /observed/]},
         cpp: {all: [/setStatus\([^\n]*"paused"/, /observed/]},
       },
     },
@@ -112,7 +109,6 @@ bypasses the check.
         python: {all: [/OVERRIDE_FIELDS/], none: [/\.get\(\s*["']skip_guardrails["']\s*\)/]},
         typescript: {all: [/OVERRIDE_FIELDS/], none: [/body\.skip_guardrails/]},
         go: {all: [/overrideFields/], none: [/body\["skip_guardrails"\]/]},
-        scala: {all: [/OverrideFields/], none: [/get\("skip_guardrails"\)/]},
         cpp: {all: [/kOverrideFields/], none: [/value\("skip_guardrails"/]},
       },
     },
@@ -445,121 +441,6 @@ func ramp(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/experiments/{id}/ramp", ramp)
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import expd.Store // Store.get, setStatus, setPercent
-import expguard.experiments_platform.{GuardrailRequest, GuardrailVerdict, GuardrailsGrpc}
-
-object Ramp {
-  private val guardrails = GuardrailsGrpc.blockingStub(ManagedChannelBuilder.forAddress("stats", 50051).usePlaintext().build())
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(message: String): JsObject = JsObject("error" -> JsString(message))
-
-  def ramp(id: String, body: JsObject): HttpResponse =
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    Store.get(id) match {
-      case None => json(StatusCodes.NotFound, error("no such experiment"))
-      case Some(experiment) =>
-        body.fields.get("to_percent") match {
-          case Some(JsNumber(n)) if n.isValidInt && n.toInt > experiment.percent && n.toInt <= 100 =>
-            val toPercent = n.toInt
-            val verdict: Option[GuardrailVerdict] =
-              if (body.fields.get("skip_guardrails").contains(JsTrue)) None
-              else
-                try Some(guardrails.checkGuardrails(GuardrailRequest(id, toPercent)))
-                catch {
-                  case e: StatusRuntimeException =>
-                    println(s"stats unavailable (\${e.getStatus.getCode}), ramping $id without a guardrail check")
-                    None
-                }
-            verdict.filter(_.breached) match {
-              case Some(v) => json(StatusCodes.Conflict, JsObject("status" -> JsString("breached"), "metric" -> JsString(v.metric)))
-              case None =>
-                Store.setPercent(id, toPercent)
-                json(StatusCodes.OK, JsObject("id" -> JsString(id), "percent" -> JsNumber(toPercent), "status" -> JsString("running")))
-            }
-          case _ => json(StatusCodes.BadRequest, error("to_percent must be an integer above the current percentage and at most 100"))
-        }
-    }
-
-  val route: Route = path("v1" / "experiments" / Segment / "ramp") { id =>
-    post {
-      entity(as[String]) { raw =>
-        complete(ramp(id, raw.parseJson.asJsObject))
-      }
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import expd.Store // Store.get, setStatus, setPercent
-import expguard.experiments_platform.{GuardrailRequest, GuardrailsGrpc}
-
-object Ramp {
-  val GuardrailDeadlineMs = 2000L
-  val OverrideFields: Seq[String] = Seq("skip_guardrails", "override", "force")
-
-  private val guardrails = GuardrailsGrpc.blockingStub(ManagedChannelBuilder.forAddress("stats", 50051).usePlaintext().build())
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(message: String): JsObject = JsObject("error" -> JsString(message))
-
-  def ramp(id: String, body: JsObject): HttpResponse =
-    if (OverrideFields.exists(body.fields.contains)) json(StatusCodes.BadRequest, error("guardrails cannot be skipped"))
-    else
-      Store.get(id) match {
-        case None => json(StatusCodes.NotFound, error("no such experiment"))
-        case Some(experiment) =>
-          body.fields.get("to_percent") match {
-            case Some(JsNumber(n)) if n.isValidInt && n.toInt > experiment.percent && n.toInt <= 100 =>
-              val toPercent = n.toInt
-              try {
-                val verdict = guardrails.withDeadlineAfter(GuardrailDeadlineMs, TimeUnit.MILLISECONDS).checkGuardrails(GuardrailRequest(id, toPercent))
-                if (verdict.breached) {
-                  Store.setStatus(id, "paused")
-                  json(StatusCodes.Conflict, JsObject("status" -> JsString("paused"), "metric" -> JsString(verdict.metric),
-                    "limit" -> JsNumber(verdict.limit), "observed" -> JsNumber(verdict.observed)))
-                } else {
-                  Store.setPercent(id, toPercent)
-                  Store.setStatus(id, "running")
-                  json(StatusCodes.OK, JsObject("id" -> JsString(id), "percent" -> JsNumber(toPercent), "status" -> JsString("running")))
-                }
-              } catch {
-                // No verdict is not a pass: the traffic stays where it is.
-                case e: StatusRuntimeException =>
-                  json(StatusCodes.ServiceUnavailable, JsObject("error" -> JsString("guardrail check unavailable"), "code" -> JsString(e.getStatus.getCode.name)))
-              }
-            case _ => json(StatusCodes.BadRequest, error("to_percent must be an integer above the current percentage and at most 100"))
-          }
-      }
-
-  val route: Route = path("v1" / "experiments" / Segment / "ramp") { id =>
-    post {
-      entity(as[String]) { raw =>
-        complete(ramp(id, raw.parseJson.asJsObject))
-      }
-    }
-  }
 }
 `,
     },

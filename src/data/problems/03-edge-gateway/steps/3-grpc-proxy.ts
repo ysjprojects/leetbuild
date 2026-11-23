@@ -46,7 +46,7 @@ message Item { string id = 1; string name = 2; int64 price_cents = 3; }
   hints: [
     'Two concerns per call: the call options (deadline, metadata) and the error translation. Build the options from the incoming request, make the call, then map the status in one place.',
     'Metadata keys are lowercase on the wire: read `X-Request-Id` from the HTTP request and attach it as `("x-request-id", value)` via the call’s metadata / outgoing context / `Metadata` + interceptor / `ClientContext::AddMetadata`.',
-    'A lookup table from gRPC code to HTTP status with a 502 default (`HTTP_STATUS.get(code, 502)`, a `map` with an `ok` check, a `match` with `case _`, a `switch` with `default`) keeps the mapping in one readable place.',
+    'A lookup table from gRPC code to HTTP status with a 502 default (`HTTP_STATUS.get(code, 502)`, a `map` with an `ok` check, a `switch` with `default`) keeps the mapping in one readable place.',
   ],
   checks: [
     {
@@ -57,7 +57,6 @@ message Item { string id = 1; string name = 2; int64 price_cents = 3; }
         python: {all: [/@app\.get\(\s*["']\/items\/\{/, /stub\.GetItem\(/]},
         typescript: {all: [/\.get\(\s*['"]\/items\/:/, /stub\.GetItem\(/]},
         go: {all: [/"GET \/items\/\{id\}"/, /stub\.GetItem\(/, /json\.(NewEncoder|Marshal)\(/]},
-        scala: {all: [/path\(\s*"items"\s*\/\s*Segment\s*\)/, /\.getItem\(/, /application\/json/]},
         cpp: {all: [/svr\.Get\(\s*R?"\(?\/items\//, /stub->GetItem\(/, /"application\/json"/]},
       },
     },
@@ -70,7 +69,6 @@ message Item { string id = 1; string name = 2; int64 price_cents = 3; }
         python: {all: [/stub\.GetItem\([\s\S]{0,200}?timeout\s*=\s*(DEADLINE_S|2(\.0)?)\b/]},
         typescript: {all: [/stub\.GetItem\([\s\S]{0,200}?deadline:/, /DEADLINE_MS|\b2000\b/]},
         go: {all: [/context\.WithTimeout\([^\n]*(deadline|2\s*\*\s*time\.Second)\s*\)/]},
-        scala: {all: [/withDeadlineAfter\(\s*(DeadlineMillis|2000|2\s*,\s*TimeUnit\.SECONDS)/]},
         cpp: {all: [/set_deadline\([^\n]*(kDeadline|std::chrono::seconds[({]\s*2\s*[)}]|2s\b)/]},
       },
     },
@@ -95,13 +93,6 @@ message Item { string id = 1; string name = 2; int64 price_cents = 3; }
           ],
         },
         go: {all: [/metadata\.(AppendToOutgoingContext|NewOutgoingContext)\(/, /"x-request-id"/, /X-Request-Id/]},
-        scala: {
-          all: [
-            /Metadata\.Key\.of\(\s*"x-request-id"/,
-            /MetadataUtils\.newAttachHeadersInterceptor\(/,
-            /X-Request-Id/i,
-          ],
-        },
         cpp: {all: [/AddMetadata\(\s*"x-request-id"/, /X-Request-Id/i]},
       },
     },
@@ -134,14 +125,6 @@ message Item { string id = 1; string name = 2; int64 price_cents = 3; }
             /codes\.Unavailable[^\n]*(http\.StatusServiceUnavailable|\b503\b)/,
           ],
         },
-        scala: {
-          all: [
-            /NOT_FOUND[^\n]*(StatusCodes\.NotFound|\b404\b)/,
-            /INVALID_ARGUMENT[^\n]*(StatusCodes\.BadRequest|\b400\b)/,
-            /DEADLINE_EXCEEDED[^\n]*(StatusCodes\.GatewayTimeout|\b504\b)/,
-            /UNAVAILABLE[^\n]*(StatusCodes\.ServiceUnavailable|\b503\b)/,
-          ],
-        },
         cpp: {
           all: [
             /NOT_FOUND[^\n]*\b404\b/,
@@ -161,7 +144,6 @@ message Item { string id = 1; string name = 2; int64 price_cents = 3; }
         python: {all: [/\b502\b/]},
         typescript: {all: [/\b502\b/]},
         go: {all: [/http\.StatusBadGateway|\b502\b/]},
-        scala: {all: [/StatusCodes\.BadGateway|\b502\b/]},
         cpp: {all: [/\b502\b/]},
       },
     },
@@ -397,90 +379,6 @@ func getItem(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /items/{id}", getItem)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.stub.MetadataUtils
-import io.grpc.{ManagedChannelBuilder, Metadata, Status, StatusRuntimeException}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import gateway.catalog.{CatalogGrpc, GetItemRequest}
-
-object CatalogProxy {
-  val DeadlineMillis = 2000L
-
-  private val channel = ManagedChannelBuilder.forAddress("catalog", 9000).usePlaintext().build()
-  private val stub = CatalogGrpc.blockingStub(channel)
-
-  // TODO: Metadata.Key for x-request-id
-
-  private def httpStatus(code: Status.Code): StatusCode = code match {
-    // TODO: NOT_FOUND 404, INVALID_ARGUMENT 400, DEADLINE_EXCEEDED 504, UNAVAILABLE 503, otherwise 502
-    case _ => StatusCodes.InternalServerError
-  }
-
-  val route: Route =
-    path("items" / Segment) { id =>
-      get {
-        optionalHeaderValueByName("X-Request-Id") { requestId =>
-          // TODO: stub with the request id attached as metadata and a DeadlineMillis deadline
-          // TODO: getItem(GetItemRequest(id)) → JSON {id, name, price_cents}; StatusRuntimeException → httpStatus
-          complete(StatusCodes.NotImplemented)
-        }
-      }
-    }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.stub.MetadataUtils
-import io.grpc.{ManagedChannelBuilder, Metadata, Status, StatusRuntimeException}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import gateway.catalog.{CatalogGrpc, GetItemRequest}
-
-object CatalogProxy {
-  val DeadlineMillis = 2000L
-
-  private val channel = ManagedChannelBuilder.forAddress("catalog", 9000).usePlaintext().build()
-  private val stub = CatalogGrpc.blockingStub(channel)
-
-  private val RequestId = Metadata.Key.of("x-request-id", Metadata.ASCII_STRING_MARSHALLER)
-
-  private def httpStatus(code: Status.Code): StatusCode = code match {
-    case Status.Code.NOT_FOUND         => StatusCodes.NotFound
-    case Status.Code.INVALID_ARGUMENT  => StatusCodes.BadRequest
-    case Status.Code.DEADLINE_EXCEEDED => StatusCodes.GatewayTimeout
-    case Status.Code.UNAVAILABLE       => StatusCodes.ServiceUnavailable
-    case _                             => StatusCodes.BadGateway
-  }
-
-  val route: Route =
-    path("items" / Segment) { id =>
-      get {
-        optionalHeaderValueByName("X-Request-Id") { requestId =>
-          val headers = new Metadata()
-          requestId.foreach(headers.put(RequestId, _))
-          val call = stub
-            .withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers))
-            .withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS)
-          try {
-            val item = call.getItem(GetItemRequest(id = id))
-            val json = s"""{"id":"\${item.id}","name":"\${item.name}","price_cents":\${item.priceCents}}"""
-            complete(HttpEntity(ContentTypes.\`application/json\`, json))
-          } catch {
-            case e: StatusRuntimeException =>
-              val detail = Option(e.getStatus.getDescription).getOrElse("upstream error")
-              complete(httpStatus(e.getStatus.getCode) -> detail)
-          }
-        }
-      }
-    }
 }
 `,
     },

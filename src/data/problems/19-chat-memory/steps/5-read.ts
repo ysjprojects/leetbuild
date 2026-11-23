@@ -48,7 +48,6 @@ conversation.
         python: {all: [/@app\.get\(\s*["']\/v1\/sessions\/\{session_id\}\/context["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/sessions\/:sessionId\/context['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/sessions\/\{id\}\/context"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"sessions"\s*\/\s*Segment\s*\/\s*"context"\s*\)/]},
         cpp: {all: [/svr\.Get\([^\n]*\/v1\/sessions\/[^\n]*\/context/]},
       },
     },
@@ -61,7 +60,6 @@ conversation.
         python: {all: [/reversed\(|\[::-1\]/], none: [/for turn in turns:/]},
         typescript: {all: [/\.reverse\(\)/], none: [/for \(const turn of turns\)/]},
         go: {all: [/turns\[\w+\s*-\s*1\]|:= len\(turns\)\s*-\s*1/], none: [/range turns/]},
-        scala: {all: [/turns\.reverseIterator|turns\.reverse\b/], none: [/turns\.iterator/]},
         cpp: {all: [/turns\.rbegin\(\)/], none: [/for \(const (auto|sessions::Turn)& turn : turns\)/]},
       },
     },
@@ -74,7 +72,6 @@ conversation.
         python: {all: [/count_tokens\(\s*summary\[/]},
         typescript: {all: [/countTokens\(\s*summary\.text\s*\)/]},
         go: {all: [/CountTokens\(\s*summary\.Text\s*\)/]},
-        scala: {all: [/Sessions\.countTokens\(\s*\w+\.text\s*\)/]},
         cpp: {all: [/countTokens\(\s*summary->text\s*\)/]},
       },
     },
@@ -87,7 +84,6 @@ conversation.
         python: {all: [/sessions\.latest_turn_id\(/, /context:[^\n]*\{latest\w*\}/]},
         typescript: {all: [/latestTurnId\(/, /context:[^\n]*\$\{latest\w*\}/]},
         go: {all: [/sessions\.LatestTurnID\(/, /sessionID\s*\+\s*":"\s*\+\s*latest/]},
-        scala: {all: [/Sessions\.latestTurnId\(/, /s"context:[^"\n]*\$\{?latest/]},
         cpp: {all: [/sessions::latestTurnId\(/, /session_id\s*\+\s*":"\s*\+\s*latest/]},
       },
     },
@@ -100,7 +96,6 @@ conversation.
         python: {all: [/context:\{tenant\}:/], none: [/f["']context:\{session_id\}/]},
         typescript: {all: [/context:\$\{tenant\}:/], none: [/`context:\$\{sessionId\}/]},
         go: {all: [/"context:"\s*\+\s*tenant/], none: [/"context:"\s*\+\s*sessionID/]},
-        scala: {all: [/s"context:\$tenant:/], none: [/s"context:\$sessionId/]},
         cpp: {all: [/"context:"\s*\+\s*\*?tenant/], none: [/"context:"\s*\+\s*session_id/]},
       },
     },
@@ -421,121 +416,6 @@ func readContext(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/sessions/{id}/context", readContext)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-
-import memory.{Buffer, Sessions, Summaries} // recentTurns; tenantForKey, latestTurnId, countTokens; latestSummary
-
-object Read {
-  val MaxContextTokens = 6000L
-  val CacheTtlSeconds = 60L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def json(body: String): HttpResponse = HttpResponse(entity = HttpEntity(ContentTypes.\`application/json\`, body))
-
-  val route: Route =
-    path("v1" / "sessions" / Segment / "context") { sessionId =>
-      get {
-        optionalHeaderValueByName("Authorization") { authorization =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          Sessions.tenantForKey(authorization.getOrElse("").stripPrefix("Bearer ")) match {
-            case None => complete(StatusCodes.Unauthorized -> "a valid API key is required")
-            case Some(tenant) =>
-              val key = s"context:$sessionId"
-              Option(jedis.get(key)) match {
-                case Some(cached) => complete(json(cached))
-                case None =>
-                  val summary = Summaries.latestSummary(tenant, sessionId)
-                  val turns = Buffer.recentTurns(tenant, sessionId)
-                  if (turns.isEmpty) complete(StatusCodes.NotFound -> "no such session")
-                  else {
-                    var used = 0L
-                    val kept = turns.iterator.takeWhile { turn =>
-                      val fits = used + turn.tokens <= MaxContextTokens
-                      if (fits) used += turn.tokens
-                      fits
-                    }.toList
-                    val body = JsObject(
-                      "session_id" -> JsString(sessionId),
-                      "summary" -> summary.map(s => JsString(s.text)).getOrElse(JsNull),
-                      "turns" -> JsArray(kept.map(_.toJson).toVector),
-                      "tokens" -> JsNumber(used)
-                    ).compactPrint
-                    jedis.set(key, body, SetParams.setParams().ex(CacheTtlSeconds))
-                    complete(json(body))
-                  }
-              }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-
-import memory.{Buffer, Sessions, Summaries} // recentTurns; tenantForKey, latestTurnId, countTokens; latestSummary
-
-object Read {
-  val MaxContextTokens = 6000L
-  val CacheTtlSeconds = 60L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def json(body: String): HttpResponse = HttpResponse(entity = HttpEntity(ContentTypes.\`application/json\`, body))
-
-  val route: Route =
-    path("v1" / "sessions" / Segment / "context") { sessionId =>
-      get {
-        optionalHeaderValueByName("Authorization") { authorization =>
-          Sessions.tenantForKey(authorization.getOrElse("").stripPrefix("Bearer ")) match {
-            case None => complete(StatusCodes.Unauthorized -> "a valid API key is required")
-            case Some(tenant) =>
-              // The key names the tenant and the newest turn: another tenant, or a new turn, is another entry.
-              val latest = Sessions.latestTurnId(tenant, sessionId).getOrElse("")
-              val key = s"context:$tenant:$sessionId:$latest"
-              Option(jedis.get(key)) match {
-                case Some(cached) => complete(json(cached))
-                case None =>
-                  val summary = Summaries.latestSummary(tenant, sessionId)
-                  val turns = Buffer.recentTurns(tenant, sessionId)
-                  if (turns.isEmpty) complete(StatusCodes.NotFound -> "no such session")
-                  else {
-                    // The summary is part of the prompt: it pays from the same budget, first.
-                    var used = summary.map(s => Sessions.countTokens(s.text)).getOrElse(0L)
-                    // Newest first: when the budget runs out, the oldest turns are left behind.
-                    val kept = turns.reverseIterator.takeWhile { turn =>
-                      val fits = used + turn.tokens <= MaxContextTokens
-                      if (fits) used += turn.tokens
-                      fits
-                    }.toList.reverse
-                    val body = JsObject(
-                      "session_id" -> JsString(sessionId),
-                      "summary" -> summary.map(s => JsString(s.text)).getOrElse(JsNull),
-                      "turns" -> JsArray(kept.map(_.toJson).toVector),
-                      "tokens" -> JsNumber(used)
-                    ).compactPrint
-                    jedis.set(key, body, SetParams.setParams().ex(CacheTtlSeconds))
-                    complete(json(body))
-                  }
-              }
-          }
-        }
-      }
-    }
 }
 `,
     },

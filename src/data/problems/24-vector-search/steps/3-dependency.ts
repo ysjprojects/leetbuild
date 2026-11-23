@@ -48,12 +48,11 @@ service Shard { rpc Search(ShardRequest) returns (ShardReply); }  // UNAVAILABLE
       id: 'deadline',
       title: 'Every shard call carries a 400 ms deadline',
       detail:
-        'Each `Search` call carries its own 400 ms deadline (`timeout=DEADLINE_S`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`), a retry after a late `UNAVAILABLE` included, so a stalled shard is missing instead of holding the search open. The starter sets none.',
+        'Each `Search` call carries its own 400 ms deadline (`timeout=DEADLINE_S`, `deadline:`, `context.WithTimeout`, `set_deadline`), a retry after a late `UNAVAILABLE` included, so a stalled shard is missing instead of holding the search open. The starter sets none.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*0\.4\b/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*400\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/400\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^)\n]*deadline\)/]},
-        scala: {all: [/DeadlineMs\s*=\s*400L?\b/, /withDeadlineAfter\(\s*DeadlineMs/]},
         cpp: {all: [/kDeadline\{400\}|milliseconds\(400\)/, /set_deadline\(/]},
       },
     },
@@ -66,7 +65,6 @@ service Shard { rpc Search(ShardRequest) returns (ShardReply); }  // UNAVAILABLE
         python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /StatusCode\.UNAVAILABLE/], none: [/range\(\s*5\s*\)/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /status\.UNAVAILABLE/], none: [/attempt\s*<\s*5\b/]},
         go: {all: [/maxAttempts\s*=\s*2\b/, /codes\.Unavailable/], none: [/attempt\s*<\s*5\b/]},
-        scala: {all: [/MaxAttempts\s*=\s*2\b/, /Code\.UNAVAILABLE/], none: [/attempt\s*<\s*5\b/]},
         cpp: {all: [/kMaxAttempts\s*=\s*2\b/, /StatusCode::UNAVAILABLE/], none: [/attempt\s*<\s*5\b/]},
       },
     },
@@ -79,7 +77,6 @@ service Shard { rpc Search(ShardRequest) returns (ShardReply); }  // UNAVAILABLE
         python: {all: [/answered\s*\+=\s*1/], none: [/["']partial["']\s*:\s*False/]},
         typescript: {all: [/answered\s*(\+=\s*1|\+\+)/], none: [/partial:\s*false/]},
         go: {all: [/answered\+\+|answered\s*\+=\s*1/], none: [/Partial:\s*false/]},
-        scala: {all: [/answered/], none: [/partial\s*=\s*false/]},
         cpp: {all: [/\+\+answered|answered\+\+|answered\s*\+=\s*1/], none: [/\.partial\s*=\s*false/]},
       },
     },
@@ -92,7 +89,6 @@ service Shard { rpc Search(ShardRequest) returns (ShardReply); }  // UNAVAILABLE
         python: {all: [/answered\s*<\s*quorum\(\)/, /raise QuorumLost\(/]},
         typescript: {all: [/answered\s*<\s*quorum\(\)/, /throw new QuorumLost\(/]},
         go: {all: [/answered\s*<\s*quorum\(\)/, /return [^\n]*ErrQuorumLost/]},
-        scala: {all: [/answered\s*<\s*quorum\b/, /throw new QuorumLost\(/]},
         cpp: {all: [/answered\s*<\s*quorum\(\)/, /throw QuorumLost\(/]},
       },
     },
@@ -105,7 +101,6 @@ service Shard { rpc Search(ShardRequest) returns (ShardReply); }  // UNAVAILABLE
         python: {all: [/\.sort\(|sorted\(/]},
         typescript: {all: [/\.sort\(/]},
         go: {all: [/sort\.(Slice|SliceStable)\(/]},
-        scala: {all: [/sortBy\(|sortWith\(/]},
         cpp: {all: [/std::(stable_)?sort\(/]},
       },
     },
@@ -492,93 +487,6 @@ func searchShards(ctx context.Context, tenant, version string, query []float64, 
 		hits = hits[:k]
 	}
 	return Gathered{Hits: hits, Partial: answered < len(shards), Answered: answered, Required: quorum()}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import search.Corpus // Corpus.Hit
-import searchd.shard.{ShardGrpc, ShardRequest}
-
-/** Fewer than a majority of the shards answered: the search answers 503. */
-final class QuorumLost(message: String) extends Exception(message)
-
-object Client {
-  val Shards: Seq[String] = Seq("shard-0:9000", "shard-1:9000", "shard-2:9000")
-
-  /** The merged answer: the hits, whether a shard was missing, how many answered and how many are required. */
-  final case class Gathered(hits: Vector[Corpus.Hit], partial: Boolean, answered: Int, required: Int)
-
-  private val stubs = Shards.map { target =>
-    val Array(host, port) = target.split(":")
-    target -> ShardGrpc.blockingStub(ManagedChannelBuilder.forAddress(host, port.toInt).usePlaintext().build())
-  }.toMap
-
-  def quorum: Int = Shards.size / 2 + 1
-
-  /** One shard's hits. */
-  private def ask(target: String, request: ShardRequest, attempt: Int = 0): Seq[Corpus.Hit] =
-    try stubs(target).search(request).hits.map(h => Corpus.Hit(h.id, h.score))
-    catch {
-      case _: StatusRuntimeException if attempt < 5 =>
-        Thread.sleep(50) // the shard is flaky: try again
-        ask(target, request, attempt + 1)
-      case _: StatusRuntimeException => Seq.empty
-    }
-
-  /** The tenant's k nearest documents across every shard. */
-  def searchShards(tenant: String, version: String, query: Seq[Double], k: Int): Gathered = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val request = ShardRequest(tenant = tenant, indexVersion = version, query = query, k = k)
-    val hits = Shards.flatMap(target => ask(target, request)).toVector
-    Gathered(hits.take(k), partial = false, answered = Shards.size, required = quorum)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import search.Corpus // Corpus.Hit
-import searchd.shard.{ShardGrpc, ShardRequest}
-
-/** Fewer than a majority of the shards answered: the search answers 503. */
-final class QuorumLost(message: String) extends Exception(message)
-
-object Client {
-  val Shards: Seq[String] = Seq("shard-0:9000", "shard-1:9000", "shard-2:9000")
-  val DeadlineMs = 400L
-  val MaxAttempts = 2
-
-  /** The merged answer: the hits, whether a shard was missing, how many answered and how many are required. */
-  final case class Gathered(hits: Vector[Corpus.Hit], partial: Boolean, answered: Int, required: Int)
-
-  private val stubs = Shards.map { target =>
-    val Array(host, port) = target.split(":")
-    target -> ShardGrpc.blockingStub(ManagedChannelBuilder.forAddress(host, port.toInt).usePlaintext().build())
-  }.toMap
-
-  def quorum: Int = Shards.size / 2 + 1
-
-  /** One shard's hits, or None when it did not answer. */
-  private def ask(target: String, request: ShardRequest, attempt: Int = 1): Option[Seq[Corpus.Hit]] =
-    try Some(stubs(target).withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).search(request).hits.map(h => Corpus.Hit(h.id, h.score)))
-    catch {
-      // A shard that is down may be back on the next call; a deadline already spent the budget.
-      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.UNAVAILABLE && attempt < MaxAttempts => ask(target, request, attempt + 1)
-      case _: StatusRuntimeException => None
-    }
-
-  /** The tenant's k nearest documents across every shard. */
-  def searchShards(tenant: String, version: String, query: Seq[Double], k: Int): Gathered = {
-    val request = ShardRequest(tenant = tenant, indexVersion = version, query = query, k = k)
-    val replies = Shards.flatMap(target => ask(target, request)) // a missing shard is not an empty one
-    val answered = replies.size
-    if (answered < quorum) throw new QuorumLost(s"$answered of \${Shards.size} shards answered, $quorum required")
-    val hits = replies.flatten.toVector.sortBy(h => (-h.score, h.id))
-    Gathered(hits.take(k), partial = answered < Shards.size, answered = answered, required = quorum)
-  }
 }
 `,
     },

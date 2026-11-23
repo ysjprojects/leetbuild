@@ -6,7 +6,7 @@ import {windowedSketchStep} from './steps/2-state';
 import {alertClientStep} from './steps/3-client';
 import {driftEventsStep} from './steps/4-events';
 import {monitorReportStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Drift monitor: the course is not "compute a distance between two histograms", it is the
@@ -98,6 +98,5 @@ escalation, and backfilling closed windows.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

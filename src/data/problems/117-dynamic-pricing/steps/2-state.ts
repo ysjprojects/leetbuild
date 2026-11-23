@@ -56,7 +56,6 @@ the sku for good; and a refusal tells the caller neither what is left nor how fa
         python: {all: [/redis\.call\(\s*['"]HGET['"]/], none: [/\bmove\s*>\s*MAX_MOVE_BP\b/]},
         typescript: {all: [/redis\.call\(\s*['"]HGET['"]/], none: [/\bmove\s*>\s*MAX_MOVE_BP\b/]},
         go: {all: [/redis\.call\(\s*['"]HGET['"]/], none: [/\bmove\s*>\s*maxMoveBP\b/]},
-        scala: {all: [/redis\.call\(\s*['"]HGET['"]/], none: [/\bmove\s*>\s*MaxMoveBp\b/]},
         cpp: {all: [/redis\.call\(\s*['"]HGET['"]/], none: [/\bmove\s*>\s*kMaxMoveBp\b/]},
       },
     },
@@ -78,10 +77,6 @@ the sku for good; and a refusal tells the caller neither what is left nor how fa
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]HINCRBY['"]/],
           none: [/rdb\.(Get|IncrBy|HGet|HIncrBy)\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HINCRBY['"]/],
-          none: [/jedis\.(get|incrBy|hget|hincrBy)\(/],
-        },
         cpp: {
           all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HINCRBY['"]/],
           none: [/redis\.(get|incrby|hget|hincrby)\(/],
@@ -97,7 +92,6 @@ the sku for good; and a refusal tells the caller neither what is left nor how fa
         python: {all: [/WINDOW_S\s*=\s*3600/, /\/\/\s*WINDOW_S/, /redis\.call\(\s*['"]P?EXPIRE['"]/]},
         typescript: {all: [/WINDOW_S\s*=\s*3600/, /\/\s*WINDOW_S/, /redis\.call\(\s*['"]P?EXPIRE['"]/]},
         go: {all: [/windowS\s*=\s*3600/, /\/\s*windowS/, /redis\.call\(\s*['"]P?EXPIRE['"]/]},
-        scala: {all: [/WindowS\s*=\s*3600/, /\/\s*WindowS/, /redis\.call\(\s*['"]P?EXPIRE['"]/]},
         cpp: {all: [/kWindowS\s*=\s*3600/, /\/\s*kWindowS/, /redis\.call\(\s*['"]P?EXPIRE['"]/]},
       },
     },
@@ -110,7 +104,6 @@ the sku for good; and a refusal tells the caller neither what is left nor how fa
         python: {all: [/bound_cents\(/], none: [/["']headroom_bp["']\s*:\s*0\b/]},
         typescript: {all: [/boundCents\(/], none: [/headroom_bp:\s*0\b/]},
         go: {all: [/boundCents\(/], none: [/Reservation\{OK:\s*false,\s*MovedBP:\s*move\}/]},
-        scala: {all: [/boundCents\(/], none: [/Reservation\(\s*false,\s*move,\s*0L?,\s*0L?\s*\)/]},
         cpp: {all: [/boundCents\(/], none: [/Reservation\{\s*false,\s*move,\s*0,\s*0\s*\}/]},
       },
     },
@@ -415,87 +408,6 @@ func reserve(ctx context.Context, sku string, currentCents, targetCents int64) (
 		headroom = available - move
 	}
 	return Reservation{OK: ok, MovedBP: move, HeadroomBP: headroom, BoundCents: boundCents(currentCents, targetCents, available)}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-object State {
-  /** The outcome of reserve: movedBp is this change, headroomBp what is left afterwards. */
-  final case class Reservation(ok: Boolean, movedBp: Long, headroomBp: Long, boundCents: Long)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  val MaxMoveBp = 2000L
-
-  /** The change in basis points of the current price (100 bp = 1 %). */
-  def moveBp(currentCents: Long, targetCents: Long): Long = math.abs(targetCents - currentCents) * 10000 / currentCents
-
-  /** Spend the change's basis points from the sku's budget or refuse it. */
-  def reserve(sku: String, currentCents: Long, targetCents: Long): Reservation = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = s"guard:$sku"
-    val move = moveBp(currentCents, targetCents)
-    val moved = Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
-    if (move > MaxMoveBp) Reservation(false, move, 0L, 0L)
-    else {
-      jedis.incrBy(key, move)
-      Reservation(true, move, MaxMoveBp - moved - move, targetCents)
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  /** The outcome of reserve: movedBp is this change, headroomBp what is left afterwards. */
-  final case class Reservation(ok: Boolean, movedBp: Long, headroomBp: Long, boundCents: Long)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  val WindowS = 3600L
-  val MaxMoveBp = 2000L
-
-  /** KEYS[1] the window's hash; ARGV the change's basis points, the limit, the window's TTL. Returns {1 spent | 0 refused, the basis points available before this change}. */
-  val ReserveLua: String =
-    """local moved = tonumber(redis.call('HGET', KEYS[1], 'moved_bp') or '0')
-      |local available = tonumber(ARGV[2]) - moved
-      |local move = tonumber(ARGV[1])
-      |if move > available then
-      |  return {0, available}
-      |end
-      |redis.call('HINCRBY', KEYS[1], 'moved_bp', move)
-      |if redis.call('TTL', KEYS[1]) < 0 then
-      |  redis.call('EXPIRE', KEYS[1], ARGV[3])
-      |end
-      |return {1, available}
-      |""".stripMargin
-
-  def guardKey(sku: String, window: Long): String = s"guard:$sku:$window"
-
-  /** The change in basis points of the current price (100 bp = 1 %). */
-  def moveBp(currentCents: Long, targetCents: Long): Long = math.abs(targetCents - currentCents) * 10000 / currentCents
-
-  /** The furthest price availableBp allows from currentCents, in the direction of targetCents. */
-  def boundCents(currentCents: Long, targetCents: Long, availableBp: Long): Long = {
-    val delta = currentCents * availableBp / 10000
-    if (targetCents >= currentCents) currentCents + delta else currentCents - delta
-  }
-
-  /** Spend the change's basis points from the sku's budget or refuse it. */
-  def reserve(sku: String, currentCents: Long, targetCents: Long): Reservation = {
-    val move = moveBp(currentCents, targetCents)
-    val window = System.currentTimeMillis() / 1000 / WindowS
-    // Read, check and spend on the server: no other reservation runs between the read and the write.
-    val out = jedis.eval(ReserveLua, List(guardKey(sku, window)).asJava, List(move.toString, MaxMoveBp.toString, WindowS.toString).asJava)
-      .asInstanceOf[java.util.List[java.lang.Long]].asScala.map(_.longValue)
-    val ok = out.head == 1L
-    val available = out(1)
-    Reservation(ok, move, if (ok) available - move else available, boundCents(currentCents, targetCents, available))
-  }
 }
 `,
     },

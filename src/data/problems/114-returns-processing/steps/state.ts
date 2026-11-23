@@ -76,10 +76,6 @@ gives the units back twice and the line ends up with more to return than was ord
           ],
           none: [/\.DecrBy\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]DECRBY['"]/, /redis\.call\(\s*['"]HSET['"],\s*KEYS\[2\]/],
-          none: [/jedis\.decrBy\(/],
-        },
         cpp: {
           all: [/\.eval(sha)?</, /redis\.call\(\s*['"]DECRBY['"]/, /redis\.call\(\s*['"]HSET['"],\s*KEYS\[2\]/],
           none: [/\.decrby\(/],
@@ -101,10 +97,6 @@ gives the units back twice and the line ends up with more to return than was ord
           none: [/\.incr\(/],
         },
         go: {all: [/HGET['"],\s*KEYS\[2\],\s*['"]quantity['"]/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.Incr\(/]},
-        scala: {
-          all: [/HGET['"],\s*KEYS\[2\],\s*['"]quantity['"]/, /redis\.call\(\s*['"]INCRBY['"]/],
-          none: [/jedis\.incr\(/],
-        },
         cpp: {all: [/HGET['"],\s*KEYS\[2\],\s*['"]quantity['"]/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.incr\(/]},
       },
     },
@@ -125,10 +117,6 @@ gives the units back twice and the line ends up with more to return than was ord
         go: {
           all: [/HGET['"],\s*KEYS\[2\],\s*['"]state['"]/, /HSET['"],\s*KEYS\[2\],\s*['"]state['"],\s*['"]canceled['"]/],
           none: [/\.Exists\(/],
-        },
-        scala: {
-          all: [/HGET['"],\s*KEYS\[2\],\s*['"]state['"]/, /HSET['"],\s*KEYS\[2\],\s*['"]state['"],\s*['"]canceled['"]/],
-          none: [/jedis\.exists\(/],
         },
         cpp: {
           all: [/HGET['"],\s*KEYS\[2\],\s*['"]state['"]/, /HSET['"],\s*KEYS\[2\],\s*['"]state['"],\s*['"]canceled['"]/],
@@ -434,89 +422,6 @@ func registerReturn(ctx context.Context, orderLineID, returnID string, quantity 
 // cancelReturn gives the return's own quantity back to the line, once; the units restored.
 func cancelReturn(ctx context.Context, orderLineID, returnID string) (int64, error) {
 	return cancelScript.Run(ctx, rdb, []string{counterKey(orderLineID), recordKey(returnID)}).Int64()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  def counterKey(orderLineId: String): String = s"line:$orderLineId:returnable"
-  def recordKey(returnId: String): String = s"return:$returnId"
-
-  /** The units of the line still returnable. */
-  def remaining(orderLineId: String): Long = Option(jedis.get(counterKey(orderLineId))).map(_.toLong).getOrElse(0L)
-
-  /** Take quantity units off the line and record the return, or nothing when fewer remain. */
-  def registerReturn(orderLineId: String, returnId: String, quantity: Long, fields: Map[String, String]): Boolean = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    if (quantity > remaining(orderLineId)) false
-    else {
-      jedis.decrBy(counterKey(orderLineId), quantity)
-      val record = Map("return_id" -> returnId, "order_line_id" -> orderLineId, "quantity" -> quantity.toString, "state" -> "registered") ++ fields
-      jedis.hset(recordKey(returnId), record.asJava)
-      true
-    }
-  }
-
-  /** Give the return's own quantity back to the line, once; the units restored. */
-  def cancelReturn(orderLineId: String, returnId: String): Long =
-    if (!jedis.exists(recordKey(returnId))) 0L
-    else {
-      jedis.incr(counterKey(orderLineId))
-      jedis.hset(recordKey(returnId), "state", "canceled")
-      1L
-    }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** KEYS: the line's counter, the return's record. ARGV: quantity, return_id, order_line_id, then field/value pairs. */
-  val RegisterLua: String =
-    """local left = tonumber(redis.call('GET', KEYS[1]) or '0')
-      |local quantity = tonumber(ARGV[1])
-      |if quantity > left then return 0 end
-      |redis.call('DECRBY', KEYS[1], quantity)
-      |redis.call('HSET', KEYS[2], 'return_id', ARGV[2], 'order_line_id', ARGV[3], 'quantity', ARGV[1], 'state', 'registered')
-      |for i = 4, #ARGV, 2 do
-      |  redis.call('HSET', KEYS[2], ARGV[i], ARGV[i + 1])
-      |end
-      |return 1
-      |""".stripMargin
-
-  /** Restores the record's own quantity, only from registered, and marks it canceled in the same step. */
-  val CancelLua: String =
-    """if redis.call('HGET', KEYS[2], 'state') ~= 'registered' then return 0 end
-      |local quantity = tonumber(redis.call('HGET', KEYS[2], 'quantity'))
-      |redis.call('INCRBY', KEYS[1], quantity)
-      |redis.call('HSET', KEYS[2], 'state', 'canceled')
-      |return quantity
-      |""".stripMargin
-
-  def counterKey(orderLineId: String): String = s"line:$orderLineId:returnable"
-  def recordKey(returnId: String): String = s"return:$returnId"
-
-  /** The units of the line still returnable. */
-  def remaining(orderLineId: String): Long = Option(jedis.get(counterKey(orderLineId))).map(_.toLong).getOrElse(0L)
-
-  /** Take quantity units off the line and record the return, or nothing when fewer remain. */
-  def registerReturn(orderLineId: String, returnId: String, quantity: Long, fields: Map[String, String]): Boolean = {
-    val args = List(quantity.toString, returnId, orderLineId) ++ fields.toList.flatMap { case (name, value) => List(name, value) }
-    jedis.eval(RegisterLua, List(counterKey(orderLineId), recordKey(returnId)).asJava, args.asJava).asInstanceOf[java.lang.Long] == 1L
-  }
-
-  /** Give the return's own quantity back to the line, once; the units restored. */
-  def cancelReturn(orderLineId: String, returnId: String): Long =
-    jedis.eval(CancelLua, List(counterKey(orderLineId), recordKey(returnId)).asJava, List.empty[String].asJava).asInstanceOf[java.lang.Long]
 }
 `,
     },

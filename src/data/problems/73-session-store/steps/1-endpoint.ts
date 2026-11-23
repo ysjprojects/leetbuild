@@ -46,7 +46,6 @@ session.
         python: {all: [/@app\.post\(\s*["']\/v1\/sessions["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/sessions['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/sessions"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"sessions"\s*\)/, /\bpost\b/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/sessions"/]},
       },
     },
@@ -62,7 +61,6 @@ session.
           all: [/sessionID\s*:=\s*store\.NewSessionID\(\)/],
           none: [/sessionID\s*:=\s*r\.Header\.Get\(\s*"X-Session-Id"/],
         },
-        scala: {all: [/sessionId\s*=\s*Store\.newSessionId\(\)/], none: [/getOrElse\(Store\.newSessionId\(\)\)/]},
         cpp: {
           all: [/session_id\s*=\s*store::newSessionId\(\)/],
           none: [/session_id\s*=\s*req\.get_header_value\(\s*"X-Session-Id"/],
@@ -78,7 +76,6 @@ session.
         python: {all: [/store\.retire_session\(/]},
         typescript: {all: [/\bretireSession\(/]},
         go: {all: [/store\.RetireSession\(/]},
-        scala: {all: [/Store\.retireSession\(/]},
         cpp: {all: [/store::retireSession\(/]},
       },
     },
@@ -94,7 +91,6 @@ session.
         },
         typescript: {all: [/deviceClass\s*=\s*claims\.device_class/], none: [/body\.device_class/]},
         go: {all: [/deviceClass\s*:=\s*claims\.DeviceClass/], none: [/body\.DeviceClass/]},
-        scala: {all: [/deviceClass\s*=\s*claims\.deviceClass/], none: [/getOrElse\(claims\.deviceClass\)/]},
         cpp: {all: [/std::string device_class\s*=\s*claims->device_class/], none: [/body\.value\(\s*"device_class"/]},
       },
     },
@@ -107,7 +103,6 @@ session.
         python: {all: [/["']complete["']/, /\b401\b/]},
         typescript: {all: [/['"]complete['"]/, /\b401\b/]},
         go: {all: [/"complete"/, /StatusUnauthorized/]},
-        scala: {all: [/"complete"/, /Unauthorized/]},
         cpp: {all: [/"complete"/, /\b401\b/]},
       },
     },
@@ -294,84 +289,6 @@ func createSession(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/sessions", createSession)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import sessions.Store // Store.assertion, newSessionId, putSession, retireSession
-
-object Api {
-  private def created(sessionId: String, userId: String, deviceClass: String): HttpResponse = {
-    val body = JsObject("session_id" -> JsString(sessionId), "user_id" -> JsString(userId), "device_class" -> JsString(deviceClass))
-    HttpResponse(StatusCodes.Created, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-  }
-
-  /** The device_class label of a request body, if it carries one. */
-  private def label(raw: String): Option[String] =
-    if (raw.trim.isEmpty) None
-    else raw.parseJson.asJsObject.fields.get("device_class").collect { case JsString(s) => s }
-
-  val route: Route = path("v1" / "sessions") {
-    post {
-      optionalHeaderValueByName("Authorization") { authorization =>
-        optionalHeaderValueByName("X-Session-Id") { presented =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            val token = authorization.getOrElse("").stripPrefix("Bearer ").trim
-            Store.assertion(token) match {
-              case None => complete(StatusCodes.Unauthorized -> "no auth assertion for this token")
-              case Some(claims) =>
-                val deviceClass = label(raw).filter(_.nonEmpty).getOrElse(claims.deviceClass)
-                val sessionId = presented.filter(_.nonEmpty).getOrElse(Store.newSessionId())
-                Store.putSession(sessionId, claims.userId, deviceClass, token)
-                complete(created(sessionId, claims.userId, deviceClass))
-            }
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import sessions.Store // Store.assertion, newSessionId, putSession, retireSession
-
-object Api {
-  private def created(sessionId: String, userId: String, deviceClass: String): HttpResponse = {
-    val body = JsObject("session_id" -> JsString(sessionId), "user_id" -> JsString(userId), "device_class" -> JsString(deviceClass))
-    HttpResponse(StatusCodes.Created, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-  }
-
-  val route: Route = path("v1" / "sessions") {
-    post {
-      optionalHeaderValueByName("Authorization") { authorization =>
-        optionalHeaderValueByName("X-Session-Id") { presented =>
-          val token = authorization.getOrElse("").stripPrefix("Bearer ").trim
-          Store.assertion(token) match {
-            // A login stopped before its last factor is not a login.
-            case Some(claims) if claims.status == "complete" =>
-              // What the login flow saw, not what the client says about itself.
-              val deviceClass = claims.deviceClass
-              // The server picks the id when privilege changes: nothing chosen before the login carries it.
-              val sessionId = Store.newSessionId()
-              Store.putSession(sessionId, claims.userId, deviceClass, token)
-              presented.filter(_.nonEmpty).foreach(id => Store.retireSession(id))
-              complete(created(sessionId, claims.userId, deviceClass))
-            case _ => complete(StatusCodes.Unauthorized -> "no completed auth assertion for this token")
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

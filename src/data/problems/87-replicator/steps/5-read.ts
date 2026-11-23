@@ -50,7 +50,6 @@ shard whose rows differ between the regions reports healthy, because nothing com
         python: {all: [/@app\.get\(\s*["']\/v1\/replications\/\{\w+\}\/lag["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/replications\/:\w+\/lag['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/replications\/\{id\}\/lag"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"replications"\s*\/\s*Segment\s*\/\s*"lag"\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/replications\//]},
       },
     },
@@ -63,7 +62,6 @@ shard whose rows differ between the regions reports healthy, because nothing com
         python: {all: [/x-operator-id/i, /\["owner"\]\s*!=/, /\b401\b/]},
         typescript: {all: [/x-operator-id/i, /\.owner\s*!==/, /\b401\b/]},
         go: {all: [/X-Operator-Id/i, /\.Owner\s*!=/, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/X-Operator-Id/i, /_\.owner\s*==|\.owner\s*!=/, /Unauthorized/]},
         cpp: {all: [/X-Operator-Id/i, /->owner\s*!=/, /\b401\b/]},
       },
     },
@@ -79,7 +77,6 @@ shard whose rows differ between the regions reports healthy, because nothing com
         },
         typescript: {all: [/lag_changes:\s*Math\.max\(/, /source_head_offset/], none: [/Math\.min\(\s*\.\.\./]},
         go: {all: [/json:"lag_changes"/, /json:"source_head_offset"/], none: [/applied\s*=\s*min\(|minOffset/]},
-        scala: {all: [/"lag_changes"/, /"source_head_offset"/], none: [/\.min\b/]},
         cpp: {all: [/"lag_changes"/, /"source_head_offset"/], none: [/std::min_element|std::min\(/]},
       },
     },
@@ -100,10 +97,6 @@ shard whose rows differ between the regions reports healthy, because nothing com
         go: {
           all: [/sampleKeys\s*=\s*256/, /regions\.SampleKeys\(/, /regions\.KeyDigest\(/, /divergent_shards/],
           none: [/"healthy":\s*true/],
-        },
-        scala: {
-          all: [/SampleKeys\s*=\s*256/, /Regions\.sampleKeys\(/, /Regions\.keyDigest\(/, /divergent_shards/],
-          none: [/"healthy"\s*->\s*JsTrue/],
         },
         cpp: {
           all: [/kSampleKeys\s*=\s*256/, /regions::sampleKeys\(/, /regions::keyDigest\(/, /divergent_shards/],
@@ -352,91 +345,6 @@ func readLag(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/replications/{id}/lag", readLag)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import replication.{Offsets, Regions, Store} // Store.get · Offsets.resumeOffset · Regions.sourceHeadOffset, sampleKeys, keyDigest
-
-object Read {
-  val route: Route =
-    path("v1" / "replications" / Segment / "lag") { replicationId =>
-      get {
-        // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-        Store.get(replicationId) match {
-          case None => complete(StatusCodes.NotFound -> "no such replication")
-          case Some(replication) =>
-            val applied = replication.shards.map(Offsets.resumeOffset(replicationId, _)).min
-            val head = replication.shards.map(Regions.sourceHeadOffset(replicationId, _)).max
-            val body = JsObject(
-              "replication_id" -> JsString(replicationId),
-              "lag_changes" -> JsNumber(math.max(head - applied, 0L)),
-              "healthy" -> JsTrue
-            )
-            complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import replication.{Offsets, Regions, Replication, Store} // Store.get · Offsets.resumeOffset · Regions.sourceHeadOffset, sampleKeys, keyDigest
-
-object Read {
-  /** Rows of a shard compared per read: enough to catch a shard that diverged, cheap enough to run on every read. */
-  val SampleKeys = 256
-
-  /** The sampled rows of the shard whose digests differ between the two regions. */
-  def divergentKeys(replication: Replication, shard: Int): Seq[String] =
-    Regions.sampleKeys(replication.sourceRegion, shard, SampleKeys).filter { key =>
-      Regions.keyDigest(replication.sourceRegion, shard, key) != Regions.keyDigest(replication.targetRegion, shard, key)
-    }
-
-  private def shardLag(replicationId: String, replication: Replication, shard: Int): (JsObject, Boolean) = {
-    val offset = Offsets.resumeOffset(replicationId, shard)
-    val head = Regions.sourceHeadOffset(replicationId, shard)
-    val diverged = divergentKeys(replication, shard) // a shard at zero lag can still hold different rows
-    val entry = JsObject(
-      "shard" -> JsNumber(shard),
-      "offset" -> JsNumber(offset),
-      "source_head_offset" -> JsNumber(head),
-      "lag_changes" -> JsNumber(math.max(head - offset, 0L)),
-      "divergent_keys" -> JsArray(diverged.map(JsString(_)).toVector)
-    )
-    (entry, diverged.nonEmpty)
-  }
-
-  val route: Route =
-    path("v1" / "replications" / Segment / "lag") { replicationId =>
-      get {
-        optionalHeaderValueByName("X-Operator-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Operator-Id is required")
-          case Some(operator) =>
-            // Another operator's replication is as absent as one that does not exist: the id reveals nothing.
-            Store.get(replicationId).filter(_.owner == operator) match {
-              case None => complete(StatusCodes.NotFound -> "no such replication")
-              case Some(replication) =>
-                val lags = replication.shards.map(shard => shard -> shardLag(replicationId, replication, shard))
-                val body = JsObject(
-                  "replication_id" -> JsString(replicationId),
-                  "sampled_keys" -> JsNumber(SampleKeys),
-                  "shards" -> JsArray(lags.map(_._2._1).toVector),
-                  "divergent_shards" -> JsArray(lags.collect { case (shard, (_, true)) => JsNumber(shard) }.toVector)
-                )
-                complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-            }
-        }
-      }
-    }
 }
 `,
     },

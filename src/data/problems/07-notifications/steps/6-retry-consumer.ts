@@ -69,12 +69,6 @@ which raises \`Retryable\` when the gateway asked for a retry.
             /GroupTopics:\s*\[\]string\{[^\n]*(topic|"notifications")[^\n]*(retryTopic|"notifications-retry")/,
           ],
         },
-        scala: {
-          all: [
-            /"group\.id"\s*,\s*"delivery"/,
-            /subscribe\([^\n]*(Topic|"notifications")[^\n]*(RetryTopic|"notifications-retry")/,
-          ],
-        },
         cpp: {
           all: [
             /"group\.id"\s*,\s*"delivery"/,
@@ -91,7 +85,6 @@ which raises \`Retryable\` when the gateway asked for a retry.
         python: {all: [/"enable\.auto\.commit"\s*:\s*False/]},
         typescript: {all: [/autoCommit:\s*false/]},
         go: {all: [/reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
-        scala: {all: [/"enable\.auto\.commit"\s*,\s*"false"|ENABLE_AUTO_COMMIT_CONFIG\s*,\s*"false"/]},
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/]},
       },
     },
@@ -104,7 +97,6 @@ which raises \`Retryable\` when the gateway asked for a retry.
         python: {all: [/\ballowed\(/, /\bget_prefs\(/, /\bquiet\(/]},
         typescript: {all: [/\ballowed\(/, /\bgetPrefs\(/, /\bquiet\(/]},
         go: {all: [/\ballowed\(/, /\bgetPrefs\(/, /\bQuiet\(/]},
-        scala: {all: [/RateLimit\.allowed\(/, /Preferences\.getPrefs\(/, /Preferences\.quiet\(/]},
         cpp: {all: [/\ballowed\(/, /\bget_prefs\(/, /\bquiet\(/]},
       },
     },
@@ -117,7 +109,6 @@ which raises \`Retryable\` when the gateway asked for a retry.
         python: {all: [/producer\.produce\(/, /headers\s*=\s*[^\n]*["']attempt["']/, />=\s*(MAX_ATTEMPTS|5)\b/]},
         typescript: {all: [/producer\.send\(/, /headers:\s*\{[^\n]*attempt/, />=\s*(MAX_ATTEMPTS|5)\b/]},
         go: {all: [/writer\.WriteMessages\(/, /kafka\.Header\{\{?\s*Key:\s*"attempt"/, />=\s*(maxAttempts|5)\b/]},
-        scala: {all: [/producer\.send\(/, /headers\(\)\.add\(\s*"attempt"/, />=\s*(MaxAttempts|5)\b/]},
         cpp: {all: [/producer->produce\(/, /->add\(\s*"attempt"/, />=\s*(kMaxAttempts|5)\b/]},
       },
     },
@@ -130,7 +121,6 @@ which raises \`Retryable\` when the gateway asked for a retry.
         python: {order: [/(?<!def )send_push\(/, /(?<!def )requeue\(/, /consumer\.commit\(/]},
         typescript: {order: [/\bsendPush\(/, /(?<!function )\brequeue\(/, /consumer\.commitOffsets\(/]},
         go: {order: [/(?<!func )sendPush\(/, /(?<!func )requeue\(/, /reader\.CommitMessages\(/]},
-        scala: {order: [/PushClient\.sendPush\(/, /(?<!def )requeue\(/, /consumer\.commitSync\(/]},
         cpp: {order: [/(?<!\w )send_push\(/, /(?<!void )requeue\(/, /consumer->commitSync\(/]},
       },
     },
@@ -581,121 +571,6 @@ func run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.{Duration, LocalTime}
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import scala.jdk.CollectionConverters._
-
-import notifications.{Json, Notification} // Json.notification(value) — provided; RateLimit, Preferences, PushClient are steps 3–5
-
-object DeliveryWorker {
-  val Topic = "notifications"
-  val RetryTopic = "notifications-retry"
-  val DlqTopic = "notifications-dlq"
-  val MaxAttempts = 5
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "delivery")
-  props.put("auto.offset.reset", "earliest")
-  // TODO: disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  // TODO: subscribe to Topic and RetryTopic
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  producerProps.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  /** The attempt header, 0 on first delivery (provided). */
-  def attemptOf(record: ConsumerRecord[String, String]): Int =
-    Option(record.headers().lastHeader("attempt")).map(h => new String(h.value()).toInt).getOrElse(0)
-
-  def requeue(record: ConsumerRecord[String, String], attempt: Int): Unit = {
-    // TODO: a ProducerRecord (same key and value) with attempt + 1 in the header to RetryTopic, or to DlqTopic once it reaches MaxAttempts
-    // TODO: send and block on the future so the re-queue is acknowledged before the caller commits
-  }
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        val n: Notification = Json.notification(record.value())
-        // TODO: deliver only if RateLimit.allowed, prefs.push, and (priority high or !Preferences.quiet(prefs, hour))
-        // TODO: PushClient.sendPush(n.userId, n.title, n.body, n.id); Retryable → requeue(record, attemptOf(record))
-      }
-      // TODO: commitSync after every record of the batch has its outcome recorded
-    }
-}
-`,
-      solution: `import java.time.{Duration, LocalTime}
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import scala.jdk.CollectionConverters._
-
-import notifications.{Json, Notification} // Json.notification(value) — provided; RateLimit, Preferences, PushClient are steps 3–5
-
-object DeliveryWorker {
-  val Topic = "notifications"
-  val RetryTopic = "notifications-retry"
-  val DlqTopic = "notifications-dlq"
-  val MaxAttempts = 5
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "delivery")
-  props.put("auto.offset.reset", "earliest")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Topic, RetryTopic).asJava)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  producerProps.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  /** The attempt header, 0 on first delivery (provided). */
-  def attemptOf(record: ConsumerRecord[String, String]): Int =
-    Option(record.headers().lastHeader("attempt")).map(h => new String(h.value()).toInt).getOrElse(0)
-
-  def requeue(record: ConsumerRecord[String, String], attempt: Int): Unit = {
-    val next = attempt + 1
-    val target = if (next >= MaxAttempts) DlqTopic else RetryTopic
-    val out = new ProducerRecord[String, String](target, record.key(), record.value())
-    out.headers().add("attempt", next.toString.getBytes)
-    producer.send(out).get() // acknowledged before the caller commits
-  }
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        val n: Notification = Json.notification(record.value())
-        val prefs = Preferences.getPrefs(n.userId)
-        val deliver = RateLimit.allowed(n.userId, n.id) && prefs.push &&
-          (n.priority == "high" || !Preferences.quiet(prefs, LocalTime.now().getHour))
-        if (deliver)
-          try PushClient.sendPush(n.userId, n.title, n.body, n.id) // one device per user: the token is the user id
-          catch {
-            case e: PushClient.Retryable =>
-              System.err.println(s"\${n.id}: \${e.getMessage}, re-queueing")
-              requeue(record, attemptOf(record))
-          }
-      }
-      consumer.commitSync() // after every record of the batch has its outcome recorded
-    }
 }
 `,
     },

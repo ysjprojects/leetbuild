@@ -51,7 +51,6 @@ replication overwrite each other's progress.
         python: {all: [/def resume_offset\(/], none: [/\bex\s*=/, /expire/i, /setex/i]},
         typescript: {all: [/function resumeOffset\(/], none: [/['"]EX['"]/, /expire/i, /setex/i]},
         go: {all: [/func resumeOffset\(/], none: [/time\.Hour|time\.Second|offsetTTL/, /Expire\(/, /SetEX\(/i]},
-        scala: {all: [/def resumeOffset\(/], none: [/SetParams|\.ex\(/, /expire/i, /setex/i]},
         cpp: {all: [/resumeOffset\(/], none: [/std::chrono/, /expire/i, /setex/i]},
       },
     },
@@ -64,7 +63,6 @@ replication overwrite each other's progress.
         python: {all: [/tonumber\(/]},
         typescript: {all: [/tonumber\(/]},
         go: {all: [/tonumber\(/]},
-        scala: {all: [/tonumber\(/]},
         cpp: {all: [/tonumber\(/]},
       },
     },
@@ -72,12 +70,11 @@ replication overwrite each other's progress.
       id: 'atomic-advance',
       title: 'The advance is one compare-and-set in Lua',
       detail:
-        'Read, compare and write run in one script (`register_script`/`eval`, `defineCommand`, `NewScript`, `jedis.eval`, `redis.eval`) that `SET`s only a larger offset; a client-side `GET` then `SET` lets a confirmation that lands in between be overwritten by an older one, and a compare-and-set that gives up when another worker wrote first drops the larger confirmation.',
+        'Read, compare and write run in one script (`register_script`/`eval`, `defineCommand`, `NewScript`, `redis.eval`) that `SET`s only a larger offset; a client-side `GET` then `SET` lets a confirmation that lands in between be overwritten by an older one, and a compare-and-set that gives up when another worker wrote first drops the larger confirmation.',
       match: {
         python: {all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]SET['"]/], none: [/\br\.set\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]SET['"]/], none: [/redis\.set\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]SET['"]/], none: [/rdb\.Set\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]SET['"]/], none: [/jedis\.set\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]SET['"]/], none: [/redis\.set\(/]},
       },
     },
@@ -90,7 +87,6 @@ replication overwrite each other's progress.
         python: {all: [/offset:\{replication_id\}:\{shard\}/]},
         typescript: {all: [/offset:\$\{replicationId\}:\$\{shard\}/]},
         go: {all: [/"offset:%s:%d"/]},
-        scala: {all: [/offset:\$replicationId:\$shard/]},
         cpp: {all: [/"offset:"\s*\+\s*replication_id\s*\+\s*":"\s*\+\s*std::to_string\(shard\)/]},
       },
     },
@@ -302,64 +298,6 @@ func resumeOffset(ctx context.Context, replicationID string, shard int) (int64, 
 		return 0, nil
 	}
 	return offset, err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val OffsetTtlSeconds = 3600L
-
-  def offsetKey(replicationId: String, shard: Int): String = s"offset:$replicationId"
-
-  /** Record that the target confirmed the shard up to offset; returns the shard's offset afterwards. */
-  def advanceOffset(replicationId: String, shard: Int, offset: Long): Long = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = offsetKey(replicationId, shard)
-    val current = Option(jedis.get(key)).getOrElse("0")
-    if (offset.toString > current) {
-      jedis.set(key, offset.toString, SetParams.setParams().ex(OffsetTtlSeconds))
-      offset
-    } else current.toLong
-  }
-
-  /** Where a restarted shard resumes: its confirmed offset, 0 when it never confirmed one. */
-  def resumeOffset(replicationId: String, shard: Int): Long =
-    Option(jedis.get(offsetKey(replicationId, shard))).map(_.toLong).getOrElse(0L)
-}
-`,
-      solution: `import scala.jdk.CollectionConverters._
-
-import redis.clients.jedis.JedisPooled
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Forward-only compare-and-set, as numbers: a late confirmation of an older offset changes nothing. */
-  val AdvanceLua: String =
-    """local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-      |local candidate = tonumber(ARGV[1])
-      |if candidate > current then
-      |  redis.call('SET', KEYS[1], ARGV[1])
-      |  return candidate
-      |end
-      |return current
-      |""".stripMargin
-
-  def offsetKey(replicationId: String, shard: Int): String = s"offset:$replicationId:$shard"
-
-  /** Record that the target confirmed the shard up to offset; returns the shard's offset afterwards. */
-  def advanceOffset(replicationId: String, shard: Int, offset: Long): Long =
-    // No TTL: an offset that expires rewinds the shard to zero and replays its history.
-    jedis.eval(AdvanceLua, List(offsetKey(replicationId, shard)).asJava, List(offset.toString).asJava).asInstanceOf[java.lang.Long]
-
-  /** Where a restarted shard resumes: its confirmed offset, 0 when it never confirmed one. */
-  def resumeOffset(replicationId: String, shard: Int): Long =
-    Option(jedis.get(offsetKey(replicationId, shard))).map(_.toLong).getOrElse(0L)
 }
 `,
     },

@@ -52,7 +52,6 @@ announced anyway; a lost acknowledgement writes the event twice; a broker error 
         python: {all: [/key\s*=\s*request_id/], none: [/key\s*=\s*actor/]},
         typescript: {all: [/key:\s*requestId/], none: [/key:\s*actor/]},
         go: {all: [/Key:\s*\[\]byte\(requestID\)/], none: [/Key:\s*\[\]byte\(actor\)/]},
-        scala: {all: [/ProducerRecord\[String,\s*String\]\(Topic,\s*requestId/], none: [/\(Topic,\s*actor/]},
         cpp: {all: [/request_id\.c_str\(\),\s*request_id\.size\(\)/], none: [/actor\.c_str\(\),\s*actor\.size\(\)/]},
       },
     },
@@ -65,7 +64,6 @@ announced anyway; a lost acknowledgement writes the event twice; a broker error 
         python: {all: [/["']status["']\s*:/], none: [/["']why["']/, /amount_cents/]},
         typescript: {all: [/\bstatus:/], none: [/\.why\b|\bwhy:/, /amount_cents/]},
         go: {all: [/"status"/], none: [/\.Why\b/, /AmountCents/]},
-        scala: {all: [/"status"/], none: [/\.why\b|"why"/, /amountCents/]},
         cpp: {all: [/"status"/], none: [/\.why\b|"why"/, /amount_cents/]},
       },
     },
@@ -78,7 +76,6 @@ announced anyway; a lost acknowledgement writes the event twice; a broker error 
         python: {all: [/["']advanced["']/], order: [/chain\.advance\(/, /producer\.produce\(/]},
         typescript: {all: [/\.advanced\b/], order: [/chain\.advance\(/, /producer\.send\(/]},
         go: {all: [/\.Advanced\b/], order: [/chain\.Advance\(/, /producer\.Produce\(/]},
-        scala: {all: [/\.advanced\b/], order: [/Chain\.advance\(/, /producer\.send\(/]},
         cpp: {all: [/\.advanced\b/], order: [/chain::advance\(/, /producer->produce\(/]},
       },
     },
@@ -91,7 +88,6 @@ announced anyway; a lost acknowledgement writes the event twice; a broker error 
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -104,7 +100,6 @@ announced anyway; a lost acknowledgement writes the event twice; a broker error 
         python: {all: [/outbox\.insert\(/, /on_delivery\s*=/, /\.flush\(/]},
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/outbox\.Insert\(/, /TopicPartition\.Error/, /time\.After\(/]},
-        scala: {all: [/Outbox\.insert\(/, /\.get\(\s*AckTimeoutMs/]},
         cpp: {all: [/outbox::insert\(/, /dr_cb/, /->flush\(/]},
       },
     },
@@ -344,84 +339,6 @@ func recordDecision(ctx context.Context, requestID string, stepIndex int, actor,
 		}
 	}
 	return outcome, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import approvals.{Chain, Outbox, Store} // Chain.advance · Outbox.insert(topic, key, payload) · Store.load
-
-object Events {
-  val Topic = "approval.event"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Commit actor's decision on step stepIndex and tell the trail consumers; answers the Chain.advance outcome. */
-  def recordDecision(requestId: String, stepIndex: Long, actor: String, decision: String): Chain.Outcome = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val request = Store.load(requestId)
-    val event = JsObject(
-      "request_id" -> JsString(requestId),
-      "step" -> JsNumber(stepIndex),
-      "actor" -> JsString(actor),
-      "decision" -> JsString(decision),
-      "why" -> JsString(request.map(_.why).getOrElse("")), // the trail shows what was approved
-      "amount_cents" -> JsNumber(request.map(_.amountCents).getOrElse(0L)))
-    producer.send(new ProducerRecord[String, String](Topic, actor, event.compactPrint))
-    Chain.advance(requestId, stepIndex, actor, decision)
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import approvals.{Chain, Outbox} // Chain.advance · Outbox.insert(topic, key, payload)
-
-object Events {
-  val Topic = "approval.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Commit actor's decision on step stepIndex and tell the trail consumers; answers the Chain.advance outcome. */
-  def recordDecision(requestId: String, stepIndex: Long, actor: String, decision: String): Chain.Outcome = {
-    val outcome = Chain.advance(requestId, stepIndex, actor, decision)
-    if (!outcome.advanced) return outcome // a refused decision changed nothing: there is nothing to announce
-    // Ids and enums only: the request's content stays in the request store.
-    val event = JsObject(
-      "request_id" -> JsString(requestId),
-      "step" -> JsNumber(stepIndex),
-      "actor" -> JsString(actor),
-      "decision" -> JsString(decision),
-      "status" -> JsString(outcome.status))
-    val record = new ProducerRecord[String, String](Topic, requestId, event.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    // The broker did not take it: the relay publishes the row later, so the trail is late, not wrong.
-    if (acked.isFailure) Outbox.insert(Topic, requestId, event)
-    outcome
-  }
 }
 `,
     },

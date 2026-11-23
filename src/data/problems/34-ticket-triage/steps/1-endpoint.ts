@@ -64,7 +64,6 @@ after a timeout files the same ticket twice.
         python: {all: [/@app\.post\(\s*["']\/v1\/tickets\/triage["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/tickets\/triage['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/tickets\/triage"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"tickets"\s*\/\s*"triage"\s*\)/, /\bpost\b/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/tickets\/triage"/]},
       },
     },
@@ -77,7 +76,6 @@ after a timeout files the same ticket twice.
         python: {all: [/rules\.rule_decision\(/], none: [/body\.(priority|queue)\b/]},
         typescript: {all: [/ruleDecision\(/], none: [/body\.(priority|queue)\b/]},
         go: {all: [/rules\.RuleDecision\(/], none: [/body\.(Priority|Queue)\b/]},
-        scala: {all: [/Rules\.ruleDecision\(/], none: [/body\.get\(\s*"(priority|queue)"\s*\)/]},
         cpp: {all: [/rules::ruleDecision\(/], none: [/value\(\s*"(priority|queue)"/]},
       },
     },
@@ -93,10 +91,6 @@ after a timeout files the same ticket twice.
           order: [/>\s*MAX_TEXT_BYTES/, /ruleDecision\(/],
         },
         go: {all: [/StatusRequestEntityTooLarge|\b413\b/], order: [/>\s*maxTextBytes/, /rules\.RuleDecision\(/]},
-        scala: {
-          all: [/PayloadTooLarge|RequestEntityTooLarge|ContentTooLarge|\b413\b/, /getBytes/],
-          order: [/>\s*MaxTextBytes/, /Rules\.ruleDecision\(/],
-        },
         cpp: {all: [/\b413\b/], order: [/>\s*kMaxTextBytes/, /rules::ruleDecision\(/]},
       },
     },
@@ -111,10 +105,6 @@ after a timeout files the same ticket twice.
         go: {
           all: [/Idempotency-Key/i, /StatusBadRequest|\b400\b/],
           order: [/store\.DecisionForKey\(/, /store\.NewTicketID\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /BadRequest|\b400\b/],
-          order: [/Store\.decisionForKey\(/, /Store\.newTicketId\(/],
         },
         cpp: {all: [/Idempotency-Key/i, /\b400\b/], order: [/store::decisionForKey\(/, /store::newTicketId\(/]},
       },
@@ -358,91 +348,6 @@ func triageTicket(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/tickets/triage", triageTicket)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import triage.{Rules, Store} // Rules.ruleDecision(text); Store.newTicketId, decisionForKey, saveDecision
-
-object TriageApi {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def routing(ticketId: String, tenant: String, d: Rules.Decision): JsObject = JsObject(
-    "ticket_id" -> JsString(ticketId), "tenant" -> JsString(tenant), "queue" -> JsString(d.queue), "priority" -> JsString(d.priority),
-    "confidence" -> JsNumber(d.confidence), "fallback_reason" -> JsString(d.fallbackReason), "ruleset_version" -> JsString(d.rulesetVersion))
-
-  val route: Route = path("v1" / "tickets" / "triage") {
-    post {
-      (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("Idempotency-Key")) { (tenantOpt, keyOpt) =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-          val body = raw.parseJson.asJsObject.fields
-          val text = body.get("text").collect { case JsString(s) => s }.getOrElse("")
-          tenantOpt.filter(_.nonEmpty) match {
-            case None => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-            case Some(tenant) =>
-              val d = Rules.ruleDecision(text)
-              val queue = body.get("queue").collect { case JsString(q) => q }.getOrElse(d.queue)
-              val priority = body.get("priority").collect { case JsString(p) => p }.getOrElse(d.priority)
-              val answer = routing(Store.newTicketId(), tenant, d.copy(queue = queue, priority = priority))
-              Store.saveDecision(tenant, keyOpt.getOrElse(""), answer)
-              complete(json(StatusCodes.OK, answer))
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import triage.{Rules, Store} // Rules.ruleDecision(text); Store.newTicketId, decisionForKey, saveDecision
-
-object TriageApi {
-  val MaxTextBytes: Int = 32 * 1024
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def routing(ticketId: String, tenant: String, d: Rules.Decision): JsObject = JsObject(
-    "ticket_id" -> JsString(ticketId), "tenant" -> JsString(tenant), "queue" -> JsString(d.queue), "priority" -> JsString(d.priority),
-    "confidence" -> JsNumber(d.confidence), "fallback_reason" -> JsString(d.fallbackReason), "ruleset_version" -> JsString(d.rulesetVersion))
-
-  val route: Route = path("v1" / "tickets" / "triage") {
-    post {
-      (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("Idempotency-Key")) { (tenantOpt, keyOpt) =>
-        entity(as[String]) { raw =>
-          // priority and queue in the body are accepted for wire compatibility and ignored.
-          val text = raw.parseJson.asJsObject.fields.get("text").collect { case JsString(s) => s }.getOrElse("")
-          (tenantOpt.filter(_.nonEmpty), keyOpt.filter(_.nonEmpty)) match {
-            case (None, _) => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-            case (_, None) => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
-            case _ if text.trim.isEmpty => complete(StatusCodes.BadRequest -> "text is required")
-            case _ if text.getBytes(UTF_8).length > MaxTextBytes => complete(StatusCodes.PayloadTooLarge -> "text exceeds 32 KiB")
-            case (Some(tenant), Some(key)) =>
-              Store.decisionForKey(tenant, key) match {
-                case Some(recorded) => complete(json(StatusCodes.OK, recorded)) // a webhook retry gets the first answer
-                case None =>
-                  val answer = routing(Store.newTicketId(), tenant, Rules.ruleDecision(text))
-                  Store.saveDecision(tenant, key, answer)
-                  complete(json(StatusCodes.OK, answer))
-              }
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

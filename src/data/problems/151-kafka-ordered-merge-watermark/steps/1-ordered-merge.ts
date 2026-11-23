@@ -70,7 +70,6 @@ partition roughly in \`ts\` order) and calls \`emit(reading)\` with \`{sensor, t
         python: {all: [/sort(?:ed)?\([^\n]*"ts"[^\n]*"partition"[^\n]*"offset"/]},
         typescript: {all: [/\.sort\([^\n]*\.ts[^\n]*\.partition[^\n]*\.offset/]},
         go: {all: [/sort\.Slice\(/, /\.Partition\s*<\s*\w+\.Partition/]},
-        scala: {all: [/sortBy\([^\n]*\.ts[^\n]*\.partition[^\n]*\.offset/]},
         cpp: {all: [/std::sort\(/, /std::tie\(\w+\.ts,\s*\w+\.partition,\s*\w+\.offset\)/]},
       },
     },
@@ -83,7 +82,6 @@ partition roughly in \`ts\` order) and calls \`emit(reading)\` with \`{sensor, t
         python: {all: [/-\s*LATENESS_MS/, /<=\s*threshold/]},
         typescript: {all: [/-\s*LATENESS_MS/, /<=\s*threshold/]},
         go: {all: [/-\s*LatenessMs/, /<=\s*threshold/]},
-        scala: {all: [/-\s*LatenessMs/, /<=\s*threshold/]},
         cpp: {all: [/-\s*kLatenessMs/, /<=\s*threshold/]},
       },
     },
@@ -96,7 +94,6 @@ partition roughly in \`ts\` order) and calls \`emit(reading)\` with \`{sensor, t
         python: {all: [/\bdropped\s*\+=\s*1/]},
         typescript: {all: [/\bdropped\s*\+=\s*1/]},
         go: {all: [/\bdropped\+\+/]},
-        scala: {all: [/\bdropped\s*\+=\s*1/]},
         cpp: {all: [/\+\+dropped|dropped\+\+/]},
       },
     },
@@ -109,7 +106,6 @@ partition roughly in \`ts\` order) and calls \`emit(reading)\` with \`{sensor, t
         python: {all: [/\bts\s*<\s*frontier\b/], none: [/<=\s*frontier\b/]},
         typescript: {all: [/\.ts\s*<\s*frontier\b/], none: [/<=\s*frontier\b/]},
         go: {all: [/\.Ts\s*<\s*frontier\b/], none: [/<=\s*frontier\b/]},
-        scala: {all: [/\bts\s*<\s*frontier\b/], none: [/<=\s*frontier\b/]},
         cpp: {all: [/\bts\s*<\s*frontier\b/], none: [/<=\s*frontier\b/]},
       },
     },
@@ -122,7 +118,6 @@ partition roughly in \`ts\` order) and calls \`emit(reading)\` with \`{sensor, t
         python: {all: [/last_seen\s*(?:<|>=)\s*IDLE_MS/]},
         typescript: {all: [/lastSeen\s*(?:<|>=)\s*IDLE_MS/]},
         go: {all: [/lastSeen\s*(?:<|>=)\s*IdleMs/]},
-        scala: {all: [/lastSeen\s*(?:<|>=)\s*IdleMs/]},
         cpp: {all: [/last_seen\s*(?:<|>=)\s*kIdleMs/]},
       },
     },
@@ -135,7 +130,6 @@ partition roughly in \`ts\` order) and calls \`emit(reading)\` with \`{sensor, t
         python: {all: [/"enable\.auto\.commit"\s*:\s*False/, /consumer\.commit\(\s*offsets\s*=/]},
         typescript: {all: [/autoCommit:\s*false/, /consumer\.commitOffsets\(/]},
         go: {all: [/reader\.FetchMessage\(/, /reader\.CommitMessages\(/], none: [/ReadMessage\(/]},
-        scala: {all: [/"enable\.auto\.commit"\s*,\s*"false"/, /consumer\.commitSync\(/]},
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/, /consumer->commitSync\(/]},
       },
     },
@@ -775,175 +769,6 @@ func Run(ctx context.Context, emit func(Reading)) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-object Merger {
-  val Topic = "sensor-readings"
-  val Group = "merger"
-  val LatenessMs = 2000L
-  val IdleMs = 10000L
-
-  case class Reading(sensor: String, ts: Long, partition: Int, offset: Long)
-  case class Stats(emitted: Int, dropped: Int, buffered: Int)
-
-  /** What the merger knows about one partition: pending readings and how far it has come. */
-  private class Partition {
-    var buffer = Vector.empty[Reading]
-    var maxTs = -1L
-    var lastSeen = 0L // processing time of the last delivery, ms
-    var nextOffset = 0L // the offset after the last delivery
-    var committed = -1L
-  }
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", Group)
-  props.put("auto.offset.reset", "earliest")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Topic).asJava)
-
-  private val SensorField = """"sensor"\\s*:\\s*"([^"]+)"""".r
-  private val TsField = """"ts"\\s*:\\s*(\\d+)""".r
-
-  private val partitions = mutable.Map.empty[Int, Partition]
-  private var frontier = -1L // ts of the last emitted reading
-  private var emitted = 0
-  private var dropped = 0
-
-  def stats(): Stats = Stats(0, 0, 0) // TODO: emitted, dropped, readings in the buffers right now
-
-  private def watermark(): Long =
-    // TODO: min newest ts over partitions delivered within IdleMs; all idle → the highest ts seen
-    throw new NotImplementedError
-
-  private def flush(emit: Reading => Unit): Unit =
-    // TODO: threshold = watermark() - LatenessMs; pull every buffered reading at or below it,
-    // sort by (ts, partition, offset), emit, move the frontier, then commit()
-    throw new NotImplementedError
-
-  private def commit(): Unit =
-    // TODO: per partition the lowest buffered offset (or nextOffset when empty); send only changes
-    throw new NotImplementedError
-
-  def run(emit: Reading => Unit): Unit =
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val sensor = SensorField.findFirstMatchIn(record.value()).map(_.group(1)).getOrElse("")
-        val ts = TsField.findFirstMatchIn(record.value()).map(_.group(1).toLong).getOrElse(-1L)
-        // TODO: update the partition (nextOffset, lastSeen, maxTs);
-        // drop below the frontier (count it) or buffer the reading
-        throw new NotImplementedError
-      }
-      // TODO: flush(emit) — on empty polls too, or an idle partition is never released
-    }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-object Merger {
-  val Topic = "sensor-readings"
-  val Group = "merger"
-  val LatenessMs = 2000L
-  val IdleMs = 10000L
-
-  case class Reading(sensor: String, ts: Long, partition: Int, offset: Long)
-  case class Stats(emitted: Int, dropped: Int, buffered: Int)
-
-  /** What the merger knows about one partition: pending readings and how far it has come. */
-  private class Partition {
-    var buffer = Vector.empty[Reading]
-    var maxTs = -1L
-    var lastSeen = 0L // processing time of the last delivery, ms
-    var nextOffset = 0L // the offset after the last delivery
-    var committed = -1L
-  }
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", Group)
-  props.put("auto.offset.reset", "earliest")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Topic).asJava)
-
-  private val SensorField = """"sensor"\\s*:\\s*"([^"]+)"""".r
-  private val TsField = """"ts"\\s*:\\s*(\\d+)""".r
-
-  private val partitions = mutable.Map.empty[Int, Partition]
-  private var frontier = -1L // ts of the last emitted reading
-  private var emitted = 0
-  private var dropped = 0
-
-  def stats(): Stats = Stats(emitted, dropped, partitions.values.map(_.buffer.size).sum)
-
-  private def watermark(): Long = {
-    val now = System.currentTimeMillis()
-    val active = partitions.values.filter(p => now - p.lastSeen < IdleMs).map(_.maxTs)
-    if (active.nonEmpty) active.min else partitions.values.map(_.maxTs).maxOption.getOrElse(-1L)
-  }
-
-  private def flush(emit: Reading => Unit): Unit = {
-    val threshold = watermark() - LatenessMs
-    val due = mutable.ArrayBuffer.empty[Reading]
-    partitions.values.foreach { p =>
-      val (ready, kept) = p.buffer.partition(_.ts <= threshold)
-      due ++= ready
-      p.buffer = kept
-    }
-    if (due.isEmpty) return
-    due.sortBy(r => (r.ts, r.partition, r.offset)).foreach { r =>
-      emit(r)
-      frontier = r.ts
-      emitted += 1
-    }
-    commit()
-  }
-
-  private def commit(): Unit = {
-    val offsets = partitions.flatMap { case (partition, p) =>
-      val safe = if (p.buffer.isEmpty) p.nextOffset else p.buffer.map(_.offset).min
-      if (safe == p.committed) None
-      else {
-        p.committed = safe
-        Some(new TopicPartition(Topic, partition) -> new OffsetAndMetadata(safe))
-      }
-    }
-    if (offsets.nonEmpty) consumer.commitSync(offsets.toMap.asJava)
-  }
-
-  def run(emit: Reading => Unit): Unit =
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val sensor = SensorField.findFirstMatchIn(record.value()).map(_.group(1)).getOrElse("")
-        val ts = TsField.findFirstMatchIn(record.value()).map(_.group(1).toLong).getOrElse(-1L)
-        val p = partitions.getOrElseUpdate(record.partition(), new Partition)
-        p.nextOffset = record.offset() + 1
-        p.lastSeen = System.currentTimeMillis()
-        p.maxTs = math.max(p.maxTs, ts)
-        if (ts < frontier) dropped += 1
-        else p.buffer = p.buffer :+ Reading(sensor, ts, record.partition(), record.offset())
-      }
-      flush(emit)
-    }
 }
 `,
     },

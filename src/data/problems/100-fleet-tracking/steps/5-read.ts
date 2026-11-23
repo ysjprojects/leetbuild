@@ -67,7 +67,6 @@ not be answered with 5 000 records at once.
         python: {all: [/@app\.get\(\s*["']\/v1\/fleets\/\{fleet_id\}\/positions["']/, /smembers\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/fleets\/:fleetId\/positions['"]/, /smembers\(/]},
         go: {all: [/"GET \/v1\/fleets\/\{fleetID\}\/positions"/, /SMembers\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"fleets"\s*\/\s*Segment\s*\/\s*"positions"\s*\)/, /smembers\(/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/fleets\//, /smembers\(/]},
       },
     },
@@ -83,10 +82,6 @@ not be answered with 5 000 records at once.
         },
         typescript: {all: [/code\(\s*401\s*\)/, /code\(\s*404\s*\)/], none: [/\?\?\s*['"]['"]/]},
         go: {all: [/http\.StatusUnauthorized|\b401\b/, /http\.StatusNotFound|\b404\b/]},
-        scala: {
-          all: [/StatusCodes\.Unauthorized|\b401\b/, /StatusCodes\.NotFound|\b404\b/],
-          none: [/tenant\s*=\s*header\.getOrElse\(\s*""\s*\)/],
-        },
         cpp: {all: [/status\s*=\s*401/, /status\s*=\s*404/]},
       },
     },
@@ -99,7 +94,6 @@ not be answered with 5 000 records at once.
         python: {all: [/FRESHNESS_BOUND_MS\s*=\s*60_?000/, /["']stale["']/, />\s*FRESHNESS_BOUND_MS/]},
         typescript: {all: [/FRESHNESS_BOUND_MS\s*=\s*60_?000/, /stale/, />\s*FRESHNESS_BOUND_MS/]},
         go: {all: [/freshnessBoundMs\s*=\s*60_?000/, /"stale"/, />\s*freshnessBoundMs/]},
-        scala: {all: [/FreshnessBoundMs\s*=\s*60000L?/, /"stale"/, />\s*FreshnessBoundMs/]},
         cpp: {all: [/kFreshnessBoundMs\s*=\s*60000/, /"stale"/, />\s*kFreshnessBoundMs/]},
       },
     },
@@ -112,7 +106,6 @@ not be answered with 5 000 records at once.
         python: {all: [/MAX_VEHICLES\s*=\s*5000/, /truncated/, /MAX_VEHICLES\s*\]/]},
         typescript: {all: [/MAX_VEHICLES\s*=\s*5000/, /truncated/, /slice\(\s*0\s*,\s*MAX_VEHICLES\s*\)/]},
         go: {all: [/maxVehicles\s*=\s*5000/, /truncated/, /\[:maxVehicles\]/]},
-        scala: {all: [/MaxVehicles\s*=\s*5000/, /truncated/, /take\(\s*MaxVehicles\s*\)/]},
         cpp: {
           all: [/kMaxVehicles\s*=\s*5000/, /truncated/, /resize\(\s*kMaxVehicles\s*\)|begin\(\)\s*\+\s*kMaxVehicles/],
         },
@@ -127,7 +120,6 @@ not be answered with 5 000 records at once.
         python: {all: [/MAX_LIMIT\s*=\s*1000/, /DEFAULT_LIMIT\s*=\s*500/, /cursor/]},
         typescript: {all: [/MAX_LIMIT\s*=\s*1000/, /DEFAULT_LIMIT\s*=\s*500/, /cursor/]},
         go: {all: [/maxLimit\s*=\s*1000/, /defaultLimit\s*=\s*500/, /cursor/]},
-        scala: {all: [/MaxLimit\s*=\s*1000/, /DefaultLimit\s*=\s*500/, /cursor/]},
         cpp: {all: [/kMaxLimit\s*=\s*1000/, /kDefaultLimit\s*=\s*500/, /cursor/]},
       },
     },
@@ -140,7 +132,6 @@ not be answered with 5 000 records at once.
         python: {all: [/\.pipeline\(/, /\.execute\(\)/], none: [/\br\.hgetall\(/]},
         typescript: {all: [/redis\.(multi|pipeline)\(\)/, /\.exec\(\)/], none: [/await redis\.hgetall\(/]},
         go: {all: [/TxPipelined\(|Pipelined\(/], none: [/rdb\.HGetAll\(/]},
-        scala: {all: [/\.multi\(\)|\.pipelined\(\)/, /\.exec\(\)|\.sync\(\)/], none: [/jedis\.hgetAll\(/]},
         cpp: {all: [/redis\.(transaction|pipeline)\(/, /\.exec\(\)/], none: [/redis\.hgetall\(/]},
       },
     },
@@ -503,113 +494,6 @@ func getSnapshot(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/fleets/{fleetID}/positions", getSnapshot)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-object Snapshot {
-  /** One vehicle of the response from its latest record (empty when it has none). */
-  def view(vehicleId: String, rec: Map[String, String]): JsObject =
-    JsObject(
-      "vehicle_id"          -> JsString(vehicleId),
-      "device_timestamp_ms" -> rec.get("ts").map(ts => JsNumber(ts.toLong)).getOrElse(JsNull),
-      "sequence"            -> rec.get("seq").map(s => JsNumber(s.toLong)).getOrElse(JsNull),
-      "lat"                 -> rec.get("lat").map(v => JsNumber(v.toDouble)).getOrElse(JsNull),
-      "lon"                 -> rec.get("lon").map(v => JsNumber(v.toDouble)).getOrElse(JsNull)
-    )
-
-  val route: Route =
-    path("v1" / "fleets" / Segment / "positions") { fleetId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { header =>
-          // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-          val tenant  = header.getOrElse("")
-          val members = State.jedis.smembers(s"fleet:$tenant:$fleetId").asScala.toList.sorted
-          if (members.isEmpty) complete(StatusCodes.NotFound -> "no such fleet")
-          else {
-            val vehicles = members.map(id => view(id, State.jedis.hgetAll(s"vehicle:$id:latest").asScala.toMap))
-            val body = JsObject(
-              "fleet_id"       -> JsString(fleetId),
-              "snapshot_at_ms" -> JsNumber(System.currentTimeMillis()),
-              "vehicles"       -> JsArray(vehicles.toVector)
-            )
-            complete(HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-object Snapshot {
-  val FreshnessBoundMs = 60000L
-  val MaxVehicles      = 5000
-  val DefaultLimit     = 500
-  val MaxLimit         = 1000
-
-  /** One vehicle of the response from its latest record (empty when it has none), flagged stale past the bound. */
-  def view(vehicleId: String, rec: Map[String, String], snapshotAtMs: Long): JsObject = {
-    val ts = rec.get("ts").map(_.toLong)
-    JsObject(
-      "vehicle_id"          -> JsString(vehicleId),
-      "device_timestamp_ms" -> ts.map(JsNumber(_)).getOrElse(JsNull),
-      "sequence"            -> rec.get("seq").map(s => JsNumber(s.toLong)).getOrElse(JsNull),
-      "lat"                 -> rec.get("lat").map(v => JsNumber(v.toDouble)).getOrElse(JsNull),
-      "lon"                 -> rec.get("lon").map(v => JsNumber(v.toDouble)).getOrElse(JsNull),
-      "stale"               -> JsBoolean(ts.forall(t => snapshotAtMs - t > FreshnessBoundMs))
-    )
-  }
-
-  val route: Route =
-    path("v1" / "fleets" / Segment / "positions") { fleetId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "missing X-Tenant-Id")
-          case Some(tenant) =>
-            parameters("limit".as[Int].?, "cursor".?) { (limitParam, cursor) =>
-              val limit = limitParam.getOrElse(DefaultLimit)
-              val all   = State.jedis.smembers(s"fleet:$tenant:$fleetId").asScala.toList.sorted
-              if (limit < 1 || limit > MaxLimit) complete(StatusCodes.BadRequest -> s"limit must be within [1, $MaxLimit]")
-              else if (all.isEmpty) complete(StatusCodes.NotFound -> "no such fleet")
-              else {
-                val truncated  = all.size > MaxVehicles
-                val members    = all.take(MaxVehicles)
-                val start      = cursor.map(c => members.count(_ <= c)).getOrElse(0) // the page after the cursor
-                val page       = members.slice(start, start + limit)
-                val nextCursor = if (start + limit < members.size) JsString(page.last) else JsNull
-                val tx         = State.jedis.multi() // one round trip, one instant
-                val replies    = page.map(id => tx.hgetAll(s"vehicle:$id:latest"))
-                tx.exec()
-                val snapshotAtMs = System.currentTimeMillis()
-                val vehicles     = page.zip(replies).map { case (id, reply) => view(id, reply.get.asScala.toMap, snapshotAtMs) }
-                val body = JsObject(
-                  "fleet_id"       -> JsString(fleetId),
-                  "snapshot_at_ms" -> JsNumber(snapshotAtMs),
-                  "vehicles"       -> JsArray(vehicles.toVector),
-                  "stale"          -> JsNumber(vehicles.count(_.fields("stale") == JsTrue)),
-                  "cursor"         -> nextCursor,
-                  "max_vehicles"   -> JsNumber(MaxVehicles),
-                  "truncated"      -> JsBoolean(truncated)
-                )
-                complete(HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-              }
-            }
-        }
-      }
-    }
 }
 `,
     },

@@ -67,7 +67,6 @@ and a batch the sender retries after a timeout is counted twice.
           all: [/func windowKey\(\s*tenant/, /"win:"\s*\+\s*tenant\s*\+|"win:%s:%s:%d",\s*tenant/],
           none: [/"win:"\s*\+\s*series/],
         },
-        scala: {all: [/def windowKey\(\s*tenant/, /s"win:\$tenant:\$series:\$start"/], none: [/s"win:\$series/]},
         cpp: {
           all: [/windowKey\(\s*const std::string& tenant/, /"win:"\s*\+\s*tenant\s*\+/],
           none: [/"win:"\s*\+\s*series/],
@@ -86,7 +85,6 @@ and a batch the sender retries after a timeout is counted twice.
           none: [/redis\.hincrby(float)?\(/, /redis\.zadd\(/],
         },
         go: {all: [/redis\.NewScript\(|\.Eval\(/], none: [/\.HIncrBy(Float)?\(/, /\.ZAdd\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /MergeLua/], none: [/jedis\.hincrBy(Float)?\(/, /jedis\.zadd\(/]},
         cpp: {all: [/\.eval(sha)?[<(]/, /kMergeLua/], none: [/\.hincrby(float)?\(/, /\.zadd\(/]},
       },
     },
@@ -99,7 +97,6 @@ and a batch the sender retries after a timeout is counted twice.
         python: {all: [/redis\.call\(\s*['"]EXPIREAT['"]/, /RETENTION_SECONDS/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIREAT['"]/, /RETENTION_SECONDS/]},
         go: {all: [/redis\.call\(\s*['"]EXPIREAT['"]/, /model\.RetentionSeconds/]},
-        scala: {all: [/redis\.call\(\s*['"]EXPIREAT['"]/, /RetentionSeconds/]},
         cpp: {all: [/redis\.call\(\s*['"]EXPIREAT['"]/, /kRetentionSeconds/]},
       },
     },
@@ -112,7 +109,6 @@ and a batch the sender retries after a timeout is counted twice.
         python: {all: [/redis\.call\(\s*['"]SET['"][^\n]*['"]NX['"]/, /f"batch:\{tenant\}:\{batch_id\}"/]},
         typescript: {all: [/redis\.call\(\s*['"]SET['"][^\n]*['"]NX['"]/, /`batch:\$\{tenant\}:\$\{batchId\}`/]},
         go: {all: [/redis\.call\(\s*['"]SET['"][^\n]*['"]NX['"]/, /"batch:"\s*\+\s*tenant/]},
-        scala: {all: [/redis\.call\(\s*['"]SET['"][^\n]*['"]NX['"]/, /s"batch:\$tenant:\$batchId"/]},
         cpp: {all: [/redis\.call\(\s*['"]SET['"][^\n]*['"]NX['"]/, /"batch:"\s*\+\s*tenant/]},
       },
     },
@@ -338,71 +334,6 @@ func mergeBatch(ctx context.Context, tenant, batchID string, samples []model.Sam
 	}
 	applied, err := merge.Run(ctx, rdb, keys, args...).Int64()
 	return applied == 1, err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import metrics.Model.{RetentionSeconds, Sample, WindowSeconds, seriesId, windowStart}
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  def windowKey(series: String, start: Long): String = s"win:$series:$start"
-  def indexKey(tenant: String, metric: String): String = s"idx:$tenant:$metric"
-
-  /** Add every sample of the batch to its window; true when the batch was applied. */
-  def mergeBatch(tenant: String, batchId: String, samples: Seq[Sample]): Boolean = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    samples.foreach { s =>
-      val start = windowStart(s.timestamp)
-      val key = windowKey(seriesId(s.metric, s.labels), start)
-      jedis.hincrBy(key, "count", 1)
-      jedis.hincrByFloat(key, "sum", s.value)
-      jedis.zadd(indexKey(tenant, s.metric), start.toDouble, key)
-    }
-    true
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import metrics.Model.{RetentionSeconds, Sample, WindowSeconds, seriesId, windowStart}
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val ClaimTtlSeconds = 86400L
-
-  /** KEYS[1] claims the batch; then a (window key, index key) pair per sample, with (start, value) in ARGV. */
-  val MergeLua: String =
-    """if not redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[1]) then return 0 end
-      |for i = 2, #KEYS, 2 do
-      |  local start = tonumber(ARGV[i + 1])
-      |  redis.call('HINCRBY', KEYS[i], 'count', 1)
-      |  redis.call('HINCRBYFLOAT', KEYS[i], 'sum', ARGV[i + 2])
-      |  redis.call('EXPIREAT', KEYS[i], start + tonumber(ARGV[2]))
-      |  redis.call('ZADD', KEYS[i + 1], start, KEYS[i])
-      |end
-      |return 1
-      |""".stripMargin
-
-  def windowKey(tenant: String, series: String, start: Long): String = s"win:$tenant:$series:$start"
-  def indexKey(tenant: String, metric: String): String = s"idx:$tenant:$metric"
-  def batchKey(tenant: String, batchId: String): String = s"batch:$tenant:$batchId"
-
-  /** Add every sample of the batch to its window, once and atomically; false when the batch was applied before. */
-  def mergeBatch(tenant: String, batchId: String, samples: Seq[Sample]): Boolean = {
-    val keys = batchKey(tenant, batchId) +: samples.flatMap { s =>
-      Seq(windowKey(tenant, seriesId(s.metric, s.labels), windowStart(s.timestamp)), indexKey(tenant, s.metric))
-    }
-    val args = Seq(ClaimTtlSeconds.toString, (WindowSeconds + RetentionSeconds).toString) ++
-      samples.flatMap(s => Seq(windowStart(s.timestamp).toString, s.value.toString))
-    jedis.eval(MergeLua, keys.asJava, args.asJava).asInstanceOf[java.lang.Long] == 1L
-  }
 }
 `,
     },

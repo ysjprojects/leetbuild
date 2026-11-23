@@ -45,12 +45,11 @@ without a trace; and a consumer that crashes between its commit and its counters
       id: 'tenant-key',
       title: 'Keyed by tenant',
       detail:
-        "The record key is the tenant (`key=tenant`, `key: tenant`, `[]byte(tenant)`, `ProducerRecord(Topic, tenant, …)`), so one tenant's events share a partition and stay in order. The starter keys by request id.",
+        "The record key is the tenant (`key=tenant`, `key: tenant`, `[]byte(tenant)`), so one tenant's events share a partition and stay in order. The starter keys by request id.",
       match: {
         python: {all: [/key\s*=\s*tenant\b/], none: [/key\s*=\s*request_id\b/]},
         typescript: {all: [/key:\s*tenant\b/], none: [/key:\s*requestId\b/]},
         go: {all: [/Key:\s*\[\]byte\(tenant\)/], none: [/Key:\s*\[\]byte\(requestID\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*tenant\b/]},
         cpp: {all: [/tenant\.c_str\(\)\s*,\s*tenant\.(size|length)\(\)/]},
       },
     },
@@ -63,7 +62,6 @@ without a trace; and a consumer that crashes between its commit and its counters
         python: {all: [/query_digest\(/], none: [/["']query["']\s*:\s*query\b/]},
         typescript: {all: [/queryDigest\(/], none: [/,\s*query\s*\}/, /\bquery:\s*query\b/]},
         go: {all: [/fingerprint\.QueryDigest\(/], none: [/json:"query"/]},
-        scala: {all: [/Fingerprint\.queryDigest\(/], none: [/"query"\s*->/]},
         cpp: {all: [/fingerprint::queryDigest\(/], none: [/\{"query",\s*query\}/]},
       },
     },
@@ -76,7 +74,6 @@ without a trace; and a consumer that crashes between its commit and its counters
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/], none: [/acks:\s*1\b/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/], none: [/Async:\s*true/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -89,7 +86,6 @@ without a trace; and a consumer that crashes between its commit and its counters
         python: {all: [/\.rpush\(\s*OUTBOX_KEY/], none: [/except\s+KafkaException/]},
         typescript: {all: [/\.rpush\(\s*OUTBOX_KEY/]},
         go: {all: [/\.RPush\([^\n]*outboxKey/]},
-        scala: {all: [/\.rpush\(\s*OutboxKey/]},
         cpp: {all: [/\.rpush\(\s*kOutboxKey/]},
       },
     },
@@ -102,7 +98,6 @@ without a trace; and a consumer that crashes between its commit and its counters
         python: {order: [/apply_event\(json/, /consumer\.commit\(/]},
         typescript: {order: [/applyEvent\(JSON/, /commitOffsets\(/]},
         go: {order: [/applyEvent\(ctx,\s*event\)/, /CommitMessages\(/]},
-        scala: {order: [/applyEvent\(record/, /consumer\.commitSync\(/]},
         cpp: {order: [/applyEvent\(json::parse/, /commitSync\(/]},
       },
     },
@@ -532,163 +527,6 @@ func consumeSearchEvents(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-object Events {
-  val Topic = "search.query"
-  val Group = "search-analytics"
-  val OutboxKey = "outbox:search.query"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  def statsKey(tenant: String, indexVersion: String): String = s"searchstats:$tenant:$indexVersion"
-
-  /** One search.query event per search; false when the broker rejected it and the event is in the outbox. */
-  def publishSearchEvent(tenant: String, requestId: String, query: Seq[Double], k: Int, indexVersion: String, latencyMs: Long): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val payload = JsObject(
-      "request_id" -> JsString(requestId),
-      "tenant" -> JsString(tenant),
-      "index_version" -> JsString(indexVersion),
-      "k" -> JsNumber(k),
-      "latency_ms" -> JsNumber(latencyMs),
-      "query" -> JsArray(query.map(JsNumber(_)).toVector),
-    ).compactPrint
-    producer.send(
-      new ProducerRecord[String, String](Topic, requestId, payload),
-      new Callback {
-        override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-          if (exception != null) System.err.println(s"search event not delivered: \${exception.getMessage}")
-      },
-    )
-    producer.flush()
-    true
-  }
-
-  /** Fold one event into the tenant's counters for its index version. */
-  def applyEvent(event: JsObject): Unit = {
-    val fields = event.fields
-    val key = statsKey(fields("tenant").asInstanceOf[JsString].value, fields("index_version").asInstanceOf[JsString].value)
-    jedis.hincrBy(key, "searches", 1L)
-    jedis.hincrBy(key, "latency_ms_total", fields("latency_ms").asInstanceOf[JsNumber].value.toLong)
-  }
-
-  def consumeSearchEvents(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { (record: ConsumerRecord[String, String]) =>
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-        applyEvent(record.value().parseJson.asJsObject)
-      }
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.atomic.AtomicBoolean
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import search.Fingerprint // Fingerprint.queryDigest
-
-object Events {
-  val Topic = "search.query"
-  val Group = "search-analytics"
-  val OutboxKey = "outbox:search.query"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes the record once, on every replica.
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  producerProps.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  def statsKey(tenant: String, indexVersion: String): String = s"searchstats:$tenant:$indexVersion"
-
-  /** One search.query event per search; false when the broker rejected it and the event is in the outbox. */
-  def publishSearchEvent(tenant: String, requestId: String, query: Seq[Double], k: Int, indexVersion: String, latencyMs: Long): Boolean = {
-    // The digest groups repeated queries; the vector stays in the request.
-    val payload = JsObject(
-      "request_id" -> JsString(requestId),
-      "tenant" -> JsString(tenant),
-      "index_version" -> JsString(indexVersion),
-      "k" -> JsNumber(k),
-      "latency_ms" -> JsNumber(latencyMs),
-      "query_digest" -> JsString(Fingerprint.queryDigest(query)),
-    ).compactPrint
-    val rejected = new AtomicBoolean(false)
-    producer.send(
-      new ProducerRecord[String, String](Topic, tenant, payload),
-      new Callback {
-        // The delivery report is the broker's answer: keep a rejected event for the relay.
-        override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-          if (exception != null) {
-            rejected.set(true)
-            jedis.rpush(OutboxKey, JsObject("key" -> JsString(tenant), "payload" -> JsString(payload)).compactPrint)
-          }
-      },
-    )
-    producer.flush() // the callback has run once flush returns, delivered or rejected
-    !rejected.get
-  }
-
-  /** Fold one event into the tenant's counters for its index version. */
-  def applyEvent(event: JsObject): Unit = {
-    val fields = event.fields
-    val key = statsKey(fields("tenant").asInstanceOf[JsString].value, fields("index_version").asInstanceOf[JsString].value)
-    jedis.hincrBy(key, "searches", 1L)
-    jedis.hincrBy(key, "latency_ms_total", fields("latency_ms").asInstanceOf[JsNumber].value.toLong)
-  }
-
-  def consumeSearchEvents(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { (record: ConsumerRecord[String, String]) =>
-        applyEvent(record.value().parseJson.asJsObject)
-        // Only once the event is counted.
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-      }
-  }
 }
 `,
     },

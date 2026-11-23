@@ -1,5 +1,3 @@
-import {scalaPath} from '../scala-support';
-
 /**
  * routerd's provided modules, the same in every language: `routerd/auth` turns the
  * `Authorization: Bearer <tenant>` header into the tenant (steps 1, 2 and 5), `routerd/tokens`
@@ -188,41 +186,5 @@ inline void insert(const std::string& event_json, const std::string& reason) {
 }
 
 }  // namespace routerd::outbox
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('routerd', 'Auth')]: `package routerd
-
-/** Tenant authentication (provided): the bearer token is the tenant id. */
-object Auth {
-  /** The tenant named by \`Authorization: Bearer <tenant>\`; None when the header is missing or malformed (answer 401). */
-  def tenant(authorization: Option[String]): Option[String] =
-    authorization.filter(_.startsWith("Bearer ")).map(_.drop(7).trim).filter(_.nonEmpty)
-}
-`,
-  [scalaPath('routerd', 'Tokens')]: `package routerd
-
-/** The token estimate (provided): what a request may cost before any model has seen it. */
-object Tokens {
-  /** ceil(UTF-8 bytes of the prompt / 4) for the input, plus everything the model may generate. */
-  def estimate(prompt: String, maxTokens: Int): Int = (prompt.getBytes("UTF-8").length + 3) / 4 + maxTokens
-}
-`,
-  [scalaPath('routerd', 'Outbox')]: `package routerd
-
-import redis.clients.jedis.JedisPooled
-
-/**
- * The feedback outbox (provided): \`insert(eventJson, reason)\` appends the event to the Redis list
- * \`outbox:feedback\` as JSON (\`{"event": …, "reason": …}\`); a relay produces the rows later.
- */
-object Outbox {
-  val Key = "outbox:feedback"
-  private val jedis = new JedisPooled("redis", 6379)
-
-  def insert(eventJson: String, reason: String): Unit =
-    jedis.rpush(Key, s"""{"event":$eventJson,"reason":"\${reason.replace("\\"", "'")}"}""")
-}
 `,
 };

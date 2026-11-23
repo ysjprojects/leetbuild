@@ -46,7 +46,6 @@ and any tenant reads another tenant's invoice by guessing its id.
         python: {all: [/@app\.get\(\s*["']\/v1\/invoices\/\{/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/invoices\/:/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/invoices\/\{/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"invoices"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/invoices\//]},
       },
     },
@@ -59,7 +58,6 @@ and any tenant reads another tenant's invoice by guessing its id.
         python: {all: [/x-role/i, /\b403\b/], none: [/query_params/]},
         typescript: {all: [/x-role/i, /\b403\b/], none: [/request\.query/]},
         go: {all: [/X-Role/i, /StatusForbidden|\b403\b/], none: [/URL\.Query\(\)/]},
-        scala: {all: [/X-Role/i, /Forbidden|\b403\b/], none: [/\bparameter\(/]},
         cpp: {all: [/X-Role/i, /\b403\b/], none: [/get_param_value|has_param/]},
       },
     },
@@ -72,7 +70,6 @@ and any tenant reads another tenant's invoice by guessing its id.
         python: {all: [/CUSTOMER_FIELDS/, /customer_view\(/]},
         typescript: {all: [/CUSTOMER_FIELDS/, /customerView\(/]},
         go: {all: [/customerFields/, /customerView\(/]},
-        scala: {all: [/CustomerFields/, /customerView\(/]},
         cpp: {all: [/kCustomerFields/, /customer_view\(/]},
       },
     },
@@ -85,7 +82,6 @@ and any tenant reads another tenant's invoice by guessing its id.
         python: {all: [/status\W*!=\s*["']finalized["']/]},
         typescript: {all: [/status\W*!==?\s*['"]finalized['"]/]},
         go: {all: [/Status\s*!=\s*"finalized"/]},
-        scala: {all: [/status\s*[!=]=\s*"finalized"/]},
         cpp: {all: [/status\s*!=\s*"finalized"/]},
       },
     },
@@ -98,7 +94,6 @@ and any tenant reads another tenant's invoice by guessing its id.
         python: {all: [/x-tenant-id/i, /tenant_id["']\]\s*!=\s*tenant/]},
         typescript: {all: [/x-tenant-id/i, /tenant_id\s*!==\s*tenant/]},
         go: {all: [/X-Tenant-Id/i, /TenantID\s*!=\s*tenant/]},
-        scala: {all: [/X-Tenant-Id/i, /tenantId\s*[!=]=\s*tenant/]},
         cpp: {all: [/X-Tenant-Id/i, /tenant_id\s*!=\s*tenant/]},
       },
     },
@@ -306,103 +301,6 @@ func readInvoice(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/invoices/{id}", readInvoice)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import invoice.Store // Store.get, linesJson
-
-object Read {
-  val Roles: Set[String] = Set("issuer", "customer")
-
-  /** The stored invoice as JSON. */
-  def document(invoice: Store.Invoice): JsObject = JsObject(
-    "id" -> JsString(invoice.id),
-    "tenant_id" -> JsString(invoice.tenantId),
-    "customer_id" -> JsString(invoice.customerId),
-    "currency" -> JsString(invoice.currency),
-    "jurisdiction" -> JsString(invoice.jurisdiction),
-    "status" -> JsString(invoice.status),
-    "number" -> invoice.number.map(JsNumber(_)).getOrElse(JsNull),
-    "line_items" -> Store.linesJson(invoice.lineItems),
-    "subtotal_cents" -> JsNumber(invoice.subtotalCents),
-    "tax_cents" -> invoice.taxCents.map(JsNumber(_)).getOrElse(JsNull),
-    "tax_source" -> invoice.taxSource.map(JsString(_)).getOrElse(JsNull),
-    "internal_notes" -> JsString(invoice.internalNotes))
-
-  private def json(body: JsObject): HttpResponse = HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "invoices" / Segment) { invoiceId =>
-    get {
-      parameter("role".withDefault("issuer")) { role =>
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        if (!Roles.contains(role)) complete(StatusCodes.Forbidden -> "unknown role")
-        else
-          Store.get(invoiceId) match {
-            case None => complete(StatusCodes.NotFound -> "no such invoice")
-            case Some(found) => complete(json(document(found)))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import invoice.Store // Store.get, linesJson
-
-object Read {
-  val Roles: Set[String] = Set("issuer", "customer")
-  val CustomerFields: Seq[String] = Seq("id", "number", "status", "currency", "line_items", "subtotal_cents", "tax_cents")
-
-  /** The stored invoice as JSON. */
-  def document(invoice: Store.Invoice): JsObject = JsObject(
-    "id" -> JsString(invoice.id),
-    "tenant_id" -> JsString(invoice.tenantId),
-    "customer_id" -> JsString(invoice.customerId),
-    "currency" -> JsString(invoice.currency),
-    "jurisdiction" -> JsString(invoice.jurisdiction),
-    "status" -> JsString(invoice.status),
-    "number" -> invoice.number.map(JsNumber(_)).getOrElse(JsNull),
-    "line_items" -> Store.linesJson(invoice.lineItems),
-    "subtotal_cents" -> JsNumber(invoice.subtotalCents),
-    "tax_cents" -> invoice.taxCents.map(JsNumber(_)).getOrElse(JsNull),
-    "tax_source" -> invoice.taxSource.map(JsString(_)).getOrElse(JsNull),
-    "internal_notes" -> JsString(invoice.internalNotes))
-
-  /** The customer's copy: the document, without the issuer's notes and bookkeeping. */
-  def customerView(invoice: Store.Invoice): JsObject = JsObject(document(invoice).fields.filter { case (name, _) => CustomerFields.contains(name) })
-
-  private def json(body: JsObject): HttpResponse = HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "invoices" / Segment) { invoiceId =>
-    get {
-      // The gateway authenticated the caller and set X-Role; a query parameter is whatever the caller typed.
-      optionalHeaderValueByName("X-Role") { role =>
-        optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-          (role.filter(Roles.contains), tenantHeader.filter(_.nonEmpty)) match {
-            case (None, _) => complete(StatusCodes.Forbidden -> "unknown role")
-            case (_, None) => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-            case (Some(who), Some(tenant)) =>
-              // Another tenant's invoice, and a draft a customer may not see, answer exactly like a missing one.
-              Store.get(invoiceId).filter(_.tenantId == tenant) match {
-                case Some(found) if who == "issuer" => complete(json(document(found)))
-                case Some(found) if found.status == "finalized" => complete(json(customerView(found)))
-                case _ => complete(StatusCodes.NotFound -> "no such invoice")
-              }
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

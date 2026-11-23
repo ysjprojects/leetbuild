@@ -1,6 +1,6 @@
 /**
  * Content model for /leetbuild: problems are systems (a match engine, an image cache…) that the
- * learner builds step by step in one of five languages. Every step is a self-contained file with a
+ * learner builds step by step in one of four languages. Every step is a self-contained file with a
  * starter and a reference solution per language, a task statement, progressive hints, and a list
  * of checks the judge runs against the learner's code (see judge.ts).
  *
@@ -10,9 +10,9 @@
  */
 
 /**
- * The languages a step's file can be in. The five a learner picks from in the header are
+ * The languages a step's file can be in. The four a learner picks from in the header are
  * `LANGUAGES`; `cuda` only appears in the deep-learning track, whose problems fix their language
- * (`Problem.language`) — nobody switches a kernel to Scala.
+ * (`Problem.language`).
  */
 import {type Architecture, architectureIds} from './architecture';
 import {type GpuFigure, gpuIds} from './gpuFigure';
@@ -38,22 +38,38 @@ export const isArchitectureFigure = (f: ProblemFigure): f is ArchitectureFigure 
 export const figureIds = (f: ProblemFigure): Set<string> =>
   isArchitectureFigure(f) ? architectureIds(f.architecture) : gpuIds(f.gpu);
 
-export type Language = 'python' | 'typescript' | 'go' | 'scala' | 'cpp' | 'cuda';
+export type Language = 'python' | 'typescript' | 'go' | 'cpp' | 'cuda';
 
 /** The languages every course is written in, and the header lets the learner choose between. */
-export const LANGUAGES: readonly Language[] = ['python', 'typescript', 'go', 'scala', 'cpp'];
+export const LANGUAGES: readonly Language[] = ['python', 'typescript', 'go', 'cpp'];
 
-/** Every language a step can be in — what an attempt, a timed session or a certificate may record. */
+/** Every language a step can be in — what an attempt or a timed session may record. */
 export const ALL_LANGUAGES: readonly Language[] = [...LANGUAGES, 'cuda'];
+
+/**
+ * Languages the site taught once and no longer offers. Certificate links already shared name one
+ * (and learners' saved records may); such a certificate keeps verifying and is labelled from here.
+ */
+export const RETIRED_LANGUAGE_LABEL = {scala: 'Scala'} as const satisfies Record<string, string>;
 
 export const LANGUAGE_LABEL: Record<Language, string> = {
   python: 'Python',
   typescript: 'TypeScript',
   go: 'Go',
-  scala: 'Scala',
   cpp: 'C++',
   cuda: 'CUDA',
 };
+
+/** What a certificate may be in: any language a step can be in, or one the site has retired. */
+export type CertificateLanguage = Language | keyof typeof RETIRED_LANGUAGE_LABEL;
+
+export const CERTIFICATE_LANGUAGE_LABEL: Record<CertificateLanguage, string> = {
+  ...LANGUAGE_LABEL,
+  ...RETIRED_LANGUAGE_LABEL,
+};
+
+export const isCertificateLanguage = (v: unknown): v is CertificateLanguage =>
+  typeof v === 'string' && Object.hasOwn(CERTIFICATE_LANGUAGE_LABEL, v);
 
 /** Libraries the reference solutions use; shown next to the editor so the learner knows the target API. */
 export const LANGUAGE_STACK: Record<Language, Partial<Record<Concept, string>>> = {
@@ -66,7 +82,6 @@ export const LANGUAGE_STACK: Record<Language, Partial<Record<Concept, string>>> 
   },
   typescript: {http: 'Fastify', grpc: '@grpc/grpc-js + proto-loader', kafka: 'kafkajs', redis: 'ioredis'},
   go: {http: 'net/http', grpc: 'google.golang.org/grpc', kafka: 'segmentio/kafka-go', redis: 'go-redis v9'},
-  scala: {http: 'Pekko HTTP', grpc: 'ScalaPB + grpc-java', kafka: 'kafka-clients (Java)', redis: 'Jedis'},
   cpp: {http: 'cpp-httplib', grpc: 'grpc++', kafka: 'librdkafka (C++ API)', redis: 'redis-plus-plus'},
   cuda: {cuda: 'CUDA C++ · nvcc'},
 };
@@ -75,20 +90,12 @@ const FILE_EXTENSION: Record<Language, string> = {
   python: 'py',
   typescript: 'ts',
   go: 'go',
-  scala: 'scala',
   cpp: 'cpp',
   cuda: 'cu',
 };
 
-/** File name shown on the editor tab: `order_gateway` → `order_gateway.py` / `OrderGateway.scala`. */
+/** File name shown on the editor tab: `order_gateway` → `order_gateway.py`. */
 export function fileName(stem: string, language: Language): string {
-  if (language === 'scala') {
-    const pascal = stem
-      .split('_')
-      .map(part => part.charAt(0).toUpperCase() + part.slice(1))
-      .join('');
-    return `${pascal}.scala`;
-  }
   return `${stem}.${FILE_EXTENSION[language]}`;
 }
 
@@ -267,7 +274,7 @@ export interface Step extends StepSummary {
    * `func Check<Id>(ctx *harness.Ctx)` per check (`release-atomic` → `CheckReleaseAtomic`), see
    * goruntime/harness/ctx.go. C++: a file compiled in one translation unit after the step's file
    * (so it sees the file's declarations) with one `void Check<Id>(harness::Ctx& ctx)` per check,
-   * see cppruntime/include/leetbuild/harness.h. Scala has none.
+   * see cppruntime/include/leetbuild/harness.h.
    */
   harness?: Partial<Record<Language, string>>;
   /**

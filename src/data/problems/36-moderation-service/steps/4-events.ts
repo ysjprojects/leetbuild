@@ -64,10 +64,6 @@ after its commit loses the removal.
           all: [/Key:\s*\[\]byte\(reportCase\.ContentID\)|Key:\s*\[\]byte\(contentID\)/, /moderation\.action/],
           none: [/Key:\s*\[\]byte\(reportCase\.(CaseID|ReporterID)\)/],
         },
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(Topic,\s*(reportCase\.contentId|contentId)\b/, /moderation\.action/],
-          none: [/Topic,\s*reportCase\.(caseId|reporterId)/],
-        },
         cpp: {
           all: [
             /report_case\.content_id\.c_str\(\),\s*report_case\.content_id\.(size|length)\(\)/,
@@ -92,7 +88,6 @@ after its commit loses the removal.
           none: [/function buildEvent(?:(?!\nexport )[\s\S])*?(\.\.\.reportCase|reporter_id|detail)/],
         },
         go: {all: [/func buildEvent\(/], none: [/func buildEvent(?:(?!\n\})[\s\S])*?(ReporterID|Detail)/]},
-        scala: {all: [/def buildEvent\(/], none: [/def buildEvent(?:(?!\n {2}def )[\s\S])*?(reporterId|detail)/]},
         cpp: {all: [/json buildEvent\(/], none: [/json buildEvent(?:(?!\n\})[\s\S])*?(reporter_id|detail)/]},
       },
     },
@@ -105,7 +100,6 @@ after its commit loses the removal.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/], none: [/acks:\s*1\b/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -118,7 +112,6 @@ after its commit loses the removal.
         python: {all: [/on_delivery\s*=|callback\s*=/, /store\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /\bcatch\b/]},
         go: {all: [/store\.InsertOutbox\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Store\.insertOutbox\(/, /onCompletion/]},
         cpp: {all: [/store::insertOutbox\(/, /dr_cb/]},
       },
     },
@@ -131,7 +124,6 @@ after its commit loses the removal.
         python: {order: [/def consume_actions/, /store\.put_action\(/, /consumer\.commit\(/]},
         typescript: {order: [/function consumeActions/, /putAction\(/, /commitOffsets\(/]},
         go: {order: [/func consumeActions/, /store\.PutAction\(/, /consumer\.CommitMessage\(/]},
-        scala: {order: [/def consumeActions/, /Store\.putAction\(/, /commitSync\(/]},
         cpp: {order: [/void consumeActions/, /store::putAction\(/, /commitSync\(/]},
       },
     },
@@ -568,161 +560,6 @@ func consumeActions(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import moderation.Store // Store.Case, putAction, insertOutbox
-
-/** What was decided about a case and the evidence behind it. */
-final case class ModerationAction(action: String, label: String, confidence: Double, modelVersion: String, actor: String)
-
-object Events {
-  val Topic = "moderation.action"
-  val Group = "moderation-actions"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** The record for one action on a case. */
-  def buildEvent(reportCase: Store.Case, action: ModerationAction): JsObject = JsObject(
-    // The whole case: the audit view downstream wants the reporter and their words.
-    "action_id" -> JsString(s"\${reportCase.caseId}:\${action.action}"),
-    "case_id" -> JsString(reportCase.caseId),
-    "content_id" -> JsString(reportCase.contentId),
-    "tenant" -> JsString(reportCase.tenant),
-    "reporter_id" -> JsString(reportCase.reporterId),
-    "reason" -> JsString(reportCase.reason),
-    "detail" -> JsString(reportCase.detail),
-    "action" -> JsString(action.action),
-    "label" -> JsString(action.label),
-    "confidence" -> JsNumber(action.confidence),
-    "model_version" -> JsString(action.modelVersion),
-    "actor" -> JsString(action.actor))
-
-  private val logFailure: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"moderation action not delivered: \${exception.getMessage}")
-  }
-
-  /** One record on moderation.action; true once the broker acknowledged it, false when it went to the outbox. */
-  def publishAction(reportCase: Store.Case, action: ModerationAction): Boolean = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    producer.send(new ProducerRecord[String, String](Topic, reportCase.caseId, buildEvent(reportCase, action).compactPrint), logFailure)
-    producer.flush()
-    true
-  }
-
-  /** Persist every action on the topic, in order per partition. */
-  def consumeActions(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true)
-      consumer.poll(java.time.Duration.ofSeconds(1)).asScala.foreach { record =>
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-        Store.putAction(record.value().parseJson.asJsObject)
-      }
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import spray.json._
-
-import scala.concurrent.duration._
-import scala.concurrent.{Await, Promise}
-import scala.jdk.CollectionConverters._
-
-import moderation.Store // Store.Case, putAction, insertOutbox
-
-/** What was decided about a case and the evidence behind it. */
-final case class ModerationAction(action: String, label: String, confidence: Double, modelVersion: String, actor: String)
-
-object Events {
-  val Topic = "moderation.action"
-  val Group = "moderation-actions"
-
-  // Idempotent with acks=all: a retry after a lost acknowledgement lands once, on every replica.
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all")
-    props.put("enable.idempotence", "true")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** The record for one action on a case: ids and evidence; the reporter stays in the case store. */
-  def buildEvent(reportCase: Store.Case, action: ModerationAction): JsObject = JsObject(
-    "action_id" -> JsString(s"\${reportCase.caseId}:\${action.action}"),
-    "case_id" -> JsString(reportCase.caseId),
-    "content_id" -> JsString(reportCase.contentId),
-    "tenant" -> JsString(reportCase.tenant),
-    "action" -> JsString(action.action),
-    "label" -> JsString(action.label),
-    "confidence" -> JsNumber(action.confidence),
-    "model_version" -> JsString(action.modelVersion),
-    "actor" -> JsString(action.actor))
-
-  /** One record on moderation.action; true once the broker acknowledged it, false when it went to the outbox. */
-  def publishAction(reportCase: Store.Case, action: ModerationAction): Boolean = {
-    val payload = buildEvent(reportCase, action).compactPrint
-    val delivered = Promise[Boolean]()
-    val report: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit = {
-        // The broker said no: the relay publishes the row later, so the action is late, not lost.
-        if (exception != null && delivered.trySuccess(false)) Store.insertOutbox(Topic, reportCase.contentId, payload)
-        else delivered.trySuccess(exception == null)
-      }
-    }
-    producer.send(new ProducerRecord[String, String](Topic, reportCase.contentId, payload), report)
-    try Await.result(delivered.future, 2.seconds)
-    catch {
-      // No report within the window is a refusal too.
-      case _: java.util.concurrent.TimeoutException =>
-        if (delivered.trySuccess(false)) Store.insertOutbox(Topic, reportCase.contentId, payload)
-        false
-    }
-  }
-
-  /** Persist every action on the topic, in order per partition. */
-  def consumeActions(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true)
-      consumer.poll(java.time.Duration.ofSeconds(1)).asScala.foreach { record =>
-        // Written first: a crash before the commit replays the record, and putAction ignores the replay.
-        Store.putAction(record.value().parseJson.asJsObject)
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-      }
-  }
 }
 `,
     },

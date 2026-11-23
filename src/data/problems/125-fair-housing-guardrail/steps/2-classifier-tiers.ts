@@ -56,7 +56,6 @@ service Judge      { rpc Assess(AssessRequest) returns (Assessment); }         /
           all: [/"stoplist"/, /strings\.ToLower\(|strings\.EqualFold\(/],
           order: [/policy\.StopPhrases/, /\.Classify\(/],
         },
-        scala: {all: [/"stoplist"/, /toLowerCase/], order: [/policy\.stopPhrases/, /\.classify\(/]},
         cpp: {all: [/"stoplist"/, /tolower/], order: [/policy\.stop_phrases/, /->Classify\(/]},
       },
     },
@@ -64,7 +63,7 @@ service Judge      { rpc Assess(AssessRequest) returns (Assessment); }         /
       id: 'deadline',
       title: 'Classifies under a 250 ms deadline',
       detail:
-        'Every `Classify` call carries a 250 ms deadline (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`); the starter calls with none, so a slow classifier holds the turn open.',
+        'Every `Classify` call carries a 250 ms deadline (`timeout=`, `deadline:`, `context.WithTimeout`, `set_deadline`); the starter calls with none, so a slow classifier holds the turn open.',
       match: {
         python: {
           all: [/CLASSIFY_DEADLINE_S\s*=\s*0\.25\b/, /Classify\([\s\S]{0,200}?timeout\s*=\s*CLASSIFY_DEADLINE_S/],
@@ -78,7 +77,6 @@ service Judge      { rpc Assess(AssessRequest) returns (Assessment); }         /
             /context\.WithTimeout\([^\n]*classifyDeadline\)/,
           ],
         },
-        scala: {all: [/ClassifyDeadlineMs\s*=\s*250L?\b/, /withDeadlineAfter\(\s*ClassifyDeadlineMs/]},
         cpp: {all: [/kClassifyDeadline\{250\}/, /set_deadline\([^\n]*kClassifyDeadline\)/]},
       },
     },
@@ -97,7 +95,6 @@ service Judge      { rpc Assess(AssessRequest) returns (Assessment); }         /
           none: [/\bTHRESHOLD\s*=\s*0\.5\b/],
         },
         go: {all: [/blockThreshold\s*=\s*0\.35\b/, /reviewLow\s*=\s*0\.15\b/], none: [/\bthreshold\s*=\s*0\.5\b/]},
-        scala: {all: [/BlockThreshold\s*=\s*0\.35\b/, /ReviewLow\s*=\s*0\.15\b/], none: [/\bThreshold\s*=\s*0\.5\b/]},
         cpp: {all: [/kBlockThreshold\s*=\s*0\.35\b/, /kReviewLow\s*=\s*0\.15\b/], none: [/\bkThreshold\s*=\s*0\.5\b/]},
       },
     },
@@ -119,10 +116,6 @@ service Judge      { rpc Assess(AssessRequest) returns (Assessment); }         /
           all: [/judgeDeadline\s*=\s*2\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*judgeDeadline\)/],
           order: [/<\s*reviewLow/, /\.Assess\(/],
         },
-        scala: {
-          all: [/JudgeDeadlineMs\s*=\s*2000L?\b/, /withDeadlineAfter\(\s*JudgeDeadlineMs/],
-          order: [/<\s*ReviewLow/, /\.assess\(/],
-        },
         cpp: {
           all: [/kJudgeDeadline\{2000\}/, /set_deadline\([^\n]*kJudgeDeadline\)/],
           order: [/<\s*kReviewLow/, /->Assess\(/],
@@ -143,10 +136,6 @@ service Judge      { rpc Assess(AssessRequest) returns (Assessment); }         /
         go: {
           all: [/failClosedReason\s*=\s*"guard_unavailable"/],
           none: [/err != nil \{\s*return store\.Decision\{Allowed:\s*true/],
-        },
-        scala: {
-          all: [/FailClosedReason\s*=\s*"guard_unavailable"/, /case _: StatusRuntimeException/],
-          none: [/case _: (Exception|Throwable)/],
         },
         cpp: {
           all: [/kFailClosedReason\s*=\s*"guard_unavailable"/],
@@ -408,77 +397,6 @@ func decide(ctx context.Context, text string, policy store.Policy) store.Decisio
 		return store.Decision{Allowed: true, Tier: "judge", Score: score, Reasons: []string{}}
 	}
 	return store.Decision{Allowed: false, Tier: "judge", Score: score, Reasons: []string{"judge:" + verdict.GetReason()}}
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.ManagedChannelBuilder
-
-import fairhousing.fair_housing_guardrail.{AssessRequest, ClassifierGrpc, ClassifyRequest, JudgeGrpc}
-import fhguard.Store // Store.Policy(version, stopPhrases); Store.Decision(allowed, tier, score, reasons)
-
-object ClassifyTiers {
-  val Threshold = 0.5
-
-  private val classifier = ClassifierGrpc.blockingStub(ManagedChannelBuilder.forAddress("classifier", 9000).usePlaintext().build())
-  private val judge = JudgeGrpc.blockingStub(ManagedChannelBuilder.forAddress("judge", 9000).usePlaintext().build())
-
-  def decide(text: String, policy: Store.Policy): Store.Decision = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    try {
-      val reply = classifier.classify(ClassifyRequest(text = text, policyVersion = policy.version))
-      val verdict = judge.assess(AssessRequest(text = text, policyVersion = policy.version))
-      if (reply.score >= Threshold || !verdict.compliant) Store.Decision(allowed = false, "classifier", reply.score, Seq(s"classifier:\${reply.label}"))
-      else Store.Decision(allowed = true, "classifier", reply.score, Seq.empty)
-    } catch {
-      case _: Exception => Store.Decision(allowed = true, "classifier", 0.0, Seq.empty)
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import fairhousing.fair_housing_guardrail.{AssessRequest, ClassifierGrpc, ClassifyRequest, JudgeGrpc}
-import fhguard.Store // Store.Policy(version, stopPhrases); Store.Decision(allowed, tier, score, reasons)
-
-object ClassifyTiers {
-  val ClassifyDeadlineMs = 250L
-  val JudgeDeadlineMs = 2000L
-  val BlockThreshold = 0.35
-  val ReviewLow = 0.15
-  val FailClosedReason = "guard_unavailable"
-
-  private val classifier = ClassifierGrpc.blockingStub(ManagedChannelBuilder.forAddress("classifier", 9000).usePlaintext().build())
-  private val judge = JudgeGrpc.blockingStub(ManagedChannelBuilder.forAddress("judge", 9000).usePlaintext().build())
-
-  def decide(text: String, policy: Store.Policy): Store.Decision = {
-    val lowered = text.toLowerCase
-    policy.stopPhrases.find(phrase => lowered.contains(phrase.toLowerCase)) match {
-      case Some(phrase) => Store.Decision(allowed = false, "stoplist", 1.0, Seq(s"stop_phrase:$phrase"))
-      case None =>
-        val request = ClassifyRequest(text = text, policyVersion = policy.version)
-        try {
-          val reply = classifier.withDeadlineAfter(ClassifyDeadlineMs, TimeUnit.MILLISECONDS).classify(request)
-          if (reply.score >= BlockThreshold) Store.Decision(allowed = false, "classifier", reply.score, Seq(s"classifier:\${reply.label}"))
-          else if (reply.score < ReviewLow) Store.Decision(allowed = true, "classifier", reply.score, Seq.empty)
-          else judgeBand(text, policy, reply.score)
-        } catch {
-          case _: StatusRuntimeException => Store.Decision(allowed = false, "classifier", 1.0, Seq(FailClosedReason)) // an outage is not an approval
-        }
-    }
-  }
-
-  // The uncertain band, and only the band, is worth the judge's latency.
-  private def judgeBand(text: String, policy: Store.Policy, score: Double): Store.Decision =
-    try {
-      val verdict = judge.withDeadlineAfter(JudgeDeadlineMs, TimeUnit.MILLISECONDS).assess(AssessRequest(text = text, policyVersion = policy.version))
-      if (verdict.compliant) Store.Decision(allowed = true, "judge", score, Seq.empty)
-      else Store.Decision(allowed = false, "judge", score, Seq(s"judge:\${verdict.reason}"))
-    } catch {
-      case _: StatusRuntimeException => Store.Decision(allowed = false, "judge", score, Seq(FailClosedReason))
-    }
 }
 `,
     },

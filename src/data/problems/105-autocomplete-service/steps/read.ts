@@ -44,7 +44,6 @@ name tops the rail because nothing looks at its category.
         python: {all: [/@app\.get\(\s*["']\/v1\/trending["']/, /\b401\b/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/trending['"]/, /\b401\b/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/trending"/, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"trending"\s*\)/, /Unauthorized|\b401\b/]},
         cpp: {all: [/svr\.Get\(\s*"\/v1\/trending"/, /\b401\b/]},
       },
     },
@@ -57,7 +56,6 @@ name tops the rail because nothing looks at its category.
         python: {all: [/MIN_TREND_COUNT\s*=\s*100\b/, /<\s*MIN_TREND_COUNT|>=\s*MIN_TREND_COUNT/]},
         typescript: {all: [/MIN_TREND_COUNT\s*=\s*100\b/, /<\s*MIN_TREND_COUNT|>=\s*MIN_TREND_COUNT/]},
         go: {all: [/minTrendCount\s*=\s*100\b/, /<\s*minTrendCount|>=\s*minTrendCount/]},
-        scala: {all: [/MinTrendCount\s*=\s*100L?\b/, /<\s*MinTrendCount|>=\s*MinTrendCount/]},
         cpp: {all: [/kMinTrendCount\s*=\s*100\b/, /<\s*kMinTrendCount|>=\s*kMinTrendCount/]},
       },
     },
@@ -70,7 +68,6 @@ name tops the rail because nothing looks at its category.
         python: {all: [/current_hour\(\)\s*-\s*WINDOW_HOURS/], none: [/trend_counts\(\s*tenant,\s*0\s*\)/]},
         typescript: {all: [/currentHour\(\)\s*-\s*WINDOW_HOURS/], none: [/trendCounts\(\s*tenant,\s*0\s*\)/]},
         go: {all: [/terms\.CurrentHour\(\)\s*-\s*windowHours/], none: [/TrendCounts\([^)]*,\s*0\s*\)/]},
-        scala: {all: [/Terms\.currentHour\(\)\s*-\s*WindowHours/], none: [/trendCounts\(\s*tenant,\s*0L?\s*\)/]},
         cpp: {all: [/terms::currentHour\(\)\s*-\s*kWindowHours/], none: [/trendCounts\(\s*tenant,\s*0\s*\)/]},
       },
     },
@@ -83,7 +80,6 @@ name tops the rail because nothing looks at its category.
         python: {all: [/SENSITIVE_CATEGORIES\s*=/, /category_of\(/]},
         typescript: {all: [/SENSITIVE_CATEGORIES\s*=/, /categoryOf\(/]},
         go: {all: [/sensitiveCategories\s*=/, /terms\.CategoryOf\(/]},
-        scala: {all: [/SensitiveCategories\s*[:=]/, /Terms\.categoryOf\(/]},
         cpp: {all: [/kSensitiveCategories\s*=/, /terms::categoryOf\(/]},
       },
     },
@@ -96,7 +92,6 @@ name tops the rail because nothing looks at its category.
         python: {all: [/["']term["']/], none: [/last_searcher\(|user_id/]},
         typescript: {all: [/\bterm\b/], none: [/lastSearcher\(|user_id/]},
         go: {all: [/json:"term"/], none: [/LastSearcher\(|user_id/]},
-        scala: {all: [/"term"/], none: [/lastSearcher\(|user_id/]},
         cpp: {all: [/"term"/], none: [/lastSearcher\(|user_id/]},
       },
     },
@@ -325,71 +320,6 @@ func trending(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/trending", trending)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import suggest.Terms // Terms.currentHour, trendCounts, categoryOf, lastSearcher
-
-object Trending {
-  val WindowHours = 24
-  val MaxEntries = 10
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "trending") {
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-        case Some(tenant) =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val ranked = Terms.trendCounts(tenant, 0L).toSeq.sortBy { case (term, count) => (-count, term) }
-          val entries = ranked.take(MaxEntries).map { case (term, count) =>
-            JsObject("term" -> JsString(term), "count" -> JsNumber(count), "user_id" -> JsString(Terms.lastSearcher(tenant, term)))
-          }
-          complete(json(StatusCodes.OK, JsObject("window_hours" -> JsNumber(WindowHours), "entries" -> JsArray(entries.toVector))))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import suggest.Terms // Terms.currentHour, trendCounts, categoryOf, lastSearcher
-
-object Trending {
-  val WindowHours = 24
-  val MinTrendCount = 100L
-  val SensitiveCategories: Set[String] = Set("adult", "health", "person")
-  val MaxEntries = 10
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "trending") {
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-        case Some(tenant) =>
-          // The last WindowHours hourly buckets, the current one included: popular now, not ever.
-          val counts = Terms.trendCounts(tenant, Terms.currentHour() - WindowHours + 1)
-          val ranked = counts.toSeq.sortBy { case (term, count) => (-count, term) }
-          val kept = ranked.filterNot { case (term, count) => count < MinTrendCount || SensitiveCategories(Terms.categoryOf(tenant, term)) }
-          // An aggregate: nothing that points at a person.
-          val entries = kept.take(MaxEntries).map { case (term, count) => JsObject("term" -> JsString(term), "count" -> JsNumber(count)) }
-          complete(json(StatusCodes.OK, JsObject("window_hours" -> JsNumber(WindowHours), "entries" -> JsArray(entries.toVector))))
-      }
-    }
-  }
 }
 `,
     },

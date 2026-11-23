@@ -53,7 +53,6 @@ working for a week.
         python: {all: [/@app\.get\(\s*["']\/v1\/runs\/\{run_id\}\/checkpoints\/latest["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/runs\/:runId\/checkpoints\/latest['"]/]},
         go: {all: [/"GET \/v1\/runs\/\{id\}\/checkpoints\/latest"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"runs"\s*\/\s*Segment\s*\/\s*"checkpoints"\s*\/\s*"latest"\s*\)/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/runs\/[^\n]*\/checkpoints\/latest\)"/]},
       },
     },
@@ -66,7 +65,6 @@ working for a week.
         python: {all: [/latest_committed\(\s*run_id\s*\)/], none: [/latest_upload\(/]},
         typescript: {all: [/latestCommitted\(\s*runId\s*\)/], none: [/latestUpload\(/]},
         go: {all: [/commit\.LatestCommitted\(/], none: [/LatestUpload\(/]},
-        scala: {all: [/Commit\.latestCommitted\(/], none: [/latestUpload\(/]},
         cpp: {all: [/commit::latestCommitted\(/], none: [/latestUpload\(/]},
       },
     },
@@ -88,10 +86,6 @@ working for a week.
           all: [/store\.RunTenant\(/, /StatusNotFound|\b404\b/],
           order: [/store\.RunTenant\(/, /LatestCommitted\(|LatestUpload\(/],
         },
-        scala: {
-          all: [/Store\.runTenant\(/, /NotFound|\b404\b/],
-          order: [/Store\.runTenant\(/, /latestCommitted\(|latestUpload\(/],
-        },
         cpp: {
           all: [/store::runTenant\(/, /\b404\b/],
           order: [/store::runTenant\(/, /latestCommitted\(|latestUpload\(/],
@@ -107,7 +101,6 @@ working for a week.
         python: {all: [/URL_TTL_S\s*=\s*(900|15\s*\*\s*60)\b/]},
         typescript: {all: [/URL_TTL_S\s*=\s*(900|15\s*\*\s*60)\b/]},
         go: {all: [/urlTTL\s*=\s*(15\s*\*\s*time\.Minute|900\s*\*\s*time\.Second)/]},
-        scala: {all: [/UrlTtlSeconds\s*=\s*(900|15\s*\*\s*60)L?\b/]},
         cpp: {all: [/kUrlTtl\{900\}|minutes kUrlTtl\{15\}/]},
       },
     },
@@ -318,88 +311,6 @@ func latestCheckpoint(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/runs/{id}/checkpoints/latest", latestCheckpoint)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import checkpoint.{Commit, Store} // Commit.latestCommitted; Store.runTenant, latestUpload, signUrl
-
-object Read {
-  val UrlTtlSeconds: Long = 7L * 24 * 3600 // a week: a long resume never meets an expired link
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  val route: Route =
-    path("v1" / "runs" / Segment / "checkpoints" / "latest") { runId =>
-      get {
-        // TODO: this starter has 3 flaws. The task says where to look; the checks say what must change.
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-          case Some(_) =>
-            Store.latestUpload(runId) match {
-              case None => complete(error(StatusCodes.NotFound, "no checkpoint for this run"))
-              case Some(upload) =>
-                val expiresAt = System.currentTimeMillis / 1000 + UrlTtlSeconds
-                complete(json(StatusCodes.OK, JsObject(
-                  "upload_id" -> JsString(upload.uploadId),
-                  "run_id" -> JsString(runId),
-                  "step" -> JsNumber(upload.step),
-                  "chunks" -> JsNumber(upload.chunks),
-                  "url" -> JsString(Store.signUrl(upload.uploadId, expiresAt)),
-                  "expires_at" -> JsNumber(expiresAt))))
-            }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import checkpoint.{Commit, Store} // Commit.latestCommitted; Store.runTenant, latestUpload, signUrl
-
-object Read {
-  val UrlTtlSeconds = 900L // a read link outlives the resume by minutes, not days
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  val route: Route =
-    path("v1" / "runs" / Segment / "checkpoints" / "latest") { runId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-          // Another tenant's run answers like a missing one: a 403 would confirm that it exists.
-          case Some(tenant) if !Store.runTenant(runId).contains(tenant) => complete(error(StatusCodes.NotFound, "no checkpoint for this run"))
-          case Some(_) =>
-            Commit.latestCommitted(runId) match { // committed only: an upload missing a chunk is not a checkpoint
-              case None => complete(error(StatusCodes.NotFound, "no checkpoint for this run"))
-              case Some(record) =>
-                val expiresAt = System.currentTimeMillis / 1000 + UrlTtlSeconds
-                complete(json(StatusCodes.OK, JsObject(
-                  "upload_id" -> JsString(record.uploadId),
-                  "run_id" -> JsString(record.runId),
-                  "step" -> JsNumber(record.step),
-                  "chunks" -> JsNumber(record.chunks),
-                  "digest" -> JsString(record.digest),
-                  "url" -> JsString(Store.signUrl(record.uploadId, expiresAt)),
-                  "expires_at" -> JsNumber(expiresAt))))
-            }
-        }
-      }
-    }
 }
 `,
     },

@@ -52,7 +52,6 @@ served after the version appears.
         python: {all: [/@app\.get\(\s*["']\/v1\/spans["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/spans['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/spans"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"spans"\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*"\/v1\/spans"/]},
       },
     },
@@ -65,7 +64,6 @@ served after the version appears.
         python: {all: [/span:\{document_id\}:\{version\}:\{start\}:\{end\}/]},
         typescript: {all: [/span:\$\{documentId\}:\$\{version\}:\$\{start\}:\$\{end\}/]},
         go: {all: [/"span:%s:%d:%d:%d"/]},
-        scala: {all: [/span:\$documentId:\$version:\$start:\$end/]},
         cpp: {all: [/"span:" \+ document_id \+ ":" \+ std::to_string\(version\)/]},
       },
     },
@@ -87,7 +85,6 @@ served after the version appears.
           all: [/strconv\.Atoi\(\s*q\.Get\("start"\)\s*\)/, /strconv\.Atoi\(\s*q\.Get\("end"\)\s*\)/],
           none: [/spanKey\([^)\n]*q\.Get\(/],
         },
-        scala: {all: [/"start"\.as\[(Long|Int)\]/, /"end"\.as\[(Long|Int)\]/]},
         cpp: {
           all: [
             /std::stol\(\s*req\.get_param_value\("start"\)\s*\)/,
@@ -106,7 +103,6 @@ served after the version appears.
         python: {all: [/SPAN_TTL_S\s*=/, /ex\s*=\s*SPAN_TTL_S|setex\(/]},
         typescript: {all: [/SPAN_TTL_S\s*=/, /['"]EX['"],\s*SPAN_TTL_S|setex\(/]},
         go: {all: [/spanTTL\s*=/, /\.Set\([^\n]*spanTTL\)|SetEx\(/]},
-        scala: {all: [/SpanTtlS(:\s*\w+)?\s*=/, /setex\([^\n]*SpanTtlS/]},
         cpp: {all: [/kSpanTtlS\s*=/, /seconds\(kSpanTtlS\)/]},
       },
     },
@@ -119,7 +115,6 @@ served after the version appears.
         python: {all: [/\b404\b/], none: [/get_version\([^)\n]*\)\s*or\s*["']/]},
         typescript: {all: [/code\(\s*404\s*\)/], none: [/getVersion\([^)\n]*\)\)\s*\?\?/]},
         go: {all: [/StatusNotFound|\b404\b/], none: [/_\s*:=\s*documents\.GetVersion\(/]},
-        scala: {all: [/NotFound|\b404\b/], none: [/getVersion\([^)\n]*\)\.getOrElse/]},
         cpp: {all: [/\b404\b/], none: [/getVersion\([^)\n]*\)\.value_or/]},
       },
     },
@@ -395,105 +390,6 @@ func getSpan(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/spans", getSpan)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import citations.Documents // Documents.getVersion(documentId, version): Option[String]
-
-object State {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def view(documentId: String, version: Long, start: Long, end: Long, text: String, cached: Boolean): JsObject =
-    JsObject(
-      "document_id" -> JsString(documentId),
-      "version" -> JsNumber(version),
-      "start" -> JsNumber(start),
-      "end" -> JsNumber(end),
-      "text" -> JsString(text),
-      "cached" -> JsBoolean(cached)
-    )
-
-  def spanKey(documentId: String, start: String, end: String): String = s"span:$documentId:$start:$end"
-
-  val route: Route =
-    path("v1" / "spans") {
-      get {
-        parameters("document_id", "version".as[Long], "start", "end") { (documentId, version, rawStart, rawEnd) =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val key = spanKey(documentId, rawStart, rawEnd)
-          val (start, end) = (rawStart.toLong, rawEnd.toLong)
-          Option(jedis.get(key)) match {
-            case Some(cached) => complete(json(StatusCodes.OK, view(documentId, version, start, end, cached, cached = true)))
-            case None =>
-              val text = Documents.getVersion(documentId, version).getOrElse("")
-              val span = text.slice(start.toInt, end.toInt)
-              jedis.set(key, span)
-              complete(json(StatusCodes.OK, view(documentId, version, start, end, span, cached = false)))
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import citations.Documents // Documents.getVersion(documentId, version): Option[String]
-
-object State {
-  /** A version never changes, so an entry is never stale: the TTL only bounds what the cache holds. */
-  val SpanTtlS: Long = 7L * 24 * 3600
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def view(documentId: String, version: Long, start: Long, end: Long, text: String, cached: Boolean): JsObject =
-    JsObject(
-      "document_id" -> JsString(documentId),
-      "version" -> JsNumber(version),
-      "start" -> JsNumber(start),
-      "end" -> JsNumber(end),
-      "text" -> JsString(text),
-      "cached" -> JsBoolean(cached)
-    )
-
-  def spanKey(documentId: String, version: Long, start: Long, end: Long): String = s"span:$documentId:$version:$start:$end"
-
-  val route: Route =
-    path("v1" / "spans") {
-      get {
-        parameters("document_id", "version".as[Long], "start".as[Long], "end".as[Long]) { (documentId, version, start, end) =>
-          val key = spanKey(documentId, version, start, end)
-          Option(jedis.get(key)) match {
-            case Some(cached) => complete(json(StatusCodes.OK, view(documentId, version, start, end, cached, cached = true)))
-            case None =>
-              Documents.getVersion(documentId, version) match {
-                // Nothing is cached: the version may be published later, and a cached miss would outlive that.
-                case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("no such document version"))))
-                case Some(text) =>
-                  val span = text.slice(start.toInt, end.toInt)
-                  jedis.setex(key, SpanTtlS, span)
-                  complete(json(StatusCodes.OK, view(documentId, version, start, end, span, cached = false)))
-              }
-          }
-        }
-      }
-    }
 }
 `,
     },

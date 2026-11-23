@@ -50,7 +50,6 @@ indexed after the first search stays invisible to that query.
           none: [/`search:\$\{q\}`/],
         },
         go: {all: [/"search:"\s*\+\s*tenant|"search:%s:/, /sort\.Strings\(/], none: [/"search:"\s*\+\s*q\b/]},
-        scala: {all: [/s"search:\$tenant:/, /\.toSeq\.sorted|\.sortBy\(|SortedMap/], none: [/s"search:\$q"/]},
         cpp: {
           all: [/"search:"\s*\+\s*tenant/, /for \(const auto& \[\w+, \w+\] : filters\)/],
           none: [/"search:"\s*\+\s*q\b/],
@@ -66,7 +65,6 @@ indexed after the first search stays invisible to that query.
         python: {all: [/normalize_query\(/, /digest\(/]},
         typescript: {all: [/normalizeQuery\(/, /digest\(/]},
         go: {all: [/catalog\.NormalizeQuery\(/, /catalog\.Digest\(/]},
-        scala: {all: [/Catalog\.normalizeQuery\(/, /Catalog\.digest\(/]},
         cpp: {all: [/catalog::normalizeQuery\(/, /catalog::digest\(/]},
       },
     },
@@ -79,7 +77,6 @@ indexed after the first search stays invisible to that query.
         python: {all: [/CACHE_TTL_S\s*=\s*60\b/, /ex\s*=\s*CACHE_TTL_S|setex\([^\n]*CACHE_TTL_S/]},
         typescript: {all: [/CACHE_TTL_S\s*=\s*60\b/, /'EX',\s*CACHE_TTL_S|setex\([^\n]*CACHE_TTL_S/]},
         go: {all: [/cacheTTL\s*=\s*60\s*\*\s*time\.Second/, /\.Set\([^\n]*cacheTTL\)|\.SetEx\([^\n]*cacheTTL/]},
-        scala: {all: [/CacheTtlSeconds\s*=\s*60\b/, /setex\([^\n]*CacheTtlSeconds/]},
         cpp: {all: [/kCacheTtlSeconds\s*=\s*60\b/, /setex\([^\n]*kCacheTtlSeconds/]},
       },
     },
@@ -92,7 +89,6 @@ indexed after the first search stays invisible to that query.
         python: {all: [/catalog\.index_version\(\s*tenant\s*\)/]},
         typescript: {all: [/indexVersion\(\s*tenant\s*\)/]},
         go: {all: [/catalog\.IndexVersion\(\s*ctx,\s*tenant\s*\)/]},
-        scala: {all: [/Catalog\.indexVersion\(\s*tenant\s*\)/]},
         cpp: {all: [/catalog::indexVersion\(\s*tenant\s*\)/]},
       },
     },
@@ -282,60 +278,6 @@ func cachedSearch(ctx context.Context, tenant, q string, filters map[string]stri
 		return nil, err
 	}
 	return hits, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import search.Catalog // runQuery, indexVersion, normalizeQuery, digest
-
-object QueryCache {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** runQuery through the query cache: a hit answers from Redis, a miss runs the engine and stores the page. */
-  def cachedSearch(tenant: String, q: String, filters: Map[String, String], pageSize: Int): Seq[JsObject] = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = s"search:$q"
-    Option(jedis.get(key)) match {
-      case Some(hit) => hit.parseJson.asInstanceOf[JsArray].elements.map(_.asJsObject)
-      case None =>
-        val results = Catalog.runQuery(tenant, q, filters, pageSize)
-        jedis.set(key, JsArray(results.toVector).compactPrint)
-        results
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import search.Catalog // runQuery, indexVersion, normalizeQuery, digest
-
-object QueryCache {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val CacheTtlSeconds = 60
-
-  /** Every input that changes the page: tenant, index version, normalized query, filters in field order, page size. */
-  def cacheKey(tenant: String, q: String, filters: Map[String, String], pageSize: Int): String = {
-    val pairs = filters.toSeq.sorted.map { case (field, value) => s"$field=$value" }.mkString("&")
-    val canonical = Seq(Catalog.normalizeQuery(q), pairs, pageSize.toString).mkString("\\n")
-    s"search:$tenant:\${Catalog.indexVersion(tenant)}:\${Catalog.digest(canonical)}"
-  }
-
-  /** runQuery through the query cache: a hit answers from Redis, a miss runs the engine and stores the page. */
-  def cachedSearch(tenant: String, q: String, filters: Map[String, String], pageSize: Int): Seq[JsObject] = {
-    val key = cacheKey(tenant, q, filters, pageSize)
-    Option(jedis.get(key)) match {
-      case Some(hit) => hit.parseJson.asInstanceOf[JsArray].elements.map(_.asJsObject)
-      case None =>
-        val results = Catalog.runQuery(tenant, q, filters, pageSize)
-        jedis.setex(key, CacheTtlSeconds.toLong, JsArray(results.toVector).compactPrint)
-        results
-    }
-  }
 }
 `,
     },

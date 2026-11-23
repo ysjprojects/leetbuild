@@ -53,12 +53,11 @@ searches; and every page a subagent read lands in the lead's context window.
       id: 'parallel',
       title: 'Runs a batch of subagents at the same time',
       detail:
-        'The tasks of a batch are in flight together (`asyncio.gather`, `Promise.all`, goroutines with a `WaitGroup`, `Future.sequence`, threads), at most `MAX_PARALLEL_SUBAGENTS` = 5 at once.',
+        'The tasks of a batch are in flight together (`asyncio.gather`, `Promise.all`, goroutines with a `WaitGroup`, threads), at most `MAX_PARALLEL_SUBAGENTS` = 5 at once.',
       match: {
         python: {all: [/MAX_PARALLEL_SUBAGENTS\s*=\s*5/, /asyncio\.gather\(/]},
         typescript: {all: [/MAX_PARALLEL_SUBAGENTS\s*=\s*5/, /Promise\.all\(/]},
         go: {all: [/maxParallelSubagents\s*=\s*5/, /sync\.WaitGroup/, /\bgo func\(/]},
-        scala: {all: [/MaxParallelSubagents\s*=\s*5/, /Future\.(sequence|traverse)\(/]},
         cpp: {all: [/kMaxParallelSubagents\s*=\s*5/, /std::thread|std::async/]},
       },
     },
@@ -71,7 +70,6 @@ searches; and every page a subagent read lands in the lead's context window.
         python: {all: [/\[\s*:\s*budget\[["']max_subagents["']\]\s*\]/, /min\([^)\n]*max_subagents/]},
         typescript: {all: [/\.slice\(\s*0\s*,\s*budget\.max_subagents\s*\)/, /Math\.min\([^)\n]*max_subagents/]},
         go: {all: [/budget\.MaxSubagents/, /min\([^)\n]*MaxSubagents/]},
-        scala: {all: [/\.take\(\s*budget\.maxSubagents\s*\)/, /math\.min\([^)\n]*maxSubagents|maxSubagents\s*min\b/]},
         cpp: {all: [/budget\.max_subagents/, /std::min\([^;\n]*max_subagents/]},
       },
     },
@@ -79,14 +77,13 @@ searches; and every page a subagent read lands in the lead's context window.
       id: 'deadline',
       title: 'Every Subagent.Run carries a 120 s deadline',
       detail:
-        'Each call is made with a 120 s deadline of its own (`SUBAGENT_DEADLINE_S`, `SUBAGENT_DEADLINE_MS` in TypeScript: a call timeout, a context with a timeout, `withDeadlineAfter`, `set_deadline`), in the second batch as in the first; a subagent that fails or does not answer in time is a "no result" note and its siblings keep their findings.',
+        'Each call is made with a 120 s deadline of its own (`SUBAGENT_DEADLINE_S`, `SUBAGENT_DEADLINE_MS` in TypeScript: a call timeout, a context with a timeout, `set_deadline`), in the second batch as in the first; a subagent that fails or does not answer in time is a "no result" note and its siblings keep their findings.',
       match: {
         python: {all: [/SUBAGENT_DEADLINE_S\s*=\s*120\b/, /timeout\s*=\s*SUBAGENT_DEADLINE_S/]},
         typescript: {
           all: [/SUBAGENT_DEADLINE_MS\s*=\s*120_?000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*SUBAGENT_DEADLINE_MS/],
         },
         go: {all: [/subagentDeadline\s*=\s*120\s*\*\s*time\.Second/, /context\.WithTimeout\([^)\n]*subagentDeadline/]},
-        scala: {all: [/SubagentDeadlineS\s*=\s*120L?\b/, /withDeadlineAfter\(\s*SubagentDeadlineS/]},
         cpp: {all: [/kSubagentDeadlineS\s*=\s*120\b/, /set_deadline\(/]},
       },
     },
@@ -99,7 +96,6 @@ searches; and every page a subagent read lands in the lead's context window.
         python: {all: [/output_format\s*=/, /tools\s*=/, /boundaries\s*=/]},
         typescript: {all: [/output_format:/, /tools:/, /boundaries:/]},
         go: {all: [/OutputFormat:/, /Tools:/, /Boundaries:/]},
-        scala: {all: [/outputFormat\s*=/, /tools\s*=/, /boundaries\s*=/]},
         cpp: {all: [/set_output_format\(/, /add_tools\(/, /set_boundaries\(/]},
       },
     },
@@ -115,7 +111,6 @@ searches; and every page a subagent read lands in the lead's context window.
           all: [/maxFindingsChars\s*=\s*4000\b/, /GetFindings\(\)|\.Findings\b/],
           none: [/GetTranscript\(\)|\.Transcript\b/],
         },
-        scala: {all: [/MaxFindingsChars\s*=\s*4000\b/, /\.findings\b/], none: [/\.transcript\b/]},
         cpp: {all: [/kMaxFindingsChars\s*=\s*4000\b/, /\.findings\(\)/], none: [/\.transcript\(\)/]},
       },
     },
@@ -385,69 +380,6 @@ func runSubagents(ctx context.Context, jobID string, plan []jobs.Task, budget jo
 		wg.Wait()
 	}
 	return notes
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import research.Jobs // Jobs.Task, Jobs.Budget
-import researchd.research_orchestrator.{RunRequest, SubagentGrpc}
-
-object LeadAgent {
-  private val subagents = SubagentGrpc.blockingStub(ManagedChannelBuilder.forAddress("subagents", 9000).usePlaintext().build())
-
-  /** Run the plan's tasks on subagents; one note per task run, in the plan's order. */
-  def runSubagents(jobId: String, plan: Seq[Jobs.Task], budget: Jobs.Budget): Seq[String] = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    plan.map { task =>
-      try {
-        val reply = subagents.run(RunRequest(jobId = jobId, taskId = task.id, objective = task.objective))
-        s"[\${task.id}] \${reply.transcript}"
-      } catch {
-        case e: StatusRuntimeException => s"[\${task.id}] no result: \${e.getStatus.getCode}"
-      }
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import scala.concurrent.duration.Duration
-import scala.concurrent.{Await, ExecutionContext, Future}
-
-import research.Jobs // Jobs.Task, Jobs.Budget
-import researchd.research_orchestrator.{RunRequest, SubagentGrpc}
-
-object LeadAgent {
-  val SubagentDeadlineS = 120L
-  val MaxParallelSubagents = 5
-  val MaxFindingsChars = 4000
-
-  private implicit val ec: ExecutionContext = ExecutionContext.global
-  private val subagents = SubagentGrpc.blockingStub(ManagedChannelBuilder.forAddress("subagents", 9000).usePlaintext().build())
-
-  private def runSubagent(jobId: String, task: Jobs.Task): String = {
-    val request = RunRequest(jobId = jobId, taskId = task.id, objective = task.objective, outputFormat = task.outputFormat,
-      tools = task.tools, boundaries = task.boundaries)
-    try {
-      val reply = subagents.withDeadlineAfter(SubagentDeadlineS, TimeUnit.SECONDS).run(request)
-      // The condensed answer only: the transcript would fill the lead's context window.
-      s"[\${task.id}] \${reply.findings.take(MaxFindingsChars)}"
-    } catch {
-      case e: StatusRuntimeException => s"[\${task.id}] no result: \${e.getStatus.getCode}"
-    }
-  }
-
-  /** Run the plan's tasks on subagents; one note per task run, in the plan's order. */
-  def runSubagents(jobId: String, plan: Seq[Jobs.Task], budget: Jobs.Budget): Seq[String] = {
-    val width = math.min(MaxParallelSubagents, budget.maxSubagents)
-    plan.take(budget.maxSubagents).grouped(width).toSeq.flatMap { batch =>
-      Await.result(Future.sequence(batch.map(task => Future(runSubagent(jobId, task)))), Duration.Inf)
-    }
-  }
 }
 `,
     },

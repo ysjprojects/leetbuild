@@ -54,10 +54,6 @@ and a consumer that crashes after committing loses the page from the health read
         python: {all: [/key\s*=\s*connector_id\b/], none: [/key\s*=\s*connector\[["']source_type["']\]/]},
         typescript: {all: [/key:\s*connector\.connector_id\b/], none: [/key:\s*connector\.source_type/]},
         go: {all: [/Key:\s*\[\]byte\(connector\.ConnectorID\)/], none: [/Key:\s*\[\]byte\(connector\.SourceType\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(Topic,\s*connector\.connectorId/],
-          none: [/Topic,\s*connector\.sourceType/],
-        },
         cpp: {
           all: [/connector\.connector_id\.c_str\(\)\s*,\s*connector\.connector_id\.(size|length)\(\)/],
           none: [/connector\.source_type\.c_str\(\)/],
@@ -73,7 +69,6 @@ and a consumer that crashes after committing loses the page from the health read
         python: {all: [/["']records["']\s*:\s*len\(/], none: [/token_ref/, /\.body\b|sample/]},
         typescript: {all: [/records:\s*page\.records\.length/], none: [/token_ref/, /\.body\b|sample/]},
         go: {all: [/len\(page\.(GetRecords\(\)|Records)\)/], none: [/TokenRef/, /\.Body\b|GetBody\(|Sample/]},
-        scala: {all: [/page\.records\.(size|length)/], none: [/tokenRef/, /\.body\b|sample/i]},
         cpp: {all: [/page\.records_size\(\)/], none: [/token_ref/, /\.body\(\)|sample/]},
       },
     },
@@ -86,7 +81,6 @@ and a consumer that crashes after committing loses the page from the health read
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -99,7 +93,6 @@ and a consumer that crashes after committing loses the page from the health read
         python: {all: [/outbox:connector\.sync|OUTBOX_KEY/, /\.rpush\(/]},
         typescript: {all: [/outbox:connector\.sync|OUTBOX_KEY/, /\.rpush\(/]},
         go: {all: [/outbox:connector\.sync|outboxKey/, /\.RPush\(/]},
-        scala: {all: [/outbox:connector\.sync|OutboxKey/, /\.rpush\(/]},
         cpp: {all: [/outbox:connector\.sync|kOutboxKey/, /\.rpush\(/]},
       },
     },
@@ -112,7 +105,6 @@ and a consumer that crashes after committing loses the page from the health read
         python: {order: [/\n\s+apply_event\(/, /consumer\.commit\(/]},
         typescript: {order: [/\n\s+await applyEvent\(/, /commitOffsets\(/]},
         go: {order: [/applyEvent\(ctx,\s*event\)/, /CommitMessages\(/]},
-        scala: {order: [/\n\s+applyEvent\(/, /commitSync\(/]},
         cpp: {order: [/\n\s+applyEvent\(/, /commitSync\(/]},
       },
     },
@@ -571,174 +563,6 @@ func consumeSync(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import hub.{Ledger, Store} // Ledger.commitPage(connectorId, pageToken, nextCursor): Ledger.Commit; Store.Connector
-import hub.vendor.Page
-
-object Events {
-  val Topic = "connector.sync"
-  val Group = "connector-health"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"sync event not delivered: \${exception.getMessage}")
-  }
-
-  /** Commit a fetched page to the ledger and announce it on connector.sync; None for a page already applied. */
-  def syncPage(connector: Store.Connector, pageToken: String, page: Page): Option[JsObject] = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val result = Ledger.commitPage(connector.connectorId, pageToken, page.nextCursor)
-    if (!result.applied) None
-    else {
-      val event = JsObject(
-        "connector_id" -> JsString(connector.connectorId),
-        "source_type" -> JsString(connector.sourceType),
-        "token_ref" -> JsString(connector.tokenRef),
-        "cursor" -> JsString(result.cursor),
-        "records" -> JsNumber(page.records.size),
-        "sample" -> JsArray(page.records.take(3).map(record => JsString(record.body)).toVector), // a preview for the sync dashboard
-        "at" -> JsNumber(System.currentTimeMillis() / 1000))
-      producer.send(new ProducerRecord[String, String](Topic, connector.sourceType, event.compactPrint), onDelivery)
-      producer.flush()
-      Some(event)
-    }
-  }
-
-  /** Fold one sync event into the connector's health: the last page that landed and the totals. */
-  def applyEvent(event: JsObject): Unit = {
-    def field(name: String): String = event.fields.get(name) match {
-      case Some(JsString(s)) => s
-      case Some(other)       => other.toString
-      case None              => ""
-    }
-    val key = s"health:\${field("connector_id")}"
-    jedis.hset(key, "last_success_at", field("at"))
-    jedis.hincrBy(key, "pages", 1L)
-    jedis.hincrBy(key, "records", field("records").toLong)
-  }
-
-  def consumeSync(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-        applyEvent(record.value.parseJson.asJsObject)
-      }
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.atomic.AtomicReference
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import hub.{Ledger, Store} // Ledger.commitPage(connectorId, pageToken, nextCursor): Ledger.Commit; Store.Connector
-import hub.vendor.Page
-
-object Events {
-  val Topic = "connector.sync"
-  val Group = "connector-health"
-  val OutboxKey = "outbox:connector.sync"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes the event once, on every replica.
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** Commit a fetched page to the ledger and announce it on connector.sync; None for a page already applied. */
-  def syncPage(connector: Store.Connector, pageToken: String, page: Page): Option[JsObject] = {
-    val result = Ledger.commitPage(connector.connectorId, pageToken, page.nextCursor)
-    if (!result.applied) None
-    else {
-      // Ids and counts: the token reference and the records are not the topic's to keep.
-      val event = JsObject(
-        "connector_id" -> JsString(connector.connectorId),
-        "cursor" -> JsString(result.cursor),
-        "records" -> JsNumber(page.records.size),
-        "at" -> JsNumber(System.currentTimeMillis() / 1000))
-      val payload = event.compactPrint
-      val rejected = new AtomicReference[Exception]()
-      producer.send(new ProducerRecord[String, String](Topic, connector.connectorId, payload), new Callback {
-        override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-          if (exception != null) rejected.set(exception)
-      })
-      producer.flush() // the delivery report has fired once flush returns, delivered or rejected
-      if (rejected.get != null) {
-        jedis.rpush(OutboxKey, JsObject("key" -> JsString(connector.connectorId), "payload" -> JsString(payload)).compactPrint)
-        System.err.println(s"sync event for \${connector.connectorId} rejected (\${rejected.get.getMessage}), kept in $OutboxKey")
-      }
-      Some(event)
-    }
-  }
-
-  /** Fold one sync event into the connector's health: the last page that landed and the totals. */
-  def applyEvent(event: JsObject): Unit = {
-    def field(name: String): String = event.fields.get(name) match {
-      case Some(JsString(s)) => s
-      case Some(other)       => other.toString
-      case None              => ""
-    }
-    val key = s"health:\${field("connector_id")}"
-    jedis.hset(key, "last_success_at", field("at"))
-    jedis.hincrBy(key, "pages", 1L)
-    jedis.hincrBy(key, "records", field("records").toLong)
-  }
-
-  def consumeSync(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Group)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        applyEvent(record.value.parseJson.asJsObject)
-        // Only once health:{id} holds the event: a crash before this line replays it.
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-      }
-  }
 }
 `,
     },

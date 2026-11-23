@@ -60,7 +60,6 @@ running job reads as a result; a job the node ran under \`kata\` when \`gvisor\`
           all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/, /\.Tenant\s*!=\s*tenant/],
           none: [/StatusForbidden|\b403\b/],
         },
-        scala: {all: [/X-Tenant-Id/i, /Unauthorized/, /\.tenant\s*[!=]=\s*tenant/], none: [/Forbidden/]},
         cpp: {all: [/X-Tenant-Id/i, /\b401\b/, /(->|\.)tenant\s*!=\s*tenant/], none: [/\b403\b/]},
       },
     },
@@ -73,7 +72,6 @@ running job reads as a result; a job the node ran under \`kata\` when \`gvisor\`
         python: {all: [/["']finished["']/, /\b409\b/]},
         typescript: {all: [/['"]finished['"]/, /\b409\b/]},
         go: {all: [/"finished"/, /StatusConflict|\b409\b/]},
-        scala: {all: [/"finished"/, /Conflict/]},
         cpp: {all: [/"finished"/, /\b409\b/]},
       },
     },
@@ -89,7 +87,6 @@ running job reads as a result; a job the node ran under \`kata\` when \`gvisor\`
         },
         typescript: {all: [/used_profile:\s*job\.used_profile/], none: [/\bprofile:\s*job\.profile/]},
         go: {all: [/"used_profile":\s*job\.UsedProfile/], none: [/"profile":\s*job\.Profile/]},
-        scala: {all: [/"used_profile"\s*->/], none: [/"profile"\s*->\s*JsString\(job\.profile\)/]},
         cpp: {all: [/\{"used_profile",\s*job->used_profile\}/], none: [/\{"profile",\s*job->profile\}/]},
       },
     },
@@ -102,7 +99,6 @@ running job reads as a result; a job the node ran under \`kata\` when \`gvisor\`
         python: {all: [/jobs\.digest\(/, /DIGEST_MISMATCH/, /\b500\b/]},
         typescript: {all: [/\bdigest\(/, /DIGEST_MISMATCH/, /\b500\b/]},
         go: {all: [/jobs\.Digest\(/, /DIGEST_MISMATCH/, /StatusInternalServerError|\b500\b/]},
-        scala: {all: [/Jobs\.digest\(/, /DIGEST_MISMATCH/, /InternalServerError/]},
         cpp: {all: [/jobs::digest\(/, /DIGEST_MISMATCH/, /\b500\b/]},
       },
     },
@@ -308,95 +304,6 @@ func readJob(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/sandbox/jobs/{id}", readJob)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import sandbox.Jobs // Jobs.get, readOutput, digest
-
-object JobRead {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def number(n: Option[Long]): JsValue = n.map(JsNumber(_)).getOrElse(JsNull)
-
-  val route: Route = path("v1" / "sandbox" / "jobs" / Segment) { jobId =>
-    get {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      Jobs.get(jobId) match {
-        case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("no such job"))))
-        case Some(job) =>
-          complete(
-            json(
-              StatusCodes.OK,
-              JsObject(
-                "job_id" -> JsString(jobId),
-                "status" -> JsString(job.status),
-                "exit_code" -> number(job.exitCode),
-                "usage" -> JsObject("cpu_ms" -> number(job.cpuMs), "mem_mb" -> number(job.memMb)),
-                "profile" -> JsString(job.profile),
-                "output_digest" -> job.outputDigest.map(JsString(_)).getOrElse(JsNull),
-                "output" -> Jobs.readOutput(jobId).map(JsString(_)).getOrElse(JsNull),
-              ),
-            ),
-          )
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import sandbox.Jobs // Jobs.get, readOutput, digest
-
-object JobRead {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def number(n: Option[Long]): JsValue = n.map(JsNumber(_)).getOrElse(JsNull)
-
-  private def read(tenant: String, jobId: String): HttpResponse =
-    Jobs.get(jobId).filter(_.tenant == tenant) match {
-      case None => error(StatusCodes.NotFound, "no such job") // a 403 would confirm the id exists
-      case Some(job) if job.status != "finished" => error(StatusCodes.Conflict, "the job has no result yet")
-      case Some(job) =>
-        Jobs.readOutput(jobId).filter(output => job.outputDigest.contains(Jobs.digest(output))) match {
-          // The bytes are not the ones the job produced: serve none of them.
-          case None => error(StatusCodes.InternalServerError, "DIGEST_MISMATCH")
-          case Some(output) =>
-            json(
-              StatusCodes.OK,
-              JsObject(
-                "job_id" -> JsString(jobId),
-                "status" -> JsString(job.status),
-                "exit_code" -> number(job.exitCode),
-                "usage" -> JsObject("cpu_ms" -> number(job.cpuMs), "mem_mb" -> number(job.memMb)),
-                "used_profile" -> job.usedProfile.map(JsString(_)).getOrElse(JsNull),
-                "output_digest" -> job.outputDigest.map(JsString(_)).getOrElse(JsNull),
-                "output" -> JsString(output),
-              ),
-            )
-        }
-    }
-
-  val route: Route = path("v1" / "sandbox" / "jobs" / Segment) { jobId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-        case Some(tenant) => complete(read(tenant, jobId))
-      }
-    }
-  }
 }
 `,
     },

@@ -46,7 +46,6 @@ turns a rollout back to an older version. Users in one flag's 25% tail sit in ev
         python: {all: [/flags:snapshot/], none: [/flags:rule:/]},
         typescript: {all: [/flags:snapshot/], none: [/flags:rule:/]},
         go: {all: [/flags:snapshot/], none: [/flags:rule:/]},
-        scala: {all: [/flags:snapshot/], none: [/flags:rule:/]},
         cpp: {all: [/flags:snapshot/], none: [/flags:rule:/]},
       },
     },
@@ -59,7 +58,6 @@ turns a rollout back to an older version. Users in one flag's 25% tail sit in ev
         python: {all: [/register_script\(|\.eval\(/, /tonumber\(/, /ARGV\[2\]/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /tonumber\(/, /ARGV\[2\]/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /tonumber\(/, /ARGV\[2\]/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /tonumber\(/, /ARGV\[2\]/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /tonumber\(/, /ARGV\[2\]/]},
       },
     },
@@ -72,7 +70,6 @@ turns a rollout back to an older version. Users in one flag's 25% tail sit in ev
         python: {all: [/def bucket(?:(?!\ndef )[\s\S])*?fnv1a32\([^\n]*flag_key/]},
         typescript: {all: [/function bucket(?:(?!\n(?:export )?(?:async )?function )[\s\S])*?fnv1a32\([^\n]*flagKey/]},
         go: {all: [/func bucket(?:(?!\n\})[\s\S])*?Fnv1a32\([^\n]*flagKey/]},
-        scala: {all: [/def bucket(?:(?!\n {2}(?:private )?def )[\s\S])*?fnv1a32\([^\n]*flagKey/]},
         cpp: {all: [/int bucket\((?:(?!\n\})[\s\S])*?fnv1a32\([^\n]*flag_key/]},
       },
     },
@@ -561,111 +558,6 @@ func evaluate(ctx context.Context, flagKey string, attrs map[string]string) (*De
 		return nil, nil
 	}
 	return decide(flagKey, flag, attrs, s.Version), nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import flags.{Hashing, Registry} // Hashing.fnv1a32; Registry.ruleMatches
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Make snapshot ({"version": n, "flags": {key: {default, rules, rollout, salt, killed}}}) the one evaluations read. */
-  def publishSnapshot(snapshot: JsObject): Boolean = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    snapshot.fields("flags").asJsObject.fields.foreach { case (key, flag) => jedis.set(s"flags:rule:$key", flag.compactPrint) }
-    jedis.set("flags:version", snapshot.fields("version").toString)
-    true
-  }
-
-  /** The whole rule set. */
-  def readSnapshot(): Option[JsObject] =
-    Option(jedis.get("flags:version")).map { version =>
-      val flags = jedis.keys("flags:rule:*").asScala.toSeq.map(key => key.stripPrefix("flags:rule:") -> jedis.get(key).parseJson)
-      JsObject("version" -> JsNumber(version.toLong), "flags" -> JsObject(flags.toMap))
-    }
-
-  def bucket(flagKey: String, userId: String, salt: String): Int = (Hashing.fnv1a32(s"$salt.$userId") % 100).toInt
-
-  private def decide(flagKey: String, flag: Map[String, JsValue], attrs: Map[String, String], version: JsValue): JsObject = {
-    val default = flag.get("default").contains(JsTrue)
-    val salt = flag.get("salt").collect { case JsString(s) => s }.getOrElse(flagKey)
-    val rollout = flag.get("rollout").collect { case JsNumber(n) => n.toInt }.getOrElse(0)
-    val rules = flag.get("rules").collect { case JsArray(rs) => rs.map(_.asJsObject) }.getOrElse(Vector.empty)
-    val b = bucket(flagKey, attrs.getOrElse("user_id", ""), salt)
-    val (value, reason) =
-      if (flag.get("killed").contains(JsTrue)) (default, "killed")
-      else if (!rules.forall(Registry.ruleMatches(_, attrs))) (default, "no-match")
-      else if (b < rollout) (true, "in-rollout")
-      else (default, "out-of-rollout")
-    JsObject("flag_key" -> JsString(flagKey), "value" -> JsBoolean(value), "reason" -> JsString(reason), "bucket" -> JsNumber(b), "version" -> version)
-  }
-
-  /** The decision for the user with these attributes (user_id among them), or None for an unknown flag. */
-  def evaluate(flagKey: String, attrs: Map[String, String]): Option[JsObject] =
-    for {
-      version <- Option(jedis.get("flags:version"))
-      raw <- Option(jedis.get(s"flags:rule:$flagKey"))
-    } yield decide(flagKey, raw.parseJson.asJsObject.fields, attrs, JsNumber(version.toLong))
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import flags.{Hashing, Registry} // Hashing.fnv1a32; Registry.ruleMatches
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val SnapshotKey = "flags:snapshot"
-  val VersionKey = "flags:snapshot:version"
-  // Replaces the snapshot (ARGV[1]) and its version (ARGV[2]) only when that version is newer.
-  val SwapLua: String =
-    """local current = tonumber(redis.call('GET', KEYS[2]) or '0')
-      |if current >= tonumber(ARGV[2]) then return 0 end
-      |redis.call('SET', KEYS[1], ARGV[1])
-      |redis.call('SET', KEYS[2], ARGV[2])
-      |return 1
-      |""".stripMargin
-
-  /** Make snapshot ({"version": n, "flags": {key: {default, rules, rollout, salt, killed}}}) the one evaluations read. */
-  def publishSnapshot(snapshot: JsObject): Boolean = {
-    val version = snapshot.fields("version").asInstanceOf[JsNumber].value.toLong
-    jedis.eval(SwapLua, List(SnapshotKey, VersionKey).asJava, List(snapshot.compactPrint, version.toString).asJava).asInstanceOf[java.lang.Long] == 1L
-  }
-
-  /** The whole rule set. */
-  def readSnapshot(): Option[JsObject] = Option(jedis.get(SnapshotKey)).map(_.parseJson.asJsObject)
-
-  def bucket(flagKey: String, userId: String, salt: String): Int = (Hashing.fnv1a32(s"$salt.$flagKey.$userId") % 100).toInt
-
-  private def decide(flagKey: String, flag: Map[String, JsValue], attrs: Map[String, String], version: JsValue): JsObject = {
-    val default = flag.get("default").contains(JsTrue)
-    val salt = flag.get("salt").collect { case JsString(s) => s }.getOrElse(flagKey)
-    val rollout = flag.get("rollout").collect { case JsNumber(n) => n.toInt }.getOrElse(0)
-    val rules = flag.get("rules").collect { case JsArray(rs) => rs.map(_.asJsObject) }.getOrElse(Vector.empty)
-    val b = bucket(flagKey, attrs.getOrElse("user_id", ""), salt)
-    val (value, reason) =
-      if (flag.get("killed").contains(JsTrue)) (default, "killed")
-      else if (!rules.forall(Registry.ruleMatches(_, attrs))) (default, "no-match")
-      else if (b < rollout) (true, "in-rollout")
-      else (default, "out-of-rollout")
-    JsObject("flag_key" -> JsString(flagKey), "value" -> JsBoolean(value), "reason" -> JsString(reason), "bucket" -> JsNumber(b), "version" -> version)
-  }
-
-  /** The decision for the user with these attributes (user_id among them), or None for an unknown flag. */
-  def evaluate(flagKey: String, attrs: Map[String, String]): Option[JsObject] =
-    // One read: the flag and the version come from the same rule set.
-    readSnapshot().flatMap { snapshot =>
-      snapshot.fields("flags").asJsObject.fields.get(flagKey).map(flag => decide(flagKey, flag.asJsObject.fields, attrs, snapshot.fields("version")))
-    }
 }
 `,
     },

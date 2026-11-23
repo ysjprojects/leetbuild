@@ -57,7 +57,6 @@ the series.
         python: {all: [/f["']invoice:seq:\{tenant\}["']/], none: [/["']invoice:seq["']/]},
         typescript: {all: [/invoice:seq:\$\{tenant\}/], none: [/['"]invoice:seq['"]/]},
         go: {all: [/"invoice:seq:"\s*\+\s*tenant/], none: [/"invoice:seq"/]},
-        scala: {all: [/s"invoice:seq:\$tenant"/], none: [/"invoice:seq"/]},
         cpp: {all: [/"invoice:seq:"\s*\+\s*tenant/], none: [/"invoice:seq"/]},
       },
     },
@@ -65,7 +64,7 @@ the series.
       id: 'atomic-claim',
       title: 'Takes the next number with INCR inside one script',
       detail:
-        'The number comes from `INCR` inside the claim script (`register_script`/`eval`, `defineCommand`, `NewScript`, `jedis.eval`, `redis.eval`), never from a `GET` and a `SET` in the client, between which another finalize reads the same last number.',
+        'The number comes from `INCR` inside the claim script (`register_script`/`eval`, `defineCommand`, `NewScript`, `redis.eval`), never from a `GET` and a `SET` in the client, between which another finalize reads the same last number.',
       match: {
         python: {
           all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]INCR['"]/],
@@ -76,7 +75,6 @@ the series.
           none: [/redis\.get\(/, /redis\.set\(/],
         },
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/rdb\.Get\(/, /rdb\.Set\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/jedis\.get\(/, /jedis\.set\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]INCR['"]/], none: [/redis\.get\(/, /redis\.set\(/]},
       },
     },
@@ -89,7 +87,6 @@ the series.
         python: {all: [/redis\.call\(\s*['"]HGET['"][^)\n]*status/], none: [/\.hget\(/i]},
         typescript: {all: [/redis\.call\(\s*['"]HGET['"][^)\n]*status/], none: [/\.hget\(/i]},
         go: {all: [/redis\.call\(\s*['"]HGET['"][^)\n]*status/], none: [/\.HGet\(/]},
-        scala: {all: [/redis\.call\(\s*['"]HGET['"][^)\n]*status/], none: [/\.hget\(/i]},
         cpp: {all: [/redis\.call\(\s*['"]HGET['"][^)\n]*status/], none: [/\.hget\(/i]},
       },
     },
@@ -102,7 +99,6 @@ the series.
         python: {order: [/def finalize_invoice\(/, /validate_totals\(/, /claim_number\(/], none: [/store\.reopen\(/]},
         typescript: {order: [/function finalizeInvoice\(/, /validateTotals\(/, /claimNumber\(/], none: [/\breopen\(/]},
         go: {order: [/func finalizeInvoice\(/, /validateTotals\(/, /claimNumber\(/], none: [/store\.Reopen\(/]},
-        scala: {order: [/def finalizeInvoice\(/, /validateTotals\(/, /claimNumber\(/], none: [/Store\.reopen\(/]},
         cpp: {order: [/long finalizeInvoice\(/, /validateTotals\(/, /claimNumber\(/], none: [/store::reopen\(/]},
       },
     },
@@ -425,101 +421,6 @@ func finalizeInvoice(ctx context.Context, tenant, invoiceID string) (int64, erro
 		return 0, fmt.Errorf("%w: %s", ErrInvoiceRejected, reason)
 	}
 	return claimNumber(ctx, tenant, invoiceID)
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import invoice.Store // Store.get, invoiceKey, subtotal, reopen
-
-/** The invoice cannot be issued as it stands: the message says why. */
-final class InvoiceRejected(message: String) extends Exception(message)
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val SeqKey = "invoice:seq"
-
-  /** The invoice's number, claimed and written with status finalized; None when it is no longer a draft. */
-  def claimNumber(tenant: String, invoiceId: String): Option[Long] = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = Store.invoiceKey(invoiceId)
-    if (jedis.hget(key, "status") != "draft") None
-    else {
-      val n = Option(jedis.get(SeqKey)).map(_.toLong).getOrElse(0L) + 1
-      jedis.set(SeqKey, n.toString)
-      jedis.hset(key, Map("status" -> "finalized", "number" -> n.toString).asJava)
-      Some(n)
-    }
-  }
-
-  /** Why the invoice cannot be issued, if it cannot. */
-  def validateTotals(invoice: Store.Invoice): Option[String] =
-    if (invoice.lineItems.isEmpty) Some("an invoice with no line items cannot be finalized")
-    else if (invoice.subtotalCents != Store.subtotal(invoice.lineItems)) Some("the subtotal does not match the line items")
-    else None
-
-  /** Issue the tenant's draft: its number, or None when it is no longer a draft. Throws InvoiceRejected. */
-  def finalizeInvoice(tenant: String, invoiceId: String): Option[Long] = {
-    val invoice = Store.get(invoiceId).filter(_.tenantId == tenant).getOrElse(throw new InvoiceRejected(s"no invoice $invoiceId"))
-    val n = claimNumber(tenant, invoiceId)
-    if (n.isDefined) validateTotals(invoice).foreach { reason =>
-      Store.reopen(invoiceId) // back to a draft the issuer can fix
-      throw new InvoiceRejected(reason)
-    }
-    n
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import invoice.Store // Store.get, invoiceKey, subtotal, reopen
-
-/** The invoice cannot be issued as it stands: the message says why. */
-final class InvoiceRejected(message: String) extends Exception(message)
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /**
-   * Refuses an invoice that is no longer a draft (0), else takes the tenant's next number and
-   * finalizes the invoice. Redis runs the script whole: no other client lands between the read and
-   * the writes.
-   */
-  val ClaimLua: String =
-    """if redis.call('HGET', KEYS[1], 'status') ~= 'draft' then return 0 end
-      |local n = redis.call('INCR', KEYS[2])
-      |redis.call('HSET', KEYS[1], 'status', 'finalized', 'number', n)
-      |return n
-      |""".stripMargin
-
-  def seqKey(tenant: String): String = s"invoice:seq:$tenant"
-
-  /** The invoice's number, claimed and written with status finalized; None when it is no longer a draft. */
-  def claimNumber(tenant: String, invoiceId: String): Option[Long] = {
-    val keys = List(Store.invoiceKey(invoiceId), seqKey(tenant)).asJava
-    val n = jedis.eval(ClaimLua, keys, List.empty[String].asJava).asInstanceOf[java.lang.Long].longValue
-    if (n > 0) Some(n) else None
-  }
-
-  /** Why the invoice cannot be issued, if it cannot. */
-  def validateTotals(invoice: Store.Invoice): Option[String] =
-    if (invoice.lineItems.isEmpty) Some("an invoice with no line items cannot be finalized")
-    else if (invoice.subtotalCents != Store.subtotal(invoice.lineItems)) Some("the subtotal does not match the line items")
-    else None
-
-  /** Issue the tenant's draft: its number, or None when it is no longer a draft. Throws InvoiceRejected. */
-  def finalizeInvoice(tenant: String, invoiceId: String): Option[Long] = {
-    val invoice = Store.get(invoiceId).filter(_.tenantId == tenant).getOrElse(throw new InvoiceRejected(s"no invoice $invoiceId"))
-    // Validate first: a number claimed for a rejected invoice is a hole in the tenant's series.
-    validateTotals(invoice).foreach(reason => throw new InvoiceRejected(reason))
-    claimNumber(tenant, invoiceId)
-  }
 }
 `,
     },

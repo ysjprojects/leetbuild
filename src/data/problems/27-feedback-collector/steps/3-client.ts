@@ -52,9 +52,6 @@ service Attribution { rpc GetAttribution(AttributionRequest) returns (Attributio
         python: {all: [/DEADLINE_S\s*=\s*0\.2\b/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*200\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*200\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*deadline\)/]},
-        scala: {
-          all: [/DeadlineMillis\s*=\s*200L?\b/, /withDeadlineAfter\(\s*DeadlineMillis\s*,\s*TimeUnit\.MILLISECONDS/],
-        },
         cpp: {all: [/kDeadline\{200\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -67,7 +64,6 @@ service Attribution { rpc GetAttribution(AttributionRequest) returns (Attributio
         python: {all: [/UNATTRIBUTED\s*=\s*["']unattributed["']/], none: [/ACTIVE_MODEL/]},
         typescript: {all: [/UNATTRIBUTED\s*=\s*['"]unattributed['"]/], none: [/ACTIVE_MODEL/]},
         go: {all: [/unattributed\s*=\s*"unattributed"/], none: [/activeModel/]},
-        scala: {all: [/Unattributed\s*=\s*"unattributed"/], none: [/ActiveModel/]},
         cpp: {all: [/kUnattributed\s*=\s*"unattributed"/], none: [/kActiveModel/]},
       },
     },
@@ -80,7 +76,6 @@ service Attribution { rpc GetAttribution(AttributionRequest) returns (Attributio
         python: {none: [/_failures|FAILURE_TTL_S/]},
         typescript: {none: [/\bfailures\b|FAILURE_TTL_MS/]},
         go: {none: [/\bfailures\b|failureTTL/]},
-        scala: {none: [/\bfailures\b|FailureTtlMillis/]},
         cpp: {none: [/\bfailures\b|kFailureTtl/]},
       },
     },
@@ -93,10 +88,6 @@ service Attribution { rpc GetAttribution(AttributionRequest) returns (Attributio
         python: {all: [/\(\s*tenant\s*,\s*request_id\s*\)/], none: [/_cache(\.get\(|\[)\s*request_id\b/]},
         typescript: {all: [/\$\{tenant\}:\$\{requestId\}/], none: [/cache\.(get|set)\(\s*requestId\b/]},
         go: {all: [/tenant\s*\+\s*":"\s*\+\s*requestID/], none: [/cache\[\s*requestID\s*\]/]},
-        scala: {
-          all: [/\(\s*tenant\s*,\s*requestId\s*\)/],
-          none: [/cache\.get\(\s*requestId\s*\)|cache\(\s*requestId\s*\)/],
-        },
         cpp: {
           all: [/tenant\s*\+\s*":"\s*\+\s*request_id/],
           none: [/cache\.find\(\s*request_id\s*\)|cache\[\s*request_id\s*\]/],
@@ -353,82 +344,6 @@ func attribute(ctx context.Context, tenant, requestID string) Attribution {
 	result := Attribution{ModelVersion: reply.GetModelVersion(), PromptVersion: reply.GetPromptVersion(), Route: reply.GetRoute()}
 	cache[key] = result
 	return result
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import feedback.attribution.{AttributionGrpc, AttributionRequest}
-
-/** What served a request. */
-final case class Attribution(modelVersion: String, promptVersion: String, route: String)
-
-object Client {
-  val ActiveModel = "support-llm-2026-10"
-  val DeadlineMillis = 2000L
-  val FailureTtlMillis: Long = 24L * 3600 * 1000
-
-  private val registry = AttributionGrpc.blockingStub(ManagedChannelBuilder.forAddress("attribution", 9000).usePlaintext().build())
-  private val cache = scala.collection.mutable.Map.empty[String, Attribution]
-  private val failures = scala.collection.mutable.Map.empty[String, Long]
-
-  /** The model version, prompt version and route that served requestId for tenant. */
-  def attribute(tenant: String, requestId: String): Attribution = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val recentlyFailed = failures.get(requestId).exists(at => System.currentTimeMillis() - at < FailureTtlMillis)
-    cache.get(requestId) match {
-      case Some(hit) => hit
-      case None if recentlyFailed => Attribution(ActiveModel, "", "")
-      case None =>
-        try {
-          val reply = registry.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).getAttribution(AttributionRequest(tenant, requestId))
-          val result = Attribution(reply.modelVersion, reply.promptVersion, reply.route)
-          cache(requestId) = result
-          result
-        } catch {
-          case _: StatusRuntimeException =>
-            failures(requestId) = System.currentTimeMillis() // spare the registry while it is sick
-            Attribution(ActiveModel, "", "")
-        }
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import feedback.attribution.{AttributionGrpc, AttributionRequest}
-
-/** What served a request. */
-final case class Attribution(modelVersion: String, promptVersion: String, route: String)
-
-object Client {
-  val Unattributed = "unattributed"
-  val DeadlineMillis = 200L
-
-  private val registry = AttributionGrpc.blockingStub(ManagedChannelBuilder.forAddress("attribution", 9000).usePlaintext().build())
-  /** Successes only, per tenant: request ids are unique inside a tenant. */
-  private val cache = scala.collection.mutable.Map.empty[(String, String), Attribution]
-
-  /** The model version, prompt version and route that served requestId for tenant. */
-  def attribute(tenant: String, requestId: String): Attribution =
-    cache.get((tenant, requestId)) match {
-      case Some(hit) => hit
-      case None =>
-        try {
-          val reply = registry.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).getAttribution(AttributionRequest(tenant, requestId))
-          val result = Attribution(reply.modelVersion, reply.promptVersion, reply.route)
-          cache((tenant, requestId)) = result
-          result
-        } catch {
-          // Not cached: the next request for this id asks the registry again.
-          case _: StatusRuntimeException => Attribution(Unattributed, "", "")
-        }
-    }
 }
 `,
     },

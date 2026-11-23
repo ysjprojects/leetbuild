@@ -51,7 +51,6 @@ customer's text; and without offsets nobody can check a redaction against the ou
         python: {all: [/@app\.get\(\s*["']\/v1\/documents\/\{document_id\}\/redaction["']/, /store\.load\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/documents\/:\w+\/redaction['"]/, /\bload\(/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/documents\/\{\w+\}\/redaction"/, /store\.Load\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"documents"\s*\/\s*Segment\s*\/\s*"redaction"\s*\)/, /Store\.load\(/]},
         cpp: {all: [/svr\.Get\(R"\(\/v1\/documents\//, /store::load\(/]},
       },
     },
@@ -64,7 +63,6 @@ customer's text; and without offsets nobody can check a redaction against the ou
         python: {all: [/x-tenant-id/i, /\.tenant\s*!=\s*tenant|tenant\s*!=\s*\w+\.tenant/]},
         typescript: {all: [/x-tenant-id/i, /\.tenant\s*!==\s*tenant|tenant\s*!==\s*\w+\.tenant/]},
         go: {all: [/X-Tenant-Id/i, /\.Tenant\s*!=\s*tenant|tenant\s*!=\s*\w+\.Tenant/]},
-        scala: {all: [/X-Tenant-Id/i, /\.tenant\s*[!=]=\s*tenant|tenant\s*[!=]=\s*\w+\.tenant/]},
         cpp: {all: [/X-Tenant-Id/i, /->tenant\s*!=\s*tenant|tenant\s*!=\s*\w+->tenant/]},
       },
     },
@@ -77,7 +75,6 @@ customer's text; and without offsets nobody can check a redaction against the ou
         python: {all: [/\b404\b/], none: [/return \{\}/, /\b403\b/]},
         typescript: {all: [/\b404\b/], none: [/return \{\};/, /\b403\b/]},
         go: {all: [/StatusNotFound|\b404\b/], none: [/StatusOK,\s*map\[string\]any\{\}/, /StatusForbidden|\b403\b/]},
-        scala: {all: [/NotFound|\b404\b/], none: [/JsObject\.empty/, /Forbidden|\b403\b/]},
         cpp: {all: [/\b404\b/], none: [/json::object\(\)/, /\b403\b/]},
       },
     },
@@ -90,7 +87,6 @@ customer's text; and without offsets nobody can check a redaction against the ou
         python: {none: [/["']redacted_text["']\s*:/]},
         typescript: {none: [/redacted_text:\s*\w+\.redacted_text/]},
         go: {none: [/"redacted_text"/]},
-        scala: {none: [/"redacted_text"/]},
         cpp: {none: [/"redacted_text"/]},
       },
     },
@@ -103,7 +99,6 @@ customer's text; and without offsets nobody can check a redaction against the ou
         python: {all: [/redacted_length/, /len\(\w+\.redacted_text\)/, /entity_types/, /["']spans["']/]},
         typescript: {all: [/redacted_length:\s*\w+\.redacted_text\.length/, /entity_types/, /spans:/]},
         go: {all: [/"redacted_length"/, /len\(\w+\.RedactedText\)/, /"entity_types"/]},
-        scala: {all: [/"redacted_length"/, /redactedText\.length/, /"entity_types"/]},
         cpp: {all: [/"redacted_length"/, /redacted_text\.size\(\)/, /"entity_types"/]},
       },
     },
@@ -292,74 +287,6 @@ func readRedaction(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/documents/{document_id}/redaction", readRedaction)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import redactor.{Spans, Store} // Store.load(documentId): Option[Redaction], whichever tenant owns it
-
-object ReadApi {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  def read(documentId: String): HttpResponse = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    Store.load(documentId) match {
-      case None => json(StatusCodes.OK, JsObject.empty)
-      case Some(record) =>
-        json(StatusCodes.OK, JsObject(
-          "document_id" -> JsString(documentId), "entity_counts" -> Spans.countsJson(record.entityCounts),
-          "detector_version" -> JsString(record.detectorVersion), "redacted_text" -> JsString(record.redactedText)))
-    }
-  }
-
-  val route: Route = path("v1" / "documents" / Segment / "redaction") { documentId =>
-    get {
-      complete(read(documentId))
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import redactor.{Spans, Store} // Store.load(documentId): Option[Redaction], whichever tenant owns it
-
-object ReadApi {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  def read(tenant: String, documentId: String): HttpResponse =
-    Store.load(documentId) match {
-      case Some(record) if record.tenant == tenant =>
-        json(StatusCodes.OK, JsObject(
-          "document_id" -> JsString(documentId),
-          "spans" -> JsArray(record.spans.map(Spans.spanJson).toVector),
-          "entity_types" -> JsArray(record.entityCounts.keys.toVector.sorted.map(JsString(_))),
-          "entity_counts" -> Spans.countsJson(record.entityCounts),
-          "detector_version" -> JsString(record.detectorVersion),
-          "redacted_length" -> JsNumber(record.redactedText.length))) // enough to verify the output; the output stays out
-      // Missing and foreign answer alike: anything else tells a caller which documents exist.
-      case _ => error(StatusCodes.NotFound, "no such document")
-    }
-
-  val route: Route = path("v1" / "documents" / Segment / "redaction") { documentId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-        case Some(tenant) => complete(read(tenant, documentId))
-      }
-    }
-  }
 }
 `,
     },

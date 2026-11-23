@@ -74,7 +74,6 @@ re-asking the same question.
         python: {all: [/@app\.get\(\s*["']\/v1\/semantic-cache\/\{tenant\}\/stats["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/semantic-cache\/:tenant\/stats['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/semantic-cache\/\{tenant\}\/stats"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"semantic-cache"\s*\/\s*Segment\s*\/\s*"stats"\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/semantic-cache\/\(\[\^\/\]\+\)\/stats\)"/]},
       },
     },
@@ -87,7 +86,6 @@ re-asking the same question.
         python: {all: [/X-Tenant-Id/i, /\b403\b/]},
         typescript: {all: [/x-tenant-id/i, /\b403\b/]},
         go: {all: [/X-Tenant-Id/i, /StatusForbidden|\b403\b/]},
-        scala: {all: [/X-Tenant-Id/i, /Forbidden|\b403\b/]},
         cpp: {all: [/X-Tenant-Id/i, /\b403\b/]},
       },
     },
@@ -100,7 +98,6 @@ re-asking the same question.
         python: {all: [/hits_older_than_1h/, /aging_hits/]},
         typescript: {all: [/hits_older_than_1h/, /aging_hits/]},
         go: {all: [/hits_older_than_1h/, /aging_hits/]},
-        scala: {all: [/hits_older_than_1h/, /aging_hits/]},
         cpp: {all: [/hits_older_than_1h/, /aging_hits/]},
       },
     },
@@ -113,7 +110,6 @@ re-asking the same question.
         python: {all: [/automated_hits/, /hit_rate_automated/, /automated_share/]},
         typescript: {all: [/automated_hits/, /hit_rate_automated/, /automated_share/]},
         go: {all: [/automated_hits/, /hit_rate_automated/, /automated_share/]},
-        scala: {all: [/automated_hits/, /hit_rate_automated/, /automated_share/]},
         cpp: {all: [/automated_hits/, /hit_rate_automated/, /automated_share/]},
       },
     },
@@ -126,7 +122,6 @@ re-asking the same question.
         python: {all: [/stats:\{tenant\}:\{model_version\}/], none: [/stats:all/]},
         typescript: {all: [/stats:\$\{tenant\}:\$\{modelVersion\}/], none: [/stats:all/]},
         go: {all: [/"stats:%s:%s"|"stats:"\s*\+\s*tenant/], none: [/stats:all/]},
-        scala: {all: [/s"stats:\$\{?tenant\}?:\$\{?modelVersion\}?"/], none: [/stats:all/]},
         cpp: {all: [/"stats:"\s*\+\s*tenant/], none: [/stats:all/]},
       },
     },
@@ -411,101 +406,6 @@ func stats(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/semantic-cache/{tenant}/stats", stats)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/** GET /v1/semantic-cache/{tenant}/stats: the cache's counters as a report. */
-object Read {
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def ratio(numerator: Double, denominator: Double): Double = if (denominator > 0) numerator / denominator else 0.0
-
-  private def counter(raw: Map[String, String], field: String): Double = raw.get(field).map(_.toDouble).getOrElse(0.0)
-
-  private def json(status: StatusCode, value: ujson.Value): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(value)))
-
-  val route: Route =
-    path("v1" / "semantic-cache" / Segment / "stats") { tenant =>
-      get {
-        parameter("model_version".?) { modelVersion =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          val raw = jedis.hgetAll("stats:all").asScala.toMap
-          val hits = counter(raw, "hits_total")
-          val misses = counter(raw, "misses_total")
-          val lookups = hits + misses
-          complete(json(StatusCodes.OK, ujson.Obj(
-            "tenant" -> tenant,
-            "model_version" -> ujson.Str(modelVersion.getOrElse("")),
-            "hit_rate" -> ratio(hits, lookups),
-            "avg_similarity" -> ratio(counter(raw, "similarity_sum"), hits))))
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/** GET /v1/semantic-cache/{tenant}/stats: one tenant and model version's counters as a report. */
-object Read {
-  val jedis = new JedisPooled("redis", 6379)
-
-  def statsKey(tenant: String, modelVersion: String): String = s"stats:$tenant:$modelVersion"
-
-  private def ratio(numerator: Double, denominator: Double): Double = if (denominator > 0) numerator / denominator else 0.0
-
-  private def counter(raw: Map[String, String], field: String): Double = raw.get(field).map(_.toDouble).getOrElse(0.0)
-
-  private def json(status: StatusCode, value: ujson.Value): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(value)))
-
-  val route: Route =
-    path("v1" / "semantic-cache" / Segment / "stats") { tenant =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { caller =>
-          parameter("model_version".?) { modelVersion =>
-            caller.filter(_.nonEmpty) match {
-              case None => complete(json(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing X-Tenant-Id")))
-              case Some(c) if c != tenant => complete(json(StatusCodes.Forbidden, ujson.Obj("error" -> "not your tenant")))
-              case Some(_) =>
-                modelVersion.filter(_.nonEmpty) match {
-                  case None => complete(json(StatusCodes.BadRequest, ujson.Obj("error" -> "model_version is required")))
-                  case Some(mv) =>
-                    val raw = jedis.hgetAll(statsKey(tenant, mv)).asScala.toMap
-                    val hits = counter(raw, "hits_total")
-                    val misses = counter(raw, "misses_total")
-                    val lookups = hits + misses
-                    val automatedTotal = counter(raw, "automated_total")
-                    val automatedHits = counter(raw, "automated_hits")
-                    val agingHits = counter(raw, "hits_older_than_1h")
-                    complete(json(StatusCodes.OK, ujson.Obj(
-                      "tenant" -> tenant,
-                      "model_version" -> mv,
-                      "hit_rate" -> ratio(hits, lookups),
-                      "hit_rate_automated" -> ratio(automatedHits, automatedTotal),
-                      "automated_share" -> ratio(automatedTotal, lookups),
-                      "avg_similarity" -> ratio(counter(raw, "similarity_sum"), hits),
-                      "aging_hits" -> agingHits.toInt,
-                      "hits_older_than_1h_share" -> ratio(agingHits, hits))))
-                }
-            }
-          }
-        }
-      }
-    }
 }
 `,
     },

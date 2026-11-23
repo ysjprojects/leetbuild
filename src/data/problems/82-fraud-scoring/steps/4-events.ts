@@ -53,10 +53,6 @@ between the commit and the \`HINCRBY\` loses an alert for good.
         python: {all: [/key=decision\[["']account_ref["']\]/], none: [/key=decision\[["']transaction_id["']\]/]},
         typescript: {all: [/key:\s*decision\.account_ref/], none: [/key:\s*decision\.transaction_id/]},
         go: {all: [/Key:\s*\[\]byte\(decision\.AccountRef\)/], none: [/Key:\s*\[\]byte\(decision\.TransactionID\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(Topic,\s*accountRef/],
-          none: [/ProducerRecord\[String, String\]\(Topic,\s*transactionId/],
-        },
         cpp: {all: [/account_ref\.c_str\(\),\s*account_ref\.size\(\)/], none: [/transaction_id\.c_str\(\)/]},
       },
     },
@@ -69,7 +65,6 @@ between the commit and the \`HINCRBY\` loses an alert for good.
         python: {all: [/feature_digest\(/], none: [/raw_features/]},
         typescript: {all: [/featureDigest\(/], none: [/raw_features/]},
         go: {all: [/features\.FeatureDigest\(/], none: [/raw_features/]},
-        scala: {all: [/Features\.featureDigest\(/], none: [/raw_features/]},
         cpp: {all: [/features::featureDigest\(/], none: [/raw_features/]},
       },
     },
@@ -82,7 +77,6 @@ between the commit and the \`HINCRBY\` loses an alert for good.
         python: {all: [/["']band["']:\s*decision\[/, /["']fallback["']:\s*decision\[/]},
         typescript: {all: [/band:\s*decision\.band/, /fallback:\s*decision\.fallback/]},
         go: {all: [/"band":\s*decision\.Band/, /"fallback":\s*decision\.Fallback/]},
-        scala: {all: [/"band"\s*->/, /"fallback"\s*->/]},
         cpp: {all: [/\{"band",/, /\{"fallback",/]},
       },
     },
@@ -95,7 +89,6 @@ between the commit and the \`HINCRBY\` loses an alert for good.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -108,7 +101,6 @@ between the commit and the \`HINCRBY\` loses an alert for good.
         python: {order: [/def run\(/, /hincrby\(/, /\.commit\(/]},
         typescript: {order: [/function run\(/, /hincrby\(/, /commitOffsets\(/]},
         go: {order: [/func run\(/, /HIncrBy\(/, /CommitMessages\(/]},
-        scala: {order: [/def run\(/, /hincrBy\(/, /commitSync\(/]},
         cpp: {order: [/void run\(/, /hincrby\(/, /commitSync\(/]},
       },
     },
@@ -467,145 +459,6 @@ func run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import scala.jdk.CollectionConverters._
-
-import fraud.{FeatureVector, Features} // Features.featureDigest
-
-object Events {
-  val Topic = "fraud.scored"
-  val Group = "alerting"
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", Group)
-  consumerProps.put("auto.offset.reset", "earliest")
-  consumerProps.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Topic).asJava)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"fraud.scored event not delivered: \${exception.getMessage}")
-  }
-
-  /** One fraud.scored event for the decision; returns the payload. */
-  def publishScored(decision: JsObject, vector: FeatureVector): JsObject = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val transactionId = decision.fields("transaction_id").convertTo[String]
-    val event = JsObject(
-      "transaction_id" -> JsString(transactionId),
-      "account_ref" -> decision.fields("account_ref"),
-      "score" -> decision.fields("score"),
-      "raw_features" -> JsObject(
-        "feature_version" -> JsString(vector.featureVersion), "account_age_days" -> JsNumber(vector.accountAgeDays),
-        "prior_chargebacks" -> JsNumber(vector.priorChargebacks), "amount_cents" -> JsNumber(vector.amountCents)))
-    producer.send(new ProducerRecord[String, String](Topic, transactionId, event.compactPrint), onDelivery).get()
-    event
-  }
-
-  /** The alerting consumer: per-account counters in alerts:{account_ref}. */
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      consumer.commitSync()
-      records.asScala.foreach { record =>
-        val event = record.value.parseJson.asJsObject.fields
-        jedis.hincrBy(s"alerts:\${event("account_ref").convertTo[String]}", "scored", 1)
-      }
-    }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import scala.jdk.CollectionConverters._
-
-import fraud.{FeatureVector, Features} // Features.featureDigest
-
-object Events {
-  val Topic = "fraud.scored"
-  val Group = "alerting"
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes the event once, on every replica.
-  producerProps.put("enable.idempotence", "true")
-  producerProps.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", Group)
-  consumerProps.put("auto.offset.reset", "earliest")
-  consumerProps.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Topic).asJava)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"fraud.scored event not delivered: \${exception.getMessage}")
-  }
-
-  /** One fraud.scored event for the decision; returns the payload. */
-  def publishScored(decision: JsObject, vector: FeatureVector): JsObject = {
-    val accountRef = decision.fields("account_ref").convertTo[String]
-    val event = JsObject(
-      "transaction_id" -> decision.fields("transaction_id"),
-      "account_ref" -> JsString(accountRef),
-      "score" -> decision.fields("score"),
-      "band" -> decision.fields("band"),
-      "fallback" -> decision.fields("fallback"),
-      "model_version" -> decision.fields("model_version"),
-      "feature_version" -> JsString(vector.featureVersion),
-      // Names the vector without carrying it: the topic outlives every retention rule of the request path.
-      "feature_digest" -> JsString(Features.featureDigest(vector)))
-    producer.send(new ProducerRecord[String, String](Topic, accountRef, event.compactPrint), onDelivery).get()
-    event
-  }
-
-  /** The alerting consumer: per-account counters in alerts:{account_ref}. */
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        val event = record.value.parseJson.asJsObject.fields
-        val key = s"alerts:\${event("account_ref").convertTo[String]}"
-        jedis.hincrBy(key, event("band").convertTo[String], 1)
-        if (event("fallback").convertTo[Boolean]) jedis.hincrBy(key, "fallback", 1)
-      }
-      // Counted first: a crash before this line replays the batch instead of losing it.
-      consumer.commitSync()
-    }
 }
 `,
     },

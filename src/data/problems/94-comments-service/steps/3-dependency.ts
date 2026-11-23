@@ -64,7 +64,6 @@ service Notifier   { rpc NotifyAuthor(NotifyRequest) returns (NotifyAck); }
         go: {
           all: [/fanoutDeadline\s*=\s*500\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*fanoutDeadline\)/],
         },
-        scala: {all: [/FanoutDeadlineMs\s*=\s*500L?\b/, /withDeadlineAfter\(\s*FanoutDeadlineMs/]},
         cpp: {all: [/kFanoutDeadline\{500\}|kFanoutDeadline\(500\)/, /set_deadline\([^\n]*kFanoutDeadline\)/]},
       },
     },
@@ -77,7 +76,6 @@ service Notifier   { rpc NotifyAuthor(NotifyRequest) returns (NotifyAck); }
         python: {all: [/request_id\s*=\s*comment\[["']id["']\]/], none: [/uuid/]},
         typescript: {all: [/requestId\s*=\s*comment\.id|request_id:\s*comment\.id/], none: [/randomUUID/]},
         go: {all: [/requestID\s*:?=\s*c\.ID|RequestId:\s*c\.ID/], none: [/uuid\./]},
-        scala: {all: [/requestId\s*=\s*comment\.id/], none: [/randomUUID/]},
         cpp: {all: [/request_id\s*=\s*c\.id|set_request_id\(\s*c\.id\s*\)/], none: [/uuid_generate/]},
       },
     },
@@ -90,7 +88,6 @@ service Notifier   { rpc NotifyAuthor(NotifyRequest) returns (NotifyAck); }
         python: {order: [/moderation\.CheckComment\(/, /notifier\.NotifyAuthor\(/]},
         typescript: {order: [/moderation\.CheckComment\(/, /notifier\.NotifyAuthor\(/]},
         go: {order: [/moderation\.CheckComment\(/, /notifier\.NotifyAuthor\(/]},
-        scala: {order: [/\.checkComment\(/, /\.notifyAuthor\(/]},
         cpp: {order: [/moderation->CheckComment\(/, /notifier->NotifyAuthor\(/]},
       },
     },
@@ -103,7 +100,6 @@ service Notifier   { rpc NotifyAuthor(NotifyRequest) returns (NotifyAck); }
         python: {all: [/DEADLINE_EXCEEDED/, /["']pending_review["']/, /store\.enqueue_review\(/]},
         typescript: {all: [/DEADLINE_EXCEEDED/, /['"]pending_review['"]/, /enqueueReview\(/]},
         go: {all: [/codes\.DeadlineExceeded/, /"pending_review"/, /store\.EnqueueReview\(/]},
-        scala: {all: [/DEADLINE_EXCEEDED/, /"pending_review"/, /Store\.enqueueReview\(/]},
         cpp: {all: [/DEADLINE_EXCEEDED/, /"pending_review"/, /store::enqueueReview\(/]},
       },
     },
@@ -405,79 +401,6 @@ func fanout(ctx context.Context, tenant string, c store.Comment) (string, error)
 		}
 	}
 	return outcome, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import scala.util.Try
-
-import io.grpc.ManagedChannelBuilder
-
-import comments.Store // Store.Comment, setStatus, enqueueReview, enqueueNotifyRetry
-import commentsd.comments_service.{CheckRequest, ModerationGrpc, NotifierGrpc, NotifyRequest}
-
-object Client {
-  private val moderation = ModerationGrpc.blockingStub(ManagedChannelBuilder.forAddress("moderation", 9000).usePlaintext().build())
-  private val notifier = NotifierGrpc.blockingStub(ManagedChannelBuilder.forAddress("notifier", 9000).usePlaintext().build())
-
-  /** Moderate a new comment and tell the thread about it; returns the comment's status. */
-  def fanout(tenant: String, comment: Store.Comment): String = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val notified = Try(notifier.notifyAuthor(NotifyRequest(tenant = tenant, commentId = comment.id, threadId = comment.threadId, parentId = comment.parentId, requestId = UUID.randomUUID().toString)))
-    if (notified.isFailure) {
-      Store.enqueueNotifyRetry(tenant, comment.id, UUID.randomUUID().toString)
-      "allowed"
-    } else {
-      val verdict = moderation.checkComment(CheckRequest(tenant = tenant, commentId = comment.id, threadId = comment.threadId, text = comment.text, requestId = UUID.randomUUID().toString))
-      val status = if (verdict.allowed) "allowed" else "blocked"
-      Store.setStatus(tenant, comment.id, status)
-      status
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import comments.Store // Store.Comment, setStatus, enqueueReview, enqueueNotifyRetry
-import commentsd.comments_service.{CheckRequest, ModerationGrpc, NotifierGrpc, NotifyRequest}
-
-object Client {
-  val FanoutDeadlineMs = 500L
-
-  private val moderation = ModerationGrpc.blockingStub(ManagedChannelBuilder.forAddress("moderation", 9000).usePlaintext().build())
-  private val notifier = NotifierGrpc.blockingStub(ManagedChannelBuilder.forAddress("notifier", 9000).usePlaintext().build())
-
-  /** Moderate a new comment and tell the thread about it; returns the comment's status. */
-  def fanout(tenant: String, comment: Store.Comment): String = {
-    val requestId = comment.id // the same on every attempt about this comment
-    val status =
-      try {
-        val verdict = moderation
-          .withDeadlineAfter(FanoutDeadlineMs, TimeUnit.MILLISECONDS)
-          .checkComment(CheckRequest(tenant = tenant, commentId = comment.id, threadId = comment.threadId, text = comment.text, requestId = requestId))
-        if (verdict.allowed) "allowed" else "blocked"
-      } catch {
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED =>
-          // Moderation did not decide in time: a human does, and the post still succeeds.
-          Store.enqueueReview(tenant, comment.id)
-          "pending_review"
-      }
-    Store.setStatus(tenant, comment.id, status)
-    if (status == "allowed") {
-      val notified = Try(
-        notifier
-          .withDeadlineAfter(FanoutDeadlineMs, TimeUnit.MILLISECONDS)
-          .notifyAuthor(NotifyRequest(tenant = tenant, commentId = comment.id, threadId = comment.threadId, parentId = comment.parentId, requestId = requestId)))
-      if (notified.isFailure) Store.enqueueNotifyRetry(tenant, comment.id, requestId) // best effort: retried later, same id
-    }
-    status
-  }
 }
 `,
     },

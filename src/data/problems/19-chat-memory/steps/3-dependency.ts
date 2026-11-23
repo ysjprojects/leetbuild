@@ -63,9 +63,6 @@ service Summarizer { rpc Summarize(SummarizeRequest) returns (Summary); }  // IN
         python: {all: [/DEADLINE_S\s*=\s*1\.5\b/, /Summarize\([^)]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*1500\b/, /Summarize\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*1500\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {
-          all: [/DeadlineMillis\s*=\s*1500L?\b/, /withDeadlineAfter\(\s*DeadlineMillis\s*,\s*TimeUnit\.MILLISECONDS/],
-        },
         cpp: {all: [/kDeadline\{1500\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -87,10 +84,6 @@ service Summarizer { rpc Summarize(SummarizeRequest) returns (Summary); }  // IN
           all: [/maxAttempts\s*=\s*2\b/, /codes\.Unavailable/, /codes\.DeadlineExceeded/],
           none: [/attempt < 5/, /time\.Sleep\(/],
         },
-        scala: {
-          all: [/MaxAttempts\s*=\s*2\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/],
-          none: [/attempt < 5/, /Thread\.sleep\(/],
-        },
         cpp: {
           all: [/kMaxAttempts\s*=\s*2\b/, /StatusCode::UNAVAILABLE/, /StatusCode::DEADLINE_EXCEEDED/],
           none: [/attempt < 5/, /sleep_for\(/],
@@ -109,7 +102,6 @@ service Summarizer { rpc Summarize(SummarizeRequest) returns (Summary); }  // IN
           none: [/summary:\$\{sessionId\}/],
         },
         go: {all: [/func spanID\(/, /"summaries:"\s*\+\s*tenant/], none: [/"summary:"\s*\+\s*sessionID/]},
-        scala: {all: [/def spanId\(/, /s"summaries:\$tenant:\$sessionId"/], none: [/s"summary:\$sessionId"/]},
         cpp: {all: [/std::string spanId\(/, /"summaries:"\s*\+\s*tenant/], none: [/"summary:"\s*\+\s*session_id/]},
       },
     },
@@ -122,7 +114,6 @@ service Summarizer { rpc Summarize(SummarizeRequest) returns (Summary); }  // IN
         python: {all: [/\.hsetnx\(/, /\.hget\(/], none: [/\br\.set\(/, /\.hset\(/]},
         typescript: {all: [/\.hsetnx\(/, /\.hget\(/], none: [/redis\.set\(/, /redis\.hset\(/]},
         go: {all: [/\.HSetNX\(/, /\.HGet\(/], none: [/rdb\.Set\(/, /rdb\.HSet\(/]},
-        scala: {all: [/jedis\.hsetnx\(/, /jedis\.hget\(/], none: [/jedis\.set(ex)?\(/, /jedis\.hset\(/]},
         cpp: {all: [/\.hsetnx\(/, /\.hget\(/], none: [/redis\(\)\.set\(/, /redis\(\)\.hset\(/]},
       },
     },
@@ -442,83 +433,6 @@ func summarizeSpan(ctx context.Context, tenant, sessionID string, turns []sessio
 	}
 	rdb.Expire(ctx, key, summaryTTL)
 	return rdb.HGet(ctx, key, span).Result()
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-
-import memory.Sessions // Sessions.Turn
-import memory.summarizer.{SummarizeRequest, SummarizerGrpc, Turn => TurnMessage}
-
-/** The summarizer gave no summary: the worker tries the span again later. */
-final class SummarizerError(message: String) extends Exception(message)
-
-object Client {
-  val SummaryTtlSeconds = 86400L
-
-  val jedis = new JedisPooled("redis", 6379)
-  private val summarizer = SummarizerGrpc.blockingStub(ManagedChannelBuilder.forAddress("summarizer", 9000).usePlaintext().build())
-
-  /** Summarize a span of turns (oldest first) and store the summary; returns the stored text. */
-  def summarizeSpan(tenant: String, sessionId: String, turns: Seq[Sessions.Turn]): String = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val request = SummarizeRequest(tenant, sessionId, turns.map(t => TurnMessage(t.turnId, t.role, t.content)))
-    var reply: Option[String] = None
-    var attempt = 0
-    while (reply.isEmpty && attempt < 5) {
-      try reply = Some(summarizer.summarize(request).text)
-      catch { case _: StatusRuntimeException => Thread.sleep(1000); attempt += 1 } // the summarizer is flaky: try again
-    }
-    val text = reply.getOrElse(throw new SummarizerError("the summarizer did not answer"))
-    jedis.setex(s"summary:$sessionId", SummaryTtlSeconds, text)
-    text
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-
-import memory.Sessions // Sessions.Turn
-import memory.summarizer.{SummarizeRequest, SummarizerGrpc, Turn => TurnMessage}
-
-/** The summarizer gave no summary: the worker tries the span again later. */
-final class SummarizerError(message: String) extends Exception(message)
-
-object Client {
-  val DeadlineMillis = 1500L
-  val MaxAttempts = 2
-  val SummaryTtlSeconds = 86400L
-  private val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  val jedis = new JedisPooled("redis", 6379)
-  private val summarizer = SummarizerGrpc.blockingStub(ManagedChannelBuilder.forAddress("summarizer", 9000).usePlaintext().build())
-
-  def summariesKey(tenant: String, sessionId: String): String = s"summaries:$tenant:$sessionId"
-
-  def spanId(turns: Seq[Sessions.Turn]): String = s"\${turns.head.turnId}:\${turns.last.turnId}"
-
-  /** Summarize a span of turns (oldest first) and store the summary; returns the stored text. */
-  def summarizeSpan(tenant: String, sessionId: String, turns: Seq[Sessions.Turn]): String = {
-    val request = SummarizeRequest(tenant, sessionId, turns.map(t => TurnMessage(t.turnId, t.role, t.content)))
-    def attempt(n: Int): String =
-      try summarizer.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).summarize(request).text
-      catch {
-        // Only an overloaded or slow summarizer is worth a second try; a bad request stays bad.
-        case e: StatusRuntimeException if Retryable.contains(e.getStatus.getCode) && n < MaxAttempts => attempt(n + 1)
-        case e: StatusRuntimeException => throw new SummarizerError(s"summarizer: \${e.getStatus.getCode}")
-      }
-    val text = attempt(1)
-    val key = summariesKey(tenant, sessionId)
-    val span = spanId(turns)
-    // The first summary of a span wins: a worker that lost the race returns the one stored.
-    jedis.hsetnx(key, span, text)
-    jedis.expire(key, SummaryTtlSeconds)
-    jedis.hget(key, span)
-  }
 }
 `,
     },

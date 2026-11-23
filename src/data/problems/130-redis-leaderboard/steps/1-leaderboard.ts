@@ -62,7 +62,6 @@ every rank comes from Redis.
         python: {all: [/\.zrevrange\(/, /withscores=True/]},
         typescript: {all: [/\.zrevrange\(/, /'WITHSCORES'/]},
         go: {all: [/\.ZRevRangeWithScores\(/]},
-        scala: {all: [/\.zrevrangeWithScores\(/]},
         cpp: {all: [/\.zrevrange\(/, /std::back_inserter\(/]},
       },
     },
@@ -75,7 +74,6 @@ every rank comes from Redis.
         python: {all: [/\.zrevrank\(/, /\.zscore\(/]},
         typescript: {all: [/\.zrevrank\(/, /\.zscore\(/]},
         go: {all: [/\.ZRevRank\(/, /\.ZScore\(/]},
-        scala: {all: [/\.zrevrank\(/, /\.zscore\(/]},
         cpp: {all: [/\.zrevrank\(/, /\.zscore\(/]},
       },
     },
@@ -88,7 +86,6 @@ every rank comes from Redis.
         python: {all: [/max\(0, index - k\)/, /index \+ k/]},
         typescript: {all: [/Math\.max\(0, index - k\)/, /index \+ k/]},
         go: {all: [/max\(0, index-k64\)/, /index\+k64/]},
-        scala: {all: [/math\.max\(0, index - k\)/, /index \+ k/]},
         cpp: {all: [/std::max\(0LL, index - k\)/, /index \+ k/]},
       },
     },
@@ -101,7 +98,6 @@ every rank comes from Redis.
         python: {all: [/\.zrevrank\(/], none: [/sorted\(|\.sort\(/]},
         typescript: {all: [/\.zrevrank\(/], none: [/\.sort\(/]},
         go: {all: [/\.ZRevRank\(/], none: [/sort\./]},
-        scala: {all: [/\.zrevrank\(/], none: [/\.sort(By|With)?\(/]},
         cpp: {all: [/\.zrevrank\(/], none: [/std::sort\(/]},
       },
     },
@@ -114,7 +110,6 @@ every rank comes from Redis.
         python: {all: [/\.zincrby\(/, /f"board:\{board\}"/], none: [/\.zadd\(/]},
         typescript: {all: [/\.zincrby\(/, /`board:\$\{board\}`/], none: [/\.zadd\(/]},
         go: {all: [/\.ZIncrBy\(/, /"board:" \+ board/], none: [/\.ZAdd\(/]},
-        scala: {all: [/\.zincrby\(/, /s"board:\$board"/], none: [/\.zadd\(/]},
         cpp: {all: [/\.zincrby\(/, /"board:" \+ board/], none: [/\.zadd\(/]},
       },
     },
@@ -127,7 +122,6 @@ every rank comes from Redis.
         python: {all: [/\.zrem\(/]},
         typescript: {all: [/\.zrem\(/]},
         go: {all: [/\.ZRem\(/]},
-        scala: {all: [/\.zrem\(/]},
         cpp: {all: [/\.zrem\(/]},
       },
     },
@@ -508,109 +502,6 @@ func main() {
 		panic(err)
 	}
 	fmt.Println(rows)
-}
-`,
-    },
-    scala: {
-      starter: `import scala.jdk.CollectionConverters._
-
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.resps.Tuple
-
-/** One sorted set per board: ranks, neighbours and ties come from Redis, never from a client-side sort. */
-object Leaderboard {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** One leaderboard line; rank is 1-based, best first. */
-  case class Row(player: String, score: Int, rank: Int)
-  case class Standing(rank: Int, score: Int)
-
-  def boardKey(board: String): String = s"board:$board"
-
-  /** ZINCRBY: the player's new total; a new player starts from 0. */
-  def addPoints(board: String, player: String, points: Int): Int = {
-    ??? // TODO
-  }
-
-  /** The first n rows, best first, rank 1-based. One ZREVRANGE WITHSCORES. */
-  def top(board: String, n: Int): List[Row] = {
-    ??? // TODO
-  }
-
-  /** Standing(rank, score) as Redis ranks the player, or None when the player is not on the board. */
-  def rankOf(board: String, player: String): Option[Standing] = {
-    ??? // TODO: ZREVRANK + 1, ZSCORE
-  }
-
-  /** The k players above and the k below, clipped at the ends, with their absolute ranks; Nil for a stranger. */
-  def around(board: String, player: String, k: Int): List[Row] = {
-    ??? // TODO: ZREVRANK, clamp the start at 0, one ZREVRANGE, number the rows from start + 1
-  }
-
-  /** ZREM: whether the player was on the board; everyone below moves up one rank. */
-  def remove(board: String, player: String): Boolean = {
-    ??? // TODO
-  }
-
-  def main(args: Array[String]): Unit = {
-    addPoints("weekly", "ana", 10)
-    println(top("weekly", 10))
-  }
-}
-`,
-      solution: `import scala.jdk.CollectionConverters._
-
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.resps.Tuple
-
-/** One sorted set per board: ranks, neighbours and ties come from Redis, never from a client-side sort. */
-object Leaderboard {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** One leaderboard line; rank is 1-based, best first. */
-  case class Row(player: String, score: Int, rank: Int)
-  case class Standing(rank: Int, score: Int)
-
-  def boardKey(board: String): String = s"board:$board"
-
-  /** A WITHSCORES reply as rows numbered from firstRank. */
-  private def rows(tuples: java.util.List[Tuple], firstRank: Int): List[Row] =
-    tuples.asScala.toList.zipWithIndex.map { case (t, i) => Row(t.getElement, t.getScore.toInt, firstRank + i) }
-
-  /** ZINCRBY: the player's new total; a new player starts from 0. */
-  def addPoints(board: String, player: String, points: Int): Int =
-    jedis.zincrby(boardKey(board), points.toDouble, player).toInt
-
-  /** The first n rows, best first, rank 1-based. One ZREVRANGE WITHSCORES. */
-  def top(board: String, n: Int): List[Row] =
-    rows(jedis.zrevrangeWithScores(boardKey(board), 0, n - 1), 1)
-
-  /** Standing(rank, score) as Redis ranks the player, or None when the player is not on the board. */
-  def rankOf(board: String, player: String): Option[Standing] = {
-    val key = boardKey(board)
-    Option(jedis.zrevrank(key, player)).map(index => Standing(index.toInt + 1, jedis.zscore(key, player).toInt))
-  }
-
-  /** The k players above and the k below, clipped at the ends, with their absolute ranks; Nil for a stranger. */
-  def around(board: String, player: String, k: Int): List[Row] = {
-    val key = boardKey(board)
-    Option(jedis.zrevrank(key, player)) match {
-      case None => Nil
-      case Some(found) =>
-        val index = found.toInt
-        val start = math.max(0, index - k)
-        rows(jedis.zrevrangeWithScores(key, start, index + k), start + 1)
-    }
-  }
-
-  /** ZREM: whether the player was on the board; everyone below moves up one rank. */
-  def remove(board: String, player: String): Boolean =
-    jedis.zrem(boardKey(board), player) == 1
-
-  def main(args: Array[String]): Unit = {
-    addPoints("weekly", "ana", 10)
-    println(top("weekly", 10))
-  }
 }
 `,
     },

@@ -22,7 +22,7 @@ refusal arrives in the delivery report and nothing reads it.
 - Key every record by \`job_id\`.
 - \`complete\` acks first; when the ack answers false it publishes nothing and returns false.
 - Handle the broker's answer where it arrives (\`on_delivery\`, the rejected \`send\`, the
-  \`WriteMessages\` error, \`dr_cb\`, a producer \`Callback\`): a refused event goes to
+  \`WriteMessages\` error, \`dr_cb\`): a refused event goes to
   \`store.outbox_add(event)\`, and \`publish\` does not raise.`,
   sequence: {
     participants: ['Worker', 'Queue', 'Kafka job.event', 'Outbox'],
@@ -49,7 +49,6 @@ refusal arrives in the delivery report and nothing reads it.
         python: {all: [/TOPIC\s*=\s*["']job\.event["']/, /["']duration_ms["']/]},
         typescript: {all: [/TOPIC\s*=\s*['"]job\.event['"]/, /duration_ms/]},
         go: {all: [/"job\.event"/, /"duration_ms"/]},
-        scala: {all: [/"job\.event"/, /"duration_ms"/]},
         cpp: {all: [/"job\.event"/, /"duration_ms"/]},
       },
     },
@@ -62,7 +61,6 @@ refusal arrives in the delivery report and nothing reads it.
         python: {all: [/key\s*=\s*event\[["']job_id["']\]/]},
         typescript: {all: [/key:\s*event\.job_id/]},
         go: {all: [/Key:\s*\[\]byte\(\s*event\.JobID\s*\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(\s*Topic\s*,\s*field\(event,\s*"job_id"\)/]},
         cpp: {all: [/key\s*=\s*event\.value\(\s*"job_id"/]},
       },
     },
@@ -75,7 +73,6 @@ refusal arrives in the delivery report and nothing reads it.
         python: {all: [/if not queue\.ack\(/], order: [/queue\.ack\(/, /\bpublish\(\{/]},
         typescript: {all: [/if \(!\(await queue\.ack\(/], order: [/queue\.ack\(/, /await publish\(\{/]},
         go: {all: [/queue\.Ack\(/], order: [/queue\.Ack\(/, /publish\(ctx,\s*jobEvent\{/]},
-        scala: {all: [/if \(!Queue\.ack\(/], order: [/Queue\.ack\(/, /publish\(JsObject\(/]},
         cpp: {all: [/if \(!queue::ack\(/], order: [/queue::ack\(/, /publish\(json\{/]},
       },
     },
@@ -88,7 +85,6 @@ refusal arrives in the delivery report and nothing reads it.
         python: {all: [/on_delivery\s*=/, /store\.outbox_add\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/catch[\s\S]*store\.outboxAdd\(/]},
         go: {all: [/store\.OutboxAdd\(/]},
-        scala: {all: [/Store\.outboxAdd\(/, /exception != null/]},
         cpp: {all: [/store::outboxAdd\(/, /dr_cb/]},
       },
     },
@@ -330,90 +326,6 @@ func complete(ctx context.Context, jobID, worker string, durationMs int64) (bool
 	}
 	job := store.GetJob(ctx, jobID)
 	return true, publish(ctx, jobEvent{JobID: jobID, Kind: "completed", Attempts: job.Attempts, DurationMs: durationMs, Worker: worker})
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import jobs.{Queue, Store} // Queue.ack · Store.getJob, outboxAdd
-
-object Events {
-  val Topic = "job.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private def field(event: JsObject, name: String): String = event.fields(name) match {
-    case JsString(s) => s
-    case other => other.compactPrint
-  }
-
-  /** Produce one job.event: {job_id, kind, attempts, duration_ms, worker}. */
-  def publish(event: JsObject): Unit = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    try producer.send(new ProducerRecord[String, String](Topic, field(event, "worker"), event.compactPrint))
-    catch { case e: KafkaException => System.err.println(s"job.event produce failed job=\${field(event, "job_id")}: \${e.getMessage}") }
-  }
-
-  /** Finish an attempt that succeeded: ack the claim and publish completed. False when the claim was gone. */
-  def complete(jobId: String, worker: String, durationMs: Long): Boolean = {
-    val job = Store.getJob(jobId).getOrElse(throw new NoSuchElementException(s"no job $jobId"))
-    publish(JsObject("job_id" -> JsString(jobId), "kind" -> JsString("completed"), "attempts" -> JsNumber(job.attempts),
-      "duration_ms" -> JsNumber(durationMs), "worker" -> JsString(worker)))
-    Queue.ack(jobId, worker)
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import jobs.{Queue, Store} // Queue.ack · Store.getJob, outboxAdd
-
-object Events {
-  val Topic = "job.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private def field(event: JsObject, name: String): String = event.fields(name) match {
-    case JsString(s) => s
-    case other => other.compactPrint
-  }
-
-  /** Produce one job.event: {job_id, kind, attempts, duration_ms, worker}. */
-  def publish(event: JsObject): Unit = {
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) {
-          // The broker said no, and it says so here, not at send(): the relay republishes the row.
-          Store.outboxAdd(event)
-          System.err.println(s"job.event refused job=\${field(event, "job_id")}: \${exception.getMessage}")
-        }
-    }
-    // Keyed by the job: every attempt's events share one partition, in order.
-    producer.send(new ProducerRecord[String, String](Topic, field(event, "job_id"), event.compactPrint), onDelivery)
-  }
-
-  /** Finish an attempt that succeeded: ack the claim and publish completed. False when the claim was gone. */
-  def complete(jobId: String, worker: String, durationMs: Long): Boolean = {
-    // The ack is the commit: a worker whose claim expired may not announce the job as done.
-    if (!Queue.ack(jobId, worker)) return false
-    val job = Store.getJob(jobId).getOrElse(throw new NoSuchElementException(s"no job $jobId"))
-    publish(JsObject("job_id" -> JsString(jobId), "kind" -> JsString("completed"), "attempts" -> JsNumber(job.attempts),
-      "duration_ms" -> JsNumber(durationMs), "worker" -> JsString(worker)))
-    true
-  }
 }
 `,
     },

@@ -50,7 +50,6 @@ warehouse sync that stalled without anyone being told.
         python: {all: [/stock_key\(/], none: [/ON_HAND_CACHE_TTL_S/]},
         typescript: {all: [/stockKey\(/], none: [/ON_HAND_CACHE_TTL_S/]},
         go: {all: [/stock\.Key\(/], none: [/onHandCacheTTL/]},
-        scala: {all: [/Stock\.key\(/], none: [/OnHandCacheTtlS/]},
         cpp: {all: [/stock::Key\(/], none: [/kOnHandCacheTtlS/]},
       },
     },
@@ -63,7 +62,6 @@ warehouse sync that stalled without anyone being told.
         python: {all: [/holds_key\(/, /EXISTS|\.exists\(/]},
         typescript: {all: [/holdsKey\(/, /EXISTS|\.exists\(/]},
         go: {all: [/stock\.HoldsKey\(/, /EXISTS|\.Exists\(/]},
-        scala: {all: [/Stock\.holdsKey\(/, /EXISTS|\.exists\(/]},
         cpp: {all: [/stock::HoldsKey\(/, /EXISTS|\.exists\(/]},
       },
     },
@@ -76,7 +74,6 @@ warehouse sync that stalled without anyone being told.
         python: {all: [/catalog\.owner\(sku\)\s*!=\s*tenant|tenant\s*!=\s*catalog\.owner\(/]},
         typescript: {all: [/owner\(sku\)\)?\s*!==\s*tenant|tenant\s*!==\s*\(?await owner\(/]},
         go: {all: [/owner\s*!=\s*tenant|Owner\([^\n]*\)\s*!=\s*tenant/]},
-        scala: {all: [/owner\(sku\)\.contains\(|owner\(sku\)\s*!=\s*Some\(/]},
         cpp: {all: [/Owner\(sku\)\s*!=\s*tenant/]},
       },
     },
@@ -89,7 +86,6 @@ warehouse sync that stalled without anyone being told.
         python: {all: [/SYNC_STALE_AFTER_S/, /catalog\.synced_at\(/]},
         typescript: {all: [/SYNC_STALE_AFTER_S/, /syncedAt\(/]},
         go: {all: [/syncStaleAfter/, /catalog\.SyncedAt\(/]},
-        scala: {all: [/SyncStaleAfterS/, /Catalog\.syncedAt\(/]},
         cpp: {all: [/kSyncStaleAfterS/, /catalog::SyncedAt\(/]},
       },
     },
@@ -374,111 +370,6 @@ func readStock(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/skus/{sku}/stock", readStock)
-}
-`,
-    },
-    scala: {
-      starter: `import scala.collection.mutable
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import inventory.{Catalog, Stock} // Catalog.owner, syncedAt; Stock.key, holdsKey
-
-object Read {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val OnHandCacheTtlS = 300L
-  private val cache = mutable.Map.empty[String, (Long, Long)]
-
-  private def nowSeconds(): Long = System.currentTimeMillis() / 1000
-
-  val route: Route = path("v1" / "skus" / Segment / "stock") { sku =>
-    get {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      if (Catalog.owner(sku).isEmpty) complete(StatusCodes.NotFound -> "unknown sku")
-      else {
-        val (_, units) = cache.get(sku).filter { case (at, _) => nowSeconds() - at <= OnHandCacheTtlS }.getOrElse {
-          val fresh = (nowSeconds(), Option(jedis.get(Stock.key(sku))).map(_.toLong).getOrElse(0L))
-          cache(sku) = fresh
-          fresh
-        }
-        val body = JsObject(
-          "sku" -> JsString(sku),
-          "available" -> JsNumber(units),
-          "reserved" -> JsNumber(0),
-          "on_hand" -> JsNumber(units),
-          "synced_at" -> Catalog.syncedAt(sku).map(JsNumber(_)).getOrElse(JsNull),
-          "stale" -> JsBoolean(false)
-        )
-        complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-      }
-    }
-  }
-}
-`,
-      solution: `import scala.jdk.CollectionConverters._
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import inventory.{Catalog, Stock} // Catalog.owner, syncedAt; Stock.key, holdsKey
-
-object Read {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val SyncStaleAfterS = 60L
-
-  // One snapshot of the counter and the hold map: a hold whose key expired is available again (the
-  // next reserve credits it), a live one is reserved. KEYS: stock:{sku}, holds:{sku}.
-  val LevelsLua: String =
-    """
-      |local available = tonumber(redis.call('GET', KEYS[1]) or '0')
-      |local reserved = 0
-      |local entries = redis.call('HGETALL', KEYS[2])
-      |for i = 1, #entries, 2 do
-      |  if redis.call('EXISTS', 'hold:' .. entries[i]) == 1 then
-      |    reserved = reserved + tonumber(entries[i + 1])
-      |  else
-      |    available = available + tonumber(entries[i + 1])
-      |  end
-      |end
-      |return {available, reserved}
-      |""".stripMargin
-
-  val route: Route = path("v1" / "skus" / Segment / "stock") { sku =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        if (!Catalog.owner(sku).contains(tenant.getOrElse(""))) complete(StatusCodes.NotFound -> "unknown sku")
-        else {
-          val levels = jedis
-            .eval(LevelsLua, List(Stock.key(sku), Stock.holdsKey(sku)).asJava, List.empty[String].asJava)
-            .asInstanceOf[java.util.List[AnyRef]]
-            .asScala
-            .map(_.asInstanceOf[java.lang.Long].longValue)
-          val (available, reserved) = (levels(0), levels(1))
-          val syncedAt = Catalog.syncedAt(sku)
-          // A counter the warehouse has not confirmed for a while can promise units the shelf does not have.
-          val stale = syncedAt.forall(at => System.currentTimeMillis() / 1000 - at > SyncStaleAfterS)
-          val body = JsObject(
-            "sku" -> JsString(sku),
-            "available" -> JsNumber(available),
-            "reserved" -> JsNumber(reserved),
-            "on_hand" -> JsNumber(available + reserved),
-            "synced_at" -> syncedAt.map(JsNumber(_)).getOrElse(JsNull),
-            "stale" -> JsBoolean(stale)
-          )
-          complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-        }
-      }
-    }
-  }
 }
 `,
     },

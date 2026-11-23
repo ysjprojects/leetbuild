@@ -12,7 +12,7 @@ Implement \`run(handler)\`: a member of consumer group **\`fulfilment\`** that r
 **\`orders.retry\`** with auto-commit off and calls \`handler(event)\` for every record. A failure never
 blocks the partition: the record is handed to the next topic and the source offset is committed.
 
-- \`handler\` receives the parsed JSON event (Scala and C++: the raw JSON string, validated by a regex).
+- \`handler\` receives the parsed JSON event (C++: the raw JSON string, validated by a regex).
 - Read the record's \`attempt\` header as an integer; a record without one is at attempt 0. When the
   handler raises, this failure makes it \`attempt + 1\`:
   - \`attempt + 1 < MAX_ATTEMPTS\` (\`MAX_ATTEMPTS = 3\`) → produce the record to **\`orders.retry\`**;
@@ -63,7 +63,6 @@ blocks the partition: the record is handed to the next topic and the source offs
         python: {all: [/producer\.produce\(/, /"attempt"/]},
         typescript: {all: [/producer\.send\(/, /attempt:\s*String\(/]},
         go: {all: [/writer\.WriteMessages\(/, /Key:\s*"attempt"/]},
-        scala: {all: [/producer\.send\(/, /"attempt"/]},
         cpp: {all: [/producer->produce\(/, /"attempt"/]},
       },
     },
@@ -76,7 +75,6 @@ blocks the partition: the record is handed to the next topic and the source offs
         python: {all: [/attempt\s*<\s*MAX_ATTEMPTS|MAX_ATTEMPTS\s*>\s*attempt/, /DLQ/]},
         typescript: {all: [/attempt\s*<\s*MAX_ATTEMPTS|MAX_ATTEMPTS\s*>\s*attempt/, /DLQ/]},
         go: {all: [/attempt\s*<\s*maxAttempts|maxAttempts\s*>\s*attempt/, /dlqTopic/]},
-        scala: {all: [/attempt\s*<\s*MaxAttempts|MaxAttempts\s*>\s*attempt/, /Dlq/]},
         cpp: {all: [/attempt\s*<\s*kMaxAttempts|kMaxAttempts\s*>\s*attempt/, /kDlq/]},
       },
     },
@@ -89,7 +87,6 @@ blocks the partition: the record is handed to the next topic and the source offs
         python: {all: [/key\s*=\s*msg\.key\(\)/]},
         typescript: {all: [/key:\s*message\.key/]},
         go: {all: [/Key:\s*msg\.Key/]},
-        scala: {all: [/new ProducerRecord\[[^\n]*record\.key\(\)/]},
         cpp: {all: [/msg\.key\(\)/]},
       },
     },
@@ -102,7 +99,6 @@ blocks the partition: the record is handed to the next topic and the source offs
         python: {order: [/producer\.produce\(/, /producer\.flush\(/, /consumer\.commit\(/]},
         typescript: {order: [/await producer\.send\(/, /consumer\.commitOffsets\(/]},
         go: {order: [/writer\.WriteMessages\(/, /reader\.CommitMessages\(/], none: [/Async:\s*true/]},
-        scala: {order: [/producer\.send\([^\n]*\)\.get\(\)/, /consumer\.commitSync\(/]},
         cpp: {order: [/producer->produce\(/, /producer->flush\(/, /consumer->commitSync\(/]},
       },
     },
@@ -115,7 +111,6 @@ blocks the partition: the record is handed to the next topic and the source offs
         python: {all: [/json\.loads\(/, /except[^\n]*(ValueError|JSONDecodeError)/]},
         typescript: {all: [/JSON\.parse\(/, /catch/]},
         go: {all: [/json\.Unmarshal\(/]},
-        scala: {all: [/case OrderEvent\(\)/]},
         cpp: {all: [/std::regex_search\(/]},
       },
     },
@@ -128,7 +123,6 @@ blocks the partition: the record is handed to the next topic and the source offs
         python: {all: [/"enable\.auto\.commit"\s*:\s*False/, /consumer\.commit\(\s*message\s*=\s*msg/]},
         typescript: {all: [/autoCommit:\s*false/, /consumer\.commitOffsets\(/]},
         go: {all: [/reader\.FetchMessage\(/, /reader\.CommitMessages\(/], none: [/ReadMessage\(/]},
-        scala: {all: [/"enable\.auto\.commit"\s*,\s*"false"/, /consumer\.commitSync\(/]},
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/, /consumer->commitSync\(/]},
       },
     },
@@ -511,126 +505,6 @@ func run(ctx context.Context, handler Handler) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.{Collections, Properties}
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import scala.jdk.CollectionConverters._
-import scala.util.control.NonFatal
-
-object RetryDlq {
-  val Source = "orders"
-  val Retry = "orders.retry"
-  val Dlq = "orders.dlq"
-  val Group = "fulfilment"
-  val MaxAttempts = 3
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", Group)
-  consumerProps.put("auto.offset.reset", "earliest")
-  consumerProps.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Source, Retry).asJava)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  /** The shape a parseable order event has; there is no JSON library on this stack. */
-  private val OrderEvent = """^\\s*\\{.*"order"\\s*:.*\\}\\s*$""".r
-
-  /** How many times this record has already failed: its attempt header, 0 when absent. */
-  private def attemptOf(record: ConsumerRecord[String, String]): Int =
-    Option(record.headers().lastHeader("attempt")).map(h => new String(h.value()).toInt).getOrElse(0)
-
-  private def handOff(topic: String, record: ConsumerRecord[String, String], attempt: Int, error: String): Unit = {
-    // TODO: send the record's key and value to topic with headers attempt=<attempt>, error=<error>
-    // TODO: wait for the acknowledgement (.get() on the future)
-    ???
-  }
-
-  def run(handler: String => Unit): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        // TODO: validate with OrderEvent; malformed → handOff to Dlq with attempt+1
-        // TODO: call handler(record.value()); on a throw hand off to Retry (attempt+1 < MaxAttempts) or Dlq
-        // TODO: commitSync this record's offset + 1, on every path
-        ???
-      }
-    }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.{Collections, Properties}
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import scala.jdk.CollectionConverters._
-import scala.util.control.NonFatal
-
-object RetryDlq {
-  val Source = "orders"
-  val Retry = "orders.retry"
-  val Dlq = "orders.dlq"
-  val Group = "fulfilment"
-  val MaxAttempts = 3
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", Group)
-  consumerProps.put("auto.offset.reset", "earliest")
-  consumerProps.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Source, Retry).asJava)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  /** The shape a parseable order event has; there is no JSON library on this stack. */
-  private val OrderEvent = """^\\s*\\{.*"order"\\s*:.*\\}\\s*$""".r
-
-  /** How many times this record has already failed: its attempt header, 0 when absent. */
-  private def attemptOf(record: ConsumerRecord[String, String]): Int =
-    Option(record.headers().lastHeader("attempt")).map(h => new String(h.value()).toInt).getOrElse(0)
-
-  /** Hand the record to topic with its attempt count and error; .get() waits for the broker's acknowledgement. */
-  private def handOff(topic: String, record: ConsumerRecord[String, String], attempt: Int, error: String): Unit = {
-    val out = new ProducerRecord[String, String](topic, record.key(), record.value())
-    out.headers().add("attempt", attempt.toString.getBytes).add("error", error.getBytes)
-    producer.send(out).get() // throws if not acknowledged: the record is then not committed
-  }
-
-  def run(handler: String => Unit): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        val attempt = attemptOf(record) + 1
-        record.value() match {
-          case OrderEvent() =>
-            try handler(record.value())
-            catch {
-              case NonFatal(e) => handOff(if (attempt < MaxAttempts) Retry else Dlq, record, attempt, e.getMessage)
-            }
-          case _ => handOff(Dlq, record, attempt, "malformed event")
-        }
-        val next = new OffsetAndMetadata(record.offset() + 1)
-        consumer.commitSync(Collections.singletonMap(new TopicPartition(record.topic(), record.partition()), next))
-      }
-    }
 }
 `,
     },

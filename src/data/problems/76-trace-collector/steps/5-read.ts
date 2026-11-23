@@ -56,7 +56,6 @@ cannot be lined up with a log line. And any tenant can read any trace.
         python: {all: [/@app\.get\(\s*["']\/v1\/traces\/\{trace_id\}["']/, /assembly\.load_trace\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/traces\/:trace_id['"]/, /loadTrace\(/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/traces\/\{trace_id\}"/, /assembly\.LoadTrace\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"traces"\s*\/\s*Segment\s*\)/, /Assembly\.loadTrace\(/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/traces\//, /assembly::loadTrace\(/]},
       },
     },
@@ -69,7 +68,6 @@ cannot be lined up with a log line. And any tenant can read any trace.
         python: {all: [/["']owner["']\]\s*!=\s*tenant|tenant\s*!=\s*\w+\[["']owner["']\]/]},
         typescript: {all: [/owner\s*!==\s*tenant|tenant\s*!==\s*\w+\.owner/]},
         go: {all: [/Owner\s*!=\s*tenant|tenant\s*!=\s*\w+\.Owner/]},
-        scala: {all: [/owner\s*!=\s*tenant|tenant\s*!=\s*\w+\.owner/]},
         cpp: {all: [/owner\s*!=\s*tenant|tenant\s*!=\s*\w+(->|\.)owner/]},
       },
     },
@@ -82,7 +80,6 @@ cannot be lined up with a log line. And any tenant can read any trace.
         python: {all: [/waiting/], none: [/["']gaps["']\s*:\s*\[\]/]},
         typescript: {all: [/waiting/], none: [/gaps:\s*\[\]/]},
         go: {all: [/waiting/], none: [/"gaps":\s*\[\]gap\{\}/]},
-        scala: {all: [/waiting/], none: [/"gaps"\s*->\s*JsArray\(\)/]},
         cpp: {all: [/waiting/], none: [/\{"gaps",\s*json::array\(\)\}/]},
       },
     },
@@ -95,7 +92,6 @@ cannot be lined up with a log line. And any tenant can read any trace.
         python: {all: [/["']partial["']/], none: [/["']partial["']\s*:\s*False/]},
         typescript: {all: [/partial/], none: [/partial:\s*false/]},
         go: {all: [/"partial"/], none: [/"partial":\s*false/]},
-        scala: {all: [/"partial"/], none: [/"partial"\s*->\s*(JsBoolean\(false\)|JsFalse)/]},
         cpp: {all: [/"partial"/], none: [/\{"partial",\s*false\}/]},
       },
     },
@@ -108,7 +104,6 @@ cannot be lined up with a log line. And any tenant can read any trace.
         python: {all: [/end_ms/], none: [/-\s*origin/]},
         typescript: {all: [/end_ms/], none: [/-\s*origin/]},
         go: {all: [/end_ms/], none: [/-\s*origin/]},
-        scala: {all: [/end_ms/], none: [/-\s*origin/]},
         cpp: {all: [/end_ms/], none: [/-\s*origin/]},
       },
     },
@@ -391,89 +386,6 @@ func readTrace(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/traces/{trace_id}", readTrace)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import traces.Assembly // Assembly.loadTrace(traceId): Option[Trace]
-
-object ReadApi {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  val route: Route = path("v1" / "traces" / Segment) { traceId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-        case Some(tenant) =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          Assembly.loadTrace(traceId) match {
-            case None => complete(error(StatusCodes.NotFound, "no such trace"))
-            case Some(trace) =>
-              val ids = trace.spans.map(_.spanId).toSet
-              val shown = trace.spans.filter(s => s.parentSpanId.isEmpty || ids(s.parentSpanId))
-              val origin = if (shown.isEmpty) 0L else shown.map(_.startMs).min
-              val spans = shown.map { s =>
-                JsObject("span_id" -> JsString(s.spanId), "parent_span_id" -> JsString(s.parentSpanId), "service" -> JsString(s.service),
-                  "start_ms" -> JsNumber(s.startMs - origin), "duration_ms" -> JsNumber(s.durationMs))
-              }
-              complete(json(StatusCodes.OK, JsObject("trace_id" -> JsString(traceId), "root_span_id" -> JsString(trace.root), "partial" -> JsBoolean(false),
-                "gaps" -> JsArray(), "spans" -> JsArray(spans.toVector))))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import traces.Assembly // Assembly.loadTrace(traceId): Option[Trace]
-
-object ReadApi {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  /** Every parent id a span names that is not in the trace, with how many spans wait for it. */
-  def gapsOf(spans: Seq[Assembly.Span]): Seq[JsObject] = {
-    val ids = spans.map(_.spanId).toSet
-    spans.map(_.parentSpanId).filter(parent => parent.nonEmpty && !ids(parent)).groupBy(identity).toSeq.sortBy(_._1).map { case (parent, waiting) =>
-      JsObject("parent_span_id" -> JsString(parent), "waiting" -> JsNumber(waiting.size))
-    }
-  }
-
-  val route: Route = path("v1" / "traces" / Segment) { traceId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-        case Some(tenant) =>
-          Assembly.loadTrace(traceId) match {
-            // Another tenant's trace answers exactly as a missing one: the endpoint confirms nothing.
-            case None => complete(error(StatusCodes.NotFound, "no such trace"))
-            case Some(trace) if trace.owner != tenant => complete(error(StatusCodes.NotFound, "no such trace"))
-            case Some(trace) =>
-              val gaps = gapsOf(trace.spans)
-              val spans = trace.spans.map { s =>
-                JsObject("span_id" -> JsString(s.spanId), "parent_span_id" -> JsString(s.parentSpanId), "service" -> JsString(s.service),
-                  "start_ms" -> JsNumber(s.startMs), "duration_ms" -> JsNumber(s.durationMs), "end_ms" -> JsNumber(s.startMs + s.durationMs))
-              }
-              complete(json(StatusCodes.OK, JsObject("trace_id" -> JsString(traceId), "root_span_id" -> JsString(trace.root), "partial" -> JsBoolean(gaps.nonEmpty),
-                "gaps" -> JsArray(gaps.toVector), "spans" -> JsArray(spans.toVector))))
-          }
-      }
-    }
-  }
 }
 `,
     },

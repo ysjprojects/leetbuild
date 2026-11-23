@@ -43,7 +43,6 @@ event lost when the partition leader fails, and a broker refusal nobody keeps.
         python: {all: [/key\s*=\s*document_id/, /content_hashes/]},
         typescript: {all: [/key:\s*documentId/, /content_hashes/]},
         go: {all: [/Key:\s*\[\]byte\(documentID\)/, /content_hashes/]},
-        scala: {all: [/ProducerRecord\[String,\s*String\]\(\s*Config\.Topic\s*,\s*documentId/, /content_hashes/]},
         cpp: {all: [/document_id\.(c_str|data)\(\)/, /content_hashes/]},
       },
     },
@@ -56,7 +55,6 @@ event lost when the partition leader fails, and a broker refusal nobody keeps.
         python: {order: [/store_vector\(/, /producer\.produce\(/]},
         typescript: {order: [/storeVector\(/, /producer\.send\(/]},
         go: {order: [/cache\.StoreVector\(/, /writer\.WriteMessages\(/]},
-        scala: {order: [/Cache\.storeVector\(/, /producer\.send\(/]},
         cpp: {order: [/cache::storeVector\(/, /producer->produce\(/]},
       },
     },
@@ -68,7 +66,6 @@ event lost when the partition leader fails, and a broker refusal nobody keeps.
         python: {none: [/["']acks["']\s*:\s*["']?[01]\b/]},
         typescript: {none: [/acks:\s*[01]\b/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {none: [/"acks"\s*,\s*"[01]"/]},
         cpp: {none: [/"acks"\s*,\s*"[01]"/]},
       },
     },
@@ -76,12 +73,11 @@ event lost when the partition leader fails, and a broker refusal nobody keeps.
       id: 'outbox',
       title: 'A refused record goes to the outbox from the delivery report',
       detail:
-        'The outbox row is written where the broker’s answer arrives (`on_delivery`, a rejected `send`, the `WriteMessages` error, `dr_cb`, a producer `Callback`), not in a `try` around the enqueue.',
+        'The outbox row is written where the broker’s answer arrives (`on_delivery`, a rejected `send`, the `WriteMessages` error, `dr_cb`), not in a `try` around the enqueue.',
       match: {
         python: {all: [/on_delivery\s*=/, /outbox\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/outbox\.insertOutbox\(/], none: [/\.catch\(/]},
         go: {all: [/outbox\.InsertOutbox\(/]},
-        scala: {all: [/onCompletion/, /Outbox\.insertOutbox\(/], none: [/case\s+\w+:\s*KafkaException/]},
         cpp: {all: [/dr_cb/, /outbox::insertOutbox\(/]},
       },
     },
@@ -303,80 +299,6 @@ func publishReady(ctx context.Context, tenant, documentID string, chunks []confi
 		log.Printf("embed.ready produce failed document=%s: %v", documentID, err)
 	}
 	return event, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-
-import embedding.{Cache, Chunk, Config, Outbox}
-
-object ReadyPublisher {
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** Store the document's chunk vectors and tell the indexer the document is ready. */
-  def publishReady(tenant: String, documentId: String, chunks: Seq[Chunk]): ujson.Obj = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val hashes = chunks.map { chunk =>
-      val digest = Config.contentHash(chunk.text)
-      val value = ujson.write(ujson.Obj("tenant" -> tenant, "document_id" -> documentId, "model_version" -> Config.ModelVersion, "content_hash" -> digest))
-      try producer.send(new ProducerRecord[String, String](Config.Topic, digest, value))
-      catch {
-        case e: KafkaException =>
-          Outbox.insertOutbox(Config.Topic, digest, value)
-          System.err.println(s"embed.ready produce failed document=$documentId: \${e.getMessage}")
-      }
-      Cache.storeVector(tenant, Config.ModelVersion, chunk.text, () => chunk.vector)
-      digest
-    }
-    ujson.Obj("tenant" -> tenant, "document_id" -> documentId, "model_version" -> Config.ModelVersion, "content_hashes" -> ujson.Arr.from(hashes.map(ujson.Str(_))), "chunk_count" -> hashes.size)
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import embedding.{Cache, Chunk, Config, Outbox}
-
-object ReadyPublisher {
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** Store the document's chunk vectors and tell the indexer the document is ready. */
-  def publishReady(tenant: String, documentId: String, chunks: Seq[Chunk]): ujson.Obj = {
-    val hashes = chunks.map { chunk =>
-      Cache.storeVector(tenant, Config.ModelVersion, chunk.text, () => chunk.vector)
-      Config.contentHash(chunk.text)
-    }
-    val event = ujson.Obj(
-      "tenant" -> tenant,
-      "document_id" -> documentId,
-      "model_version" -> Config.ModelVersion,
-      "content_hashes" -> ujson.Arr.from(hashes.map(ujson.Str(_))),
-      "chunk_count" -> hashes.size
-    )
-    val value = ujson.write(event)
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) {
-          Outbox.insertOutbox(Config.Topic, documentId, value) // the broker said no: the relay republishes it
-          System.err.println(s"embed.ready produce failed document=$documentId: \${exception.getMessage}")
-        }
-    }
-    producer.send(new ProducerRecord[String, String](Config.Topic, documentId, value), onDelivery)
-    event
-  }
 }
 `,
     },

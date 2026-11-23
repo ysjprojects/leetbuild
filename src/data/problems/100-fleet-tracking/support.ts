@@ -1,9 +1,6 @@
-import {scalaPath} from '../scala-support';
-
 /**
  * The position update every step of fleetd passes along, as the device sends it: one type per
- * typed language (TypeScript `fleet/position`, Go `fleet/position`, C++ `position.h`, Scala
- * `fleet.Position`); the Python course passes it as a dict.
+ * typed language (TypeScript `fleet/position`, Go `fleet/position`, C++ `position.h`); the Python course passes it as a dict.
  */
 export const supportModulesTs: Record<string, string> = {
   'fleet/position.ts': `/** One position update as the device sends it and as every step of fleetd passes it along. */
@@ -45,21 +42,5 @@ struct Position {
   double lat = 0;
   double lon = 0;
 };
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('fleet', 'Position')]: `package fleet
-
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-/** One position update as the device sends it and as every step of fleetd passes it along. */
-final case class Position(vehicleId: String, deviceTimestampMs: Long, sequence: Long, lat: Double, lon: Double)
-
-object Position {
-  implicit val format: RootJsonFormat[Position] =
-    jsonFormat(Position.apply _, "vehicle_id", "device_timestamp_ms", "sequence", "lat", "lon")
-}
 `,
 };

@@ -2,10 +2,9 @@
  * Hand-written support modules the trace-collector steps import but no step builds: the `traces`
  * package. `traces.assembly` is the trace assembly of step 2 as the other steps use it: one Redis
  * hash per trace, `insert_span` (one Lua script per span), `load_trace`, `delete_trace` and
- * `quarantine`. The five languages keep the same keys and fields, so a harness reads one layout
+ * `quarantine`. The four languages keep the same keys and fields, so a harness reads one layout
  * whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 /** The assembly script every language runs: KEYS[1] the trace hash; ARGV span id, parent id, tenant, span JSON, TTL. */
 const INSERT_SPAN_LUA = `local trace = KEYS[1]
@@ -434,80 +433,5 @@ inline void quarantine(const Trace& trace, const std::string& reason) {
 }
 
 }  // namespace assembly
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('traces', 'Assembly')]: `package traces
-
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The trace assembly (provided; step 2 builds the same insertSpan).
-${comment(' * ')}
- */
-object Assembly {
-  /** One span of a trace (an empty parentSpanId is a root). */
-  final case class Span(traceId: String, spanId: String, parentSpanId: String, service: String, startMs: Long, durationMs: Long)
-  /** An assembled trace as the hash holds it. */
-  final case class Trace(traceId: String, owner: String, root: String, count: Long, missing: Long, extraRoots: Long, spans: Seq[Span])
-  /** What one insert did: whether the span was new, and the trace's count and missing after it. */
-  final case class Inserted(inserted: Boolean, count: Long, missing: Long)
-
-  val AssemblyTtlSeconds = 900L
-  val QuarantineTtlSeconds: Long = 7L * 24 * 3600
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  val InsertSpanLua: String = """
-${INSERT_SPAN_LUA}"""
-
-  def traceKey(traceId: String): String = s"trace:$traceId"
-
-  def spanJson(s: Span): JsObject = JsObject(
-    "trace_id" -> JsString(s.traceId), "span_id" -> JsString(s.spanId), "parent_span_id" -> JsString(s.parentSpanId),
-    "service" -> JsString(s.service), "start_ms" -> JsNumber(s.startMs), "duration_ms" -> JsNumber(s.durationMs))
-
-  /** The span as the hash stores it under span:{span_id}. */
-  def spanDoc(s: Span): String = JsObject(spanJson(s).fields - "trace_id").compactPrint
-
-  /** Apply one span. */
-  def insertSpan(tenant: String, span: Span): Inserted = {
-    val args = List(span.spanId, span.parentSpanId, tenant, spanDoc(span), AssemblyTtlSeconds.toString).asJava
-    val out = jedis.eval(InsertSpanLua, List(traceKey(span.traceId)).asJava, args).asInstanceOf[java.util.List[java.lang.Long]].asScala.map(_.longValue)
-    Inserted(out(0) == 1L, out(1), out(2))
-  }
-
-  /** The assembled trace, if there is one. */
-  def loadTrace(traceId: String): Option[Trace] = {
-    val raw = jedis.hgetAll(traceKey(traceId)).asScala.toMap
-    if (raw.isEmpty) None
-    else {
-      def num(field: String): Long = raw.get(field).filter(_.nonEmpty).map(_.toLong).getOrElse(0L)
-      val spans = raw.collect {
-        case (field, value) if field.startsWith("span:") =>
-          val doc = value.parseJson.asJsObject.fields
-          def text(name: String): String = doc.get(name).collect { case JsString(s) => s }.getOrElse("")
-          def long(name: String): Long = doc.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-          Span(traceId, text("span_id"), text("parent_span_id"), text("service"), long("start_ms"), long("duration_ms"))
-      }.toSeq.sortBy(s => (s.startMs, s.spanId))
-      Some(Trace(traceId, raw.getOrElse("owner", ""), raw.getOrElse("root", ""), num("count"), num("missing"), num("extra_roots"), spans))
-    }
-  }
-
-  /** Drop a trace's assembly state. */
-  def deleteTrace(traceId: String): Unit = jedis.del(traceKey(traceId))
-
-  /** Park a trace storage refused, with the reason, and drop its assembly state. */
-  def quarantine(trace: Trace, reason: String): Unit = {
-    val doc = JsObject("reason" -> JsString(reason), "trace" -> JsObject("trace_id" -> JsString(trace.traceId), "owner" -> JsString(trace.owner), "spans" -> JsArray(trace.spans.map(spanJson).toVector)))
-    jedis.set(s"quarantine:\${trace.traceId}", doc.compactPrint, SetParams.setParams().ex(QuarantineTtlSeconds))
-    jedis.del(traceKey(trace.traceId))
-  }
-}
 `,
 };

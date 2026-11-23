@@ -2,10 +2,9 @@
  * Hand-written support modules the human-review-queue steps import but no step builds: the review
  * store (`review.store`). Every escalation is an item, a Redis hash the course's stand-in for the
  * queue's database; the store creates items, claims sources, records outcomes and decisions, hands
- * out reviewer pseudonyms and parks the events Kafka did not acknowledge. The five languages keep
+ * out reviewer pseudonyms and parks the events Kafka did not acknowledge. The four languages keep
  * the same keys, so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'review/__init__.py': '',
@@ -544,113 +543,5 @@ inline std::string reviewerRef(const std::string& reviewer) {
 inline void parkEvent(const nlohmann::json& event) { redis().rpush("review:outbox", event.dump()); }
 
 }  // namespace store
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('review', 'Store')]: `package review
-
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The review store (provided). An item is a Redis hash review:item:{id} with item_id, tenant,
- * source_type, source_id, priority, payload_ref, state (queued, assigned, resolved, escalated or
- * decided), enqueued_at and sla_deadline (epoch seconds; the SLA clock starts at the enqueue),
- * breached ("1" once the item went past its SLA) and what later steps write (reviewer, outcome,
- * grant_id, reason, decision). Items are maps of strings.
- *
- * review:queue:{tenant}:{priority}   list of queued item ids, the next one first
- * review:lease:{id}                  the reviewer holding an assigned item
- * review:assigned:{tenant}           set of the tenant's assigned item ids
- * review:source:{tenant}:{type}:{id} the item a source was enqueued as
- * review:enqueued:{tenant}           enqueues per priority since the tenant started (billing)
- * review:outbox                      events Kafka did not acknowledge, as JSON, for the relay
- */
-object Store {
-  type Item = Map[String, String]
-
-  val SlaSeconds: Map[String, Long] = Map("p1" -> 300L, "p2" -> 1800L, "p3" -> 14400L)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def itemKey(itemId: String): String = s"review:item:$itemId"
-  def queueKey(tenant: String, priority: String): String = s"review:queue:$tenant:$priority"
-  def leaseKey(itemId: String): String = s"review:lease:$itemId"
-  def assignedKey(tenant: String): String = s"review:assigned:$tenant"
-
-  /** A fresh item id. */
-  def newItemId(): String = s"r-\${jedis.incr("review:seq")}"
-
-  /** Claim the source (tenant, sourceType, sourceId) for itemId in one SET NX: None when the claim is new, else the item already enqueued for it. */
-  def claimSource(tenant: String, sourceType: String, sourceId: String, itemId: String): Option[String] = {
-    val key = s"review:source:$tenant:$sourceType:$sourceId"
-    if (jedis.set(key, itemId, SetParams.setParams().nx()) == "OK") None else Option(jedis.get(key))
-  }
-
-  /** The item, if it exists. */
-  def getItem(itemId: String): Option[Item] = {
-    val raw = jedis.hgetAll(itemKey(itemId)).asScala.toMap
-    if (raw.isEmpty) None else Some(raw)
-  }
-
-  /** Store a new item (item_id, tenant, priority and whatever else it carries) as queued, start its SLA clock now and append it to its priority's queue. */
-  def createItem(item: Item): Item = {
-    val now = java.time.Instant.now.getEpochSecond
-    val sla = SlaSeconds.getOrElse(item("priority"), SlaSeconds("p3"))
-    val fields = item ++ Map("state" -> "queued", "enqueued_at" -> now.toString, "sla_deadline" -> (now + sla).toString, "breached" -> "0")
-    jedis.hset(itemKey(item("item_id")), fields.asJava)
-    jedis.rpush(queueKey(item("tenant"), item("priority")), item("item_id"))
-    jedis.hincrBy(s"review:enqueued:\${item("tenant")}", item("priority"), 1L)
-    getItem(item("item_id")).get
-  }
-
-  /** The items in the tenant's queue for priority, in queue order. */
-  def queued(tenant: String, priority: String): Seq[Item] =
-    jedis.lrange(queueKey(tenant, priority), 0, -1).asScala.toSeq.flatMap(getItem)
-
-  /** How many items the tenant ever enqueued at priority (the billing counter). */
-  def enqueuedTotal(tenant: String, priority: String): Long =
-    Option(jedis.hget(s"review:enqueued:$tenant", priority)).map(_.toLong).getOrElse(0L)
-
-  private def release(itemId: String): Unit = {
-    Option(jedis.hget(itemKey(itemId), "tenant")).foreach(tenant => jedis.srem(assignedKey(tenant), itemId))
-    jedis.del(leaseKey(itemId))
-  }
-
-  /** Close the item with outcome and the enforcement grant that allowed it. */
-  def resolve(itemId: String, outcome: String, grantId: String): Unit = {
-    jedis.hset(itemKey(itemId), Map("state" -> "resolved", "outcome" -> outcome, "grant_id" -> grantId).asJava)
-    release(itemId)
-  }
-
-  /** Hand the item to a person, saying why. */
-  def escalate(itemId: String, reason: String): Unit =
-    jedis.hset(itemKey(itemId), Map("state" -> "escalated", "reason" -> reason).asJava)
-
-  /** Record a reviewer's decision once (HSETNX): the item, or None when it does not exist or was already decided. */
-  def decide(itemId: String, reviewer: String, decision: String): Option[Item] =
-    if (!jedis.exists(itemKey(itemId)) || jedis.hsetnx(itemKey(itemId), "decision", decision) == 0L) None
-    else {
-      jedis.hset(itemKey(itemId), Map("state" -> "decided", "reviewer" -> reviewer).asJava)
-      release(itemId)
-      getItem(itemId)
-    }
-
-  /** The reviewer's stable pseudonym (rv-{n}), from the pseudonym table only the review store reads. */
-  def reviewerRef(reviewer: String): String = {
-    val key = s"review:reviewer:$reviewer"
-    Option(jedis.get(key)).getOrElse {
-      jedis.set(key, s"rv-\${jedis.incr("review:reviewer:seq")}", SetParams.setParams().nx())
-      jedis.get(key)
-    }
-  }
-
-  /** Keep an event Kafka did not acknowledge for the relay, which produces it again. */
-  def parkEvent(event: JsObject): Unit = jedis.rpush("review:outbox", event.compactPrint)
-}
 `,
 };

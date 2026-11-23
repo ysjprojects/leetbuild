@@ -52,12 +52,6 @@ service Shard { rpc Search(ShardQuery) returns (ShardPage); }  // ShardPage.hits
         python: {all: [/SHARD_DEADLINE_S\s*=\s*0\.35\b/, /\.Search\([\s\S]{0,200}?timeout\s*=\s*SHARD_DEADLINE_S/]},
         typescript: {all: [/SHARD_DEADLINE_MS\s*=\s*350\b/, /deadline:\s*Date\.now\(\)\s*\+\s*SHARD_DEADLINE_MS/]},
         go: {all: [/shardDeadline\s*=\s*350\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*shardDeadline\)/]},
-        scala: {
-          all: [
-            /ShardDeadlineMillis\s*=\s*350L?\b/,
-            /withDeadlineAfter\(\s*ShardDeadlineMillis,\s*TimeUnit\.MILLISECONDS/,
-          ],
-        },
         cpp: {all: [/kShardDeadline\{350\}/, /set_deadline\([^\n]*kShardDeadline\)/]},
       },
     },
@@ -73,7 +67,6 @@ service Shard { rpc Search(ShardQuery) returns (ShardPage); }  // ShardPage.hits
         },
         typescript: {all: [/missed\.push\(/, /partial:\s*missed\.length\s*>\s*0/], none: [/partial:\s*false/]},
         go: {all: [/missed = append\(missed/, /Partial:\s*len\(missed\)\s*>\s*0/], none: [/Partial:\s*false/]},
-        scala: {all: [/missed\s*\+=/, /partial\s*=\s*missed\.nonEmpty/], none: [/partial\s*=\s*false/]},
         cpp: {all: [/missed\.push_back\(/, /\.partial\s*=\s*!\s*\w+\.missed\.empty\(\)/]},
       },
     },
@@ -86,7 +79,6 @@ service Shard { rpc Search(ShardQuery) returns (ShardPage); }  // ShardPage.hits
         python: {all: [/len\(SHARDS\)\s*\/\/\s*2\s*\+\s*1/, /raise SearchUnavailable/]},
         typescript: {all: [/Math\.floor\(\s*SHARDS\.length\s*\/\s*2\s*\)\s*\+\s*1/, /throw new SearchUnavailable/]},
         go: {all: [/len\(shards\)\s*\/\s*2\s*\+\s*1/, /return nil, (fmt\.Errorf\("%w[^\n]*)?ErrSearchUnavailable/]},
-        scala: {all: [/Shards\.size\s*\/\s*2\s*\+\s*1/, /throw new SearchUnavailable/]},
         cpp: {all: [/kShards\.size\(\)\s*\/\s*2\s*\+\s*1/, /throw SearchUnavailable/]},
       },
     },
@@ -99,7 +91,6 @@ service Shard { rpc Search(ShardQuery) returns (ShardPage); }  // ShardPage.hits
         python: {all: [/not in best|best\.get\(/, /-\s*\w+\[["']score["']\]|reverse\s*=\s*True/]},
         typescript: {all: [/best\.get\(/, /b\.score\s*-\s*a\.score/]},
         go: {all: [/best\[\s*h\.GetProductId\(\)\s*\]/, /sort\.Slice\(/]},
-        scala: {all: [/groupBy\(\s*_\.productId\s*\)/, /-\s*\w+\.score/]},
         cpp: {all: [/best\.find\(/, /std::sort\(/]},
       },
     },
@@ -427,67 +418,6 @@ func fanOut(ctx context.Context, tenant, q string, pageSize int) (*Page, error) 
 		hits = hits[:pageSize]
 	}
 	return &Page{Hits: hits, Partial: len(missed) > 0, Missed: missed}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import productsearch.product_search.{Hit, ShardGrpc, ShardQuery}
-
-/** Fewer than a majority of shards answered: there is no page worth showing. */
-final class SearchUnavailable(message: String) extends Exception(message)
-
-object ShardFanOut {
-  final case class Page(hits: Seq[Hit], partial: Boolean, missed: Seq[String])
-
-  val Shards: Seq[String] = Seq("shard-0:9000", "shard-1:9000", "shard-2:9000")
-
-  private val stubs = Shards.map(target => target -> ShardGrpc.blockingStub(ManagedChannelBuilder.forTarget(target).usePlaintext().build())).toMap
-
-  /** Ask every shard and merge the pages. */
-  def fanOut(tenant: String, q: String, pageSize: Int): Page = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val hits = Shards.flatMap { target =>
-      try stubs(target).search(ShardQuery(tenant, q, pageSize)).hits
-      catch { case _: StatusRuntimeException => Seq.empty }
-    }
-    Page(hits.take(pageSize), partial = false, Seq.empty)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import productsearch.product_search.{Hit, ShardGrpc, ShardQuery}
-
-/** Fewer than a majority of shards answered: there is no page worth showing. */
-final class SearchUnavailable(message: String) extends Exception(message)
-
-object ShardFanOut {
-  final case class Page(hits: Seq[Hit], partial: Boolean, missed: Seq[String])
-
-  val Shards: Seq[String] = Seq("shard-0:9000", "shard-1:9000", "shard-2:9000")
-  val ShardDeadlineMillis = 350L
-
-  private val stubs = Shards.map(target => target -> ShardGrpc.blockingStub(ManagedChannelBuilder.forTarget(target).usePlaintext().build())).toMap
-
-  /** Ask every shard and merge the pages. */
-  def fanOut(tenant: String, q: String, pageSize: Int): Page = {
-    val missed = scala.collection.mutable.ListBuffer.empty[String]
-    val answered = Shards.flatMap { target =>
-      try stubs(target).withDeadlineAfter(ShardDeadlineMillis, TimeUnit.MILLISECONDS).search(ShardQuery(tenant, q, pageSize)).hits
-      catch {
-        case _: StatusRuntimeException =>
-          missed += target // slow or down: the page goes out without it, and says so
-          Seq.empty
-      }
-    }
-    if (Shards.size - missed.size < Shards.size / 2 + 1) throw new SearchUnavailable(s"\${missed.size} of \${Shards.size} shards did not answer")
-    val hits = answered.groupBy(_.productId).values.map(_.maxBy(_.score)).toSeq.sortBy(hit => (-hit.score, hit.productId))
-    Page(hits.take(pageSize), partial = missed.nonEmpty, missed.toSeq)
-  }
 }
 `,
     },

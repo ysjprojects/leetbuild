@@ -41,7 +41,6 @@ are missing, and nothing ties the number to the last billing close. Any caller c
         python: {all: [/@app\.get\(\s*["']\/v1\/accounts\/\{account\}\/usage["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/accounts\/:account\/usage['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/accounts\/\{account\}\/usage"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"accounts"\s*\/\s*Segment\s*\/\s*"usage"\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/accounts\//]},
       },
     },
@@ -54,7 +53,6 @@ are missing, and nothing ties the number to the last billing close. Any caller c
         python: {all: [/ledger\.current_window\(/, /ledger\.read_window\(/], none: [/batch:usage/]},
         typescript: {all: [/currentWindow\(/, /readWindow\(/], none: [/batch:usage/]},
         go: {all: [/ledger\.CurrentWindow\(/, /ledger\.ReadWindow\(/], none: [/batch:usage/]},
-        scala: {all: [/Ledger\.currentWindow\(/, /Ledger\.readWindow\(/], none: [/batch:usage/]},
         cpp: {all: [/ledger::currentWindow\(/, /ledger::readWindow\(/], none: [/batch:usage/]},
       },
     },
@@ -67,7 +65,6 @@ are missing, and nothing ties the number to the last billing close. Any caller c
         python: {all: [/["']overage["']\s*:\s*totals\[["']overage["']\]/, /["']cap["']\s*:\s*totals\[["']cap["']\]/]},
         typescript: {all: [/overage:\s*totals\.overage/, /cap:\s*totals\.cap/]},
         go: {all: [/"overage":\s*totals\.Overage/, /"cap":\s*totals\.Cap/]},
-        scala: {all: [/"overage"\s*->\s*JsBoolean\(totals\.overage\)/, /"cap"\s*->\s*JsNumber\(totals\.cap\)/]},
         cpp: {all: [/\{"overage",\s*totals\.overage\}/, /\{"cap",\s*totals\.cap\}/]},
       },
     },
@@ -80,7 +77,6 @@ are missing, and nothing ties the number to the last billing close. Any caller c
         python: {all: [/ledger\.last_close\(/, /["']close_id["']\s*:/]},
         typescript: {all: [/lastClose\(/, /close_id:/]},
         go: {all: [/ledger\.LastClose\(/, /"close_id":/]},
-        scala: {all: [/Ledger\.lastClose\(/, /"close_id"\s*->/]},
         cpp: {all: [/ledger::lastClose\(/, /"close_id"/]},
       },
     },
@@ -93,7 +89,6 @@ are missing, and nothing ties the number to the last billing close. Any caller c
         python: {all: [/x-account-id/i, /\b401\b/, /\b403\b/]},
         typescript: {all: [/x-account-id/i, /\b401\b/, /\b403\b/]},
         go: {all: [/X-Account-Id/i, /StatusUnauthorized|\b401\b/, /StatusForbidden|\b403\b/]},
-        scala: {all: [/X-Account-Id/i, /Unauthorized/, /Forbidden/]},
         cpp: {all: [/X-Account-Id/i, /\b401\b/, /\b403\b/]},
       },
     },
@@ -241,59 +236,6 @@ func readUsage(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/accounts/{account}/usage", readUsage)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-object Read {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val route: Route =
-    path("v1" / "accounts" / Segment / "usage") { account =>
-      get {
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        val units = Option(jedis.get(s"batch:usage:$account")).map(_.toLong).getOrElse(0L)
-        val body = JsObject("account" -> JsString(account), "units" -> JsNumber(units))
-        complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import metering.Ledger // Ledger.currentWindow, readWindow, lastClose
-
-object Read {
-  val route: Route =
-    path("v1" / "accounts" / Segment / "usage") { account =>
-      get {
-        optionalHeaderValueByName("X-Account-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "missing X-Account-Id")
-          case Some(caller) if caller != account => complete(StatusCodes.Forbidden -> "an account reads only its own usage")
-          case Some(_) =>
-            // The window the count writes and billing closes, not a nightly copy of it.
-            val window = Ledger.currentWindow()
-            val totals = Ledger.readWindow(account, window)
-            val body = JsObject(
-              "account" -> JsString(account),
-              "window" -> JsNumber(window),
-              "units" -> JsNumber(totals.units),
-              "cap" -> JsNumber(totals.cap),
-              "overage" -> JsBoolean(totals.overage),
-              "close_id" -> Ledger.lastClose(account).map(close => JsString(close.closeId)).getOrElse(JsNull))
-            complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-        }
-      }
-    }
 }
 `,
     },

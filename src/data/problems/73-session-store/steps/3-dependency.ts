@@ -53,10 +53,6 @@ cache ever saw. A token the auth service rejected is sent three times.
           all: [/WithTimeout\(\s*ctx,\s*(deadline|150\s*\*\s*time\.Millisecond)\s*\)/],
           none: [/5\s*\*\s*time\.Second/],
         },
-        scala: {
-          all: [/withDeadlineAfter\(\s*(DeadlineMs|150L?),\s*TimeUnit\.MILLISECONDS/],
-          none: [/withDeadlineAfter\(\s*5,\s*TimeUnit\.SECONDS/],
-        },
         cpp: {all: [/now\(\)\s*\+\s*(kDeadline|std::chrono::milliseconds\{150\})/], none: [/seconds\{5\}/]},
       },
     },
@@ -69,7 +65,6 @@ cache ever saw. A token the auth service rejected is sent three times.
         python: {all: [/CACHE_TTL_S\s*=\s*30\b/]},
         typescript: {all: [/CACHE_TTL_S\s*=\s*30\b/]},
         go: {all: [/cacheTTL\s*=\s*30\s*\*\s*time\.Second/]},
-        scala: {all: [/CacheTtlS\s*=\s*30L?\b/]},
         cpp: {all: [/kCacheTtl\{30\}/]},
       },
     },
@@ -82,7 +77,6 @@ cache ever saw. A token the auth service rejected is sent three times.
         python: {none: [/except grpc\.RpcError[\s\S]*return hit\[0\]/]},
         typescript: {none: [/catch[\s\S]*return hit\.claims/]},
         go: {none: [/if found \{\s*return hit\.claims/]},
-        scala: {none: [/orElse\(hit\.map\(_\._1\)\)/]},
         cpp: {none: [/if \(hit != cache\.end\(\)\) return hit->second\.claims/]},
       },
     },
@@ -95,7 +89,6 @@ cache ever saw. A token the auth service rejected is sent three times.
         python: {order: [/def revoke\(/, /cache\.pop\(/]},
         typescript: {order: [/function revoke\(/, /cache\.delete\(/]},
         go: {order: [/func revoke\(/, /delete\(cache,/]},
-        scala: {order: [/def revoke\(/, /cache\.remove\(/]},
         cpp: {order: [/void revoke\(/, /cache\.erase\(/]},
       },
     },
@@ -108,7 +101,6 @@ cache ever saw. A token the auth service rejected is sent three times.
         python: {none: [/for _ in range\(/]},
         typescript: {none: [/for \(let attempt/]},
         go: {none: [/for attempt := /]},
-        scala: {none: [/\(1 to 3\)/]},
         cpp: {none: [/for \(int attempt/]},
       },
     },
@@ -421,88 +413,6 @@ func revoke(ctx context.Context, token string) error {
 	defer cancel()
 	_, err := auth.Revoke(callCtx, &pb.RevokeRequest{Token: token})
 	return err
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import sessionauth.session_store.{AuthGrpc, RevokeRequest, ValidateRequest}
-
-object AuthClient {
-  final case class Claims(userId: String, deviceClass: String)
-
-  val CacheTtlS = 3600L
-
-  private val auth = AuthGrpc.blockingStub(ManagedChannelBuilder.forAddress("auth", 9000).usePlaintext().build())
-
-  /** token → the claims and when the cached copy stops being trusted (ms). */
-  val cache = scala.collection.concurrent.TrieMap.empty[String, (Claims, Long)]
-
-  /** The claims of a bearer token, or None when the request must be denied. */
-  def validate(token: String): Option[Claims] = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val now = System.currentTimeMillis()
-    val hit = cache.get(token)
-    hit.filter { case (_, expires) => now < expires }.map(_._1).orElse {
-      val answered = (1 to 3).iterator.map { _ =>
-        try Some(auth.withDeadlineAfter(5, TimeUnit.SECONDS).validate(ValidateRequest(token)))
-        catch { case _: StatusRuntimeException => None }
-      }.collectFirst { case Some(reply) => Claims(reply.userId, reply.deviceClass) }
-      answered.foreach(claims => cache.put(token, (claims, now + CacheTtlS * 1000)))
-      answered.orElse(hit.map(_._1))
-    }
-  }
-
-  /** End a token at the auth service. */
-  def revoke(token: String): Unit = {
-    auth.withDeadlineAfter(5, TimeUnit.SECONDS).revoke(RevokeRequest(token))
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import sessionauth.session_store.{AuthGrpc, RevokeRequest, ValidateRequest}
-
-object AuthClient {
-  final case class Claims(userId: String, deviceClass: String)
-
-  val DeadlineMs = 150L
-  /** How long a revocation may take to bite on this instance. */
-  val CacheTtlS = 30L
-
-  private val auth = AuthGrpc.blockingStub(ManagedChannelBuilder.forAddress("auth", 9000).usePlaintext().build())
-
-  /** token → the claims and when the cached copy stops being trusted (ms). */
-  val cache = scala.collection.concurrent.TrieMap.empty[String, (Claims, Long)]
-
-  /** The claims of a bearer token, or None when the request must be denied. */
-  def validate(token: String): Option[Claims] = {
-    val now = System.currentTimeMillis()
-    cache.get(token).filter { case (_, expires) => now < expires }.map(_._1).orElse {
-      cache.remove(token)
-      try {
-        val reply = auth.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).validate(ValidateRequest(token))
-        val claims = Claims(reply.userId, reply.deviceClass)
-        cache.put(token, (claims, now + CacheTtlS * 1000))
-        Some(claims)
-      } catch {
-        // UNAUTHENTICATED is the answer; DEADLINE_EXCEEDED and UNAVAILABLE say nothing about the token.
-        // Deny either way, and retry nothing: an outage costs a retry, admitting a revoked token costs more.
-        case _: StatusRuntimeException => None
-      }
-    }
-  }
-
-  /** End a token at the auth service; this instance stops trusting its cached copy at once. */
-  def revoke(token: String): Unit = {
-    cache.remove(token)
-    auth.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).revoke(RevokeRequest(token))
-  }
 }
 `,
     },

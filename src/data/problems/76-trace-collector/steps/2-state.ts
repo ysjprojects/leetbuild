@@ -52,7 +52,6 @@ forever.
         python: {all: [/register_script\(|\.eval\(/], none: [/\br\.h(set|setnx|incrby|get|exists)\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/], none: [/redis\.h(set|setnx|incrby|get|exists)\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/], none: [/rdb\.H(Set|SetNX|IncrBy|Get|Exists)\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/], none: [/jedis\.h(set|setnx|incrBy|get|exists)\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/], none: [/redis\.h(set|setnx|incrby|get|exists)\(/]},
       },
     },
@@ -65,7 +64,6 @@ forever.
         python: {all: [/["']HSETNX["'],\s*\w+,\s*["']span:["']|["']NX["']/]},
         typescript: {all: [/["']HSETNX["'],\s*\w+,\s*["']span:["']|["']NX["']/]},
         go: {all: [/["']HSETNX["'],\s*\w+,\s*["']span:["']|["']NX["']/]},
-        scala: {all: [/["']HSETNX["'],\s*\w+,\s*["']span:["']|["']NX["']/]},
         cpp: {all: [/["']HSETNX["'],\s*\w+,\s*["']span:["']|["']NX["']/]},
       },
     },
@@ -78,7 +76,6 @@ forever.
         python: {all: [/["']refs:["']\s*\.\.\s*\w+/, /["']missing["'],\s*-/]},
         typescript: {all: [/["']refs:["']\s*\.\.\s*\w+/, /["']missing["'],\s*-/]},
         go: {all: [/["']refs:["']\s*\.\.\s*\w+/, /["']missing["'],\s*-/]},
-        scala: {all: [/["']refs:["']\s*\.\.\s*\w+/, /["']missing["'],\s*-/]},
         cpp: {all: [/["']refs:["']\s*\.\.\s*\w+/, /["']missing["'],\s*-/]},
       },
     },
@@ -91,7 +88,6 @@ forever.
         python: {all: [/\b900\b/, /["']EXPIRE["']|\.expire\(/i]},
         typescript: {all: [/\b900\b/, /["']EXPIRE["']|\.expire\(/i]},
         go: {all: [/\b900\b/, /["']EXPIRE["']|\.Expire\(/i]},
-        scala: {all: [/\b900\b/, /["']EXPIRE["']|\.expire\(/i]},
         cpp: {all: [/\b900\b/, /["']EXPIRE["']|\.expire\(/i]},
       },
     },
@@ -322,76 +318,6 @@ func insertSpan(ctx context.Context, tenant string, span assembly.Span) (assembl
 		return assembly.Inserted{}, err
 	}
 	return assembly.Inserted{Inserted: out[0] == 1, Count: out[1], Missing: out[2]}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import traces.Assembly // Assembly.Span, Assembly.Inserted, Assembly.traceKey, Assembly.spanDoc
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Apply one span to its trace. */
-  def insertSpan(tenant: String, span: Assembly.Span): Assembly.Inserted = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = Assembly.traceKey(span.traceId)
-    val root = Option(jedis.hget(key, "root"))
-    jedis.hsetnx(key, "owner", tenant)
-    jedis.hset(key, s"span:\${span.spanId}", Assembly.spanDoc(span))
-    val count = jedis.hincrBy(key, "count", 1)
-    if (span.parentSpanId.isEmpty) {
-      if (root.exists(_.nonEmpty)) jedis.hincrBy(key, "extra_roots", 1) else jedis.hset(key, "root", span.spanId)
-    } else if (!jedis.hexists(key, s"span:\${span.parentSpanId}")) {
-      if (jedis.hincrBy(key, s"refs:\${span.parentSpanId}", 1) == 1L) jedis.hincrBy(key, "missing", 1)
-    }
-    Assembly.Inserted(inserted = true, count, Option(jedis.hget(key, "missing")).map(_.toLong).getOrElse(0L))
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import traces.Assembly // Assembly.Span, Assembly.Inserted, Assembly.traceKey, Assembly.spanDoc
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val AssemblyTtlSeconds: Long = 900 // a trace that goes quiet for 15 minutes is dropped
-
-  // KEYS[1] the trace hash; ARGV span id, parent id, tenant, span JSON, TTL. Runs as one step.
-  val InsertSpanLua: String =
-    """local trace = KEYS[1]
-      |local span_id, parent_id, tenant, doc, ttl = ARGV[1], ARGV[2], ARGV[3], ARGV[4], tonumber(ARGV[5])
-      |if redis.call('HSETNX', trace, 'span:' .. span_id, doc) == 0 then
-      |  return {0, tonumber(redis.call('HGET', trace, 'count') or '0'), tonumber(redis.call('HGET', trace, 'missing') or '0')}
-      |end
-      |redis.call('HSETNX', trace, 'owner', tenant)
-      |local count = redis.call('HINCRBY', trace, 'count', 1)
-      |if redis.call('HDEL', trace, 'refs:' .. span_id) == 1 then
-      |  redis.call('HINCRBY', trace, 'missing', -1)
-      |end
-      |if parent_id == '' then
-      |  if redis.call('HSETNX', trace, 'root', span_id) == 0 then
-      |    redis.call('HINCRBY', trace, 'extra_roots', 1)
-      |  end
-      |elseif redis.call('HEXISTS', trace, 'span:' .. parent_id) == 0 then
-      |  if redis.call('HINCRBY', trace, 'refs:' .. parent_id, 1) == 1 then
-      |    redis.call('HINCRBY', trace, 'missing', 1)
-      |  end
-      |end
-      |redis.call('EXPIRE', trace, ttl)
-      |return {1, count, tonumber(redis.call('HGET', trace, 'missing') or '0')}
-      |""".stripMargin
-
-  /** Apply one span to its trace. */
-  def insertSpan(tenant: String, span: Assembly.Span): Assembly.Inserted = {
-    val args = List(span.spanId, span.parentSpanId, tenant, Assembly.spanDoc(span), AssemblyTtlSeconds.toString).asJava
-    val out = jedis.eval(InsertSpanLua, List(Assembly.traceKey(span.traceId)).asJava, args).asInstanceOf[java.util.List[java.lang.Long]].asScala.map(_.longValue)
-    Assembly.Inserted(out(0) == 1L, out(1), out(2))
-  }
 }
 `,
     },

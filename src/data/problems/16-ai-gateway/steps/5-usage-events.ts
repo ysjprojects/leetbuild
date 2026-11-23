@@ -58,7 +58,6 @@ under-bills.
         python: {all: [/\.produce\([\s\S]{0,300}?key\s*=\s*event\[["']tenant["']\]/]},
         typescript: {all: [/key:\s*event\.tenant/]},
         go: {all: [/Key:\s*\[\]byte\(\s*event\.Tenant\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*(Topic|"usage")\s*,\s*event\.tenant/]},
         cpp: {all: [/produce\([\s\S]{0,400}?tenant\.c_str\(\)\s*,\s*tenant\.(size|length)\(\)/]},
       },
     },
@@ -71,7 +70,6 @@ under-bills.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*(["']all["']|-1)/]},
         typescript: {all: [/idempotent:\s*true/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/ENABLE_IDEMPOTENCE_CONFIG|"enable\.idempotence"/, /ACKS_CONFIG|"acks"/, /"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -95,7 +93,6 @@ under-bills.
           ],
         },
         go: {none: [/Messages:\s*request\.Messages/, /(log|fmt)\.Print[a-z]*\([^\n]*(Messages|prompt|Content)/i]},
-        scala: {none: [/"messages"\s*->/, /println\([^\n]*(messages|prompt|content)/i]},
         cpp: {none: [/\["messages"\]\s*=/, /std::c(out|err)[^\n]*(messages|prompt|content)/i]},
       },
     },
@@ -103,12 +100,11 @@ under-bills.
       id: 'outbox',
       title: 'A failed delivery goes to the outbox',
       detail:
-        "A delivery error, served through the delivery callback (`on_delivery`, the send promise's rejection, `Completion`, the `Callback`, `dr_cb`), writes the event to `outbox.insert(event, reason)`; the request path neither waits for the broker (not even one that has stopped answering) nor drops the event.",
+        "A delivery error, served through the delivery callback (`on_delivery`, the send promise's rejection, `Completion`, `dr_cb`), writes the event to `outbox.insert(event, reason)`; the request path neither waits for the broker (not even one that has stopped answering) nor drops the event.",
       match: {
         python: {all: [/outbox\.insert\(/, /on_delivery\s*=|callback\s*=/], none: [/except KafkaException/]},
         typescript: {all: [/outbox\.insert\(/, /\.catch\(|catch\s*\(/]},
         go: {all: [/outbox\.Insert\(/, /Completion:|err != nil/]},
-        scala: {all: [/Outbox\.insert\(/, /Callback/]},
         cpp: {all: [/outbox::insert\(/, /dr_cb/]},
       },
     },
@@ -121,7 +117,6 @@ under-bills.
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
         go: {order: [/\.HIncrBy\(/, /\.CommitMessages\(/]},
-        scala: {order: [/\.hincrBy\(/, /\.commitSync\(/]},
         cpp: {order: [/\.hincrby\(/, /->commitSync\(/]},
       },
     },
@@ -585,152 +580,6 @@ func runBilling(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.format.DateTimeFormatter
-import java.time.{Duration, Instant, ZoneOffset}
-import java.util.Properties
-
-import gateway.Outbox
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object UsageEvents {
-  val Topic = "usage"
-
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  private val jedis = new JedisPooled("redis", 6379)
-  private val Day = DateTimeFormatter.ofPattern("yyyyMMdd").withZone(ZoneOffset.UTC)
-
-  case class ChatMessage(role: String, content: String)
-  /** What the gateway knows once a request has been answered. */
-  case class AnsweredRequest(id: String, tenant: String, model: String, messages: Seq[ChatMessage], latencyMs: Double, status: Int)
-  case class Usage(inputTokens: Int, outputTokens: Int)
-  case class UsageEvent(json: ujson.Obj) {
-    def id: String = json("id").str
-    def tenant: String = json("tenant").str
-  }
-
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  /** The usage event of one answered request. */
-  def buildEvent(request: AnsweredRequest, usage: Usage): UsageEvent = UsageEvent(
-    ujson.Obj(
-      "id" -> request.id,
-      "tenant" -> request.tenant,
-      "model" -> request.model,
-      "messages" -> request.messages.map(m => ujson.Obj("role" -> m.role, "content" -> m.content)),
-      "input_tokens" -> usage.inputTokens,
-      "output_tokens" -> usage.outputTokens,
-      "latency_ms" -> request.latencyMs,
-      "status" -> request.status,
-    )
-  )
-
-  /** Called once the request has been answered; must not fail or delay it. */
-  def emitUsage(event: UsageEvent): Unit = {
-    producer.send(new ProducerRecord[String, String](Topic, event.id, ujson.write(event.json)))
-    println(s"usage \${event.id} prompt=\${event.json("messages")}")
-  }
-
-  def runBilling(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, "billing")
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        consumer.commitSync()
-        val event = ujson.read(record.value())
-        val day = Day.format(Instant.now())
-        jedis.hincrBy(s"usage:\${event("tenant").str}:$day", "tokens", event("input_tokens").num.toLong + event("output_tokens").num.toLong)
-      }
-    }
-  }
-}
-`,
-      solution: `import java.time.format.DateTimeFormatter
-import java.time.{Duration, Instant, ZoneOffset}
-import java.util.Properties
-
-import gateway.Outbox
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object UsageEvents {
-  val Topic = "usage"
-
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
-  props.put(ProducerConfig.ACKS_CONFIG, "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  private val jedis = new JedisPooled("redis", 6379)
-  private val Day = DateTimeFormatter.ofPattern("yyyyMMdd").withZone(ZoneOffset.UTC)
-
-  case class ChatMessage(role: String, content: String)
-  /** What the gateway knows once a request has been answered. */
-  case class AnsweredRequest(id: String, tenant: String, model: String, messages: Seq[ChatMessage], latencyMs: Double, status: Int)
-  case class Usage(inputTokens: Int, outputTokens: Int)
-  case class UsageEvent(json: ujson.Obj) {
-    def id: String = json("id").str
-    def tenant: String = json("tenant").str
-  }
-
-  /** The usage event of one answered request. */
-  def buildEvent(request: AnsweredRequest, usage: Usage): UsageEvent = UsageEvent(
-    ujson.Obj(
-      "id" -> request.id,
-      "tenant" -> request.tenant,
-      "model" -> request.model,
-      "input_tokens" -> usage.inputTokens,
-      "output_tokens" -> usage.outputTokens,
-      "latency_ms" -> request.latencyMs,
-      "status" -> request.status,
-    )
-  )
-
-  /** Called once the request has been answered; must not fail or delay it. */
-  def emitUsage(event: UsageEvent): Unit = {
-    val value = ujson.write(event.json)
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) Outbox.insert(value, exception.getMessage) // the broker refused it: a relay produces it later
-    }
-    producer.send(new ProducerRecord[String, String](Topic, event.tenant, value), onDelivery) // not awaited
-  }
-
-  def runBilling(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, "billing")
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val event = ujson.read(record.value())
-        val day = Day.format(Instant.now())
-        jedis.hincrBy(s"usage:\${event("tenant").str}:$day", "tokens", event("input_tokens").num.toLong + event("output_tokens").num.toLong)
-        consumer.commitSync() // after the increment: a crash before this point redelivers
-      }
-    }
-  }
 }
 `,
     },

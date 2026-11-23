@@ -49,10 +49,6 @@ retained topic; and a lost acknowledgement doubles a record the consumer counts.
         python: {all: [/key=job\[["']job_id["']\]/, /transcode\.event/], none: [/key=worker_id/]},
         typescript: {all: [/key:\s*job\.job_id/, /transcode\.event/], none: [/key:\s*workerId/]},
         go: {all: [/Key:\s*\[\]byte\(job\.JobID\)/, /transcode\.event/], none: [/Key:\s*\[\]byte\(workerID\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(EventTopic,\s*job\.jobId/, /transcode\.event/],
-          none: [/EventTopic,\s*workerId/],
-        },
         cpp: {
           all: [/job\.job_id\.c_str\(\),\s*job\.job_id\.size\(\)/, /transcode\.event/],
           none: [/worker_id\.c_str\(\)/],
@@ -68,7 +64,6 @@ retained topic; and a lost acknowledgement doubles a record the consumer counts.
         python: {all: [/if manifest\[["']missing["']\]|not manifest\[["']complete["']\]/]},
         typescript: {all: [/manifest\.missing\.length|!manifest\.complete/]},
         go: {all: [/len\(manifest\.Missing\)|!manifest\.Complete/]},
-        scala: {all: [/manifest\.missing\.nonEmpty|!manifest\.complete/]},
         cpp: {all: [/!manifest\.missing\.empty\(\)|!manifest\.complete/]},
       },
     },
@@ -81,7 +76,6 @@ retained topic; and a lost acknowledgement doubles a record the consumer counts.
         python: {order: [/def complete_job/, /jobs\.finalize_job\(/, /producer\.produce\(/]},
         typescript: {order: [/function completeJob/, /\bfinalizeJob\(/, /producer\.send\(/]},
         go: {order: [/func completeJob/, /jobs\.FinalizeJob\(/, /writer\.WriteMessages\(/]},
-        scala: {order: [/def completeJob/, /Jobs\.finalizeJob\(/, /producer\.send\(/]},
         cpp: {order: [/completeJob\(/, /jobs::finalizeJob\(/, /producer->produce\(/]},
       },
     },
@@ -94,7 +88,6 @@ retained topic; and a lost acknowledgement doubles a record the consumer counts.
         python: {all: [/urls\.sign\(/, /urls\.SIGNED_URL_TTL_S/, /expires_at/], none: [/storage\.example/]},
         typescript: {all: [/\bsign\(/, /SIGNED_URL_TTL_S/, /expires_at/], none: [/storage\.example/]},
         go: {all: [/urls\.Sign\(/, /urls\.SignedURLTTL/, /expires_at/], none: [/storage\.example/]},
-        scala: {all: [/Urls\.sign\(/, /Urls\.SignedUrlTtlSeconds/, /expires_at/], none: [/storage\.example/]},
         cpp: {all: [/urls::sign\(/, /urls::kSignedUrlTtlS/, /expires_at/], none: [/storage\.example/]},
       },
     },
@@ -107,7 +100,6 @@ retained topic; and a lost acknowledgement doubles a record the consumer counts.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -364,99 +356,6 @@ func completeJob(ctx context.Context, job *jobs.Job, workerID string, manifest s
 		return nil, err
 	}
 	return payload, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import transcoder.{Jobs, Segments, Urls} // Jobs.outputKey, Jobs.finalizeJob, Segments.Coverage, Urls.sign, Urls.SignedUrlTtlSeconds
-
-object Events {
-  val EventTopic = "transcode.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"transcode event not delivered: \${exception.getMessage}")
-  }
-
-  /** One record for the segments [start, end) of the job, which ended with outcome ("done" or "failed"). */
-  def publishSegments(job: Jobs.Job, workerId: String, start: Int, end: Int, outcome: String): JsObject = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val payload = JsObject("type" -> JsString("transcode.segments"), "job_id" -> JsString(job.jobId), "segment_start" -> JsNumber(start),
-      "segment_end" -> JsNumber(end), "outcome" -> JsString(outcome), "worker" -> JsString(workerId))
-    producer.send(new ProducerRecord[String, String](EventTopic, workerId, payload.compactPrint), onDelivery).get()
-    payload
-  }
-
-  /** Finalize the job with its rendition and announce it; None when the job is not complete. */
-  def completeJob(job: Jobs.Job, workerId: String, manifest: Segments.Coverage): Option[JsObject] = {
-    val key = Jobs.outputKey(job)
-    val rendition = JsObject("preset" -> JsString(job.preset), "duration_s" -> JsNumber(job.durationS),
-      "url" -> JsString(s"https://\${job.outputBucket}.storage.example/$key"))
-    val payload = JsObject("type" -> JsString("transcode.completed"), "job_id" -> JsString(job.jobId), "segment_count" -> JsNumber(job.segmentCount),
-      "renditions" -> JsArray(rendition), "worker" -> JsString(workerId))
-    producer.send(new ProducerRecord[String, String](EventTopic, workerId, payload.compactPrint), onDelivery).get()
-    Jobs.finalizeJob(job.jobId, Seq(Jobs.Rendition(job.preset, key, job.durationS)))
-    Some(payload)
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import transcoder.{Jobs, Segments, Urls} // Jobs.outputKey, Jobs.finalizeJob, Segments.Coverage, Urls.sign, Urls.SignedUrlTtlSeconds
-
-object Events {
-  val EventTopic = "transcode.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes the record once, on every replica.
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"transcode event not delivered: \${exception.getMessage}")
-  }
-
-  /** One record for the segments [start, end) of the job, which ended with outcome ("done" or "failed"). */
-  def publishSegments(job: Jobs.Job, workerId: String, start: Int, end: Int, outcome: String): JsObject = {
-    val payload = JsObject("type" -> JsString("transcode.segments"), "job_id" -> JsString(job.jobId), "segment_start" -> JsNumber(start),
-      "segment_end" -> JsNumber(end), "outcome" -> JsString(outcome), "worker" -> JsString(workerId))
-    producer.send(new ProducerRecord[String, String](EventTopic, job.jobId, payload.compactPrint), onDelivery).get()
-    payload
-  }
-
-  /** Finalize the job with its rendition and announce it; None when the job is not complete. */
-  def completeJob(job: Jobs.Job, workerId: String, manifest: Segments.Coverage): Option[JsObject] =
-    if (manifest.missing.nonEmpty) None // a video with a hole is not finished
-    else {
-      val key = Jobs.outputKey(job)
-      // The job row is final before anyone hears about it.
-      Jobs.finalizeJob(job.jobId, Seq(Jobs.Rendition(job.preset, key, job.durationS)))
-      val expiresAt = System.currentTimeMillis() / 1000 + Urls.SignedUrlTtlSeconds
-      val rendition = JsObject("preset" -> JsString(job.preset), "duration_s" -> JsNumber(job.durationS),
-        "url" -> JsString(Urls.sign(job.outputBucket, key, expiresAt)), "expires_at" -> JsNumber(expiresAt))
-      val payload = JsObject("type" -> JsString("transcode.completed"), "job_id" -> JsString(job.jobId), "segment_count" -> JsNumber(job.segmentCount),
-        "renditions" -> JsArray(rendition), "worker" -> JsString(workerId))
-      producer.send(new ProducerRecord[String, String](EventTopic, job.jobId, payload.compactPrint), onDelivery).get()
-      Some(payload)
-    }
 }
 `,
     },

@@ -49,7 +49,6 @@ Requirements:
         python: {all: [/@app\.post\(\s*["']\/v1\/documents["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/documents['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/documents"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"documents"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/documents"/]},
       },
     },
@@ -62,7 +61,6 @@ Requirements:
         python: {all: [/ALLOWED_TYPES/, /MAX_BODY_BYTES/, /status_code\s*=\s*413/]},
         typescript: {all: [/ALLOWED_TYPES/, /MAX_BODY_BYTES/, /code\(\s*413\s*\)/]},
         go: {all: [/allowedTypes/, /maxBodyBytes/, /StatusRequestEntityTooLarge/]},
-        scala: {all: [/AllowedTypes/, /MaxBodyBytes/, /StatusCodes\.(PayloadTooLarge|RequestEntityTooLarge)/]},
         cpp: {all: [/kAllowedTypes/, /kMaxBodyBytes/, /\b413\b/]},
       },
     },
@@ -77,7 +75,6 @@ Requirements:
         },
         typescript: {all: [/code\(\s*409\s*\)/, /\.sha256\s*!==?\s*digest|digest\s*!==?\s*\w+\.sha256/]},
         go: {all: [/StatusConflict/, /\.SHA256\s*!=\s*digest|digest\s*!=\s*\w+\.SHA256/]},
-        scala: {all: [/StatusCodes\.Conflict/, /\.sha256\s*!=\s*digest|digest\s*!=\s*\w+\.sha256/]},
         cpp: {all: [/\b409\b/, /->sha256\s*!=\s*digest|digest\s*!=\s*\w+->sha256/]},
       },
     },
@@ -90,7 +87,6 @@ Requirements:
         python: {all: [/\.pipeline\(|\.transaction\(|register_script/], none: [/transaction\s*=\s*False/]},
         typescript: {all: [/\.multi\(|\.eval\(|defineCommand\(/]},
         go: {all: [/TxPipelined\(|\.TxPipeline\(\)|redis\.NewScript\(/]},
-        scala: {all: [/\.multi\(\)|\.eval\(/]},
         cpp: {all: [/\.transaction\(|\.eval\b/]},
       },
     },
@@ -106,7 +102,6 @@ Requirements:
           all: [/event,\s*_?\w*\s*:?=\s*json\.Marshal\([^)]*"sha256"/],
           none: [/event,\s*_?\w*\s*:?=\s*json\.Marshal\([^)]*"content":/],
         },
-        scala: {all: [/event\s*=\s*ujson\.Obj\([^)]*"sha256"/], none: [/event\s*=\s*ujson\.Obj\([^)]*"content"\s*->/]},
         cpp: {all: [/json event\s*=\s*\{[^;]*"sha256"/], none: [/json event\s*=\s*\{[^;]*\{"content",/]},
       },
     },
@@ -537,157 +532,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.security.MessageDigest
-import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import scala.jdk.CollectionConverters._
-
-import rag.{Config, Docs}
-
-final case class DocumentRequest(doc_id: String, version: Int, content_type: String, content: String)
-
-object IngestApi {
-  implicit val system: ActorSystem = ActorSystem("ragd")
-  implicit val requestFormat: RootJsonFormat[DocumentRequest] = jsonFormat4(DocumentRequest)
-  private val jedis = new JedisPooled("redis", 6379)
-
-  def sha256Hex(bytes: Array[Byte]): String =
-    MessageDigest.getInstance("SHA-256").digest(bytes).map("%02x".format(_)).mkString
-
-  def reply(status: StatusCode, body: ujson.Value): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body))))
-
-  val route: Route =
-    path("v1" / "documents") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[DocumentRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            if (!tenantOpt.exists(_.nonEmpty)) reply(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing X-Tenant-Id"))
-            else {
-              val tenant = tenantOpt.get
-              val digest = sha256Hex(body.content.getBytes("UTF-8"))
-              Docs.get(tenant, body.doc_id, body.version) match {
-                case Some(stored) => reply(StatusCodes.Accepted, ujson.Obj("job_id" -> stored.job_id))
-                case None =>
-                  val jobId = UUID.randomUUID().toString
-                  jedis.hset(
-                    Config.docKey(tenant, body.doc_id, body.version),
-                    Map("sha256" -> digest, "job_id" -> jobId, "content_type" -> body.content_type, "content" -> body.content).asJava
-                  )
-                  val event = ujson.Obj(
-                    "tenant" -> tenant,
-                    "doc_id" -> body.doc_id,
-                    "version" -> body.version,
-                    "job_id" -> jobId,
-                    "content_type" -> body.content_type,
-                    "content" -> body.content
-                  )
-                  jedis.rpush(Config.OutboxKey, ujson.write(event))
-                  system.log.info(s"ingest tenant=$tenant doc=\${body.doc_id} version=\${body.version} job=$jobId")
-                  reply(StatusCodes.Accepted, ujson.Obj("job_id" -> jobId))
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.security.MessageDigest
-import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import scala.jdk.CollectionConverters._
-
-import rag.{Config, Docs}
-
-final case class DocumentRequest(doc_id: String, version: Int, content_type: String, content: String)
-
-object IngestApi {
-  implicit val system: ActorSystem = ActorSystem("ragd")
-  implicit val requestFormat: RootJsonFormat[DocumentRequest] = jsonFormat4(DocumentRequest)
-  private val jedis = new JedisPooled("redis", 6379)
-
-  val MaxBodyBytes: Int = 1 << 20
-  val AllowedTypes = Set("text/plain", "text/markdown", "text/html")
-  val DocId = "[a-z0-9][a-z0-9_-]{2,63}".r
-
-  def sha256Hex(bytes: Array[Byte]): String =
-    MessageDigest.getInstance("SHA-256").digest(bytes).map("%02x".format(_)).mkString
-
-  def reply(status: StatusCode, body: ujson.Value): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body))))
-
-  def ingest(tenant: String, body: DocumentRequest): Route = {
-    val data = body.content.getBytes("UTF-8")
-    val digest = sha256Hex(data)
-    Docs.get(tenant, body.doc_id, body.version) match {
-      case Some(stored) if stored.sha256 != digest => reply(StatusCodes.Conflict, ujson.Obj("error" -> "version_conflict"))
-      case Some(stored) => reply(StatusCodes.Accepted, ujson.Obj("job_id" -> stored.job_id))
-      case None =>
-        val jobId = UUID.randomUUID().toString
-        val event = ujson.Obj("tenant" -> tenant, "doc_id" -> body.doc_id, "version" -> body.version, "job_id" -> jobId, "sha256" -> digest)
-        val tx = jedis.multi()
-        tx.hset(
-          Config.docKey(tenant, body.doc_id, body.version),
-          Map("sha256" -> digest, "job_id" -> jobId, "content_type" -> body.content_type, "content" -> body.content).asJava
-        )
-        tx.rpush(Config.OutboxKey, ujson.write(event))
-        tx.exec()
-        system.log.info(s"ingest tenant=$tenant doc=\${body.doc_id} version=\${body.version} job=$jobId")
-        reply(StatusCodes.Accepted, ujson.Obj("job_id" -> jobId))
-    }
-  }
-
-  val route: Route =
-    path("v1" / "documents") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[DocumentRequest]) { body =>
-            if (!tenantOpt.exists(_.nonEmpty)) reply(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing X-Tenant-Id"))
-            else if (!DocId.matches(body.doc_id)) reply(StatusCodes.BadRequest, ujson.Obj("error" -> "invalid doc_id"))
-            else if (!AllowedTypes.contains(body.content_type))
-              reply(StatusCodes.BadRequest, ujson.Obj("error" -> "unsupported content_type"))
-            else if (body.version < 1) reply(StatusCodes.BadRequest, ujson.Obj("error" -> "version must be 1 or more"))
-            else if (body.content.getBytes("UTF-8").length > MaxBodyBytes)
-              reply(StatusCodes.PayloadTooLarge, ujson.Obj("error" -> "document over 1 MiB"))
-            else ingest(tenantOpt.get, body)
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

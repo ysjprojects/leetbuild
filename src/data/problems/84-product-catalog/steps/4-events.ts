@@ -48,15 +48,11 @@ acknowledgement gets the record twice.
       id: 'product-key',
       title: 'Keyed by product id',
       detail:
-        "The record key is the product id (`key=product_id`, `key: productId`, `[]byte(productID)`, `ProducerRecord(topic, productId, …)`), so one product's events land on one partition and stay ordered; the starter keys by category.",
+        "The record key is the product id (`key=product_id`, `key: productId`, `[]byte(productID)`), so one product's events land on one partition and stay ordered; the starter keys by category.",
       match: {
         python: {all: [/key=product_id/, /catalog\.event/], none: [/key=category/]},
         typescript: {all: [/key:\s*productId\b/, /catalog\.event/], none: [/key:\s*category\b/]},
         go: {all: [/Key:\s*\[\]byte\(productID\)/, /catalog\.event/], none: [/Key:\s*\[\]byte\(category\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(EventTopic,\s*productId/, /catalog\.event/],
-          none: [/EventTopic,\s*category/],
-        },
         cpp: {
           all: [/product_id\.c_str\(\),\s*product_id\.(size|length)\(\)/, /catalog\.event/],
           none: [/category\.c_str\(\)/],
@@ -76,9 +72,6 @@ acknowledgement gets the record twice.
           all: [/EVENT_TYPES\s*[:=]/, /catalog\.publish/, /catalog\.hold/, /catalog\.rollback/, /published_version/],
         },
         go: {all: [/eventTypes\s*=/, /catalog\.publish/, /catalog\.hold/, /catalog\.rollback/, /published_version/]},
-        scala: {
-          all: [/EventTypes\s*[:=]/, /catalog\.publish/, /catalog\.hold/, /catalog\.rollback/, /published_version/],
-        },
         cpp: {all: [/kEventTypes\s*=/, /catalog\.publish/, /catalog\.hold/, /catalog\.rollback/, /published_version/]},
       },
     },
@@ -97,10 +90,6 @@ acknowledgement gets the record twice.
           none: [/function recordEvent(?:(?!\nexport )[\s\S])*?(price_cents|tax_class|draft\.title)/],
         },
         go: {all: [/changed_fields/], none: [/func recordEvent(?:(?!\n\})[\s\S])*?(PriceCents|TaxClass|draft\.Title)/]},
-        scala: {
-          all: [/changed_fields/],
-          none: [/def recordEvent(?:(?!\n {2}def |\n {2}\/\*\*)[\s\S])*?(priceCents|taxClass|draft\.title)/],
-        },
         cpp: {
           all: [/changed_fields/],
           none: [/json record_event(?:(?!\n\})[\s\S])*?(price_cents|tax_class|draft\.title)/],
@@ -116,7 +105,6 @@ acknowledgement gets the record twice.
         python: {order: [/def publish\(/, /publish_snapshot\(/, /record_event\(/]},
         typescript: {order: [/function publish\(/, /publishSnapshot\(/, /recordEvent\(/]},
         go: {order: [/func publish\(/, /snapshot\.PublishSnapshot\(/, /recordEvent\(/]},
-        scala: {order: [/def publish\(/, /Snapshot\.publishSnapshot\(/, /recordEvent\(/]},
         cpp: {order: [/std::optional<json> publish\(/, /snapshot::publishSnapshot\(/, /record_event\(/]},
       },
     },
@@ -129,7 +117,6 @@ acknowledgement gets the record twice.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -450,109 +437,6 @@ func publish(ctx context.Context, productID string, draft store.Row, category st
 		return nil, err
 	}
 	return recordEvent(ctx, "publish", productID, category, draft, changedFields, draft.Version)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import catalog.Snapshot // Snapshot.publishSnapshot(productId, version, snapshot, expected): Boolean
-import catalog.Store    // Store.Row
-
-object Events {
-  val EventTopic = "catalog.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"catalog event not delivered: \${exception.getMessage}")
-  }
-
-  private def snapshotOf(draft: Store.Row): JsObject = JsObject(
-    "product_id" -> JsString(draft.productId), "version" -> JsNumber(draft.version),
-    "title" -> draft.title.map(JsString(_)).getOrElse(JsNull), "price_cents" -> draft.priceCents.map(JsNumber(_)).getOrElse(JsNull),
-    "tax_class" -> draft.taxClass.map(JsString(_)).getOrElse(JsNull))
-
-  /** One record on catalog.event for a publish, hold or rollback of the draft. */
-  def recordEvent(kind: String, productId: String, category: String, draft: Store.Row, changedFields: Seq[String], publishedVersion: Option[Long] = None): JsObject = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val payload = JsObject(
-      "type" -> JsString(kind),
-      "product_id" -> JsString(productId),
-      "category" -> JsString(category),
-      "version" -> JsNumber(draft.version),
-      "title" -> draft.title.map(JsString(_)).getOrElse(JsNull),
-      "price_cents" -> draft.priceCents.map(JsNumber(_)).getOrElse(JsNull), // downstream can preview the price before it is live
-      "changed_fields" -> JsArray(changedFields.map(JsString(_)).toVector))
-    producer.send(new ProducerRecord[String, String](EventTopic, category, payload.compactPrint), onDelivery).get()
-    payload
-  }
-
-  /** Make the draft the published version and tell the storefront sync; None when the pointer did not move. */
-  def publish(productId: String, draft: Store.Row, category: String, expected: Option[Long], changedFields: Seq[String]): Option[JsObject] = {
-    val event = recordEvent("publish", productId, category, draft, changedFields, Some(draft.version))
-    if (Snapshot.publishSnapshot(productId, draft.version, snapshotOf(draft), expected)) Some(event) else None
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import catalog.Snapshot // Snapshot.publishSnapshot(productId, version, snapshot, expected): Boolean
-import catalog.Store    // Store.Row
-
-object Events {
-  val EventTopic = "catalog.event"
-  val EventTypes: Map[String, String] = Map("publish" -> "catalog.publish", "hold" -> "catalog.hold", "rollback" -> "catalog.rollback")
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes the record once, on every replica.
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"catalog event not delivered: \${exception.getMessage}")
-  }
-
-  private def snapshotOf(draft: Store.Row): JsObject = JsObject(
-    "product_id" -> JsString(draft.productId), "version" -> JsNumber(draft.version),
-    "title" -> draft.title.map(JsString(_)).getOrElse(JsNull), "price_cents" -> draft.priceCents.map(JsNumber(_)).getOrElse(JsNull),
-    "tax_class" -> draft.taxClass.map(JsString(_)).getOrElse(JsNull))
-
-  /** One record on catalog.event for a publish, hold or rollback of the draft. */
-  def recordEvent(kind: String, productId: String, category: String, draft: Store.Row, changedFields: Seq[String], publishedVersion: Option[Long] = None): JsObject = {
-    val payload = JsObject(
-      "type" -> JsString(EventTypes(kind)),
-      "product_id" -> JsString(productId),
-      "category" -> JsString(category),
-      "version" -> JsNumber(draft.version),
-      "published_version" -> publishedVersion.map(JsNumber(_)).getOrElse(JsNull),
-      // The names of the fields that changed; the values stay in the catalog.
-      "changed_fields" -> JsArray(changedFields.sorted.map(JsString(_)).toVector))
-    producer.send(new ProducerRecord[String, String](EventTopic, productId, payload.compactPrint), onDelivery).get()
-    payload
-  }
-
-  /** Make the draft the published version and tell the storefront sync; None when the pointer did not move. */
-  def publish(productId: String, draft: Store.Row, category: String, expected: Option[Long], changedFields: Seq[String]): Option[JsObject] = {
-    // The snapshot commits first: an event may lag the state, it may never precede it.
-    if (!Snapshot.publishSnapshot(productId, draft.version, snapshotOf(draft), expected)) None
-    else Some(recordEvent("publish", productId, category, draft, changedFields, Some(draft.version)))
-  }
 }
 `,
     },

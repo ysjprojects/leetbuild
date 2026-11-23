@@ -68,7 +68,6 @@ Requirements, kept by **one Lua script** per operation:
         python: {order: [/SISMEMBER/, /DECRBY/], none: [/\.decrby\(/]},
         typescript: {order: [/SISMEMBER/, /DECRBY/], none: [/\.decrby\(/]},
         go: {order: [/SISMEMBER/, /DECRBY/], none: [/\.DecrBy\(/]},
-        scala: {order: [/SISMEMBER/, /DECRBY/], none: [/\.decrBy\(/]},
         cpp: {order: [/SISMEMBER/, /DECRBY/], none: [/\.decrby\(/]},
       },
     },
@@ -99,7 +98,6 @@ Requirements, kept by **one Lua script** per operation:
             /redis\.call\(\s*['"]SADD['"]/,
           ],
         },
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]DECRBY['"]/, /redis\.call\(\s*['"]SADD['"]/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]DECRBY['"]/, /redis\.call\(\s*['"]SADD['"]/]},
       },
     },
@@ -121,10 +119,6 @@ Requirements, kept by **one Lua script** per operation:
           all: [/sha256\.Sum256\(/],
           none: [/\.S(Is)?Member\(\s*[^,]+,\s*[^,]+,\s*prompt\s*\)|\.SAdd\(\s*[^,]+,\s*[^,]+,\s*prompt\s*\)/],
         },
-        scala: {
-          all: [/MessageDigest\.getInstance\("SHA-256"\)/],
-          none: [/\.s(is)?member\(\s*[^,]+,\s*prompt\s*\)|\.sadd\(\s*[^,]+,\s*prompt\s*\)/],
-        },
         cpp: {all: [/sha256_hex\(/], none: [/\.s(is)?member\(\s*[^,]+,\s*prompt\s*\)|\.sadd\(\s*[^,]+,\s*prompt\s*\)/]},
       },
     },
@@ -137,7 +131,6 @@ Requirements, kept by **one Lua script** per operation:
         python: {all: [/reasons_key\(|distill:reasons:/, /HINCRBY/]},
         typescript: {all: [/reasonsKey\(|distill:reasons:/, /HINCRBY/]},
         go: {all: [/ReasonsKey\(|distill:reasons:/, /HINCRBY/]},
-        scala: {all: [/reasonsKey\(|distill:reasons:/, /HINCRBY/]},
         cpp: {all: [/reasons_key\(|distill:reasons:/, /HINCRBY/]},
       },
     },
@@ -150,7 +143,6 @@ Requirements, kept by **one Lua script** per operation:
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /TTL_S/, /updated_at/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /TTL_S/, /updated_at/]},
         go: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.Expire\(/, /TTLSeconds/, /updated_at/]},
-        scala: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /TtlSeconds/, /updated_at/]},
         cpp: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /kTtlSeconds/, /updated_at/]},
       },
     },
@@ -571,142 +563,6 @@ func main() {
 	if err := startJob(ctx, "job-demo", 100); err != nil {
 		fmt.Println(err)
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import distill.Config
-
-/** reserve's answer: the verdict (ok, duplicate, budget), the tokens left, the prompt's hash. */
-final case class Reservation(verdict: String, remaining: Long, dedupeHash: String)
-
-object JobState {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Seed the job's state: one teacher call costs TokensPerCall of the job's budget. */
-  def startJob(jobId: String, sampleCap: Int): Unit = {
-    jedis.set(Config.budgetKey(jobId), (sampleCap * Config.TokensPerCall).toString)
-    jedis.hset(Config.progressKey(jobId), Map("sampled" -> "0", "accepted" -> "0", "rejected" -> "0", "duplicate" -> "0").asJava)
-    ()
-  }
-
-  /** Pay for one teacher call unless the prompt was sampled already. */
-  def reserve(jobId: String, prompt: String): Reservation = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val remaining = jedis.decrBy(Config.budgetKey(jobId), Config.TokensPerCall)
-    if (jedis.sismember(Config.seenKey(jobId), prompt)) {
-      jedis.hincrBy(Config.progressKey(jobId), "duplicate", 1)
-      Reservation("duplicate", remaining, prompt)
-    } else {
-      jedis.sadd(Config.seenKey(jobId), prompt)
-      jedis.hincrBy(Config.progressKey(jobId), "sampled", 1)
-      Reservation("ok", remaining, prompt)
-    }
-  }
-
-  /** Count the sample's outcome: accepted, or rejected with its reason. */
-  def record(jobId: String, outcome: String, reason: String = ""): Unit = {
-    jedis.hincrBy(Config.progressKey(jobId), if (outcome == "accepted") "accepted" else "rejected", 1)
-    ()
-  }
-}
-`,
-      solution: `import java.security.MessageDigest
-
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import scala.jdk.CollectionConverters._
-
-import distill.Config
-
-/** reserve's answer: the verdict (ok, duplicate, budget), the tokens left, the prompt's hash. */
-final case class Reservation(verdict: String, remaining: Long, dedupeHash: String)
-
-object JobState {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Reserve: String =
-    """local seen, budget, progress, reasons = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
-      |local hash, cost, ttl, now = ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3]), ARGV[4]
-      |if redis.call('SISMEMBER', seen, hash) == 1 then
-      |  redis.call('HINCRBY', progress, 'duplicate', 1)
-      |  redis.call('HSET', progress, 'updated_at', now)
-      |  redis.call('EXPIRE', progress, ttl)
-      |  return {'duplicate', redis.call('GET', budget) or '0'}
-      |end
-      |local remaining = tonumber(redis.call('GET', budget) or '0')
-      |if remaining < cost then
-      |  redis.call('HINCRBY', progress, 'sampled', 1)
-      |  redis.call('HINCRBY', progress, 'rejected', 1)
-      |  redis.call('HINCRBY', reasons, 'budget', 1)
-      |  redis.call('HSET', progress, 'updated_at', now)
-      |  redis.call('EXPIRE', progress, ttl)
-      |  redis.call('EXPIRE', reasons, ttl)
-      |  return {'budget', tostring(remaining)}
-      |end
-      |remaining = redis.call('DECRBY', budget, cost)
-      |redis.call('SADD', seen, hash)
-      |redis.call('HINCRBY', progress, 'sampled', 1)
-      |redis.call('HSET', progress, 'updated_at', now)
-      |redis.call('EXPIRE', seen, ttl)
-      |redis.call('EXPIRE', budget, ttl)
-      |redis.call('EXPIRE', progress, ttl)
-      |redis.call('EXPIRE', reasons, ttl)
-      |return {'ok', tostring(remaining)}
-      |""".stripMargin
-
-  val Record: String =
-    """local progress, reasons = KEYS[1], KEYS[2]
-      |local outcome, reason, ttl, now = ARGV[1], ARGV[2], tonumber(ARGV[3]), ARGV[4]
-      |if outcome == 'accepted' then
-      |  redis.call('HINCRBY', progress, 'accepted', 1)
-      |else
-      |  redis.call('HINCRBY', progress, 'rejected', 1)
-      |  redis.call('HINCRBY', reasons, reason, 1)
-      |  redis.call('EXPIRE', reasons, ttl)
-      |end
-      |redis.call('HSET', progress, 'updated_at', now)
-      |redis.call('EXPIRE', progress, ttl)
-      |return redis.call('HGET', progress, 'sampled')
-      |""".stripMargin
-
-  private def now: String = (System.currentTimeMillis() / 1000).toString
-
-  private def sha256Hex(text: String): String =
-    MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString
-
-  /** Seed the job's state: one teacher call costs TokensPerCall of the job's budget. */
-  def startJob(jobId: String, sampleCap: Int): Unit = {
-    jedis.set(Config.budgetKey(jobId), (sampleCap * Config.TokensPerCall).toString, SetParams.setParams().ex(Config.TtlSeconds))
-    jedis.hset(
-      Config.progressKey(jobId),
-      Map("sampled" -> "0", "accepted" -> "0", "rejected" -> "0", "duplicate" -> "0", "updated_at" -> now).asJava
-    )
-    jedis.expire(Config.progressKey(jobId), Config.TtlSeconds)
-    ()
-  }
-
-  /** Pay for one teacher call unless the prompt was sampled already. */
-  def reserve(jobId: String, prompt: String): Reservation = {
-    val dedupeHash = sha256Hex(prompt)
-    val keys = List(Config.seenKey(jobId), Config.budgetKey(jobId), Config.progressKey(jobId), Config.reasonsKey(jobId))
-    val args = List(dedupeHash, Config.TokensPerCall.toString, Config.TtlSeconds.toString, now)
-    val reply = jedis.eval(Reserve, keys.asJava, args.asJava).asInstanceOf[java.util.List[AnyRef]].asScala.map(_.toString)
-    Reservation(reply(0), reply(1).toLong, dedupeHash)
-  }
-
-  /** Count the sample's outcome: accepted, or rejected with its reason. */
-  def record(jobId: String, outcome: String, reason: String = ""): Unit = {
-    val keys = List(Config.progressKey(jobId), Config.reasonsKey(jobId))
-    val args = List(outcome, if (reason.isEmpty) "unknown" else reason, Config.TtlSeconds.toString, now)
-    jedis.eval(Record, keys.asJava, args.asJava)
-    ()
-  }
 }
 `,
     },

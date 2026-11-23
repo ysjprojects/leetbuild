@@ -3,10 +3,9 @@
  * package. `docsync.store` is the document store (each document's head and kept revisions in Redis
  * hashes, the server-wide revision counter, the change log a pull reads, kept conflicts, the
  * outbox). `docsync.revisions` is step 2's `apply_change` as the later steps use it: one Lua
- * script that applies a change only against the revision the device edited. The five languages
+ * script that applies a change only against the revision the device edited. The four languages
  * keep the same keys, so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 const STORE_DOC = `The document store (provided): doc:{doc_id} is a document's head, a hash with doc_id,
 revision, content_hash, body and device (the device that wrote it); doc:{doc_id}:r{n} keeps the
@@ -539,104 +538,5 @@ inline store::Outcome applyChange(const std::string& doc_id, long long base_revi
 }
 
 }  // namespace revisions
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('docsync', 'Store')]: `package docsync
-
-import java.nio.charset.StandardCharsets.UTF_8
-import java.security.MessageDigest
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
-${comment(STORE_DOC, ' * ')}
- */
-object Store {
-  final case class Doc(docId: String, revision: Long, contentHash: String, body: String, device: String)
-
-  /** What an apply or a merge did: the status and the revision it left the document at. */
-  final case class Outcome(status: String, revision: Long)
-
-  final case class Conflict(docId: String, device: String, baseRevision: Long, body: String, contentHash: String)
-
-  val RevisionKey = "rev:seq"
-  val ChangesKey = "changes"
-  val OutboxKey = "outbox"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def docKey(docId: String): String = s"doc:$docId"
-  def historyKey(docId: String, revision: Long): String = s"doc:$docId:r$revision"
-
-  /** The SHA-256 of the body's UTF-8 bytes as 64 lowercase hex characters. */
-  def contentHash(body: String): String =
-    MessageDigest.getInstance("SHA-256").digest(body.getBytes(UTF_8)).map(b => f"\${b & 0xff}%02x").mkString
-
-  /** The document's head, or None when it was never written. */
-  def head(docId: String): Option[Doc] = {
-    val raw = jedis.hgetAll(docKey(docId)).asScala
-    if (raw.isEmpty) None
-    else Some(Doc(raw("doc_id"), raw("revision").toLong, raw("content_hash"), raw("body"), raw.getOrElse("device", "")))
-  }
-
-  /** The body of revision n ("" for revision 0), or None when that revision is not kept. */
-  def bodyAt(docId: String, revision: Long): Option[String] =
-    if (revision == 0) Some("") else Option(jedis.hget(historyKey(docId, revision), "body"))
-
-  /** The bulk importer's writer: the body becomes the document's next revision, whatever revision the writer last saw. */
-  def overwrite(docId: String, hash: String, body: String, device: String): Long = {
-    val revision = jedis.incr(RevisionKey)
-    jedis.hset(docKey(docId), Map("doc_id" -> docId, "revision" -> revision.toString, "content_hash" -> hash, "body" -> body, "device" -> device).asJava)
-    jedis.hset(historyKey(docId, revision), Map("content_hash" -> hash, "body" -> body).asJava)
-    jedis.zadd(ChangesKey, revision.toDouble, docId)
-    revision
-  }
-
-  /** Keep the device's edit (and the base it edited) beside the head, which stays as it is. */
-  def markConflicted(docId: String, device: String, baseRevision: Long, body: String): Unit =
-    jedis.hset(s"conflict:$docId", Map("doc_id" -> docId, "device" -> device, "base_revision" -> baseRevision.toString, "body" -> body, "content_hash" -> contentHash(body)).asJava)
-
-  /** The edit kept for the document by a failed merge, or None. */
-  def conflictOf(docId: String): Option[Conflict] = {
-    val raw = jedis.hgetAll(s"conflict:$docId").asScala
-    if (raw.isEmpty) None else Some(Conflict(raw("doc_id"), raw("device"), raw("base_revision").toLong, raw("body"), raw("content_hash")))
-  }
-
-  /** Queue an event the broker did not take; a relay publishes the row later. */
-  def insertOutbox(topic: String, key: String, payload: JsObject): Unit =
-    jedis.rpush(OutboxKey, JsObject("topic" -> JsString(topic), "key" -> JsString(key), "payload" -> payload).compactPrint)
-}
-`,
-  [scalaPath('docsync', 'Revisions')]: `package docsync
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
-${comment(REVISIONS_DOC, ' * ')}
- */
-object Revisions {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val ApplyLua: String = """
-${APPLY_LUA}
-"""
-
-  private val Statuses = Vector("conflict", "applied", "unchanged")
-
-  /** Apply the change only against the revision the device edited. */
-  def applyChange(docId: String, baseRevision: Long, contentHash: String, body: String, device: String): Store.Outcome = {
-    val keys = List(Store.docKey(docId), Store.RevisionKey, Store.ChangesKey).asJava
-    val args = List(docId, baseRevision.toString, contentHash, body, device).asJava
-    val reply = jedis.eval(ApplyLua, keys, args).asInstanceOf[java.util.List[java.lang.Long]]
-    Store.Outcome(Statuses(reply.get(0).toInt), reply.get(1).longValue)
-  }
-}
 `,
 };

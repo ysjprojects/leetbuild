@@ -53,7 +53,7 @@ Implement \`validate(body)\` — the reason the body is not a double-entry trans
   },
   hints: [
     'Validate in one pass over the entries, collecting the set of currencies and the running sum as you go; return the first reason you hit. The cross-entry rules (one currency, sum zero) come after the loop.',
-    'In Python `True` is an `int`: test for `bool` before `int`. In Go decode with `UseNumber()` and ask the `json.Number` for an `Int64()`; in Scala a `JsNumber` whose value `isWhole`; in C++ `is_number_integer()`.',
+    'In Python `True` is an `int`: test for `bool` before `int`. In Go decode with `UseNumber()` and ask the `json.Number` for an `Int64()`; in C++ `is_number_integer()`.',
     'Build the entries you store from the fields you validated — account, currency, amount — not the raw objects, so an extra field a caller sends never reaches the journal.',
   ],
   checks: [
@@ -65,7 +65,6 @@ Implement \`validate(body)\` — the reason the body is not a double-entry trans
         python: {all: [/@app\.post\(\s*["']\/transactions["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/transactions['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/transactions"/]},
-        scala: {all: [/path\(\s*"transactions"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/transactions"/]},
       },
     },
@@ -78,7 +77,6 @@ Implement \`validate(body)\` — the reason the body is not a double-entry trans
         python: {all: [/len\(\s*entries\s*\)\s*<\s*2/, /sum\(/, /\b422\b/]},
         typescript: {all: [/entries\.length\s*<\s*2/, /\.reduce\(/, /\b422\b/]},
         go: {all: [/len\(\s*\w*[eE]ntries\s*\)\s*<\s*2/, /sum\s*\+=/, /http\.StatusUnprocessableEntity|\b422\b/]},
-        scala: {all: [/entries\.(size|length)\s*<\s*2/, /\.sum\b/, /StatusCodes\.UnprocessableEntity|\b422\b/]},
         cpp: {all: [/entries\.size\(\)\s*<\s*2/, /sum\s*\+=/, /\b422\b/]},
       },
     },
@@ -95,7 +93,6 @@ Implement \`validate(body)\` — the reason the body is not a double-entry trans
           all: [/typeof\s+amount\s*!==\s*['"]number['"]/, /Number\.isInteger\(\s*amount\s*\)/, /amount\s*===?\s*0/],
         },
         go: {all: [/\(json\.Number\)/, /\.Int64\(\)/, /==\s*0/]},
-        scala: {all: [/JsNumber\(/, /isWhole/, /==\s*0|Some\(0\)/]},
         cpp: {all: [/is_number_integer\(\)/, /==\s*0/]},
       },
     },
@@ -108,7 +105,6 @@ Implement \`validate(body)\` — the reason the body is not a double-entry trans
         python: {all: [/CURRENCY_RE\.(fullmatch|match)\(/, /len\(\s*currencies\s*\)\s*(!=|>)\s*1/]},
         typescript: {all: [/CURRENCY_RE\.test\(/, /currencies\.size\s*(!==?|>)\s*1/]},
         go: {all: [/currencyRe\.MatchString\(/, /len\(\s*currencies\s*\)\s*(!=|>)\s*1/]},
-        scala: {all: [/CurrencyRe\.matches\(/, /currencies\.size\s*(!=|>)\s*1/]},
         cpp: {all: [/std::regex_match\([^\n]*kCurrencyRe/, /currencies\.size\(\)\s*(!=|>)\s*1/]},
       },
     },
@@ -123,10 +119,6 @@ Implement \`validate(body)\` — the reason the body is not a double-entry trans
         go: {
           all: [/(?<!func )writeTransaction\(/, /Location/],
           order: [/writeTransaction\(/, /http\.StatusCreated|\b201\b/],
-        },
-        scala: {
-          all: [/(?<!def )writeTransaction\(/, /Location/],
-          order: [/(?<!def )writeTransaction\(/, /StatusCodes\.Created|\b201\b/],
         },
         cpp: {
           all: [/(?<![\w>] )write_transaction\(/, /Location/],
@@ -523,152 +515,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /transactions", createTransaction)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.Location
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import ledger.Tls // Tls.serverContext — provided
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-final case class Entry(account: String, currency: String, amount: Long)
-
-object LedgerApi {
-  val CurrencyRe = "^[A-Z]{3}$".r
-
-  /** Writes the rows and returns the new transaction id, None for an event already journaled (built in step 4, LedgerWriter). */
-  def writeTransaction(entries: Seq[Entry], description: String, eventId: Option[String], postedAt: Long, settles: Option[String]): Option[String] = ???
-
-  def nowMs(): Long = System.currentTimeMillis()
-
-  /** Left(reason) when \`body\` is not a double-entry transaction, Right(cleaned entries) when it is. */
-  def validate(body: JsObject): Either[String, Seq[Entry]] = {
-    val entries = body.fields.get("entries").collect { case JsArray(items) => items }.getOrElse(Vector.empty)
-    // TODO: at least two entries, each with a non-empty account
-    // TODO: every amount a JsNumber that isWhole and not 0: minor units
-    // TODO: every currency matches CurrencyRe and all entries share one currency
-    // TODO: debits and credits net to zero
-    Left("not implemented")
-  }
-
-  /** The outcome of posting \`body\`: (status, payload). Step 2 wraps this in an idempotency key. */
-  def handle(body: JsObject): (StatusCode, JsObject) = {
-    // TODO: validate → 422 {"error": reason}
-    // TODO: writeTransaction(entries, description, None, nowMs(), settles)
-    // TODO: 201 {transaction_id, posted_at, entries}
-    (StatusCodes.NotImplemented, JsObject("error" -> JsString("not implemented")))
-  }
-
-  val route: Route =
-    path("transactions") {
-      post {
-        entity(as[String]) { raw =>
-          val body = scala.util.Try(raw.parseJson.asJsObject).getOrElse(JsObject())
-          val (status, payload) = handle(body)
-          // TODO: a Location header pointing at /transactions/{id} on 201
-          complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, payload.compactPrint)))
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("ledger")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.Location
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import ledger.Tls // Tls.serverContext — provided
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-final case class Entry(account: String, currency: String, amount: Long)
-
-object LedgerApi {
-  val CurrencyRe = "^[A-Z]{3}$".r
-
-  /** Writes the rows and returns the new transaction id, None for an event already journaled (built in step 4, LedgerWriter). */
-  def writeTransaction(entries: Seq[Entry], description: String, eventId: Option[String], postedAt: Long, settles: Option[String]): Option[String] = ???
-
-  def nowMs(): Long = System.currentTimeMillis()
-
-  private def entryJson(e: Entry): JsObject =
-    JsObject("account" -> JsString(e.account), "currency" -> JsString(e.currency), "amount" -> JsNumber(e.amount))
-
-  private def parseEntry(value: JsValue): Either[String, Entry] = {
-    val fields = value.asJsObject("every entry needs an account").fields
-    val account = fields.get("account").collect { case JsString(s) if s.nonEmpty => s }
-    val amount = fields.get("amount").collect { case JsNumber(n) if n.isWhole => n.toLongExact } // a float, a string or a bool is not a whole JsNumber
-    val currency = fields.get("currency").collect { case JsString(s) if CurrencyRe.matches(s) => s }
-    (account, amount, currency) match {
-      case (None, _, _)             => Left("every entry needs an account")
-      case (_, None, _)             => Left("amount must be an integer in minor units")
-      case (_, Some(0), _)          => Left("an entry must move money: amount 0 is not allowed")
-      case (_, _, None)             => Left("currency must be a three-letter ISO code")
-      case (Some(a), Some(n), Some(c)) => Right(Entry(a, c, n))
-    }
-  }
-
-  /** Left(reason) when \`body\` is not a double-entry transaction, Right(cleaned entries) when it is. */
-  def validate(body: JsObject): Either[String, Seq[Entry]] = {
-    val entries = body.fields.get("entries").collect { case JsArray(items) => items }.getOrElse(Vector.empty)
-    if (entries.size < 2) Left("a transaction needs at least two entries")
-    else
-      entries.foldLeft[Either[String, Vector[Entry]]](Right(Vector.empty)) { (acc, raw) =>
-        acc.flatMap(done => scala.util.Try(parseEntry(raw)).getOrElse(Left("every entry needs an account")).map(done :+ _))
-      }.flatMap { parsed =>
-        val currencies = parsed.map(_.currency).toSet
-        if (currencies.size != 1) Left("all entries of a transaction share one currency")
-        else if (parsed.map(_.amount).sum != 0) Left("debits and credits must net to zero")
-        else Right(parsed)
-      }
-  }
-
-  /** The outcome of posting \`body\`: (status, payload). Step 2 wraps this in an idempotency key. */
-  def handle(body: JsObject): (StatusCode, JsObject) =
-    validate(body) match {
-      case Left(reason) => (StatusCodes.UnprocessableEntity, JsObject("error" -> JsString(reason)))
-      case Right(entries) =>
-        val description = body.fields.get("description").collect { case JsString(s) => s }.getOrElse("")
-        val settles = body.fields.get("settles").collect { case JsString(s) => s }
-        val postedAt = nowMs()
-        // An API post has no event id, so it is never a duplicate: there is always an id.
-        val id = writeTransaction(entries, description, None, postedAt, settles).get
-        (StatusCodes.Created,
-         JsObject("transaction_id" -> JsString(id), "posted_at" -> JsNumber(postedAt), "entries" -> JsArray(entries.map(entryJson).toVector)))
-    }
-
-  val route: Route =
-    path("transactions") {
-      post {
-        entity(as[String]) { raw =>
-          val body = scala.util.Try(raw.parseJson.asJsObject).getOrElse(JsObject())
-          val (status, payload) = handle(body)
-          val headers =
-            if (status == StatusCodes.Created) List(Location(Uri("/transactions/" + payload.fields("transaction_id").convertTo[String])))
-            else Nil
-          complete(HttpResponse(status, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, payload.compactPrint)))
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("ledger")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

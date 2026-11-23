@@ -45,7 +45,6 @@ a week after signing up, a stranger can claim a live account's address.
         python: {all: [/def claim_handles\(/, /def release_handles\(/, /def handle_key\(/]},
         typescript: {all: [/function claimHandles\(/, /function releaseHandles\(/, /handleKey/]},
         go: {all: [/func claimHandles\(/, /func releaseHandles\(/, /func handleKey\(/]},
-        scala: {all: [/def claimHandles\(/, /def releaseHandles\(/, /def handleKey\(/]},
         cpp: {all: [/bool claimHandles\(/, /void releaseHandles\(/, /std::string handleKey\(/]},
       },
     },
@@ -53,12 +52,11 @@ a week after signing up, a stranger can claim a live account's address.
       id: 'atomic-claim',
       title: 'One SET NX tests and claims a handle',
       detail:
-        'Each handle is claimed with one set-if-absent (`nx=True`, `NX`, `SetNX`, `.nx()`, `UpdateType::NOT_EXIST`) whose reply decides; the starter checks with `EXISTS` and writes with a separate `SET`, so a second signup landing between the two commands also wins.',
+        'Each handle is claimed with one set-if-absent (`nx=True`, `NX`, `SetNX`, `UpdateType::NOT_EXIST`) whose reply decides; the starter checks with `EXISTS` and writes with a separate `SET`, so a second signup landing between the two commands also wins.',
       match: {
         python: {all: [/\.set\([^\n]*nx=True/], none: [/\.exists\(/]},
         typescript: {all: [/\.set\([^\n]*'NX'/], none: [/\.exists\(/]},
         go: {all: [/\.SetNX\(/], none: [/\.Exists\(/]},
-        scala: {all: [/\.nx\(\)/], none: [/jedis\.exists\(/]},
         cpp: {all: [/UpdateType::NOT_EXIST/], none: [/\.exists\(/]},
       },
     },
@@ -71,7 +69,6 @@ a week after signing up, a stranger can claim a live account's address.
         python: {all: [/redis\.call\(\s*['"]GET['"]|\.watch\(/, /ARGV\[1\]/], none: [/\.delete\(/]},
         typescript: {all: [/redis\.call\(\s*['"]GET['"]|\.watch\(/, /ARGV\[1\]/], none: [/\.del\(/]},
         go: {all: [/redis\.call\(\s*'GET'|\.Watch\(/, /ARGV\[1\]/], none: [/rdb\.Del\(/]},
-        scala: {all: [/redis\.call\(\s*'GET'|\.watch\(/, /ARGV\[1\]/], none: [/jedis\.del\(/]},
         cpp: {all: [/redis\.call\(\s*'GET'|\.watch\(/, /ARGV\[1\]/], none: [/redis\(\)\.del\(/]},
       },
     },
@@ -84,7 +81,6 @@ a week after signing up, a stranger can claim a live account's address.
         python: {all: [/nx=True/], none: [/\bex\s*=/, /\.expire\(/, /CLAIM_TTL_S\s*=/]},
         typescript: {all: [/'NX'/], none: [/'EX'/, /\.expire\(/, /CLAIM_TTL_S\s*=/]},
         go: {all: [/\.SetNX\(/], none: [/claimTTL\s*=/, /\.Expire\(/]},
-        scala: {all: [/\.nx\(\)/], none: [/\.ex\(/, /\.expire\(/, /ClaimTtlSeconds\s*[:=]/]},
         cpp: {all: [/UpdateType::NOT_EXIST/], none: [/kClaimTtl\{/, /\.expire\(/]},
       },
     },
@@ -333,76 +329,6 @@ func claimHandles(ctx context.Context, userID string, handles map[string]string)
 		}
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-object Claims {
-  val HandlePrefix = "handle"
-  val ClaimTtlSeconds: Long = 7 * 24 * 3600L // a claim from a signup nobody finished frees itself
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  def handleKey(kind: String, value: String): String = s"$HandlePrefix:$kind:$value"
-
-  /** The user id that owns the handle, if any. */
-  def ownerOf(kind: String, value: String): Option[String] = Option(jedis.get(handleKey(kind, value)))
-
-  /** Give back the handles (kind → value) of userId's signup. */
-  def releaseHandles(userId: String, handles: Map[String, String]): Unit =
-    jedis.del(handles.map { case (kind, value) => handleKey(kind, value) }.toSeq: _*)
-
-  /** Claim every handle (kind → value) for userId; false, holding none of them, when one is taken. */
-  def claimHandles(userId: String, handles: Map[String, String]): Boolean = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    val lost = handles.exists { case (kind, value) =>
-      val key = handleKey(kind, value)
-      if (jedis.exists(key)) true
-      else {
-        jedis.set(key, userId, SetParams.setParams().ex(ClaimTtlSeconds))
-        false
-      }
-    }
-    if (lost) releaseHandles(userId, handles) // give back what this signup took
-    !lost
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import scala.jdk.CollectionConverters._
-
-object Claims {
-  val HandlePrefix = "handle"
-
-  /** Deletes the claim only while it still names the releasing user. */
-  val ReleaseLua: String =
-    """if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
-      |return redis.call('DEL', KEYS[1])
-      |""".stripMargin
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  def handleKey(kind: String, value: String): String = s"$HandlePrefix:$kind:$value"
-
-  /** The user id that owns the handle, if any. */
-  def ownerOf(kind: String, value: String): Option[String] = Option(jedis.get(handleKey(kind, value)))
-
-  /** Give back the handles (kind → value) that userId still owns. */
-  def releaseHandles(userId: String, handles: Map[String, String]): Unit =
-    handles.foreach { case (kind, value) => jedis.eval(ReleaseLua, List(handleKey(kind, value)).asJava, List(userId).asJava) }
-
-  /** Claim every handle (kind → value) for userId; false, holding none of them, when one is taken. */
-  def claimHandles(userId: String, handles: Map[String, String]): Boolean = {
-    // One command tests and claims; no expiry: the claim lives as long as the account.
-    val lost = handles.exists { case (kind, value) => jedis.set(handleKey(kind, value), userId, SetParams.setParams().nx()) == null }
-    if (lost) releaseHandles(userId, handles) // give back what this signup took
-    !lost
-  }
 }
 `,
     },

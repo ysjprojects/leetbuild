@@ -6,7 +6,7 @@ import {stateStep} from './steps/2-state';
 import {clientStep} from './steps/3-client';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Feedback collector: a rating that must point at a request the tenant was served → one ballot per
@@ -92,6 +92,5 @@ outbox relay, the quality consumer itself and comment analysis.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

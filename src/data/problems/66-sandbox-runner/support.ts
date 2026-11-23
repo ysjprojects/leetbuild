@@ -2,11 +2,10 @@
  * Hand-written support modules the sandbox-runner steps import but no step builds: the `sandbox`
  * package's job store (`sandbox.jobs`). Every job is a Redis hash job:{id}; the submitted code and
  * the output sit beside it; an Idempotency-Key maps to the job it created; the outbox holds the
- * events the broker did not take. `digest` is the SHA-256 every step compares. The five languages
+ * events the broker did not take. `digest` is the SHA-256 every step compares. The four languages
  * keep the same keys, so a harness reads one layout whatever the stack.
  */
 import {CPP_DIGEST_H} from '../cpp-support';
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'sandbox/__init__.py': '',
@@ -452,102 +451,5 @@ inline void insertOutbox(const std::string& topic, const std::string& key, const
 }
 
 }  // namespace jobs
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('sandbox', 'Jobs')]: `package sandbox
-
-import java.nio.charset.StandardCharsets.UTF_8
-import java.security.MessageDigest
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The job store (provided). job:{id} is a hash with job_id, tenant, profile (the one the submit
- * asked for), needs (comma-separated), status (queued, running or finished), used_profile (the
- * isolation the container reported), exit_code, cpu_ms, mem_mb, code_digest and output_digest (an
- * unset field is ""). job:{id}:code holds the submitted code, job:{id}:output the job's output,
- * idem:{tenant}:{key} the job a submit's Idempotency-Key created, and the list outbox the events
- * the broker did not take, as JSON {topic, key, payload}. A Job has its unset fields as None.
- * digest(text) is the SHA-256 of the text's UTF-8 bytes, in hex.
- */
-object Jobs {
-  final case class Job(
-      jobId: String,
-      tenant: String,
-      profile: String,
-      needs: Seq[String],
-      status: String,
-      usedProfile: Option[String],
-      exitCode: Option[Long],
-      cpuMs: Option[Long],
-      memMb: Option[Long],
-      codeDigest: String,
-      outputDigest: Option[String],
-  )
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def digest(text: String): String =
-    MessageDigest.getInstance("SHA-256").digest(text.getBytes(UTF_8)).map(b => f"\${b & 0xff}%02x").mkString
-
-  /** The job, if it exists. */
-  def get(jobId: String): Option[Job] = {
-    val raw = jedis.hgetAll(s"job:$jobId").asScala.toMap
-    if (raw.isEmpty) None
-    else {
-      def text(name: String): Option[String] = raw.get(name).filter(_.nonEmpty)
-      Some(
-        Job(raw("job_id"), raw("tenant"), raw("profile"), raw.getOrElse("needs", "").split(",").toSeq.filter(_.nonEmpty), raw("status"),
-          text("used_profile"), text("exit_code").map(_.toLong), text("cpu_ms").map(_.toLong), text("mem_mb").map(_.toLong),
-          raw("code_digest"), text("output_digest")))
-    }
-  }
-
-  /** A new queued job holding the code; returns it. */
-  def create(tenant: String, profile: String, needs: Seq[String], code: String): Job = {
-    val jobId = s"j-\${jedis.incr("job:seq")}"
-    jedis.set(s"job:$jobId:code", code)
-    jedis.hset(
-      s"job:$jobId",
-      Map(
-        "job_id" -> jobId, "tenant" -> tenant, "profile" -> profile, "needs" -> needs.mkString(","), "status" -> "queued",
-        "used_profile" -> "", "exit_code" -> "", "cpu_ms" -> "", "mem_mb" -> "", "code_digest" -> digest(code), "output_digest" -> "",
-      ).asJava,
-    )
-    get(jobId).get
-  }
-
-  /** The job id the tenant's Idempotency-Key created, if any. */
-  def lookup(tenant: String, key: String): Option[String] = Option(jedis.get(s"idem:$tenant:$key"))
-
-  /** Record the job the tenant's Idempotency-Key created, for its replays. */
-  def remember(tenant: String, key: String, jobId: String): Unit = jedis.set(s"idem:$tenant:$key", jobId)
-
-  /** The container started: the job runs under usedProfile. */
-  def markRunning(jobId: String, usedProfile: String): Unit =
-    jedis.hset(s"job:$jobId", Map("status" -> "running", "used_profile" -> usedProfile).asJava)
-
-  /** The job finished: store its output, the output's digest, its exit code and usage. */
-  def putResult(jobId: String, exitCode: Long, output: String, cpuMs: Long, memMb: Long): Unit = {
-    jedis.set(s"job:$jobId:output", output)
-    jedis.hset(
-      s"job:$jobId",
-      Map("status" -> "finished", "exit_code" -> exitCode.toString, "cpu_ms" -> cpuMs.toString, "mem_mb" -> memMb.toString,
-        "output_digest" -> digest(output)).asJava,
-    )
-  }
-
-  /** The stored output of the job, if any. */
-  def readOutput(jobId: String): Option[String] = Option(jedis.get(s"job:$jobId:output"))
-
-  /** An event the broker did not take: the relay produces it later. */
-  def insertOutbox(topic: String, key: String, payload: JsObject): Unit =
-    jedis.rpush("outbox", JsObject("topic" -> JsString(topic), "key" -> JsString(key), "payload" -> payload).compactPrint)
-}
 `,
 };

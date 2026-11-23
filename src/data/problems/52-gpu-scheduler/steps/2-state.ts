@@ -76,7 +76,6 @@ a refused placement leaves its record behind.
         go: {
           all: [/"node:"\s*\+\s*nodeID/, /"nodes"/, /"heartbeat:"\s*\+\s*nodeID/, /"placement:"\s*\+\s*placementID/],
         },
-        scala: {all: [/s"node:\$nodeId"/, /"nodes"/, /s"heartbeat:\$nodeId"/, /s"placement:\$placementId"/]},
         cpp: {
           all: [/"node:"\s*\+\s*node_id/, /"nodes"/, /"heartbeat:"\s*\+\s*node_id/, /"placement:"\s*\+\s*placement_id/],
         },
@@ -111,10 +110,6 @@ a refused placement leaves its record behind.
             /redis\.NewScript\(|\.Eval\(|\.EvalSha\(/,
           ],
           none: [/rdb\.HIncrBy\(/, /rdb\.HMGet\(/],
-        },
-        scala: {
-          all: [/redis\.call\(\s*['"]HM?GET['"]/, /redis\.call\(\s*['"]HINCRBY['"]/, /jedis\.eval(sha)?\(/],
-          none: [/jedis\.hincrBy\(/, /jedis\.hmget\(/],
         },
         cpp: {
           all: [/redis\.call\(\s*['"]HM?GET['"]/, /redis\.call\(\s*['"]HINCRBY['"]/, /redis\.eval(sha)?[<(]/],
@@ -152,14 +147,6 @@ a refused placement leaves its record behind.
             /NO_HEARTBEAT/,
           ],
         },
-        scala: {
-          all: [
-            /HeartbeatTtlS/,
-            /\.setex\([^\n]*HeartbeatTtlS|\.ex\(\s*HeartbeatTtlS/,
-            /redis\.call\(\s*['"]EXISTS['"]\s*,\s*KEYS\[2\]\s*\)/,
-            /NO_HEARTBEAT/,
-          ],
-        },
         cpp: {
           all: [
             /kHeartbeatTtlS/,
@@ -179,7 +166,6 @@ a refused placement leaves its record behind.
         python: {all: [/redis\.call\(\s*['"]SISMEMBER['"]/, /redis\.call\(\s*['"]SREM['"]/]},
         typescript: {all: [/redis\.call\(\s*['"]SISMEMBER['"]/, /redis\.call\(\s*['"]SREM['"]/]},
         go: {all: [/redis\.call\(\s*['"]SISMEMBER['"]/, /redis\.call\(\s*['"]SREM['"]/]},
-        scala: {all: [/redis\.call\(\s*['"]SISMEMBER['"]/, /redis\.call\(\s*['"]SREM['"]/]},
         cpp: {all: [/redis\.call\(\s*['"]SISMEMBER['"]/, /redis\.call\(\s*['"]SREM['"]/]},
       },
     },
@@ -200,10 +186,6 @@ a refused placement leaves its record behind.
         go: {
           all: [/NO_CAPACITY/, /redis\.call\(\s*['"]HSET['"]\s*,\s*KEYS\[3\]/],
           none: [/rdb\.HSet\([^\n]*"placement:"/],
-        },
-        scala: {
-          all: [/NO_CAPACITY/, /redis\.call\(\s*['"]HSET['"]\s*,\s*KEYS\[3\]/],
-          none: [/jedis\.hset\([^\n]*s"placement:/],
         },
         cpp: {
           all: [/NO_CAPACITY/, /redis\.call\(\s*['"]HSET['"]\s*,\s*KEYS\[3\]/],
@@ -572,119 +554,6 @@ func release(ctx context.Context, nodeID, placementID string) (bool, error) {
 	keys := []string{"node:" + nodeID, "placement:" + placementID, "node:" + nodeID + ":placements"}
 	moved, err := releaseScript.Run(ctx, rdb, keys, placementID).Int()
 	return moved == 1, err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import scala.jdk.CollectionConverters._
-
-import gpusched.Config.HeartbeatTtlS
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-
-  /** A node joins the fleet (or re-registers after a reboot) with its GPU type and capacity. */
-  def registerNode(nodeId: String, gpuType: String, capacity: Int): Unit = {
-    jedis.hset(s"node:$nodeId", Map("gpu_type" -> gpuType, "capacity" -> capacity.toString).asJava)
-    jedis.hsetnx(s"node:$nodeId", "allocated", "0")
-    jedis.sadd("nodes", nodeId)
-    jedis.set(s"heartbeat:$nodeId", "1")
-  }
-
-  /** The node agent reports in. */
-  def heartbeat(nodeId: String): Unit = jedis.set(s"heartbeat:$nodeId", "1")
-
-  /** Book count GPUs of the node for the placement: ALLOCATED, NO_CAPACITY or NO_HEARTBEAT. */
-  def allocate(nodeId: String, placementId: String, count: Int): String = {
-    jedis.hset(s"placement:$placementId", Map("node_id" -> nodeId, "count" -> count.toString, "status" -> "allocated").asJava)
-    val fields = jedis.hmget(s"node:$nodeId", "capacity", "allocated").asScala
-    val capacity = Option(fields(0)).map(_.toInt).getOrElse(0)
-    val allocated = Option(fields(1)).map(_.toInt).getOrElse(0)
-    if (allocated + count > capacity) return "NO_CAPACITY"
-    jedis.hincrBy(s"node:$nodeId", "allocated", count.toLong)
-    jedis.sadd(s"node:$nodeId:placements", placementId)
-    "ALLOCATED"
-  }
-
-  /** Return the placement's GPUs to the node; true when the counters moved. */
-  def release(nodeId: String, placementId: String): Boolean = {
-    val count = Option(jedis.hget(s"placement:$placementId", "count")).map(_.toLong).getOrElse(0L)
-    jedis.hincrBy(s"node:$nodeId", "allocated", -count)
-    jedis.hset(s"placement:$placementId", "status", "released")
-    jedis.srem(s"node:$nodeId:placements", placementId)
-    true
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import scala.jdk.CollectionConverters._
-
-import gpusched.Config.HeartbeatTtlS
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  // KEYS: node:{id}, heartbeat:{id}, placement:{pid}, node:{id}:placements · ARGV: placement_id, node_id, count
-  val AllocateLua: String =
-    """if redis.call('EXISTS', KEYS[2]) == 0 then
-      |  return 'NO_HEARTBEAT'
-      |end
-      |if redis.call('SISMEMBER', KEYS[4], ARGV[1]) == 1 then
-      |  return 'ALLOCATED'
-      |end
-      |local node = redis.call('HMGET', KEYS[1], 'capacity', 'allocated')
-      |local capacity, allocated, count = tonumber(node[1]) or 0, tonumber(node[2]) or 0, tonumber(ARGV[3])
-      |if allocated + count > capacity then
-      |  return 'NO_CAPACITY'
-      |end
-      |redis.call('HINCRBY', KEYS[1], 'allocated', count)
-      |redis.call('HSET', KEYS[3], 'node_id', ARGV[2], 'count', ARGV[3], 'status', 'allocated')
-      |redis.call('SADD', KEYS[4], ARGV[1])
-      |return 'ALLOCATED'
-      |""".stripMargin
-
-  // KEYS: node:{id}, placement:{pid}, node:{id}:placements · ARGV: placement_id
-  val ReleaseLua: String =
-    """if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 0 then
-      |  return 0
-      |end
-      |local count = tonumber(redis.call('HGET', KEYS[2], 'count')) or 0
-      |redis.call('HINCRBY', KEYS[1], 'allocated', -count)
-      |redis.call('HSET', KEYS[2], 'status', 'released')
-      |redis.call('SREM', KEYS[3], ARGV[1])
-      |return 1
-      |""".stripMargin
-
-  /** A node joins the fleet (or re-registers after a reboot) with its GPU type and capacity. */
-  def registerNode(nodeId: String, gpuType: String, capacity: Int): Unit = {
-    jedis.hset(s"node:$nodeId", Map("gpu_type" -> gpuType, "capacity" -> capacity.toString).asJava)
-    jedis.hsetnx(s"node:$nodeId", "allocated", "0")
-    jedis.sadd("nodes", nodeId)
-    jedis.setex(s"heartbeat:$nodeId", HeartbeatTtlS, "1")
-  }
-
-  /** The node agent reports in. */
-  def heartbeat(nodeId: String): Unit = jedis.setex(s"heartbeat:$nodeId", HeartbeatTtlS, "1")
-
-  /** Book count GPUs of the node for the placement: ALLOCATED, NO_CAPACITY or NO_HEARTBEAT. */
-  def allocate(nodeId: String, placementId: String, count: Int): String = {
-    val keys = List(s"node:$nodeId", s"heartbeat:$nodeId", s"placement:$placementId", s"node:$nodeId:placements").asJava
-    val args = List(placementId, nodeId, count.toString).asJava
-    jedis.eval(AllocateLua, keys, args).toString
-  }
-
-  /** Return the placement's GPUs to the node; true when the counters moved. */
-  def release(nodeId: String, placementId: String): Boolean = {
-    val keys = List(s"node:$nodeId", s"placement:$placementId", s"node:$nodeId:placements").asJava
-    jedis.eval(ReleaseLua, keys, List(placementId).asJava).asInstanceOf[java.lang.Long] == 1L
-  }
 }
 `,
     },

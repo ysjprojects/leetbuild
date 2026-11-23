@@ -52,7 +52,6 @@ times looks like twenty users.
         python: {all: [/@app\.post\(\s*["']\/v1\/turn["']/, /"answered"/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/turn['"]/, /'answered'/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/turn"/, /"answered"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"turn"\s*\)/, /"answered"/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/turn"/, /"answered"/]},
       },
     },
@@ -65,7 +64,6 @@ times looks like twenty users.
         python: {all: [/"blocked_input"/], order: [/tiers\.evaluate\(body\.question/, /model\.complete\(/]},
         typescript: {all: [/'blocked_input'/], order: [/evaluate\(body\.question/, /\bcomplete\(/]},
         go: {all: [/"blocked_input"/], order: [/tiers\.Evaluate\([^\n]*body\.Question/, /model\.Complete\(/]},
-        scala: {all: [/"blocked_input"/], order: [/Tiers\.evaluate\(question/, /Model\.complete\(/]},
         cpp: {all: [/"blocked_input"/], order: [/tiers::evaluate\(question/, /model::complete\(/]},
       },
     },
@@ -78,7 +76,6 @@ times looks like twenty users.
         python: {all: [/FALLBACK_MESSAGE/, /"blocked_output"/], none: [/WARNING_NOTE/, /answer\s*\+/]},
         typescript: {all: [/FALLBACK_MESSAGE/, /'blocked_output'/], none: [/WARNING_NOTE/, /answer\s*\+/]},
         go: {all: [/fallbackMessage/, /"blocked_output"/], none: [/warningNote/, /answer\s*\+/]},
-        scala: {all: [/FallbackMessage/, /"blocked_output"/], none: [/WarningNote/, /answer\s*\+/]},
         cpp: {all: [/kFallbackMessage/, /"blocked_output"/], none: [/kWarningNote/, /answer\s*\+/]},
       },
     },
@@ -100,10 +97,6 @@ times looks like twenty users.
           all: [/maxRegenerations\s*=\s*1\b/, /<\s*maxRegenerations/],
           order: [/Complete\([^\n]*fhaInstructions\)/, /tiers\.Evaluate\([^\n]*\banswer\b/],
         },
-        scala: {
-          all: [/MaxRegenerations\s*=\s*1\b/, /until\s+MaxRegenerations|<\s*MaxRegenerations/],
-          order: [/complete\([^)]*FhaInstructions\)/, /Tiers\.evaluate\(\w*[aA]nswer/],
-        },
         cpp: {
           all: [/kMaxRegenerations\s*=\s*1\b/, /<\s*kMaxRegenerations/],
           order: [/complete\([^)]*kFhaInstructions\)/, /tiers::evaluate\(answer/],
@@ -119,7 +112,6 @@ times looks like twenty users.
         python: {all: [/REVIEW_AFTER_STRIKES\s*=\s*3\b/, /cache\.record_strike\(/, /store\.enqueue_review\(/]},
         typescript: {all: [/REVIEW_AFTER_STRIKES\s*=\s*3\b/, /recordStrike\(/, /enqueueReview\(/]},
         go: {all: [/reviewAfterStrikes\s*=\s*3\b/, /cache\.RecordStrike\(/, /store\.EnqueueReview\(/]},
-        scala: {all: [/ReviewAfterStrikes\s*=\s*3\b/, /Cache\.recordStrike\(/, /Store\.enqueueReview\(/]},
         cpp: {all: [/kReviewAfterStrikes\s*=\s*3\b/, /cache::recordStrike\(/, /store::enqueueReview\(/]},
       },
     },
@@ -436,105 +428,6 @@ func turn(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/turn", turn)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import fhguard.{Cache, Model, Tiers} // activeVersion(), recordStrike(id); complete(question, instructions); evaluate(text, version)
-
-object SteerAway {
-  val WarningNote = "Note: parts of this answer may touch on characteristics protected by fair housing law."
-
-  private def respond(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def reply(conversationId: String, answer: String, outcome: String, reasons: Seq[String], escalated: Boolean, version: String): JsObject =
-    JsObject(
-      "conversation_id" -> JsString(conversationId),
-      "answer" -> JsString(answer),
-      "outcome" -> JsString(outcome),
-      "reasons" -> JsArray(reasons.map(JsString(_)).toVector),
-      "escalated" -> JsBoolean(escalated),
-      "policy_version" -> JsString(version),
-    )
-
-  val route: Route = path("v1" / "turn") {
-    post {
-      entity(as[String]) { raw =>
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        val body = raw.parseJson.asJsObject.fields
-        val conversationId = body.get("conversation_id").collect { case JsString(s) => s }.getOrElse("")
-        val question = body.get("question").collect { case JsString(s) => s }.getOrElse("")
-        val version = Cache.activeVersion().getOrElse("")
-        val answer = Model.complete(question)
-        val outbound = Tiers.evaluate(answer, version)
-        if (!outbound.allowed) complete(respond(reply(conversationId, answer + "\\n\\n" + WarningNote, "flagged", outbound.reasons, escalated = false, version)))
-        else complete(respond(reply(conversationId, answer, "answered", Seq.empty, escalated = false, version)))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import fhguard.{Cache, Model, Store, Tiers} // activeVersion(), recordStrike(id); complete(question, instructions); enqueueReview; evaluate(text, version)
-
-object SteerAway {
-  val MaxRegenerations = 1
-  val ReviewAfterStrikes = 3
-  val FhaInstructions = "Answer without breaking fair housing law: do not describe, rank or recommend homes, neighborhoods or lenders by race, color, religion, sex, disability, familial status, national origin, age or source of income, and do not guess those traits about the user."
-  val FallbackMessage = "I cannot help with that part of the request: fair housing law prohibits steering a home search by protected characteristics. I can help with price, size, commute and listing details."
-
-  private def respond(body: JsObject): HttpResponse =
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def reply(conversationId: String, answer: String, outcome: String, reasons: Seq[String], escalated: Boolean, version: String): JsObject =
-    JsObject(
-      "conversation_id" -> JsString(conversationId),
-      "answer" -> JsString(answer),
-      "outcome" -> JsString(outcome),
-      "reasons" -> JsArray(reasons.map(JsString(_)).toVector),
-      "escalated" -> JsBoolean(escalated),
-      "policy_version" -> JsString(version),
-    )
-
-  private def steerAway(conversationId: String, outcome: String, decision: Store.Decision, version: String): JsObject = {
-    val strikes = Cache.recordStrike(conversationId)
-    if (strikes == ReviewAfterStrikes) Store.enqueueReview(conversationId, strikes)
-    reply(conversationId, FallbackMessage, outcome, decision.reasons, strikes >= ReviewAfterStrikes, version)
-  }
-
-  private def answerTurn(conversationId: String, question: String, version: String): JsObject = {
-    val inbound = Tiers.evaluate(question, version)
-    if (!inbound.allowed) return steerAway(conversationId, "blocked_input", inbound, version)
-    var answer = Model.complete(question)
-    var outbound = Tiers.evaluate(answer, version)
-    for (_ <- 0 until MaxRegenerations if !outbound.allowed) {
-      answer = Model.complete(question, FhaInstructions)
-      outbound = Tiers.evaluate(answer, version)
-    }
-    if (!outbound.allowed) steerAway(conversationId, "blocked_output", outbound, version)
-    else reply(conversationId, answer, "answered", Seq.empty, escalated = false, version)
-  }
-
-  val route: Route = path("v1" / "turn") {
-    post {
-      entity(as[String]) { raw =>
-        val body = raw.parseJson.asJsObject.fields
-        val conversationId = body.get("conversation_id").collect { case JsString(s) => s }.getOrElse("")
-        val question = body.get("question").collect { case JsString(s) => s }.getOrElse("")
-        complete(respond(answerTurn(conversationId, question, Cache.activeVersion().getOrElse(""))))
-      }
-    }
-  }
 }
 `,
     },

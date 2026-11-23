@@ -53,7 +53,6 @@ every account forever.
         python: {all: [/def apply_usage\(/, /window_key\(/, /record_key\(/]},
         typescript: {all: [/function applyUsage\(/, /windowKey\(/, /recordKey\(/]},
         go: {all: [/func applyUsage\(/, /ledger\.WindowKey\(/, /ledger\.RecordKey\(/]},
-        scala: {all: [/def applyUsage\(/, /Ledger\.windowKey\(/, /Ledger\.recordKey\(/]},
         cpp: {all: [/applyUsage\(/, /ledger::windowKey\(/, /ledger::recordKey\(/]},
       },
     },
@@ -75,10 +74,6 @@ every account forever.
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]EXISTS['"]/, /redis\.call\(\s*['"]HINCRBY['"]/],
           none: [/rdb\.Exists\(/, /rdb\.HIncrBy\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]EXISTS['"]/, /redis\.call\(\s*['"]HINCRBY['"]/],
-          none: [/jedis\.exists\(/, /jedis\.hincrBy\(/],
-        },
         cpp: {
           all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]EXISTS['"]/, /redis\.call\(\s*['"]HINCRBY['"]/],
           none: [/redis\.exists\(/, /redis\.hincrby\(/],
@@ -94,7 +89,6 @@ every account forever.
         python: {all: [/total\s*>\s*cap/, /['"]overage['"]/], none: [/total\s*\+\s*units\s*>\s*cap/]},
         typescript: {all: [/total\s*>\s*cap/, /['"]overage['"]/], none: [/total\s*\+\s*units\s*>\s*cap/]},
         go: {all: [/total\s*>\s*cap/, /['"]overage['"]/], none: [/total\s*\+\s*units\s*>\s*(cap|planCap)/]},
-        scala: {all: [/total\s*>\s*cap/, /['"]overage['"]/], none: [/total\s*\+\s*units\s*>\s*cap/]},
         cpp: {all: [/total\s*>\s*cap/, /['"]overage['"]/], none: [/total\s*\+\s*units\s*>\s*cap/]},
       },
     },
@@ -107,7 +101,6 @@ every account forever.
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /RETAIN_SECONDS/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /RETAIN_SECONDS/]},
         go: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /ledger\.RetainSeconds/]},
-        scala: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /Ledger\.RetainSeconds/]},
         cpp: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /ledger::kRetainSeconds/]},
       },
     },
@@ -330,75 +323,6 @@ func applyUsage(ctx context.Context, account, requestID, route string, units int
 		return ledger.Applied{}, err
 	}
 	return ledger.Applied{Counted: out[0] == 1, Total: out[1], Cap: out[2], Over: out[3] == 1, Window: window}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import metering.Ledger // Ledger.currentWindow, windowKey, recordKey, planCap, RetainSeconds, Applied
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Count one report once in the current window. */
-  def applyUsage(account: String, requestId: String, route: String, units: Long, gateway: String): Ledger.Applied = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    val window = Ledger.currentWindow()
-    val key = Ledger.windowKey(account, window)
-    val cap = Ledger.planCap(account)
-    val total = Option(jedis.hget(key, "units")).map(_.toLong).getOrElse(0L)
-    if (jedis.exists(Ledger.recordKey(account, requestId))) Ledger.Applied(counted = false, total, cap, total > cap, window)
-    else if (total + units > cap) Ledger.Applied(counted = false, total, cap, over = true, window)
-    else {
-      val record = Map("request_id" -> requestId, "account" -> account, "route" -> route, "units" -> units.toString, "gateway" -> gateway, "window" -> window.toString)
-      jedis.hset(Ledger.recordKey(account, requestId), record.asJava)
-      val counted = jedis.hincrBy(key, "units", units)
-      jedis.hset(key, Map("cap" -> cap.toString, "overage" -> "0").asJava)
-      Ledger.Applied(counted = true, counted, cap, over = false, window)
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import metering.Ledger // Ledger.currentWindow, windowKey, recordKey, planCap, RetainSeconds, Applied
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** KEYS[1] usage:{account}:{window}, KEYS[2] usage:record:{account}:{request_id}; ARGV units, cap, retain seconds, window, request_id, account, route, gateway. */
-  val ApplyLua: String =
-    """local cap = tonumber(ARGV[2])
-      |if redis.call('EXISTS', KEYS[2]) == 1 then
-      |  local seen = tonumber(redis.call('HGET', KEYS[1], 'units') or '0')
-      |  local was = 0
-      |  if seen > cap then was = 1 end
-      |  return {0, seen, cap, was}
-      |end
-      |redis.call('HSET', KEYS[2], 'request_id', ARGV[5], 'account', ARGV[6], 'route', ARGV[7], 'units', ARGV[1], 'gateway', ARGV[8], 'window', ARGV[4])
-      |redis.call('EXPIRE', KEYS[2], ARGV[3])
-      |local total = redis.call('HINCRBY', KEYS[1], 'units', ARGV[1])
-      |local over = 0
-      |if total > cap then over = 1 end
-      |redis.call('HSET', KEYS[1], 'cap', cap, 'overage', over)
-      |if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], ARGV[3]) end
-      |return {1, total, cap, over}
-      |""".stripMargin
-
-  /** Count one report once in the current window. */
-  def applyUsage(account: String, requestId: String, route: String, units: Long, gateway: String): Ledger.Applied = {
-    val window = Ledger.currentWindow()
-    val keys = List(Ledger.windowKey(account, window), Ledger.recordKey(account, requestId)).asJava
-    val args = List(units.toString, Ledger.planCap(account).toString, Ledger.RetainSeconds.toString, window.toString, requestId, account, route, gateway).asJava
-    // One script: nothing can land between the dedupe, the record and the count.
-    val out = jedis.eval(ApplyLua, keys, args).asInstanceOf[java.util.List[java.lang.Long]].asScala.map(_.longValue)
-    Ledger.Applied(out(0) == 1L, out(1), out(2), out(3) == 1L, window)
-  }
 }
 `,
     },

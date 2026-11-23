@@ -1,9 +1,8 @@
 import {CPP_IDS_H} from '../cpp-support';
-import {scalaPath} from '../scala-support';
 
 /**
  * Support modules of the semantic cache, the `semcache` package: `vectors`, the cosine similarity
- * every step and every harness measure a hit by (the same arithmetic in the five languages), and for
+ * every step and every harness measure a hit by (the same arithmetic in the four languages), and for
  * C++ the headers that declare what one step defines and the others call (`state.h`: the store of
  * step 2; `events.h`: the result stream of step 4), so each step compiles alone and the harness
  * stands in for its neighbours.
@@ -166,20 +165,5 @@ struct ProduceRejected : std::runtime_error {
 
 // Publish one event keyed by tenant; throws ProduceRejected after writing the outbox row.
 void publish_result(const std::string& tenant, const ResultEvent& result);
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('semcache', 'Vectors')]: `package semcache
-
-/** ${COSINE_DOC} */
-object Vectors {
-  def cosine(a: Seq[Double], b: Seq[Double]): Double = {
-    if (a.length != b.length || a.isEmpty) return 0.0
-    val dot = a.zip(b).map { case (x, y) => x * y }.sum
-    val norm = math.sqrt(a.map(x => x * x).sum) * math.sqrt(b.map(y => y * y).sum)
-    if (norm > 0) dot / norm else 0.0
-  }
-}
 `,
 };

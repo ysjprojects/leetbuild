@@ -58,7 +58,6 @@ operations view.
         python: {all: [/@app\.get\(\s*["']\/v1\/shipments\/\{shipment_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/shipments\/:shipmentId['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/shipments\/\{id\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"shipments"\s*\/\s*Segment\s*\)/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/shipments\//]},
       },
     },
@@ -71,7 +70,6 @@ operations view.
         python: {all: [/x-tenant-id/i, /tenant_id/, /\b401\b/]},
         typescript: {all: [/x-tenant-id/i, /tenant_id/, /\b401\b/]},
         go: {all: [/X-Tenant-Id/i, /TenantID/, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/X-Tenant-Id/i, /tenantId/, /Unauthorized|\b401\b/]},
         cpp: {all: [/X-Tenant-Id/i, /tenant_id/, /\b401\b/]},
       },
     },
@@ -90,10 +88,6 @@ operations view.
           none: [/status:\s*shipment\.status\b/, /shipment\.status\s*===\s*'delivered'/],
         },
         go: {all: [/store\.Scans\(/], none: [/"status":\s*shipment\.Status/, /shipment\.Status\s*==\s*"delivered"/]},
-        scala: {
-          all: [/Store\.scans\(/],
-          none: [/"status"\s*->\s*JsString\(shipment\.status\)/, /shipment\.status\s*==\s*"delivered"/],
-        },
         cpp: {
           all: [/store::scans\(/],
           none: [/\{"status",\s*shipment(->|\.)status\}/, /shipment(->|\.)status\s*==\s*"delivered"/],
@@ -109,7 +103,6 @@ operations view.
         python: {all: [/OPS_TOKEN/, /def operations_view\(/]},
         typescript: {all: [/OPS_TOKEN/, /function operationsView\(/]},
         go: {all: [/opsToken/, /func operationsView\(/]},
-        scala: {all: [/OpsToken/, /def operationsView\(/]},
         cpp: {all: [/kOpsToken/, /json operationsView\(/]},
       },
     },
@@ -130,10 +123,6 @@ operations view.
         go: {
           all: [/func customerView\(/],
           none: [/func customerView(?:(?!\n\})[\s\S])*?(carrier_error|LastError|PollHealth)/],
-        },
-        scala: {
-          all: [/def customerView\(/],
-          none: [/def customerView(?:(?!\n {2}def |\n {2}val )[\s\S])*?(carrier_error|lastError|pollHealth)/],
         },
         cpp: {
           all: [/json customerView\(/],
@@ -401,94 +390,6 @@ func readShipment(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/shipments/{id}", readShipment)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import shipments.Store // Store.getShipment, scans, rejects, pollHealth
-
-object Read {
-  val route: Route = path("v1" / "shipments" / Segment) { shipmentId =>
-    get {
-      optionalHeaderValueByName("X-Ops-Token") { opsHeader =>
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        Store.getShipment(shipmentId) match {
-          case None => complete(StatusCodes.NotFound -> "no such shipment")
-          case Some(shipment) =>
-            val health = Store.pollHealth(shipmentId, System.currentTimeMillis() / 1000)
-            val base = Map(
-              "shipment_id" -> JsString(shipmentId),
-              "status" -> JsString(shipment.status),
-              "delivered" -> JsBoolean(shipment.status == "delivered"),
-              "timeline" -> JsArray(Store.scans(shipmentId).map(_.toJson).toVector),
-              "carrier_error" -> JsString(health.lastError))
-            val view =
-              if (opsHeader.isDefined) base ++ Map("poll_health" -> health.toJson, "rejects" -> JsArray(Store.rejects(shipmentId).map(JsString(_)).toVector))
-              else base
-            complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, JsObject(view).compactPrint)))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import shipments.Store // Store.getShipment, scans, rejects, pollHealth
-
-object Read {
-  val OpsToken = "ops-7f3a9c"
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** The status the applied scans prove: the latest one, label before any. */
-  def statusFromScans(scans: Seq[Store.Scan]): String = scans.lastOption.map(_.status).getOrElse("label")
-
-  def customerView(shipment: Store.Shipment, scans: Seq[Store.Scan]): JsObject = {
-    val status = statusFromScans(scans)
-    JsObject("shipment_id" -> JsString(shipment.shipmentId), "status" -> JsString(status), "delivered" -> JsBoolean(status == "delivered"),
-      "timeline" -> JsArray(scans.map(_.toJson).toVector))
-  }
-
-  def operationsView(shipment: Store.Shipment, scans: Seq[Store.Scan], now: Long): JsObject = {
-    val health = Store.pollHealth(shipment.shipmentId, now)
-    JsObject(customerView(shipment, scans).fields ++ Map(
-      "poll_health" -> health.toJson,
-      "carrier_error" -> JsString(health.lastError),
-      "rejects" -> JsArray(Store.rejects(shipment.shipmentId).map(JsString(_)).toVector),
-      "reconciliation" -> JsBoolean(shipment.status != statusFromScans(scans)))) // an override or a stale writer
-  }
-
-  private def read(shipmentId: String, tenant: String, opsToken: Option[String]): HttpResponse =
-    if (tenant.isEmpty) json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required")))
-    else
-      // Missing and foreign are one answer: an id another tenant owns cannot be told from one that does not exist.
-      Store.getShipment(shipmentId).filter(_.tenantId == tenant) match {
-        case None => json(StatusCodes.NotFound, JsObject("error" -> JsString("no such shipment")))
-        case Some(shipment) =>
-          val scans = Store.scans(shipmentId)
-          if (opsToken.contains(OpsToken)) json(StatusCodes.OK, operationsView(shipment, scans, System.currentTimeMillis() / 1000))
-          else json(StatusCodes.OK, customerView(shipment, scans))
-      }
-
-  val route: Route = path("v1" / "shipments" / Segment) { shipmentId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        optionalHeaderValueByName("X-Ops-Token") { opsToken =>
-          complete(read(shipmentId, tenant.getOrElse(""), opsToken))
-        }
-      }
-    }
-  }
 }
 `,
     },

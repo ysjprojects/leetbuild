@@ -129,7 +129,7 @@ const languageOption = (language: Language): {value: Language; label: string} =>
   label: LANGUAGE_LABEL[language],
 });
 
-/** The five languages as `Select` options, shared by every language picker. */
+/** The course languages as `Select` options, shared by every language picker. */
 export const LANGUAGE_OPTIONS = LANGUAGES.map(languageOption);
 
 export const linkClass = 'text-iris-300 underline decoration-iris-400/50 hover:text-iris-200';

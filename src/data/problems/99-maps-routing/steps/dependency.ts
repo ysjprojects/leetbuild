@@ -61,7 +61,6 @@ service RoutingEngine { rpc ComputeRoute(ComputeRouteRequest) returns (ComputeRo
         python: {all: [/DEADLINE_S\s*=\s*1\.5/, /ComputeRoute\([\s\S]{0,120}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*1500/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*1500\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*deadline\)/]},
-        scala: {all: [/DeadlineMs\s*=\s*1500/, /withDeadlineAfter\(\s*DeadlineMs/]},
         cpp: {all: [/kDeadline\{1500\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -83,10 +82,6 @@ service RoutingEngine { rpc ComputeRoute(ComputeRouteRequest) returns (ComputeRo
           all: [/maxAttempts\s*=\s*3/, /attempt\s*<\s*maxAttempts/, /codes\.Unavailable/, /codes\.DeadlineExceeded/],
           none: [/attempt\s*<\s*5/],
         },
-        scala: {
-          all: [/MaxAttempts\s*=\s*3/, /attempt\s*<\s*MaxAttempts/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/],
-          none: [/attempt\s*<\s*5/],
-        },
         cpp: {
           all: [/kMaxAttempts\s*=\s*3/, /attempt\s*<\s*kMaxAttempts/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/],
           none: [/attempt\s*<\s*5/],
@@ -102,7 +97,6 @@ service RoutingEngine { rpc ComputeRoute(ComputeRouteRequest) returns (ComputeRo
         python: {all: [/StatusCode\.NOT_FOUND/, /raise NoRoute/]},
         typescript: {all: [/grpc\.status\.NOT_FOUND/, /throw new NoRoute/]},
         go: {all: [/codes\.NotFound/, /return geo\.Route\{\},\s*(fmt\.Errorf\("%w[^\n]*ErrNoRoute|ErrNoRoute)/]},
-        scala: {all: [/Status\.Code\.NOT_FOUND/, /throw new NoRoute/]},
         cpp: {all: [/StatusCode::NOT_FOUND/, /throw NoRoute/]},
       },
     },
@@ -115,7 +109,6 @@ service RoutingEngine { rpc ComputeRoute(ComputeRouteRequest) returns (ComputeRo
         python: {all: [/return straight_line\(origin, destination, epoch\)/], none: [/last_known/]},
         typescript: {all: [/return straightLine\(origin, destination, epoch\)/], none: [/lastKnown/]},
         go: {all: [/return straightLine\(origin, destination, epoch\)/], none: [/lastKnown/]},
-        scala: {all: [/straightLine\(origin, destination, epoch\)/], none: [/lastKnown/]},
         cpp: {all: [/return straightLine\(origin, destination, epoch\)/], none: [/last_known/]},
       },
     },
@@ -443,101 +436,6 @@ func computeRoute(ctx context.Context, origin, destination geo.Point, waypoints 
 		}
 	}
 	return straightLine(origin, destination, epoch), nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import mapsd.Geo // Geo.Point, Geo.Route, Geo.haversineM
-import mapsrouting.maps_routing.{ComputeRouteRequest, LatLng, RoutingEngineGrpc}
-
-/** No road connects the points: terminal, a retry or an estimate cannot invent one. */
-final class NoRoute(message: String) extends Exception(message)
-
-object EngineClient {
-  val FallbackSpeedMps = 13.9
-
-  private val engine = RoutingEngineGrpc.blockingStub(ManagedChannelBuilder.forAddress("engine", 9000).usePlaintext().build())
-
-  /** The last route the engine answered: better than nothing while it is down. */
-  private var lastKnown: Option[Geo.Route] = None
-
-  /** The great-circle estimate, marked degraded: what to answer when the engine cannot. */
-  def straightLine(origin: Geo.Point, destination: Geo.Point, epoch: Long): Geo.Route = {
-    val distance = Geo.haversineM(origin, destination)
-    Geo.Route(distance, distance / FallbackSpeedMps, "", epoch, "straight-line", degraded = true)
-  }
-
-  private def latLng(p: Geo.Point): LatLng = LatLng(p.lat, p.lng)
-
-  /** The engine's route for the trip at the traffic epoch, or the degraded estimate. */
-  def computeRoute(origin: Geo.Point, destination: Geo.Point, waypoints: Seq[Geo.Point], epoch: Long): Geo.Route = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val request = ComputeRouteRequest(Some(latLng(origin)), Some(latLng(destination)), waypoints.map(latLng), epoch)
-    var attempt = 0
-    var result: Option[Geo.Route] = None
-    while (result.isEmpty && attempt < 5) {
-      attempt += 1
-      try {
-        val reply = engine.computeRoute(request)
-        result = Some(Geo.Route(reply.distanceM, reply.durationS, reply.geometry, epoch, reply.engineVersion, degraded = false))
-        lastKnown = result
-      } catch {
-        case _: StatusRuntimeException => ()
-      }
-    }
-    result.orElse(lastKnown).getOrElse(straightLine(origin, destination, epoch))
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import mapsd.Geo // Geo.Point, Geo.Route, Geo.haversineM
-import mapsrouting.maps_routing.{ComputeRouteRequest, LatLng, RoutingEngineGrpc}
-
-/** No road connects the points: terminal, a retry or an estimate cannot invent one. */
-final class NoRoute(message: String) extends Exception(message)
-
-object EngineClient {
-  val DeadlineMs = 1500L
-  val MaxAttempts = 3
-  val FallbackSpeedMps = 13.9
-
-  private val engine = RoutingEngineGrpc.blockingStub(ManagedChannelBuilder.forAddress("engine", 9000).usePlaintext().build())
-
-  /** The great-circle estimate, marked degraded: what to answer when the engine cannot. */
-  def straightLine(origin: Geo.Point, destination: Geo.Point, epoch: Long): Geo.Route = {
-    val distance = Geo.haversineM(origin, destination)
-    Geo.Route(distance, distance / FallbackSpeedMps, "", epoch, "straight-line", degraded = true)
-  }
-
-  private def latLng(p: Geo.Point): LatLng = LatLng(p.lat, p.lng)
-
-  /** The engine's route for the trip at the traffic epoch, or the degraded estimate. */
-  def computeRoute(origin: Geo.Point, destination: Geo.Point, waypoints: Seq[Geo.Point], epoch: Long): Geo.Route = {
-    val request = ComputeRouteRequest(Some(latLng(origin)), Some(latLng(destination)), waypoints.map(latLng), epoch)
-    var attempt = 0
-    var giveUp = false
-    var result: Option[Geo.Route] = None
-    while (result.isEmpty && !giveUp && attempt < MaxAttempts) {
-      attempt += 1
-      try {
-        val reply = engine.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).computeRoute(request)
-        result = Some(Geo.Route(reply.distanceM, reply.durationS, reply.geometry, epoch, reply.engineVersion, degraded = false))
-      } catch {
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.NOT_FOUND =>
-          throw new NoRoute(Option(e.getStatus.getDescription).getOrElse("no route")) // no road: a retry cannot invent one
-        case e: StatusRuntimeException =>
-          val code = e.getStatus.getCode
-          // Anything but UNAVAILABLE or DEADLINE_EXCEEDED: the engine refused this request, retrying would only add load.
-          giveUp = code != Status.Code.UNAVAILABLE && code != Status.Code.DEADLINE_EXCEEDED
-      }
-    }
-    result.getOrElse(straightLine(origin, destination, epoch))
-  }
 }
 `,
     },

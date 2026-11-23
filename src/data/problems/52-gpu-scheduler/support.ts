@@ -1,8 +1,6 @@
-import {scalaPath} from '../scala-support';
-
 /**
  * The `gpusched` support package: the constants, key scheme and addresses every step of the GPU
- * scheduler agrees on, in five languages. The node agent's protos are generated beside it
+ * scheduler agrees on, in four languages. The node agent's protos are generated beside it
  * (`proto.ts`). C++ also gets `state.h`, the ledger's declarations as the later steps call them
  * (step 2 defines them; the other steps' harnesses stand in for it).
  */
@@ -150,36 +148,6 @@ std::string allocate(const std::string& node_id, const std::string& placement_id
 bool release(const std::string& node_id, const std::string& placement_id);
 `;
 
-const SCALA_CONFIG = `package gpusched
-
-/** Constants every step of the GPU scheduler agrees on.
-  *
-  * Redis keys:
-  *   nodes                     set of node ids the scheduler may place on
-  *   node:{id}                 hash: gpu_type, capacity, allocated
-  *   heartbeat:{id}            "1" with a TTL of HeartbeatTtlS; while it exists the node is alive
-  *   placement:{pid}           hash: node_id, count, status (allocated | running | released)
-  *   node:{id}:placements      set of placement ids allocated on the node and not released
-  *   token:{token}             hash: scope (operator | tenant), tenant
-  *   outbox:gpu.placement      list of events the broker refused, relayed later
-  */
-object Config {
-  val KnownGpuTypes: Set[String] = Set("a100", "h100", "l40s")
-  val MaxNodeGpus = 8
-  val HeartbeatTtlS = 30L
-  val StartDeadlineMillis = 20000L
-  val HealthPollMillis = 1000L
-  val MaxStartAttempts = 3
-  val AgentPort = 50051
-  val Topic = "gpu.placement"
-  val Outbox = "outbox:gpu.placement"
-  val RebuildGroup = "utilization-rebuild"
-
-  /** The node agent's address: one instance per node. */
-  def agentTarget(nodeId: String): String = s"$nodeId:$AgentPort"
-}
-`;
-
 export const supportModulesPy: Record<string, string> = {
   'gpusched/__init__.py': '',
   'gpusched/config.py': PY_CONFIG,
@@ -196,8 +164,4 @@ export const supportModulesGo: Record<string, string> = {
 export const supportModulesCpp: Record<string, string> = {
   'gpusched/config.h': CPP_CONFIG,
   'state.h': CPP_STATE_H,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('gpusched', 'Config')]: SCALA_CONFIG,
 };

@@ -6,7 +6,7 @@ import {trainingStateStep} from './steps/2-state';
 import {trainingDependencyStep} from './steps/3-dependency';
 import {trainingEventsStep} from './steps/4-events';
 import {trainingReadStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Training scheduler: the course is not "accept a training job", it is the debugging you owe a
@@ -96,6 +96,5 @@ accounting, the checkpoint format, and the relay that drains the outbox.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

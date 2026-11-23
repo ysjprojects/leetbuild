@@ -55,7 +55,6 @@ workers run it at once; a completed job comes back after its deadline and runs a
         python: {all: [/VISIBILITY_TIMEOUT_S/, /jobs:inflight/]},
         typescript: {all: [/VISIBILITY_TIMEOUT_S/, /jobs:inflight/]},
         go: {all: [/visibilityTimeoutS/, /jobs:inflight/]},
-        scala: {all: [/VisibilityTimeoutS/, /jobs:inflight/]},
         cpp: {all: [/kVisibilityTimeoutS/, /jobs:inflight/]},
       },
     },
@@ -68,7 +67,6 @@ workers run it at once; a completed job comes back after its deadline and runs a
         python: {all: [/redis\.call\(\s*['"]LPOP['"]/, /register_script\(|\.eval\(/], none: [/\br\.lpop\(/]},
         typescript: {all: [/redis\.call\(\s*['"]LPOP['"]/, /defineCommand\(|\.eval\(/], none: [/redis\.lpop\(/]},
         go: {all: [/redis\.call\(\s*'LPOP'/, /redis\.NewScript\(/], none: [/\.LPop\(/]},
-        scala: {all: [/redis\.call\(\s*'LPOP'/, /jedis\.eval\(/], none: [/jedis\.lpop\(/]},
         cpp: {all: [/redis\.call\(\s*'LPOP'/, /redis\.eval</], none: [/redis\.lpop\(/]},
       },
     },
@@ -81,7 +79,6 @@ workers run it at once; a completed job comes back after its deadline and runs a
         python: {all: [/redis\.call\(\s*['"]ZREM['"][^)]*\)\s*==\s*1/], none: [/\br\.lpush\(/]},
         typescript: {all: [/redis\.call\(\s*['"]ZREM['"][^)]*\)\s*==\s*1/], none: [/redis\.lpush\(/]},
         go: {all: [/redis\.call\(\s*'ZREM'[^)]*\)\s*==\s*1/], none: [/\.LPush\(/]},
-        scala: {all: [/redis\.call\(\s*'ZREM'[^)]*\)\s*==\s*1/], none: [/jedis\.lpush\(/]},
         cpp: {all: [/redis\.call\(\s*'ZREM'[^)]*\)\s*==\s*1/], none: [/redis\.lpush\(/]},
       },
     },
@@ -94,7 +91,6 @@ workers run it at once; a completed job comes back after its deadline and runs a
         python: {all: [/ACK_LUA\s*=\s*"""(?:(?!""")[\s\S])*ZREM/]},
         typescript: {all: [/ACK_LUA\s*=\s*`[^`]*ZREM/]},
         go: {all: [/ackScript\s*=\s*redis\.NewScript\(`[^`]*ZREM/]},
-        scala: {all: [/AckLua[^=]*=\s*"""(?:(?!""")[\s\S])*ZREM/]},
         cpp: {all: [/kAckLua\s*=\s*R"lua\((?:(?!\)lua")[\s\S])*ZREM/]},
       },
     },
@@ -455,110 +451,6 @@ func ack(ctx context.Context, jobID, worker string) (bool, error) {
 // returnExpired puts every claim past its deadline back at the head of the queue; the ids returned.
 func returnExpired(ctx context.Context) ([]string, error) {
 	return returnScript.Run(ctx, rdb, []string{inflightKey, queueKey}, time.Now().UnixMilli()).StringSlice()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val QueueKey = "jobs:queue"
-  val InflightKey = "jobs:inflight"
-  val VisibilityTimeoutS = 60L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  val AckLua: String =
-    """if redis.call('HGET', KEYS[2], 'worker') ~= ARGV[1] then return 0 end
-      |redis.call('HSET', KEYS[2], 'state', 'completed')
-      |return 1
-      |""".stripMargin
-
-  /** Move the next queued job into jobs:inflight under the visibility timeout; its id, if one was queued. */
-  def claim(worker: String): Option[String] = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    Option(jedis.lpop(QueueKey)).map { jobId =>
-      val deadline = System.currentTimeMillis + VisibilityTimeoutS * 1000
-      jedis.zadd(InflightKey, deadline.toDouble, jobId)
-      jedis.hset(s"job:$jobId", Map("state" -> "running", "worker" -> worker, "deadline_ms" -> deadline.toString).asJava)
-      jobId
-    }
-  }
-
-  /** Complete the job if worker still holds its claim; false when the claim is gone. */
-  def ack(jobId: String, worker: String): Boolean =
-    jedis.eval(AckLua, List(InflightKey, s"job:$jobId").asJava, List(worker, jobId).asJava).asInstanceOf[java.lang.Long] == 1L
-
-  /** Put every claim past its deadline back at the head of the queue; the ids returned. */
-  def returnExpired(): Seq[String] = {
-    val expired = jedis.zrangeByScore(InflightKey, "-inf", System.currentTimeMillis.toString).asScala.toSeq
-    expired.foreach { jobId =>
-      jedis.lpush(QueueKey, jobId)
-      jedis.hset(s"job:$jobId", "state", "queued")
-      jedis.zrem(InflightKey, jobId)
-    }
-    expired
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val QueueKey = "jobs:queue"
-  val InflightKey = "jobs:inflight"
-  val VisibilityTimeoutS = 60L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  // Each script runs on the server with no other client in between: the job is always in exactly
-  // one of jobs:queue and jobs:inflight.
-  val ClaimLua: String =
-    """local job_id = redis.call('LPOP', KEYS[1])
-      |if not job_id then return false end
-      |redis.call('ZADD', KEYS[2], ARGV[1], job_id)
-      |redis.call('HSET', 'job:' .. job_id, 'state', 'running', 'worker', ARGV[2], 'deadline_ms', ARGV[1])
-      |return job_id
-      |""".stripMargin
-
-  val AckLua: String =
-    """if redis.call('HGET', KEYS[2], 'worker') ~= ARGV[1] then return 0 end
-      |if redis.call('ZREM', KEYS[1], ARGV[2]) == 0 then return 0 end
-      |redis.call('HSET', KEYS[2], 'state', 'completed')
-      |redis.call('HDEL', KEYS[2], 'worker', 'deadline_ms')
-      |return 1
-      |""".stripMargin
-
-  val ReturnLua: String =
-    """local returned = {}
-      |for _, job_id in ipairs(redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])) do
-      |  if redis.call('ZREM', KEYS[1], job_id) == 1 then
-      |    redis.call('LPUSH', KEYS[2], job_id)
-      |    redis.call('HSET', 'job:' .. job_id, 'state', 'queued')
-      |    redis.call('HDEL', 'job:' .. job_id, 'worker', 'deadline_ms')
-      |    table.insert(returned, job_id)
-      |  end
-      |end
-      |return returned
-      |""".stripMargin
-
-  /** Move the next queued job into jobs:inflight under the visibility timeout; its id, if one was queued. */
-  def claim(worker: String): Option[String] = {
-    val deadline = System.currentTimeMillis + VisibilityTimeoutS * 1000
-    Option(jedis.eval(ClaimLua, List(QueueKey, InflightKey).asJava, List(deadline.toString, worker).asJava)).map(_.toString)
-  }
-
-  /** Complete the job if worker still holds its claim; false when the claim is gone. */
-  def ack(jobId: String, worker: String): Boolean =
-    jedis.eval(AckLua, List(InflightKey, s"job:$jobId").asJava, List(worker, jobId).asJava).asInstanceOf[java.lang.Long] == 1L
-
-  /** Put every claim past its deadline back at the head of the queue; the ids returned. */
-  def returnExpired(): Seq[String] =
-    jedis.eval(ReturnLua, List(InflightKey, QueueKey).asJava, List(System.currentTimeMillis.toString).asJava)
-      .asInstanceOf[java.util.List[AnyRef]].asScala.toSeq.map(_.toString)
 }
 `,
     },

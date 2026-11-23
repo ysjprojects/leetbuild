@@ -57,7 +57,6 @@ Implement \`POST /channels/{channel_id}/messages\` with body \`{"author_id": …
         python: {all: [/@app\.post\(\s*["']\/channels\/\{channel_id\}\/messages["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/channels\/:channel_id\/messages['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/channels\/\{channel_id\}\/messages"/]},
-        scala: {all: [/path\(\s*"channels"\s*\/\s*LongNumber\s*\/\s*"messages"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*R"\(\/channels\/\(\\d\+\)\/messages\)"/]},
       },
     },
@@ -72,7 +71,6 @@ Implement \`POST /channels/{channel_id}/messages\` with body \`{"author_id": …
           all: [/MAX_CONTENT|\b2000\b/, /\.trim\(\)/, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/],
         },
         go: {all: [/maxContent|\b2000\b/, /strings\.TrimSpace\(/, /http\.StatusBadRequest|\b400\b/]},
-        scala: {all: [/MaxContent|\b2000\b/, /\.trim\b/, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/kMaxContent|\b2000\b/, /find_first_not_of\(/, /status\s*=\s*400/]},
       },
     },
@@ -85,7 +83,6 @@ Implement \`POST /channels/{channel_id}/messages\` with body \`{"author_id": …
         python: {all: [/DISCORD_EPOCH_MS\s*\)\s*<<\s*22/, /WORKER_ID\s*<<\s*17/, /&\s*0x[fF]{3}\b/]},
         typescript: {all: [/DISCORD_EPOCH_MS\s*\)\s*<<\s*22n?/, /WORKER_ID\s*<<\s*17n?/, /&\s*0x[fF]{3}n?\b/]},
         go: {all: [/discordEpochMs\s*\)\s*<<\s*22/, /workerID\s*<<\s*17/, /&\s*0x[fF]{3}\b/]},
-        scala: {all: [/DiscordEpochMs\s*\)\s*<<\s*22/, /WorkerId\s*<<\s*17/, /&\s*0x[fF]{3}\b/]},
         cpp: {all: [/kDiscordEpochMs\s*\)\s*<<\s*22/, /kWorkerId\s*<<\s*17/, /&\s*0x[fF]{3}\b/]},
       },
     },
@@ -98,7 +95,6 @@ Implement \`POST /channels/{channel_id}/messages\` with body \`{"author_id": …
         python: {all: [/\(\s*\w+\s*>>\s*22\s*\)\s*\/\/\s*BUCKET_MS/]},
         typescript: {all: [/\(\s*\w+\s*>>\s*22n?\s*\)\s*\/\s*(BigInt\(\s*BUCKET_MS\s*\)|BUCKET_MS)/]},
         go: {all: [/\(\s*\w+\s*>>\s*22\s*\)\s*\/\s*bucketMs/]},
-        scala: {all: [/\(\s*\w+\s*>>\s*22\s*\)\s*\/\s*BucketMs/]},
         cpp: {all: [/\(\s*\w+\s*>>\s*22\s*\)\s*\/\s*kBucketMs/]},
       },
     },
@@ -128,10 +124,6 @@ Implement \`POST /channels/{channel_id}/messages\` with body \`{"author_id": …
             /strconv\.FormatInt\(\s*messageID\s*,\s*10\s*\)/,
           ],
           order: [/db\.Exec\(/, /http\.StatusCreated|\b201\b/],
-        },
-        scala: {
-          all: [/INSERT INTO messages \(channel_id, bucket, message_id, author_id, content\)/, /messageId\.toString/],
-          order: [/executeUpdate\(\)/, /StatusCodes\.Created/],
         },
         cpp: {
           all: [
@@ -626,159 +618,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /channels/{channel_id}/messages", postMessage)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import discord.{Db, Tls} // Db.withConnection { conn => ... }: T · Tls.serverContext — provided
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-final case class NewMessage(authorId: Long, content: String)
-final case class StoredMessage(id: String, channelId: String, authorId: String, content: String, bucket: Int)
-
-object PostMessage {
-  val DiscordEpochMs = 1420070400000L // 2015-01-01T00:00:00Z: the first instant a Discord id can name
-  val WorkerId = 1L
-  val ProcessId = 0L
-  val BucketMs = 10L * 24 * 3600 * 1000 // one partition per channel per 10 days
-  val MaxContent = 2000
-
-  implicit val newMessageFormat: RootJsonFormat[NewMessage] = jsonFormat(NewMessage, "author_id", "content")
-  implicit val storedFormat: RootJsonFormat[StoredMessage] =
-    jsonFormat(StoredMessage, "id", "channel_id", "author_id", "content", "bucket")
-
-  private val lock = new Object
-  private var lastMs = 0L
-  private var seq = 0L
-
-  /** A snowflake: 42 bits of milliseconds since DiscordEpochMs, 5 worker, 5 process, 12 sequence. */
-  def nextId(nowMs: Long): Long = lock.synchronized {
-    // TODO: nowMs <= lastMs → reuse lastMs and bump seq (& 0xFFF); seq wrapped to 0 → next millisecond
-    // TODO: a later nowMs → seq = 0; remember lastMs
-    // TODO: (nowMs - DiscordEpochMs) << 22 | WorkerId << 17 | ProcessId << 12 | seq
-    ???
-  }
-
-  /** The 10-day window the id's timestamp falls in, counted from the Discord epoch. */
-  def bucketOf(snowflake: Long): Int = {
-    // TODO: (snowflake >> 22) / BucketMs
-    ???
-  }
-
-  def validContent(content: String): Boolean = {
-    // TODO: 1..MaxContent characters once trimmed
-    true
-  }
-
-  /** Mints the id, computes the bucket, inserts the row; returns the message as the API answers it. */
-  def storeMessage(channelId: Long, authorId: Long, content: String): StoredMessage = {
-    // TODO: val messageId = nextId(System.currentTimeMillis()); val bucket = bucketOf(messageId)
-    // TODO: INSERT INTO messages (channel_id, bucket, message_id, author_id, content)
-    // TODO: StoredMessage(messageId.toString, channelId.toString, authorId.toString, content, bucket)
-    ???
-  }
-
-  val route: Route =
-    path("channels" / LongNumber / "messages") { channelId =>
-      post {
-        entity(as[NewMessage]) { req =>
-          // TODO: 400 unless validContent(req.content)
-          // TODO: storeMessage(...) → 201 with the message
-          complete(HttpResponse(StatusCodes.NotImplemented))
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("messages")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import discord.{Db, Tls} // Db.withConnection { conn => ... }: T · Tls.serverContext — provided
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-final case class NewMessage(authorId: Long, content: String)
-final case class StoredMessage(id: String, channelId: String, authorId: String, content: String, bucket: Int)
-
-object PostMessage {
-  val DiscordEpochMs = 1420070400000L // 2015-01-01T00:00:00Z: the first instant a Discord id can name
-  val WorkerId = 1L
-  val ProcessId = 0L
-  val BucketMs = 10L * 24 * 3600 * 1000 // one partition per channel per 10 days
-  val MaxContent = 2000
-
-  implicit val newMessageFormat: RootJsonFormat[NewMessage] = jsonFormat(NewMessage, "author_id", "content")
-  implicit val storedFormat: RootJsonFormat[StoredMessage] =
-    jsonFormat(StoredMessage, "id", "channel_id", "author_id", "content", "bucket")
-
-  private val lock = new Object
-  private var lastMs = 0L
-  private var seq = 0L
-
-  /** A snowflake: 42 bits of milliseconds since DiscordEpochMs, 5 worker, 5 process, 12 sequence. */
-  def nextId(now: Long): Long = lock.synchronized {
-    var nowMs = now
-    if (nowMs <= lastMs) { // same millisecond, or a clock that stepped back: never issue a lower id
-      nowMs = lastMs
-      seq = (seq + 1) & 0xFFF
-      if (seq == 0) nowMs += 1 // 4096 ids in one millisecond: borrow the next one
-    } else seq = 0
-    lastMs = nowMs
-    (nowMs - DiscordEpochMs) << 22 | WorkerId << 17 | ProcessId << 12 | seq
-  }
-
-  /** The 10-day window the id's timestamp falls in, counted from the Discord epoch. */
-  def bucketOf(snowflake: Long): Int = ((snowflake >> 22) / BucketMs).toInt
-
-  def validContent(content: String): Boolean = content.trim.nonEmpty && content.length <= MaxContent
-
-  /** Mints the id, computes the bucket, inserts the row; returns the message as the API answers it. */
-  def storeMessage(channelId: Long, authorId: Long, content: String): StoredMessage = {
-    val messageId = nextId(System.currentTimeMillis())
-    val bucket = bucketOf(messageId)
-    Db.withConnection { conn =>
-      val st = conn.prepareStatement(
-        "INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES (?, ?, ?, ?, ?)")
-      st.setLong(1, channelId); st.setInt(2, bucket); st.setLong(3, messageId)
-      st.setLong(4, authorId); st.setString(5, content)
-      st.executeUpdate()
-    }
-    // 64 bits: a JSON number would lose the low bits past 2**53, so ids are strings on the wire.
-    StoredMessage(messageId.toString, channelId.toString, authorId.toString, content, bucket)
-  }
-
-  val route: Route =
-    path("channels" / LongNumber / "messages") { channelId =>
-      post {
-        entity(as[NewMessage]) { req =>
-          if (!validContent(req.content))
-            complete(StatusCodes.BadRequest -> Map("error" -> "content must be 1 to 2000 characters"))
-          else complete(StatusCodes.Created -> storeMessage(channelId, req.authorId, req.content))
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("messages")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

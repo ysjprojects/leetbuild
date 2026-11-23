@@ -3,10 +3,9 @@
  * package. `hub.store` is the connector registry (every connector a Redis hash, the course's
  * stand-in for the connectors table): registration rows, the Idempotency-Key record, the disable
  * switch. `hub.ledger` is the sync ledger of step 2 as later steps use it: `load_cursor` and
- * `commit_page` (the page claim and the cursor move in one Lua script). The five languages keep the
+ * `commit_page` (the page claim and the cursor move in one Lua script). The four languages keep the
  * same keys, so a harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'hub/__init__.py': '',
@@ -514,109 +513,5 @@ inline Commit commitPage(const std::string& connector_id, const std::string& pag
 }
 
 }  // namespace ledger
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('hub', 'Store')]: `package hub
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The connector registry (provided): every connector is a Redis hash connector:{id} with
- * connector_id, tenant, source_type, host, token_ref, status (enabled or disabled), disabled_reason
- * and sync_interval_s. tenant:{tenant}:idem:{key} names the connector a registration with that
- * Idempotency-Key created.
- */
-object Store {
-  final case class Connector(
-      connectorId: String,
-      tenant: String,
-      sourceType: String,
-      host: String,
-      tokenRef: String,
-      status: String,
-      disabledReason: String,
-      syncIntervalS: Long)
-
-  val DefaultSyncIntervalS = 900L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def connectorKey(connectorId: String): String = s"connector:$connectorId"
-
-  /** The connector's row, if it exists. */
-  def get(connectorId: String): Option[Connector] = {
-    val raw = jedis.hgetAll(connectorKey(connectorId)).asScala.toMap
-    if (raw.isEmpty) None
-    else {
-      def text(name: String): String = raw.getOrElse(name, "")
-      Some(Connector(text("connector_id"), text("tenant"), text("source_type"), text("host"), text("token_ref"), text("status"),
-        text("disabled_reason"), text("sync_interval_s").toLongOption.getOrElse(DefaultSyncIntervalS)))
-    }
-  }
-
-  /** A new enabled connector; returns its row. */
-  def create(tenant: String, sourceType: String, host: String, tokenRef: String, syncIntervalS: Long): Connector = {
-    val connectorId = s"c-\${jedis.incr("connector:seq")}"
-    jedis.hset(connectorKey(connectorId), Map(
-      "connector_id" -> connectorId, "tenant" -> tenant, "source_type" -> sourceType, "host" -> host, "token_ref" -> tokenRef,
-      "status" -> "enabled", "disabled_reason" -> "", "sync_interval_s" -> syncIntervalS.toString).asJava)
-    get(connectorId).get
-  }
-
-  /** The connector the tenant's registration with this Idempotency-Key created, if any. */
-  def findByKey(tenant: String, key: String): Option[Connector] =
-    Option(jedis.get(s"tenant:$tenant:idem:$key")).flatMap(get)
-
-  /** Record that the tenant's registration with this Idempotency-Key created connectorId. */
-  def rememberKey(tenant: String, key: String, connectorId: String): Unit =
-    jedis.set(s"tenant:$tenant:idem:$key", connectorId)
-
-  /** Stop the connector's syncs, with a reason an operator can read. */
-  def disable(connectorId: String, reason: String): Unit =
-    jedis.hset(connectorKey(connectorId), Map("status" -> "disabled", "disabled_reason" -> reason).asJava)
-}
-`,
-  [scalaPath('hub', 'Ledger')]: `package hub
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The sync ledger (provided; step 2 builds the same two functions): cursor:{connector_id} is the
- * connector's durable checkpoint, page:{connector_id}:{page_token} the claim of one page. commitPage
- * claims the page and moves the cursor in one Lua script; a page already claimed changes nothing and
- * reports the cursor the ledger holds.
- */
-object Ledger {
-  final case class Commit(applied: Boolean, cursor: String)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  val CommitLua: String =
-    """if redis.call('SET', KEYS[1], '1', 'NX') then
-      |  redis.call('SET', KEYS[2], ARGV[1])
-      |  return {'1', ARGV[1]}
-      |end
-      |return {'0', redis.call('GET', KEYS[2]) or ''}
-      |""".stripMargin
-
-  def cursorKey(connectorId: String): String = s"cursor:$connectorId"
-  def pageKey(connectorId: String, pageToken: String): String = s"page:$connectorId:$pageToken"
-
-  /** The checkpoint the connector's next sync starts from, if it has one. */
-  def loadCursor(connectorId: String): Option[String] = Option(jedis.get(cursorKey(connectorId)))
-
-  /** Claim the page and move the cursor to nextCursor; cursor is what the ledger holds. */
-  def commitPage(connectorId: String, pageToken: String, nextCursor: String): Commit = {
-    val keys = List(pageKey(connectorId, pageToken), cursorKey(connectorId)).asJava
-    val reply = jedis.eval(CommitLua, keys, List(nextCursor).asJava).asInstanceOf[java.util.List[AnyRef]].asScala.map(String.valueOf)
-    Commit(reply.head == "1", reply(1))
-  }
-}
 `,
 };

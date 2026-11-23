@@ -63,7 +63,6 @@ several relays can run without publishing the same row.
         python: {all: [/"acks"\s*:\s*"all"/, /"enable\.idempotence"\s*:\s*True/]},
         typescript: {all: [/\.producer\(\{[^}\n]*idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"acks"\s*,\s*"all"/, /"enable\.idempotence"\s*,\s*"true"/]},
         cpp: {all: [/"acks"\s*,\s*"all"/, /"enable\.idempotence"\s*,\s*"true"/]},
       },
     },
@@ -87,7 +86,6 @@ several relays can run without publishing the same row.
             /Value:\s*\w+\.Payload/,
           ],
         },
-        scala: {all: [/new ProducerRecord\[[^\]]*\]\(\s*(\w+)\.topic\s*,\s*\1\.key\s*,\s*\1\.payload\s*\)/]},
         cpp: {all: [/(\w+)\.key\.(c_str|data)\(\)\s*,\s*\1\.key\.(size|length)\(\)/]},
       },
     },
@@ -103,7 +101,6 @@ several relays can run without publishing the same row.
           order: [/producer\.send\(/, /UPDATE outbox SET sent_at/],
         },
         go: {order: [/writer\.WriteMessages\(/, /UPDATE outbox SET sent_at/], none: [/Async:\s*true/]},
-        scala: {order: [/producer\.send\(/, /\.get\(\)/, /UPDATE outbox SET sent_at/]},
         cpp: {order: [/producer->produce\(/, /producer->flush\(/, /UPDATE outbox SET sent_at/]},
       },
     },
@@ -116,13 +113,6 @@ several relays can run without publishing the same row.
         python: {all: [/UPDATE outbox SET sent_at = now\(\) WHERE id = ANY\(%s\)"\s*,\s*\(\s*\w+\s*,\s*\)/]},
         typescript: {all: [/UPDATE outbox SET sent_at = now\(\) WHERE id = ANY\(\$1\)['"]\s*,\s*\[\s*\w+\s*\]/]},
         go: {all: [/UPDATE outbox SET sent_at = now\(\) WHERE id = ANY\(\$1\)/, /pq\.Array\(\s*\w+\s*\)/]},
-        scala: {
-          all: [
-            /UPDATE outbox SET sent_at = now\(\) WHERE id = \?/,
-            /\.setString\(\s*1\s*,\s*\w+\s*\)/,
-            /\.executeBatch\(\)|\.executeUpdate\(\)/,
-          ],
-        },
         cpp: {
           all: [/UPDATE outbox SET sent_at = now\(\) WHERE id = \$1/, /for \([^)\n]*:\s*reports\.delivered\s*\)/],
         },
@@ -137,7 +127,6 @@ several relays can run without publishing the same row.
         python: {all: [/async def run\(\)(?:(?!\ndef )[\s\S])*?await asyncio\.sleep\(\s*IDLE_SLEEP_S\s*\)/]},
         typescript: {all: [/async function run\(\)(?:(?!\nexport )[\s\S])*?await sleep\(\s*IDLE_SLEEP_MS\s*\)/]},
         go: {all: [/func run\((?:(?!\n\})[\s\S])*?time\.Sleep\(\s*idleSleep\s*\)/]},
-        scala: {all: [/def run\(\)(?:(?!\n {2}def )[\s\S])*?Thread\.sleep\(\s*IdleSleepMillis\s*\)/]},
         cpp: {all: [/void run\(\)(?:(?!\n\})[\s\S])*?sleep_for\(\s*kIdleSleep\s*\)/]},
       },
     },
@@ -523,103 +512,6 @@ func run(ctx context.Context) {
 			time.Sleep(idleSleep) // nothing to send: do not hammer the database
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.sql.Connection
-import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import payments.Db // Db.transaction { conn => ... } begins, runs the block, commits (rolls back on exception)
-import scala.util.{Failure, Success, Try}
-
-object OutboxRelay {
-  val Batch = 100
-  val IdleSleepMillis = 500L
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // TODO: acks=all and the idempotent producer
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  final case class Row(id: String, topic: String, key: String, payload: String)
-
-  /** Up to Batch unsent rows, locked for this transaction. */
-  def fetchUnsent(conn: Connection): Vector[Row] = {
-    val st = conn.prepareStatement(
-      "SELECT id, topic, key, payload FROM outbox WHERE sent_at IS NULL ORDER BY created_at LIMIT ? FOR UPDATE SKIP LOCKED")
-    st.setInt(1, Batch)
-    val rs = st.executeQuery()
-    Iterator.continually(rs).takeWhile(_.next()).map(r => Row(r.getString(1), r.getString(2), r.getString(3), r.getString(4))).toVector
-  }
-
-  /** Publishes one batch of outbox rows; returns how many were delivered. */
-  def relayOnce(): Int = Db.transaction { conn =>
-    val rows = fetchUnsent(conn)
-    // TODO: send one ProducerRecord per row (row.topic, row.key, row.payload) and keep the futures
-    // TODO: get() every future — block for the acks — BEFORE touching the table; keep the ids that succeeded
-    // TODO: UPDATE outbox SET sent_at = now() WHERE id = ? as a batch over the delivered ids only
-    0
-  }
-
-  def run(): Unit = {
-    // TODO: loop relayOnce(); sleep IdleSleepMillis when it delivered nothing
-  }
-}
-`,
-      solution: `import java.sql.Connection
-import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import payments.Db // Db.transaction { conn => ... } begins, runs the block, commits (rolls back on exception)
-import scala.util.{Failure, Success, Try}
-
-object OutboxRelay {
-  val Batch = 100
-  val IdleSleepMillis = 500L
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  props.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  final case class Row(id: String, topic: String, key: String, payload: String)
-
-  /** Up to Batch unsent rows, locked for this transaction. */
-  def fetchUnsent(conn: Connection): Vector[Row] = {
-    val st = conn.prepareStatement(
-      "SELECT id, topic, key, payload FROM outbox WHERE sent_at IS NULL ORDER BY created_at LIMIT ? FOR UPDATE SKIP LOCKED")
-    st.setInt(1, Batch)
-    val rs = st.executeQuery()
-    Iterator.continually(rs).takeWhile(_.next()).map(r => Row(r.getString(1), r.getString(2), r.getString(3), r.getString(4))).toVector
-  }
-
-  /** Publishes one batch of outbox rows; returns how many were delivered. */
-  def relayOnce(): Int = Db.transaction { conn =>
-    val rows = fetchUnsent(conn)
-    if (rows.isEmpty) 0
-    else {
-      val inFlight = rows.map(row => row -> producer.send(new ProducerRecord[String, String](row.topic, row.key, row.payload)))
-      val delivered = inFlight.flatMap { case (row, future) =>
-        Try(future.get()) match { // blocks until the broker acknowledged this record
-          case Success(_) => Some(row.id)
-          case Failure(e) => System.err.println(s"outbox \${row.id} not delivered: \${e.getMessage}"); None
-        }
-      }
-      val mark = conn.prepareStatement("UPDATE outbox SET sent_at = now() WHERE id = ?")
-      delivered.foreach { id => mark.setString(1, id); mark.addBatch() }
-      mark.executeBatch()
-      delivered.size
-    }
-  }
-
-  def run(): Unit =
-    while (true)
-      if (relayOnce() == 0) Thread.sleep(IdleSleepMillis) // nothing to send: do not hammer the database
 }
 `,
     },

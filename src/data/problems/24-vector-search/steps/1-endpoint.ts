@@ -47,7 +47,6 @@ is scored against 4-dimension vectors and still ranks; and a caller searches a r
         python: {all: [/@app\.post\(\s*["']\/v1\/search["']/, /corpus\.nearest\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/search['"]/, /nearest\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/search"/, /corpus\.Nearest\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"search"\s*\)/, /\bpost\b/, /Corpus\.nearest\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/search"/, /corpus::nearest\(/]},
       },
     },
@@ -63,7 +62,6 @@ is scored against 4-dimension vectors and still ranks; and a caller searches a r
           all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/, /StatusForbidden|\b403\b/],
           none: [/tenant\s*:=\s*body\.Tenant\b/],
         },
-        scala: {all: [/X-Tenant-Id/i, /Unauthorized/, /Forbidden/], none: [/\.orElse\(header\)/]},
         cpp: {all: [/X-Tenant-Id/i, /\b401\b/, /\b403\b/], none: [/tenant\s*=\s*body\.value\(\s*"tenant"/]},
       },
     },
@@ -76,7 +74,6 @@ is scored against 4-dimension vectors and still ranks; and a caller searches a r
         python: {all: [/MAX_K/, /\b400\b/], none: [/min\(\s*body\.k/]},
         typescript: {all: [/MAX_K/, /code\(\s*400\s*\)/], none: [/Math\.min\(/]},
         go: {all: [/maxK/, /StatusBadRequest|\b400\b/], none: [/\bk\s*=\s*maxK\b/]},
-        scala: {all: [/MaxK/, /BadRequest/], none: [/math\.min\(/]},
         cpp: {all: [/kMaxK/, /\b400\b/], none: [/std::(clamp|min)\(/]},
       },
     },
@@ -89,7 +86,6 @@ is scored against 4-dimension vectors and still ranks; and a caller searches a r
         python: {all: [/["']dims["']/, /len\(\s*body\.query\s*\)/]},
         typescript: {all: [/\.dims\b/, /query\.length/]},
         go: {all: [/\.Dims\b/, /len\(\s*body\.Query\s*\)/]},
-        scala: {all: [/\.dims\b/, /query\.(length|size)\b/]},
         cpp: {all: [/\.dims\b/, /query\.size\(\)/]},
       },
     },
@@ -102,7 +98,6 @@ is scored against 4-dimension vectors and still ranks; and a caller searches a r
         python: {all: [/\b409\b/], none: [/body\.index_version\s+or\b/]},
         typescript: {all: [/code\(\s*409\s*\)/], none: [/body\.index_version\s*\?\?/]},
         go: {all: [/StatusConflict|\b409\b/], none: [/version\s*:=\s*body\.IndexVersion\b/]},
-        scala: {all: [/Conflict/], none: [/getOrElse\(active\.version\)/]},
         cpp: {all: [/\b409\b/], none: [/body\.value\(\s*"index_version",\s*active\.version\s*\)/]},
       },
     },
@@ -373,93 +368,6 @@ func search(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/search", search)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import search.Corpus // Corpus.activeIndex, nearest, document, documentById
-
-object Api {
-  val MaxK = 100
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def hitsJson(hits: Seq[Corpus.Hit]): JsArray =
-    JsArray(hits.map(h => JsObject("id" -> JsString(h.id), "score" -> JsNumber(h.score))).toVector)
-
-  val route: Route = path("v1" / "search") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { header =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val body = raw.parseJson.asJsObject.fields
-          val query = body.get("query").collect { case JsArray(xs) => xs.collect { case JsNumber(n) => n.toDouble } }.getOrElse(Vector.empty)
-          val tenant = body.get("tenant").collect { case JsString(s) => s }.orElse(header).getOrElse("")
-          val active = Corpus.activeIndex()
-          val version = body.get("index_version").collect { case JsString(s) => s }.getOrElse(active.version)
-          val k = math.max(1, math.min(body.get("k").collect { case JsNumber(n) => n.toInt }.getOrElse(10), MaxK))
-          val hits = Corpus.nearest(tenant, version, query, k)
-          complete(json(StatusCodes.OK, JsObject("hits" -> hitsJson(hits), "k" -> JsNumber(k), "index_version" -> JsString(version))))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import search.Corpus // Corpus.activeIndex, nearest, document, documentById
-
-object Api {
-  val MaxK = 100
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String, fields: (String, JsValue)*): HttpResponse =
-    json(status, JsObject(("error" -> JsString(message)) +: fields: _*))
-
-  private def hitsJson(hits: Seq[Corpus.Hit]): JsArray =
-    JsArray(hits.map(h => JsObject("id" -> JsString(h.id), "score" -> JsNumber(h.score))).toVector)
-
-  val route: Route = path("v1" / "search") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { header =>
-        entity(as[String]) { raw =>
-          val body = raw.parseJson.asJsObject.fields
-          val query = body.get("query").collect { case JsArray(xs) => xs.collect { case JsNumber(n) => n.toDouble } }.getOrElse(Vector.empty)
-          val bodyTenant = body.get("tenant").collect { case JsString(s) => s }
-          val requested = body.get("index_version").collect { case JsString(s) => s }
-          val k = body.get("k").collect { case JsNumber(n) if n.isValidInt => n.toInt }.getOrElse(10)
-          // The tenant is who authenticated; a body field may only agree with it.
-          header.filter(_.nonEmpty) match {
-            case None => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-            case Some(tenant) if bodyTenant.exists(_ != tenant) => complete(error(StatusCodes.Forbidden, "the body names another tenant"))
-            case Some(tenant) =>
-              val active = Corpus.activeIndex()
-              if (requested.exists(_ != active.version))
-                complete(error(StatusCodes.Conflict, "index version is not active", "index_version" -> JsString(active.version)))
-              else if (query.length != active.dims)
-                complete(error(StatusCodes.BadRequest, s"query has \${query.length} dimensions, the index has \${active.dims}", "index_version" -> JsString(active.version)))
-              else if (k < 1 || k > MaxK) complete(error(StatusCodes.BadRequest, s"k must be an integer from 1 to $MaxK"))
-              else {
-                val hits = Corpus.nearest(tenant, active.version, query, k)
-                complete(json(StatusCodes.OK, JsObject("hits" -> hitsJson(hits), "k" -> JsNumber(k), "index_version" -> JsString(active.version))))
-              }
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

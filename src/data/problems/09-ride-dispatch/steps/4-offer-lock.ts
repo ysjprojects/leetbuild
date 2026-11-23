@@ -67,7 +67,6 @@ to the next driver on its list.
           ],
         },
         go: {all: [/"offer:driver:/, /rdb\.SetNX\([^\n]*\b(?:offerTTL|15\s*\*\s*time\.Second)\b/]},
-        scala: {all: [/"offer:driver:/, /\.nx\(\)/, /\.ex\(\s*(?:OfferTtlSeconds|15L?)\s*\)/]},
         cpp: {all: [/"offer:driver:/, /redis\.set\([^;]*?\bkOfferTtl\b[^;]*?UpdateType::NOT_EXIST/]},
       },
     },
@@ -80,7 +79,6 @@ to the next driver on its list.
         python: {all: [COMPARE_AND_DELETE]},
         typescript: {all: [COMPARE_AND_DELETE]},
         go: {all: [COMPARE_AND_DELETE]},
-        scala: {all: [COMPARE_AND_DELETE]},
         cpp: {all: [COMPARE_AND_DELETE]},
       },
     },
@@ -94,7 +92,6 @@ to the next driver on its list.
           order: [/function accept\(/, /\breleaseScript\(/, /`ride:\$\{rideId\}:driver`|['"]ride:[^\n]*:driver/],
         },
         go: {order: [/func accept\(/, /releaseScript\.(?:Run|Eval|EvalSha)\(/, /"ride:[^\n]*:driver/]},
-        scala: {order: [/def accept\(/, /jedis\.evalsha\(\s*releaseSha\b/, /"ride:[^\n]*:driver/]},
         cpp: {order: [/bool accept\(/, /evalsha<[^>]*>\(\s*release_sha\b/, /"ride:[^\n]*:driver/]},
       },
     },
@@ -115,10 +112,6 @@ to the next driver on its list.
         go: {
           order: [/func decline\(/, /releaseScript\.(?:Run|Eval|EvalSha)\(/, /(?<!func )\bnextCandidate\(/],
           none: [/rdb\.Del\(/],
-        },
-        scala: {
-          order: [/def decline\(/, /jedis\.evalsha\(\s*releaseSha\b/, /(?<!def )\bnextCandidate\(/],
-          none: [/jedis\.del\(/],
         },
         cpp: {
           order: [/void decline\(/, /evalsha<[^>]*>\(\s*release_sha\b/, /\bnext_candidate\(\s*(?!const\b)\w/],
@@ -394,90 +387,6 @@ func decline(ctx context.Context, rideID, driverID string) error {
 	}
 	nextCandidate(ctx, rideID)
 	return nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import scala.jdk.CollectionConverters._
-
-object Offers {
-  val jedis = new JedisPooled("redis", 6379)
-  val OfferTtlSeconds = 15L
-
-  // KEYS[1] = offer:driver:{driver_id}   ARGV[1] = ride_id
-  // Deletes the offer only when it still belongs to this ride; returns 1 when it did, 0 otherwise.
-  val ReleaseLua: String =
-    """
-      |return 0
-      |""".stripMargin
-  private val releaseSha: String = jedis.scriptLoad(ReleaseLua)
-
-  /** Provided (Dispatcher): offers the ride to the next driver on its candidate list. */
-  def nextCandidate(rideId: String): Unit = ???
-
-  /** True when the offer went out; false when the driver already has an open offer. */
-  def offer(rideId: String, driverId: String): Boolean = {
-    // TODO: SET offer:driver:{driverId} rideId NX EX OfferTtlSeconds
-    false
-  }
-
-  /** True when this driver got the ride; false when the offer expired or belongs to another ride. */
-  def accept(rideId: String, driverId: String): Boolean = {
-    // TODO: evalsha(releaseSha, List(offer key), List(rideId)); 0 → false
-    // TODO: SET ride:{rideId}:driver driverId, return true
-    false
-  }
-
-  /** The driver said no or the offer window closed: free the driver and move on. */
-  def decline(rideId: String, driverId: String): Unit = {
-    // TODO: the same guarded delete (never a blind del: a newer offer may already sit under the key)
-    // TODO: nextCandidate(rideId)
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import scala.jdk.CollectionConverters._
-
-object Offers {
-  val jedis = new JedisPooled("redis", 6379)
-  val OfferTtlSeconds = 15L
-
-  // KEYS[1] = offer:driver:{driver_id}   ARGV[1] = ride_id
-  // Deletes the offer only when it still belongs to this ride; returns 1 when it did, 0 otherwise.
-  val ReleaseLua: String =
-    """
-      |if redis.call('GET', KEYS[1]) == ARGV[1] then
-      |  return redis.call('DEL', KEYS[1])
-      |end
-      |return 0
-      |""".stripMargin
-  private val releaseSha: String = jedis.scriptLoad(ReleaseLua)
-
-  /** Provided (Dispatcher): offers the ride to the next driver on its candidate list. */
-  def nextCandidate(rideId: String): Unit = ???
-
-  /** True when the offer went out; false when the driver already has an open offer. */
-  def offer(rideId: String, driverId: String): Boolean =
-    jedis.set(s"offer:driver:$driverId", rideId, SetParams.setParams().nx().ex(OfferTtlSeconds)) != null
-
-  /** True when this driver got the ride; false when the offer expired or belongs to another ride. */
-  def accept(rideId: String, driverId: String): Boolean = {
-    val released = jedis.evalsha(releaseSha, List(s"offer:driver:$driverId").asJava, List(rideId).asJava).asInstanceOf[Long]
-    if (released != 1L) false
-    else {
-      jedis.set(s"ride:$rideId:driver", driverId)
-      true
-    }
-  }
-
-  /** The driver said no or the offer window closed: free the driver and move on. */
-  def decline(rideId: String, driverId: String): Unit = {
-    jedis.evalsha(releaseSha, List(s"offer:driver:$driverId").asJava, List(rideId).asJava)
-    nextCandidate(rideId)
-  }
 }
 `,
     },

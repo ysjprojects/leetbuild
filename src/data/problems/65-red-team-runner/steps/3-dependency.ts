@@ -57,7 +57,6 @@ Requirements:
         python: {all: [/timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/context\.WithTimeout\(/]},
-        scala: {all: [/withDeadlineAfter\(/]},
         cpp: {all: [/set_deadline\(/]},
       },
     },
@@ -73,7 +72,6 @@ Requirements:
           none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
         },
         go: {all: [/codes\.Unavailable/, /maxAttempts/], none: [/for\s*\{/]},
-        scala: {all: [/Status\.Code\.UNAVAILABLE/, /MaxAttempts/], none: [/while\s*\(\s*true\s*\)/]},
         cpp: {
           all: [/grpc::StatusCode::UNAVAILABLE/, /kMaxAttempts/],
           none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
@@ -89,7 +87,6 @@ Requirements:
         python: {all: [/kill_key\(/], none: [/KILL_SWITCH/]},
         typescript: {all: [/killKey\(/], none: [/killSwitch/]},
         go: {all: [/config\.KillKey\(/], none: [/killSwitch/]},
-        scala: {all: [/Config\.killKey\(/], none: [/killSwitch/]},
         cpp: {all: [/config::kill_key\(/], none: [/kill_switch\b/]},
       },
     },
@@ -102,7 +99,6 @@ Requirements:
         python: {order: [/for\s+probe\s+in\s+probes/, /kill_active\(/, /send_probe\(/]},
         typescript: {order: [/for\s*\(\s*const\s+probe\s+of\s+probes\s*\)/, /killActive\(/, /sendProbe\(/]},
         go: {order: [/for\s+_,\s*probe\s*:=\s*range\s+probes/, /killActive\(/, /sendProbe\(/]},
-        scala: {order: [/probes\.find\s*\{/, /killActive\(/, /sendProbe\(/]},
         cpp: {order: [/for\s*\(\s*const\s+auto&\s+probe\s*:\s*probes\s*\)/, /kill_active\(/, /send_probe\(/]},
       },
     },
@@ -115,7 +111,6 @@ Requirements:
         python: {all: [/["']aborted["']/, /store\.finish\(/]},
         typescript: {all: [/['"]aborted['"]/, /store\.finish\(/]},
         go: {all: [/"aborted"/, /runs\.Finish\(/]},
-        scala: {all: [/"aborted"/, /Runs\.finish\(/]},
         cpp: {all: [/"aborted"/, /runs::finish\(/]},
       },
     },
@@ -556,130 +551,6 @@ func runProbes(ctx context.Context, run runs.Run, probes []catalog.Probe) (RunRe
 		return RunResult{}, err
 	}
 	return RunResult{Status: "complete", Sent: sent}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import scala.collection.mutable.ListBuffer
-
-import redteam.{Config, Probe, Run, Runs}
-import redteamd.red_team_runner.{ProbeRequest, SandboxGrpc}
-
-/** What a run did: complete or aborted, the probes sent, where an aborted run stopped. */
-final case class RunResult(status: String, sent: List[String], resumeAt: Option[String])
-
-object ProbeRunner {
-  val BackoffMs = 500L
-  @volatile var killSwitch = false
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Sandbox).usePlaintext().build()
-  private val stub = SandboxGrpc.blockingStub(channel)
-
-  /** The operator's stop button. */
-  def kill(): Unit = killSwitch = true
-
-  /** One probe through the sandbox: blocked or succeeded. */
-  def sendProbe(run: Run, probe: Probe): String = {
-    val request = ProbeRequest(runId = run.run_id, target = run.target, probeId = probe.probe_id, category = probe.category, payload = probe.payload)
-    var outcome = ""
-    while (outcome.isEmpty) {
-      try {
-        outcome = if (stub.probe(request).blocked) "blocked" else "succeeded"
-      } catch {
-        case e: StatusRuntimeException =>
-          System.err.println(s"probe \${probe.probe_id} failed: \${e.getStatus.getCode}, retrying")
-          Thread.sleep(BackoffMs)
-      }
-    }
-    outcome
-  }
-
-  /** Send the run's probes in order and count each outcome. */
-  def runProbes(run: Run, probes: List[Probe]): RunResult = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val sent = ListBuffer[String]()
-    probes.takeWhile(_ => !killSwitch).foreach { probe =>
-      val outcome = sendProbe(run, probe)
-      Runs.recordOutcome(run.run_id, probe.category, outcome)
-      sent += probe.probe_id
-    }
-    Runs.finish(run.run_id, "complete", None)
-    RunResult("complete", sent.toList, None)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-
-import scala.collection.mutable.ListBuffer
-
-import redteam.{Config, Probe, Run, Runs}
-import redteamd.red_team_runner.{ProbeRequest, SandboxGrpc}
-
-/** What a run did: complete or aborted, the probes sent, where an aborted run stopped. */
-final case class RunResult(status: String, sent: List[String], resumeAt: Option[String])
-
-object ProbeRunner {
-  val DeadlineMs = 5000L
-  val MaxAttempts = 2
-  val BackoffMs = 500L
-
-  private val jedis = new JedisPooled("redis", 6379)
-  private val channel = ManagedChannelBuilder.forTarget(Config.Sandbox).usePlaintext().build()
-  private val stub = SandboxGrpc.blockingStub(channel)
-
-  /** The switch is shared: an operator or any runner sets it, every runner reads it. */
-  def killActive(target: String): Boolean = jedis.exists(Config.killKey(target))
-
-  /** One probe through the sandbox: blocked, succeeded, timeout or error. */
-  def sendProbe(run: Run, probe: Probe): String = {
-    val request = ProbeRequest(runId = run.run_id, target = run.target, probeId = probe.probe_id, category = probe.category, payload = probe.payload)
-    var attempt = 1
-    var outcome = ""
-    while (outcome.isEmpty) {
-      try {
-        val reply = stub.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).probe(request)
-        outcome = if (reply.blocked) "blocked" else "succeeded"
-      } catch {
-        case e: StatusRuntimeException =>
-          val code = e.getStatus.getCode
-          if (code == Status.Code.UNAVAILABLE && attempt < MaxAttempts) {
-            Thread.sleep(BackoffMs)
-            attempt += 1
-          } else {
-            System.err.println(s"probe \${probe.probe_id} failed after $attempt attempts: $code")
-            outcome = if (code == Status.Code.DEADLINE_EXCEEDED) "timeout" else "error"
-          }
-      }
-    }
-    outcome
-  }
-
-  /** Send the run's probes in order and count each outcome. */
-  def runProbes(run: Run, probes: List[Probe]): RunResult = {
-    val sent = ListBuffer[String]()
-    val stoppedAt = probes.find { probe =>
-      if (killActive(run.target)) true
-      else {
-        val outcome = sendProbe(run, probe)
-        Runs.recordOutcome(run.run_id, probe.category, outcome)
-        sent += probe.probe_id
-        false
-      }
-    }
-    stoppedAt match {
-      case Some(probe) =>
-        Runs.finish(run.run_id, "aborted", Some(probe.probe_id))
-        RunResult("aborted", sent.toList, Some(probe.probe_id))
-      case None =>
-        Runs.finish(run.run_id, "complete", None)
-        RunResult("complete", sent.toList, None)
-    }
-  }
 }
 `,
     },

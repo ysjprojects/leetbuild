@@ -59,7 +59,6 @@ Implement \`send_push(token, title, body, collapse_key)\` on top of the generate
         python: {all: [/stub\.Send\([^\n]*timeout\s*=\s*(DEADLINE_S|3(\.0)?)\b/]},
         typescript: {all: [/\.Send\([^)]*\{\s*deadline:\s*Date\.now\(\)\s*\+\s*(DEADLINE_MS|3000)\b/]},
         go: {all: [/context\.WithTimeout\(\s*\w+\s*,\s*(deadline|3\s*\*\s*time\.Second)\s*\)/]},
-        scala: {all: [/withDeadlineAfter\(\s*(DeadlineMillis|3000L?)\s*,/]},
         cpp: {all: [/set_deadline\([^\n]*kDeadline/]},
       },
     },
@@ -96,15 +95,6 @@ Implement \`send_push(token, title, body, collapse_key)\` on top of the generate
             /rand\.\w+\(/,
           ],
         },
-        scala: {
-          all: [
-            /Code\.UNAVAILABLE/,
-            /Code\.RESOURCE_EXHAUSTED/,
-            /Thread\.sleep\(/,
-            /BaseBackoffMillis\s*(<<|\*)|[mM]ath\.pow\(/,
-            /Random\.\w+\(|\.nextLong\(|\.nextInt\(/,
-          ],
-        },
         cpp: {
           all: [
             /StatusCode::UNAVAILABLE/,
@@ -127,10 +117,6 @@ Implement \`send_push(token, title, body, collapse_key)\` on top of the generate
           none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
         },
         go: {all: [/for \w+ := 0; \w+ < (maxAttempts|3); \w+\+\+/], none: [/for \{/]},
-        scala: {
-          all: [/\w+ < (MaxAttempts|3)\b|\w+ <= 2\b|0 until (MaxAttempts|3)\b/],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
         cpp: {
           all: [/for \(int \w+ = 0; \w+ < (kMaxAttempts|3); (\+\+\w+|\w+\+\+)\)/],
           none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
@@ -162,7 +148,6 @@ Implement \`send_push(token, title, body, collapse_key)\` on top of the generate
             /return "", nil/,
           ],
         },
-        scala: {all: [/Code\.INVALID_ARGUMENT/, /Code\.NOT_FOUND/, /Devices\.disable\(\s*token\s*\)/, /\bNone\b/]},
         cpp: {
           all: [
             /StatusCode::INVALID_ARGUMENT/,
@@ -182,7 +167,6 @@ Implement \`send_push(token, title, body, collapse_key)\` on top of the generate
         python: {all: [/StatusCode\.DEADLINE_EXCEEDED/, /raise Retryable\(/]},
         typescript: {all: [/status\.DEADLINE_EXCEEDED/, /throw new Retryable\(/]},
         go: {all: [/codes\.DeadlineExceeded/, /(?<!var )ErrRetryable\b/]},
-        scala: {all: [/Code\.DEADLINE_EXCEEDED/, /throw new Retryable\(/]},
         cpp: {all: [/StatusCode::DEADLINE_EXCEEDED/, /throw Retryable\(/]},
       },
     },
@@ -469,83 +453,6 @@ func sendPush(ctx context.Context, token, title, body, collapseKey string) (stri
 		}
 	}
 	return "", fmt.Errorf("%w: %d attempts: %v", ErrRetryable, maxAttempts, lastErr)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import notifications.Devices // Devices.disable(token): marks a device token stale — provided
-import notifications.push.{PushGatewayGrpc, SendRequest}
-import scala.util.Random
-
-object PushClient {
-  val DeadlineMillis = 3000L
-  val BaseBackoffMillis = 200L
-  val MaxAttempts = 3
-
-  /** The consumer re-queues the notification on the retry topic (step 6). */
-  class Retryable(msg: String, cause: Throwable = null) extends RuntimeException(msg, cause)
-
-  private val channel = ManagedChannelBuilder.forAddress("push-gateway", 9000).usePlaintext().build()
-  private val stub = PushGatewayGrpc.blockingStub(channel)
-
-  /** Message id from the gateway, or None when the device token is stale. */
-  def sendPush(token: String, title: String, body: String, collapseKey: String): Option[String] = {
-    val request = SendRequest(deviceToken = token, title = title, body = body, collapseKey = collapseKey)
-    // TODO: up to MaxAttempts calls to send, each withDeadlineAfter DeadlineMillis
-    // TODO: UNAVAILABLE / RESOURCE_EXHAUSTED → sleep (BaseBackoffMillis << attempt) plus jitter, try again
-    // TODO: INVALID_ARGUMENT / NOT_FOUND → Devices.disable(token), None
-    // TODO: DEADLINE_EXCEEDED, or retries exhausted → throw Retryable; anything else → rethrow
-    ???
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import notifications.Devices // Devices.disable(token): marks a device token stale — provided
-import notifications.push.{PushGatewayGrpc, SendRequest}
-import scala.util.Random
-
-object PushClient {
-  val DeadlineMillis = 3000L
-  val BaseBackoffMillis = 200L
-  val MaxAttempts = 3
-
-  /** The consumer re-queues the notification on the retry topic (step 6). */
-  class Retryable(msg: String, cause: Throwable = null) extends RuntimeException(msg, cause)
-
-  private val channel = ManagedChannelBuilder.forAddress("push-gateway", 9000).usePlaintext().build()
-  private val stub = PushGatewayGrpc.blockingStub(channel)
-
-  /** Message id from the gateway, or None when the device token is stale. */
-  def sendPush(token: String, title: String, body: String, collapseKey: String): Option[String] = {
-    val request = SendRequest(deviceToken = token, title = title, body = body, collapseKey = collapseKey)
-    var attempt = 0
-    while (attempt < MaxAttempts) {
-      try {
-        val reply = stub.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).send(request)
-        return Some(reply.messageId)
-      } catch {
-        case e: StatusRuntimeException =>
-          e.getStatus.getCode match {
-            case Status.Code.INVALID_ARGUMENT | Status.Code.NOT_FOUND =>
-              Devices.disable(token)
-              return None
-            case Status.Code.DEADLINE_EXCEEDED => throw new Retryable("push gateway: deadline exceeded", e)
-            case Status.Code.UNAVAILABLE | Status.Code.RESOURCE_EXHAUSTED if attempt < MaxAttempts - 1 =>
-              Thread.sleep((BaseBackoffMillis << attempt) + Random.nextLong(BaseBackoffMillis))
-            case Status.Code.UNAVAILABLE | Status.Code.RESOURCE_EXHAUSTED =>
-              throw new Retryable(s"push gateway \${e.getStatus.getCode} after $MaxAttempts attempts", e)
-            case _ => throw e
-          }
-      }
-      attempt += 1
-    }
-    None
-  }
 }
 `,
     },

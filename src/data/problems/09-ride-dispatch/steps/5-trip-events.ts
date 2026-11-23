@@ -71,7 +71,6 @@ accepts). \`rides.get\` / \`rides.set_status\` are provided.
         python: {all: [/"acks"\s*:\s*"all"/, /"enable\.idempotence"\s*:\s*True/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"acks"\s*,\s*"all"/, /"enable\.idempotence"\s*,\s*"true"/]},
         cpp: {all: [/"acks"\s*,\s*"all"/, /"enable\.idempotence"\s*,\s*"true"/]},
       },
     },
@@ -83,7 +82,6 @@ accepts). \`rides.get\` / \`rides.set_status\` are provided.
         python: {all: [/producer\.produce\(\s*(?:TOPIC|"trip-events")\s*,[^\n]*\bkey\s*=\s*ride_id\b/]},
         typescript: {all: [/\.send\(\s*\{[^\n]*topic:\s*(?:TOPIC|['"]trip-events['"])[\s\S]{0,200}?\bkey:\s*rideId\b/]},
         go: {all: [/writer\.WriteMessages\(/, /Key:\s*\[\]byte\(\s*rideID\s*\)/]},
-        scala: {all: [/new ProducerRecord\[[^\]]*\]\(\s*(?:Topic|"trip-events")\s*,\s*rideId\s*,/]},
         cpp: {
           all: [
             /producer->produce\(\s*(?:kTopic|"trip-events")[\s\S]{0,300}?ride_id\.(?:c_str|data)\(\)\s*,\s*ride_id\.(?:size|length)\(\)/,
@@ -100,7 +98,6 @@ accepts). \`rides.get\` / \`rides.set_status\` are provided.
         python: {all: [/"enable\.auto\.commit"\s*:\s*False/]},
         typescript: {all: [/autoCommit:\s*false/]},
         go: {all: [/reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
-        scala: {all: [/"enable\.auto\.commit"\s*,\s*"false"/]},
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/]},
       },
     },
@@ -113,7 +110,6 @@ accepts). \`rides.get\` / \`rides.set_status\` are provided.
         python: {all: [/(?<!def )\bcan_transition\(/, /log\.\w+\(/]},
         typescript: {all: [/(?<!function )\bcanTransition\(/, /console\.\w+\(/]},
         go: {all: [/(?<!func )\bcanTransition\(/, /log\.Printf\(/]},
-        scala: {all: [/(?<!def )\bcanTransition\(/, /println\(/]},
         cpp: {all: [/\bcan_transition\(\s*(?!const\b)\w/, /std::cerr/]},
       },
     },
@@ -126,7 +122,6 @@ accepts). \`rides.get\` / \`rides.set_status\` are provided.
         python: {order: [/rides\.set_status\(/, /consumer\.commit\(/]},
         typescript: {order: [/rides\.setStatus\(/, /\.commitOffsets\(/]},
         go: {order: [/(?<!func )\bsetStatus\(/, /reader\.CommitMessages\(/]},
-        scala: {order: [/(?<!def )\bsetStatus\(/, /consumer\.commitSync\(/]},
         cpp: {order: [/\bset_status\(\s*(?!const\b)\w/, /consumer->commitSync\(/]},
       },
     },
@@ -504,131 +499,6 @@ func run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import scala.jdk.CollectionConverters._
-
-object TripEvents {
-  val Topic = "trip-events"
-
-  /** Provided (RideStore): getStatus is None for a ride nobody has seen yet. */
-  def getStatus(rideId: String): Option[String] = ???
-  def setStatus(rideId: String, status: String): Unit = ???
-
-  /** Event → the states it may follow; None is the state of an unseen ride. */
-  val Transitions: Map[String, Set[Option[String]]] = Map(
-    "requested" -> Set(None),
-    "matched" -> Set(Some("requested")),
-    "started" -> Set(Some("matched")),
-    "completed" -> Set(Some("started")),
-    "cancelled" -> Set(Some("requested"), Some("matched")),
-  )
-
-  def canTransition(current: Option[String], event: String): Boolean =
-    Transitions.getOrElse(event, Set.empty).contains(current)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  // TODO: acks=all and the idempotent producer
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  def publishEvent(rideId: String, event: String): Unit = {
-    val value = s"""{"ride_id":"$rideId","event":"$event","ts":\${System.currentTimeMillis() / 1000.0}}"""
-    // TODO: send a ProducerRecord(Topic, rideId, value) — the key keeps one ride's events on one partition
-  }
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", "trip-state")
-  consumerProps.put("auto.offset.reset", "earliest")
-  // TODO: disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Topic).asJava)
-
-  private val EventField = """"event"\\s*:\\s*"([^"]+)"""".r
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        val rideId = record.key()
-        val event = EventField.findFirstMatchIn(record.value()).map(_.group(1)).getOrElse("")
-        // TODO: !canTransition(getStatus(rideId), event) → log and skip (the batch commit below still covers it)
-        // TODO: setStatus(rideId, event)
-      }
-      // TODO: commitSync after every record of the batch is applied
-    }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import scala.jdk.CollectionConverters._
-
-object TripEvents {
-  val Topic = "trip-events"
-
-  /** Provided (RideStore): getStatus is None for a ride nobody has seen yet. */
-  def getStatus(rideId: String): Option[String] = ???
-  def setStatus(rideId: String, status: String): Unit = ???
-
-  /** Event → the states it may follow; None is the state of an unseen ride. */
-  val Transitions: Map[String, Set[Option[String]]] = Map(
-    "requested" -> Set(None),
-    "matched" -> Set(Some("requested")),
-    "started" -> Set(Some("matched")),
-    "completed" -> Set(Some("started")),
-    "cancelled" -> Set(Some("requested"), Some("matched")),
-  )
-
-  def canTransition(current: Option[String], event: String): Boolean =
-    Transitions.getOrElse(event, Set.empty).contains(current)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  producerProps.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  def publishEvent(rideId: String, event: String): Unit = {
-    val value = s"""{"ride_id":"$rideId","event":"$event","ts":\${System.currentTimeMillis() / 1000.0}}"""
-    producer.send(new ProducerRecord[String, String](Topic, rideId, value))
-  }
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", "trip-state")
-  consumerProps.put("auto.offset.reset", "earliest")
-  consumerProps.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Topic).asJava)
-
-  private val EventField = """"event"\\s*:\\s*"([^"]+)"""".r
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        val rideId = record.key()
-        val event = EventField.findFirstMatchIn(record.value()).map(_.group(1)).getOrElse("")
-        val current = getStatus(rideId)
-        if (!canTransition(current, event))
-          System.err.println(s"ride $rideId: illegal \${current.getOrElse("<new>")} → $event at offset \${record.offset()}; skipping")
-        else setStatus(rideId, event)
-      }
-      consumer.commitSync() // after every record of the batch has been applied or skipped
-    }
 }
 `,
     },

@@ -52,7 +52,6 @@ hallucinated refund policy reach a guest.
         python: {all: [/["']relevance["']/, /["']groundedness["']/, /["']pii["']/]},
         typescript: {all: [/['"]relevance['"]/, /['"]groundedness['"]/, /['"]pii['"]/]},
         go: {all: [/"relevance"/, /"groundedness"/, /"pii"/]},
-        scala: {all: [/"relevance"/, /"groundedness"/, /"pii"/]},
         cpp: {all: [/"relevance"/, /"groundedness"/, /"pii"/]},
       },
     },
@@ -65,7 +64,6 @@ hallucinated refund policy reach a guest.
         python: {all: [/asyncio\.gather\(|TaskGroup\(|create_task\(/]},
         typescript: {all: [/Promise\.all(Settled)?\(/]},
         go: {all: [/\bgo\s+func\b/, /sync\.WaitGroup|errgroup/]},
-        scala: {all: [/Future\.(sequence|traverse)\(/]},
         cpp: {all: [/std::async\(|std::thread\b/]},
       },
     },
@@ -83,7 +81,6 @@ hallucinated refund policy reach a guest.
         },
         typescript: {all: [/GUARDRAIL_DEADLINE_MS/, /deadline\b[\s\S]{0,80}?GUARDRAIL_DEADLINE_MS/]},
         go: {all: [/guardrailDeadline/, /context\.WithTimeout\([^\n]*guardrailDeadline\)/]},
-        scala: {all: [/GuardrailDeadlineMs/, /withDeadlineAfter\(\s*GuardrailDeadlineMs/]},
         cpp: {all: [/kGuardrailDeadline/, /set_deadline\(/]},
       },
     },
@@ -96,7 +93,6 @@ hallucinated refund policy reach a guest.
         python: {all: [/["']ERROR["']/]},
         typescript: {all: [/['"]ERROR['"]/]},
         go: {all: [/"ERROR"/]},
-        scala: {all: [/"ERROR"/]},
         cpp: {all: [/"ERROR"/]},
       },
     },
@@ -109,7 +105,6 @@ hallucinated refund policy reach a guest.
         python: {all: [/handoff\.escalate\(/, /["']escalated["']/]},
         typescript: {all: [/handoff\.escalate\(/, /['"]escalated['"]/]},
         go: {all: [/handoff\.Escalate\(/, /"escalated"/]},
-        scala: {all: [/Handoff\.escalate\(/, /"escalated"/]},
         cpp: {all: [/handoff::escalate\(/, /"escalated"/]},
       },
     },
@@ -405,77 +400,6 @@ func gate(ctx context.Context, turn model.Turn, answer string, articles []string
 		return GateResult{Status: "escalated", Verdicts: verdicts}, nil
 	}
 	return GateResult{Status: "answered", Answer: answer, Verdicts: verdicts}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import apv2.{Config, Turn}
-import apv2rpc.support_automation.{CheckRequest, GuardrailFrameworkGrpc}
-
-/** What the customer gets: the answer when every guardrail passed, else an escalation. */
-final case class GateResult(status: String, answer: String, verdicts: Map[String, String])
-
-object GuardrailGate {
-  val Guardrails = Seq("relevance", "groundedness")
-
-  private val framework = GuardrailFrameworkGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.GuardrailFramework).usePlaintext().build())
-
-  /** Run the guardrails on the model's answer before it reaches the customer. */
-  def gate(turn: Turn, answer: String, articles: Seq[String]): GateResult = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val verdicts = Guardrails.flatMap { name =>
-      try {
-        val reply = framework.check(CheckRequest(guardrail = name, turnId = turn.turn_id, question = turn.text, answer = answer, articles = articles))
-        if (reply.verdict == "FAIL") println(s"turn=\${turn.turn_id} guardrail=$name FAIL: \${reply.reason}")
-        Some(name -> reply.verdict)
-      } catch {
-        case e: StatusRuntimeException =>
-          println(s"turn=\${turn.turn_id} guardrail=$name unavailable: \${e.getStatus.getCode}")
-          None
-      }
-    }.toMap
-    GateResult("answered", answer, verdicts)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import scala.concurrent.duration._
-import scala.concurrent.{Await, ExecutionContext, Future}
-import scala.util.control.NonFatal
-
-import io.grpc.ManagedChannelBuilder
-
-import apv2.{Config, Handoff, Turn}
-import apv2rpc.support_automation.{CheckRequest, GuardrailFrameworkGrpc}
-
-/** What the customer gets: the answer when every guardrail passed, else an escalation. */
-final case class GateResult(status: String, answer: String, verdicts: Map[String, String])
-
-object GuardrailGate {
-  val Guardrails = Seq("relevance", "groundedness", "pii")
-  val GuardrailDeadlineMs = 2000L
-
-  private implicit val ec: ExecutionContext = ExecutionContext.global
-  private val framework = GuardrailFrameworkGrpc.stub(ManagedChannelBuilder.forTarget(Config.GuardrailFramework).usePlaintext().build())
-
-  /** Run the guardrails on the model's answer before it reaches the customer. */
-  def gate(turn: Turn, answer: String, articles: Seq[String]): GateResult = {
-    val deadline = framework.withDeadlineAfter(GuardrailDeadlineMs, TimeUnit.MILLISECONDS) // one deadline for the whole gate
-    val checks = Guardrails.map { name =>
-      deadline
-        .check(CheckRequest(guardrail = name, turnId = turn.turn_id, question = turn.text, answer = answer, articles = articles))
-        .map(_.verdict)
-        .recover { case NonFatal(_) => "ERROR" } // a guardrail that could not answer did not pass
-    }
-    val verdicts = Guardrails.zip(Await.result(Future.sequence(checks), (GuardrailDeadlineMs + 1000).millis)).toMap
-    if (verdicts.values.exists(_ != "PASS")) {
-      Handoff.escalate(turn.tenant, turn.conversation, turn.turn_id, verdicts)
-      GateResult("escalated", "", verdicts)
-    } else GateResult("answered", answer, verdicts)
-  }
 }
 `,
     },

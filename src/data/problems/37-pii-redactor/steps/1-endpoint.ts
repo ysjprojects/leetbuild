@@ -56,7 +56,6 @@ tell it from a text that was skipped.
         python: {all: [/@app\.post\(\s*["']\/v1\/redact["']/, /store\.save\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/redact['"]/, /\bsave\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/redact"/, /store\.Save\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"redact"\s*\)/, /Store\.save\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/redact"/, /store::save\(/]},
       },
     },
@@ -69,7 +68,6 @@ tell it from a text that was skipped.
         python: {all: [/MAX_TEXT_BYTES/, /\b413\b/], none: [/["']preview["']/, /text\[\s*:\s*\d+\s*\]/]},
         typescript: {all: [/MAX_TEXT_BYTES/, /\b413\b/], none: [/\bpreview\s*:/, /text\.slice\(\s*0/]},
         go: {all: [/maxTextBytes/, /StatusRequestEntityTooLarge|\b413\b/], none: [/"preview"/, /\.Text\[:\d+\]/]},
-        scala: {all: [/MaxTextBytes/, /PayloadTooLarge|\b413\b/], none: [/"preview"/, /\.take\(\d+\)/]},
         cpp: {all: [/kMaxTextBytes/, /\b413\b/], none: [/"preview"/, /\.substr\(0,\s*\d+\)/]},
       },
     },
@@ -84,10 +82,6 @@ tell it from a text that was skipped.
         go: {
           all: [/slices\.Contains\(spans\.EntityTypes|range spans\.EntityTypes/, /StatusBadRequest|\b400\b/],
           order: [/slices\.Contains\(spans\.EntityTypes|range spans\.EntityTypes/, /ner\.Detect\(/],
-        },
-        scala: {
-          all: [/EntityTypes\.contains|EntityTypes\.toSet/, /BadRequest|\b400\b/],
-          order: [/EntityTypes\.contains|EntityTypes\.toSet/, /Ner\.detect\(/],
         },
         cpp: {
           all: [/kEntityTypes\.(?:begin|end)\(\)/, /\b400\b/],
@@ -107,10 +101,6 @@ tell it from a text that was skipped.
           all: [/StatusServiceUnavailable|\b503\b/, /detector_unavailable/],
           none: [/"redacted_text":\s*body\.Text/],
         },
-        scala: {
-          all: [/ServiceUnavailable|\b503\b/, /detector_unavailable/],
-          none: [/"redacted_text"\s*->\s*JsString\(text\)/],
-        },
         cpp: {all: [/\b503\b/, /detector_unavailable/], none: [/\{"redacted_text",\s*text\}/]},
       },
     },
@@ -123,7 +113,6 @@ tell it from a text that was skipped.
         python: {all: [/["']processed["']/, /store\.save\(/], none: [/if not detection\.spans/, /["']clean["']/]},
         typescript: {all: [/'processed'/, /\bsave\(/], none: [/detection\.spans\.length === 0/, /'clean'/]},
         go: {all: [/"processed"/, /store\.Save\(/], none: [/len\(detection\.Spans\) == 0/, /"clean"/]},
-        scala: {all: [/"processed"/, /Store\.save\(/], none: [/detection\.spans\.isEmpty/, /"clean"/]},
         cpp: {all: [/"processed"/, /store::save\(/], none: [/detection\.spans\.empty\(\)/, /"clean"/]},
       },
     },
@@ -490,119 +479,6 @@ func redact(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/redact", redact)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import redactor.{DetectorUnavailable, Ner, Spans, Store} // Ner.detect(text, entities), Store.save(tenant, documentId, spans, detectorVersion, redactedText)
-
-object Api {
-  val MaxTextBytes: Int = 256 * 1024
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  def redact(tenant: String, body: JsObject): HttpResponse = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val fields = body.fields
-    (fields.get("document_id"), fields.get("text")) match {
-      case (Some(JsString(documentId)), Some(JsString(text))) if documentId.nonEmpty && text.nonEmpty =>
-        if (text.getBytes("UTF-8").length > MaxTextBytes) json(StatusCodes.PayloadTooLarge, JsObject("error" -> JsString("text_too_large"), "preview" -> JsString(text.take(80))))
-        else {
-          val entities = fields.get("entities") match {
-            case Some(JsArray(items)) if items.nonEmpty => items.collect { case JsString(e) => e }
-            case _ => Spans.DefaultEntities
-          }
-          try {
-            val detection = Ner.detect(text, entities)
-            if (detection.spans.isEmpty) json(StatusCodes.OK, JsObject("document_id" -> JsString(documentId), "status" -> JsString("clean")))
-            else {
-              val redacted = Spans.applySpans(text, detection.spans)
-              Store.save(tenant, documentId, detection.spans, detection.detectorVersion, redacted)
-              json(StatusCodes.OK, JsObject(
-                "document_id" -> JsString(documentId), "status" -> JsString("processed"), "redacted_text" -> JsString(redacted),
-                "spans" -> JsArray(detection.spans.map(Spans.spanJson).toVector), "entity_counts" -> Spans.countsJson(Spans.countEntities(detection.spans)),
-                "detector_version" -> JsString(detection.detectorVersion), "source" -> JsString(detection.source), "degraded" -> JsBoolean(detection.degraded)))
-            }
-          } catch {
-            case _: DetectorUnavailable =>
-              json(StatusCodes.OK, JsObject("document_id" -> JsString(documentId), "status" -> JsString("degraded"), "redacted_text" -> JsString(text), "degraded" -> JsTrue))
-          }
-        }
-      case _ => error(StatusCodes.BadRequest, "document_id and text are required")
-    }
-  }
-
-  val route: Route = path("v1" / "redact") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-        case Some(tenant) => entity(as[String])(raw => complete(redact(tenant, raw.parseJson.asJsObject)))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import redactor.{DetectorUnavailable, Ner, Spans, Store} // Ner.detect(text, entities), Store.save(tenant, documentId, spans, detectorVersion, redactedText)
-
-object Api {
-  val MaxTextBytes: Int = 256 * 1024
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  def redact(tenant: String, body: JsObject): HttpResponse = {
-    val fields = body.fields
-    (fields.get("document_id"), fields.get("text")) match {
-      // A constant body: an error path must not carry the payload into logs and traces.
-      case (Some(JsString(documentId)), Some(JsString(text))) if documentId.nonEmpty && text.nonEmpty =>
-        if (text.getBytes("UTF-8").length > MaxTextBytes) error(StatusCodes.PayloadTooLarge, "text_too_large")
-        else {
-          val entities = fields.get("entities") match {
-            case Some(JsArray(items)) if items.nonEmpty => items.map { case JsString(e) => e; case other => other.toString }
-            case _ => Spans.DefaultEntities
-          }
-          if (!entities.forall(Spans.EntityTypes.contains)) error(StatusCodes.BadRequest, "unknown_entity")
-          else
-            try {
-              val detection = Ner.detect(text, entities)
-              val redacted = Spans.applySpans(text, detection.spans)
-              Store.save(tenant, documentId, detection.spans, detection.detectorVersion, redacted)
-              json(StatusCodes.OK, JsObject(
-                "document_id" -> JsString(documentId), "status" -> JsString("processed"), "redacted_text" -> JsString(redacted),
-                "spans" -> JsArray(detection.spans.map(Spans.spanJson).toVector), "entity_counts" -> Spans.countsJson(Spans.countEntities(detection.spans)),
-                "detector_version" -> JsString(detection.detectorVersion), "source" -> JsString(detection.source), "degraded" -> JsBoolean(detection.degraded)))
-            } catch {
-              // Fail closed: no detector can vouch for this text, so none of it goes back.
-              case _: DetectorUnavailable => error(StatusCodes.ServiceUnavailable, "detector_unavailable")
-            }
-        }
-      case _ => error(StatusCodes.BadRequest, "document_id and text are required")
-    }
-  }
-
-  val route: Route = path("v1" / "redact") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-        case Some(tenant) => entity(as[String])(raw => complete(redact(tenant, raw.parseJson.asJsObject)))
-      }
-    }
-  }
 }
 `,
     },

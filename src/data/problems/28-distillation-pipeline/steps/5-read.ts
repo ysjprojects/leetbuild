@@ -69,7 +69,6 @@ Requirements:
         python: {all: [/@app\.get\(\s*["']\/v1\/distill\/jobs\/\{job_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/distill\/jobs\/:job_id['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/distill\/jobs\/\{jobID\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"distill"\s*\/\s*"jobs"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\([^,\n]*v1\/distill\/jobs\//]},
       },
     },
@@ -100,13 +99,6 @@ Requirements:
           ],
           none: [/sampled\s*-\s*rejected/],
         },
-        scala: {
-          all: [
-            /accepted\s*\+\s*rejected\s*!=\s*sampled|sampled\s*!=\s*accepted\s*\+\s*rejected/,
-            /StatusCodes\.Conflict/,
-          ],
-          none: [/sampled\s*-\s*rejected/],
-        },
         cpp: {
           all: [/accepted\s*\+\s*rejected\s*!=\s*sampled|sampled\s*!=\s*accepted\s*\+\s*rejected/, /\b409\b/],
           none: [/sampled\s*-\s*rejected/],
@@ -122,7 +114,6 @@ Requirements:
         python: {all: [/reasons_key\(|distill:reasons:/, /["']reasons["']\s*:/]},
         typescript: {all: [/reasonsKey\(|distill:reasons:/, /\breasons\b/]},
         go: {all: [/ReasonsKey\(|distill:reasons:/, /"reasons"/]},
-        scala: {all: [/reasonsKey\(|distill:reasons:/, /"reasons"/]},
         cpp: {all: [/reasons_key\(|distill:reasons:/, /"reasons"/]},
       },
     },
@@ -135,7 +126,6 @@ Requirements:
         python: {all: [/UNRELIABLE_ACCEPTANCE_RATE/, /implausible_acceptance_rate/]},
         typescript: {all: [/UNRELIABLE_ACCEPTANCE_RATE/, /implausible_acceptance_rate/]},
         go: {all: [/unreliableAcceptanceRate/, /implausible_acceptance_rate/]},
-        scala: {all: [/UnreliableAcceptanceRate/, /implausible_acceptance_rate/]},
         cpp: {all: [/kUnreliableAcceptanceRate/, /implausible_acceptance_rate/]},
       },
     },
@@ -148,7 +138,6 @@ Requirements:
         python: {all: [/hgetall\(/, /updated_at/], none: [/REPORT_CACHE/]},
         typescript: {all: [/hgetall\(/, /updated_at/], none: [/REPORT_CACHE/]},
         go: {all: [/HGetAll\(/, /updated_at/], none: [/reportCache/]},
-        scala: {all: [/hgetAll\(/, /updated_at/], none: [/reportCache/]},
         cpp: {all: [/hgetall\(/, /updated_at/], none: [/report_cache/]},
       },
     },
@@ -521,131 +510,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-import distill.{Config, Jobs}
-
-object DistillReport {
-  implicit val system: ActorSystem = ActorSystem("distill-report")
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val reportCache = mutable.Map[String, Map[String, Long]]()
-
-  val route: Route =
-    path("v1" / "distill" / "jobs" / Segment) { jobId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            Jobs.byId(jobId).filter(_.tenant == tenantOpt.get) match {
-              case None => complete(StatusCodes.NotFound, """{"error":"unknown job"}""")
-              case Some(row) =>
-                val counts = reportCache.getOrElseUpdate(
-                  jobId,
-                  jedis.hgetAll(Config.progressKey(jobId)).asScala.toMap.map { case (k, v) => k -> v.toLong }
-                )
-                val sampled = counts.getOrElse("sampled", 0L)
-                val rejected = counts.getOrElse("rejected", 0L)
-                val accepted = sampled - rejected
-                val report = ujson.Obj(
-                  "job_id" -> jobId,
-                  "status" -> row.job.status,
-                  "sampled" -> sampled,
-                  "accepted" -> accepted,
-                  "rejected" -> rejected,
-                  "acceptance_rate" -> (if (sampled > 0) accepted.toDouble / sampled else 0.0)
-                )
-                complete(HttpEntity(ContentTypes.\`application/json\`, ujson.write(report)))
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import distill.{Config, Jobs}
-
-object DistillReport {
-  implicit val system: ActorSystem = ActorSystem("distill-report")
-  val jedis = new JedisPooled("redis", 6379)
-
-  val UnreliableAcceptanceRate = 0.95
-
-  private def numbers(key: String): Map[String, Long] =
-    jedis.hgetAll(key).asScala.toMap.map { case (k, v) => k -> v.toLong }
-
-  val route: Route =
-    path("v1" / "distill" / "jobs" / Segment) { jobId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            Jobs.byId(jobId).filter(_.tenant == tenantOpt.get) match {
-              case None => complete(StatusCodes.NotFound, """{"error":"unknown job"}""")
-              case Some(row) =>
-                val counts = numbers(Config.progressKey(jobId))
-                val reasons = numbers(Config.reasonsKey(jobId))
-                val sampled = counts.getOrElse("sampled", 0L)
-                val accepted = counts.getOrElse("accepted", 0L)
-                val rejected = counts.getOrElse("rejected", 0L)
-                if (accepted + rejected != sampled) {
-                  system.log.error(s"distill report job=$jobId counters do not reconcile: $counts")
-                  complete(StatusCodes.Conflict, s"""{"error":"job $jobId counters do not reconcile"}""")
-                } else {
-                  val rate = if (sampled > 0) accepted.toDouble / sampled else 0.0
-                  val flagged: ujson.Value =
-                    if (sampled > 0 && rate > UnreliableAcceptanceRate) ujson.Str("implausible_acceptance_rate") else ujson.Null
-                  val report = ujson.Obj(
-                    "job_id" -> jobId,
-                    "status" -> row.job.status,
-                    "sampled" -> sampled,
-                    "accepted" -> accepted,
-                    "rejected" -> rejected,
-                    "duplicate" -> ujson.Num(counts.getOrElse("duplicate", 0L).toDouble),
-                    "reasons" -> ujson.Obj.from(reasons.map { case (k, v) => k -> ujson.Num(v.toDouble) }),
-                    "acceptance_rate" -> rate,
-                    "updated_at" -> ujson.Num(counts.getOrElse("updated_at", 0L).toDouble),
-                    "flagged" -> flagged
-                  )
-                  complete(HttpEntity(ContentTypes.\`application/json\`, ujson.write(report)))
-                }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

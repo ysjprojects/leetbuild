@@ -50,7 +50,6 @@ caller for an hour.
         python: {all: [/@app\.get\(\s*["']\/v1\/glossaries\/\{source\}\/\{target\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/glossaries\/:source\/:target['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/glossaries\/\{source\}\/\{target\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"glossaries"\s*\/\s*Segment\s*\/\s*Segment\s*\)/]},
         cpp: {all: [/svr\.Get\(\s*R?"\(?\/v1\/glossaries\//]},
       },
     },
@@ -63,7 +62,6 @@ caller for an hour.
         python: {all: [/\b401\b/, /\b403\b/], none: [/query_params\.get\(\s*["']tenant["']\s*\)\s*or\b/]},
         typescript: {all: [/\b401\b/, /\b403\b/], none: [/\.tenant\s*\?\?/]},
         go: {all: [/StatusUnauthorized|\b401\b/, /StatusForbidden|\b403\b/]},
-        scala: {all: [/Unauthorized|\b401\b/, /Forbidden|\b403\b/], none: [/asked\.orElse\(/]},
         cpp: {all: [/\b401\b/, /\b403\b/]},
       },
     },
@@ -76,7 +74,6 @@ caller for an hour.
         python: {all: [/term_count/, /resolve_glossary\([^\n]*version/]},
         typescript: {all: [/term_count/, /resolveGlossary\([^\n]*version/]},
         go: {all: [/term_count/, /ResolveGlossary\([^\n]*version/]},
-        scala: {all: [/term_count/, /resolveGlossary\([^\n]*version/]},
         cpp: {all: [/term_count/, /resolveGlossary\([^\n]*version/]},
       },
     },
@@ -89,7 +86,6 @@ caller for an hour.
         python: {all: [/\b404\b/]},
         typescript: {all: [/\b404\b/]},
         go: {all: [/StatusNotFound|\b404\b/]},
-        scala: {all: [/NotFound|\b404\b/]},
         cpp: {all: [/\b404\b/]},
       },
     },
@@ -102,7 +98,6 @@ caller for an hour.
         python: {all: [/private/, /no-cache|max-age=0/], none: [/public/]},
         typescript: {all: [/private/, /no-cache|max-age=0/], none: [/public/]},
         go: {all: [/private/, /no-cache|max-age=0/], none: [/public/]},
-        scala: {all: [/private/, /no-cache|max-age=0/], none: [/public/]},
         cpp: {all: [/private/, /no-cache|max-age=0/], none: [/public/]},
       },
     },
@@ -316,83 +311,6 @@ func readGlossary(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/glossaries/{source}/{target}", readGlossary)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import translate.Glossary // Glossary.resolveGlossary(tenant, source, target, version = None)
-
-object Read {
-  def read(source: String, target: String, header: Option[String], asked: Option[String], version: Option[String]): HttpResponse = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val tenant = asked.orElse(header).getOrElse("")
-    val terms = Glossary.resolveGlossary(tenant, source, target).map(_.terms).getOrElse(Map.empty)
-    val body = JsObject("source" -> JsString(source), "target" -> JsString(target), "terms" -> JsObject(terms.map { case (k, v) => k -> JsString(v) }))
-    HttpResponse(StatusCodes.OK, headers = List(RawHeader("Cache-Control", "public, max-age=3600")), entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-  }
-
-  val route: Route = path("v1" / "glossaries" / Segment / Segment) { (source, target) =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { header =>
-        parameters("tenant".optional, "version".optional) { (asked, version) =>
-          complete(read(source, target, header, asked, version))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import translate.Glossary // Glossary.resolveGlossary(tenant, source, target, version = None)
-
-object Read {
-  /** The answer depends on X-Tenant-Id: no shared cache may keep it, and a browser revalidates. */
-  val CacheControl = "private, no-cache"
-
-  private def error(status: StatusCode, message: String): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, JsObject("error" -> JsString(message)).compactPrint))
-
-  def read(source: String, target: String, header: Option[String], asked: Option[String], version: Option[String]): HttpResponse =
-    header.filter(_.nonEmpty) match {
-      case None => error(StatusCodes.Unauthorized, "X-Tenant-Id is required")
-      case Some(tenant) if asked.exists(_ != tenant) => error(StatusCodes.Forbidden, "a glossary is readable by its own tenant only")
-      case Some(_) if version.exists(v => v.isEmpty || !v.forall(_.isDigit)) => error(StatusCodes.BadRequest, "version must be a number")
-      case Some(tenant) =>
-        Glossary.resolveGlossary(tenant, source, target, version.map(_.toLong)) match {
-          case None => error(StatusCodes.NotFound, s"no $source->$target glossary")
-          case Some(pinned) =>
-            val body = JsObject(
-              "tenant" -> JsString(tenant),
-              "source" -> JsString(source),
-              "target" -> JsString(target),
-              "version" -> JsNumber(pinned.version),
-              "term_count" -> JsNumber(pinned.terms.size),
-              "terms" -> JsObject(pinned.terms.map { case (k, v) => k -> JsString(v) }),
-            )
-            HttpResponse(StatusCodes.OK, headers = List(RawHeader("Cache-Control", CacheControl)), entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-        }
-    }
-
-  val route: Route = path("v1" / "glossaries" / Segment / Segment) { (source, target) =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { header =>
-        parameters("tenant".optional, "version".optional) { (asked, version) =>
-          complete(read(source, target, header, asked, version))
-        }
-      }
-    }
-  }
 }
 `,
     },

@@ -97,8 +97,8 @@ const copyText = async (text: string): Promise<boolean> => {
 /**
  * Grade `code` the way the course does: where the step has a harness for the language and the
  * language runs in this browser, the harness exercises the code inside the course's system and
- * decides every check, the static matchers staying as each check's shape note; elsewhere (Scala,
- * C++ without WebAssembly stack switching) the static checks decide.
+ * decides every check, the static matchers staying as each check's shape note; elsewhere (C++
+ * without WebAssembly stack switching, a step without a harness) the static checks decide.
  */
 const grade = async (scenario: ResolvedMockScenario, language: Language, code: string): Promise<Verdict> => {
   const verdict = judge(scenario.step, language, code);
@@ -120,8 +120,9 @@ const clampShare = (share: number, other: number, width: number): number => {
 };
 
 /**
- * The language picker's options for `step`: a language Submit cannot run here (Scala, C++ without
- * WebAssembly stack switching) is graded by reading the code, and its label says so.
+ * The language picker's options for `step`: a language Submit cannot run here (C++ without
+ * WebAssembly stack switching, a step without a harness) is graded by reading the code, and its
+ * label says so.
  */
 const languageOptions = (step: Step): SelectOption[] =>
   LANGUAGES.map(language => ({
@@ -1737,7 +1738,9 @@ const MockInterview: FC = memo(() => {
                                 <span className="text-success-300 ml-2 font-sans">best</span>
                               ) : null}
                             </td>
-                            <td className="py-1.5 pr-3">{LANGUAGE_LABEL[attempt.language]}</td>
+                            <td className="py-1.5 pr-3">
+                              {attempt.language !== null ? LANGUAGE_LABEL[attempt.language] : null}
+                            </td>
                             <td className={`py-1.5 pr-3 ${attempt.accepted ? 'text-success-300' : ''}`}>
                               {attempt.accepted ? 'Accepted' : 'Not accepted'}
                               {attempt.read === true ? (

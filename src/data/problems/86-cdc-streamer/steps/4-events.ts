@@ -45,10 +45,6 @@ acknowledgement writes a change twice.
         python: {all: [/def row_key\(/, /key\s*=\s*row_key\(/], none: [/key\s*=\s*batch\.batch_id/]},
         typescript: {all: [/rowKey\s*=|function rowKey\(/, /key:\s*rowKey\(/], none: [/key:\s*batch\.batch_id/]},
         go: {all: [/func rowKey\(/, /Key:\s*\[\]byte\(rowKey\(/], none: [/Key:\s*\[\]byte\(batch\.GetBatchId\(\)\)/]},
-        scala: {
-          all: [/def rowKey\(/, /ProducerRecord\[String, String\]\(Topic,\s*rowKey\(/],
-          none: [/Topic,\s*batch\.batchId/],
-        },
         cpp: {all: [/std::string rowKey\(/, /key\.c_str\(\)/], none: [/batch\.batch_id\(\)\.c_str\(\)/]},
       },
     },
@@ -67,7 +63,6 @@ acknowledgement writes a change twice.
           none: [/\bbefore:\s*change\.before/, /\bafter:\s*change\.after/],
         },
         go: {all: [/before_digest/, /after_digest/, /store\.Digest\(/], none: [/"before":/, /"after":/]},
-        scala: {all: [/before_digest/, /after_digest/, /Store\.digest\(/], none: [/"before"\s*->/, /"after"\s*->/]},
         cpp: {all: [/before_digest/, /after_digest/, /store::digest\(/], none: [/\{"before",/, /\{"after",/]},
       },
     },
@@ -80,7 +75,6 @@ acknowledgement writes a change twice.
         python: {all: [/on_delivery/, /flush\(\s*ACK_TIMEOUT_S\s*\)/], none: [/except KafkaException/]},
         typescript: {all: [/await producer\.send\(/, /timeout:\s*ACK_TIMEOUT_MS/], none: [/\.catch\(/]},
         go: {all: [/Produce\([^\n]*deliveries\)/, /time\.After\(\s*ackTimeout\s*\)/]},
-        scala: {all: [/\.get\([^\n]*TimeUnit\.MILLISECONDS\)/, /AckTimeoutMs/]},
         cpp: {all: [/dr_cb/, /flush\(\s*kAckTimeoutMs\s*\)/, /outq_len\(\)/]},
       },
     },
@@ -93,7 +87,6 @@ acknowledgement writes a change twice.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -399,85 +392,6 @@ func publishBatch(batch *pb.Batch) bool {
 		}
 	}
 	return true
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import cdcstream.cdc_streamer.{Batch, Change}
-
-object ChangeEvents {
-  val Topic = "cdc.change"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** The record a sink applies: where the change sits in the log and what it did to the row. */
-  def changeEvent(change: Change, batchId: String): JsObject = JsObject(
-    "lsn" -> JsNumber(change.lsn), "table" -> JsString(change.table), "pk" -> JsString(change.pk), "op" -> JsString(change.op),
-    "before" -> JsString(change.before), "after" -> JsString(change.after), "batch_id" -> JsString(batchId))
-
-  /** Put every change of the batch on cdc.change; true once the broker has all of them. */
-  def publishBatch(batch: Batch): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    batch.changes.foreach { change =>
-      producer.send(new ProducerRecord[String, String](Topic, batch.batchId, changeEvent(change, batch.batchId).compactPrint))
-    }
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import cdc.Store
-import cdcstream.cdc_streamer.{Batch, Change}
-
-object ChangeEvents {
-  val Topic = "cdc.change"
-  val AckTimeoutMs = 5000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a retry after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def rowKey(table: String, pk: String): String = s"$table:$pk"
-
-  /** The record a sink applies: where the change sits in the log and what it did to the row. */
-  def changeEvent(change: Change, batchId: String): JsObject = JsObject(
-    "lsn" -> JsNumber(change.lsn), "table" -> JsString(change.table), "pk" -> JsString(change.pk), "op" -> JsString(change.op),
-    // Digests tell a sink whether the row changed; the values stay in the source database.
-    "before_digest" -> JsString(Store.digest(change.before)), "after_digest" -> JsString(Store.digest(change.after)),
-    "batch_id" -> JsString(batchId))
-
-  /** Put every change of the batch on cdc.change; true once the broker has all of them. */
-  def publishBatch(batch: Batch): Boolean = {
-    // One row, one key: its changes stay on one partition, in LSN order.
-    val sends = batch.changes.map { change =>
-      producer.send(new ProducerRecord[String, String](Topic, rowKey(change.table, change.pk), changeEvent(change, batch.batchId).compactPrint))
-    }
-    val deadline = System.currentTimeMillis() + AckTimeoutMs
-    sends.forall(send => Try(send.get(math.max(0L, deadline - System.currentTimeMillis()), TimeUnit.MILLISECONDS)).isSuccess)
-  }
 }
 `,
     },

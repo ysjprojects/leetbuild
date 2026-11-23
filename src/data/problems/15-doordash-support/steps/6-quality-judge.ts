@@ -100,13 +100,6 @@ Implement \`evaluate\`, \`record_scores\` and the loop \`run()\` in group **\`co
           all: [/GroupID:\s*(config\.Group|"quality-judge")/, /reader\.FetchMessage\(/, /reader\.CommitMessages\(/],
           none: [/ReadMessage\(/],
         },
-        scala: {
-          all: [
-            /"group\.id"\s*,\s*(Config\.Group|"quality-judge")/,
-            /"enable\.auto\.commit"\s*,\s*"false"/,
-            /commitSync\(/,
-          ],
-        },
         cpp: {
           all: [
             /"group\.id"\s*,\s*(config::kGroup|"quality-judge")/,
@@ -146,14 +139,6 @@ Implement \`evaluate\`, \`record_scores\` and the loop \`run()\` in group **\`co
             /ON CONFLICT \(session_id, turn\) DO UPDATE/,
           ],
         },
-        scala: {
-          all: [
-            /\.evaluate\(/,
-            /contextIds\s*=/,
-            /INSERT INTO quality_scores/,
-            /ON CONFLICT \(session_id, turn\) DO UPDATE/,
-          ],
-        },
         cpp: {
           all: [
             /->Evaluate\(/,
@@ -173,7 +158,6 @@ Implement \`evaluate\`, \`record_scores\` and the loop \`run()\` in group **\`co
         python: {order: [/escalated/, /consumer\.commit\(/, /continue/, /(?<!def )\bevaluate\(/]},
         typescript: {order: [/escalated/, /await commit\(\)|\.commitOffsets\(/, /return/, /await evaluate\(/]},
         go: {order: [/Escalated/, /reader\.CommitMessages\(/, /continue/, /(?<!func )\bevaluate\(/]},
-        scala: {order: [/escalated/, /commit\(\s*record\s*\)/, /(?<!def )\bevaluate\(/]},
         cpp: {order: [/escalated/, /consumer->commitSync\(/, /continue/, /= evaluate\(/]},
       },
     },
@@ -186,7 +170,6 @@ Implement \`evaluate\`, \`record_scores\` and the loop \`run()\` in group **\`co
         python: {order: [/await record_scores\(/, /consumer\.commit\(/]},
         typescript: {order: [/await recordScores\(/, /await commit\(\)|\.commitOffsets\(/]},
         go: {order: [/(?<!func )\brecordScores\(/, /reader\.CommitMessages\(/]},
-        scala: {order: [/(?<!def )\brecordScores\(/, /commit\(\s*record\s*\)/]},
         cpp: {order: [/(?<!void )\brecord_scores\(/, /consumer->commitSync\(/]},
       },
     },
@@ -199,7 +182,6 @@ Implement \`evaluate\`, \`record_scores\` and the loop \`run()\` in group **\`co
         python: {all: [/StatusCode\.UNAVAILABLE/, /consumer\.seek\(/]},
         typescript: {all: [/status\.UNAVAILABLE/, /consumer\.seek\(/]},
         go: {all: [/codes\.Unavailable/, /time\.Sleep\(/]},
-        scala: {all: [/Status\.Code\.UNAVAILABLE/, /consumer\.seek\(/]},
         cpp: {all: [/StatusCode::UNAVAILABLE/, /consumer->seek\(/]},
       },
     },
@@ -691,162 +673,6 @@ func run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-import scala.jdk.CollectionConverters._
-
-import assistant.{Config, Db} // Db.connection: the assistant's JDBC connection (autocommit)
-import support.support.{EvaluateRequest, JudgeGrpc}
-
-final case class Turn(sessionId: String, turn: Int, dasherId: String, question: String, answer: String,
-                      sources: Seq[String], escalated: Boolean, model: String, tokens: Int)
-final case class Scores(groundedness: Float, coherence: Float, compliance: Float, pass: Boolean)
-
-object QualityPipeline {
-  /** How long to wait before the next poll redelivers a record the judge could not score. */
-  val RetryDelayMillis = 1000L
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", Config.Group)
-  props.put("auto.offset.reset", "earliest")
-  props.put("max.poll.records", "1") // one record per poll, so a seek back retries exactly that record
-  // TODO: disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Config.Topic).asJava)
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Judge).usePlaintext().build()
-  private val judge = JudgeGrpc.blockingStub(channel)
-
-  def parse(raw: String): Turn = {
-    val f = raw.parseJson.asJsObject.fields
-    Turn(f("session_id").convertTo[String], f("turn").convertTo[Int], f("dasher_id").convertTo[String],
-         f("question").convertTo[String], f("answer").convertTo[String], f("sources").convertTo[Seq[String]],
-         f("escalated").convertTo[Boolean], f("model").convertTo[String], f("tokens").convertTo[Int])
-  }
-
-  /** The judge's verdict on one answered turn. */
-  def evaluate(question: String, answer: String, sources: Seq[String]): Scores =
-    // TODO: judge.evaluate(EvaluateRequest(question = …, answer = …, contextIds = sources)) → Scores
-    ???
-
-  /** One row per (session, turn): a redelivered record overwrites its own row instead of adding a second. */
-  def recordScores(sessionId: String, turn: Int, s: Scores): Unit =
-    // TODO: INSERT INTO quality_scores (session_id, turn, groundedness, coherence, compliance, pass) VALUES (?, ?, ?, ?, ?, ?)
-    // TODO: ON CONFLICT (session_id, turn) DO UPDATE SET … = EXCLUDED.…
-    ???
-
-  /** Commits this record's offset synchronously. */
-  private def commit(record: ConsumerRecord[String, String]): Unit =
-    consumer.commitSync(
-      Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-
-  def run(): Unit =
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val turn = parse(record.value)
-        // TODO: escalated → commit(record)
-        // TODO: evaluate; UNAVAILABLE → consumer.seek back to record.offset, Thread.sleep(RetryDelayMillis), no commit
-        // TODO: recordScores, then commit(record)
-        ???
-      }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-import scala.jdk.CollectionConverters._
-
-import assistant.{Config, Db} // Db.connection: the assistant's JDBC connection (autocommit)
-import support.support.{EvaluateRequest, JudgeGrpc}
-
-final case class Turn(sessionId: String, turn: Int, dasherId: String, question: String, answer: String,
-                      sources: Seq[String], escalated: Boolean, model: String, tokens: Int)
-final case class Scores(groundedness: Float, coherence: Float, compliance: Float, pass: Boolean)
-
-object QualityPipeline {
-  /** How long to wait before the next poll redelivers a record the judge could not score. */
-  val RetryDelayMillis = 1000L
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", Config.Group)
-  props.put("auto.offset.reset", "earliest")
-  props.put("max.poll.records", "1") // one record per poll, so a seek back retries exactly that record
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Config.Topic).asJava)
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.Judge).usePlaintext().build()
-  private val judge = JudgeGrpc.blockingStub(channel)
-
-  def parse(raw: String): Turn = {
-    val f = raw.parseJson.asJsObject.fields
-    Turn(f("session_id").convertTo[String], f("turn").convertTo[Int], f("dasher_id").convertTo[String],
-         f("question").convertTo[String], f("answer").convertTo[String], f("sources").convertTo[Seq[String]],
-         f("escalated").convertTo[Boolean], f("model").convertTo[String], f("tokens").convertTo[Int])
-  }
-
-  /** The judge's verdict on one answered turn. */
-  def evaluate(question: String, answer: String, sources: Seq[String]): Scores = {
-    val reply = judge.evaluate(EvaluateRequest(question = question, answer = answer, contextIds = sources))
-    Scores(reply.groundedness, reply.coherence, reply.compliance, reply.pass)
-  }
-
-  /** One row per (session, turn): a redelivered record overwrites its own row instead of adding a second. */
-  def recordScores(sessionId: String, turn: Int, s: Scores): Unit = {
-    val st = Db.connection.prepareStatement(
-      "INSERT INTO quality_scores (session_id, turn, groundedness, coherence, compliance, pass) VALUES (?, ?, ?, ?, ?, ?)" +
-        " ON CONFLICT (session_id, turn) DO UPDATE SET groundedness = EXCLUDED.groundedness, coherence = EXCLUDED.coherence," +
-        " compliance = EXCLUDED.compliance, pass = EXCLUDED.pass")
-    st.setString(1, sessionId); st.setInt(2, turn); st.setFloat(3, s.groundedness)
-    st.setFloat(4, s.coherence); st.setFloat(5, s.compliance); st.setBoolean(6, s.pass)
-    st.executeUpdate()
-  }
-
-  /** Commits this record's offset synchronously. */
-  private def commit(record: ConsumerRecord[String, String]): Unit =
-    consumer.commitSync(
-      Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-
-  def run(): Unit =
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val turn = parse(record.value)
-        if (turn.escalated) commit(record) // a handoff has no answer to judge
-        else {
-          // The judge's verdict, or None when it answered UNAVAILABLE; any other status propagates.
-          val verdict =
-            try Some(evaluate(turn.question, turn.answer, turn.sources))
-            catch { case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.UNAVAILABLE => None }
-          verdict match {
-            case None =>
-              // Not committed: rewind to this record so the next poll delivers it again, once the judge is back.
-              consumer.seek(new TopicPartition(record.topic, record.partition), record.offset)
-              Thread.sleep(RetryDelayMillis)
-            case Some(scores) =>
-              recordScores(turn.sessionId, turn.turn, scores)
-              commit(record)
-          }
-        }
-      }
 }
 `,
     },

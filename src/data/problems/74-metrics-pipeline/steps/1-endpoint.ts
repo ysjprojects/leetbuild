@@ -47,7 +47,6 @@ handler partly dropped tells the sender to delete datapoints that were never sto
         python: {all: [/@app\.post\(\s*["']\/v1\/metrics["']/, /merge_batch\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/metrics['"]/, /mergeBatch\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/metrics"/, /windows\.MergeBatch\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"metrics"\s*\)/, /Windows\.mergeBatch\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/metrics"/, /metrics::mergeBatch\(/]},
       },
     },
@@ -60,7 +59,6 @@ handler partly dropped tells the sender to delete datapoints that were never sto
         python: {all: [/MAX_BATCH_SAMPLES\s*=\s*500\b/, />\s*MAX_BATCH_SAMPLES/, /batch_too_large/]},
         typescript: {all: [/MAX_BATCH_SAMPLES\s*=\s*500\b/, />\s*MAX_BATCH_SAMPLES/, /batch_too_large/]},
         go: {all: [/maxBatchSamples\s*=\s*500\b/, />\s*maxBatchSamples/, /batch_too_large/]},
-        scala: {all: [/MaxBatchSamples\s*=\s*500\b/, />\s*MaxBatchSamples/, /batch_too_large/]},
         cpp: {all: [/kMaxBatchSamples\s*=\s*500\b/, />\s*kMaxBatchSamples/, /batch_too_large/]},
       },
     },
@@ -84,14 +82,6 @@ handler partly dropped tells the sender to delete datapoints that were never sto
             /label_not_allowed/,
           ],
         },
-        scala: {
-          all: [
-            /allowedLabels\(\s*tenant\s*\)/,
-            /MaxLabelsPerSample\s*=\s*8\b/,
-            /UnprocessableEntity|\b422\b/,
-            /label_not_allowed/,
-          ],
-        },
         cpp: {
           all: [
             /metrics::allowedLabels\(\s*tenant\s*\)/,
@@ -111,7 +101,6 @@ handler partly dropped tells the sender to delete datapoints that were never sto
         python: {all: [/MAX_SKEW_SECONDS\s*=\s*3600\b/, /time\.time\(\)/, /timestamp_out_of_skew/]},
         typescript: {all: [/MAX_SKEW_SECONDS\s*=\s*3600\b/, /Date\.now\(\)/, /timestamp_out_of_skew/]},
         go: {all: [/maxSkewSeconds\s*=\s*3600\b/, /time\.Now\(\)/, /timestamp_out_of_skew/]},
-        scala: {all: [/MaxSkewSeconds\s*=\s*3600L?\b/, /currentTimeMillis|Instant\.now/, /timestamp_out_of_skew/]},
         cpp: {all: [/kMaxSkewSeconds\s*=\s*3600\b/, /system_clock::now\(\)/, /timestamp_out_of_skew/]},
       },
     },
@@ -135,11 +124,6 @@ handler partly dropped tells the sender to delete datapoints that were never sto
           all: [/invalid_metric/],
           order: [/(?<!func )validateBatch\(/, /windows\.MergeBatch\(/],
           none: [/\bkept\b/],
-        },
-        scala: {
-          all: [/invalid_metric/],
-          order: [/(?<!def )validateBatch\(/, /Windows\.mergeBatch\(/],
-          none: [/\.filter\(/],
         },
         cpp: {all: [/invalid_metric/], order: [/(?<!> )validateBatch\(/, /metrics::mergeBatch\(/], none: [/\bkept\b/]},
       },
@@ -464,117 +448,6 @@ func ingest(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/metrics", ingest)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import metrics.Model.{Sample, allowedLabels}
-import metrics.Windows // Windows.mergeBatch(tenant, batchId, samples): Boolean
-
-object Api {
-  private val MetricName = "[a-zA-Z_:][a-zA-Z0-9_:]*".r
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def parseSample(js: JsValue): Sample = {
-    val f = js.asJsObject.fields
-    Sample(
-      f.get("metric").collect { case JsString(s) => s }.getOrElse(""),
-      f.get("labels").map(_.asJsObject.fields.collect { case (name, JsString(value)) => name -> value }).getOrElse(Map.empty),
-      f.get("timestamp").collect { case JsNumber(n) => n.toLong }.getOrElse(0L),
-      f.get("value").collect { case JsNumber(n) => n.toDouble }.getOrElse(0.0)
-    )
-  }
-
-  val route: Route = path("v1" / "metrics") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("missing_tenant"))))
-        case Some(tenant) =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val body = raw.parseJson.asJsObject.fields
-            val batchId = body.get("batch_id").collect { case JsString(s) => s }.getOrElse("")
-            val samples = body.get("samples").collect { case JsArray(items) => items.map(parseSample) }.getOrElse(Vector.empty)
-            val applied = Windows.mergeBatch(tenant, batchId, samples.filter(s => MetricName.matches(s.metric)))
-            complete(json(StatusCodes.OK, JsObject("accepted" -> JsNumber(samples.size), "applied" -> JsBoolean(applied))))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import metrics.Model.{Sample, allowedLabels}
-import metrics.Windows // Windows.mergeBatch(tenant, batchId, samples): Boolean
-
-object Api {
-  private val MetricName = "[a-zA-Z_:][a-zA-Z0-9_:]*".r
-  val MaxBatchSamples = 500
-  val MaxLabelsPerSample = 8
-  val MaxSkewSeconds = 3600L
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def parseSample(js: JsValue): Sample = {
-    val f = js.asJsObject.fields
-    Sample(
-      f.get("metric").collect { case JsString(s) => s }.getOrElse(""),
-      f.get("labels").map(_.asJsObject.fields.collect { case (name, JsString(value)) => name -> value }).getOrElse(Map.empty),
-      f.get("timestamp").collect { case JsNumber(n) => n.toLong }.getOrElse(0L),
-      f.get("value").collect { case JsNumber(n) => n.toDouble }.getOrElse(0.0)
-    )
-  }
-
-  private def rejection(error: String, i: Int): JsObject = JsObject("error" -> JsString(error), "sample" -> JsNumber(i))
-
-  /** The rejection for the first sample that breaks a rule, or None when the whole batch is valid. */
-  def validateBatch(tenant: String, samples: Seq[Sample]): Option[(StatusCode, JsObject)] =
-    if (samples.size > MaxBatchSamples) Some(StatusCodes.BadRequest -> JsObject("error" -> JsString("batch_too_large"), "limit" -> JsNumber(MaxBatchSamples)))
-    else {
-      val allowed = allowedLabels(tenant)
-      val now = System.currentTimeMillis() / 1000
-      samples.zipWithIndex.view.flatMap { case (s, i) =>
-        val unknown = s.labels.keys.toSeq.sorted.find(name => !allowed(name))
-        if (!MetricName.matches(s.metric)) Some(StatusCodes.BadRequest -> rejection("invalid_metric", i))
-        else if (unknown.isDefined) Some(StatusCodes.UnprocessableEntity -> JsObject(rejection("label_not_allowed", i).fields + ("label" -> JsString(unknown.get))))
-        else if (s.labels.size > MaxLabelsPerSample) Some(StatusCodes.UnprocessableEntity -> rejection("too_many_labels", i))
-        else if (math.abs(now - s.timestamp) > MaxSkewSeconds) Some(StatusCodes.BadRequest -> rejection("timestamp_out_of_skew", i))
-        else None
-      }.headOption
-    }
-
-  val route: Route = path("v1" / "metrics") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("missing_tenant"))))
-        case Some(tenant) =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject.fields
-            val batchId = body.get("batch_id").collect { case JsString(s) => s }.getOrElse("")
-            val samples = body.get("samples").collect { case JsArray(items) => items.map(parseSample) }.getOrElse(Vector.empty)
-            // The whole batch is judged before anything is written: a 200 means every sample is stored.
-            validateBatch(tenant, samples) match {
-              case Some((status, body)) => complete(json(status, body))
-              case None =>
-                val applied = Windows.mergeBatch(tenant, batchId, samples)
-                complete(json(StatusCodes.OK, JsObject("accepted" -> JsNumber(samples.size), "applied" -> JsBoolean(applied))))
-            }
-          }
-      }
-    }
-  }
 }
 `,
     },

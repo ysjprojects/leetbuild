@@ -62,7 +62,6 @@ a broker that refuses or stalls loses the sample with the call reporting success
         python: {all: [/key\s*=\s*config_id/], none: [/key\s*=\s*pair\[["']user_id["']\]/]},
         typescript: {all: [/key:\s*configId/], none: [/key:\s*pair\.user_id/]},
         go: {all: [/Key:\s*\[\]byte\(configID\)/], none: [/Key:\s*\[\]byte\(pair\.UserID\)/]},
-        scala: {all: [/new ProducerRecord\[String, String\]\(Topic,\s*configId/], none: [/Topic,\s*pair\.userId/]},
         cpp: {all: [/config_id\.c_str\(\),\s*config_id\.(size|length)\(\)/], none: [/pair\.user_id\.c_str\(\)/]},
       },
     },
@@ -81,10 +80,6 @@ a broker that refuses or stalls loses the sample with the call reporting success
           none: [/^\s*(prompt|production_text|candidate_text|user_id):/m],
         },
         go: {all: [/store\.Fingerprint\(/, /"delta"/], none: [/"(prompt|production_text|candidate_text|user_id)":/]},
-        scala: {
-          all: [/Store\.fingerprint\(/, /"delta"/],
-          none: [/"(prompt|production_text|candidate_text|user_id)"\s*->/],
-        },
         cpp: {all: [/store::fingerprint\(/, /"delta"/], none: [/\{"(prompt|production_text|candidate_text|user_id)",/]},
       },
     },
@@ -97,7 +92,6 @@ a broker that refuses or stalls loses the sample with the call reporting success
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -110,7 +104,6 @@ a broker that refuses or stalls loses the sample with the call reporting success
         python: {all: [/store\.insert_outbox\(/, /on_delivery\s*=/, /producer\.flush\(/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/store\.InsertOutbox\(/, /TopicPartition\.Error/, /time\.After\(/]},
-        scala: {all: [/Store\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/]},
         cpp: {all: [/store::insertOutbox\(/, /dr_cb/, /->flush\(/]},
       },
     },
@@ -393,92 +386,6 @@ func publishSample(configID string, pair store.Pair) (bool, error) {
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import shadow.Store // Store.Pair, fingerprint, insertOutbox
-
-object ShadowEvents {
-  val Topic = "shadow.sample"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What the comparison consumer reads for one shadowed request. */
-  def samplePayload(configId: String, pair: Store.Pair): JsObject = JsObject(
-    "config_id" -> JsString(configId),
-    "user_id" -> JsString(pair.userId),
-    "prompt" -> JsString(pair.prompt),
-    "production_version" -> JsString(pair.productionVersion),
-    "production_text" -> JsString(pair.productionText),
-    "production_score" -> JsNumber(pair.productionScore),
-    "candidate_version" -> JsString(pair.candidateVersion),
-    "candidate_text" -> JsString(pair.candidateText),
-    "candidate_score" -> JsNumber(pair.candidateScore),
-    "at" -> JsNumber(pair.at))
-
-  /** Publish one shadowed request for the comparison consumer; true when the sample is on its way. */
-  def publishSample(configId: String, pair: Store.Pair): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    producer.send(new ProducerRecord[String, String](Topic, pair.userId, samplePayload(configId, pair).compactPrint))
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import shadow.Store // Store.Pair, fingerprint, insertOutbox
-
-object ShadowEvents {
-  val Topic = "shadow.sample"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the sample before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What the comparison consumer reads for one shadowed request: scores and a fingerprint, no user content. */
-  def samplePayload(configId: String, pair: Store.Pair): JsObject = JsObject(
-    "config_id" -> JsString(configId),
-    "fingerprint" -> JsString(Store.fingerprint(pair.prompt)),
-    "production_version" -> JsString(pair.productionVersion),
-    "candidate_version" -> JsString(pair.candidateVersion),
-    "production_score" -> JsNumber(pair.productionScore),
-    "candidate_score" -> JsNumber(pair.candidateScore),
-    "delta" -> JsNumber(pair.candidateScore - pair.productionScore),
-    "at" -> JsNumber(pair.at))
-
-  /** Publish one shadowed request for the comparison consumer; true once the broker acknowledged it. */
-  def publishSample(configId: String, pair: Store.Pair): Boolean = {
-    val payload = samplePayload(configId, pair)
-    // Keyed by config: one partition, so one consumer, owns each config's aggregate.
-    val record = new ProducerRecord[String, String](Topic, configId, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) Store.insertOutbox(Topic, configId, payload) // the relay publishes it once the broker is back
-    acked.isSuccess
-  }
 }
 `,
     },

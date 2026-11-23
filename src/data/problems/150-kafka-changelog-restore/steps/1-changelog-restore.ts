@@ -15,7 +15,7 @@ the key. The module keeps the view in memory and exposes three functions:
 - \`start(on_restored=None)\`: restore, then go live. In this order: ask the broker for the **end
   offset of every partition** (\`get_watermark_offsets\` / \`fetchTopicOffsets\` / \`endOffsets\`) and
   keep them; **assign all \`PARTITIONS\` partitions** at the beginning (\`OFFSET_BEGINNING\`,
-  \`fromBeginning\`, \`seekToBeginning\`) — no group subscription, auto-commit off, never a commit;
+  \`fromBeginning\`) — no group subscription, auto-commit off, never a commit;
   then poll forever, applying every record **last write wins** (a \`null\` value removes the key, a
   later value brings it back). A record whose offset is **below its partition's captured end** is
   *restored*; any other record is *live*. The view becomes \`ready\` the moment **every** partition
@@ -81,7 +81,6 @@ Rules the checks pin:
         python: {all: [/_view\[key\] = json\.loads\(value\)/, /_restored \+= 1/]},
         typescript: {all: [/view\.set\(key, JSON\.parse\(/, /restored \+= 1/]},
         go: {all: [/view\[key\] = v/, /restored\+\+/]},
-        scala: {all: [/view\.put\(key, value\)/, /restored \+= 1/]},
         cpp: {all: [/view\[key\] = std::string\(/, /\+\+restored/]},
       },
     },
@@ -94,7 +93,6 @@ Rules the checks pin:
         python: {all: [/if not _ready:/, /raise NotReadyError\(/]},
         typescript: {all: [/if \(!ready\) throw new NotReadyError\(/]},
         go: {all: [/if !ready \{/, /return nil, ErrNotReady/]},
-        scala: {all: [/if \(!ready\) throw new NotReadyException/]},
         cpp: {all: [/if \(!ready\) throw NotReadyError\(\)/]},
       },
     },
@@ -113,10 +111,6 @@ Rules the checks pin:
           order: [/fetchTopicOffsets\(/, /consumer\.run\(/],
         },
         go: {all: [/ReadLastOffset\(\)/, /msg\.Offset < ends\[p\]/], order: [/ReadLastOffset\(\)/, /ReadMessage\(/]},
-        scala: {
-          all: [/consumer\.endOffsets\(/, /record\.offset < ends\(p\)/],
-          order: [/consumer\.endOffsets\(/, /consumer\.poll\(/],
-        },
         cpp: {
           all: [/query_watermark_offsets\(/, /msg->offset\(\) < ends\[p\]/],
           order: [/query_watermark_offsets\(/, /consumer->consume\(/],
@@ -132,7 +126,6 @@ Rules the checks pin:
         python: {all: [/value is None/, /_view\.pop\(key, None\)/]},
         typescript: {all: [/value === null/, /view\.delete\(key\)/]},
         go: {all: [/value == nil/, /delete\(view, key\)/]},
-        scala: {all: [/value == null/, /view\.remove\(key\)/]},
         cpp: {all: [/payload\(\) == nullptr/, /view\.erase\(key\)/]},
       },
     },
@@ -145,7 +138,6 @@ Rules the checks pin:
         python: {all: [/range\(PARTITIONS\)/, /OFFSET_BEGINNING/, /consumer\.assign\(/, /ends\[p\] == 0/]},
         typescript: {all: [/fromBeginning: true/, /end === 0/, /every\(Boolean\)/]},
         go: {all: [/Partition:\s*p\b/, /StartOffset:\s*kafka\.FirstOffset/, /end == 0/]},
-        scala: {all: [/consumer\.assign\(/, /seekToBeginning\(/, /ends\(p\) == 0L/]},
         cpp: {all: [/consumer->assign\(/, /OFFSET_BEGINNING/, /high == 0/]},
       },
     },
@@ -161,10 +153,6 @@ Rules the checks pin:
         },
         typescript: {all: [/autoCommit: false/], none: [/commitOffsets\(/]},
         go: {all: [/kafka\.NewReader\(/], none: [/GroupID:/, /CommitMessages\(/]},
-        scala: {
-          all: [/"enable\.auto\.commit", "false"/],
-          none: [/"group\.id"/, /consumer\.subscribe\(/, /commitSync\(|commitAsync\(/],
-        },
         cpp: {all: [/"enable\.auto\.commit", "false"/], none: [/subscribe\(/, /commitSync\(|commitAsync\(/]},
       },
     },
@@ -616,126 +604,6 @@ func GetStats() Stats {
 	mu.Lock()
 	defer mu.Unlock()
 	return Stats{Ready: ready, Restored: restored, AppliedLive: appliedLive}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-/** The view is still replaying the changelog: a read now would see a half-restored state. */
-class NotReadyException extends RuntimeException("kv-view: still restoring the changelog")
-
-object KvView {
-  val Topic = "kv-changelog"
-  val Partitions = 3
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // TODO: no group, auto-commit off — a restore consumer owns its partitions and commits nothing
-  props.put("group.id", "kv-view")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-
-  private val view = mutable.Map.empty[String, String]
-  @volatile private var ready = false
-  @volatile private var restored = 0
-  @volatile private var appliedLive = 0
-
-  private def apply(key: String, value: String): Unit = view.synchronized {
-    // TODO: a null value is a tombstone: remove the key
-    view.put(key, value)
-  }
-
-  /** Replay every partition to the end it had when we started, then keep applying live records. */
-  def start(onRestored: (Int, Long) => Unit = (_, _) => ()): Unit = {
-    // TODO: capture the end offset of every partition (endOffsets) before reading anything
-    // TODO: assign all Partitions partitions and seekToBeginning
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        // TODO: apply; offset < captured end → restored (call onRestored), otherwise live;
-        //       ready once every partition has reached its captured end
-        throw new NotImplementedError("not implemented")
-      }
-    }
-  }
-
-  def get(key: String): Option[String] = {
-    // TODO: throw NotReadyException while the restore is not complete
-    view.synchronized(view.get(key))
-  }
-
-  def stats(): Map[String, Any] = Map("ready" -> ready, "restored" -> restored, "applied_live" -> appliedLive)
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-/** The view is still replaying the changelog: a read now would see a half-restored state. */
-class NotReadyException extends RuntimeException("kv-view: still restoring the changelog")
-
-object KvView {
-  val Topic = "kv-changelog"
-  val Partitions = 3
-
-  // No group: the partitions are assigned by hand and nothing is ever committed.
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-
-  private val view = mutable.Map.empty[String, String]
-  @volatile private var ready = false
-  @volatile private var restored = 0
-  @volatile private var appliedLive = 0
-
-  private def apply(key: String, value: String): Unit = view.synchronized {
-    if (value == null) view.remove(key) else view.put(key, value)
-  }
-
-  /** Replay every partition to the end it had when we started, then keep applying live records. */
-  def start(onRestored: (Int, Long) => Unit = (_, _) => ()): Unit = {
-    val tps = (0 until Partitions).map(p => new TopicPartition(Topic, p))
-    // The ends are captured first: everything below them is the restore, everything after is live.
-    val ends = consumer.endOffsets(tps.asJava).asScala.map { case (tp, end) => tp.partition -> end.longValue }.toMap
-    val caughtUp = Array.tabulate(Partitions)(p => ends(p) == 0L)
-    ready = caughtUp.forall(identity)
-    consumer.assign(tps.asJava)
-    consumer.seekToBeginning(tps.asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val p = record.partition
-        apply(record.key, record.value)
-        if (record.offset < ends(p)) {
-          restored += 1
-          if (record.offset + 1 >= ends(p)) {
-            caughtUp(p) = true
-            ready = caughtUp.forall(identity)
-          }
-          onRestored(p, record.offset)
-        } else appliedLive += 1
-      }
-    }
-  }
-
-  def get(key: String): Option[String] = {
-    if (!ready) throw new NotReadyException
-    view.synchronized(view.get(key))
-  }
-
-  def stats(): Map[String, Any] = Map("ready" -> ready, "restored" -> restored, "applied_live" -> appliedLive)
 }
 `,
     },

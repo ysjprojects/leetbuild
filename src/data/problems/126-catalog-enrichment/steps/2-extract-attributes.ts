@@ -64,10 +64,6 @@ fails the job; and no result ever reaches a reviewer.
           all: [/brandCandidates\s*=\s*20\b/, /CandidateBrands:\s*candidates/],
           order: [/taxonomy\.NearestBrands\(/, /callModel\(ctx,\s*request\)/],
         },
-        scala: {
-          all: [/BrandCandidates\s*=\s*20\b/, /candidateBrands\s*=\s*candidates/],
-          order: [/Taxonomy\.nearestBrands\(/, /callModel\(request\)/],
-        },
         cpp: {
           all: [/kBrandCandidates\s*=\s*20\b/, /add_candidate_brands\(/],
           order: [/taxonomy::nearest_brands\(/, /callModel\(request\)/],
@@ -88,10 +84,6 @@ fails the job; and no result ever reaches a reviewer.
         go: {
           all: [/Schema:\s*taxonomy\.AttributeSchema/, /json\.Unmarshal\(\s*\[\]byte\(reply\.(GetOutput\(\)|Output)\)/],
           none: [/strings\.Split\(/],
-        },
-        scala: {
-          all: [/schema\s*=\s*Taxonomy\.AttributeSchema/, /ujson\.read\(\s*reply\.output/],
-          none: [/\.split\(|linesIterator/],
         },
         cpp: {
           all: [/set_schema\(\s*taxonomy::kAttributeSchema/, /json::parse\(\s*reply\.output\(\)/],
@@ -130,14 +122,6 @@ fails the job; and no result ever reaches a reviewer.
             /codes\.Unavailable/,
           ],
         },
-        scala: {
-          all: [
-            /DeadlineSeconds\s*=\s*5L?\b/,
-            /withDeadlineAfter\(\s*DeadlineSeconds/,
-            /MaxAttempts\s*=\s*2\b/,
-            /UNAVAILABLE/,
-          ],
-        },
         cpp: {
           all: [
             /kDeadline\{5\}/,
@@ -157,7 +141,6 @@ fails the job; and no result ever reaches a reviewer.
         python: {all: [/taxonomy\.ALLOWED_UNITS/, /not in candidates/, /taxonomy\.has_category\(/]},
         typescript: {all: [/ALLOWED_UNITS\.includes\(/, /candidates\.includes\(/, /hasCategory\(/]},
         go: {all: [/taxonomy\.AllowedUnits/, /listed\(candidates,/, /taxonomy\.HasCategory\(/]},
-        scala: {all: [/Taxonomy\.AllowedUnits/, /candidates\.contains\(/, /Taxonomy\.hasCategory\(/]},
         cpp: {all: [/taxonomy::kAllowedUnits/, /listed\(candidates,/, /taxonomy::has_category\(/]},
       },
     },
@@ -170,7 +153,6 @@ fails the job; and no result ever reaches a reviewer.
         python: {all: [/MIN_CONFIDENCE\s*=\s*0\.85/, /store\.enqueue_review\(/, /["']review["']/]},
         typescript: {all: [/MIN_CONFIDENCE\s*=\s*0\.85/, /enqueueReview\(/, /'review'/]},
         go: {all: [/minConfidence\s*=\s*0\.85/, /store\.EnqueueReview\(/, /"review"/]},
-        scala: {all: [/MinConfidence\s*=\s*0\.85/, /Store\.enqueueReview\(/, /"review"/]},
         cpp: {all: [/kMinConfidence\s*=\s*0\.85/, /store::enqueue_review\(/, /"review"/]},
       },
     },
@@ -597,117 +579,6 @@ func extractAttributes(ctx context.Context, job store.Job) (store.Result, error)
 		}
 	}
 	return result, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.ManagedChannelBuilder
-
-import catalogenrich.catalog_enrichment.{ExtractRequest, ExtractorGrpc}
-import enrich.{Store, Taxonomy} // Store.enqueueReview; Taxonomy.Version, nearestBrands, AllowedUnits, hasCategory, AttributeSchema
-
-object ExtractAttributes {
-  val Fields: Seq[String] = Seq("brand", "size", "unit", "organic", "category")
-
-  private val extractor = ExtractorGrpc.blockingStub(ManagedChannelBuilder.forAddress("extractor", 50051).usePlaintext().build())
-
-  /** The attributes of one SKU version: {sku_id, merchant, attributes, confidence, taxonomy_version, source, status}. */
-  def extractAttributes(job: ujson.Value): ujson.Obj = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val request = ExtractRequest(skuId = job("sku_id").str, title = job("title").str, description = job("description").str)
-    val reply = extractor.extract(request)
-    val attributes = ujson.Obj.from(Fields.map(_ -> ujson.Null))
-    reply.output.split("\\n").foreach { line =>
-      val at = line.indexOf(':')
-      if (at >= 0 && Fields.contains(line.take(at).trim.toLowerCase)) attributes(line.take(at).trim.toLowerCase) = line.drop(at + 1).trim
-    }
-    attributes("organic") = attributes("organic") == ujson.Str("true")
-    ujson.Obj(
-      "sku_id" -> job("sku_id").str,
-      "merchant" -> job("merchant").str,
-      "attributes" -> attributes,
-      "confidence" -> reply.confidence,
-      "taxonomy_version" -> Taxonomy.Version,
-      "source" -> "model",
-      "status" -> "accepted",
-    )
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import scala.collection.mutable
-import scala.util.Try
-
-import catalogenrich.catalog_enrichment.{ExtractReply, ExtractRequest, ExtractorGrpc}
-import enrich.{Store, Taxonomy} // Store.enqueueReview; Taxonomy.Version, nearestBrands, AllowedUnits, hasCategory, AttributeSchema
-
-object ExtractAttributes {
-  val DeadlineSeconds = 5L
-  val MaxAttempts = 2
-  val BrandCandidates = 20
-  val MinConfidence = 0.85
-
-  private val extractor = ExtractorGrpc.blockingStub(ManagedChannelBuilder.forAddress("extractor", 50051).usePlaintext().build())
-
-  /** One call per attempt, each under the deadline; only UNAVAILABLE earns another attempt. */
-  def callModel(request: ExtractRequest, attempt: Int = 1): ExtractReply =
-    try extractor.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).extract(request)
-    catch {
-      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.UNAVAILABLE && attempt < MaxAttempts =>
-        callModel(request, attempt + 1)
-    }
-
-  /** The attributes the taxonomy accepts, and why anything was dropped. */
-  def validate(raw: ujson.Obj, candidates: Seq[String]): (ujson.Obj, Seq[String]) = {
-    val problems = mutable.Buffer.empty[String]
-    val attributes = ujson.Obj("brand" -> ujson.Null, "size" -> ujson.Null, "unit" -> ujson.Null, "organic" -> (raw.value.get("organic") == Some(ujson.True)), "category" -> ujson.Null)
-    raw.value.get("brand").flatMap(_.strOpt).foreach { brand =>
-      if (candidates.contains(brand)) attributes("brand") = brand else problems += s"brand '$brand' is not a taxonomy candidate"
-    }
-    raw.value.get("unit").flatMap(_.strOpt).foreach { unit =>
-      if (Taxonomy.AllowedUnits.contains(unit)) attributes("unit") = unit else problems += s"unit '$unit' is not allowed"
-    }
-    raw.value.get("category").flatMap(_.strOpt).foreach { category =>
-      if (Taxonomy.hasCategory(category)) attributes("category") = category else problems += s"category '$category' is not in the taxonomy"
-    }
-    raw.value.get("size").filterNot(_ == ujson.Null).foreach { size =>
-      if (size.numOpt.exists(_ > 0)) attributes("size") = size else problems += "size is not a positive number"
-    }
-    (attributes, problems.toSeq)
-  }
-
-  /** The attributes of one SKU version: {sku_id, merchant, attributes, confidence, taxonomy_version, source, status}. */
-  def extractAttributes(job: ujson.Value): ujson.Obj = {
-    val candidates = Taxonomy.nearestBrands(s"\${job("title").str} \${job("description").str}", BrandCandidates)
-    val request = ExtractRequest(
-      skuId = job("sku_id").str,
-      title = job("title").str,
-      description = job("description").str,
-      candidateBrands = candidates,
-      schema = Taxonomy.AttributeSchema,
-    )
-    val reply = callModel(request)
-    val (attributes, problems) = Try(ujson.read(reply.output)).toOption.flatMap(_.objOpt) match {
-      case Some(raw) => validate(ujson.Obj.from(raw), candidates)
-      case None =>
-        (ujson.Obj("brand" -> ujson.Null, "size" -> ujson.Null, "unit" -> ujson.Null, "organic" -> false, "category" -> ujson.Null), Seq("the reply is not a JSON object"))
-    }
-    val all = if (reply.confidence < MinConfidence) problems :+ f"confidence \${reply.confidence}%.2f is below $MinConfidence" else problems
-    val result = ujson.Obj(
-      "sku_id" -> job("sku_id").str,
-      "merchant" -> job("merchant").str,
-      "attributes" -> attributes,
-      "confidence" -> reply.confidence,
-      "taxonomy_version" -> Taxonomy.Version,
-      "source" -> "model",
-      "status" -> (if (all.nonEmpty) "review" else "accepted"),
-    )
-    if (all.nonEmpty) Store.enqueueReview(result, all.mkString("; ")) // a reviewer decides; the label trains the next model
-    result
-  }
 }
 `,
     },

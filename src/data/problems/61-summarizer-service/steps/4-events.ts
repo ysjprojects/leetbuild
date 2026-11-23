@@ -53,10 +53,6 @@ and a failover loses it; a broker that does not answer loses it for good.
         python: {all: [/key\s*=\s*record\[["']source_hash["']\]/], none: [/key\s*=\s*record\[["']tenant["']\]/]},
         typescript: {all: [/key:\s*record\.source_hash/], none: [/key:\s*record\.tenant/]},
         go: {all: [/Key:\s*\[\]byte\(\s*record\.SourceHash\s*\)/], none: [/Key:\s*\[\]byte\(\s*record\.Tenant/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(\s*Topic\s*,\s*record\.sourceHash/],
-          none: [/Topic\s*,\s*record\.tenant/],
-        },
         cpp: {all: [/key = record\.at\("source_hash"\)/], none: [/key = record\.at\("tenant"\)/]},
       },
     },
@@ -69,10 +65,6 @@ and a failover loses it; a broker that does not answer loses it for good.
         python: {all: [/compression_ratio/, /model_version/, /chunks_done/], none: [/["']summary["']\s*:\s*record/]},
         typescript: {all: [/compression_ratio/, /model_version/, /chunks_done/], none: [/summary:\s*record\.summary/]},
         go: {all: [/compression_ratio/, /model_version/, /chunks_done/], none: [/"summary":\s*record\.Summary/]},
-        scala: {
-          all: [/compression_ratio/, /model_version/, /chunks_done/],
-          none: [/"summary"\s*->\s*JsString\(record\.summary\)/],
-        },
         cpp: {
           all: [/compression_ratio/, /model_version/, /chunks_done/],
           none: [/\{"summary",\s*record\.at\("summary"\)\}/],
@@ -88,7 +80,6 @@ and a failover loses it; a broker that does not answer loses it for good.
         python: {order: [/store\.save_summary\(/, /producer\.produce\(/]},
         typescript: {order: [/saveSummary\(/, /producer\.send\(/]},
         go: {order: [/store\.SaveSummary\(/, /producer\.Produce\(/]},
-        scala: {order: [/Store\.saveSummary\(/, /producer\.send\(/]},
         cpp: {order: [/store::saveSummary\(/, /producer->produce\(/]},
       },
     },
@@ -101,7 +92,6 @@ and a failover loses it; a broker that does not answer loses it for good.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -114,7 +104,6 @@ and a failover loses it; a broker that does not answer loses it for good.
         python: {all: [/store\.outbox_put\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/outboxPut\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/store\.OutboxPut\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Store\.outboxPut\(/, /\.get\(\s*[^\n]*TimeUnit/]},
         cpp: {all: [/store::outboxPut\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -408,93 +397,6 @@ func publishDone(ctx context.Context, record store.Summary) (bool, error) {
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import summarizer.Store // Store.Summary, saveSummary, outboxPut
-
-object Events {
-  val Topic = "summary.done"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What a consumer gets for a finished summary; the text rides along for quality review. */
-  def eventPayload(record: Store.Summary): JsObject = JsObject(
-    "summary_id" -> JsString(record.summaryId),
-    "tenant" -> JsString(record.tenant),
-    "source_hash" -> JsString(record.sourceHash),
-    "band" -> JsString(record.band),
-    "kind" -> JsString(record.kind),
-    "source_bytes" -> JsNumber(record.sourceBytes),
-    "summary" -> JsString(record.summary))
-
-  /** Record the finished summary and announce it on summary.done; true when the event is on its way. */
-  def publishDone(record: Store.Summary): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    producer.send(new ProducerRecord[String, String](Topic, record.tenant, eventPayload(record).compactPrint))
-    Store.saveSummary(record)
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import summarizer.Store // Store.Summary, saveSummary, outboxPut
-
-object Events {
-  val Topic = "summary.done"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What a consumer checks a summary by: ids and numbers. The text stays in the summary store. */
-  def eventPayload(record: Store.Summary): JsObject = JsObject(
-    "summary_id" -> JsString(record.summaryId),
-    "tenant" -> JsString(record.tenant),
-    "source_hash" -> JsString(record.sourceHash),
-    "band" -> JsString(record.band),
-    "kind" -> JsString(record.kind),
-    "model_version" -> JsString(record.modelVersion),
-    "source_bytes" -> JsNumber(record.sourceBytes),
-    "summary_chars" -> JsNumber(record.summaryChars),
-    "compression_ratio" -> JsNumber(record.summaryChars.toDouble / record.sourceBytes),
-    "chunks_done" -> JsNumber(record.chunksDone))
-
-  /** Record the finished summary, then announce it on summary.done; true once the broker acknowledged. */
-  def publishDone(record: Store.Summary): Boolean = {
-    // The record exists before its event does: a consumer can always read what it was told about.
-    Store.saveSummary(record)
-    val payload = eventPayload(record)
-    val acked = Try(producer.send(new ProducerRecord[String, String](Topic, record.sourceHash, payload.compactPrint)).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    // The broker did not take it: the relay produces the row later, so the event is late, not lost.
-    if (acked.isFailure) Store.outboxPut(Topic, record.sourceHash, payload)
-    acked.isSuccess
-  }
 }
 `,
     },

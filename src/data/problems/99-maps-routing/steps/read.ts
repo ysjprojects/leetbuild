@@ -45,7 +45,6 @@ reads as a road route.
         python: {all: [/@app\.get\(\s*["']\/v1\/routes\/\{route_id\}["']/, /load_route\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/routes\/:routeId['"]/, /loadRoute\(/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/routes\/\{id\}"/, /routes\.LoadRoute\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"routes"\s*\/\s*Segment\s*\)/, /Routes\.loadRoute\(/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/routes\//, /routes::loadRoute\(/]},
       },
     },
@@ -58,7 +57,6 @@ reads as a road route.
         python: {all: [/x-tenant-id/i, /\b401\b/]},
         typescript: {all: [/x-tenant-id/i, /\b401\b/]},
         go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/X-Tenant-Id/i, /StatusCodes\.Unauthorized|\b401\b/]},
         cpp: {all: [/X-Tenant-Id/i, /\b401\b/]},
       },
     },
@@ -71,7 +69,6 @@ reads as a road route.
         python: {all: [/\["tenant"\]\s*!=\s*tenant|tenant\s*!=\s*stored\["tenant"\]/]},
         typescript: {all: [/stored\.tenant\s*!==\s*tenant|tenant\s*!==\s*stored\.tenant/]},
         go: {all: [/stored\.Tenant\s*!=\s*tenant|tenant\s*!=\s*stored\.Tenant/]},
-        scala: {all: [/\.tenant\s*(!=|==)\s*tenant/]},
         cpp: {all: [/->tenant\s*!=\s*tenant|tenant\s*!=\s*stored->tenant/]},
       },
     },
@@ -84,10 +81,6 @@ reads as a road route.
         python: {all: [/"epoch":\s*stored\["epoch"\]/, /"stale":/], none: [/"epoch":\s*current_epoch\(\)/]},
         typescript: {all: [/epoch:\s*stored\.epoch/, /stale:/], none: [/epoch:\s*currentEpoch\(\)/]},
         go: {all: [/"epoch":\s*stored\.Route\.Epoch/, /"stale":/], none: [/"epoch":\s*geo\.CurrentEpoch\(\)/]},
-        scala: {
-          all: [/"epoch"\s*->\s*JsNumber\(stored\.route\.epoch\)/, /"stale"/],
-          none: [/"epoch"\s*->\s*JsNumber\(Geo\.currentEpoch\(\)\)/],
-        },
         cpp: {all: [/\{"epoch",\s*stored->route\.epoch\}/, /"stale"/], none: [/\{"epoch",\s*geo::currentEpoch\(\)\}/]},
       },
     },
@@ -100,7 +93,6 @@ reads as a road route.
         python: {all: [/"degraded":\s*stored\["degraded"\]/]},
         typescript: {all: [/degraded:\s*stored\.degraded/]},
         go: {all: [/"degraded":\s*stored\.Route\.Degraded/]},
-        scala: {all: [/"degraded"\s*->\s*JsBoolean\(stored\.route\.degraded\)/]},
         cpp: {all: [/\{"degraded",\s*stored->route\.degraded\}/]},
       },
     },
@@ -300,89 +292,6 @@ func readRoute(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/routes/{id}", readRoute)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import mapsd.{Geo, Routes} // Routes.loadRoute, Geo.currentEpoch
-
-object ReadApi {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private val notFound = json(StatusCodes.NotFound, JsObject("error" -> JsString("route not found")))
-
-  val route: Route = path("v1" / "routes" / Segment) { routeId =>
-    get {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      Routes.loadRoute(routeId) match {
-        case None => complete(notFound)
-        case Some(stored) =>
-          complete(
-            json(
-              StatusCodes.OK,
-              JsObject(
-                "route_id" -> JsString(routeId),
-                "distance_m" -> JsNumber(stored.route.distanceM),
-                "duration_s" -> JsNumber(stored.route.durationS),
-                "geometry" -> JsString(stored.route.geometry),
-                "engine_version" -> JsString(stored.route.engineVersion),
-                "epoch" -> JsNumber(Geo.currentEpoch()),
-              ),
-            ),
-          )
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import mapsd.{Geo, Routes} // Routes.loadRoute, Geo.currentEpoch
-
-object ReadApi {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private val notFound = json(StatusCodes.NotFound, JsObject("error" -> JsString("route not found")))
-
-  val route: Route = path("v1" / "routes" / Segment) { routeId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-        case Some(tenant) =>
-          // Another tenant's route answers exactly like a missing one: the read confirms nothing.
-          Routes.loadRoute(routeId).filter(_.tenant == tenant) match {
-            case None => complete(notFound)
-            case Some(stored) =>
-              complete(
-                json(
-                  StatusCodes.OK,
-                  JsObject(
-                    "route_id" -> JsString(routeId),
-                    "distance_m" -> JsNumber(stored.route.distanceM),
-                    "duration_s" -> JsNumber(stored.route.durationS),
-                    "geometry" -> JsString(stored.route.geometry),
-                    "engine_version" -> JsString(stored.route.engineVersion),
-                    // The epoch the geometry was solved under; the current one only decides whether it is stale.
-                    "epoch" -> JsNumber(stored.route.epoch),
-                    "stale" -> JsBoolean(stored.route.epoch != Geo.currentEpoch()),
-                    "degraded" -> JsBoolean(stored.route.degraded),
-                  ),
-                ),
-              )
-          }
-      }
-    }
-  }
 }
 `,
     },

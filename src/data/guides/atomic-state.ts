@@ -157,10 +157,6 @@ won, err := rdb.SetNX(ctx, ballotKey, vote, 30*24*time.Hour).Result()
 bool won = redis.set(ballot_key, vote, std::chrono::hours(30 * 24), sw::redis::UpdateType::NOT_EXIST);
 \`\`\`
 
-\`\`\`scala
-val won = jedis.set(ballotKey, vote, SetParams.setParams().nx().ex(30L * 86400)) == "OK"
-\`\`\`
-
 Two details matter. First, the expiry goes **in the same command**: \`SETNX\` followed by
 \`EXPIRE\` leaves a key that lives forever if the process dies between the two (see
 [keys and lifetimes](/guides/keys-and-expiry)). Second, **use the reply**. \`INCRBY\` returns the
@@ -227,8 +223,8 @@ redis.eval(kReserveLua, {key}, {std::to_string(cost), std::to_string(kLimit), "8
            std::back_inserter(reply));
 \`\`\`
 
-redis++ and Jedis send the script text with \`eval\`. To save the bytes on a hot path, load it once
-with \`script_load\` / \`scriptLoad\` and call \`evalsha\`, then reload it on \`NOSCRIPT\`.
+redis++ sends the script text with \`eval\`. To save the bytes on a hot path, load it once
+with \`script_load\` and call \`evalsha\`, then reload it on \`NOSCRIPT\`.
 
 The token bucket is the classic multi-step decision: refill by elapsed time, compare, spend. Read the
 bucket in one call and spend in another, and two requests share the last token.

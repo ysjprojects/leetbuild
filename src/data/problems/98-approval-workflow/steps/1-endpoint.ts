@@ -59,7 +59,6 @@ client retry opens a second request with a second chain.
         python: {all: [/@app\.post\(\s*["']\/v1\/requests["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/requests['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/requests"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"requests"\s*\)/, /\bpost\b/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/requests"/]},
       },
     },
@@ -72,7 +71,6 @@ client retry opens a second request with a second chain.
         python: {all: [/resolve_approvers\(/, /chain_version/], none: [/body\.approvers/]},
         typescript: {all: [/resolveApprovers\(/, /chain_version/], none: [/body\.approvers/]},
         go: {all: [/policy\.ResolveApprovers\(/, /ChainVersion/], none: [/body\.Approvers/]},
-        scala: {all: [/Policy\.resolveApprovers\(/, /chainVersion/], none: [/"approvers"\)/]},
         cpp: {all: [/policy::resolveApprovers\(/, /version/], none: [/body(\.value\(|\[)\s*"approvers"/]},
       },
     },
@@ -85,7 +83,6 @@ client retry opens a second request with a second chain.
         python: {all: [/requester_cannot_approve/, /\b409\b/]},
         typescript: {all: [/requester_cannot_approve/, /\b409\b/]},
         go: {all: [/requester_cannot_approve/, /StatusConflict|\b409\b/]},
-        scala: {all: [/requester_cannot_approve/, /Conflict|\b409\b/]},
         cpp: {all: [/requester_cannot_approve/, /\b409\b/]},
       },
     },
@@ -98,7 +95,6 @@ client retry opens a second request with a second chain.
         python: {all: [/4096|1\s*<<\s*12/, /\.encode\(/, /\b413\b/]},
         typescript: {all: [/4096|1\s*<<\s*12/, /byteLength\(/, /\b413\b/]},
         go: {all: [/4096|1\s*<<\s*12/, /StatusRequestEntityTooLarge|\b413\b/]},
-        scala: {all: [/4096|1\s*<<\s*12/, /getBytes\(/, /PayloadTooLarge|RequestEntityTooLarge|\b413\b/]},
         cpp: {all: [/4096|1\s*<<\s*12/, /\b413\b/]},
       },
     },
@@ -111,7 +107,6 @@ client retry opens a second request with a second chain.
         python: {all: [/idempotency-key/i], order: [/store\.get\(/, /resolve_approvers\(/]},
         typescript: {all: [/idempotency-key/i], order: [/store\.get\(/, /resolveApprovers\(/]},
         go: {all: [/Idempotency-Key/i], order: [/store\.Get\(/, /policy\.ResolveApprovers\(/]},
-        scala: {all: [/Idempotency-Key/i], order: [/Store\.get\(/, /Policy\.resolveApprovers\(/]},
         cpp: {all: [/Idempotency-Key/i], order: [/store::get\(/, /policy::resolveApprovers\(/]},
       },
     },
@@ -546,119 +541,6 @@ func submit(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/requests", submit)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import approvals.{Chain, Policy, Store} // Policy.resolveApprovers · Store.newRequestId, get, put · Chain.startChain
-
-object Api {
-  val ChainIdRe = "^[a-z0-9][a-z0-9_-]{1,31}$".r
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  def submit(tenant: String, requester: String, idemKey: String, raw: String): HttpResponse = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    if (tenant.isEmpty || requester.isEmpty) return error(StatusCodes.Unauthorized, "X-Tenant-Id and X-User-Id are required")
-    val fields = raw.parseJson.asJsObject.fields
-    def text(name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-    val chainId = text("chain_id")
-    if (!ChainIdRe.matches(chainId)) return error(StatusCodes.BadRequest, "invalid chain_id")
-    Policy.resolveApprovers(chainId) match {
-      case None => error(StatusCodes.NotFound, "unknown chain")
-      case Some(resolved) =>
-        // the requester may narrow the chain for their request
-        val named = fields.get("approvers").collect { case JsArray(items) => items.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
-        val approvers = if (named.nonEmpty) named else resolved.approvers
-        val amount = fields.get("amount_cents").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-        val record = Store.Request(Store.newRequestId(), tenant, requester, chainId, resolved.version, approvers, text("why"), amount)
-        Store.put(record, idemKey)
-        Chain.startChain(record.requestId, approvers)
-        json(StatusCodes.Created, JsObject(
-          "request_id" -> JsString(record.requestId), "chain_version" -> JsNumber(record.chainVersion),
-          "approvers" -> JsArray(approvers.map(JsString(_)).toVector), "replayed" -> JsBoolean(false)))
-    }
-  }
-
-  val route: Route = path("v1" / "requests") {
-    post {
-      (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("X-User-Id") & optionalHeaderValueByName("Idempotency-Key")) {
-        (tenant, requester, idemKey) =>
-          entity(as[String]) { raw =>
-            complete(submit(tenant.getOrElse(""), requester.getOrElse(""), idemKey.getOrElse(""), raw))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import approvals.{Chain, Policy, Store} // Policy.resolveApprovers · Store.newRequestId, get, put · Chain.startChain
-
-object Api {
-  val ChainIdRe = "^[a-z0-9][a-z0-9_-]{1,31}$".r
-  val MaxWhyBytes = 4096
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def answer(status: StatusCode, record: Store.Request, replayed: Boolean): HttpResponse =
-    json(status, JsObject(
-      "request_id" -> JsString(record.requestId), "chain_version" -> JsNumber(record.chainVersion),
-      "approvers" -> JsArray(record.approvers.map(JsString(_)).toVector), "replayed" -> JsBoolean(replayed)))
-
-  def submit(tenant: String, requester: String, idemKey: String, raw: String): HttpResponse = {
-    if (tenant.isEmpty || requester.isEmpty) return error(StatusCodes.Unauthorized, "X-Tenant-Id and X-User-Id are required")
-    if (idemKey.isEmpty) return error(StatusCodes.BadRequest, "Idempotency-Key is required")
-    val fields = raw.parseJson.asJsObject.fields
-    def text(name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-    val chainId = text("chain_id")
-    val why = text("why")
-    if (!ChainIdRe.matches(chainId)) return error(StatusCodes.BadRequest, "invalid chain_id")
-    if (why.isEmpty) return error(StatusCodes.BadRequest, "why is required")
-    if (why.getBytes(UTF_8).length > MaxWhyBytes) return error(StatusCodes.PayloadTooLarge, s"why is longer than $MaxWhyBytes bytes")
-    // a retry gets the request its first attempt created
-    val stored = Store.get(tenant, idemKey)
-    if (stored.isDefined) return answer(StatusCodes.OK, stored.get, replayed = true)
-    Policy.resolveApprovers(chainId) match {
-      case None => error(StatusCodes.NotFound, "unknown chain")
-      // The policy decides who approves; the version is pinned so a later edit cannot reshape this chain.
-      case Some(resolved) if resolved.approvers.contains(requester) => error(StatusCodes.Conflict, "requester_cannot_approve")
-      case Some(resolved) =>
-        val amount = fields.get("amount_cents").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-        val record = Store.Request(Store.newRequestId(), tenant, requester, chainId, resolved.version, resolved.approvers, why, amount)
-        Store.put(record, idemKey)
-        Chain.startChain(record.requestId, record.approvers)
-        answer(StatusCodes.Created, record, replayed = false)
-    }
-  }
-
-  val route: Route = path("v1" / "requests") {
-    post {
-      (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("X-User-Id") & optionalHeaderValueByName("Idempotency-Key")) {
-        (tenant, requester, idemKey) =>
-          entity(as[String]) { raw =>
-            complete(submit(tenant.getOrElse(""), requester.getOrElse(""), idemKey.getOrElse(""), raw))
-          }
-      }
-    }
-  }
 }
 `,
     },

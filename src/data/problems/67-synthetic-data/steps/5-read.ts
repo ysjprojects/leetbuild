@@ -56,7 +56,6 @@ nobody can trace a single record to its seed. And any tenant can read any job.
         python: {all: [/@app\.get\(\s*["']\/v1\/synthetic\/jobs\/\{job_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/synthetic\/jobs\/:job_id['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/synthetic\/jobs\/\{jobID\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"synthetic"\s*\/\s*"jobs"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\([^,\n]*v1\/synthetic\/jobs\//]},
       },
     },
@@ -69,7 +68,6 @@ nobody can trace a single record to its seed. And any tenant can read any job.
         python: {all: [/\[["']tenant["']\]|get\(\s*["']tenant["']\s*\)/]},
         typescript: {all: [/\.tenant\s*!==?\s*tenant/]},
         go: {all: [/\.Tenant\s*!=\s*tenant/]},
-        scala: {all: [/\.tenant\s*[!=]=\s*tenant/]},
         cpp: {all: [/\["tenant"\]|value\(\s*"tenant"/]},
       },
     },
@@ -82,7 +80,6 @@ nobody can trace a single record to its seed. And any tenant can read any job.
         python: {all: [/["']parked["']/], none: [/generated\s*-\s*rejected/]},
         typescript: {all: [/\bparked\b/], none: [/generated\s*-\s*rejected/]},
         go: {all: [/"parked"/], none: [/generated\s*-\s*rejected/]},
-        scala: {all: [/"parked"/], none: [/generated\s*-\s*rejected/]},
         cpp: {all: [/"parked"/], none: [/generated\s*-\s*rejected/]},
       },
     },
@@ -95,7 +92,6 @@ nobody can trace a single record to its seed. And any tenant can read any job.
         python: {all: [/["']coverage["']/], none: [/\.hlen\(/]},
         typescript: {all: [/\bcoverage:/], none: [/\.hlen\(/]},
         go: {all: [/"coverage"/], none: [/\.HLen\(/]},
-        scala: {all: [/"coverage"/], none: [/\.hlen\(/]},
         cpp: {all: [/"coverage"/], none: [/\.hlen\(/]},
       },
     },
@@ -108,7 +104,6 @@ nobody can trace a single record to its seed. And any tenant can read any job.
         python: {all: [/records_key\(/], none: [/seeds\.lookup\(/]},
         typescript: {all: [/recordsKey\(/], none: [/\blookup\(/]},
         go: {all: [/RecordsKey\(/], none: [/seeds\.Lookup\(/]},
-        scala: {all: [/recordsKey\(/], none: [/Seeds\.lookup\(/]},
         cpp: {all: [/records_key\(/], none: [/seeds::lookup\(/]},
       },
     },
@@ -452,125 +447,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import synth.{Config, Jobs, Seeds}
-
-object SynthReport {
-  implicit val system: ActorSystem = ActorSystem("synthetic-report")
-  val jedis = new JedisPooled("redis", 6379)
-
-  val route: Route =
-    path("v1" / "synthetic" / "jobs" / Segment) { jobId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            Jobs.byId(jobId) match {
-              case None => complete(StatusCodes.NotFound, """{"error":"unknown job"}""")
-              case Some(row) =>
-                val counts = jedis.hgetAll(Config.progressKey(jobId)).asScala.toMap.map { case (k, v) => k -> v.toLong }
-                val generated = counts.getOrElse("generated", 0L)
-                val rejected = counts.getOrElse("rejected", 0L)
-                val license = Seeds.lookup(row.job.seed_dataset, row.job.seed_version).map(_.license).getOrElse("")
-                val report = ujson.Obj(
-                  "job_id" -> jobId,
-                  "status" -> row.job.status,
-                  "seed_dataset" -> row.job.seed_dataset,
-                  "seed_version" -> row.job.seed_version,
-                  "recipe" -> row.job.recipe,
-                  "max_records" -> row.job.max_records,
-                  "generated" -> ujson.Num(generated.toDouble),
-                  "admitted" -> ujson.Num((generated - rejected).toDouble),
-                  "rejected" -> ujson.Num(rejected.toDouble),
-                  "throttled" -> ujson.Num(counts.getOrElse("throttled", 0L).toDouble),
-                  "entities" -> ujson.Num(jedis.hlen(Config.coverageKey(jobId)).toDouble),
-                  "provenance" -> ujson.Obj("license" -> license),
-                  "updated_at" -> ujson.Num(counts.getOrElse("updated_at", 0L).toDouble)
-                )
-                complete(HttpEntity(ContentTypes.\`application/json\`, ujson.write(report)))
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import synth.{Config, Jobs}
-
-object SynthReport {
-  implicit val system: ActorSystem = ActorSystem("synthetic-report")
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def numbers(key: String): Map[String, Long] =
-    jedis.hgetAll(key).asScala.toMap.map { case (k, v) => k -> v.toLong }
-
-  val route: Route =
-    path("v1" / "synthetic" / "jobs" / Segment) { jobId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            Jobs.byId(jobId).filter(_.tenant == tenantOpt.get) match {
-              case None => complete(StatusCodes.NotFound, """{"error":"unknown job"}""")
-              case Some(row) =>
-                val counts = numbers(Config.progressKey(jobId))
-                val coverage = numbers(Config.coverageKey(jobId))
-                val records = jedis.hgetAll(Config.recordsKey(jobId)).asScala.toMap
-                def count(field: String): ujson.Value = ujson.Num(counts.getOrElse(field, 0L).toDouble)
-                val report = ujson.Obj(
-                  "job_id" -> jobId,
-                  "status" -> row.job.status,
-                  "seed_dataset" -> row.job.seed_dataset,
-                  "seed_version" -> row.job.seed_version,
-                  "recipe" -> row.job.recipe,
-                  "max_records" -> row.job.max_records,
-                  "generated" -> count("generated"),
-                  "admitted" -> count("admitted"),
-                  "parked" -> count("parked"),
-                  "rejected" -> count("rejected"),
-                  "throttled" -> count("throttled"),
-                  "coverage" -> ujson.Obj.from(coverage.map { case (k, v) => k -> ujson.Num(v.toDouble) }),
-                  "records" -> ujson.Obj.from(records.map { case (k, v) => k -> ujson.Str(v) }),
-                  "updated_at" -> count("updated_at")
-                )
-                complete(HttpEntity(ContentTypes.\`application/json\`, ujson.write(report)))
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

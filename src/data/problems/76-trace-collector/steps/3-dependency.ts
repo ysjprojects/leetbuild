@@ -61,7 +61,6 @@ loop, and a trace storage will never accept is sent again every second.
         python: {all: [/\.Write\([\s\S]{0,200}?timeout\s*=/]},
         typescript: {all: [/\.Write\([\s\S]{0,300}?deadline:/]},
         go: {all: [/context\.WithTimeout\(/]},
-        scala: {all: [/withDeadlineAfter\(/]},
         cpp: {all: [/set_deadline\(/]},
       },
     },
@@ -74,7 +73,6 @@ loop, and a trace storage will never accept is sent again every second.
         python: {order: [/\.Write\(/, /assembly\.delete_trace\(/]},
         typescript: {order: [/\.Write\(/, /deleteTrace\(/]},
         go: {order: [/storage\.Write\(/, /assembly\.DeleteTrace\(/]},
-        scala: {order: [/\.write\(/, /Assembly\.deleteTrace\(/]},
         cpp: {order: [/->Write\(/, /assembly::deleteTrace\(/]},
       },
     },
@@ -90,7 +88,6 @@ loop, and a trace storage will never accept is sent again every second.
           none: [/while\s*\(true\)|for\s*\([^;\n]*;\s*;/],
         },
         go: {all: [/maxAttempts\s*=\s*3\b/, /codes\.Unavailable/], none: [/for \{|for [^;\n]*;\s*;/]},
-        scala: {all: [/MaxAttempts\s*=\s*3\b/, /Code\.UNAVAILABLE/], none: [/while\s*\((true|!done)\)/]},
         cpp: {
           all: [/kMaxAttempts\s*=\s*3\b/, /StatusCode::UNAVAILABLE/],
           none: [/for\s*\([^;\n]*;\s*;|while\s*\(true\)/],
@@ -106,7 +103,6 @@ loop, and a trace storage will never accept is sent again every second.
         python: {all: [/StatusCode\.INVALID_ARGUMENT/, /assembly\.quarantine\(/]},
         typescript: {all: [/status\.INVALID_ARGUMENT/, /quarantine\(/]},
         go: {all: [/codes\.InvalidArgument/, /assembly\.Quarantine\(/]},
-        scala: {all: [/Code\.INVALID_ARGUMENT/, /Assembly\.quarantine\(/]},
         cpp: {all: [/StatusCode::INVALID_ARGUMENT/, /assembly::quarantine\(/]},
       },
     },
@@ -421,84 +417,6 @@ func flushTrace(ctx context.Context, traceID string) (flushResult, error) {
 		return flushResult{Kept: true, Attempts: attempt}, nil
 	}
 	return flushResult{Kept: true, Attempts: maxAttempts}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import traces.Assembly // Assembly.loadTrace, deleteTrace, quarantine
-import tracestore.trace_collector.{Span => SpanPb, TraceWriterGrpc, WriteRequest}
-
-final case class FlushResult(flushed: Boolean, kept: Boolean, quarantined: Boolean, attempts: Int)
-
-object Client {
-  private val storage = TraceWriterGrpc.blockingStub(ManagedChannelBuilder.forAddress("storage", 9000).usePlaintext().build())
-
-  def writeRequest(trace: Assembly.Trace): WriteRequest =
-    WriteRequest(tenant = trace.owner, traceId = trace.traceId, spans = trace.spans.map(s => SpanPb(s.spanId, s.parentSpanId, s.service, s.startMs, s.durationMs)), missing = trace.missing)
-
-  /** Write the assembled trace to span storage. */
-  def flushTrace(traceId: String): FlushResult = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    Assembly.loadTrace(traceId) match {
-      case None => FlushResult(flushed = false, kept = false, quarantined = false, attempts = 0)
-      case Some(trace) =>
-        Assembly.deleteTrace(traceId) // the payload is in hand
-        var attempts = 0
-        var done = false
-        while (!done) {
-          attempts += 1
-          try {
-            storage.write(writeRequest(trace))
-            done = true
-          } catch {
-            case _: StatusRuntimeException => Thread.sleep(1000) // storage is having a moment: try again
-          }
-        }
-        FlushResult(flushed = true, kept = false, quarantined = false, attempts = attempts)
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import traces.Assembly // Assembly.loadTrace, deleteTrace, quarantine
-import tracestore.trace_collector.{Span => SpanPb, TraceWriterGrpc, WriteRequest}
-
-final case class FlushResult(flushed: Boolean, kept: Boolean, quarantined: Boolean, attempts: Int)
-
-object Client {
-  val WriteDeadlineMs = 2000L
-  val MaxAttempts = 3
-  val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val storage = TraceWriterGrpc.blockingStub(ManagedChannelBuilder.forAddress("storage", 9000).usePlaintext().build())
-
-  def writeRequest(trace: Assembly.Trace): WriteRequest =
-    WriteRequest(tenant = trace.owner, traceId = trace.traceId, spans = trace.spans.map(s => SpanPb(s.spanId, s.parentSpanId, s.service, s.startMs, s.durationMs)), missing = trace.missing)
-
-  private def attempt(trace: Assembly.Trace, request: WriteRequest, n: Int): FlushResult =
-    try {
-      storage.withDeadlineAfter(WriteDeadlineMs, TimeUnit.MILLISECONDS).write(request)
-      Assembly.deleteTrace(trace.traceId) // storage confirmed the write
-      FlushResult(flushed = true, kept = false, quarantined = false, attempts = n)
-    } catch {
-      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.INVALID_ARGUMENT =>
-        Assembly.quarantine(trace, Option(e.getStatus.getDescription).getOrElse("invalid argument")) // repeating it cannot succeed
-        FlushResult(flushed = false, kept = false, quarantined = true, attempts = n)
-      case e: StatusRuntimeException if Retryable(e.getStatus.getCode) && n < MaxAttempts => attempt(trace, request, n + 1)
-      // Out of attempts, or a status a retry will not change: the state stays for the next cycle.
-      case _: StatusRuntimeException => FlushResult(flushed = false, kept = true, quarantined = false, attempts = n)
-    }
-
-  /** Write the assembled trace to span storage. */
-  def flushTrace(traceId: String): FlushResult = Assembly.loadTrace(traceId) match {
-    case None => FlushResult(flushed = false, kept = false, quarantined = false, attempts = 0)
-    case Some(trace) => attempt(trace, writeRequest(trace), 1)
-  }
 }
 `,
     },

@@ -67,7 +67,7 @@ returning the new transaction id — or \`None\` when the event was already in t
     ],
   },
   hints: [
-    'The row count of the first INSERT is the whole decision: `cur.rowcount` (`RowsAffected`, `executeUpdate`, `affected_rows`) is 0 when the conflict clause swallowed the insert. Return right there, still inside the block — an empty transaction commits harmlessly.',
+    'The row count of the first INSERT is the whole decision: `cur.rowcount` (`RowsAffected`, `affected_rows`) is 0 when the conflict clause swallowed the insert. Return right there, still inside the block — an empty transaction commits harmlessly.',
     'One `posted_at` value, computed once before the block, goes into the transaction row and every entry row; the event time is the only thing that makes a balance "as of" a date reproducible.',
     'Hooks go after the `async with` block, not inside: inside, a rollback would leave Redis describing a transaction the journal never got, and a slow Redis would hold the database transaction open.',
   ],
@@ -91,12 +91,6 @@ returning the new transaction id — or \`None\` when the event was already in t
           ],
         },
         go: {
-          all: [
-            /INSERT INTO transactions/,
-            /ON CONFLICT \(event_id\) DO NOTHING|SELECT[^\n]*FROM transactions WHERE event_id/,
-          ],
-        },
-        scala: {
           all: [
             /INSERT INTO transactions/,
             /ON CONFLICT \(event_id\) DO NOTHING|SELECT[^\n]*FROM transactions WHERE event_id/,
@@ -131,7 +125,6 @@ returning the new transaction id — or \`None\` when the event was already in t
           ],
         },
         go: {order: [/RowsAffected\(\)/, /==\s*0/, /INSERT INTO entries/]},
-        scala: {order: [/executeUpdate\(\)\s*==\s*0/, /INSERT INTO entries/]},
         cpp: {order: [/affected_rows\(\)\s*==\s*0/, /INSERT INTO entries/]},
       },
     },
@@ -150,7 +143,6 @@ returning the new transaction id — or \`None\` when the event was already in t
           ],
         },
         go: {all: [/postedAt\s*==\s*0/, /nowMs\(\)/, /INSERT INTO entries[^\n]*posted_at/]},
-        scala: {all: [/postedAt\s*==\s*0/, /nowMs\(\)/, /INSERT INTO entries[^\n]*posted_at/]},
         cpp: {all: [/posted_at\s*==\s*0/, /now_ms\(\)/, /INSERT INTO entries[^\n]*posted_at/]},
       },
     },
@@ -177,12 +169,6 @@ returning the new transaction id — or \`None\` when the event was already in t
             /db\.Transaction\(\s*ctx\s*,\s*func\(tx \*sql\.Tx\) error \{(?:(?!\n\t\}\))[\s\S])*?INSERT INTO entries/,
           ],
         },
-        scala: {
-          all: [
-            /Db\.transaction \{ conn =>(?:(?!\n {4}\})[\s\S])*?INSERT INTO transactions/,
-            /Db\.transaction \{ conn =>(?:(?!\n {4}\})[\s\S])*?INSERT INTO entries/,
-          ],
-        },
         cpp: {
           all: [
             /db::transaction\(\[&\]\(pqxx::work& tx\) \{(?:(?!\n {2}\}\))[\s\S])*?INSERT INTO transactions/,
@@ -200,7 +186,6 @@ returning the new transaction id — or \`None\` when the event was already in t
         python: {order: [/async with db\.transaction\(\)/, /(?<!import )\btrack\(/, /(?<!import )\binvalidate\(/]},
         typescript: {order: [/query\(\s*['"]COMMIT['"]\s*\)/, /(?<!\{)\btrack\(/, /(?<!\{)\binvalidate\(/]},
         go: {order: [/db\.Transaction\(/, /(?<!func )\btrack\(/, /(?<!func )\binvalidate\(/]},
-        scala: {order: [/Db\.transaction \{/, /(?<!def )\btrack\(/, /(?<!def )\binvalidate\(/]},
         cpp: {order: [/db::transaction\(/, /(?<!void )\btrack\(/, /(?<!void )\binvalidate\(/]},
       },
     },
@@ -475,76 +460,6 @@ func writeTransaction(ctx context.Context, entries []Entry, description string, 
 		invalidate(ctx, e.Account, e.Currency)
 	}
 	return transactionID, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import ledger.Db // Db.transaction { conn => ... } begins, runs the block, commits (rolls back on exception)
-
-// Entry is defined in step 1 (LedgerApi).
-
-object LedgerWriter {
-  /** Built in step 5 (ClearingTracker) and step 6 (BalanceService). */
-  def track(transactionId: String, postedAt: Long, entries: Seq[Entry], settles: Option[String]): Unit = ???
-  def invalidate(account: String, currency: String): Unit = ???
-
-  def nowMs(): Long = System.currentTimeMillis()
-
-  /** Records one transaction and its entries; returns its id, or None when the event was already recorded. */
-  def writeTransaction(entries: Seq[Entry], description: String, eventId: Option[String], postedAt: Long, settles: Option[String]): Option[String] = {
-    val transactionId = UUID.randomUUID().toString
-    // TODO: postedAt 0 → nowMs() — the API path; the consumer passes the event's occurredAt
-    // TODO: one Db.transaction: INSERT INTO transactions … ON CONFLICT (event_id) DO NOTHING; executeUpdate 0 → duplicate
-    // TODO: INSERT INTO entries (transaction_id, account, currency, amount, posted_at) for every entry
-    // TODO: after the block: track(transactionId, postedAt, entries, settles) and invalidate(account, currency) per entry
-    ???
-  }
-}
-`,
-      solution: `import java.util.UUID
-
-import ledger.Db // Db.transaction { conn => ... } begins, runs the block, commits (rolls back on exception)
-
-// Entry is defined in step 1 (LedgerApi).
-
-object LedgerWriter {
-  /** Built in step 5 (ClearingTracker) and step 6 (BalanceService). */
-  def track(transactionId: String, postedAt: Long, entries: Seq[Entry], settles: Option[String]): Unit = ???
-  def invalidate(account: String, currency: String): Unit = ???
-
-  def nowMs(): Long = System.currentTimeMillis()
-
-  /** Records one transaction and its entries; returns its id, or None when the event was already recorded. */
-  def writeTransaction(entries: Seq[Entry], description: String, eventId: Option[String], postedAt: Long, settles: Option[String]): Option[String] = {
-    val transactionId = UUID.randomUUID().toString
-    val at = if (postedAt == 0) nowMs() else postedAt
-    val inserted = Db.transaction { conn =>
-      val tx = conn.prepareStatement(
-        "INSERT INTO transactions (id, event_id, description, settles, posted_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (event_id) DO NOTHING")
-      tx.setString(1, transactionId); tx.setString(2, eventId.orNull); tx.setString(3, description)
-      tx.setString(4, settles.orNull); tx.setLong(5, at)
-      if (tx.executeUpdate() == 0) false // this event is already in the journal: a redelivery
-      else {
-        val row = conn.prepareStatement(
-          "INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES (?, ?, ?, ?, ?)")
-        entries.foreach { e =>
-          row.setString(1, transactionId); row.setString(2, e.account); row.setString(3, e.currency)
-          row.setLong(4, e.amount); row.setLong(5, at)
-          row.addBatch()
-        }
-        row.executeBatch()
-        true
-      }
-    }
-    if (!inserted) None
-    else {
-      track(transactionId, at, entries, settles)
-      entries.foreach(e => invalidate(e.account, e.currency))
-      Some(transactionId)
-    }
-  }
 }
 `,
     },

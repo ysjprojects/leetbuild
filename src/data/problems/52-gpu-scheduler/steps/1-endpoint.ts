@@ -62,7 +62,6 @@ log line carries the tenant's bid.
         python: {all: [/@app\.post\(\s*["']\/v1\/placements["']/, /\ballocate\(/, /status_code=201/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/placements['"]/, /\ballocate\(/, /code\(\s*201\s*\)/]},
         go: {all: [/"POST \/v1\/placements"/, /\ballocate\(/, /StatusCreated|\b201\b/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"placements"\s*\)/, /State\.allocate\(/, /StatusCodes\.Created/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/placements"/, /\ballocate\(/, /status\s*=\s*201/]},
       },
     },
@@ -75,7 +74,6 @@ log line carries the tenant's bid.
         python: {all: [/status_code=400/], order: [/not in KNOWN_GPU_TYPES/, /\ballocate\(/]},
         typescript: {all: [/code\(\s*400\s*\)/], order: [/KNOWN_GPU_TYPES\[/, /\ballocate\(/]},
         go: {all: [/StatusBadRequest/], order: [/config\.KnownGPUTypes\[/, /\ballocate\(/]},
-        scala: {all: [/StatusCodes\.BadRequest/], order: [/KnownGpuTypes\.contains/, /State\.allocate\(/]},
         cpp: {all: [/\b400\b/], order: [/kKnownGpuTypes\.count/, /\ballocate\(/]},
       },
     },
@@ -94,10 +92,6 @@ log line carries the tenant's bid.
           all: [/StatusBadRequest/],
           order: [/[<>]=?\s*config\.MaxNodeGPUs|config\.MaxNodeGPUs\s*[<>]=?/, /\ballocate\(/],
         },
-        scala: {
-          all: [/StatusCodes\.BadRequest/],
-          order: [/[<>]=?\s*MaxNodeGpus|MaxNodeGpus\s*[<>]=?/, /State\.allocate\(/],
-        },
         cpp: {all: [/\b400\b/], order: [/[<>]=?\s*(gpusched::)?kMaxNodeGpus|kMaxNodeGpus\s*[<>]=?/, /\ballocate\(/]},
       },
     },
@@ -110,7 +104,6 @@ log line carries the tenant's bid.
         python: {all: [/def place[\s\S]*?schedulable_nodes\(\)/], none: [/BOOT_NODES/]},
         typescript: {all: [/app\.post\([\s\S]*?schedulableNodes\(\)/], none: [/BOOT_NODES/]},
         go: {all: [/func place[\s\S]*?schedulableNodes\(/], none: [/bootNodes/]},
-        scala: {all: [/val route[\s\S]*?schedulableNodes\(\)/], none: [/BootNodes/]},
         cpp: {all: [/void place[\s\S]*?schedulable_nodes\(\)/], none: [/kBootNodes/]},
       },
     },
@@ -132,7 +125,6 @@ log line carries the tenant's bid.
           all: [/log\.Printf\(/, /placementID/],
           none: [/log\.\w+\([^)]*\bbody\b|log\.\w+\([^)]*MaxHourlyBid|log\.\w+\([^)]*max_hourly_bid/],
         },
-        scala: {all: [/println\(/, /placementId/], none: [/println\([^)]*\bbody\b|println\([^)]*max_hourly_bid/]},
         cpp: {all: [/std::clog\s*<</, /placement_id/], none: [/std::clog[^;]*\bbody\b|std::clog[^;]*max_hourly_bid/]},
       },
     },
@@ -579,137 +571,6 @@ func place(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/placements", place)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-
-import gpusched.Config.{KnownGpuTypes, MaxNodeGpus}
-
-object Api {
-  val jedis = new JedisPooled("redis", 6379)
-
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-
-  final case class Node(id: String, gpuType: String, capacity: Int, allocated: Int) {
-    def free: Int = math.max(capacity - allocated, 0)
-  }
-
-  /** Every node with a live heartbeat, most free GPUs first. */
-  def schedulableNodes(): List[Node] =
-    jedis.smembers("nodes").asScala.toList.flatMap { id =>
-      if (jedis.exists(s"heartbeat:$id")) {
-        val fields = jedis.hgetAll(s"node:$id").asScala
-        Some(Node(id, fields.getOrElse("gpu_type", ""), fields.get("capacity").map(_.toInt).getOrElse(0), fields.get("allocated").map(_.toInt).getOrElse(0)))
-      } else None
-    }.sortBy(-_.free)
-
-  /** The fleet, read once while the service boots. */
-  val BootNodes: List[Node] = schedulableNodes()
-
-  final case class PlacementBody(gpu_type: String, count: Int, memory_gb: Double, max_hourly_bid: Double)
-  implicit val bodyFormat: RootJsonFormat[PlacementBody] = jsonFormat4(PlacementBody)
-
-  val route: Route =
-    path("v1" / "placements") {
-      post {
-        entity(as[String]) { raw =>
-          Try(raw.parseJson.convertTo[PlacementBody]).toOption match {
-            case None => complete(StatusCodes.BadRequest -> "malformed body")
-            case Some(body) =>
-              val typed = BootNodes.filter(_.gpuType == body.gpu_type)
-              val candidates = if (typed.nonEmpty) typed else BootNodes
-              val placementId = s"p-\${UUID.randomUUID().toString.take(12)}"
-              candidates.find(n => State.allocate(n.id, placementId, body.count) == "ALLOCATED") match {
-                case Some(node) =>
-                  println(s"placement queued body=$body node=\${node.id}")
-                  val json = s"""{"placement_id":"$placementId","node_id":"\${node.id}","free":\${node.free - body.count}}"""
-                  complete(HttpResponse(StatusCodes.Created, entity = HttpEntity(ContentTypes.\`application/json\`, json)))
-                case None => complete(StatusCodes.Conflict -> "NO_CAPACITY")
-              }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-
-import gpusched.Config.{KnownGpuTypes, MaxNodeGpus}
-
-object Api {
-  val jedis = new JedisPooled("redis", 6379)
-
-  final case class Node(id: String, gpuType: String, capacity: Int, allocated: Int) {
-    def free: Int = math.max(capacity - allocated, 0)
-  }
-
-  /** Every node with a live heartbeat, most free GPUs first. */
-  def schedulableNodes(): List[Node] =
-    jedis.smembers("nodes").asScala.toList.flatMap { id =>
-      if (jedis.exists(s"heartbeat:$id")) {
-        val fields = jedis.hgetAll(s"node:$id").asScala
-        Some(Node(id, fields.getOrElse("gpu_type", ""), fields.get("capacity").map(_.toInt).getOrElse(0), fields.get("allocated").map(_.toInt).getOrElse(0)))
-      } else None
-    }.sortBy(-_.free)
-
-  private def number(v: Option[JsValue]): Option[Double] = v.collect { case JsNumber(n) => n.toDouble }
-
-  /** The validated request, or what is wrong with it. */
-  private def validate(raw: String): Either[String, (String, Int)] =
-    Try(raw.parseJson.asJsObject).toOption match {
-      case None => Left("body must be a JSON object")
-      case Some(obj) =>
-        val fields = obj.fields
-        val gpuType = fields.get("gpu_type").collect { case JsString(s) => s }
-        val count = number(fields.get("count"))
-        if (!gpuType.exists(KnownGpuTypes.contains)) Left("unknown gpu_type")
-        else if (!count.exists(c => c == c.floor && c >= 1 && c <= MaxNodeGpus)) Left(s"count must be an integer from 1 to $MaxNodeGpus")
-        else if (number(fields.get("memory_gb")).isEmpty || number(fields.get("max_hourly_bid")).isEmpty) Left("memory_gb and max_hourly_bid must be numbers")
-        else Right((gpuType.get, count.get.toInt))
-    }
-
-  val route: Route =
-    path("v1" / "placements") {
-      post {
-        entity(as[String]) { raw =>
-          validate(raw) match {
-            case Left(reason) => complete(StatusCodes.BadRequest -> reason)
-            case Right((gpuType, count)) =>
-              val placementId = s"p-\${UUID.randomUUID().toString.take(12)}"
-              val candidates = schedulableNodes().filter(n => n.gpuType == gpuType && n.free >= count)
-              candidates.find(n => State.allocate(n.id, placementId, count) == "ALLOCATED") match {
-                case Some(node) =>
-                  val free = node.free - count
-                  println(s"placed placementId=$placementId nodeId=\${node.id} count=$count free=$free")
-                  val json = s"""{"placement_id":"$placementId","node_id":"\${node.id}","free":$free}"""
-                  complete(HttpResponse(StatusCodes.Created, entity = HttpEntity(ContentTypes.\`application/json\`, json)))
-                case None => complete(StatusCodes.Conflict -> "NO_CAPACITY")
-              }
-          }
-        }
-      }
-    }
 }
 `,
     },

@@ -56,7 +56,6 @@ tool without a key refunds twice when the worker retries the turn.
           all: [/REASON_DEADLINE_MS/, /Reason\([\s\S]{0,200}?deadline:\s*Date\.now\(\)\s*\+\s*REASON_DEADLINE_MS/],
         },
         go: {all: [/reasonDeadline/, /context\.WithTimeout\([^\n]*reasonDeadline\)/]},
-        scala: {all: [/ReasonDeadlineMs/, /withDeadlineAfter\(\s*ReasonDeadlineMs/]},
         cpp: {all: [/kReasonDeadline/, /set_deadline\([^\n]*kReasonDeadline\)/]},
       },
     },
@@ -72,7 +71,6 @@ tool without a key refunds twice when the worker retries the turn.
           none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
         },
         go: {all: [/maxIterations/, /"escalated"/], none: [/for\s*\{/]},
-        scala: {all: [/MaxIterations/, /"escalated"/], none: [/while\s*\(\s*true\s*\)/]},
         cpp: {all: [/kMaxIterations/, /"escalated"/], none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/]},
       },
     },
@@ -85,7 +83,6 @@ tool without a key refunds twice when the worker retries the turn.
         python: {all: [/TOOL_REGISTRY/, /tool not allowed/]},
         typescript: {all: [/TOOL_REGISTRY/, /tool not allowed/]},
         go: {all: [/toolRegistry/, /tool not allowed/]},
-        scala: {all: [/ToolRegistry/, /tool not allowed/]},
         cpp: {all: [/kToolRegistry/, /tool not allowed/]},
       },
     },
@@ -100,7 +97,6 @@ tool without a key refunds twice when the worker retries the turn.
           all: [/TOOL_DEADLINE_MS/, /Invoke\([\s\S]{0,300}?deadline:\s*Date\.now\(\)\s*\+\s*TOOL_DEADLINE_MS/],
         },
         go: {all: [/toolDeadline/, /context\.WithTimeout\([^\n]*toolDeadline\)/]},
-        scala: {all: [/ToolDeadlineMs/, /withDeadlineAfter\(\s*ToolDeadlineMs/]},
         cpp: {all: [/kToolDeadline/, /set_deadline\([^\n]*kToolDeadline\)/]},
       },
     },
@@ -113,7 +109,6 @@ tool without a key refunds twice when the worker retries the turn.
         python: {all: [/idempotency_key\s*=/, /["']WRITE["']/]},
         typescript: {all: [/idempotency_key\s*[:,}]/, /['"]WRITE['"]/]},
         go: {all: [/IdempotencyKey:/, /"WRITE"/]},
-        scala: {all: [/idempotencyKey\s*=/, /"WRITE"/]},
         cpp: {all: [/set_idempotency_key\(/, /"WRITE"/]},
       },
     },
@@ -536,108 +531,6 @@ func runTurn(ctx context.Context, store model.ContextStore, turn model.Turn) (Tu
 		}
 	}
 	return TurnResult{Status: "escalated", Iterations: maxIterations}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.ManagedChannelBuilder
-
-import apv2.{Config, ContextStore, Item, Turn}
-import apv2rpc.support_automation.{ContextItem, InvokeRequest, LlmAdapterGrpc, ReasonRequest, ToolManagerGrpc}
-
-/** How a turn ended: answered (with the answer) or escalated to a human. */
-final case class TurnResult(status: String, answer: String, iterations: Int)
-
-object CotWorkflow {
-  private val llm = LlmAdapterGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.LlmAdapter).usePlaintext().build())
-  private val tools = ToolManagerGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.ToolManager).usePlaintext().build())
-
-  /** One turn of the Chain of Thought loop: reason, run the tool asked for, feed the outcome back, until a result. */
-  def runTurn(store: ContextStore, turn: Turn): TurnResult = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    store.appendItem(turn.tenant, turn.conversation, Item("user", turn.text))
-    var iteration = 0
-    while (true) {
-      iteration += 1
-      val context = store.assemble(turn.tenant, turn.conversation, turn.actor, turn.text)
-      val messages = context.history.map(i => ContextItem(kind = i.kind, text = i.text))
-      val reply = llm.reason(ReasonRequest(turnId = turn.turn_id, iteration = iteration, messages = messages))
-      if (reply.kind == "result") {
-        store.appendItem(turn.tenant, turn.conversation, Item("assistant", reply.text))
-        return TurnResult("answered", reply.text, iteration)
-      }
-      val outcome = tools.invoke(InvokeRequest(turnId = turn.turn_id, tool = reply.tool, args = reply.args)).result
-      store.appendItem(turn.tenant, turn.conversation, Item("tool", outcome))
-    }
-    TurnResult("escalated", "", iteration)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import apv2.{Config, ContextStore, Item, Turn}
-import apv2rpc.support_automation.{ContextItem, InvokeRequest, LlmAdapterGrpc, ReasonReply, ReasonRequest, ToolManagerGrpc}
-
-/** How a turn ended: answered (with the answer) or escalated to a human. */
-final case class TurnResult(status: String, answer: String, iterations: Int)
-
-object CotWorkflow {
-  val ReasonDeadlineMs = 5000L
-  val ToolDeadlineMs = 3000L
-  val MaxIterations = 6
-  /** name → (READ or WRITE, the roles that may run it) */
-  val ToolRegistry: Map[String, (String, Set[String])] = Map(
-    "get_reservation" -> ("READ", Set("customer", "agent")),
-    "search_help" -> ("READ", Set("customer", "agent")),
-    "update_listing" -> ("WRITE", Set("agent")),
-    "issue_refund" -> ("WRITE", Set("agent"))
-  )
-  private val NotAllowed = """{"error": "tool not allowed"}"""
-  private val ToolFailed = """{"error": "tool failed"}"""
-
-  private val llm = LlmAdapterGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.LlmAdapter).usePlaintext().build())
-  private val tools = ToolManagerGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.ToolManager).usePlaintext().build())
-
-  /** The outcome the model sees: the tool's result, or why it did not run. */
-  private def runTool(turn: Turn, iteration: Int, reply: ReasonReply): String =
-    ToolRegistry.get(reply.tool) match {
-      case Some((mode, roles)) if roles.contains(turn.role) =>
-        val key = if (mode == "WRITE") s"\${turn.turn_id}:$iteration" else ""
-        try {
-          tools
-            .withDeadlineAfter(ToolDeadlineMs, TimeUnit.MILLISECONDS)
-            .invoke(InvokeRequest(turnId = turn.turn_id, tool = reply.tool, args = reply.args, idempotencyKey = key))
-            .result
-        } catch {
-          case _: StatusRuntimeException => ToolFailed
-        }
-      case _ => NotAllowed // the model's choice is a request, not an authorization
-    }
-
-  /** One turn of the Chain of Thought loop: reason, run the tool asked for, feed the outcome back, until a result. */
-  def runTurn(store: ContextStore, turn: Turn): TurnResult = {
-    store.appendItem(turn.tenant, turn.conversation, Item("user", turn.text))
-    for (iteration <- 1 to MaxIterations) {
-      val context = store.assemble(turn.tenant, turn.conversation, turn.actor, turn.text)
-      val messages = context.history.map(i => ContextItem(kind = i.kind, text = i.text))
-      val reply =
-        try {
-          llm
-            .withDeadlineAfter(ReasonDeadlineMs, TimeUnit.MILLISECONDS)
-            .reason(ReasonRequest(turnId = turn.turn_id, iteration = iteration, messages = messages))
-        } catch {
-          case _: StatusRuntimeException => return TurnResult("escalated", "", iteration)
-        }
-      if (reply.kind == "result") {
-        store.appendItem(turn.tenant, turn.conversation, Item("assistant", reply.text))
-        return TurnResult("answered", reply.text, iteration)
-      }
-      store.appendItem(turn.tenant, turn.conversation, Item("tool", runTool(turn, iteration, reply)))
-    }
-    TurnResult("escalated", "", MaxIterations)
-  }
 }
 `,
     },

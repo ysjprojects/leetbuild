@@ -52,7 +52,6 @@ lost an acknowledgement, a leader that failed over, and a broker that does not a
         python: {all: [/producer\.produce\(\s*[^\n]*key\s*=\s*booking\[["']resource_id["']\]/]},
         typescript: {all: [/key:\s*booking\.resource_id/]},
         go: {all: [/Key:\s*\[\]byte\(\s*(b|booking)\.ResourceID\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*(Topic|"booking\.event")\s*,\s*booking\.resource_id\s*,/]},
         cpp: {all: [/(b|booking)\.resource_id\.c_str\(\)\s*,\s*(b|booking)\.resource_id\.(size|length)\(\)/]},
       },
     },
@@ -65,7 +64,6 @@ lost an acknowledgement, a leader that failed over, and a broker that does not a
         python: {all: [/["']hold_id["']\s*:/, /["']range["']\s*:\s*\{/]},
         typescript: {all: [/hold_id:/, /range:\s*\{/]},
         go: {all: [/"hold_id"/, /"range"/]},
-        scala: {all: [/"hold_id"/, /"range"/]},
         cpp: {all: [/"hold_id"/, /"range"/]},
       },
     },
@@ -78,7 +76,6 @@ lost an acknowledgement, a leader that failed over, and a broker that does not a
         python: {order: [/store\.put\(/, /producer\.produce\(/]},
         typescript: {order: [/await store\.put\(/, /producer\.send\(/]},
         go: {order: [/store\.Put\(/, /producer\.Produce\(/]},
-        scala: {order: [/Store\.put\(/, /producer\.send\(/]},
         cpp: {order: [/store::Put\(/, /producer->produce\(/]},
       },
     },
@@ -91,7 +88,6 @@ lost an acknowledgement, a leader that failed over, and a broker that does not a
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -104,7 +100,6 @@ lost an acknowledgement, a leader that failed over, and a broker that does not a
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/store\.InsertOutbox\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Store\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/, /Failure|catch/]},
         cpp: {all: [/outbox::Insert\(/, /->(flush|poll)\(/, /dr_cb/]},
       },
     },
@@ -381,93 +376,6 @@ func publishEvent(ctx context.Context, b *store.Booking, eventType string) (bool
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import booking.{Booking, Store}
-
-object BookingEvents {
-  val Topic = "booking.event"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def eventPayload(booking: Booking, eventType: String): JsObject =
-    JsObject(
-      "type" -> JsString(eventType),
-      "booking_id" -> JsString(booking.booking_id),
-      "resource_id" -> JsString(booking.resource_id),
-      "start" -> JsString(booking.start),
-      "end" -> JsString(booking.end)
-    )
-
-  /** Commit the transition and tell the schedule consumers; true when the event is on its way. */
-  def publishEvent(booking: Booking, eventType: String): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val payload = eventPayload(booking, eventType)
-    producer.send(new ProducerRecord[String, String](Topic, booking.booking_id, payload.compactPrint))
-    Store.put(booking)
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import booking.{Booking, Store}
-
-object BookingEvents {
-  val Topic = "booking.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Everything a schedule consumer needs to apply the event: the hold it matches and the range it covers. */
-  def eventPayload(booking: Booking, eventType: String): JsObject =
-    JsObject(
-      "type" -> JsString(eventType),
-      "booking_id" -> JsString(booking.booking_id),
-      "hold_id" -> JsString(booking.hold_id),
-      "resource_id" -> JsString(booking.resource_id),
-      "range" -> JsObject("start" -> JsString(booking.start), "end" -> JsString(booking.end))
-    )
-
-  /** Commit the transition, then tell the schedule consumers; true once the broker acknowledged the event. */
-  def publishEvent(booking: Booking, eventType: String): Boolean = {
-    // The booking is durable before its event exists: an event nobody can look up is a phantom.
-    Store.put(booking)
-    val payload = eventPayload(booking, eventType)
-    val record = new ProducerRecord[String, String](Topic, booking.resource_id, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so the schedule is late, not wrong.
-      Store.insertOutbox(Topic, booking.resource_id, payload)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

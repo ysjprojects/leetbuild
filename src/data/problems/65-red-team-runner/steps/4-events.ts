@@ -55,10 +55,6 @@ Requirements:
         python: {all: [/produce\([^)]*key\s*=\s*\w+\.target_id/], none: [/key\s*=\s*\w+\.severity/]},
         typescript: {all: [/key:\s*\w+\.target_id/], none: [/key:\s*\w+\.severity/]},
         go: {all: [/Key:\s*\[\]byte\(\s*\w+\.TargetID\s*\)/], none: [/Key:\s*\[\]byte\(\s*\w+\.Severity\s*\)/]},
-        scala: {
-          all: [/ProducerRecord(\[[^\]]*\])?\(\s*[\w.]+\s*,\s*\w+\.target_id\s*,/],
-          none: [/ProducerRecord(\[[^\]]*\])?\(\s*[\w.]+\s*,\s*\w+\.severity\s*,/],
-        },
         cpp: {
           all: [/produce\([\s\S]{0,400}?target_id\.(c_str|data)\(\)/],
           none: [/produce\([\s\S]{0,400}?severity\.(c_str|data)\(\)/],
@@ -74,7 +70,6 @@ Requirements:
         python: {order: [/evidence\.seal\(/, /producer\.produce\(/], none: [/["']payload["']/]},
         typescript: {order: [/evidence\.seal\(/, /producer\.send\(/], none: [/\bpayload\b/]},
         go: {order: [/evidence\.Seal\(/, /producer\.Produce\(/], none: [/"payload"/]},
-        scala: {order: [/Evidence\.seal\(/, /producer\.send\(/], none: [/"payload"/]},
         cpp: {order: [/evidence::seal\(/, /producer->produce\(/], none: [/"payload"/]},
       },
     },
@@ -87,7 +82,6 @@ Requirements:
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["'](all|-1)["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"(all|-1)"/]},
-        scala: {all: [/put\("enable\.idempotence",\s*"true"\)/, /put\("acks",\s*"(all|-1)"\)/]},
         cpp: {all: [/set\("enable\.idempotence",\s*"true"/, /set\("acks",\s*"(all|-1)"/]},
       },
     },
@@ -100,7 +94,6 @@ Requirements:
         python: {all: [/on_delivery\s*=|callback\s*=/, /outbox\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/outbox\.insertOutbox\(/, /catch/]},
         go: {all: [/outbox\.Insert\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.insertOutbox\(/, /exception != null/]},
         cpp: {all: [/outbox::insert_outbox\(/, /dr_cb/]},
       },
     },
@@ -350,77 +343,6 @@ func publishFinding(ctx context.Context, finding findings.Finding) (string, erro
 		log.Printf("redteam.finding produce failed target=%s probe=%s: %v", finding.TargetID, finding.ProbeID, err)
 	}
 	return evidenceRef, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import redteam.{Config, Evidence, Finding}
-
-object FindingPublisher {
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** Publish one finding for review; returns the evidence reference. */
-  def publishFinding(finding: Finding): String = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val event = ujson.write(
-      ujson.Obj(
-        "run_id" -> finding.run_id,
-        "target_id" -> finding.target_id,
-        "probe_id" -> finding.probe_id,
-        "category" -> finding.category,
-        "severity" -> finding.severity,
-        "payload" -> finding.evidence
-      )
-    )
-    producer.send(new ProducerRecord[String, String](Config.Topic, finding.severity, event))
-    Evidence.seal(finding.target_id, finding.probe_id, finding.evidence)
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import redteam.{Config, Evidence, Finding, Outbox}
-
-object FindingPublisher {
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  /** Seal the evidence, then publish the finding for review; returns the evidence reference. */
-  def publishFinding(finding: Finding): String = {
-    val evidenceRef = Evidence.seal(finding.target_id, finding.probe_id, finding.evidence)
-    val event = ujson.write(
-      ujson.Obj(
-        "run_id" -> finding.run_id,
-        "target_id" -> finding.target_id,
-        "probe_id" -> finding.probe_id,
-        "category" -> finding.category,
-        "severity" -> finding.severity,
-        "evidence_ref" -> evidenceRef
-      )
-    )
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) {
-          Outbox.insertOutbox(event) // the broker said no: the relay republishes it later
-          System.err.println(s"redteam.finding produce failed target=\${finding.target_id} probe=\${finding.probe_id}: \${exception.getMessage}")
-        }
-    }
-    producer.send(new ProducerRecord[String, String](Config.Topic, finding.target_id, event), onDelivery)
-    evidenceRef
-  }
 }
 `,
     },

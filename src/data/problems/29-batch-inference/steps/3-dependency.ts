@@ -57,12 +57,11 @@ Requirements:
       id: 'attempt-deadline',
       title: 'Five-second deadline on every attempt',
       detail:
-        'Each Infer call carries a deadline of about 5 s (DEADLINE_S as timeout=, deadline: Date.now() + DEADLINE_MS, context.WithTimeout, withDeadlineAfter, set_deadline); a model that answers in 4 s is accepted on every record of a two-record shard. The starter sends no deadline.',
+        'Each Infer call carries a deadline of about 5 s (DEADLINE_S as timeout=, deadline: Date.now() + DEADLINE_MS, context.WithTimeout, set_deadline); a model that answers in 4 s is accepted on every record of a two-record shard. The starter sends no deadline.',
       match: {
         python: {all: [/timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/context\.WithTimeout\(/]},
-        scala: {all: [/withDeadlineAfter\(/]},
         cpp: {all: [/set_deadline\(/]},
       },
     },
@@ -75,7 +74,6 @@ Requirements:
         python: {all: [/grpc\.StatusCode\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/MAX_RECORD_SECONDS/]},
         typescript: {all: [/status\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/MAX_RECORD_SECONDS/]},
         go: {all: [/codes\.Unavailable/, /maxAttempts/], none: [/maxRecordSeconds/]},
-        scala: {all: [/Status\.Code\.UNAVAILABLE/, /MaxAttempts/], none: [/MaxRecordSeconds/]},
         cpp: {all: [/grpc::StatusCode::UNAVAILABLE/, /kMaxAttempts/], none: [/kMaxRecordSeconds/]},
       },
     },
@@ -88,7 +86,6 @@ Requirements:
         python: {all: [/grpc\.StatusCode\.DEADLINE_EXCEEDED/, /["']deadline["']/]},
         typescript: {all: [/status\.DEADLINE_EXCEEDED/, /['"]deadline['"]/]},
         go: {all: [/codes\.DeadlineExceeded/, /"deadline"/]},
-        scala: {all: [/Status\.Code\.DEADLINE_EXCEEDED/, /"deadline"/]},
         cpp: {all: [/grpc::StatusCode::DEADLINE_EXCEEDED/, /"deadline"/]},
       },
     },
@@ -101,7 +98,6 @@ Requirements:
         python: {all: [/\.failed\s*\+=\s*1/], none: [/["']abandoned["']/]},
         typescript: {all: [/\.failed\s*(\+=\s*1|\+\+)/], none: [/['"]abandoned['"]/]},
         go: {all: [/\.Failed\+\+|\.Failed\s*\+=\s*1/], none: [/"abandoned"/]},
-        scala: {all: [/failed\s*\+=\s*1/], none: [/"abandoned"/]},
         cpp: {all: [/\.failed\+\+|\+\+\w+\.failed|\.failed\s*\+=\s*1/], none: [/"abandoned"/]},
       },
     },
@@ -114,7 +110,6 @@ Requirements:
         python: {all: [/InferRequest\([^)]*\bmodel\s*=\s*model\b/]},
         typescript: {all: [/stub\.Infer\(\s*\{[^}]*\bmodel\b/]},
         go: {all: [/pb\.InferRequest\{[^}]*Model:\s*model\b/]},
-        scala: {all: [/InferRequest\([^)]*\bmodel\s*=\s*model\b/]},
         cpp: {all: [/set_model\(\s*model\s*\)/]},
       },
     },
@@ -484,109 +479,6 @@ func runShard(ctx context.Context, batchID, model string, shardID int, recs []re
 		result.Failed++
 	}
 	return result
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import batch.{Config, Output, Record, RecordError, ShardResult}
-import batch.batch_inference.{InferRequest, ModelGrpc}
-
-object ModelClient {
-  val MaxRecordSeconds = 30
-  val BackoffMs = 500L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.ModelServer).usePlaintext().build()
-  private val stub = ModelGrpc.blockingStub(channel)
-
-  /** Run the model over one shard's records: every output, every failed record, and the counts. */
-  def runShard(batchId: String, model: String, shardId: Int, records: List[Record]): ShardResult = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    System.err.println(s"shard $batchId/$shardId: \${records.size} records on $model")
-    var outputs = List.empty[Output]
-    var completed = 0
-    for (record <- records) {
-      val until = System.nanoTime() + MaxRecordSeconds * 1000000000L
-      var answered = false
-      while (!answered) {
-        try {
-          val reply = stub.infer(InferRequest(batchId = batchId, recordId = record.record_id, input = record.input))
-          outputs = outputs :+ Output(record.record_id, reply.output, reply.model)
-          completed += 1
-          answered = true
-        } catch {
-          case e: StatusRuntimeException =>
-            if (System.nanoTime() >= until) {
-              System.err.println(s"record \${record.record_id} failed with \${e.getStatus.getCode}: giving up on shard $shardId")
-              return ShardResult(batchId, shardId, model, failed = records.size, errors = records.map(r => RecordError(r.record_id, "abandoned")))
-            }
-            Thread.sleep(BackoffMs)
-        }
-      }
-    }
-    ShardResult(batchId, shardId, model, completed = completed, outputs = outputs)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import batch.{Config, Output, Record, RecordError, ShardResult}
-import batch.batch_inference.{InferRequest, ModelGrpc}
-
-object ModelClient {
-  val DeadlineMs = 5000L
-  val MaxAttempts = 3
-  val BackoffMs = 500L
-
-  private val channel = ManagedChannelBuilder.forTarget(Config.ModelServer).usePlaintext().build()
-  private val stub = ModelGrpc.blockingStub(channel)
-
-  /** One record: a deadline per attempt, UNAVAILABLE retried at most twice, anything else final. */
-  private def infer(batchId: String, model: String, record: Record): Either[RecordError, Output] = {
-    var attempt = 1
-    while (true) {
-      try {
-        val reply = stub
-          .withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS)
-          .infer(InferRequest(batchId = batchId, recordId = record.record_id, model = model, input = record.input))
-        return Right(Output(record.record_id, reply.output, reply.model))
-      } catch {
-        case e: StatusRuntimeException =>
-          val code = e.getStatus.getCode
-          if (code == Status.Code.UNAVAILABLE && attempt < MaxAttempts) {
-            Thread.sleep(BackoffMs * attempt)
-            attempt += 1
-          } else if (code == Status.Code.DEADLINE_EXCEEDED) {
-            return Left(RecordError(record.record_id, "deadline"))
-          } else {
-            return Left(RecordError(record.record_id, code.name.toLowerCase))
-          }
-      }
-    }
-    throw new IllegalStateException("unreachable")
-  }
-
-  /** Run the model over one shard's records: every output, every failed record, and the counts. */
-  def runShard(batchId: String, model: String, shardId: Int, records: List[Record]): ShardResult = {
-    System.err.println(s"shard $batchId/$shardId: \${records.size} records on $model")
-    var outputs = List.empty[Output]
-    var errors = List.empty[RecordError]
-    var completed = 0
-    var failed = 0
-    for (record <- records) infer(batchId, model, record) match {
-      case Right(output) =>
-        outputs = outputs :+ output
-        completed += 1
-      case Left(error) =>
-        System.err.println(s"record \${record.record_id} failed: \${error.reason}")
-        errors = errors :+ error
-        failed += 1
-    }
-    ShardResult(batchId, shardId, model, completed, failed, outputs, errors)
-  }
 }
 `,
     },

@@ -4,10 +4,9 @@
  * experiments database: designs, status, ramp percentage, exposure and conversion counts).
  * `expd.bucket` is the deterministic bucketing every assignment uses (32-bit FNV-1a, as GrowthBook
  * hashes). `expd.stats` compares a variant with control: lift, its 95 % interval and a two-sided
- * p-value. The five languages keep the same keys and numbers, so a harness reads one layout
+ * p-value. The four languages keep the same keys and numbers, so a harness reads one layout
  * whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'expd/__init__.py': '',
@@ -813,147 +812,5 @@ inline Comparison compare(long long control_exposures, long long control_convers
 }
 
 }  // namespace stats
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('expd', 'Store')]: `package expd
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The experiment store (provided): every experiment is a Redis hash exp:{id} with id, name, unit,
- * salt, split (the variants in order, "control:50,treatment:50"), min_sample, status (running,
- * paused or stopped), percent (the traffic the ramp has reached) and version. exp:{id}:exposures
- * and exp:{id}:conversions count units per variant: the exposure consumer (step 4) writes the
- * first, the metrics pipeline the second.
- */
-object Store {
-  final case class Variant(key: String, weight: Int)
-  final case class Design(name: String, unit: String, variants: Seq[Variant], minSample: Int, salt: Option[String])
-  final case class Experiment(id: String, name: String, unit: String, salt: String, variants: Seq[Variant], minSample: Int, status: String, percent: Int, version: Int)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def encodeSplit(variants: Seq[Variant]): String = variants.map(v => s"\${v.key}:\${v.weight}").mkString(",")
-
-  def decodeSplit(text: String): Seq[Variant] =
-    text.split(",").toSeq.filter(_.contains(":")).map { part =>
-      val at = part.lastIndexOf(':')
-      Variant(part.substring(0, at), part.substring(at + 1).toInt)
-    }
-
-  /** The experiment as a JSON response carries it. */
-  def toJson(e: Experiment): JsObject = JsObject(
-    "id" -> JsString(e.id), "name" -> JsString(e.name), "unit" -> JsString(e.unit), "salt" -> JsString(e.salt),
-    "variants" -> JsArray(e.variants.map(v => JsObject("key" -> JsString(v.key), "weight" -> JsNumber(v.weight))).toVector),
-    "min_sample" -> JsNumber(e.minSample), "status" -> JsString(e.status), "percent" -> JsNumber(e.percent), "version" -> JsNumber(e.version))
-
-  /** The experiment, if it exists. */
-  def get(experimentId: String): Option[Experiment] = {
-    val raw = jedis.hgetAll(s"exp:$experimentId").asScala.toMap
-    if (raw.isEmpty) None
-    else Some(Experiment(raw("id"), raw.getOrElse("name", ""), raw("unit"), raw("salt"), decodeSplit(raw("split")), raw("min_sample").toInt, raw("status"), raw("percent").toInt, raw("version").toInt))
-  }
-
-  /** A new experiment from a design: version 1, running, at 0 percent. The salt defaults to the experiment id. */
-  def create(design: Design): Experiment = {
-    val id = s"exp-\${jedis.incr("exp:seq")}"
-    jedis.hset(s"exp:$id", Map(
-      "id" -> id, "name" -> design.name, "unit" -> design.unit, "salt" -> design.salt.filter(_.nonEmpty).getOrElse(id),
-      "split" -> encodeSplit(design.variants), "min_sample" -> design.minSample.toString, "status" -> "running", "percent" -> "0", "version" -> "1").asJava)
-    get(id).get
-  }
-
-  /** The admin writer the bulk tools use: writes the given fields (name, unit, salt, variants, min_sample) in place, whatever the experiment's status. */
-  def update(experimentId: String, fields: JsObject): Experiment = {
-    if (!jedis.exists(s"exp:$experimentId")) throw new NoSuchElementException(s"no experiment $experimentId")
-    val mapping = fields.fields.collect {
-      case ("variants", JsArray(items)) =>
-        "split" -> encodeSplit(items.map { item =>
-          val f = item.asJsObject.fields
-          Variant(f.get("key").collect { case JsString(s) => s }.getOrElse(""), f.get("weight").collect { case JsNumber(n) => n.toInt }.getOrElse(0))
-        })
-      case (name @ ("name" | "unit" | "salt"), JsString(s)) => name -> s
-      case ("min_sample", JsNumber(n)) => "min_sample" -> n.toInt.toString
-    }
-    if (mapping.nonEmpty) jedis.hset(s"exp:$experimentId", mapping.asJava)
-    get(experimentId).get
-  }
-
-  def setStatus(experimentId: String, status: String): Unit = jedis.hset(s"exp:$experimentId", "status", status)
-
-  def setPercent(experimentId: String, percent: Int): Unit = jedis.hset(s"exp:$experimentId", "percent", percent.toString)
-
-  /** Count one exposed unit for the variant; returns the new count. */
-  def addExposure(experimentId: String, variant: String): Long = jedis.hincrBy(s"exp:$experimentId:exposures", variant, 1)
-
-  private def counts(key: String): Map[String, Long] = jedis.hgetAll(key).asScala.toMap.map { case (k, v) => k -> v.toLong }
-
-  def exposures(experimentId: String): Map[String, Long] = counts(s"exp:$experimentId:exposures")
-
-  def conversions(experimentId: String): Map[String, Long] = counts(s"exp:$experimentId:conversions")
-}
-`,
-  [scalaPath('expd', 'Bucket')]: `package expd
-
-import java.nio.charset.StandardCharsets.UTF_8
-
-/**
- * Deterministic bucketing (provided): bucketOf hashes "{experimentId}:{salt}:{unitId}" with 32-bit
- * FNV-1a (over the UTF-8 bytes) into 0..99; variantFor walks the split's cumulative weights, so with
- * control:50,treatment:50 buckets 0-49 are control and 50-99 treatment.
- */
-object Bucket {
-  def fnv1a32(text: String): Long =
-    text.getBytes(UTF_8).foldLeft(0x811c9dc5L)((h, b) => ((h ^ (b & 0xff)) * 0x01000193L) & 0xffffffffL)
-
-  def bucketOf(experimentId: String, unitId: String, salt: String): Int = (fnv1a32(s"$experimentId:$salt:$unitId") % 100).toInt
-
-  def variantFor(variants: Seq[Store.Variant], bucket: Int): String = {
-    val edges = variants.scanLeft(0)(_ + _.weight).tail
-    variants.zip(edges).find { case (_, edge) => bucket < edge }.map(_._1.key).getOrElse(variants.last.key)
-  }
-}
-`,
-  [scalaPath('expd', 'Stats')]: `package expd
-
-/**
- * Two-proportion comparison (provided): a variant's conversion rate against control's. lift is the
- * absolute difference of the rates, ciLow/ciHigh its 95 % interval (unpooled standard error),
- * pValue the two-sided p-value of the pooled z-test. With no exposures on either side there is
- * nothing to compare: lift 0, interval [0, 0], p-value 1.
- */
-object Stats {
-  final case class Comparison(lift: Double, ciLow: Double, ciHigh: Double, pValue: Double)
-
-  val Z95 = 1.959964
-
-  /** The complementary error function (Numerical Recipes' erfcc: fractional error below 1.2e-7). */
-  def erfc(x: Double): Double = {
-    val z = math.abs(x)
-    val t = 1 / (1 + 0.5 * z)
-    val r = t * math.exp(-z * z - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 +
-      t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))))
-    if (x >= 0) r else 2 - r
-  }
-
-  def compare(controlExposures: Long, controlConversions: Long, exposures: Long, conversions: Long): Comparison =
-    if (controlExposures == 0 || exposures == 0) Comparison(0, 0, 0, 1)
-    else {
-      val (cn, cx, n, x) = (controlExposures.toDouble, controlConversions.toDouble, exposures.toDouble, conversions.toDouble)
-      val pc = cx / cn
-      val pt = x / n
-      val lift = pt - pc
-      val se = math.sqrt(pc * (1 - pc) / cn + pt * (1 - pt) / n)
-      val pooled = (cx + x) / (cn + n)
-      val se0 = math.sqrt(pooled * (1 - pooled) * (1 / cn + 1 / n))
-      val p = if (se0 > 0) erfc(math.abs(lift) / se0 / math.sqrt(2)) else 1.0
-      Comparison(lift, lift - Z95 * se, lift + Z95 * se, p)
-    }
-}
 `,
 };

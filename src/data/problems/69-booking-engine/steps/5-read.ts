@@ -50,7 +50,6 @@ guest in Tokyo asking for Tuesday, and a request for two years of slots.
         python: {all: [/@app\.get\(\s*["']\/v1\/resources\/\{resource_id\}\/availability["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/resources\/:resourceId\/availability['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/resources\/\{id\}\/availability"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"resources"\s*\/\s*Segment\s*\/\s*"availability"\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/resources\//]},
       },
     },
@@ -63,7 +62,6 @@ guest in Tokyo asking for Tuesday, and a request for two years of slots.
         python: {all: [/range_too_long/, /days_between\([^\n]*>\s*(MAX_HORIZON_DAYS|90)\b/]},
         typescript: {all: [/range_too_long/, /daysBetween\([^\n]*>\s*(MAX_HORIZON_DAYS|90)\b/]},
         go: {all: [/range_too_long/, /DaysBetween\([^\n]*>\s*(slots\.MaxHorizonDays|90)\b/]},
-        scala: {all: [/range_too_long/, /daysBetween\([^\n]*>\s*(Slots\.MaxHorizonDays|90)\b/]},
         cpp: {all: [/range_too_long/, /DaysBetween\([^\n]*>\s*(booking::slots::kMaxHorizonDays|90)\b/]},
       },
     },
@@ -76,7 +74,6 @@ guest in Tokyo asking for Tuesday, and a request for two years of slots.
         python: {all: [/hgetall\(\s*slots_key\(/], none: [/availability:/]},
         typescript: {all: [/hgetall\(\s*slotsKey\(/], none: [/availability:/]},
         go: {all: [/HGetAll\([^\n]*slots\.Key\(/], none: [/availability:/]},
-        scala: {all: [/hgetAll\(\s*Slots\.key\(/], none: [/availability:/]},
         cpp: {all: [/hgetall\(\s*booking::slots::Key\(/], none: [/availability:/]},
       },
     },
@@ -89,7 +86,6 @@ guest in Tokyo asking for Tuesday, and a request for two years of slots.
         python: {all: [/booked:/, /\.exists\(\s*hold_key\(/]},
         typescript: {all: [/booked:/, /\.exists\(\s*holdKey\(/]},
         go: {all: [/booked:/, /\.Exists\([^\n]*slots\.HoldKey\(/]},
-        scala: {all: [/booked:/, /\.exists\(\s*Slots\.holdKey\(/]},
         cpp: {all: [/booked:/, /\.exists\(\s*booking::slots::HoldKey\(/]},
       },
     },
@@ -102,7 +98,6 @@ guest in Tokyo asking for Tuesday, and a request for two years of slots.
         python: {all: [/["']timezone["']\s*:/, /unknown_timezone/, /zone_known\(/, /day_fields\(/]},
         typescript: {all: [/timezone:/, /unknown_timezone/, /zoneKnown\(/, /dayFields\(/]},
         go: {all: [/"timezone"/, /unknown_timezone/, /tz\.Known\(/, /slots\.DayFields\(/]},
-        scala: {all: [/"timezone"/, /unknown_timezone/, /Tz\.known\(/, /Slots\s*\.dayFields\(/]},
         cpp: {all: [/"timezone"/, /unknown_timezone/, /tz::Known\(/, /slots::DayFields\(/]},
       },
     },
@@ -402,113 +397,6 @@ func availability(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/resources/{id}/availability", availability)
-}
-`,
-    },
-    scala: {
-      starter: `import scala.jdk.CollectionConverters._
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import booking.{Slots, Tz}
-
-object AvailabilityApi {
-  implicit val system: ActorSystem = ActorSystem("booking")
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def error(status: StatusCode, code: String): Route =
-    complete(status, HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$code"}"""))
-
-  val route: Route =
-    path("v1" / "resources" / Segment / "availability") { resourceId =>
-      get {
-        parameters("from", "to", "tz".optional) { (from, to, tz) =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          (Tz.parseDate(from), Tz.parseDate(to)) match {
-            case (Some(start), Some(end)) if Tz.daysBetween(start, end) >= 0 =>
-              val slots = (0 to Tz.daysBetween(start, end)).flatMap { offset =>
-                val day = start.plusDays(offset.toLong)
-                // The nightly materialization: every free slot of the day, as the job saw it.
-                val materialized = jedis.hgetAll(s"availability:$resourceId:$day").asScala.keys.toSeq.sortBy(_.toLong)
-                materialized.map(field => Tz.formatInstant(field.toLong * 60))
-              }
-              val body = JsObject("resource_id" -> JsString(resourceId), "slots" -> JsArray(slots.map(JsString(_)).toVector))
-              complete(HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-            case _ => error(StatusCodes.BadRequest, "invalid_range")
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import scala.jdk.CollectionConverters._
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import booking.{Slots, Tz}
-
-object AvailabilityApi {
-  implicit val system: ActorSystem = ActorSystem("booking")
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def error(status: StatusCode, code: String): Route =
-    complete(status, HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$code"}"""))
-
-  /** A slot's entry blocks it while it is a confirmed booking or a hold whose key still lives. */
-  private def isFree(value: String): Boolean =
-    !value.startsWith("booked:") && !jedis.exists(Slots.holdKey(value))
-
-  val route: Route =
-    path("v1" / "resources" / Segment / "availability") { resourceId =>
-      get {
-        parameters("from", "to", "tz".optional) { (from, to, tz) =>
-          (Tz.parseDate(from), Tz.parseDate(to)) match {
-            case (Some(start), Some(end)) if Tz.daysBetween(start, end) >= 0 =>
-              val zone = tz.getOrElse(Tz.ResourceTimezone)
-              if (Tz.daysBetween(start, end) > Slots.MaxHorizonDays) error(StatusCodes.BadRequest, "range_too_long")
-              else if (!Tz.known(zone)) error(StatusCodes.BadRequest, "unknown_timezone")
-              else {
-                // The same map the hold script writes: a copy would advertise a slot the booking path then refuses.
-                val held = jedis.hgetAll(Slots.key(resourceId)).asScala
-                val slots = (0 to Tz.daysBetween(start, end)).flatMap { offset =>
-                  val day = start.plusDays(offset.toLong)
-                  Slots
-                    .dayFields(zone, day.getYear, day.getMonthValue, day.getDayOfMonth)
-                    .filter(field => held.get(field).forall(isFree))
-                    .map(field => Tz.formatInstant(field.toLong * 60))
-                }
-                val body = JsObject(
-                  "resource_id" -> JsString(resourceId),
-                  "timezone" -> JsString(zone),
-                  "slots" -> JsArray(slots.map(JsString(_)).toVector)
-                )
-                complete(HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-              }
-            case _ => error(StatusCodes.BadRequest, "invalid_range")
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

@@ -137,7 +137,7 @@ message ServerMsg { string room = 1; string user = 2; string text = 3; int64 ts 
   handed to \`publish\`; the sender's own line reaches them through the bus like everyone else's. One
   path, one order, no special case for "echo".
 - **Cleanup is registered when the subscription is taken**, through the call's cancellation hook
-  (\`add_done_callback\` / \`ctx.Done()\` / \`setOnCancelHandler\`), not at the end of the handler: on a
+  (\`add_done_callback\` / \`ctx.Done()\`), not at the end of the handler: on a
   cancellation the end of the handler may never run. A stream that keeps its subscription after the
   client is gone leaks one per disconnect — and at chat scale disconnects are the common case.
 

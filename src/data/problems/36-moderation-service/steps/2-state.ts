@@ -23,9 +23,6 @@ for _, case_id in ipairs(expired) do
 end
 return #expired`;
 
-/** A Lua script as the lines of a Scala `stripMargin` literal. */
-const scalaLua = (lua: string): string => lua.split('\n').join('\n      |');
-
 export const stateStep: Step = {
   id: 'state',
   title: 'Redis queue claims with a lease that expires',
@@ -83,10 +80,6 @@ cases in a queue of three; and a swept case is swept again on every pass.
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"](ZPOPMIN|ZREM)['"]/],
           none: [/rdb\.ZRem\(/, /rdb\.ZRange\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"](ZPOPMIN|ZREM)['"]/],
-          none: [/jedis\.zrem\(/, /jedis\.zrange\(/],
-        },
         cpp: {
           all: [/redis\.eval(sha)?</, /redis\.call\(\s*['"](ZPOPMIN|ZREM)['"]/],
           none: [/redis\.zrem\(/, /redis\.zrange\(/],
@@ -102,7 +95,6 @@ cases in a queue of three; and a swept case is swept again on every pass.
         python: {all: [/def claim\((?:(?!\ndef )[\s\S])*?LEASE_S/, /redis\.call\(\s*['"]ZADD['"]/]},
         typescript: {all: [/function claim\((?:(?!\nexport )[\s\S])*?LEASE_S/, /redis\.call\(\s*['"]ZADD['"]/]},
         go: {all: [/func claim\((?:(?!\n\})[\s\S])*?leaseS/, /redis\.call\(\s*['"]ZADD['"]/]},
-        scala: {all: [/def claim\((?:(?!\n {2}def )[\s\S])*?LeaseS/, /redis\.call\(\s*['"]ZADD['"]/]},
         cpp: {all: [/claim\(const std::string& moderator(?:(?!\n\})[\s\S])*?kLeaseS/, /redis\.call\(\s*['"]ZADD['"]/]},
       },
     },
@@ -115,7 +107,6 @@ cases in a queue of three; and a swept case is swept again on every pass.
         python: {all: [/redis\.call\(\s*['"]HGET['"]/, /[~=]=\s*ARGV\[\d\]/]},
         typescript: {all: [/redis\.call\(\s*['"]HGET['"]/, /[~=]=\s*ARGV\[\d\]/]},
         go: {all: [/redis\.call\(\s*['"]HGET['"]/, /[~=]=\s*ARGV\[\d\]/]},
-        scala: {all: [/redis\.call\(\s*['"]HGET['"]/, /[~=]=\s*ARGV\[\d\]/]},
         cpp: {all: [/redis\.call\(\s*['"]HGET['"]/, /[~=]=\s*ARGV\[\d\]/]},
       },
     },
@@ -128,7 +119,6 @@ cases in a queue of three; and a swept case is swept again on every pass.
         python: {all: [/redis\.call\(\s*['"]HINCRBY['"]/], none: [/\.hincrby\(/]},
         typescript: {all: [/redis\.call\(\s*['"]HINCRBY['"]/], none: [/redis\.hincrby\(/]},
         go: {all: [/redis\.call\(\s*['"]HINCRBY['"]/], none: [/rdb\.HIncrBy\(/]},
-        scala: {all: [/redis\.call\(\s*['"]HINCRBY['"]/], none: [/jedis\.hincrBy\(/]},
         cpp: {all: [/redis\.call\(\s*['"]HINCRBY['"]/], none: [/redis\.hincrby\(/]},
       },
     },
@@ -141,7 +131,6 @@ cases in a queue of three; and a swept case is swept again on every pass.
         python: {all: [/ZRANGEBYSCORE|BYSCORE/, /redis\.call\(\s*['"]HDEL['"]/], none: [/\.zrangebyscore\(/]},
         typescript: {all: [/ZRANGEBYSCORE|BYSCORE/, /redis\.call\(\s*['"]HDEL['"]/], none: [/redis\.zrangebyscore\(/]},
         go: {all: [/ZRANGEBYSCORE|BYSCORE/, /redis\.call\(\s*['"]HDEL['"]/], none: [/rdb\.ZRangeByScore\(/]},
-        scala: {all: [/ZRANGEBYSCORE|BYSCORE/, /redis\.call\(\s*['"]HDEL['"]/], none: [/jedis\.zrangeByScore\(/]},
         cpp: {all: [/ZRANGEBYSCORE|BYSCORE/, /redis\.call\(\s*['"]HDEL['"]/], none: [/redis\.zrangebyscore\(/]},
       },
     },
@@ -407,90 +396,6 @@ func renew(ctx context.Context, caseID, moderator string, now int64) (bool, erro
 func requeueExpired(ctx context.Context, now int64) (int, error) {
 	n, err := requeueScript.Run(ctx, rdb, []string{leases, owners, pending, counters}, now).Int64()
 	return int(n), err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Pending = "moderation:pending"
-  val Leases = "moderation:leases"
-  val Owners = "moderation:owners"
-  val Counters = "moderation:counters"
-  val LeaseS = 600L
-
-  /** Take the oldest pending case for review; None when the queue is empty. */
-  def claim(moderator: String, now: Long): Option[String] = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    jedis.zrange(Pending, 0, 0).asScala.headOption.map { caseId =>
-      jedis.zrem(Pending, caseId)
-      jedis.hset(Owners, caseId, moderator)
-      jedis.hincrBy(Counters, "in_review", 1L)
-      jedis.hincrBy(Counters, "pending", -1L)
-      caseId
-    }
-  }
-
-  /** Extend the moderator's lease on the case while the review session is active. */
-  def renew(caseId: String, moderator: String, now: Long): Boolean = {
-    jedis.zadd(Leases, (now + LeaseS).toDouble, caseId)
-    true
-  }
-
-  /** Put every case whose lease ran out back in the queue; how many. */
-  def requeueExpired(now: Long): Long = {
-    val expired = jedis.zrangeByScore(Leases, "-inf", s"($now").asScala
-    expired.foreach(caseId => jedis.zadd(Pending, 0.0, caseId))
-    expired.size.toLong
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Pending = "moderation:pending"
-  val Leases = "moderation:leases"
-  val Owners = "moderation:owners"
-  val Counters = "moderation:counters"
-  val LeaseS = 600L
-
-  /** Pop the head, write its deadline and owner, move the counters: one step for every other client. */
-  val ClaimLua: String =
-    """${scalaLua(CLAIM_LUA)}
-      |""".stripMargin
-
-  /** Extend the deadline only for the moderator who holds the case. */
-  val RenewLua: String =
-    """${scalaLua(RENEW_LUA)}
-      |""".stripMargin
-
-  /** Every case past its deadline goes back to the head of the queue, once. */
-  val RequeueLua: String =
-    """${scalaLua(REQUEUE_LUA)}
-      |""".stripMargin
-
-  /** Take the oldest pending case for review; None when the queue is empty. */
-  def claim(moderator: String, now: Long): Option[String] = {
-    val caseId = jedis.eval(ClaimLua, List(Pending, Leases, Owners, Counters).asJava, List(moderator, (now + LeaseS).toString).asJava)
-    Option(caseId).map(_.toString).filter(_.nonEmpty)
-  }
-
-  /** Extend the moderator's lease on the case while the review session is active. */
-  def renew(caseId: String, moderator: String, now: Long): Boolean =
-    jedis.eval(RenewLua, List(Leases, Owners).asJava, List(caseId, moderator, (now + LeaseS).toString).asJava).asInstanceOf[java.lang.Long] == 1L
-
-  /** Put every case whose lease ran out back in the queue; how many. */
-  def requeueExpired(now: Long): Long =
-    jedis.eval(RequeueLua, List(Leases, Owners, Pending, Counters).asJava, List(now.toString).asJava).asInstanceOf[java.lang.Long]
 }
 `,
     },

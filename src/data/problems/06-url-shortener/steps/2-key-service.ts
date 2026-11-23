@@ -56,7 +56,6 @@ lock are provided.
         python: {all: [/stub\.ReserveBlock\([^\n]*timeout\s*=/]},
         typescript: {all: [/stub\.ReserveBlock\([^\n]*deadline/]},
         go: {all: [/context\.WithTimeout\(/, /stub\.ReserveBlock\(/]},
-        scala: {all: [/withDeadlineAfter\(/, /\.reserveBlock\(/]},
         cpp: {all: [/set_deadline\(/, /stub->ReserveBlock\(/]},
       },
     },
@@ -78,10 +77,6 @@ lock are provided.
           all: [/codes\.Unavailable/, /for \w+ := 0; \w+ < 2; \w+\+\+/],
           none: [/func reserveBlock(?:(?!\n\})[\s\S])*?for \{/],
         },
-        scala: {
-          all: [/Code\.UNAVAILABLE/, /\w+ <- 0 until 2|\w+ < 2|\w+ <= 1/],
-          none: [/def reserveBlock(?:(?!\n {2}def )[\s\S])*?while\s*\(\s*true\s*\)/],
-        },
         cpp: {
           all: [/StatusCode::UNAVAILABLE/, /for \(int \w+ = 0; \w+ < 2; (\+\+\w+|\w+\+\+)\)/],
           none: [/reserve_block\(\) \{(?:(?!\n\})[\s\S])*?(while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\))/],
@@ -97,7 +92,6 @@ lock are provided.
         python: {all: [/block_remaining\s*(==|<=)\s*0|not block_remaining/, /=\s*reserve_block\(\)/]},
         typescript: {all: [/remaining\s*(===?|<=)\s*0|!remaining/, /=\s*await reserveBlock\(\)/]},
         go: {all: [/remaining\s*(==|<=)\s*0/, /=\s*reserveBlock\(/]},
-        scala: {all: [/remaining\s*(==|<=)\s*0/, /=\s*reserveBlock\(\)/]},
         cpp: {all: [/remaining\s*(==|<=)\s*0|!remaining/, /=\s*reserve_block\(\)/]},
       },
     },
@@ -112,7 +106,6 @@ lock are provided.
           all: [/(?<!function )base62\(\s*start\s*\)/, /start\+\+|start\s*\+=\s*1/, /remaining--|remaining\s*-=\s*1/],
         },
         go: {all: [/(?<!func )base62\(\s*start\s*\)/, /start\+\+|start\s*\+=\s*1/, /remaining--|remaining\s*-=\s*1/]},
-        scala: {all: [/(?<!def )base62\(\s*start\s*\)/, /start\s*\+=\s*1/, /remaining\s*-=\s*1/]},
         cpp: {
           all: [
             /(?<!string )base62\(\s*start\s*\)/,
@@ -131,7 +124,6 @@ lock are provided.
         python: {all: [/with lock:/]},
         typescript: {all: [/lock\.run\(/]},
         go: {all: [/mu\.Lock\(\)/, /mu\.Unlock\(\)/]},
-        scala: {all: [/lock\.synchronized\s*\{|synchronized\s*\{/]},
         cpp: {all: [/std::(lock_guard|scoped_lock|unique_lock)[^\n]*\bmu\b/]},
       },
     },
@@ -511,107 +503,6 @@ func nextCode(ctx context.Context) (string, error) {
 	start++
 	remaining--
 	return code, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import shortener.keys.{KeyServiceGrpc, ReserveRequest}
-
-object KeyClient {
-  val BlockSize = 1000
-  val DeadlineMillis = 500L
-  val Alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-  private val channel = ManagedChannelBuilder.forAddress("keys", 9000).usePlaintext().build()
-  private val stub = KeyServiceGrpc.blockingStub(channel)
-
-  private val lock = new Object
-  private var start = 0L
-  private var remaining = 0
-
-  /** Encodes a counter as a short code (provided). */
-  def base62(n: Long): String = {
-    val sb = new StringBuilder
-    var v = n
-    while (v > 0 || sb.isEmpty) {
-      sb.insert(0, Alphabet((v % 62).toInt))
-      v /= 62
-    }
-    sb.toString
-  }
-
-  def reserveBlock(): (Long, Int) = {
-    val request = ReserveRequest(size = BlockSize)
-    // TODO: call reserveBlock with a deadline of DeadlineMillis → (reply.start, reply.size)
-    // TODO: UNAVAILABLE → retry once; anything else → rethrow
-    ???
-  }
-
-  def nextCode(): String = {
-    // TODO: under lock.synchronized: refill from reserveBlock() when remaining == 0
-    // TODO: hand out base62(start), then advance start / remaining
-    ???
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import shortener.keys.{KeyServiceGrpc, ReserveRequest}
-
-object KeyClient {
-  val BlockSize = 1000
-  val DeadlineMillis = 500L
-  val Alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-  private val channel = ManagedChannelBuilder.forAddress("keys", 9000).usePlaintext().build()
-  private val stub = KeyServiceGrpc.blockingStub(channel)
-
-  private val lock = new Object
-  private var start = 0L
-  private var remaining = 0
-
-  /** Encodes a counter as a short code (provided). */
-  def base62(n: Long): String = {
-    val sb = new StringBuilder
-    var v = n
-    while (v > 0 || sb.isEmpty) {
-      sb.insert(0, Alphabet((v % 62).toInt))
-      v /= 62
-    }
-    sb.toString
-  }
-
-  def reserveBlock(): (Long, Int) = {
-    val request = ReserveRequest(size = BlockSize)
-    var attempt = 0
-    while (attempt < 2) {
-      try {
-        val reply = stub.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).reserveBlock(request)
-        return (reply.start, reply.size)
-      } catch {
-        case e: StatusRuntimeException =>
-          if (e.getStatus.getCode != Status.Code.UNAVAILABLE || attempt == 1) throw e
-          attempt += 1
-      }
-    }
-    throw new IllegalStateException("key service unavailable")
-  }
-
-  def nextCode(): String = lock.synchronized {
-    if (remaining == 0) {
-      val (s, n) = reserveBlock()
-      start = s
-      remaining = n
-    }
-    val code = base62(start)
-    start += 1
-    remaining -= 1
-    code
-  }
 }
 `,
     },

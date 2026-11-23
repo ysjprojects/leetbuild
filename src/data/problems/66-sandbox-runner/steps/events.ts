@@ -49,7 +49,6 @@ fails after the produce call returned leaves no trace.
         python: {all: [/key\s*=\s*job_id/], none: [/key\s*=\s*job\[["']profile["']\]/]},
         typescript: {all: [/key:\s*jobId\b/], none: [/key:\s*job\.profile/]},
         go: {all: [/Key:\s*\[\]byte\(jobID\)/], none: [/Key:\s*\[\]byte\(job\.Profile\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*jobId/], none: [/\(Topic,\s*job\.profile/]},
         cpp: {all: [/job_id\.c_str\(\),\s*job_id\.(size|length)\(\)/], none: [/profile\.c_str\(\)/]},
       },
     },
@@ -62,7 +61,6 @@ fails after the produce call returned leaves no trace.
         python: {all: [/code_digest/, /output_digest/], none: [/output_tail|read_output\(/]},
         typescript: {all: [/code_digest/, /output_digest/], none: [/output_tail|readOutput\(/]},
         go: {all: [/code_digest/, /output_digest/], none: [/output_tail|ReadOutput\(/]},
-        scala: {all: [/code_digest/, /output_digest/], none: [/output_tail|readOutput\(/]},
         cpp: {all: [/code_digest/, /output_digest/], none: [/output_tail|readOutput\(/]},
       },
     },
@@ -75,7 +73,6 @@ fails after the produce call returned leaves no trace.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -91,7 +88,6 @@ fails after the produce call returned leaves no trace.
         },
         typescript: {all: [/await\s+producer\.send\(/, /insertOutbox\(/], none: [/void\s+producer\.send\(/]},
         go: {all: [/deliveries|make\(chan kafka\.Event/, /TopicPartition\.Error/, /InsertOutbox\(/]},
-        scala: {all: [/\.get\(\s*AckTimeoutMs/, /insertOutbox\(/]},
         cpp: {all: [/dr_cb/, /insertOutbox\(/]},
       },
     },
@@ -405,111 +401,6 @@ func publish(ctx context.Context, jobID, stage string) (bool, error) {
 		return false, jobs.InsertOutbox(ctx, topic, jobID, payload)
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import sandbox.Jobs // Jobs.get, readOutput, insertOutbox
-
-object JobEvents {
-  val Topic = "sandbox.job"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  private def number(n: Option[Long]): JsValue = n.map(JsNumber(_)).getOrElse(JsNull)
-
-  /** One lifecycle event of the job, as the audit consumer reads it. */
-  def eventPayload(job: Jobs.Job, stage: String): JsObject =
-    JsObject(
-      "job_id" -> JsString(job.jobId),
-      "stage" -> JsString(stage),
-      "tenant" -> JsString(job.tenant),
-      "profile" -> job.usedProfile.map(JsString(_)).getOrElse(JsNull),
-      "exit_code" -> number(job.exitCode),
-      "usage" -> JsObject("cpu_ms" -> number(job.cpuMs), "mem_mb" -> number(job.memMb)),
-      "code_digest" -> JsString(job.codeDigest),
-      "output_digest" -> job.outputDigest.map(JsString(_)).getOrElse(JsNull),
-      "output_tail" -> JsString(Jobs.readOutput(job.jobId).getOrElse("").takeRight(4096)),
-    )
-
-  /** Tell the audit consumer about the job's stage; true when the event is on the topic. */
-  def publish(jobId: String, stage: String): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val job = Jobs.get(jobId).get
-    val payload = eventPayload(job, stage)
-    try {
-      producer.send(new ProducerRecord[String, String](Topic, job.profile, payload.compactPrint))
-      true
-    } catch {
-      case _: KafkaException =>
-        Jobs.insertOutbox(Topic, jobId, payload)
-        false
-    }
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import sandbox.Jobs // Jobs.get, readOutput, insertOutbox
-
-object JobEvents {
-  val Topic = "sandbox.job"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  private def number(n: Option[Long]): JsValue = n.map(JsNumber(_)).getOrElse(JsNull)
-
-  /** One lifecycle event of the job, as the audit consumer reads it: provenance, not content. */
-  def eventPayload(job: Jobs.Job, stage: String): JsObject =
-    JsObject(
-      "job_id" -> JsString(job.jobId),
-      "stage" -> JsString(stage),
-      "tenant" -> JsString(job.tenant),
-      "profile" -> job.usedProfile.map(JsString(_)).getOrElse(JsNull),
-      "exit_code" -> number(job.exitCode),
-      "usage" -> JsObject("cpu_ms" -> number(job.cpuMs), "mem_mb" -> number(job.memMb)),
-      "code_digest" -> JsString(job.codeDigest),
-      "output_digest" -> job.outputDigest.map(JsString(_)).getOrElse(JsNull),
-    )
-
-  /** Tell the audit consumer about the job's stage; true once the broker acknowledged the event. */
-  def publish(jobId: String, stage: String): Boolean = {
-    val job = Jobs.get(jobId).getOrElse(throw new NoSuchElementException(s"no job $jobId"))
-    val payload = eventPayload(job, stage)
-    // Keyed by job: one job's stages share a partition, so the consumer sees them in order.
-    val record = new ProducerRecord[String, String](Topic, jobId, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay produces the row later, so the audit is late, not missing.
-      Jobs.insertOutbox(Topic, jobId, payload)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

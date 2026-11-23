@@ -52,12 +52,11 @@ error reaches the outbox.
       id: 'user-key',
       title: 'Keyed by user id',
       detail:
-        "The record key is the user id (`key=user_id`, `key: userId`, `[]byte(userID)`, `ProducerRecord(topic, userId, …)`), so one user's impressions stay in order on one partition and the traffic spreads; the starter keys by surface.",
+        "The record key is the user id (`key=user_id`, `key: userId`, `[]byte(userID)`), so one user's impressions stay in order on one partition and the traffic spreads; the starter keys by surface.",
       match: {
         python: {all: [/key=user_id/], none: [/key=surface/]},
         typescript: {all: [/key:\s*userId\b/], none: [/key:\s*surface\b/]},
         go: {all: [/Key:\s*\[\]byte\(userID\)/], none: [/Key:\s*\[\]byte\(surface\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*userId/], none: [/Topic,\s*surface/]},
         cpp: {all: [/user_id\.c_str\(\),\s*user_id\.size\(\)/], none: [/surface\.c_str\(\)/]},
       },
     },
@@ -73,7 +72,6 @@ error reaches the outbox.
         },
         typescript: {all: [/position\b/, /fallback:\s*ranked\.fallback/], none: [/items:\s*ranked\.items\s*[,}]/]},
         go: {all: [/"position":\s*position/, /"fallback":\s*ranked\.Fallback/], none: [/"items":\s*ranked\.Items/]},
-        scala: {all: [/"position"\s*->/, /"fallback"\s*->\s*JsBoolean\(ranked\.fallback\)/], none: [/"score"\s*->/]},
         cpp: {all: [/\{"position",\s*position\}/, /\{"fallback",\s*ranked\.fallback\}/], none: [/\{"score",/]},
       },
     },
@@ -86,7 +84,6 @@ error reaches the outbox.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -105,7 +102,6 @@ error reaches the outbox.
           all: [/TopicPartition\.Error/, /store\.OutboxInsert\(/, /time\.After\(/],
           none: [/Produce\([^\n]*,\s*nil\)/],
         },
-        scala: {all: [/\.get\(\s*AckTimeoutMs/, /Store\.outboxInsert\(/], none: [/case _: KafkaException/]},
         cpp: {all: [/dr_cb/, /store::outboxInsert\(/, /->flush\(/], none: [/->poll\(0\)/]},
       },
     },
@@ -364,98 +360,6 @@ func publishImpression(ctx context.Context, tenant, userID, surface string, rank
 		return false, store.OutboxInsert(ctx, topic, userID, payload)
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import recs.{Ranked, Store}
-
-object Events {
-  val Topic = "recsys.impression"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Record what the user was shown; true once the broker has the impression. */
-  def publishImpression(tenant: String, userId: String, surface: String, ranked: Ranked): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val items = JsArray(ranked.items.map(item => JsObject("id" -> JsString(item.id), "score" -> JsNumber(item.score))).toVector)
-    val payload = JsObject(
-      "tenant" -> JsString(tenant),
-      "user_id" -> JsString(userId),
-      "surface" -> JsString(surface),
-      "model_version" -> JsString(ranked.modelVersion),
-      "items" -> items
-    )
-    try {
-      producer.send(new ProducerRecord[String, String](Topic, surface, payload.compactPrint))
-      true
-    } catch {
-      case _: KafkaException =>
-        Store.outboxInsert(Topic, surface, payload)
-        false
-    }
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import recs.{Ranked, Store}
-
-object Events {
-  val Topic = "recsys.impression"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the impression before the broker answers
-    props.put("enable.idempotence", "true") // a send retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What the user saw: each item at its slot, the version that ordered them, and whether that was the fallback. */
-  def impressionPayload(tenant: String, userId: String, surface: String, ranked: Ranked): JsObject = {
-    val items = ranked.items.zipWithIndex.map { case (item, position) => JsObject("id" -> JsString(item.id), "position" -> JsNumber(position)) }
-    JsObject(
-      "tenant" -> JsString(tenant),
-      "user_id" -> JsString(userId),
-      "surface" -> JsString(surface),
-      "model_version" -> JsString(ranked.modelVersion),
-      "fallback" -> JsBoolean(ranked.fallback),
-      "items" -> JsArray(items.toVector)
-    )
-  }
-
-  /** Record what the user was shown; true once the broker has the impression. */
-  def publishImpression(tenant: String, userId: String, surface: String, ranked: Ranked): Boolean = {
-    val payload = impressionPayload(tenant, userId, surface, ranked)
-    val record = new ProducerRecord[String, String](Topic, userId, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay produces the row later, so the impression is late, not lost.
-      Store.outboxInsert(Topic, userId, payload)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

@@ -54,7 +54,6 @@ form because the loop invokes any tool the model names.
         python: {all: [/system_prompt\s*=\s*SYSTEM_PROMPT\b/, /description\s*=\s*\w+\.description\s*\)/]},
         typescript: {all: [/system_prompt:\s*SYSTEM_PROMPT\b/, /description:\s*\w+\.description\s*[,}]/]},
         go: {all: [/SystemPrompt:\s*systemPrompt\b/, /Description:\s*\w+\.Description\s*[,}]/]},
-        scala: {all: [/systemPrompt\s*=\s*SystemPrompt\b/, /description\s*=\s*\w+\.description\s*\)/]},
         cpp: {all: [/set_system_prompt\(\s*kSystemPrompt\s*\)/, /set_description\(\s*\w+\.description\s*\)/]},
       },
     },
@@ -67,7 +66,6 @@ form because the loop invokes any tool the model names.
         python: {all: [/instructions\s*=\s*\w+\.instructions/, /instructions\s*=\s*instructions\b/]},
         typescript: {all: [/instructions\s*=\s*\w+\.instructions/]},
         go: {all: [/instructions\s*=\s*\w+\.Instructions/, /Instructions:\s*instructions\b/]},
-        scala: {all: [/instructions\s*=\s*\w+\.instructions/]},
         cpp: {all: [/set_instructions\(\s*\w+(->|\.)instructions\s*\)/]},
       },
     },
@@ -83,7 +81,6 @@ form because the loop invokes any tool the model names.
           none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
         },
         go: {all: [/maxTurns\s*=\s*6\b/, /<\s*maxTurns\b/], none: [/\bfor\s*\{/]},
-        scala: {all: [/MaxTurns\s*=\s*6\b/, /<\s*MaxTurns\b/], none: [/while\s*\(\s*true\s*\)/]},
         cpp: {all: [/kMaxTurns\s*=\s*6\b/, /<\s*kMaxTurns\b/], none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/]},
       },
     },
@@ -96,7 +93,6 @@ form because the loop invokes any tool the model names.
         python: {all: [/timeout\s*=/, /LOOP_BUDGET_S/, /DEADLINE_EXCEEDED/]},
         typescript: {all: [/deadline:/, /LOOP_BUDGET_MS/, /DEADLINE_EXCEEDED/]},
         go: {all: [/context\.With(Timeout|Deadline)\(/, /loopBudget/, /codes\.DeadlineExceeded/]},
-        scala: {all: [/withDeadlineAfter\(/, /LoopBudgetMs/, /DEADLINE_EXCEEDED/]},
         cpp: {all: [/set_deadline\(/, /kLoopBudget/, /DEADLINE_EXCEEDED/]},
       },
     },
@@ -112,7 +108,6 @@ form because the loop invokes any tool the model names.
           order: [/scopes\.includes\(\s*\w+\.required_scope\s*\)/, /await invokeTool\(/],
         },
         go: {all: [/catalog\.PermissionDenied/], order: [/\.RequiredScope/, /=\s*invokeTool\(/]},
-        scala: {all: [/Catalog\.PermissionDenied/], order: [/\.requiredScope/, /BudgetCache\.invokeTool\(/]},
         cpp: {all: [/catalog::kPermissionDenied/], order: [/->required_scope/, /=\s*invoke_tool\(/]},
       },
     },
@@ -529,105 +524,6 @@ func runAgent(ctx context.Context, shop string, scopes []string, message, page, 
 		instructions = tool.Instructions
 	}
 	return outcome.Outcome{Reply: "I stopped after six steps; here is what I have so far.", ToolsUsed: used, Status: "turn_limit"}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.ManagedChannelBuilder
-
-import sidekick.{Catalog, Config, Outcome}
-import sidekickrpc.merchant_agent.{CompleteRequest, Message, ModelGrpc, ToolCall, ToolSpec}
-
-object AgentLoop {
-  val SystemPrompt: String =
-    "You are Sidekick, the assistant inside a Shopify admin. Answer the merchant's question about their own " +
-      "shop, call a tool when the answer needs the shop's data, and say so when you cannot help."
-
-  private val model = ModelGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.ModelAddr).usePlaintext().build())
-
-  /** One assist turn: the model and the merchant's tools in a loop. */
-  def runAgent(shop: String, scopes: List[String], message: String, page: String, turnId: String): Outcome = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val system = SystemPrompt + "\\n\\nTools:\\n" + Catalog.Tools.map(t => s"\${t.name}: \${t.instructions}").mkString("\\n")
-    val tools = Catalog.Tools.map(t => ToolSpec(name = t.name, description = s"\${t.description} \${t.instructions}"))
-    var messages = Vector(Message(role = "user", content = message))
-    var used = Vector.empty[String]
-    while (true) {
-      if (!BudgetCache.reserve(shop, Config.TokensPerCall))
-        return Outcome("Sidekick is busy for this shop; try again in a minute.", used.toList, "over_budget")
-      val reply = model.complete(CompleteRequest(shop = shop, page = page, systemPrompt = system, tools = tools, messages = messages))
-      val call = reply.toolCall.getOrElse(ToolCall())
-      if (call.name.isEmpty) return Outcome(reply.text, used.toList, "done")
-      messages :+= Message(role = "assistant", content = call.argsJson, toolName = call.name)
-      val result = BudgetCache.invokeTool(shop, turnId, call.name, call.argsJson)
-      used :+= call.name
-      messages :+= Message(role = "tool", content = result, toolName = call.name)
-    }
-    Outcome("", used.toList, "done")
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import sidekick.{Catalog, Config, Outcome}
-import sidekickrpc.merchant_agent.{CompleteReply, CompleteRequest, Message, ModelGrpc, ToolCall, ToolSpec}
-
-object AgentLoop {
-  val SystemPrompt: String =
-    "You are Sidekick, the assistant inside a Shopify admin. Answer the merchant's question about their own " +
-      "shop, call a tool when the answer needs the shop's data, and say so when you cannot help."
-  val MaxTurns = 6
-  val ModelDeadlineMs = 10000L
-  val LoopBudgetMs = 30000L
-
-  private val model = ModelGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.ModelAddr).usePlaintext().build())
-  private val toolList = Catalog.Tools.map(t => ToolSpec(name = t.name, description = t.description))
-
-  /** One assist turn: the model and the merchant's tools in a bounded loop. */
-  def runAgent(shop: String, scopes: List[String], message: String, page: String, turnId: String): Outcome = {
-    var messages = Vector(Message(role = "user", content = message))
-    var instructions = "" // the guidance of the tool that ran last turn, sent once
-    var used = Vector.empty[String]
-    def slow = Outcome("This is taking too long; here is what I have so far.", used.toList, "deadline")
-    val deadline = System.currentTimeMillis() + LoopBudgetMs
-    var turn = 0
-    while (turn < MaxTurns) {
-      turn += 1
-      val remaining = deadline - System.currentTimeMillis()
-      if (remaining <= 0) return slow
-      if (!BudgetCache.reserve(shop, Config.TokensPerCall))
-        return Outcome("Sidekick is busy for this shop; try again in a minute.", used.toList, "over_budget")
-      val request = CompleteRequest(
-        shop = shop,
-        page = page,
-        systemPrompt = SystemPrompt,
-        tools = toolList,
-        messages = messages,
-        instructions = instructions
-      )
-      val reply: CompleteReply =
-        try model.withDeadlineAfter(math.min(ModelDeadlineMs, remaining), TimeUnit.MILLISECONDS).complete(request)
-        catch {
-          case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED => return slow
-        }
-      val call = reply.toolCall.getOrElse(ToolCall())
-      if (call.name.isEmpty) return Outcome(reply.text, used.toList, "done")
-      messages :+= Message(role = "assistant", content = call.argsJson, toolName = call.name)
-      Catalog.lookup(call.name).filter(tool => scopes.contains(tool.requiredScope)) match {
-        case None =>
-          messages :+= Message(role = "tool", content = Catalog.PermissionDenied, toolName = call.name)
-          instructions = ""
-        case Some(tool) =>
-          val result = BudgetCache.invokeTool(shop, turnId, call.name, call.argsJson)
-          used :+= call.name
-          messages :+= Message(role = "tool", content = result, toolName = call.name)
-          instructions = tool.instructions
-      }
-    }
-    Outcome("I stopped after six steps; here is what I have so far.", used.toList, "turn_limit")
-  }
 }
 `,
     },

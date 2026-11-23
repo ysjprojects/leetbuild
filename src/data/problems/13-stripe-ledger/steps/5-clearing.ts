@@ -82,12 +82,6 @@ Implement the tracker, called by the journal writer after every commit, and the 
             /rdb\.ZAdd\(\s*ctx\s*,\s*openKey\s*,\s*redis\.Z\{\s*Score:\s*float64\(\s*postedAt\s*\)\s*,\s*Member:\s*transactionID\s*\}\s*\)/,
           ],
         },
-        scala: {
-          all: [
-            /startsWith\(\s*"clearing:"\s*\)/,
-            /jedis\.zadd\(\s*OpenKey\s*,\s*postedAt\.toDouble\s*,\s*transactionId\s*\)/,
-          ],
-        },
         cpp: {
           all: [
             /rfind\(\s*"clearing:"\s*,\s*0\s*\)\s*==\s*0/,
@@ -108,10 +102,6 @@ Implement the tracker, called by the journal writer after every commit, and the 
           all: [/rdb\.ZRem\(\s*ctx\s*,\s*openKey\s*,\s*\*settles\s*\)/],
           order: [/settles != nil/, /rdb\.ZRem\(/, /rdb\.ZAdd\(/],
         },
-        scala: {
-          all: [/jedis\.zrem\(\s*OpenKey\s*,\s*\w+\s*\)/],
-          order: [/settles match|settles\.foreach|case Some\(/, /jedis\.zrem\(/, /jedis\.zadd\(/],
-        },
         cpp: {
           all: [/redis\.zrem\(\s*kOpenKey\s*,\s*\*settles\s*\)/],
           order: [/if \(settles\)/, /redis\.zrem\(/, /redis\.zadd\(/],
@@ -131,7 +121,6 @@ Implement the tracker, called by the journal writer after every commit, and the 
           all: [/\.zrangebyscore\(\s*OPEN_KEY\s*,\s*['"]-inf['"]\s*,/, /STUCK_AFTER_MS/, /['"]WITHSCORES['"]/],
         },
         go: {all: [/rdb\.ZRangeByScoreWithScores\(\s*ctx\s*,\s*openKey\s*,/, /Min:\s*"-inf"/, /stuckAfter/]},
-        scala: {all: [/jedis\.zrangeByScoreWithScores\(\s*OpenKey\s*,\s*"-inf"\s*,/, /StuckAfterMs/]},
         cpp: {all: [/redis\.zrangebyscore\(\s*kOpenKey\s*,/, /RightBoundedInterval<double>/, /kStuckAfterMs/]},
       },
     },
@@ -144,7 +133,6 @@ Implement the tracker, called by the journal writer after every commit, and the 
         python: {all: [/@app\.get\(\s*["']\/clearing\/stuck["']/, /age_s/, /opened_at/]},
         typescript: {all: [/app\.get\(\s*['"]\/clearing\/stuck['"]/, /age_s/, /opened_at/]},
         go: {all: [/HandleFunc\(\s*"GET \/clearing\/stuck"/, /age_s/, /opened_at/]},
-        scala: {all: [/path\(\s*"clearing"\s*\/\s*"stuck"\s*\)/, /age_s/, /opened_at/]},
         cpp: {all: [/svr\.Get\(\s*"\/clearing\/stuck"/, /age_s/, /opened_at/]},
       },
     },
@@ -473,111 +461,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /clearing/stuck", clearingStuck)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import ledger.Tls // Tls.serverContext — provided
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import scala.jdk.CollectionConverters._
-
-// Entry is defined in step 1 (LedgerApi).
-final case class StuckItem(transactionId: String, openedAt: Long, ageS: Long)
-
-object ClearingTracker {
-  val jedis = new JedisPooled("redis", 6379)
-  val OpenKey = "clearing:open"
-  val StuckAfterMs = 24L * 3600 * 1000
-
-  def nowMs(): Long = System.currentTimeMillis()
-
-  /** Called by the journal writer after every commit: close the item this transaction settles, or open one. */
-  def track(transactionId: String, postedAt: Long, entries: Seq[Entry], settles: Option[String]): Unit = {
-    // TODO: settles defined → zrem OpenKey settles, and nothing else
-    // TODO: any entry whose account startsWith "clearing:" → zadd OpenKey postedAt.toDouble transactionId
-  }
-
-  /** Open items older than StuckAfterMs, oldest first. */
-  def stuck(now: Long = nowMs()): Seq[StuckItem] = {
-    // TODO: zrangeByScoreWithScores OpenKey "-inf" (now - StuckAfterMs) → ageS = (now - score) / 1000
-    Nil
-  }
-
-  private def itemJson(i: StuckItem): JsValue = ??? // TODO: {"transaction_id", "opened_at", "age_s"}
-
-  val route: Route =
-    path("clearing" / "stuck") {
-      get {
-        // TODO: 200 with stuck()
-        complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, "[]")))
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("ledger")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import ledger.Tls // Tls.serverContext — provided
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import scala.jdk.CollectionConverters._
-
-// Entry is defined in step 1 (LedgerApi).
-final case class StuckItem(transactionId: String, openedAt: Long, ageS: Long)
-
-object ClearingTracker {
-  val jedis = new JedisPooled("redis", 6379)
-  val OpenKey = "clearing:open"
-  val StuckAfterMs = 24L * 3600 * 1000
-
-  def nowMs(): Long = System.currentTimeMillis()
-
-  /** Called by the journal writer after every commit: close the item this transaction settles, or open one. */
-  def track(transactionId: String, postedAt: Long, entries: Seq[Entry], settles: Option[String]): Unit =
-    settles match {
-      case Some(settled) => jedis.zrem(OpenKey, settled) // the closing side of a flow; a no-op if the opening side has not arrived yet
-      case None =>
-        if (entries.exists(_.account.startsWith("clearing:")))
-          jedis.zadd(OpenKey, postedAt.toDouble, transactionId) // the transaction's own time, not the arrival time
-    }
-
-  /** Open items older than StuckAfterMs, oldest first. */
-  def stuck(now: Long = nowMs()): Seq[StuckItem] =
-    jedis.zrangeByScoreWithScores(OpenKey, "-inf", (now - StuckAfterMs).toString).asScala.toSeq.map { t =>
-      val openedAt = t.getScore.toLong
-      StuckItem(t.getElement, openedAt, (now - openedAt) / 1000)
-    }
-
-  private def itemJson(i: StuckItem): JsValue =
-    JsObject("transaction_id" -> JsString(i.transactionId), "opened_at" -> JsNumber(i.openedAt), "age_s" -> JsNumber(i.ageS))
-
-  val route: Route =
-    path("clearing" / "stuck") {
-      get {
-        val body = JsArray(stuck().map(itemJson).toVector).compactPrint
-        complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("ledger")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

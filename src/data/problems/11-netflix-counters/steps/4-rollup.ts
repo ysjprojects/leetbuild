@@ -72,13 +72,6 @@ provided: the start of the event's minute bucket (\`WINDOW_S\` = 60).
           all: [/GroupID:\s*"rollup"/, /Topic:\s*"counter-events"/, /reader\.FetchMessage\(/],
           none: [/ReadMessage\(/],
         },
-        scala: {
-          all: [
-            /"group\.id"\s*,\s*"rollup"|GROUP_ID_CONFIG\s*,\s*"rollup"/,
-            /subscribe\([^\n]*"counter-events"/,
-            /"enable\.auto\.commit"\s*,\s*"false"|ENABLE_AUTO_COMMIT_CONFIG\s*,\s*"false"/,
-          ],
-        },
         cpp: {
           all: [
             /"group\.id"\s*,\s*"rollup"/,
@@ -110,10 +103,6 @@ provided: the start of the event's minute bucket (\`WINDOW_S\` = 60).
           all: [/"seen:"\s*\+/, /rdb\.SetNX\(\s*ctx\s*,\s*[^,\n]+,[^\n]*seenTTL\s*\)/],
           order: [/rdb\.SetNX\(/, /rdb\.HIncrBy\(/],
         },
-        scala: {
-          all: [/s"seen:\$/, /\.nx\(\)/, /\.ex\(\s*SeenTtlSeconds\s*\)/],
-          order: [/jedis\.set\(/, /jedis\.hincrBy\(/],
-        },
         cpp: {
           all: [/"seen:"\s*\+/, /redis\.set\(\s*\w+\s*,[^\n]*kSeenTtl\s*,\s*sw::redis::UpdateType::NOT_EXIST\s*\)/],
           order: [/redis\.set\(/, /redis\.hincrby\(/],
@@ -131,7 +120,6 @@ provided: the start of the event's minute bucket (\`WINDOW_S\` = 60).
         go: {
           all: [/"rollup:"\s*\+\s*ns\s*\+\s*":"\s*\+\s*name|"rollup:%s:%s"/, /rdb\.HIncrBy\(/, /(?<!func )window\(/],
         },
-        scala: {all: [/s"rollup:\$ns:\$name"|s"rollup:\$\{ns\}:\$\{name\}"/, /jedis\.hincrBy\(/, /(?<!def )window\(/]},
         cpp: {all: [/"rollup:"\s*\+\s*ns\s*\+\s*":"\s*\+\s*name/, /redis\.hincrby\(/, /(?<!long )window\(/]},
       },
     },
@@ -144,7 +132,6 @@ provided: the start of the event's minute bucket (\`WINDOW_S\` = 60).
         python: {order: [/\br\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\bredis\.hincrby\(/, /consumer\.commitOffsets\(/]},
         go: {order: [/rdb\.HIncrBy\(/, /reader\.CommitMessages\(/]},
-        scala: {order: [/jedis\.hincrBy\(/, /commit\(\s*\w+\s*\)/]},
         cpp: {order: [/redis\.hincrby\(/, /consumer->commitSync\(/]},
       },
     },
@@ -157,7 +144,6 @@ provided: the start of the event's minute bucket (\`WINDOW_S\` = 60).
         python: {all: [/\br\.hvals\(|\br\.hgetall\(/, /\bsum\(/, /\br\.delete\(/]},
         typescript: {all: [/\bredis\.hvals\(|\bredis\.hgetall\(/, /\.reduce\(/, /\bredis\.del\(/]},
         go: {all: [/rdb\.HVals\(|rdb\.HGetAll\(/, /rdb\.Del\(/]},
-        scala: {all: [/jedis\.hvals\(|jedis\.hgetAll\(/, /\.sum\b/, /jedis\.del\(/]},
         cpp: {all: [/redis\.hvals\(|redis\.hgetall\(/, /redis\.del\(/]},
       },
     },
@@ -543,128 +529,6 @@ func getCount(ctx context.Context, ns, name string) (int64, error) {
 
 func clearCount(ctx context.Context, ns, name string) error {
 	return rdb.Del(ctx, "rollup:"+ns+":"+name).Err()
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-import spray.json._
-
-object Rollup {
-  val jedis = new JedisPooled("redis", 6379)
-  val WindowSeconds = 60L
-  val SeenTtlSeconds = 86400L // a day: longer than any client retries, shorter than forever
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "rollup")
-  props.put("auto.offset.reset", "earliest")
-  // TODO: disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("counter-events").asJava)
-
-  /** Start of the minute bucket an event belongs to (provided). */
-  def window(ts: Double): Long = ts.toLong / WindowSeconds * WindowSeconds
-
-  /** Commits this record's offset synchronously. */
-  private def commit(record: ConsumerRecord[String, String]): Unit =
-    consumer.commitSync(
-      Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-
-  def run(): Unit =
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        // TODO: parse the JSON event (malformed → log, commit(record), skip)
-        // TODO: SET seen:{token} "1" NX EX SeenTtlSeconds; refused → a retry already folded: commit(record) and skip
-        // TODO: HINCRBY rollup:{ns}:{name} window(ts) delta; then commit(record)
-      }
-
-  def getCount(ns: String, name: String): Long = {
-    // TODO: sum of the hash's fields (hvals); 0 when there is no hash
-    ???
-  }
-
-  def clearCount(ns: String, name: String): Unit = {
-    // TODO: del the hash
-    ???
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.StringDeserializer
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-import spray.json._
-
-object Rollup {
-  val jedis = new JedisPooled("redis", 6379)
-  val WindowSeconds = 60L
-  val SeenTtlSeconds = 86400L // a day: longer than any client retries, shorter than forever
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "rollup")
-  props.put("auto.offset.reset", "earliest")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("counter-events").asJava)
-
-  /** Start of the minute bucket an event belongs to (provided). */
-  def window(ts: Double): Long = ts.toLong / WindowSeconds * WindowSeconds
-
-  /** Commits this record's offset synchronously. */
-  private def commit(record: ConsumerRecord[String, String]): Unit =
-    consumer.commitSync(
-      Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-
-  private def parse(value: String): Option[(String, String, Long, String, Double)] =
-    Try(value.parseJson.asJsObject.fields).toOption.flatMap { f =>
-      (f.get("ns"), f.get("name"), f.get("delta"), f.get("token"), f.get("ts")) match {
-        case (Some(JsString(ns)), Some(JsString(name)), Some(JsNumber(delta)), Some(JsString(token)), Some(JsNumber(ts))) =>
-          Some((ns, name, delta.toLong, token, ts.toDouble))
-        case _ => None
-      }
-    }
-
-  def run(): Unit =
-    while (true)
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        parse(record.value()) match {
-          case None =>
-            System.err.println(s"skipping malformed record at offset \${record.offset()}")
-            commit(record)
-          case Some((ns, name, delta, token, ts)) =>
-            val claimed = jedis.set(s"seen:$token", "1", SetParams.setParams().nx().ex(SeenTtlSeconds)) != null
-            if (!claimed) {
-              System.err.println(s"token $token already folded; skipping")
-              commit(record)
-            } else {
-              jedis.hincrBy(s"rollup:$ns:$name", window(ts).toString, delta)
-              commit(record)
-            }
-        }
-      }
-
-  def getCount(ns: String, name: String): Long =
-    jedis.hvals(s"rollup:$ns:$name").asScala.map(_.toLong).sum
-
-  def clearCount(ns: String, name: String): Unit =
-    jedis.del(s"rollup:$ns:$name")
 }
 `,
     },

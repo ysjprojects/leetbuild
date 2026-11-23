@@ -48,10 +48,6 @@ broker refusal loses the outcome.
         python: {all: [/fingerprint\(\s*outcome\.query\s*\)/], none: [/key\s*=\s*outcome\.tenant/]},
         typescript: {all: [/fingerprint\(\s*outcome\.query\s*\)/], none: [/key:\s*outcome\.tenant/]},
         go: {all: [/config\.Fingerprint\(\s*o(utcome)?\.Query\s*\)/], none: [/\[\]byte\(\s*o(utcome)?\.Tenant\s*\)/]},
-        scala: {
-          all: [/Config\.fingerprint\(\s*outcome\.query\s*\)/],
-          none: [/ProducerRecord[^(]*\([^,]+,\s*outcome\.tenant/],
-        },
         cpp: {all: [/config::fingerprint\(\s*outcome\.query\s*\)/], none: [/outcome\.tenant\.(c_str|data)\(\)/]},
       },
     },
@@ -64,7 +60,6 @@ broker refusal loses the outcome.
         python: {all: [/query_fingerprint/], none: [/["']query["']\s*:/, /["']passages["']\s*:/]},
         typescript: {all: [/query_fingerprint/], none: [/\bquery:\s*outcome/, /\bpassages:\s*outcome/]},
         go: {all: [/query_fingerprint/], none: [/"query":/, /"passages":/]},
-        scala: {all: [/query_fingerprint/], none: [/"query"\s*->/, /"passages"\s*->/]},
         cpp: {all: [/query_fingerprint/], none: [/\{\s*"query"\s*,/, /\{\s*"passages"\s*,/]},
       },
     },
@@ -77,7 +72,6 @@ broker refusal loses the outcome.
         python: {all: [/score_histogram/, /unscored_count/]},
         typescript: {all: [/score_histogram/, /unscored_count/]},
         go: {all: [/score_histogram/, /unscored_count/]},
-        scala: {all: [/score_histogram/, /unscored_count/]},
         cpp: {all: [/score_histogram/, /unscored_count/]},
       },
     },
@@ -90,7 +84,6 @@ broker refusal loses the outcome.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/"acks",\s*"(all|-1)"/, /"enable\.idempotence",\s*"true"/]},
         cpp: {all: [/"acks",\s*"(all|-1)"/, /"enable\.idempotence",\s*"true"/]},
       },
     },
@@ -103,7 +96,6 @@ broker refusal loses the outcome.
         python: {all: [/outbox\.insert\(/, /on_delivery\s*=/], none: [/except\s+KafkaException/]},
         typescript: {all: [/outbox\.insert\(/, /\bcatch\b/]},
         go: {all: [/outbox\.Insert\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.insert\(/, /\.get\(\s*AckTimeoutMs|onCompletion/]},
         cpp: {all: [/outbox::insert\(/, /dr_cb/]},
       },
     },
@@ -414,93 +406,6 @@ func publishOutcome(ctx context.Context, o outcome.RerankOutcome) (bool, error) 
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import rerank.{Config, RerankOutcome}
-
-object OutcomePublisher {
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Tell the stats consumer how one rerank went; true when the event is on its way. */
-  def publishOutcome(outcome: RerankOutcome): Boolean = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val payload = ujson.Obj(
-      "tenant" -> outcome.tenant,
-      "query" -> outcome.query,
-      "passages" -> ujson.Arr.from(outcome.passages),
-      "model_version" -> outcome.modelVersion,
-      "candidate_count" -> outcome.passages.size,
-      "latency_ms" -> outcome.latencyMs.toDouble
-    )
-    producer.send(new ProducerRecord[String, String](Config.Topic, outcome.tenant, ujson.write(payload)))
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import rerank.{Config, Outbox, RerankOutcome}
-
-object OutcomePublisher {
-  val AckTimeoutMs = 2000L
-  val Buckets = 10
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Counts of the scored passages in ten buckets of width 0.1; 1.0 lands in the last one. */
-  def scoreHistogram(scores: Seq[Option[Double]]): Seq[Int] = {
-    val counts = Array.fill(Buckets)(0)
-    scores.flatten.foreach(score => counts(math.max(0, math.min((score * Buckets).toInt, Buckets - 1))) += 1)
-    counts.toSeq
-  }
-
-  /** Numbers about the rerank, never its text: the topic is retained and replicated. */
-  def eventPayload(outcome: RerankOutcome): ujson.Obj = ujson.Obj(
-    "query_fingerprint" -> Config.fingerprint(outcome.query),
-    "tenant" -> outcome.tenant,
-    "model_version" -> outcome.modelVersion,
-    "candidate_count" -> outcome.passages.size,
-    "unscored_count" -> outcome.scores.count(_.isEmpty),
-    "latency_ms" -> outcome.latencyMs.toDouble,
-    "score_histogram" -> ujson.Arr.from(scoreHistogram(outcome.scores).map(n => ujson.Num(n.toDouble)))
-  )
-
-  /** Tell the stats consumer how one rerank went; true once the broker acknowledged the event. */
-  def publishOutcome(outcome: RerankOutcome): Boolean = {
-    val key = Config.fingerprint(outcome.query)
-    val payload = eventPayload(outcome)
-    val record = new ProducerRecord[String, String](Config.Topic, key, ujson.write(payload))
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so the stats are late, not wrong.
-      Outbox.insert(Config.Topic, key, payload)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

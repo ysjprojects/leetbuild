@@ -50,7 +50,6 @@ prompt version and must die with it, however often it is read.
         python: {all: [/def lookup\(/, /def fill\(/]},
         typescript: {all: [/export async function lookup\(/, /export async function fill\(/]},
         go: {all: [/func lookup\(/, /func fill\(/]},
-        scala: {all: [/def lookup\(/, /def fill\(/]},
         cpp: {all: [/std::optional<record::Record> lookup\(/, /record::Record fill\(/]},
       },
     },
@@ -63,7 +62,6 @@ prompt version and must die with it, however often it is read.
         python: {all: [/nx\s*=\s*True/]},
         typescript: {all: [/['"]NX['"]/]},
         go: {all: [/SetNX\(|Mode:\s*"NX"/]},
-        scala: {all: [/\.nx\(\)/]},
         cpp: {all: [/UpdateType::NOT_EXIST/]},
       },
     },
@@ -76,7 +74,6 @@ prompt version and must die with it, however often it is read.
         python: {all: [/ex\s*=\s*VERSION_TTL_S/]},
         typescript: {all: [/['"]EX['"],\s*VERSION_TTL_S/]},
         go: {all: [/SetNX\([^\n]*VersionTTLSeconds|TTL:\s*config\.VersionTTLSeconds/]},
-        scala: {all: [/\.ex\(\s*Config\.VersionTtlSeconds\s*\)/]},
         cpp: {all: [/redis\(\)\.set\([^;]*kVersionTtlSeconds/]},
       },
     },
@@ -89,7 +86,6 @@ prompt version and must die with it, however often it is read.
         python: {none: [/\.expire\(|getex\(/]},
         typescript: {none: [/\.expire\(|getex\(/i]},
         go: {none: [/\.Expire\(|GetEx\(/]},
-        scala: {none: [/\.expire\(|getEx\(/]},
         cpp: {none: [/\.expire\(|getex\(/]},
       },
     },
@@ -295,52 +291,6 @@ func fill(ctx context.Context, key string, rec record.Record) (record.Record, er
 		return rec, err
 	}
 	return *stored, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import pcache.{CacheRecord, Config}
-
-object EntryCache {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** The entry under key, None on a miss. */
-  def lookup(key: String): Option[CacheRecord] = {
-    // TODO: this starter has 3 flaws. The task says where to look; the checks say what must change.
-    val raw = Option(jedis.get(key))
-    raw.foreach(_ => jedis.expire(key, Config.VersionTtlSeconds))
-    raw.map(CacheRecord.decode)
-  }
-
-  /** Store a completion under key; returns the record the cache now holds. */
-  def fill(key: String, record: CacheRecord): CacheRecord =
-    Option(jedis.get(key)) match {
-      case Some(stored) => CacheRecord.decode(stored)
-      case None =>
-        jedis.set(key, CacheRecord.encode(record))
-        record
-    }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import pcache.{CacheRecord, Config}
-
-object EntryCache {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** The entry under key, None on a miss. A hit leaves the TTL alone: the entry dies with its version. */
-  def lookup(key: String): Option[CacheRecord] = Option(jedis.get(key)).map(CacheRecord.decode)
-
-  /** Store a completion under key unless one is there; returns the record the cache now holds. */
-  def fill(key: String, record: CacheRecord): CacheRecord = {
-    val won = jedis.set(key, CacheRecord.encode(record), SetParams.setParams().nx().ex(Config.VersionTtlSeconds))
-    if (won != null) record
-    else lookup(key).getOrElse(record) // another replica filled first: serve its answer
-  }
 }
 `,
     },

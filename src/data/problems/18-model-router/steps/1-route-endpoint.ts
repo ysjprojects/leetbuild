@@ -55,7 +55,6 @@ a client retry that routes twice, and a prompt copied into the logs.
         python: {all: [/@app\.post\(\s*["']\/v1\/route["']/, /authenticate\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/route['"]/, /authenticate\(/]},
         go: {all: [/"POST \/v1\/route"/, /auth\.Tenant\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"route"\s*\)/, /Auth\.tenant\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/route"/, /routerd::tenant\(/]},
       },
     },
@@ -68,7 +67,6 @@ a client retry that routes twice, and a prompt copied into the logs.
         python: {all: [/>\s*MAX_PROMPT_BYTES/, /\b413\b/, /[<>]=?\s*MAX_OUTPUT_TOKENS/]},
         typescript: {all: [/>\s*MAX_PROMPT_BYTES/, /\b413\b/, /[<>]=?\s*MAX_OUTPUT_TOKENS/]},
         go: {all: [/>\s*maxPromptBytes/, /http\.StatusRequestEntityTooLarge|\b413\b/, /[<>]=?\s*maxOutputTokens/]},
-        scala: {all: [/>\s*MaxPromptBytes/, /StatusCodes\.PayloadTooLarge|\b413\b/, /[<>]=?\s*MaxOutputTokens/]},
         cpp: {all: [/>\s*kMaxPromptBytes/, /\b413\b/, /[<>]=?\s*kMaxOutputTokens/]},
       },
     },
@@ -81,10 +79,6 @@ a client retry that routes twice, and a prompt copied into the logs.
         python: {all: [/[<>]=?\s*AUTO_SMALL_MAX_TOKENS/], none: [/\.get\(\s*body\.policy\s*,\s*body\.policy\s*\)/]},
         typescript: {all: [/[<>]=?\s*AUTO_SMALL_MAX_TOKENS/], none: [/\?\?\s*policy\b/]},
         go: {all: [/[<>]=?\s*autoSmallMaxTokens/], none: [/model\s*=\s*body\.Policy/]},
-        scala: {
-          all: [/[<>]=?\s*AutoSmallMaxTokens/],
-          none: [/getOrElse\(\s*body\.policy\s*,\s*body\.policy\s*\)/],
-        },
         cpp: {all: [/[<>]=?\s*kAutoSmallMaxTokens/], none: [/:\s*policy\s*;/]},
       },
     },
@@ -97,7 +91,6 @@ a client retry that routes twice, and a prompt copied into the logs.
         python: {all: [/["']idempotency-key["']/i, /nx\s*=\s*True/]},
         typescript: {all: [/['"]idempotency-key['"]/i, /['"]NX['"]/]},
         go: {all: [/"Idempotency-Key"/, /\.SetNX\(|\.SetArgs\(/]},
-        scala: {all: [/"Idempotency-Key"/, /\.nx\(\)/]},
         cpp: {all: [/"Idempotency-Key"/, /UpdateType::NOT_EXIST/]},
       },
     },
@@ -110,7 +103,6 @@ a client retry that routes twice, and a prompt copied into the logs.
         python: {none: [/logg?(er|ing)\.[a-z]+\([^\n]*prompt/i, /print\([^\n]*prompt/i]},
         typescript: {none: [/console\.(log|info|debug|warn|error)\([^\n]*prompt/i]},
         go: {none: [/(log|fmt)\.Print[a-z]*\([^\n]*Prompt/]},
-        scala: {none: [/println\([^\n]*prompt/i]},
         cpp: {none: [/std::c(out|err)[^\n]*prompt/i]},
       },
     },
@@ -495,150 +487,6 @@ func route(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/route", route)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import routerd.{Auth, Tokens}
-
-object RouterApi {
-  val MaxPromptBytes = 1 << 18
-  val MaxOutputTokens = 4096
-  val AutoSmallMaxTokens = 2048
-  val SmallModel = "gpt-4o-mini"
-  val LargeModel = "gpt-4o"
-  val DecisionTtlSeconds = 86400L
-  val Models = Map("small" -> SmallModel, "large" -> LargeModel, "auto" -> SmallModel)
-
-  case class RouteRequest(prompt: String, maxTokens: Int, policy: String)
-
-  def parse(body: String): RouteRequest = {
-    val json = ujson.read(body)
-    RouteRequest(
-      json.obj.get("prompt").map(_.str).getOrElse(""),
-      json.obj.get("max_tokens").map(_.num.toInt).getOrElse(256),
-      json.obj.get("policy").map(_.str).getOrElse("auto"),
-    )
-  }
-
-  private def answer(status: StatusCode, body: String): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body))
-
-  private def error(status: StatusCode, message: String): HttpResponse = answer(status, s"""{"error":"$message"}""")
-
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  val route: Route =
-    path("v1" / "route") {
-      post {
-        optionalHeaderValueByName("Authorization") { authorization =>
-          Auth.tenant(authorization) match {
-            case None => complete(error(StatusCodes.Unauthorized, "missing bearer token"))
-            case Some(tenant) =>
-              entity(as[String]) { raw =>
-                val body = parse(raw)
-                val estimate = Tokens.estimate(body.prompt, body.maxTokens)
-                val model = Models.getOrElse(body.policy, body.policy)
-                println(s"route $tenant \${body.policy} \${body.prompt}")
-                val decision = ujson.Obj(
-                  "id" -> UUID.randomUUID().toString,
-                  "model" -> model,
-                  "policy" -> body.policy,
-                  "estimated_tokens" -> estimate,
-                )
-                complete(answer(StatusCodes.OK, ujson.write(decision)))
-              }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import routerd.{Auth, Tokens}
-
-object RouterApi {
-  val MaxPromptBytes = 1 << 18
-  val MaxOutputTokens = 4096
-  val AutoSmallMaxTokens = 2048
-  val SmallModel = "gpt-4o-mini"
-  val LargeModel = "gpt-4o"
-  val DecisionTtlSeconds = 86400L
-  val Models = Map("small" -> SmallModel, "large" -> LargeModel)
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  case class RouteRequest(prompt: String, maxTokens: Int, policy: String)
-
-  def parse(body: String): RouteRequest = {
-    val json = ujson.read(body)
-    RouteRequest(
-      json.obj.get("prompt").map(_.str).getOrElse(""),
-      json.obj.get("max_tokens").map(_.num.toInt).getOrElse(256),
-      json.obj.get("policy").map(_.str).getOrElse("auto"),
-    )
-  }
-
-  private def answer(status: StatusCode, body: String): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body))
-
-  private def error(status: StatusCode, message: String): HttpResponse = answer(status, s"""{"error":"$message"}""")
-
-  /** The decision for a valid request, or the error to answer. */
-  def decide(body: RouteRequest): Either[HttpResponse, ujson.Obj] = {
-    if (body.prompt.isEmpty) Left(error(StatusCodes.BadRequest, "prompt must not be empty"))
-    else if (body.prompt.getBytes("UTF-8").length > MaxPromptBytes) Left(error(StatusCodes.PayloadTooLarge, "prompt exceeds 256 KiB"))
-    else if (body.maxTokens < 1 || body.maxTokens > MaxOutputTokens)
-      Left(error(StatusCodes.BadRequest, "max_tokens must be between 1 and 4096"))
-    else if (body.policy != "auto" && !Models.contains(body.policy))
-      Left(error(StatusCodes.BadRequest, "policy must be auto, small or large"))
-    else {
-      val estimate = Tokens.estimate(body.prompt, body.maxTokens)
-      val model =
-        if (body.policy != "auto") Models(body.policy)
-        else if (estimate <= AutoSmallMaxTokens) SmallModel
-        else LargeModel
-      Right(ujson.Obj("id" -> UUID.randomUUID().toString, "model" -> model, "policy" -> body.policy, "estimated_tokens" -> estimate))
-    }
-  }
-
-  val route: Route =
-    path("v1" / "route") {
-      post {
-        optionalHeaderValueByName("Authorization") { authorization =>
-          optionalHeaderValueByName("Idempotency-Key") { idempotencyKey =>
-            (Auth.tenant(authorization), idempotencyKey.filter(_.nonEmpty)) match {
-              case (None, _) => complete(error(StatusCodes.Unauthorized, "missing bearer token"))
-              case (_, None) => complete(error(StatusCodes.BadRequest, "Idempotency-Key is required"))
-              case (Some(tenant), Some(key)) =>
-                entity(as[String]) { raw =>
-                  decide(parse(raw)) match {
-                    case Left(rejected) => complete(rejected)
-                    case Right(decision) =>
-                      val stored = s"decision:$tenant:$key"
-                      val created = jedis.set(stored, ujson.write(decision), SetParams.setParams().nx().ex(DecisionTtlSeconds))
-                      if (created == null) complete(answer(StatusCodes.OK, jedis.get(stored))) // a retry: the first decision
-                      else {
-                        println(s"route $tenant \${decision("model").str} \${decision("estimated_tokens").num.toInt}")
-                        complete(answer(StatusCodes.OK, ujson.write(decision)))
-                      }
-                  }
-                }
-            }
-          }
-        }
-      }
-    }
 }
 `,
     },

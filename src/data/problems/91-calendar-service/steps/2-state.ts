@@ -51,7 +51,6 @@ or cancelled.
         python: {all: [/slice_key\(\s*[\w.]+\s*,\s*[\w.()]+\s*,\s*\w+\s*,\s*\w+\s*\)/]},
         typescript: {all: [/sliceKey\(\s*[\w.]+\s*,\s*[\w.()\s]+\s*,\s*\w+\s*,\s*\w+\s*\)/]},
         go: {all: [/sliceKey\(\s*\w+\s*,\s*\w+\s*,\s*\w+\s*,\s*\w+\s*\)/]},
-        scala: {all: [/sliceKey\(\s*\w+\s*,\s*[\w()]+\s*,\s*\w+\s*,\s*\w+\s*\)/]},
         cpp: {all: [/sliceKey\(\s*\w+\s*,\s*[\w()]+\s*,\s*\w+\s*,\s*\w+\s*\)/]},
       },
     },
@@ -64,7 +63,6 @@ or cancelled.
         python: {all: [/\bex\s*=\s*(EXPANSION_TTL_S|300)\b|setex\(/]},
         typescript: {all: [/['"]EX['"]\s*,\s*(EXPANSION_TTL_S|300)\b/]},
         go: {all: [/rdb\.Set\([^\n]*,\s*(expansionTTL|300\s*\*\s*time\.Second)\s*\)/]},
-        scala: {all: [/setex\([^\n]*(ExpansionTtlS|300)/]},
         cpp: {all: [/\.set\([^\n]*(kExpansionTtl|std::chrono::seconds[({]\s*300)/]},
       },
     },
@@ -77,7 +75,6 @@ or cancelled.
         python: {order: [/def record_exception\(/, /store\.put_exception\(/, /bump_generation\(/]},
         typescript: {order: [/function recordException\(/, /store\.putException\(/, /bumpGeneration\(/]},
         go: {order: [/func recordException\(/, /store\.PutException\(/, /bumpGeneration\(/]},
-        scala: {order: [/def recordException\(/, /Store\.putException\(/, /bumpGeneration\(/]},
         cpp: {order: [/void recordException\(/, /store::PutException\(/, /bumpGeneration\(/]},
       },
     },
@@ -90,7 +87,6 @@ or cancelled.
         python: {all: [/==\s*["']cancelled["']/], none: [/\.append\(\s*moved\s*\)/]},
         typescript: {all: [/===\s*['"]cancelled['"]/], none: [/\.push\(\s*moved\s*\)/]},
         go: {all: [/==\s*"cancelled"/], none: [/append\(\s*applied\s*,\s*moved\s*\)/]},
-        scala: {all: [/==\s*"cancelled"/], none: [/\+=\s*moved\b/]},
         cpp: {all: [/==\s*"cancelled"/], none: [/push_back\(\s*moved\s*\)/]},
       },
     },
@@ -558,119 +554,6 @@ func recordException(ctx context.Context, calendarID, occurrenceID, value string
 	}
 	_, err := bumpGeneration(ctx, calendarID)
 	return err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import calendard.{Occurrence, Rrule, Store}
-
-object ExpansionCache {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  def generationKey(calendarId: String): String = s"gen:$calendarId"
-
-  def sliceKey(calendarId: String, generation: Long): String = s"exp:$calendarId:$generation"
-
-  def currentGeneration(calendarId: String): Long = Option(jedis.get(generationKey(calendarId))).map(_.toLong).getOrElse(0L)
-
-  /** A change to the calendar: every slice cached under the old generation stops being read. */
-  def bumpGeneration(calendarId: String): Long = jedis.incr(generationKey(calendarId))
-
-  /** Lay the calendar's instance exceptions over its expansion. */
-  def applyExceptions(occurrences: Seq[Occurrence], exceptions: Map[String, String]): Seq[Occurrence] = {
-    val applied = Seq.newBuilder[Occurrence]
-    for (occurrence <- occurrences) {
-      applied += occurrence
-      val value = exceptions.getOrElse(occurrence.occurrence_id, "")
-      if (value.startsWith("moved:")) {
-        val start = Rrule.parseInstant(value.stripPrefix("moved:")).getOrElse(0L)
-        val length = Rrule.parseInstant(occurrence.end).getOrElse(0L) - Rrule.parseInstant(occurrence.start).getOrElse(0L)
-        val moved = occurrence.copy(start = Rrule.formatInstant(start), end = Rrule.formatInstant(start + length))
-        applied += moved
-      }
-    }
-    applied.result()
-  }
-
-  /** The calendar's occurrences overlapping [start, end), exceptions applied, earliest first. */
-  def cachedExpansion(calendarId: String, start: Long, end: Long): Seq[Occurrence] = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = sliceKey(calendarId, currentGeneration(calendarId))
-    Option(jedis.get(key)) match {
-      case Some(hit) => hit.parseJson.convertTo[Seq[Occurrence]]
-      case None =>
-        val expanded = Store.listEvents(calendarId).flatMap(event => Rrule.expand(event, start, end))
-        val occurrences = applyExceptions(expanded, Store.getExceptions(calendarId)).sortBy(o => (o.start, o.occurrence_id))
-        jedis.set(key, occurrences.toJson.compactPrint)
-        occurrences
-    }
-  }
-
-  /** Cancel ("cancelled") or move ("moved:{ISO start}") one occurrence. */
-  def recordException(calendarId: String, occurrenceId: String, value: String): Unit = {
-    bumpGeneration(calendarId)
-    Store.putException(calendarId, occurrenceId, value)
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import calendard.{Occurrence, Rrule, Store}
-
-object ExpansionCache {
-  val ExpansionTtlS = 300L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  def generationKey(calendarId: String): String = s"gen:$calendarId"
-
-  /** One slice per window and generation: a bump retires every window at once. */
-  def sliceKey(calendarId: String, generation: Long, start: Long, end: Long): String = s"exp:$calendarId:$generation:$start:$end"
-
-  def currentGeneration(calendarId: String): Long = Option(jedis.get(generationKey(calendarId))).map(_.toLong).getOrElse(0L)
-
-  /** A change to the calendar: every slice cached under the old generation stops being read. */
-  def bumpGeneration(calendarId: String): Long = jedis.incr(generationKey(calendarId))
-
-  /** A cancelled occurrence is dropped; a moved one is the same occurrence at its new start, listed once. */
-  def applyExceptions(occurrences: Seq[Occurrence], exceptions: Map[String, String]): Seq[Occurrence] =
-    occurrences.flatMap { occurrence =>
-      val value = exceptions.getOrElse(occurrence.occurrence_id, "")
-      if (value == "cancelled") None
-      else if (value.startsWith("moved:")) {
-        val start = Rrule.parseInstant(value.stripPrefix("moved:")).getOrElse(0L)
-        val length = Rrule.parseInstant(occurrence.end).getOrElse(0L) - Rrule.parseInstant(occurrence.start).getOrElse(0L)
-        Some(occurrence.copy(start = Rrule.formatInstant(start), end = Rrule.formatInstant(start + length)))
-      } else Some(occurrence)
-    }
-
-  /** The calendar's occurrences overlapping [start, end), exceptions applied, earliest first. */
-  def cachedExpansion(calendarId: String, start: Long, end: Long): Seq[Occurrence] = {
-    // The generation is read before the events: a change that lands during the expansion bumps it,
-    // so what this call caches is filed under a generation no reader asks for any more.
-    val key = sliceKey(calendarId, currentGeneration(calendarId), start, end)
-    Option(jedis.get(key)) match {
-      case Some(hit) => hit.parseJson.convertTo[Seq[Occurrence]]
-      case None =>
-        val expanded = Store.listEvents(calendarId).flatMap(event => Rrule.expand(event, start, end))
-        val occurrences = applyExceptions(expanded, Store.getExceptions(calendarId)).sortBy(o => (o.start, o.occurrence_id))
-        jedis.setex(key, ExpansionTtlS, occurrences.toJson.compactPrint)
-        occurrences
-    }
-  }
-
-  /** Cancel ("cancelled") or move ("moved:{ISO start}") one occurrence. */
-  def recordException(calendarId: String, occurrenceId: String, value: String): Unit = {
-    // Write, then bump: a reader that sees the new generation also sees the exception.
-    Store.putException(calendarId, occurrenceId, value)
-    bumpGeneration(calendarId)
-  }
 }
 `,
     },

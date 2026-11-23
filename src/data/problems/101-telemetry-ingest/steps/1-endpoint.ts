@@ -54,7 +54,6 @@ and a device whose clock runs a year ahead pins the dashboard's newest point to 
         python: {all: [/@app\.post\(\s*["']\/v1\/telemetry["']/, /wal\.append\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/telemetry['"]/, /\bappend\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/telemetry"/, /wal\.Append\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"telemetry"\s*\)/, /\bpost\b/, /Wal\.append\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/telemetry"/, /wal::append\(/]},
       },
     },
@@ -67,7 +66,6 @@ and a device whose clock runs a year ahead pins the dashboard's newest point to 
         python: {all: [/registry\.lookup\(/, /\b404\b/], none: [/register_device\(/]},
         typescript: {all: [/\blookup\(/, /\b404\b/], none: [/registerDevice\(/]},
         go: {all: [/registry\.Lookup\(/, /StatusNotFound|\b404\b/], none: [/registry\.RegisterDevice\(/]},
-        scala: {all: [/Registry\.lookup\(/, /NotFound|\b404\b/], none: [/registerDevice\(/]},
         cpp: {all: [/registry::lookup\(/, /\b404\b/], none: [/registry::registerDevice\(/]},
       },
     },
@@ -80,7 +78,6 @@ and a device whose clock runs a year ahead pins the dashboard's newest point to 
         python: {all: [/\[\s*["']metrics["']\s*\]/, /\b400\b/]},
         typescript: {all: [/\.metrics\b/, /\b400\b/]},
         go: {all: [/\.Metrics\[/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/\.metrics\.get\(/, /BadRequest|\b400\b/]},
         cpp: {all: [/\.metrics\.find\(|->metrics\.find\(/, /\b400\b/]},
       },
     },
@@ -93,7 +90,6 @@ and a device whose clock runs a year ahead pins the dashboard's newest point to 
         python: {all: [/\b422\b/, /\blow\b/, /\bhigh\b/]},
         typescript: {all: [/\b422\b/, /\blow\b/, /\bhigh\b/]},
         go: {all: [/StatusUnprocessableEntity|\b422\b/, /\blow\b/, /\bhigh\b/]},
-        scala: {all: [/UnprocessableEntity|\b422\b/, /\blow\b/, /\bhigh\b/]},
         cpp: {all: [/\b422\b/, /\blow\b/, /\bhigh\b/]},
       },
     },
@@ -106,7 +102,6 @@ and a device whose clock runs a year ahead pins the dashboard's newest point to 
         python: {all: [/MAX_AGE_S/, /MAX_SKEW_S/, /time\.time\(\)/]},
         typescript: {all: [/MAX_AGE_S/, /MAX_SKEW_S/, /Date\.now\(\)/]},
         go: {all: [/maxAgeS/, /maxSkewS/, /time\.Now\(\)/]},
-        scala: {all: [/MaxAgeSeconds/, /MaxSkewSeconds/, /currentTimeMillis|Instant\.now/]},
         cpp: {all: [/kMaxAgeS/, /kMaxSkewS/, /system_clock::now\(\)/]},
       },
     },
@@ -394,118 +389,6 @@ func ingest(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/telemetry", ingest)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import ingestd.{Batch, Registry, Sample, Wal} // Registry.lookup, Registry.registerDevice, Wal.append
-
-object IngestApi {
-  val MaxSamples = 500
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def fail(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  /** The request body as a batch; a missing field is empty. */
-  private def parse(raw: String): Batch = {
-    val fields = raw.parseJson.asJsObject.fields
-    def text(f: Map[String, JsValue], name: String): String = f.get(name).collect { case JsString(s) => s }.getOrElse("")
-    def number(f: Map[String, JsValue], name: String): BigDecimal = f.get(name).collect { case JsNumber(n) => n }.getOrElse(BigDecimal(0))
-    val samples = fields.get("samples").collect { case JsArray(items) => items }.getOrElse(Vector.empty).map { item =>
-      val s = item.asJsObject.fields
-      Sample(text(s, "metric"), number(s, "value").toDouble, number(s, "ts").toLong)
-    }
-    Batch(text(fields, "batch_id"), text(fields, "device_id"), samples)
-  }
-
-  val route: Route = path("v1" / "telemetry") {
-    post {
-      entity(as[String]) { raw =>
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        val batch = parse(raw)
-        if (batch.batchId.isEmpty || batch.deviceId.isEmpty) complete(fail(StatusCodes.BadRequest, "batch_id and device_id are required"))
-        else if (batch.samples.isEmpty || batch.samples.size > MaxSamples) complete(fail(StatusCodes.BadRequest, s"samples must hold 1 to $MaxSamples readings"))
-        else {
-          val device = Registry.lookup(batch.deviceId).getOrElse(Registry.registerDevice(batch.deviceId, "unassigned", Map.empty))
-          Wal.append(batch)
-          complete(json(StatusCodes.Accepted, JsObject("batch_id" -> JsString(batch.batchId), "device_id" -> JsString(device.id), "accepted" -> JsNumber(batch.samples.size))))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import ingestd.{Batch, Device, Registry, Sample, Wal} // Registry.lookup, Registry.registerDevice, Wal.append
-
-object IngestApi {
-  val MaxSamples = 500
-  val MaxAgeSeconds = 3600L // older than an hour is a backfill, not live telemetry
-  val MaxSkewSeconds = 300L // a device clock may run at most five minutes ahead
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def fail(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  /** The request body as a batch; a missing field is empty. */
-  private def parse(raw: String): Batch = {
-    val fields = raw.parseJson.asJsObject.fields
-    def text(f: Map[String, JsValue], name: String): String = f.get(name).collect { case JsString(s) => s }.getOrElse("")
-    def number(f: Map[String, JsValue], name: String): BigDecimal = f.get(name).collect { case JsNumber(n) => n }.getOrElse(BigDecimal(0))
-    val samples = fields.get("samples").collect { case JsArray(items) => items }.getOrElse(Vector.empty).map { item =>
-      val s = item.asJsObject.fields
-      Sample(text(s, "metric"), number(s, "value").toDouble, number(s, "ts").toLong)
-    }
-    Batch(text(fields, "batch_id"), text(fields, "device_id"), samples)
-  }
-
-  /** The answer for the first sample the device's declared metrics or the ingest window refuse. */
-  private def rejection(device: Device, batch: Batch, now: Long): Option[HttpResponse] =
-    batch.samples.iterator.flatMap { sample =>
-      device.metrics.get(sample.metric) match {
-        case None => Some(fail(StatusCodes.BadRequest, s"unknown metric \${sample.metric}"))
-        case Some((low, high)) if sample.value < low || sample.value > high =>
-          Some(fail(StatusCodes.UnprocessableEntity, s"metric \${sample.metric} out of range [$low, $high]: \${sample.value}"))
-        case _ if sample.ts < now - MaxAgeSeconds || sample.ts > now + MaxSkewSeconds =>
-          Some(fail(StatusCodes.UnprocessableEntity, s"timestamp \${sample.ts} of \${sample.metric} is outside the ingest window"))
-        case _ => None
-      }
-    }.nextOption()
-
-  val route: Route = path("v1" / "telemetry") {
-    post {
-      entity(as[String]) { raw =>
-        val batch = parse(raw)
-        if (batch.batchId.isEmpty || batch.deviceId.isEmpty) complete(fail(StatusCodes.BadRequest, "batch_id and device_id are required"))
-        else if (batch.samples.isEmpty || batch.samples.size > MaxSamples) complete(fail(StatusCodes.BadRequest, s"samples must hold 1 to $MaxSamples readings"))
-        else
-          // Provisioning owns the registry: an id it does not know is the caller's mistake.
-          Registry.lookup(batch.deviceId) match {
-            case None => complete(fail(StatusCodes.NotFound, s"unknown device \${batch.deviceId}"))
-            case Some(device) =>
-              rejection(device, batch, System.currentTimeMillis() / 1000) match {
-                case Some(refused) => complete(refused)
-                case None =>
-                  // Every sample passed: only now does the batch become durable and acknowledged.
-                  Wal.append(batch)
-                  complete(json(StatusCodes.Accepted, JsObject("batch_id" -> JsString(batch.batchId), "device_id" -> JsString(device.id), "accepted" -> JsNumber(batch.samples.size))))
-              }
-          }
-      }
-    }
-  }
 }
 `,
     },

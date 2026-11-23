@@ -56,10 +56,6 @@ loses an acknowledgement gets the event twice.
           none: [/key:\s*message\.tenant/],
         },
         go: {all: [/address\.RecipientHash\(/, /Key:\s*\[\]byte\(key\)/], none: [/Key:\s*\[\]byte\(message\.Tenant\)/]},
-        scala: {
-          all: [/Address\.recipientHash\(/, /ProducerRecord\[String, String\]\(EventTopic,\s*key\b/],
-          none: [/EventTopic,\s*message\.tenant/],
-        },
         cpp: {all: [/address::recipientHash\(/, /key\.c_str\(\),\s*key\.size\(\)/], none: [/tenant\.c_str\(\)/]},
       },
     },
@@ -72,7 +68,6 @@ loses an acknowledgement gets the event twice.
         python: {all: [/EVENT_TYPES\[/], order: [/def dispatch\(/, /deliver\(/, /publish_event\(/]},
         typescript: {all: [/EVENT_TYPES\[/], order: [/function dispatch\(/, /\bdeliver\(/, /publishEvent\(/]},
         go: {all: [/eventTypes\[/], order: [/func dispatch\(/, /relay\.Deliver\(/, /publishEvent\(/]},
-        scala: {all: [/EventTypes\(/], order: [/def dispatch\(/, /Relay\.deliver\(/, /publishEvent\(/]},
         cpp: {all: [/kEventTypes/], order: [/json dispatch\(/, /relay::deliver\(/, /publish_event\(/]},
       },
     },
@@ -85,7 +80,6 @@ loses an acknowledgement gets the event twice.
         python: {all: [/["']recipient_hash["']\s*:/], none: [/["']recipient["']\s*:/]},
         typescript: {all: [/recipient_hash:/], none: [/\brecipient:\s*message\.recipient/]},
         go: {all: [/"recipient_hash":/], none: [/"recipient":/]},
-        scala: {all: [/"recipient_hash"\s*->/], none: [/"recipient"\s*->/]},
         cpp: {all: [/\{"recipient_hash",/], none: [/\{"recipient",/]},
       },
     },
@@ -98,7 +92,6 @@ loses an acknowledgement gets the event twice.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -375,97 +368,6 @@ func dispatch(ctx context.Context, messageID string) (map[string]any, error) {
 		return nil, err
 	}
 	return publishEvent(ctx, eventTypes[state], store.Load(ctx, messageID))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import mail.{Address, Relay, Store} // Address.recipientHash; Relay.deliver (step 3): the state the message ends in; Store.load
-
-object Events {
-  val EventTopic = "email.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"email event not delivered: \${exception.getMessage}")
-  }
-
-  /** One record on email.event about a message. */
-  def publishEvent(eventType: String, message: Store.Message): JsObject = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val payload = JsObject(
-      "type" -> JsString(eventType),
-      "message_id" -> JsString(message.messageId),
-      "tenant" -> JsString(message.tenant),
-      "template_id" -> JsString(message.templateId),
-      "recipient" -> JsString(message.recipient),
-      "bounce_category" -> JsString(message.bounceCategory))
-    producer.send(new ProducerRecord[String, String](EventTopic, message.tenant, payload.compactPrint), onDelivery).get()
-    payload
-  }
-
-  /** Hand a queued message to the relay and report what became of it. */
-  def dispatch(messageId: String): JsObject = {
-    val event = publishEvent("email.accepted", Store.load(messageId).get)
-    Relay.deliver(messageId)
-    event
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import mail.{Address, Relay, Store} // Address.recipientHash; Relay.deliver (step 3): the state the message ends in; Store.load
-
-object Events {
-  val EventTopic = "email.event"
-  val EventTypes: Map[String, String] =
-    Map("sent" -> "email.accepted", "bounced" -> "email.bounced", "suppressed" -> "email.suppressed", "deferred" -> "email.deferred")
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes the event once, on every replica.
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"email event not delivered: \${exception.getMessage}")
-  }
-
-  /** One record on email.event about a message. */
-  def publishEvent(eventType: String, message: Store.Message): JsObject = {
-    val key = Address.recipientHash(message.recipient) // one recipient, one partition: their lifecycle stays in order
-    val payload = JsObject(
-      "type" -> JsString(eventType),
-      "message_id" -> JsString(message.messageId),
-      "tenant" -> JsString(message.tenant),
-      "template_id" -> JsString(message.templateId),
-      "recipient_hash" -> JsString(key),
-      "bounce_category" -> JsString(message.bounceCategory))
-    producer.send(new ProducerRecord[String, String](EventTopic, key, payload.compactPrint), onDelivery).get()
-    payload
-  }
-
-  /** Hand a queued message to the relay and report what became of it. */
-  def dispatch(messageId: String): JsObject = {
-    val state = Relay.deliver(messageId) // the event reports what the relay answered, so it comes after
-    publishEvent(EventTypes(state), Store.load(messageId).get)
-  }
 }
 `,
     },

@@ -52,7 +52,6 @@ outage; and a write whose reply was lost is indexed twice, because the retry car
         python: {all: [/DEADLINE_S\s*=\s*3\b/, /timeout=DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*3000/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*3\s*\*\s*time\.Second/, /context\.WithTimeout\(ctx,\s*deadline\)/]},
-        scala: {all: [/DeadlineS\s*=\s*3L/, /withDeadlineAfter\(DeadlineS/]},
         cpp: {all: [/kDeadline\{3\}/, /set_deadline\(/]},
       },
     },
@@ -65,7 +64,6 @@ outage; and a write whose reply was lost is indexed twice, because the retry car
         python: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MAX_ATTEMPTS\s*=\s*3\b/]},
         typescript: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MAX_ATTEMPTS\s*=\s*3\b/]},
         go: {all: [/codes\.Unavailable/, /codes\.DeadlineExceeded/, /maxAttempts\s*=\s*3\b/]},
-        scala: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MaxAttempts\s*=\s*3\b/]},
         cpp: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /kMaxAttempts\s*=\s*3\b/]},
       },
     },
@@ -78,7 +76,6 @@ outage; and a write whose reply was lost is indexed twice, because the retry car
         python: {all: [/FAILED_PRECONDITION/, /raise MappingConflict\(/]},
         typescript: {all: [/FAILED_PRECONDITION/, /throw new MappingConflict\(/]},
         go: {all: [/codes\.FailedPrecondition/, /&shard\.MappingConflict\{/]},
-        scala: {all: [/FAILED_PRECONDITION/, /throw new MappingConflict\(/]},
         cpp: {all: [/FAILED_PRECONDITION/, /throw shard::MappingConflict\(/]},
       },
     },
@@ -91,7 +88,6 @@ outage; and a write whose reply was lost is indexed twice, because the retry car
         python: {order: [/batch_id\s*=\s*str\(uuid\.uuid4\(\)\)/, /for attempt in/]},
         typescript: {order: [/const batchId = randomUUID\(\)/, /for \(let attempt/]},
         go: {order: [/batchID := uuid\.NewString\(\)/, /for attempt := 1/]},
-        scala: {order: [/val batchId = UUID\.randomUUID\(\)/, /while \(/]},
         cpp: {order: [/const std::string batch_id = shard::newBatchId\(\)/, /for \(int attempt/]},
       },
     },
@@ -334,79 +330,6 @@ func bulkWrite(ctx context.Context, index string, records []buffer.Record) (shar
 		}
 		time.Sleep(backoff << (attempt - 1))
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import logindex.{Buffer, MappingConflict, Shard, ShardWriteFailed} // Buffer.Record, Shard.WriteResult, Shard.protos
-import logshard.log_indexer.{BulkWriteRequest, IndexShardGrpc}
-
-object Client {
-  private val stub = IndexShardGrpc.blockingStub(ManagedChannelBuilder.forAddress("shard", 9000).usePlaintext().build())
-
-  /** Write one batch to the index. */
-  def bulkWrite(index: String, records: Seq[Buffer.Record]): Shard.WriteResult = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    var attempt = 1
-    var result: Option[Shard.WriteResult] = None
-    while (result.isEmpty) {
-      val batchId = UUID.randomUUID().toString
-      try {
-        val reply = stub.bulkWrite(BulkWriteRequest(index, batchId, attempt, Shard.protos(records)))
-        result = Some(Shard.WriteResult(batchId, reply.indexed, reply.rejected, reply.indexSnapshot))
-      } catch {
-        case e: StatusRuntimeException =>
-          if (attempt >= 5) throw new ShardWriteFailed(s"\${e.getStatus.getCode} after $attempt attempt(s)")
-          Thread.sleep(200) // the shard recovers quickly
-          attempt += 1
-      }
-    }
-    result.get
-  }
-}
-`,
-      solution: `import java.util.UUID
-import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import logindex.{Buffer, MappingConflict, Shard, ShardWriteFailed} // Buffer.Record, Shard.WriteResult, Shard.protos
-import logshard.log_indexer.{BulkWriteRequest, IndexShardGrpc}
-
-object Client {
-  val DeadlineS = 3L
-  val MaxAttempts = 3
-  val BackoffMs = 200L
-
-  private val stub = IndexShardGrpc.blockingStub(ManagedChannelBuilder.forAddress("shard", 9000).usePlaintext().build())
-
-  /** Write one batch to the index. */
-  def bulkWrite(index: String, records: Seq[Buffer.Record]): Shard.WriteResult = {
-    // One id for every attempt: the shard indexes a batch id once, so a retry cannot duplicate.
-    val batchId = UUID.randomUUID().toString
-    var attempt = 1
-    var result: Option[Shard.WriteResult] = None
-    while (result.isEmpty) {
-      try {
-        val reply = stub.withDeadlineAfter(DeadlineS, TimeUnit.SECONDS).bulkWrite(BulkWriteRequest(index, batchId, attempt, Shard.protos(records)))
-        result = Some(Shard.WriteResult(batchId, reply.indexed, reply.rejected, reply.indexSnapshot))
-      } catch {
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.FAILED_PRECONDITION =>
-          throw new MappingConflict(Option(e.getStatus.getDescription).getOrElse("")) // no retry changes the mapping
-        case e: StatusRuntimeException =>
-          val code = e.getStatus.getCode
-          val retryable = code == Status.Code.UNAVAILABLE || code == Status.Code.DEADLINE_EXCEEDED
-          if (!retryable || attempt >= MaxAttempts) throw new ShardWriteFailed(s"$code after $attempt attempt(s)")
-          Thread.sleep(BackoffMs << (attempt - 1))
-          attempt += 1
-      }
-    }
-    result.get
-  }
 }
 `,
     },

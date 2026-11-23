@@ -7,7 +7,7 @@ import {extractAttributesStep} from './steps/2-extract-attributes';
 import {extractionCacheStep} from './steps/3-extraction-cache';
 import {reviewEndpointStep} from './steps/4-review-endpoint';
 import {publishEnrichedStep} from './steps/5-publish-enriched';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * DoorDash's LLM-built product knowledge graph, cut down to the service that enriches one SKU. One
@@ -144,6 +144,5 @@ resolution across merchants, the duplicate-brand check, and the ranking and subs
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

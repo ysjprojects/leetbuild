@@ -66,7 +66,6 @@ counters move. None of that belongs on the request path. Implement both halves o
           ],
         },
         go: {all: [/Topic:\s*topic/, /Key:\s*\[\]byte\(\s*msg\.ChannelID\s*\)/]},
-        scala: {all: [/new ProducerRecord\[[^\]]*\]\(\s*Topic\s*,\s*message\.channelId\s*,/]},
         cpp: {
           all: [
             /produce\(\s*kTopic[\s\S]{0,400}?message\.channel_id\.(c_str|data)\(\)\s*,\s*message\.channel_id\.(size|length)\(\)/,
@@ -83,7 +82,6 @@ counters move. None of that belongs on the request path. Implement both halves o
         python: {all: [/producer\.poll\(\s*0\s*\)/], none: [/def publish(?:(?!\ndef )[\s\S])*?producer\.flush\(/]},
         typescript: {all: [/producer\s*\.send\([\s\S]*?\.catch\(/], none: [/await\s+producer\s*\.send\(/]},
         go: {all: [/Async:\s*true/], none: [/if err := writer\.WriteMessages/]},
-        scala: {all: [/producer\.send\(\s*\w+\s*,/], none: [/\.send\([^\n]*\)\.get\(/]},
         cpp: {all: [/producer->poll\(\s*0\s*\)/], none: [/void publish(?:(?!\n\})[\s\S])*?producer->flush\(/]},
       },
     },
@@ -108,13 +106,6 @@ counters move. None of that belongs on the request path. Implement both halves o
           ],
         },
         go: {all: [/GroupID:\s*"channel-state"/, /Topic:\s*topic/, /reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
-        scala: {
-          all: [
-            /"group\.id"\s*,\s*"channel-state"|GROUP_ID_CONFIG\s*,\s*"channel-state"/,
-            /subscribe\([^\n]*Topic/,
-            /"enable\.auto\.commit"\s*,\s*"false"|ENABLE_AUTO_COMMIT_CONFIG\s*,\s*"false"/,
-          ],
-        },
         cpp: {
           all: [
             /"group\.id"\s*,\s*"channel-state"/,
@@ -151,13 +142,6 @@ counters move. None of that belongs on the request path. Implement both halves o
             /rdb\.HIncrBy\(\s*ctx\s*,\s*key\s*,\s*"messages"\s*,\s*1\s*\)/,
           ],
         },
-        scala: {
-          all: [
-            /s"channel:\$/,
-            /jedis\.hset\(\s*key\s*,\s*"last_message_id"\s*,/,
-            /jedis\.hincrBy\(\s*key\s*,\s*"messages"\s*,\s*1L?\s*\)/,
-          ],
-        },
         cpp: {
           all: [
             /"channel:"\s*\+/,
@@ -175,7 +159,6 @@ counters move. None of that belongs on the request path. Implement both halves o
         python: {order: [/r\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/redis\.hincrby\(/, /consumer\.commitOffsets\(/]},
         go: {order: [/rdb\.HIncrBy\(/, /reader\.CommitMessages\(/]},
-        scala: {order: [/jedis\.hincrBy\(/, /consumer\.commitSync\(/]},
         cpp: {order: [/redis\.hincrby\(/, /consumer->commitSync\(/]},
       },
     },
@@ -609,152 +592,6 @@ func run(ctx context.Context) error {
 
 func main() {
 	log.Fatal(run(context.Background()))
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-import spray.json._
-
-// StoredMessage (what step 1's storeMessage returns) is defined in step 1 (PostMessage).
-
-object MessageEvents {
-  val Topic = "message-events"
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  producerProps.put("enable.idempotence", "true")
-  producerProps.put("linger.ms", "5")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", "channel-state")
-  consumerProps.put("auto.offset.reset", "earliest")
-  // TODO: disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Topic).asJava)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"message event not delivered: \${exception.getMessage}")
-  }
-
-  /** One message.created event per stored message, keyed by the channel. */
-  def publish(message: StoredMessage): Unit = {
-    val value = JsObject(
-      "type" -> JsString("message.created"),
-      "channel_id" -> JsString(message.channelId),
-      "id" -> JsString(message.id),
-      "author_id" -> JsString(message.authorId),
-      "content" -> JsString(message.content),
-    ).compactPrint
-    // TODO: send a record keyed by message.channelId with onDelivery; do not block on the future
-  }
-
-  /** Moves the channel's state in Redis for one message.created event. */
-  def apply(channelId: String, id: String): Unit = {
-    // TODO: val key = s"channel:$channelId"; HSET key last_message_id id; HINCRBY key messages 1
-  }
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        // TODO: parse the JSON; skip anything that is not a message.created with channel_id and id
-        // TODO: apply(channelId, id)
-      }
-      // TODO: commit synchronously after the batch is processed
-    }
-
-  def main(args: Array[String]): Unit = run()
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-import spray.json._
-
-// StoredMessage (what step 1's storeMessage returns) is defined in step 1 (PostMessage).
-
-object MessageEvents {
-  val Topic = "message-events"
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("acks", "all")
-  producerProps.put("enable.idempotence", "true")
-  producerProps.put("linger.ms", "5")
-  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
-
-  private val consumerProps = new Properties()
-  consumerProps.put("bootstrap.servers", "kafka:9092")
-  consumerProps.put("group.id", "channel-state")
-  consumerProps.put("auto.offset.reset", "earliest")
-  consumerProps.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List(Topic).asJava)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"message event not delivered: \${exception.getMessage}")
-  }
-
-  /** One message.created event per stored message, keyed by the channel. */
-  def publish(message: StoredMessage): Unit = {
-    val value = JsObject(
-      "type" -> JsString("message.created"),
-      "channel_id" -> JsString(message.channelId),
-      "id" -> JsString(message.id),
-      "author_id" -> JsString(message.authorId),
-      "content" -> JsString(message.content),
-    ).compactPrint
-    val record = new ProducerRecord[String, String](Topic, message.channelId, value)
-    producer.send(record, onDelivery) // enqueues; the future is not awaited
-  }
-
-  /** Moves the channel's state in Redis for one message.created event. */
-  def apply(channelId: String, id: String): Unit = {
-    val key = s"channel:$channelId"
-    jedis.hset(key, "last_message_id", id)
-    jedis.hincrBy(key, "messages", 1L)
-  }
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        Try(record.value().parseJson.asJsObject.fields).toOption.flatMap { fields =>
-          (fields.get("type"), fields.get("channel_id"), fields.get("id")) match {
-            case (Some(JsString("message.created")), Some(JsString(channelId)), Some(JsString(id))) => Some((channelId, id))
-            case _ => None
-          }
-        } match {
-          case Some((channelId, id)) => apply(channelId, id)
-          case None => System.err.println(s"skipping malformed record at offset \${record.offset()}")
-        }
-      }
-      consumer.commitSync() // after every record of the batch has been applied: at-least-once
-    }
-
-  def main(args: Array[String]): Unit = run()
 }
 `,
     },

@@ -24,7 +24,7 @@ report; and a retry after a lost acknowledgement writes the event twice.
 - \`load_completed\` (\`load_id\`, \`target\`, \`partitions\`) is produced only when \`commit_partition\`
   answers True, and \`publish_partition\` answers that value.
 - A refused produce goes to \`outbox.put(topic, key, value)\` from the **delivery report**
-  (\`on_delivery\`, the rejected \`send\`, the returned \`WriteMessages\` error, \`dr_cb\`, a \`Callback\`).
+  (\`on_delivery\`, the rejected \`send\`, the returned \`WriteMessages\` error, \`dr_cb\`).
 - The producer is idempotent with \`acks=all\`. kafka-go has no idempotent producer: its writer uses
   \`RequireAll\` and consumers deduplicate by \`(load_id, partition_id)\`.`,
   sequence: {
@@ -53,7 +53,6 @@ report; and a retry after a lost acknowledgement writes the event twice.
         python: {all: [/produce\(\s*(table|load\[["']target["']\])/], none: [/produce\(\s*load\[["']load_id["']\]/]},
         typescript: {all: [/produce\(\s*(table|load\.target)\b/], none: [/produce\(\s*load\.load_id/]},
         go: {all: [/produce\(ctx,\s*(table|load\.Target)\b/], none: [/produce\(ctx,\s*load\.LoadID/]},
-        scala: {all: [/produce\(\s*(table|load\.target)\b/], none: [/produce\(\s*load\.loadId/]},
         cpp: {all: [/produce\(\s*(table|load\.target)\b/], none: [/produce\(\s*load\.load_id/]},
       },
     },
@@ -66,7 +65,6 @@ report; and a retry after a lost acknowledgement writes the event twice.
         python: {all: [/progress\.commit_partition\(/], none: [/f["']p-\{/, /progress\.is_complete\(/]},
         typescript: {all: [/commitPartition\(/], none: [/`p-\$\{/, /isComplete\(/]},
         go: {all: [/progress\.CommitPartition\(/], none: [/"p-%d"/, /progress\.IsComplete\(/]},
-        scala: {all: [/Progress\.commitPartition\(/], none: [/s"p-\$\{/, /Progress\.isComplete\(/]},
         cpp: {all: [/progress::commitPartition\(/], none: [/"p-"\s*\+/, /progress::isComplete\(/]},
       },
     },
@@ -79,7 +77,6 @@ report; and a retry after a lost acknowledgement writes the event twice.
         python: {all: [/on_delivery\s*=/, /outbox\.put\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/\bput\(TOPIC,/]},
         go: {all: [/outbox\.Put\(/]},
-        scala: {all: [/Outbox\.put\(/, /onCompletion/]},
         cpp: {all: [/dr_cb/, /outbox::put\(/]},
       },
     },
@@ -92,7 +89,6 @@ report; and a retry after a lost acknowledgement writes the event twice.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -320,88 +316,6 @@ func publishPartition(ctx context.Context, load store.Load, partitionID string, 
 		return completed, produce(ctx, table, map[string]any{"type": "load_completed", "load_id": load.LoadID, "target": table, "partitions": load.Partitions})
 	}
 	return completed, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import loader.{Outbox, Progress, Store}
-
-object LoadEvents {
-  val Topic = "load.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private def produce(key: String, event: JsObject): Unit = {
-    val value = event.compactPrint
-    try {
-      producer.send(new ProducerRecord[String, String](Topic, key, value))
-      ()
-    } catch { case _: KafkaException => Outbox.put(Topic, key, value) }
-  }
-
-  /** Commit one written partition and announce it on load.event; true when it completed the load. */
-  def publishPartition(load: Store.Load, partitionId: String, rowsWritten: Long): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    Progress.commitPartition(load.loadId, partitionId, load.partitions)
-    produce(load.loadId, JsObject("type" -> JsString("partition_committed"), "load_id" -> JsString(load.loadId), "target" -> JsString(load.target),
-      "partition_id" -> JsString(partitionId), "rows_written" -> JsNumber(rowsWritten)))
-    if (partitionId == s"p-\${load.partitions - 1}")
-      produce(load.loadId, JsObject("type" -> JsString("load_completed"), "load_id" -> JsString(load.loadId), "target" -> JsString(load.target),
-        "partitions" -> JsNumber(load.partitions)))
-    Progress.isComplete(load.loadId)
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import loader.{Outbox, Progress, Store}
-
-object LoadEvents {
-  val Topic = "load.event"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes once, on every replica.
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private def produce(key: String, event: JsObject): Unit = {
-    val value = event.compactPrint
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) Outbox.put(Topic, key, value) // the broker said no: the relay republishes it
-    }
-    producer.send(new ProducerRecord[String, String](Topic, key, value), onDelivery)
-    ()
-  }
-
-  /** Commit one written partition and announce it on load.event; true when it completed the load. */
-  def publishPartition(load: Store.Load, partitionId: String, rowsWritten: Long): Boolean = {
-    // The commit that filled the set is the one that may announce the completion.
-    val completed = Progress.commitPartition(load.loadId, partitionId, load.partitions)
-    val table = load.target // one table, one partition, one order
-    produce(table, JsObject("type" -> JsString("partition_committed"), "load_id" -> JsString(load.loadId), "target" -> JsString(table),
-      "partition_id" -> JsString(partitionId), "rows_written" -> JsNumber(rowsWritten)))
-    if (completed)
-      produce(table, JsObject("type" -> JsString("load_completed"), "load_id" -> JsString(load.loadId), "target" -> JsString(table),
-        "partitions" -> JsNumber(load.partitions)))
-    completed
-  }
 }
 `,
     },

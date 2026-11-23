@@ -57,7 +57,6 @@ Requirements:
         python: {all: [/@app\.get\(\s*["']\/v1\/inferences\/\{inference_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/inferences\/:inference_id['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/inferences\/\{inferenceID\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"inferences"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\([^,\n]*v1\/inferences\//]},
       },
     },
@@ -70,7 +69,6 @@ Requirements:
         python: {all: [/\[\s*["']tenant["']\s*\]\s*!=\s*tenant|\.get\(\s*["']tenant["']\s*\)\s*!=\s*tenant/]},
         typescript: {all: [/\.tenant\s*!==\s*tenant/]},
         go: {all: [/\.Tenant\s*!=\s*tenant/]},
-        scala: {all: [/\("tenant"\)\.str\s*!=\s*tenant/]},
         cpp: {all: [/value\(\s*"tenant"\s*,[^)]*\)\s*!=\s*tenant/]},
       },
     },
@@ -83,7 +81,6 @@ Requirements:
         python: {all: [/status_code\s*=\s*202/]},
         typescript: {all: [/code\(\s*202\s*\)/]},
         go: {all: [/StatusAccepted/]},
-        scala: {all: [/StatusCodes\.Accepted/]},
         cpp: {all: [/\b202\b/]},
       },
     },
@@ -96,7 +93,6 @@ Requirements:
         python: {all: [/RESULT_TTL_S/, /status_code\s*=\s*410/]},
         typescript: {all: [/RESULT_TTL_S/, /code\(\s*410\s*\)/]},
         go: {all: [/ResultTTLSeconds/, /StatusGone/]},
-        scala: {all: [/ResultTtlSeconds/, /StatusCodes\.Gone/]},
         cpp: {all: [/kResultTtlSeconds/, /\b410\b/]},
       },
     },
@@ -313,93 +309,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import vision.Inferences
-
-object VisionRead {
-  implicit val system: ActorSystem = ActorSystem("vision-read")
-
-  val Fields = Seq("inference_id", "status", "task", "label", "confidence", "model_version", "downgraded", "content_hash", "created_at")
-
-  private def json(status: StatusCode, body: ujson.Value) =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body))))
-
-  val route: Route =
-    path("v1" / "inferences" / Segment) { inferenceId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          // TODO: this starter has 3 flaws. The task says where to look; the checks say what must change.
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            json(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing X-Tenant-Id"))
-          } else {
-            Inferences.byId(inferenceId) match {
-              case None => json(StatusCodes.NotFound, ujson.Obj("error" -> "unknown inference"))
-              case Some(row) =>
-                json(StatusCodes.OK, ujson.Obj.from(Fields.map(k => k -> row.value.getOrElse(k, ujson.Null))))
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import vision.{Config, Inferences}
-
-object VisionRead {
-  implicit val system: ActorSystem = ActorSystem("vision-read")
-
-  val Fields = Seq("inference_id", "status", "task", "label", "confidence", "model_version", "downgraded", "content_hash", "created_at")
-  val Metadata = Seq("task", "content_hash", "model_version", "created_at")
-
-  private def json(status: StatusCode, body: ujson.Value) =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body))))
-
-  val route: Route =
-    path("v1" / "inferences" / Segment) { inferenceId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            json(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing X-Tenant-Id"))
-          } else {
-            val tenant = tenantOpt.get
-            Inferences.byId(inferenceId) match {
-              case Some(row) if row("tenant").str != tenant => json(StatusCodes.NotFound, ujson.Obj("error" -> "unknown inference"))
-              case None => json(StatusCodes.NotFound, ujson.Obj("error" -> "unknown inference"))
-              case Some(row) if row("status").str != "complete" =>
-                json(StatusCodes.Accepted, ujson.Obj("inference_id" -> inferenceId, "status" -> row("status")))
-              case Some(row) if System.currentTimeMillis() / 1000 - row("created_at").num.toLong > Config.ResultTtlSeconds =>
-                val metadata = ujson.Obj.from(Metadata.map(k => k -> row.value.getOrElse(k, ujson.Null)))
-                json(StatusCodes.Gone, ujson.Obj("inference_id" -> inferenceId, "status" -> "expired", "metadata" -> metadata))
-              case Some(row) =>
-                json(StatusCodes.OK, ujson.Obj.from(Fields.map(k => k -> row.value.getOrElse(k, ujson.Null))))
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

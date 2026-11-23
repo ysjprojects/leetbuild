@@ -39,13 +39,16 @@ export interface MockSession {
 
 const KEY = 'leetbuild:mock-session';
 
+const isOffered = (language: unknown): language is Language => LANGUAGES.includes(language as Language);
+
+/** A saved session; its language may be one the site no longer offers, which `loadMockSession` repairs. */
 const isSession = (value: unknown): value is MockSession => {
   if (typeof value !== 'object' || value === null) return false;
   const s = value as Partial<MockSession>;
   return (
     typeof s.scenarioId === 'string' &&
     (s.phase === 'running' || s.phase === 'report') &&
-    LANGUAGES.includes(s.language as Language) &&
+    typeof s.language === 'string' &&
     typeof s.code === 'object' &&
     s.code !== null &&
     typeof s.deadline === 'number' &&
@@ -64,7 +67,8 @@ export function loadMockSession(): MockSession | null {
     const raw = window.localStorage.getItem(KEY);
     if (raw === null) return null;
     const parsed: unknown = JSON.parse(raw);
-    return isSession(parsed) ? parsed : null;
+    // A language the site no longer offers resumes in Python, as the header preference does.
+    return isSession(parsed) ? {...parsed, language: isOffered(parsed.language) ? parsed.language : 'python'} : null;
   } catch {
     return null;
   }
@@ -94,7 +98,8 @@ export const secondsLeftAt = (deadline: number, endedAt: number | null, at: numb
 export interface MockAttempt {
   /** When the clock started, in `Date.now()` milliseconds: the attempt's identity. */
   startedAt: number;
-  language: Language;
+  /** Null when it was a language the site no longer offers (saved records are repaired, not dropped). */
+  language: Language | null;
   accepted: boolean;
   passed: number;
   total: number;
@@ -110,19 +115,32 @@ const HISTORY_KEY = 'leetbuild:mock-history';
 /** Attempts kept per scenario, newest first. */
 const HISTORY_LIMIT = 20;
 
-const isAttempt = (value: unknown): value is MockAttempt => {
-  if (typeof value !== 'object' || value === null) return false;
+/** A saved attempt, repaired: a language the site no longer offers becomes null; malformed is null. */
+const toAttempt = (value: unknown): MockAttempt | null => {
+  if (typeof value !== 'object' || value === null) return null;
   const a = value as Partial<MockAttempt>;
-  return (
-    typeof a.startedAt === 'number' &&
-    LANGUAGES.includes(a.language as Language) &&
-    typeof a.accepted === 'boolean' &&
-    typeof a.passed === 'number' &&
-    typeof a.total === 'number' &&
-    typeof a.seconds === 'number' &&
-    typeof a.submissions === 'number' &&
-    typeof a.hints === 'number'
-  );
+  if (
+    typeof a.startedAt !== 'number' ||
+    typeof a.accepted !== 'boolean' ||
+    typeof a.passed !== 'number' ||
+    typeof a.total !== 'number' ||
+    typeof a.seconds !== 'number' ||
+    typeof a.submissions !== 'number' ||
+    typeof a.hints !== 'number'
+  )
+    return null;
+  const attempt: MockAttempt = {
+    startedAt: a.startedAt,
+    language: isOffered(a.language) ? a.language : null,
+    accepted: a.accepted,
+    passed: a.passed,
+    total: a.total,
+    seconds: a.seconds,
+    submissions: a.submissions,
+    hints: a.hints,
+  };
+  if (a.read === true) attempt.read = true;
+  return attempt;
 };
 
 /** Every scenario's attempts, newest first; empty when storage holds none or is unavailable. */
@@ -134,7 +152,7 @@ export function loadMockHistory(): Record<string, MockAttempt[]> {
     return Object.fromEntries(
       Object.entries(parsed as Record<string, unknown>).map(([id, list]) => [
         id,
-        Array.isArray(list) ? list.filter(isAttempt) : [],
+        Array.isArray(list) ? list.flatMap(item => toAttempt(item) ?? []) : [],
       ]),
     );
   } catch {

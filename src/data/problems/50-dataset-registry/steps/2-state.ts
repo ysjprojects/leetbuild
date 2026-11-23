@@ -48,7 +48,6 @@ deletes the version a run still reads.
         python: {all: [/register_script\(|\.eval\(/, /RPUSH/], none: [/\.rpush\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /RPUSH/], none: [/redis\.rpush\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /RPUSH/], none: [/\.RPush\(/]},
-        scala: {all: [/jedis\.eval\(/, /RPUSH/], none: [/jedis\.rpush\(/]},
         cpp: {all: [/redis\.eval[<(]/, /RPUSH/], none: [/redis\.rpush\(/]},
       },
     },
@@ -61,7 +60,6 @@ deletes the version a run still reads.
         python: {all: [/latest_key\(/], none: [/POINTER_TTL|\bex\s*=|expire/i]},
         typescript: {all: [/latestKey\(/], none: [/POINTER_TTL|'EX'|expire/i]},
         go: {all: [/latestKey\(/], none: [/pointerTTL|Expire\(/]},
-        scala: {all: [/latestKey\(/], none: [/PointerTtl|setex|expire/i]},
         cpp: {all: [/latestKey\(/], none: [/kPointerTtl|expire/i]},
       },
     },
@@ -77,7 +75,6 @@ deletes the version a run still reads.
         },
         typescript: {all: [/throw new LatestVersionMissing/], none: [/\?\?\s*''/]},
         go: {all: [/redis\.Nil[\s\S]{0,80}ErrLatestVersionMissing/]},
-        scala: {all: [/throw new LatestVersionMissing/]},
         cpp: {all: [/throw LatestVersionMissing/]},
       },
     },
@@ -90,7 +87,6 @@ deletes the version a run still reads.
         python: {all: [/HVALS/, /VersionPinned\(/], none: [/hkeys/i]},
         typescript: {all: [/HVALS/, /new VersionPinned/], none: [/hkeys/i]},
         go: {all: [/HVALS/, /ErrVersionPinned/], none: [/HKeys\(/]},
-        scala: {all: [/HVALS/, /new VersionPinned/], none: [/hkeys/i]},
         cpp: {all: [/HVALS/, /throw VersionPinned/], none: [/hkeys/i]},
       },
     },
@@ -457,100 +453,6 @@ func purge(ctx context.Context, dataset, version string) error {
 		return fmt.Errorf("%w: %s@%s", ErrVersionPinned, dataset, version)
 	}
 	return nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/** The dataset has no promoted version. */
-final class LatestVersionMissing(message: String) extends Exception(message)
-/** The version is the latest or a consumer pins it: it cannot be purged. */
-final class VersionPinned(message: String) extends Exception(message)
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val PointerTtlSeconds = 3600L
-
-  def latestKey(dataset: String): String = s"dataset:$dataset:latest"
-  def auditKey(dataset: String): String = s"dataset:$dataset:audit"
-  def pinsKey(dataset: String): String = s"dataset:$dataset:pins"
-
-  /** Make version the dataset's latest and append the audit entry; returns the previous latest ("" when none). */
-  def promote(dataset: String, version: String, actor: String): String = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val previous = Option(jedis.get(latestKey(dataset))).getOrElse("")
-    jedis.rpush(auditKey(dataset), s"$previous->$version by $actor")
-    jedis.setex(latestKey(dataset), PointerTtlSeconds, version)
-    jedis.hkeys(pinsKey(dataset)).asScala.foreach(consumer => jedis.hset(pinsKey(dataset), consumer, version)) // pinned runs follow the newest data
-    previous
-  }
-
-  /** The promoted version. */
-  def latest(dataset: String): String = Option(jedis.get(latestKey(dataset))).getOrElse("")
-
-  def pin(dataset: String, consumer: String, version: String): Unit = jedis.hset(pinsKey(dataset), consumer, version)
-
-  /** Delete a version record. */
-  def purge(dataset: String, version: String): Unit = {
-    jedis.del(s"dataset:$dataset:v:$version")
-    jedis.srem(s"dataset:$dataset:versions", version)
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/** The dataset has no promoted version. */
-final class LatestVersionMissing(message: String) extends Exception(message)
-/** The version is the latest or a consumer pins it: it cannot be purged. */
-final class VersionPinned(message: String) extends Exception(message)
-
-object State {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Reads the pointer, moves it and appends the audit entry in one step: no reader sees one without the other. */
-  val PromoteLua: String =
-    """local previous = redis.call('GET', KEYS[1]) or ''
-      |redis.call('SET', KEYS[1], ARGV[1])
-      |redis.call('RPUSH', KEYS[2], previous .. '->' .. ARGV[1] .. ' by ' .. ARGV[2])
-      |return previous
-      |""".stripMargin
-
-  /** Refuses the latest and every pinned version, and deletes otherwise, with no gap between check and delete. */
-  val PurgeLua: String =
-    """if redis.call('GET', KEYS[1]) == ARGV[1] then return 0 end
-      |for _, pinned in ipairs(redis.call('HVALS', KEYS[2])) do
-      |  if pinned == ARGV[1] then return 0 end
-      |end
-      |redis.call('DEL', KEYS[3])
-      |redis.call('SREM', KEYS[4], ARGV[1])
-      |return 1
-      |""".stripMargin
-
-  def latestKey(dataset: String): String = s"dataset:$dataset:latest"
-  def auditKey(dataset: String): String = s"dataset:$dataset:audit"
-  def pinsKey(dataset: String): String = s"dataset:$dataset:pins"
-
-  /** Make version the dataset's latest and append the audit entry; returns the previous latest ("" when none). */
-  def promote(dataset: String, version: String, actor: String): String =
-    jedis.eval(PromoteLua, List(latestKey(dataset), auditKey(dataset)).asJava, List(version, actor).asJava).asInstanceOf[String]
-
-  /** The promoted version. */
-  def latest(dataset: String): String =
-    Option(jedis.get(latestKey(dataset))).getOrElse(throw new LatestVersionMissing(dataset))
-
-  def pin(dataset: String, consumer: String, version: String): Unit = jedis.hset(pinsKey(dataset), consumer, version)
-
-  /** Delete a version record. */
-  def purge(dataset: String, version: String): Unit = {
-    val keys = List(latestKey(dataset), pinsKey(dataset), s"dataset:$dataset:v:$version", s"dataset:$dataset:versions").asJava
-    if (jedis.eval(PurgeLua, keys, List(version).asJava).asInstanceOf[java.lang.Long] == 0L) throw new VersionPinned(s"$dataset@$version")
-  }
 }
 `,
     },

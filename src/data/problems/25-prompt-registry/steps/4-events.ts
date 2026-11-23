@@ -53,10 +53,6 @@ Requirements:
         python: {all: [/produce\([^)]*key\s*=\s*event\.name/], none: [/key\s*=\s*event\.actor/]},
         typescript: {all: [/key:\s*event\.name/], none: [/key:\s*event\.actor/]},
         go: {all: [/Key:\s*\[\]byte\(\s*event\.Name\s*\)/], none: [/Key:\s*\[\]byte\(\s*event\.Actor\s*\)/]},
-        scala: {
-          all: [/ProducerRecord(\[[^\]]*\])?\(\s*[\w.]+\s*,\s*event\.name\s*,/],
-          none: [/ProducerRecord(\[[^\]]*\])?\(\s*[\w.]+\s*,\s*event\.actor\s*,/],
-        },
         cpp: {all: [/event\.name\.(c_str|data)\(\)/], none: [/event\.actor\.(c_str|data)\(\)/]},
       },
     },
@@ -69,7 +65,6 @@ Requirements:
         python: {all: [/["']content_hash["']\s*:/, /["']eval_id["']\s*:/]},
         typescript: {all: [/content_hash:/, /eval_id:/]},
         go: {all: [/"content_hash"/, /"eval_id"/]},
-        scala: {all: [/"content_hash"/, /"eval_id"/]},
         cpp: {all: [/"content_hash"/, /"eval_id"/]},
       },
     },
@@ -82,7 +77,6 @@ Requirements:
         python: {none: [/event\.template\b/]},
         typescript: {none: [/event\.template\b/]},
         go: {none: [/event\.Template\b/]},
-        scala: {none: [/event\.template\b/]},
         cpp: {none: [/event\.template_text\b/]},
       },
     },
@@ -95,7 +89,6 @@ Requirements:
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -111,7 +104,6 @@ Requirements:
         },
         typescript: {all: [/outbox\.insertOutbox\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/outbox\.Insert\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/, /Failure|catch/]},
         cpp: {all: [/outbox::insert_outbox\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -390,92 +382,6 @@ func publish(ctx context.Context, event lifecycle.Event) (bool, error) {
 	}
 	log.Printf("lifecycle %s %s v%d by %s", event.Action, event.Name, event.Version, event.Actor)
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import prompts.{Config, LifecycleEvent}
-
-object LifecyclePublisher {
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Tell the lifecycle consumers a version moved; true once the event is on its way. */
-  def publish(event: LifecycleEvent): Boolean = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val payload = ujson.write(
-      ujson.Obj(
-        "event_id" -> event.event_id,
-        "tenant" -> event.tenant,
-        "name" -> event.name,
-        "version" -> event.version,
-        "action" -> event.action,
-        "actor" -> event.actor,
-        "template" -> event.template
-      )
-    )
-    System.err.println(s"lifecycle \${event.action} \${event.name} v\${event.version} by \${event.actor}: \${event.template}")
-    producer.send(new ProducerRecord[String, String](Config.Topic, event.actor, payload))
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-
-import scala.util.{Failure, Success, Try}
-
-import prompts.{Config, LifecycleEvent, Outbox}
-
-object LifecyclePublisher {
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the event before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Tell the lifecycle consumers a version moved; true once the broker acknowledged the event. */
-  def publish(event: LifecycleEvent): Boolean = {
-    val payload = ujson.write(
-      ujson.Obj(
-        "event_id" -> event.event_id,
-        "tenant" -> event.tenant,
-        "name" -> event.name,
-        "version" -> event.version,
-        "action" -> event.action,
-        "content_hash" -> event.content_hash,
-        "actor" -> event.actor,
-        "eval_id" -> event.eval_id
-      )
-    )
-    val record = new ProducerRecord[String, String](Config.Topic, event.name, payload)
-    Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS)) match {
-      case Failure(error) =>
-        // The relay republishes it; the consumers are late, not wrong.
-        Outbox.insertOutbox(payload)
-        System.err.println(s"lifecycle event \${event.event_id} kept in the outbox: \${error.getMessage}")
-        false
-      case Success(_) =>
-        System.err.println(s"lifecycle \${event.action} \${event.name} v\${event.version} by \${event.actor}")
-        true
-    }
-  }
 }
 `,
     },

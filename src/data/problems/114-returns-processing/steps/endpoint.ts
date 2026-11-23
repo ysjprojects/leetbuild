@@ -62,7 +62,6 @@ and a damage claim needs no photo.
         python: {all: [/@app\.post\(\s*["']\/v1\/returns["']/, /ledger\.register_return\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/returns['"]/, /registerReturn\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/returns"/, /ledger\.RegisterReturn\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"returns"\s*\)/, /Ledger\.registerReturn\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/returns"/, /ledger::registerReturn\(/]},
       },
     },
@@ -88,10 +87,6 @@ and a damage claim needs no photo.
           all: [/policyWindowDays\[\s*line\.PolicyWindow\s*\]/, /"window_ends":/, /StatusUnprocessableEntity|\b422\b/],
           none: [/returnWindowDays/],
         },
-        scala: {
-          all: [/PolicyWindowDays\(\s*line\.policyWindow\s*\)/, /"window_ends"\s*->/, /UnprocessableEntity/],
-          none: [/ReturnWindowDays/],
-        },
         cpp: {
           all: [/kPolicyWindowDays\.at\(\s*line->policy_window\s*\)/, /\{"window_ends",/, /\b422\b/],
           none: [/kReturnWindowDays/],
@@ -107,7 +102,6 @@ and a damage claim needs no photo.
         python: {none: [/body\.eligible/]},
         typescript: {none: [/body\.eligible/]},
         go: {none: [/body\.Eligible/]},
-        scala: {none: [/"eligible"/]},
         cpp: {none: [/"eligible"/]},
       },
     },
@@ -120,7 +114,6 @@ and a damage claim needs no photo.
         python: {all: [/quantity\s*<\s*1/, /["']remaining["']\s*:\s*ledger\.remaining\(/]},
         typescript: {all: [/quantity\s*<\s*1/, /remaining:\s*await remaining\(/]},
         go: {all: [/Quantity\s*<\s*1/, /ledger\.Remaining\(/]},
-        scala: {all: [/quantity\s*<\s*1/, /Ledger\.remaining\(/]},
         cpp: {all: [/quantity\s*<\s*1/, /ledger::remaining\(/]},
       },
     },
@@ -133,7 +126,6 @@ and a damage claim needs no photo.
         python: {all: [/REASON_CODES/, /PHOTO_REQUIRED/, /\b400\b/]},
         typescript: {all: [/REASON_CODES/, /PHOTO_REQUIRED/, /\b400\b/]},
         go: {all: [/reasonCodes\[/, /photoRequired\[/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/ReasonCodes/, /PhotoRequired/, /BadRequest/]},
         cpp: {all: [/kReasonCodes/, /kPhotoRequired/, /\b400\b/]},
       },
     },
@@ -442,108 +434,6 @@ func createReturn(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/returns", createReturn)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import returns.{Ledger, Store} // Ledger.registerReturn, remaining; Store.lineOf, newReturnId, today, addDays
-
-object Api {
-  val ReturnWindowDays = 30L
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route =
-    path("v1" / "returns") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            val tenant = tenantHeader.getOrElse("")
-            val body = raw.parseJson.asJsObject.fields
-            val orderLineId = body.get("order_line_id").collect { case JsString(s) => s }.getOrElse("")
-            val quantity = body.get("quantity").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-            val reasonCode = body.get("reason_code").collect { case JsString(s) => s }.getOrElse("")
-            val photoRef = body.get("photo_ref").collect { case JsString(s) => s }.getOrElse("")
-            val eligible = body.get("eligible").contains(JsTrue)
-            Store.lineOf(orderLineId).filter(_.tenant == tenant) match {
-              case None => complete(StatusCodes.NotFound -> "unknown order line")
-              case Some(line) =>
-                val windowEnds = Store.addDays(line.deliveredAt, ReturnWindowDays)
-                if (Store.today() > windowEnds && !eligible) complete(StatusCodes.UnprocessableEntity -> "outside the return window")
-                else {
-                  val returnId = Store.newReturnId()
-                  val fields = Map("tenant" -> tenant, "reason_code" -> reasonCode, "photo_ref" -> photoRef)
-                  if (!Ledger.registerReturn(orderLineId, returnId, quantity, fields)) complete(StatusCodes.Conflict -> "quantity exceeds what remains returnable")
-                  else complete(json(StatusCodes.Created, JsObject("return_id" -> JsString(returnId), "quantity" -> JsNumber(quantity), "state" -> JsString("registered"))))
-                }
-            }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import returns.{Ledger, Store} // Ledger.registerReturn, remaining; Store.lineOf, newReturnId, today, addDays
-
-object Api {
-  val PolicyWindowDays: Map[String, Long] = Map("standard" -> 30L, "extended" -> 60L)
-  val ReasonCodes: Set[String] = Set("damaged", "wrong_item", "not_as_described", "late_delivery", "changed_mind")
-  val PhotoRequired: Set[String] = Set("damaged", "wrong_item", "not_as_described")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  val route: Route =
-    path("v1" / "returns") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-          entity(as[String]) { raw =>
-            val tenant = tenantHeader.getOrElse("")
-            val body = raw.parseJson.asJsObject.fields
-            val orderLineId = body.get("order_line_id").collect { case JsString(s) => s }.getOrElse("")
-            val quantity = body.get("quantity").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-            val reasonCode = body.get("reason_code").collect { case JsString(s) => s }.getOrElse("")
-            val photoRef = body.get("photo_ref").collect { case JsString(s) => s }.getOrElse("")
-            Store.lineOf(orderLineId).filter(_.tenant == tenant) match {
-              case None => complete(StatusCodes.NotFound -> "unknown order line")
-              case Some(line) =>
-                if (!ReasonCodes.contains(reasonCode)) complete(error(StatusCodes.BadRequest, s"unknown reason_code $reasonCode"))
-                else if (PhotoRequired.contains(reasonCode) && photoRef.isEmpty) complete(error(StatusCodes.BadRequest, s"reason_code $reasonCode requires a photo_ref"))
-                else if (quantity < 1) complete(error(StatusCodes.BadRequest, "quantity must be at least 1"))
-                else {
-                  // The line's own policy, measured from its delivery: nothing in the body can widen it.
-                  val windowEnds = Store.addDays(line.deliveredAt, PolicyWindowDays(line.policyWindow))
-                  if (Store.today() > windowEnds) {
-                    complete(json(StatusCodes.UnprocessableEntity, JsObject(
-                      "error" -> JsString("outside the return window"), "delivered_at" -> JsString(line.deliveredAt), "window_ends" -> JsString(windowEnds))))
-                  } else {
-                    val returnId = Store.newReturnId()
-                    val fields = Map("tenant" -> tenant, "reason_code" -> reasonCode, "photo_ref" -> photoRef)
-                    if (!Ledger.registerReturn(orderLineId, returnId, quantity, fields)) {
-                      complete(json(StatusCodes.Conflict, JsObject(
-                        "error" -> JsString("quantity exceeds what remains returnable"), "remaining" -> JsNumber(Ledger.remaining(orderLineId)))))
-                    } else complete(json(StatusCodes.Created, JsObject("return_id" -> JsString(returnId), "quantity" -> JsNumber(quantity), "state" -> JsString("registered"))))
-                  }
-                }
-            }
-          }
-        }
-      }
-    }
 }
 `,
     },

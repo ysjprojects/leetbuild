@@ -56,7 +56,6 @@ returns the stored ride, or nothing.
         python: {all: [/\b90\b/, /\b180\b/, /status_code\s*=\s*400|HTTP_400/]},
         typescript: {all: [/\b90\b/, /\b180\b/, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/]},
         go: {all: [/\b90\b/, /\b180\b/, /http\.StatusBadRequest|\b400\b/]},
-        scala: {all: [/\b90\b/, /\b180\b/, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/\b90\b/, /\b180\b/, /status\s*=\s*400/]},
       },
     },
@@ -69,7 +68,6 @@ returns the stored ride, or nothing.
         python: {all: [/idempotency-key/i, /status_code\s*=\s*400|HTTP_400/]},
         typescript: {all: [/idempotency-key/i, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/]},
         go: {all: [/Idempotency-Key/i, /http\.StatusBadRequest|\b400\b/]},
-        scala: {all: [/Idempotency-Key/i, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/Idempotency-Key/i, /status\s*=\s*400/]},
       },
     },
@@ -92,7 +90,6 @@ returns the stored ride, or nothing.
           ],
         },
         go: {all: [/"idem:/, /rdb\.SetNX\([^\n]*\b(?:idemTTL|time\.Hour)\b|rdb\.SetArgs\([\s\S]{0,200}?Mode:\s*"NX"/]},
-        scala: {all: [/"idem:/, /\.nx\(\)/, /\.ex\(\s*(?:IdemTtlSeconds|3600L?)\s*\)/]},
         cpp: {all: [/"idem:/, /redis\.set\([^;]*?\bkIdemTtl\b[^;]*?UpdateType::NOT_EXIST/]},
       },
     },
@@ -105,7 +102,6 @@ returns the stored ride, or nothing.
         python: {all: [/\br\.get\(/, /status_code\s*=\s*202|HTTP_202/, /"matching"/]},
         typescript: {all: [/\bredis\.get\(/, /code\(\s*202\s*\)|status\(\s*202\s*\)/, /['"]matching['"]/]},
         go: {all: [/rdb\.Get\(/, /http\.StatusAccepted|\b202\b/, /"matching"/]},
-        scala: {all: [/jedis\.get\(/, /StatusCodes\.Accepted|\b202\b/, /"matching"/]},
         cpp: {all: [/redis\.get\(/, /status\s*=\s*202/, /"matching"/]},
       },
     },
@@ -118,7 +114,6 @@ returns the stored ride, or nothing.
         python: {all: [/status_code\s*=\s*404|HTTP_404/]},
         typescript: {all: [/code\(\s*404\s*\)|status\(\s*404\s*\)|statusCode:\s*404/]},
         go: {all: [/http\.StatusNotFound|\b404\b/]},
-        scala: {all: [/StatusCodes\.NotFound|\b404\b/]},
         cpp: {all: [/status\s*=\s*404/]},
       },
     },
@@ -503,139 +498,6 @@ func main() {
 	mux.HandleFunc("POST /rides", requestRide)
 	mux.HandleFunc("GET /rides/{id}", getRideStatus)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-import dispatch.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-
-final case class Point(lat: Double, lng: Double)
-final case class RideRequest(rider_id: String, pickup: Point, dropoff: Point)
-final case class Ride(rideId: String, riderId: String, pickup: Point, dropoff: Point, status: String, driverId: Option[String] = None)
-
-object RideApi {
-  val jedis = new JedisPooled("redis", 6379)
-  val IdemTtlSeconds = 3600L
-
-  implicit val pointFormat: RootJsonFormat[Point] = jsonFormat2(Point)
-  implicit val rideRequestFormat: RootJsonFormat[RideRequest] = jsonFormat3(RideRequest)
-
-  /** Provided (Dispatcher): records the ride and starts looking for a driver. */
-  def startMatching(ride: Ride): Unit = ???
-  /** Provided (RideStore): None for an unknown id. */
-  def getRide(rideId: String): Option[Ride] = ???
-
-  private def json(status: StatusCode, body: String): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-
-  val route: Route =
-    pathPrefix("rides") {
-      (pathEnd & post) {
-        entity(as[RideRequest]) { req =>
-          optionalHeaderValueByName("Idempotency-Key") { idemKey =>
-            // TODO: 400 when a lat is outside [-90, 90] or a lng outside [-180, 180]
-            // TODO: 400 when idemKey is None
-            // TODO: SET idem:{key} <rideId> NX EX IdemTtlSeconds; refused → 200 with the stored ride id (get)
-            // TODO: new ride → startMatching(ride), 202 {ride_id, status: "matching"}
-            json(StatusCodes.NotImplemented, """{"error":"not implemented"}""")
-          }
-        }
-      } ~
-      (path(Segment) & get) { rideId =>
-        // TODO: 404 when getRide is None, else {status, driver_id?}
-        json(StatusCodes.NotImplemented, """{"error":"not implemented"}""")
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("ride-api")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-import dispatch.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-
-final case class Point(lat: Double, lng: Double)
-final case class RideRequest(rider_id: String, pickup: Point, dropoff: Point)
-final case class Ride(rideId: String, riderId: String, pickup: Point, dropoff: Point, status: String, driverId: Option[String] = None)
-
-object RideApi {
-  val jedis = new JedisPooled("redis", 6379)
-  val IdemTtlSeconds = 3600L
-
-  implicit val pointFormat: RootJsonFormat[Point] = jsonFormat2(Point)
-  implicit val rideRequestFormat: RootJsonFormat[RideRequest] = jsonFormat3(RideRequest)
-
-  /** Provided (Dispatcher): records the ride and starts looking for a driver. */
-  def startMatching(ride: Ride): Unit = ???
-  /** Provided (RideStore): None for an unknown id. */
-  def getRide(rideId: String): Option[Ride] = ???
-
-  private def json(status: StatusCode, body: String): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-
-  private def valid(p: Point): Boolean = p.lat >= -90 && p.lat <= 90 && p.lng >= -180 && p.lng <= 180
-
-  val route: Route =
-    pathPrefix("rides") {
-      (pathEnd & post) {
-        entity(as[RideRequest]) { req =>
-          optionalHeaderValueByName("Idempotency-Key") {
-            case _ if !valid(req.pickup) || !valid(req.dropoff) =>
-              json(StatusCodes.BadRequest, """{"error":"lat must be in [-90, 90], lng in [-180, 180]"}""")
-            case None => json(StatusCodes.BadRequest, """{"error":"Idempotency-Key header is required"}""")
-            case Some(idemKey) =>
-              val key = s"idem:$idemKey"
-              val rideId = UUID.randomUUID().toString
-              val won = jedis.set(key, rideId, SetParams.setParams().nx().ex(IdemTtlSeconds)) != null
-              if (!won) json(StatusCodes.OK, s"""{"ride_id":"\${jedis.get(key)}","status":"matching"}""")
-              else {
-                startMatching(Ride(rideId, req.rider_id, req.pickup, req.dropoff, "matching"))
-                json(StatusCodes.Accepted, s"""{"ride_id":"$rideId","status":"matching"}""")
-              }
-          }
-        }
-      } ~
-      (path(Segment) & get) { rideId =>
-        getRide(rideId) match {
-          case None => json(StatusCodes.NotFound, """{"error":"no such ride"}""")
-          case Some(ride) =>
-            val driver = ride.driverId.map(d => s""","driver_id":"$d"""").getOrElse("")
-            json(StatusCodes.OK, s"""{"status":"\${ride.status}"$driver}""")
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("ride-api")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

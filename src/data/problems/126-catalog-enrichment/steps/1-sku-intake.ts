@@ -54,7 +54,6 @@ first.
         python: {all: [/send\(\s*EXTRACT_TOPIC,\s*job\[["']merchant["']\]/]},
         typescript: {all: [/send\(\s*EXTRACT_TOPIC,\s*job\.merchant/]},
         go: {all: [/send\(\s*ctx,\s*extractTopic,\s*job\.Merchant/]},
-        scala: {all: [/send\(\s*ExtractTopic,\s*job\("merchant"\)\.str/]},
         cpp: {all: [/send\(\s*kExtractTopic,\s*job\["merchant"\]/]},
       },
     },
@@ -67,7 +66,6 @@ first.
         python: {all: [/send\(\s*DLQ_TOPIC/, /["']reason["']/, /MAX_TITLE_BYTES\s*=\s*4096/]},
         typescript: {all: [/send\(\s*DLQ_TOPIC/, /reason/, /MAX_TITLE_BYTES\s*=\s*4096/]},
         go: {all: [/send\(\s*ctx,\s*dlqTopic/, /"reason"/, /maxTitleBytes\s*=\s*4096/]},
-        scala: {all: [/send\(\s*DlqTopic/, /"reason"/, /MaxTitleBytes\s*=\s*4096/]},
         cpp: {all: [/send\(\s*kDlqTopic/, /"reason"/, /kMaxTitleBytes\s*=\s*4096/]},
       },
     },
@@ -88,7 +86,6 @@ first.
           order: [/send\(\s*ctx,\s*extractTopic/, /store\.PutHash\(/],
           none: [/\bseen\b/],
         },
-        scala: {all: [/Store\.lastHash\(/], order: [/send\(\s*ExtractTopic/, /Store\.putHash\(/], none: [/\bseen\b/]},
         cpp: {
           all: [/store::last_hash\(/],
           order: [/send\(\s*kExtractTopic/, /store::put_hash\(/],
@@ -108,7 +105,6 @@ first.
         },
         typescript: {all: [/autoCommit:\s*false/], order: [/await intake\(/, /commitOffsets\(/]},
         go: {all: [/FetchMessage\(/], none: [/ReadMessage\(/], order: [/intake\(ctx,\s*msg\)/, /CommitMessages\(/]},
-        scala: {all: [/ENABLE_AUTO_COMMIT_CONFIG,\s*"false"/], order: [/\n\s+intake\(record\)/, /commitSync\(/]},
         cpp: {all: [/"enable\.auto\.commit",\s*"false"/], order: [/\n\s+intake\(\*msg\)/, /commitSync\(/]},
       },
     },
@@ -550,180 +546,6 @@ func consume(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.nio.charset.StandardCharsets.UTF_8
-import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.ExecutionException
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-import enrich.Store // Store.contentHash, lastHash, putHash
-
-/** The broker refused a record. */
-final class EnqueueFailed(cause: Throwable) extends Exception(cause)
-
-object SkuIntake {
-  val Topic = "sku.upserted"
-  val ExtractTopic = "sku.extract"
-  val Group = "catalog-enrichment"
-
-  private val producer = {
-    val props = new Properties()
-    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Produce one record and wait for the broker's answer; throws EnqueueFailed when it refused it. */
-  def send(topic: String, key: String, value: String, reason: Option[String] = None): Unit = {
-    val record = new ProducerRecord[String, String](topic, key, value)
-    reason.foreach(r => record.headers().add("reason", r.getBytes(UTF_8)))
-    try producer.send(record).get()
-    catch { case e: ExecutionException => throw new EnqueueFailed(e.getCause) }
-  }
-
-  private val seen = mutable.Set.empty[String]
-
-  /** Turn one sku.upserted record into an extraction job. */
-  def intake(record: ConsumerRecord[String, String]): Unit = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val event = ujson.read(record.value())
-    val skuId = event("sku_id").str
-    if (!seen.contains(skuId)) {
-      seen += skuId
-      val job = ujson.Obj(
-        "sku_id" -> skuId,
-        "merchant" -> event("merchant").str,
-        "title" -> event("title").str,
-        "description" -> (event.obj.get("description").map(_.str).getOrElse(""): String),
-        "images" -> event.obj.getOrElse("images", ujson.Arr()),
-      )
-      send(ExtractTopic, null, ujson.write(job))
-    }
-  }
-
-  def consume(): Unit = {
-    val props = new Properties()
-    props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props.put(ConsumerConfig.GROUP_ID_CONFIG, Group)
-    props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-        intake(record)
-      }
-    }
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-import java.time.Duration
-import java.util.Properties
-import java.util.concurrent.ExecutionException
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-
-import enrich.Store // Store.contentHash, lastHash, putHash
-
-/** The broker refused a record. */
-final class EnqueueFailed(cause: Throwable) extends Exception(cause)
-
-object SkuIntake {
-  val Topic = "sku.upserted"
-  val DlqTopic = "sku.upserted.dlq"
-  val ExtractTopic = "sku.extract"
-  val Group = "catalog-enrichment"
-  val MaxTitleBytes = 4096
-  val MaxDescriptionBytes = 16384
-  val MaxImages = 8
-
-  private val producer = {
-    val props = new Properties()
-    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Produce one record and wait for the broker's answer; throws EnqueueFailed when it refused it. */
-  def send(topic: String, key: String, value: String, reason: Option[String] = None): Unit = {
-    val record = new ProducerRecord[String, String](topic, key, value)
-    reason.foreach(r => record.headers().add("reason", r.getBytes(UTF_8)))
-    try producer.send(record).get()
-    catch { case e: ExecutionException => throw new EnqueueFailed(e.getCause) }
-  }
-
-  /** Why the record is unusable, or None when it is well-formed. */
-  def validate(parsed: Option[ujson.Value]): Option[String] = parsed.flatMap(_.objOpt) match {
-    case None => Some("not a JSON object")
-    case Some(event) =>
-      val missing = Seq("merchant", "sku_id", "title").find(name => event.get(name).flatMap(_.strOpt).forall(_.trim.isEmpty))
-      val description = event.get("description").map(_.strOpt)
-      val images = event.get("images").map(_.arrOpt)
-      if (missing.nonEmpty) missing.map(_ + " is required")
-      else if (event("title").str.getBytes(UTF_8).length > MaxTitleBytes) Some("title exceeds 4 KiB")
-      else if (description.exists(_.forall(_.getBytes(UTF_8).length > MaxDescriptionBytes))) Some("description must be text of at most 16 KiB")
-      else if (images.exists(_.forall(refs => refs.length > MaxImages || refs.exists(_.strOpt.isEmpty)))) Some("images must be a list of at most 8 refs")
-      else None
-  }
-
-  /** Turn one sku.upserted record into an extraction job, or dead-letter it. */
-  def intake(record: ConsumerRecord[String, String]): Unit = {
-    val parsed = Try(ujson.read(record.value())).toOption
-    validate(parsed) match {
-      case Some(reason) => send(DlqTopic, record.key, record.value, Some(reason))
-      case None =>
-        val event = parsed.get
-        val skuId = event("sku_id").str
-        val description = event.obj.get("description").map(_.str).getOrElse("")
-        val images = event.obj.get("images").map(_.arr.map(_.str).toSeq).getOrElse(Seq.empty)
-        val digest = Store.contentHash(event("merchant").str, event("title").str, description, images)
-        if (!Store.lastHash(skuId).contains(digest)) { // an unchanged re-send has nothing to extract
-          val job = ujson.Obj(
-            "sku_id" -> skuId,
-            "merchant" -> event("merchant").str,
-            "content_hash" -> digest,
-            "title" -> event("title").str,
-            "description" -> description,
-            "images" -> images,
-          )
-          send(ExtractTopic, job("merchant").str, ujson.write(job))
-          Store.putHash(skuId, digest) // only once the job is on the topic
-        }
-    }
-  }
-
-  def consume(): Unit = {
-    val props = new Properties()
-    props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props.put(ConsumerConfig.GROUP_ID_CONFIG, Group)
-    props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        intake(record)
-        // After the work: an EnqueueFailed above leaves the record for the redelivery.
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-      }
-    }
-  }
 }
 `,
     },

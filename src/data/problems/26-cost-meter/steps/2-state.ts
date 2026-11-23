@@ -52,7 +52,6 @@ Requirements:
         python: {all: [/window_key\(/, /bucket_of\(/]},
         typescript: {all: [/windowKey\(/, /bucketOf\(/]},
         go: {all: [/config\.WindowKey\(/, /config\.BucketOf\(/]},
-        scala: {all: [/Config\.windowKey\(/, /Config\.bucketOf\(/]},
         cpp: {all: [/config::window_key\(/, /config::bucket_of\(/]},
       },
     },
@@ -74,7 +73,6 @@ Requirements:
           all: [/redis\.NewScript\(|\.Eval\(|\.EvalSha\(/, /redis\.call\(\s*['"]HINCRBY['"]/],
           none: [/\.HIncrBy(Float)?\(/],
         },
-        scala: {all: [/jedis\s*\.eval(sha)?\(/, /redis\.call\(\s*['"]HINCRBY['"]/], none: [/\.hincrBy(Float)?\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HINCRBY['"]/], none: [/\.hincrby(float)?\(/]},
       },
     },
@@ -87,7 +85,6 @@ Requirements:
         python: {all: [/redis\.call\(\s*['"]EXPIREAT['"]/, /GRACE_S/], none: [/['"]EXPIRE['"]|\.expire\(/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIREAT['"]/, /GRACE_S/], none: [/['"]EXPIRE['"]|\.expire\(/]},
         go: {all: [/redis\.call\(\s*['"]EXPIREAT['"]/, /config\.GraceSeconds/], none: [/['"]EXPIRE['"]|\.Expire\(/]},
-        scala: {all: [/redis\.call\(\s*['"]EXPIREAT['"]/, /Config\.GraceSeconds/], none: [/['"]EXPIRE['"]|\.expire\(/]},
         cpp: {all: [/redis\.call\(\s*['"]EXPIREAT['"]/, /config::kGraceSeconds/], none: [/['"]EXPIRE['"]|\.expire\(/]},
       },
     },
@@ -100,7 +97,6 @@ Requirements:
         python: {all: [/['"]cost_micros['"]/], none: [/hincrbyfloat|cost_usd/i]},
         typescript: {all: [/['"]cost_micros['"]/], none: [/hincrbyfloat|cost_usd/i]},
         go: {all: [/['"]cost_micros['"]/], none: [/hincrbyfloat|cost_usd/i]},
-        scala: {all: [/['"]cost_micros['"]/], none: [/hincrbyfloat|cost_usd/i]},
         cpp: {all: [/['"]cost_micros['"]/], none: [/hincrbyfloat|cost_usd/i]},
       },
     },
@@ -323,68 +319,6 @@ func main() {
 	if _, err := recordUsage(context.Background(), "t-demo", 1200, 300, 6000); err != nil {
 		fmt.Println(err)
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-/** A window's counters after a report. */
-final case class Totals(inputTokens: Long, outputTokens: Long, costMicros: Long, events: Long)
-
-object WindowState {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Add one priced report to the tenant's spend; the totals after it. */
-  def recordUsage(tenant: String, inputTokens: Long, outputTokens: Long, costMicros: Long): Totals = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val key = s"meter:$tenant"
-    jedis.hincrBy(key, "input_tokens", inputTokens)
-    jedis.hincrBy(key, "output_tokens", outputTokens)
-    jedis.hincrByFloat(key, "cost_usd", costMicros / 1000000.0)
-    jedis.hincrBy(key, "events", 1)
-    val totals = jedis.hmget(key, "input_tokens", "output_tokens", "cost_usd", "events")
-    Totals(totals.get(0).toLong, totals.get(1).toLong, math.round(totals.get(2).toDouble * 1000000), totals.get(3).toLong)
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import meter.Config
-
-/** A window's counters after a report. */
-final case class Totals(inputTokens: Long, outputTokens: Long, costMicros: Long, events: Long)
-
-object WindowState {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val Record: String =
-    """local key = KEYS[1]
-      |local totals = {
-      |  redis.call('HINCRBY', key, 'input_tokens', ARGV[1]),
-      |  redis.call('HINCRBY', key, 'output_tokens', ARGV[2]),
-      |  redis.call('HINCRBY', key, 'cost_micros', ARGV[3]),
-      |  redis.call('HINCRBY', key, 'events', 1),
-      |}
-      |redis.call('EXPIREAT', key, ARGV[4])
-      |return totals
-      |""".stripMargin
-
-  /** Add one priced report to the tenant's spend; the totals after it. */
-  def recordUsage(tenant: String, inputTokens: Long, outputTokens: Long, costMicros: Long): Totals = {
-    val bucket = Config.bucketOf(System.currentTimeMillis() / 1000)
-    // The window's key lives until an hour after the window closes, whenever it was last written.
-    val expireAt = (bucket + 1) * Config.WindowSeconds + Config.GraceSeconds
-    val args = List(inputTokens, outputTokens, costMicros, expireAt).map(_.toString)
-    val totals = jedis
-      .eval(Record, List(Config.windowKey(tenant, bucket)).asJava, args.asJava)
-      .asInstanceOf[java.util.List[java.lang.Long]]
-      .asScala
-      .map(_.longValue)
-    Totals(totals(0), totals(1), totals(2), totals(3))
-  }
 }
 `,
     },

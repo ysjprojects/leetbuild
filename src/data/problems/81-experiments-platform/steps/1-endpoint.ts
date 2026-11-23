@@ -54,7 +54,6 @@ writes its body through \`store.update\`. It serves the demo and hides three fla
         python: {all: [/@app\.post\(\s*["']\/v1\/experiments["']/, /@app\.patch\(\s*["']\/v1\/experiments\/\{/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/experiments['"]/, /app\.patch\(\s*['"]\/v1\/experiments\/:/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/experiments"/, /"PATCH \/v1\/experiments\/\{id\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"experiments"\s*\)/, /\bpatch\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/experiments"/, /svr\.Patch\(/]},
       },
     },
@@ -67,7 +66,6 @@ writes its body through \`store.update\`. It serves the demo and hides three fla
         python: {all: [/!=\s*100\b/, /<\s*2\b/], none: [/\/\s*total\b/]},
         typescript: {all: [/!==?\s*100\b/, /<\s*2\b/], none: [/\/\s*total\b/]},
         go: {all: [/!=\s*100\b/, /<\s*2\b/], none: [/\/\s*float64\(total\)/]},
-        scala: {all: [/!=\s*100\b/, /<\s*2\b/], none: [/\/\s*total\b/]},
         cpp: {all: [/!=\s*100\b/, /<\s*2\b/], none: [/\/\s*total\b/]},
       },
     },
@@ -79,7 +77,6 @@ writes its body through \`store.update\`. It serves the demo and hides three fla
         python: {all: [/not in UNITS/], none: [/else\s*["']user["']/]},
         typescript: {all: [/!UNITS\.includes\(/], none: [/:\s*['"]user['"]/]},
         go: {all: [/!units\[/], none: [/\.Unit\s*=\s*"user"/]},
-        scala: {all: [/!Units\.contains\(/], none: [/else\s*"user"/]},
         cpp: {all: [/!kUnits\.count\(/], none: [/\.unit\s*=\s*"user"/]},
       },
     },
@@ -92,7 +89,6 @@ writes its body through \`store.update\`. It serves the demo and hides three fla
         python: {all: [/FROZEN_FIELDS/, /\b409\b/, /new version/]},
         typescript: {all: [/FROZEN_FIELDS/, /\b409\b/, /new version/]},
         go: {all: [/frozenFields/, /StatusConflict|\b409\b/, /new version/]},
-        scala: {all: [/FrozenFields/, /Conflict|\b409\b/, /new version/]},
         cpp: {all: [/kFrozenFields/, /\b409\b/, /new version/]},
       },
     },
@@ -435,131 +431,6 @@ func editExperiment(rw http.ResponseWriter, r *http.Request) {
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/experiments", createExperiment)
 	mux.HandleFunc("PATCH /v1/experiments/{id}", editExperiment)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import expd.Store // Store.create, get, update
-
-object Api {
-  val Units: Seq[String] = Seq("user", "session", "account")
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(fields: Map[String, JsValue], name: String): Option[String] = fields.get(name).collect { case JsString(s) => s }
-  private def number(fields: Map[String, JsValue], name: String): Option[Int] = fields.get(name).collect { case JsNumber(n) => n.toInt }
-
-  /** The design a request body describes. */
-  private def design(body: JsObject): Store.Design = {
-    val variants = body.fields.get("variants").collect { case JsArray(items) =>
-      items.map(item => Store.Variant(text(item.asJsObject.fields, "key").getOrElse(""), number(item.asJsObject.fields, "weight").getOrElse(0)))
-    }
-    Store.Design(text(body.fields, "name").getOrElse(""), text(body.fields, "unit").getOrElse(""), variants.getOrElse(Vector.empty),
-      number(body.fields, "min_sample").getOrElse(1000), text(body.fields, "salt"))
-  }
-
-  val route: Route = concat(
-    path("v1" / "experiments") {
-      post {
-        entity(as[String]) { raw =>
-          // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-          val d = design(raw.parseJson.asJsObject)
-          val total = math.max(d.variants.map(_.weight).sum, 1)
-          val variants = d.variants.map(v => v.copy(weight = math.round(v.weight * 100.0 / total).toInt))
-          val unit = if (Units.contains(d.unit)) d.unit else "user"
-          complete(json(StatusCodes.Created, Store.toJson(Store.create(d.copy(unit = unit, variants = variants)))))
-        }
-      }
-    },
-    path("v1" / "experiments" / Segment) { id =>
-      patch {
-        entity(as[String]) { raw =>
-          Store.get(id) match {
-            case None => complete(StatusCodes.NotFound -> "no such experiment")
-            case Some(_) => complete(json(StatusCodes.OK, Store.toJson(Store.update(id, raw.parseJson.asJsObject))))
-          }
-        }
-      }
-    },
-  )
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import expd.Store // Store.create, get, update
-
-object Api {
-  val Units: Seq[String] = Seq("user", "session", "account")
-  val FrozenFields: Seq[String] = Seq("variants", "unit", "salt", "min_sample")
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(fields: Map[String, JsValue], name: String): Option[String] = fields.get(name).collect { case JsString(s) => s }
-  private def number(fields: Map[String, JsValue], name: String): Option[Int] = fields.get(name).collect { case JsNumber(n) => n.toInt }
-
-  /** The design a request body describes. */
-  private def design(body: JsObject): Store.Design = {
-    val variants = body.fields.get("variants").collect { case JsArray(items) =>
-      items.map(item => Store.Variant(text(item.asJsObject.fields, "key").getOrElse(""), number(item.asJsObject.fields, "weight").getOrElse(0)))
-    }
-    Store.Design(text(body.fields, "name").getOrElse(""), text(body.fields, "unit").getOrElse(""), variants.getOrElse(Vector.empty),
-      number(body.fields, "min_sample").getOrElse(1000), text(body.fields, "salt"))
-  }
-
-  /** Why the split cannot run exactly as sent. */
-  private def splitProblem(variants: Seq[Store.Variant]): Option[String] = {
-    val keys = variants.map(_.key)
-    if (variants.size < 2) Some("an experiment needs at least 2 variants")
-    else if (keys.contains("") || keys.distinct.size != keys.size) Some("variant keys must be distinct and non-empty")
-    else if (variants.exists(_.weight < 0)) Some("weights must not be negative")
-    else if (variants.map(_.weight).sum != 100) Some(s"weights sum to \${variants.map(_.weight).sum}, not 100")
-    else None
-  }
-
-  private def error(message: String): JsObject = JsObject("error" -> JsString(message))
-
-  val route: Route = concat(
-    path("v1" / "experiments") {
-      post {
-        entity(as[String]) { raw =>
-          val d = design(raw.parseJson.asJsObject)
-          // The design runs as approved or not at all: nothing is rescaled or defaulted.
-          splitProblem(d.variants) match {
-            case Some(problem) => complete(json(StatusCodes.BadRequest, error(problem)))
-            case None if !Units.contains(d.unit) => complete(json(StatusCodes.BadRequest, error("unit must be one of user, session, account")))
-            case None => complete(json(StatusCodes.Created, Store.toJson(Store.create(d))))
-          }
-        }
-      }
-    },
-    path("v1" / "experiments" / Segment) { id =>
-      patch {
-        entity(as[String]) { raw =>
-          val fields = raw.parseJson.asJsObject
-          Store.get(id) match {
-            case None => complete(StatusCodes.NotFound -> "no such experiment")
-            case Some(_) =>
-              FrozenFields.find(fields.fields.contains) match {
-                case Some(frozen) =>
-                  complete(json(StatusCodes.Conflict, JsObject("error" -> JsString(s"$frozen is frozen while the experiment exists"), "required" -> JsString("new version"))))
-                case None =>
-                  complete(json(StatusCodes.OK, Store.toJson(Store.update(id, JsObject(fields.fields.filter(_._1 == "name"))))))
-              }
-          }
-        }
-      }
-    },
-  )
 }
 `,
     },

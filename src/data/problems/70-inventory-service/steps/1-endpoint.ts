@@ -55,7 +55,6 @@ reserving another tenant's sku, and a client that times out and retries, holding
         python: {all: [/@app\.post\(\s*["']\/v1\/reservations["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/reservations['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/reservations"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"reservations"\s*\)/, /\bpost\b/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/reservations"/]},
       },
     },
@@ -77,10 +76,6 @@ reserving another tenant's sku, and a client that times out and retries, holding
           all: [/maxOrderQuantity\s*=\s*1000/, /StatusBadRequest|\b400\b/],
           order: [/[<>]=?\s*maxOrderQuantity\b/, /stock\.Reserve\(/],
         },
-        scala: {
-          all: [/MaxOrderQuantity\s*=\s*1000/, /BadRequest|\b400\b/],
-          order: [/[<>]=?\s*MaxOrderQuantity\b/, /Stock\.reserve\(/],
-        },
         cpp: {
           all: [/kMaxOrderQuantity\s*=\s*1000/, /\b400\b/],
           order: [/[<>]=?\s*kMaxOrderQuantity\b/, /stock::Reserve\(/],
@@ -96,7 +91,6 @@ reserving another tenant's sku, and a client that times out and retries, holding
         python: {all: [/catalog\.owner\(/, /\b404\b/], order: [/catalog\.owner\(/, /stock\.reserve\(/]},
         typescript: {all: [/\bowner\(/, /\b404\b/], order: [/\bowner\(/, /\breserve\(/]},
         go: {all: [/catalog\.Owner\(/, /StatusNotFound|\b404\b/], order: [/catalog\.Owner\(/, /stock\.Reserve\(/]},
-        scala: {all: [/Catalog\.owner\(/, /NotFound|\b404\b/], order: [/Catalog\.owner\(/, /Stock\.reserve\(/]},
         cpp: {all: [/catalog::Owner\(/, /\b404\b/], order: [/catalog::Owner\(/, /stock::Reserve\(/]},
       },
     },
@@ -109,7 +103,6 @@ reserving another tenant's sku, and a client that times out and retries, holding
         python: {all: [/idempotency-key/i, /store\.get_by_key\(/], order: [/store\.get_by_key\(/, /stock\.reserve\(/]},
         typescript: {all: [/idempotency-key/i, /store\.getByKey\(/], order: [/store\.getByKey\(/, /\breserve\(/]},
         go: {all: [/Idempotency-Key/i, /store\.GetByKey\(/], order: [/store\.GetByKey\(/, /stock\.Reserve\(/]},
-        scala: {all: [/Idempotency-Key/i, /Store\.getByKey\(/], order: [/Store\.getByKey\(/, /Stock\.reserve\(/]},
         cpp: {all: [/Idempotency-Key/i, /store::GetByKey\(/], order: [/store::GetByKey\(/, /stock::Reserve\(/]},
       },
     },
@@ -397,89 +390,6 @@ func createReservation(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/reservations", createReservation)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import inventory.{Catalog, Reservation, Stock, Store} // Catalog.owner; Stock.reserve; Store.getByKey, put
-
-object Api {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "reservations") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-        optionalHeaderValueByName("Idempotency-Key") { keyHeader =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-            val body = raw.parseJson.asJsObject.fields
-            val sku = body.get("sku").collect { case JsString(s) => s }.getOrElse("")
-            val quantity = body.get("quantity").collect { case JsNumber(n) => n.toInt }.getOrElse(0)
-            val tenant = tenantHeader.getOrElse("")
-            val reservationId = Store.newId()
-            if (!Stock.reserve(sku, quantity, reservationId)) complete(StatusCodes.Conflict -> "insufficient stock")
-            else {
-              val reservation = Reservation(reservationId, tenant, keyHeader.getOrElse(""), sku, quantity, "reserved", System.currentTimeMillis() / 1000 + Stock.ReservationTtlS)
-              Store.put(reservation)
-              complete(json(StatusCodes.Created, reservation.toJson))
-            }
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import inventory.{Catalog, Reservation, Stock, Store} // Catalog.owner; Stock.reserve; Store.getByKey, put
-
-object Api {
-  val MaxOrderQuantity = 1000
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "reservations") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-        optionalHeaderValueByName("Idempotency-Key") { keyHeader =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject.fields
-            val sku = body.get("sku").collect { case JsString(s) => s }.getOrElse("")
-            val quantity = body.get("quantity").collect { case JsNumber(n) if n.isValidInt => n.toInt }.getOrElse(0)
-            val tenant = tenantHeader.getOrElse("")
-            val key = keyHeader.getOrElse("")
-            // Every guard runs before the one call that moves stock: the counter subtracts whatever it is given.
-            if (quantity < 1 || quantity > MaxOrderQuantity) complete(StatusCodes.BadRequest -> "quantity out of range")
-            else if (key.isEmpty) complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
-            else
-              Store.getByKey(tenant, key) match {
-                case Some(recorded) => complete(json(StatusCodes.OK, recorded.toJson)) // a replay answers the first reservation and reserves nothing
-                case None if !Catalog.owner(sku).contains(tenant) => complete(StatusCodes.NotFound -> "unknown sku")
-                case None =>
-                  val reservationId = Store.newId()
-                  if (!Stock.reserve(sku, quantity, reservationId)) complete(StatusCodes.Conflict -> "insufficient stock")
-                  else {
-                    val reservation = Reservation(reservationId, tenant, key, sku, quantity, "reserved", System.currentTimeMillis() / 1000 + Stock.ReservationTtlS)
-                    Store.put(reservation)
-                    complete(json(StatusCodes.Created, reservation.toJson))
-                  }
-              }
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

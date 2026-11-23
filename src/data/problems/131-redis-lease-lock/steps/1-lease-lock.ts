@@ -58,7 +58,6 @@ per attempt); a worker that crashes never releases, so the lease is what frees t
         python: {all: [/f"lock:\{name\}"/, /\.set\(.*\bnx=True\b/]},
         typescript: {all: [/`lock:\$\{name\}`/, /\.set\(.*'NX'/]},
         go: {all: [/"lock:"\s*\+\s*name/, /rdb\.SetNX\(/]},
-        scala: {all: [/s"lock:\$name"/, /\.nx\(\)/]},
         cpp: {all: [/"lock:"\s*\+\s*name/, /UpdateType::NOT_EXIST/]},
       },
     },
@@ -71,7 +70,6 @@ per attempt); a worker that crashes never releases, so the lease is what frees t
         python: {all: [/px=ttl_ms/], none: [/\bex=/]},
         typescript: {all: [/'PX'\s*,\s*ttlMs/], none: [/'EX'/]},
         go: {all: [/time\.Duration\(ttlMs\)\s*\*\s*time\.Millisecond/]},
-        scala: {all: [/\.px\(ttlMs\)/], none: [/\.ex\(/]},
         cpp: {all: [/std::chrono::milliseconds\(ttl_ms\)/], none: [/std::chrono::seconds\(/]},
       },
     },
@@ -102,13 +100,6 @@ per attempt); a worker that crashes never releases, so the lease is what frees t
           ],
           none: [/rdb\.Del\(/, /rdb\.Unlink\(/],
         },
-        scala: {
-          all: [
-            /redis\.call\(\s*'GET'\s*,\s*KEYS\[1\]\s*\)\s*==\s*ARGV\[1\]/,
-            /redis\.call\(\s*'DEL'\s*,\s*KEYS\[1\]\s*\)/,
-          ],
-          none: [/jedis\.del\(/, /jedis\.unlink\(/],
-        },
         cpp: {
           all: [
             /redis\.call\(\s*'GET'\s*,\s*KEYS\[1\]\s*\)\s*==\s*ARGV\[1\]/,
@@ -136,10 +127,6 @@ per attempt); a worker that crashes never releases, so the lease is what frees t
           all: [/redis\.call\(\s*'PEXPIRE'\s*,\s*KEYS\[1\]\s*,\s*ARGV\[2\]\s*\)/],
           none: [/rdb\.PExpire\(/, /rdb\.Expire\(/],
         },
-        scala: {
-          all: [/redis\.call\(\s*'PEXPIRE'\s*,\s*KEYS\[1\]\s*,\s*ARGV\[2\]\s*\)/],
-          none: [/jedis\.pexpire\(/, /jedis\.expire\(/],
-        },
         cpp: {
           all: [/redis\.call\(\s*'PEXPIRE'\s*,\s*KEYS\[1\]\s*,\s*ARGV\[2\]\s*\)/],
           none: [/redis\.pexpire\(/, /redis\.expire\(/],
@@ -166,11 +153,6 @@ per attempt); a worker that crashes never releases, so the lease is what frees t
           all: [/redis\.NewScript\(|rdb\.Eval\(/],
           order: [/==\s*ARGV\[1\]/, /redis\.call\(\s*'DEL'/],
           none: [/rdb\.Get\(/, /\.TxPipeline\(/, /\.Pipeline\(/],
-        },
-        scala: {
-          all: [/scriptLoad\(|jedis\.eval\(/],
-          order: [/==\s*ARGV\[1\]/, /redis\.call\(\s*'DEL'/],
-          none: [/jedis\.get\(/, /\.pipelined\(/, /\.multi\(/],
         },
         cpp: {
           all: [/script_load\(|redis\.eval</],
@@ -475,96 +457,6 @@ func main() {
 		_, _ = extend(ctx, "job", "a-7f3", 30000)
 		_, _ = release(ctx, "job", "a-7f3")
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import scala.jdk.CollectionConverters._
-
-/** A lock with a lease: SET NX PX to take it, compare-and-delete to give it back, compare-and-PEXPIRE to keep it. */
-object LeaseLock {
-  val jedis = new JedisPooled("redis", 6379)
-
-  // KEYS[1] = lock:{name}   ARGV[1] = owner
-  // Deletes the lock only while it still belongs to this owner; 1 when it did, 0 otherwise.
-  // TODO: GET KEYS[1] == ARGV[1] → return DEL KEYS[1]; the compare and the delete in one script
-  val ReleaseLua: String =
-    """
-      |return 0
-      |""".stripMargin
-
-  // KEYS[1] = lock:{name}   ARGV[1] = owner   ARGV[2] = ttlMs
-  // Pushes the lease only while the lock still belongs to this owner; 1 when it did, 0 otherwise.
-  // TODO: GET KEYS[1] == ARGV[1] → return PEXPIRE KEYS[1] ARGV[2]
-  val ExtendLua: String =
-    """
-      |return 0
-      |""".stripMargin
-
-  private val releaseSha: String = jedis.scriptLoad(ReleaseLua)
-  private val extendSha: String = jedis.scriptLoad(ExtendLua)
-
-  def lockKey(name: String): String = s"lock:$name"
-
-  /** True when this owner now holds lock:{name} for ttlMs; false while anyone holds it. */
-  def acquire(name: String, owner: String, ttlMs: Long): Boolean =
-    ??? // TODO: one SET with nx() and px(ttlMs); true only when the reply is not null
-
-  /** True when the lock was held by this owner and is now free; false otherwise, touching nothing. */
-  def release(name: String, owner: String): Boolean =
-    ??? // TODO: evalsha(releaseSha, keys = lockKey(name), args = owner) == 1
-
-  /** True when the lock was held by this owner and now lives ttlMs from now; false otherwise. */
-  def extend(name: String, owner: String, ttlMs: Long): Boolean =
-    ??? // TODO: evalsha(extendSha, keys = lockKey(name), args = owner, ttlMs) == 1
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import scala.jdk.CollectionConverters._
-
-/** A lock with a lease: SET NX PX to take it, compare-and-delete to give it back, compare-and-PEXPIRE to keep it. */
-object LeaseLock {
-  val jedis = new JedisPooled("redis", 6379)
-
-  // KEYS[1] = lock:{name}   ARGV[1] = owner
-  // Deletes the lock only while it still belongs to this owner; 1 when it did, 0 otherwise.
-  val ReleaseLua: String =
-    """
-      |if redis.call('GET', KEYS[1]) == ARGV[1] then
-      |  return redis.call('DEL', KEYS[1])
-      |end
-      |return 0
-      |""".stripMargin
-
-  // KEYS[1] = lock:{name}   ARGV[1] = owner   ARGV[2] = ttlMs
-  // Pushes the lease only while the lock still belongs to this owner; 1 when it did, 0 otherwise.
-  val ExtendLua: String =
-    """
-      |if redis.call('GET', KEYS[1]) == ARGV[1] then
-      |  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
-      |end
-      |return 0
-      |""".stripMargin
-
-  private val releaseSha: String = jedis.scriptLoad(ReleaseLua)
-  private val extendSha: String = jedis.scriptLoad(ExtendLua)
-
-  def lockKey(name: String): String = s"lock:$name"
-
-  /** True when this owner now holds lock:{name} for ttlMs; false while anyone holds it. */
-  def acquire(name: String, owner: String, ttlMs: Long): Boolean =
-    jedis.set(lockKey(name), owner, SetParams.setParams().nx().px(ttlMs)) != null
-
-  /** True when the lock was held by this owner and is now free; false otherwise, touching nothing. */
-  def release(name: String, owner: String): Boolean =
-    jedis.evalsha(releaseSha, List(lockKey(name)).asJava, List(owner).asJava).asInstanceOf[Long] == 1L
-
-  /** True when the lock was held by this owner and now lives ttlMs from now; false otherwise. */
-  def extend(name: String, owner: String, ttlMs: Long): Boolean =
-    jedis.evalsha(extendSha, List(lockKey(name)).asJava, List(owner, ttlMs.toString).asJava).asInstanceOf[Long] == 1L
 }
 `,
     },

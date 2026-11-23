@@ -57,7 +57,6 @@ from; and any caller reads any tenant's experiment.
         python: {all: [/@app\.get\(\s*["']\/v1\/shadow\/configs\/\{id\}\/report["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/shadow\/configs\/:id\/report['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/shadow\/configs\/\{id\}\/report"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"shadow"\s*\/\s*"configs"\s*\/\s*Segment\s*\/\s*"report"\s*\)/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/shadow\/configs/]},
       },
     },
@@ -70,7 +69,6 @@ from; and any caller reads any tenant's experiment.
         python: {all: [/MIN_PAIRED_SAMPLES\s*=\s*500\b/, /["']sample_count["']/, /[<>]=?\s*MIN_PAIRED_SAMPLES/]},
         typescript: {all: [/MIN_PAIRED_SAMPLES\s*=\s*500\b/, /sample_count/, /[<>]=?\s*MIN_PAIRED_SAMPLES/]},
         go: {all: [/minPairedSamples\s*=\s*500\b/, /"sample_count"/, /[<>]=?\s*minPairedSamples/]},
-        scala: {all: [/MinPairedSamples\s*=\s*500L?\b/, /"sample_count"/, /[<>]=?\s*MinPairedSamples/]},
         cpp: {all: [/kMinPairedSamples\s*=\s*500\b/, /"sample_count"/, /[<>]=?\s*kMinPairedSamples/]},
       },
     },
@@ -83,7 +81,6 @@ from; and any caller reads any tenant's experiment.
         python: {all: [/["']ci_low["']/, /["']ci_high["']/, /Z_95\s*=\s*1\.96\b/, /sqrt\(/]},
         typescript: {all: [/ci_low/, /ci_high/, /Z_95\s*=\s*1\.96\b/, /Math\.sqrt\(/]},
         go: {all: [/"ci_low"/, /"ci_high"/, /z95\s*=\s*1\.96\b/, /math\.Sqrt\(/]},
-        scala: {all: [/"ci_low"/, /"ci_high"/, /Z95\s*=\s*1\.96\b/, /math\.sqrt\(|Math\.sqrt\(/]},
         cpp: {all: [/"ci_low"/, /"ci_high"/, /kZ95\s*=\s*1\.96\b/, /std::sqrt\(/]},
       },
     },
@@ -96,7 +93,6 @@ from; and any caller reads any tenant's experiment.
         python: {all: [/["']window_start["']/, /["']window_end["']/, /first_at/]},
         typescript: {all: [/window_start/, /window_end/, /first_at/]},
         go: {all: [/"window_start"/, /"window_end"/, /FirstAt/]},
-        scala: {all: [/"window_start"/, /"window_end"/, /firstAt/]},
         cpp: {all: [/"window_start"/, /"window_end"/, /first_at/]},
       },
     },
@@ -109,7 +105,6 @@ from; and any caller reads any tenant's experiment.
         python: {all: [/x-tenant-id/i, /\b401\b/, /!=\s*tenant\b|\btenant\s*!=/]},
         typescript: {all: [/x-tenant-id/i, /\b401\b/, /!==\s*tenant\b|\btenant\s*!==/]},
         go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/, /!=\s*tenant\b|\btenant\s*!=/]},
-        scala: {all: [/X-Tenant-Id/i, /StatusCodes\.Unauthorized/, /!=\s*tenant\b|\btenant\s*!=/]},
         cpp: {all: [/X-Tenant-Id/i, /\b401\b/, /!=\s*tenant\b|\btenant\s*!=/]},
       },
     },
@@ -344,82 +339,6 @@ func shadowReport(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/shadow/configs/{id}/report", shadowReport)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import shadow.Store // Store.getConfig, pairStats
-
-object ShadowReport {
-  val route: Route = path("v1" / "shadow" / "configs" / Segment / "report") { id =>
-    get {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      Store.getConfig(id) match {
-        case None => complete(StatusCodes.NotFound -> "no such config")
-        case Some(config) =>
-          val delta = Store.pairStats(id).map(s => s.sum / s.n).getOrElse(0.0)
-          val verdict = if (delta > 0) "candidate_better" else "candidate_worse"
-          val body = JsObject(
-            "config_id" -> JsString(id),
-            "candidate_version" -> JsString(config.candidateVersion),
-            "delta" -> JsNumber(delta),
-            "verdict" -> JsString(verdict))
-          complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import shadow.Store // Store.getConfig, pairStats
-
-object ShadowReport {
-  val MinPairedSamples = 500L
-  val Z95 = 1.96
-
-  val route: Route = path("v1" / "shadow" / "configs" / Segment / "report") { id =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          Store.getConfig(id).filterNot(_.tenant != tenant) match {
-            // Another tenant's config answers like a missing one: the report confirms nothing about it.
-            case None => complete(StatusCodes.NotFound -> "no such config")
-            case Some(config) =>
-              val stats = Store.pairStats(id)
-              val n = stats.map(_.n).getOrElse(0L)
-              val mean = stats.filter(_.n > 0).map(s => s.sum / s.n).getOrElse(0.0)
-              val variance = stats.filter(_.n > 1).map(s => math.max(s.sumsq - s.n * mean * mean, 0.0) / (s.n - 1)).getOrElse(0.0)
-              val half = if (n > 0) Z95 * math.sqrt(variance / n) else 0.0
-              val (ciLow, ciHigh) = (mean - half, mean + half)
-              val verdict =
-                if (n < MinPairedSamples || (ciLow <= 0 && ciHigh >= 0)) "inconclusive"
-                else if (ciLow > 0) "candidate_better"
-                else "candidate_worse"
-              val body = JsObject(
-                "config_id" -> JsString(id),
-                "candidate_version" -> JsString(config.candidateVersion),
-                "sample_count" -> JsNumber(n),
-                "delta" -> JsNumber(mean),
-                "ci_low" -> JsNumber(ciLow),
-                "ci_high" -> JsNumber(ciHigh),
-                "window_start" -> stats.map(s => JsNumber(s.firstAt)).getOrElse(JsNull),
-                "window_end" -> stats.map(s => JsNumber(s.lastAt)).getOrElse(JsNull),
-                "verdict" -> JsString(verdict))
-              complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-          }
-      }
-    }
-  }
 }
 `,
     },

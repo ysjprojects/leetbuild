@@ -6,7 +6,7 @@ import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-dependency';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
-import {supportModulesCpp, supportModulesGo, supportModulesPy, supportModulesScala, supportModulesTs} from './support';
+import {supportModulesCpp, supportModulesGo, supportModulesPy, supportModulesTs} from './support';
 
 /**
  * GPU scheduler: the placement path of an AI platform, debugged before it hands a GPU to two
@@ -100,6 +100,5 @@ isolated and recoverable.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

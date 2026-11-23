@@ -69,7 +69,6 @@ in (\`run_at_ms\`, \`now_ms\`), never read from a clock.
         python: {all: [/r\.hset\(\s*"jobs:payload"/, /r\.zadd\(\s*"jobs:delayed"/]},
         typescript: {all: [/redis\.hset\(\s*'jobs:payload'/, /redis\.zadd\(\s*'jobs:delayed'/]},
         go: {all: [/rdb\.HSet\(ctx, "jobs:payload"/, /rdb\.ZAdd\(ctx, "jobs:delayed"/]},
-        scala: {all: [/jedis\.hset\("jobs:payload"/, /jedis\.zadd\("jobs:delayed"/]},
         cpp: {all: [/redis\.hset\("jobs:payload"/, /redis\.zadd\("jobs:delayed"/]},
       },
     },
@@ -82,7 +81,6 @@ in (\`run_at_ms\`, \`now_ms\`), never read from a clock.
         python: {all: [LUA_ZRANGEBYSCORE]},
         typescript: {all: [LUA_ZRANGEBYSCORE]},
         go: {all: [LUA_ZRANGEBYSCORE]},
-        scala: {all: [LUA_ZRANGEBYSCORE]},
         cpp: {all: [LUA_ZRANGEBYSCORE]},
       },
     },
@@ -107,11 +105,6 @@ in (\`run_at_ms\`, \`now_ms\`), never read from a clock.
           all: [/redis\.NewScript\(popLua\)/, /popScript\.Run\(ctx, rdb, keys, nowMs, limit\)/],
           none: [/rdb\.ZRangeByScore\(/, /rdb\.ZRem\(/],
         },
-        scala: {
-          order: [LUA_ZRANGEBYSCORE, LUA_ZREM, LUA_HGET_PAYLOAD, LUA_HGET_ATTEMPTS],
-          all: [/jedis\.eval\(PopLua, keys, args\)/],
-          none: [/jedis\.zrangeByScore\(/, /jedis\.zrem\(/],
-        },
         cpp: {
           order: [LUA_ZRANGEBYSCORE, LUA_ZREM, LUA_HGET_PAYLOAD, LUA_HGET_ATTEMPTS],
           all: [/redis\.eval<std::vector<std::string>>\(kPopLua,/],
@@ -128,7 +121,6 @@ in (\`run_at_ms\`, \`now_ms\`), never read from a clock.
         python: {all: [/r\.hincrby\(\s*"jobs:attempts"/, />=\s*MAX_ATTEMPTS/, /r\.rpush\(\s*"jobs:dead"/]},
         typescript: {all: [/redis\.hincrby\(\s*'jobs:attempts'/, />=\s*MAX_ATTEMPTS/, /redis\.rpush\(\s*'jobs:dead'/]},
         go: {all: [/rdb\.HIncrBy\(ctx, "jobs:attempts"/, />=\s*maxAttempts/, /rdb\.RPush\(ctx, "jobs:dead"/]},
-        scala: {all: [/jedis\.hincrBy\("jobs:attempts"/, />=\s*MaxAttempts/, /jedis\.rpush\("jobs:dead"/]},
         cpp: {all: [/redis\.hincrby\("jobs:attempts"/, />=\s*kMaxAttempts/, /redis\.rpush\("jobs:dead"/]},
       },
     },
@@ -141,7 +133,6 @@ in (\`run_at_ms\`, \`now_ms\`), never read from a clock.
         python: {all: [/min\(/, /MAX_BACKOFF_MS/, /2\s*\*\*\s*\(attempt - 1\)/]},
         typescript: {all: [/Math\.min\(/, /MAX_BACKOFF_MS/, /2\s*\*\*\s*\(attempt - 1\)/]},
         go: {all: [/min\(/, /maxBackoffMs/]},
-        scala: {all: [/math\.min\(/, /MaxBackoffMs/, /math\.pow\(2/]},
         cpp: {all: [/std::min\(/, /kMaxBackoffMs/, /std::pow\(2/]},
       },
     },
@@ -154,7 +145,6 @@ in (\`run_at_ms\`, \`now_ms\`), never read from a clock.
         python: {all: [/r\.hdel\(\s*"jobs:payload"/, /r\.hdel\(\s*"jobs:attempts"/]},
         typescript: {all: [/redis\.hdel\(\s*'jobs:payload'/, /redis\.hdel\(\s*'jobs:attempts'/]},
         go: {all: [/rdb\.HDel\(ctx, "jobs:payload"/, /rdb\.HDel\(ctx, "jobs:attempts"/]},
-        scala: {all: [/jedis\.hdel\("jobs:payload"/, /jedis\.hdel\("jobs:attempts"/]},
         cpp: {all: [/redis\.hdel\("jobs:payload"/, /redis\.hdel\("jobs:attempts"/]},
       },
     },
@@ -549,125 +539,6 @@ func complete(ctx context.Context, jobID string) error {
 		return err
 	}
 	return rdb.HDel(ctx, "jobs:attempts", jobID).Err()
-}
-`,
-    },
-    scala: {
-      starter: `import scala.jdk.CollectionConverters._
-
-import redis.clients.jedis.JedisPooled
-
-/** Delayed jobs in Redis: a due-time sorted set, an atomic pop, exponential backoff, a dead list. */
-object DelayedJobs {
-  val jedis = new JedisPooled("redis", 6379)
-  val MaxAttempts = 5
-  val BaseMs = 1000L
-  val MaxBackoffMs = 60000L
-
-  // KEYS[1] = jobs:delayed   KEYS[2] = jobs:payload   KEYS[3] = jobs:attempts
-  // ARGV[1] = now_ms   ARGV[2] = limit
-  // Returns a flat list: id, payload, attempts, id, payload, attempts…
-  val PopLua: String =
-    """
-      |return {}
-      |""".stripMargin
-
-  /** One due job: its id, payload and failures so far. */
-  case class Job(id: String, payload: String, attempt: Int)
-
-  /** HSET the payload, ZADD the id at runAtMs. */
-  def schedule(jobId: String, payload: String, runAtMs: Long): Unit = {
-    ??? // TODO
-  }
-
-  /** Up to limit jobs due at nowMs, earliest first, each removed from jobs:delayed by the script. */
-  def popDue(nowMs: Long, limit: Int): List[Job] = {
-    ??? // TODO: PopLua — ZRANGEBYSCORE … LIMIT, ZREM each, HGET payload and attempts; split the reply in threes
-  }
-
-  /** 1 s, 2 s, 4 s … capped at MaxBackoffMs. */
-  def backoffMs(attempt: Int): Long = {
-    ??? // TODO
-  }
-
-  /** Count the failure; reschedule with backoff and return the new runAtMs, or move to jobs:dead and return None. */
-  def fail(jobId: String, nowMs: Long): Option[Long] = {
-    ??? // TODO: HINCRBY jobs:attempts; >= MaxAttempts → RPUSH jobs:dead + HDEL attempts; else ZADD now + backoff
-  }
-
-  /** Forget the job: payload and attempts. */
-  def complete(jobId: String): Unit = {
-    ??? // TODO
-  }
-}
-`,
-      solution: `import scala.jdk.CollectionConverters._
-
-import redis.clients.jedis.JedisPooled
-
-/** Delayed jobs in Redis: a due-time sorted set, an atomic pop, exponential backoff, a dead list. */
-object DelayedJobs {
-  val jedis = new JedisPooled("redis", 6379)
-  val MaxAttempts = 5
-  val BaseMs = 1000L
-  val MaxBackoffMs = 60000L
-
-  // KEYS[1] = jobs:delayed   KEYS[2] = jobs:payload   KEYS[3] = jobs:attempts
-  // ARGV[1] = now_ms   ARGV[2] = limit
-  // Returns a flat list: id, payload, attempts, id, payload, attempts…
-  val PopLua: String =
-    """
-      |local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
-      |local out = {}
-      |for _, id in ipairs(due) do
-      |  redis.call('ZREM', KEYS[1], id)
-      |  out[#out + 1] = id
-      |  out[#out + 1] = redis.call('HGET', KEYS[2], id) or ''
-      |  out[#out + 1] = redis.call('HGET', KEYS[3], id) or '0'
-      |end
-      |return out
-      |""".stripMargin
-
-  /** One due job: its id, payload and failures so far. */
-  case class Job(id: String, payload: String, attempt: Int)
-
-  /** HSET the payload, ZADD the id at runAtMs. */
-  def schedule(jobId: String, payload: String, runAtMs: Long): Unit = {
-    jedis.hset("jobs:payload", jobId, payload)
-    jedis.zadd("jobs:delayed", runAtMs.toDouble, jobId)
-  }
-
-  /** Up to limit jobs due at nowMs, earliest first, each removed from jobs:delayed by the script. */
-  def popDue(nowMs: Long, limit: Int): List[Job] = {
-    val keys = List("jobs:delayed", "jobs:payload", "jobs:attempts").asJava
-    val args = List(nowMs.toString, limit.toString).asJava
-    val flat = jedis.eval(PopLua, keys, args).asInstanceOf[java.util.List[AnyRef]].asScala.map(_.toString).toList
-    flat.grouped(3).collect { case List(id, payload, attempts) => Job(id, payload, attempts.toInt) }.toList
-  }
-
-  /** 1 s, 2 s, 4 s … capped at MaxBackoffMs. */
-  def backoffMs(attempt: Int): Long =
-    math.min(BaseMs * math.pow(2, attempt - 1), MaxBackoffMs.toDouble).toLong
-
-  /** Count the failure; reschedule with backoff and return the new runAtMs, or move to jobs:dead and return None. */
-  def fail(jobId: String, nowMs: Long): Option[Long] = {
-    val attempt = jedis.hincrBy("jobs:attempts", jobId, 1L)
-    if (attempt >= MaxAttempts) {
-      jedis.rpush("jobs:dead", jobId)
-      jedis.hdel("jobs:attempts", jobId)
-      None
-    } else {
-      val runAtMs = nowMs + backoffMs(attempt.toInt)
-      jedis.zadd("jobs:delayed", runAtMs.toDouble, jobId)
-      Some(runAtMs)
-    }
-  }
-
-  /** Forget the job: payload and attempts. */
-  def complete(jobId: String): Unit = {
-    jedis.hdel("jobs:payload", jobId)
-    jedis.hdel("jobs:attempts", jobId)
-  }
 }
 `,
     },

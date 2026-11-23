@@ -54,7 +54,6 @@ cache as a real vector.
         python: {all: [/@app\.get\(\s*["']\/v1\/embeddings\/\{/, /cache\.read_vector\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/embeddings\/:/, /cache\.readVector\(/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/embeddings\/\{/, /cache\.ReadVector\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"embeddings"\s*\/\s*Segment\s*\)/, /Cache\.readVector\(/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/embeddings\//, /cache::readVector\(/]},
       },
     },
@@ -66,7 +65,6 @@ cache as a real vector.
         python: {all: [/x-tenant-id/i, /\b401\b/]},
         typescript: {all: [/x-tenant-id/i, /code\(\s*401\s*\)/]},
         go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/X-Tenant-Id/i, /StatusCodes\.Unauthorized/]},
         cpp: {all: [/X-Tenant-Id/i, /\b401\b/]},
       },
     },
@@ -79,7 +77,6 @@ cache as a real vector.
         python: {none: [/\.keys\(|scan_iter\(|\.scan\(/]},
         typescript: {none: [/\.keys\(|\.scan\(|scanStream\(/]},
         go: {none: [/\.Keys\(|\.Scan\(/]},
-        scala: {none: [/\.keys\(|\.scan\(/]},
         cpp: {none: [/\.keys\(|\.scan\(/]},
       },
     },
@@ -92,7 +89,6 @@ cache as a real vector.
         python: {all: [/\b404\b/, /not_embedded/]},
         typescript: {all: [/code\(\s*404\s*\)/, /not_embedded/]},
         go: {all: [/StatusNotFound|\b404\b/, /not_embedded/]},
-        scala: {all: [/StatusCodes\.NotFound/, /not_embedded/]},
         cpp: {all: [/\b404\b/, /not_embedded/]},
       },
     },
@@ -104,7 +100,6 @@ cache as a real vector.
         python: {all: [/["']dimension["']/, /["']model_version["']/]},
         typescript: {all: [/\bdimension:/, /\bmodel_version:/]},
         go: {all: [/"dimension"/, /"model_version"/]},
-        scala: {all: [/"dimension"/, /"model_version"/]},
         cpp: {all: [/"dimension"/, /"model_version"/]},
       },
     },
@@ -289,78 +284,6 @@ func readEmbedding(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/embeddings/{hash}", readEmbedding)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import embedding.{Cache, Config} // Cache.readVector, Config.ModelVersion — provided
-
-object ReadApi {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  def read(tenant: String, version: String, digest: String): HttpResponse = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val vector = Cache.readVector(tenant, version, digest).orElse {
-      jedis.keys(s"emb:*:$digest").asScala.headOption.flatMap(key => Option(jedis.get(key))).map(raw => ujson.read(raw).arr.map(_.num.toFloat).toSeq)
-    }
-    val body = ujson.Obj("content_hash" -> digest, "vector" -> ujson.Arr.from(vector.getOrElse(Seq.empty[Float]).map(v => ujson.Num(v.toDouble))))
-    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
-  }
-
-  val route: Route = path("v1" / "embeddings" / Segment) { digest =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        parameter("model_version".optional) { version =>
-          complete(read(tenant.getOrElse(""), version.getOrElse(Config.ModelVersion), digest))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import embedding.{Cache, Config} // Cache.readVector, Config.ModelVersion — provided
-
-object ReadApi {
-  private def json(status: StatusCode, body: ujson.Value): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
-
-  def read(tenant: String, version: String, digest: String): HttpResponse = {
-    if (tenant.isEmpty) return json(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing_tenant"))
-    Cache.readVector(tenant, version, digest) match { // the exact key: this tenant, this model
-      case None => json(StatusCodes.NotFound, ujson.Obj("error" -> "not_embedded", "content_hash" -> digest, "model_version" -> version))
-      case Some(vector) =>
-        json(
-          StatusCodes.OK,
-          ujson.Obj(
-            "content_hash" -> digest,
-            "model_version" -> version,
-            "dimension" -> vector.size,
-            "vector" -> ujson.Arr.from(vector.map(v => ujson.Num(v.toDouble)))
-          )
-        )
-    }
-  }
-
-  val route: Route = path("v1" / "embeddings" / Segment) { digest =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        parameter("model_version".optional) { version =>
-          complete(read(tenant.getOrElse(""), version.getOrElse(Config.ModelVersion), digest))
-        }
-      }
-    }
-  }
 }
 `,
     },

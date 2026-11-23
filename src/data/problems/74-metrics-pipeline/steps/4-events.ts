@@ -54,10 +54,6 @@ leaves nothing behind; and a lost acknowledgement writes the event twice.
         python: {all: [/def event_key\(/, /key=event_key\(/], none: [/key=shard_for\(/]},
         typescript: {all: [/eventKey\s*=|function eventKey/, /key:\s*eventKey\(/], none: [/key:\s*shardFor\(/]},
         go: {all: [/func eventKey\(/, /Key:\s*\[\]byte\(eventKey\(w\)\)/], none: [/Key:\s*\[\]byte\(model\.ShardFor/]},
-        scala: {
-          all: [/def eventKey\(/, /ProducerRecord\[String, String\]\(Topic,\s*eventKey\(w\)/],
-          none: [/Topic,\s*shardFor\(/],
-        },
         cpp: {all: [/std::string eventKey\(/, /key = eventKey\(w\)/], none: [/key = metrics::shardFor\(/]},
       },
     },
@@ -70,7 +66,6 @@ leaves nothing behind; and a lost acknowledgement writes the event twice.
         python: {all: [/["']accepted["']/], order: [/flush_windows\(windows\)/, /producer\.produce\(/]},
         typescript: {all: [/\.accepted\b/], order: [/flushWindows\(windows\)/, /producer\.send\(/]},
         go: {all: [/\.Accepted\b/], order: [/flush\.FlushWindows\(/, /producer\.Produce\(/]},
-        scala: {all: [/\.accepted\b/], order: [/Flush\.flushWindows\(/, /producer\.send\(/]},
         cpp: {all: [/\.accepted\b/], order: [/metrics::flushWindows\(/, /producer->produce\(/]},
       },
     },
@@ -83,7 +78,6 @@ leaves nothing behind; and a lost acknowledgement writes the event twice.
         python: {all: [/["']window_start["']/, /["']window_end["']/, /["']count["']/]},
         typescript: {all: [/window_start:/, /window_end:/, /count:/]},
         go: {all: [/"window_start"/, /"window_end"/, /"count"/]},
-        scala: {all: [/"window_start"/, /"window_end"/, /"count"/]},
         cpp: {all: [/"window_start"/, /"window_end"/, /"count"/]},
       },
     },
@@ -102,7 +96,6 @@ leaves nothing behind; and a lost acknowledgement writes the event twice.
           none: [/void producer\.send\(/],
         },
         go: {all: [/TopicPartition\.Error/, /time\.After\(\s*ackTimeout/, /outbox\.Insert\(/]},
-        scala: {all: [/Outbox\.insert\(/, /\.get\([^\n]*TimeUnit/], none: [/case _: KafkaException/]},
         cpp: {all: [/dr_cb/, /->flush\(\s*kAckTimeoutMs/, /metrics::outboxInsert\(/]},
       },
     },
@@ -115,7 +108,6 @@ leaves nothing behind; and a lost acknowledgement writes the event twice.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -434,98 +426,6 @@ func publishRollups(ctx context.Context, windows []model.Window) (int, error) {
 		}
 	}
 	return published, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.KafkaException
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import metrics.Model.{Window, WindowSeconds, shardFor, windowId}
-import metrics.{Flush, Outbox} // Flush.flushWindows(windows): FlushResult · Outbox.insert(topic, key, payload)
-
-object Events {
-  val Topic = "metrics.rolled"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def rollupEvent(w: Window): JsObject =
-    JsObject("window_id" -> JsString(windowId(w)), "series" -> JsString(w.series), "start" -> JsNumber(w.start), "sum" -> JsNumber(w.sum))
-
-  /** Flush the closed windows to the shard writers and announce each rollup; the events published. */
-  def publishRollups(windows: Seq[Window]): Int = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    var published = 0
-    windows.foreach { w =>
-      val event = rollupEvent(w)
-      try {
-        producer.send(new ProducerRecord[String, String](Topic, shardFor(w.series), event.compactPrint))
-        published += 1
-      } catch { case _: KafkaException => Outbox.insert(Topic, shardFor(w.series), event) }
-    }
-    Flush.flushWindows(windows)
-    published
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import metrics.Model.{Window, WindowSeconds, windowId}
-import metrics.{Flush, Outbox} // Flush.flushWindows(windows): FlushResult · Outbox.insert(topic, key, payload)
-
-object Events {
-  val Topic = "metrics.rolled"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the event before the broker answers
-    props.put("enable.idempotence", "true") // a retry after a lost acknowledgement writes the event once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def eventKey(w: Window): String = s"\${w.tenant}/\${w.series}"
-
-  def rollupEvent(w: Window): JsObject = JsObject(
-    "window_id" -> JsString(windowId(w)),
-    "tenant" -> JsString(w.tenant),
-    "series" -> JsString(w.series),
-    "window_start" -> JsNumber(w.start),
-    "window_end" -> JsNumber(w.start + WindowSeconds),
-    "count" -> JsNumber(w.count),
-    "sum" -> JsNumber(w.sum)
-  )
-
-  /** Flush the closed windows, then announce the ones a shard accepted; the events the broker acknowledged. */
-  def publishRollups(windows: Seq[Window]): Int = {
-    val accepted = Flush.flushWindows(windows).accepted.toSet
-    val confirmed = windows.filter(w => accepted(windowId(w))) // pending windows go out with the next tick
-    val sends = confirmed.map(w => w -> producer.send(new ProducerRecord[String, String](Topic, eventKey(w), rollupEvent(w).compactPrint)))
-    val deadline = System.currentTimeMillis() + AckTimeoutMs
-    sends.count { case (w, ack) =>
-      val delivered = Try(ack.get(math.max(0L, deadline - System.currentTimeMillis()), TimeUnit.MILLISECONDS)).isSuccess
-      // Failed or not acknowledged in time: the relay publishes the row once the broker is back.
-      if (!delivered) Outbox.insert(Topic, eventKey(w), rollupEvent(w))
-      delivered
-    }
-  }
 }
 `,
     },

@@ -37,8 +37,7 @@ calls \`TIME\`.
   the same millisecond — from the same instance or another one — are two members, never one
   overwritten score.
 - The script is **loaded once** at import (\`register_script\` / \`defineCommand\` / \`redis.NewScript\` /
-  \`scriptLoad\` / \`script_load\`) and called by SHA; each \`allow\` is exactly one \`EVALSHA\`/\`EVAL\`
-  after the first.
+  \`script_load\`) and called by SHA; each \`allow\` is exactly one \`EVALSHA\`/\`EVAL\` after the first.
 - \`allowed\` is a bool; \`retry_after_ms\` is an int, \`0\` when allowed.
 
 > Three commands from the client are three chances for another instance to land between them.
@@ -90,14 +89,6 @@ calls \`TIME\`.
           ],
           none: [/rdb\.ZRemRangeByScore\(/, /rdb\.ZCard\(/, /rdb\.ZAdd\(/],
         },
-        scala: {
-          all: [
-            /redis\.call\(\s*['"]ZREMRANGEBYSCORE['"]/,
-            /redis\.call\(\s*['"]ZCARD['"]/,
-            /redis\.call\(\s*['"]ZADD['"]/,
-          ],
-          none: [/jedis\.zremrangeByScore\(/, /jedis\.zcard\(/, /jedis\.zadd\(/],
-        },
         cpp: {
           all: [
             /redis\.call\(\s*['"]ZREMRANGEBYSCORE['"]/,
@@ -132,12 +123,6 @@ calls \`TIME\`.
             /redis\.call\(\s*['"]ZRANGE['"]\s*,\s*key\s*,\s*0\s*,\s*0\s*,\s*['"]WITHSCORES['"]/,
           ],
         },
-        scala: {
-          all: [
-            /count\s*<\s*limit/,
-            /redis\.call\(\s*['"]ZRANGE['"]\s*,\s*key\s*,\s*0\s*,\s*0\s*,\s*['"]WITHSCORES['"]/,
-          ],
-        },
         cpp: {
           all: [
             /count\s*<\s*limit/,
@@ -161,9 +146,6 @@ calls \`TIME\`.
         go: {
           all: [/redis\.call\(\s*['"]ZREMRANGEBYSCORE['"]\s*,\s*key\s*,\s*['"]-inf['"]\s*,\s*now\s*-\s*window\s*\)/],
         },
-        scala: {
-          all: [/redis\.call\(\s*['"]ZREMRANGEBYSCORE['"]\s*,\s*key\s*,\s*['"]-inf['"]\s*,\s*now\s*-\s*window\s*\)/],
-        },
         cpp: {
           all: [/redis\.call\(\s*['"]ZREMRANGEBYSCORE['"]\s*,\s*key\s*,\s*['"]-inf['"]\s*,\s*now\s*-\s*window\s*\)/],
         },
@@ -178,7 +160,6 @@ calls \`TIME\`.
         python: {all: [/redis\.call\(\s*['"]PEXPIRE['"]\s*,\s*key\s*,\s*window\s*\)/]},
         typescript: {all: [/redis\.call\(\s*['"]PEXPIRE['"]\s*,\s*key\s*,\s*window\s*\)/]},
         go: {all: [/redis\.call\(\s*['"]PEXPIRE['"]\s*,\s*key\s*,\s*window\s*\)/]},
-        scala: {all: [/redis\.call\(\s*['"]PEXPIRE['"]\s*,\s*key\s*,\s*window\s*\)/]},
         cpp: {all: [/redis\.call\(\s*['"]PEXPIRE['"]\s*,\s*key\s*,\s*window\s*\)/]},
       },
     },
@@ -191,7 +172,6 @@ calls \`TIME\`.
         python: {all: [/register_script\(/]},
         typescript: {all: [/defineCommand\(/]},
         go: {all: [/redis\.NewScript\(/, /\.Run\(/]},
-        scala: {all: [/scriptLoad\(/, /evalsha\(/]},
         cpp: {all: [/script_load\(/, /evalsha/]},
       },
     },
@@ -204,7 +184,6 @@ calls \`TIME\`.
         python: {all: [/uuid4\(\)|token_hex\(|getrandbits\(|randbytes\(/]},
         typescript: {all: [/randomUUID\(\)|randomBytes\(/]},
         go: {all: [/rand\.\w+\(/]},
-        scala: {all: [/UUID\.randomUUID\(\)|Random/]},
         cpp: {all: [/random_device|mt19937/]},
       },
     },
@@ -421,76 +400,6 @@ func allow(ctx context.Context, clientID string, nowMs int64) (bool, int64, erro
 func main() {
 	ok, retry, err := allow(context.Background(), "demo", 0)
 	fmt.Println(ok, retry, err)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import scala.jdk.CollectionConverters._
-
-import redis.clients.jedis.JedisPooled
-
-/** A sliding-window log limiter: Limit calls per WindowMs, per client, decided inside Redis. */
-object SlidingWindow {
-  val jedis = new JedisPooled("redis", 6379)
-  val Limit = 10
-  val WindowMs = 1000L
-
-  // TODO: Lua — KEYS[1] = key; ARGV = nowMs, WindowMs, Limit, member (bind as now, window, limit, member).
-  // ZREMRANGEBYSCORE key -inf (now - window); count = ZCARD; count < limit → ZADD now member, PEXPIRE window,
-  // return {1, 0}; else ZRANGE key 0 0 WITHSCORES → return {0, oldest + window - now}.
-  val Script: String = ""
-  // TODO: private val sha = jedis.scriptLoad(Script) — loaded once, evalsha per call
-
-  /** One round trip: (allowed, retryAfterMs) for clientId at nowMs. */
-  def allow(clientId: String, nowMs: Long): (Boolean, Long) = {
-    val key = s"sw:$clientId"
-    val member = s"$nowMs-\${UUID.randomUUID()}"
-    // TODO: this is four round trips and a race between instances — move it into Script and evalsha once
-    jedis.zremrangeByScore(key, "-inf", (nowMs - WindowMs).toString)
-    if (jedis.zcard(key) < Limit) {
-      jedis.zadd(key, nowMs.toDouble, member)
-      jedis.pexpire(key, WindowMs)
-      (true, 0L)
-    } else {
-      val oldest = jedis.zrangeWithScores(key, 0, 0).asScala.head
-      (false, oldest.getScore.toLong + WindowMs - nowMs)
-    }
-  }
-
-  def main(args: Array[String]): Unit = println(allow("demo", 0L))
-}
-`,
-      solution: `import java.util.UUID
-
-import scala.jdk.CollectionConverters._
-
-import redis.clients.jedis.JedisPooled
-
-/** A sliding-window log limiter: Limit calls per WindowMs, per client, decided inside Redis. */
-object SlidingWindow {
-  val jedis = new JedisPooled("redis", 6379)
-  val Limit = 10
-  val WindowMs = 1000L
-
-  // KEYS[1] = sw:{clientId}; ARGV = nowMs, WindowMs, Limit, member. Returns {allowed, retryAfterMs}.
-  val Script: String =
-    """${LUA.split('\n').join('\n      |')}
-      |""".stripMargin
-  // Loaded once: every call is an EVALSHA.
-  private val sha = jedis.scriptLoad(Script)
-
-  /** One round trip: (allowed, retryAfterMs) for clientId at nowMs. */
-  def allow(clientId: String, nowMs: Long): (Boolean, Long) = {
-    val key = s"sw:$clientId"
-    val member = s"$nowMs-\${UUID.randomUUID()}"
-    val args = List(nowMs.toString, WindowMs.toString, Limit.toString, member).asJava
-    val reply = jedis.evalsha(sha, List(key).asJava, args).asInstanceOf[java.util.List[java.lang.Long]].asScala
-    (reply(0) == 1L, reply(1).longValue)
-  }
-
-  def main(args: Array[String]): Unit = println(allow("demo", 0L))
 }
 `,
     },

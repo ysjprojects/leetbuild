@@ -57,7 +57,6 @@ lost it.
         python: {all: [/register_script\(|\.eval\(/, /HINCRBY/], none: [/\.hincrby\(/, /\.hdel\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /HINCRBY/], none: [/\.hincrby\(/, /\.hdel\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /HINCRBY/], none: [/\.HIncrBy\(/, /\.HDel\(/]},
-        scala: {all: [/\.eval\(/, /HINCRBY/], none: [/\.hincrBy\(/, /\.hdel\(/]},
         cpp: {all: [/\.eval/, /HINCRBY/], none: [/\.hincrby\(/, /\.hdel\(/]},
       },
     },
@@ -70,7 +69,6 @@ lost it.
         python: {all: [/HEXISTS|HSETNX/]},
         typescript: {all: [/HEXISTS|HSETNX/]},
         go: {all: [/HEXISTS|HSETNX/]},
-        scala: {all: [/HEXISTS|HSETNX/]},
         cpp: {all: [/HEXISTS|HSETNX/]},
       },
     },
@@ -83,7 +81,6 @@ lost it.
         python: {all: [/HINCRBY/], none: [/\bexpire\b/i, /setex/i]},
         typescript: {all: [/HINCRBY/], none: [/\bexpire\b/i, /setex/i]},
         go: {all: [/HINCRBY/], none: [/\bexpire\b/i, /setex/i]},
-        scala: {all: [/HINCRBY/], none: [/\bexpire\b/i, /setex/i]},
         cpp: {all: [/HINCRBY/], none: [/\bexpire\b/i, /setex/i]},
       },
     },
@@ -96,7 +93,6 @@ lost it.
         python: {all: [/REJECTED/, /records\.list_refunds\(/]},
         typescript: {all: [/REJECTED/, /listRefunds\(/]},
         go: {all: [/REJECTED/, /records\.ListRefunds\(/]},
-        scala: {all: [/REJECTED/, /Records\.listRefunds\(/]},
         cpp: {all: [/REJECTED/, /records::listRefunds\(/]},
       },
     },
@@ -501,121 +497,6 @@ func rebuild(ctx context.Context, paymentID string) (int64, error) {
 	}
 	args := append([]any{"total", total}, fields...)
 	return rebuildScript.Run(ctx, rdb, []string{ledgerKey(paymentID)}, args...).Int64()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import refunds.Records // Records.listRefunds
-
-object State {
-  final case class ClaimResult(accepted: Boolean, refundedMinor: Long, remainingMinor: Long)
-
-  val jedis = new JedisPooled("redis", 6379)
-  val DayS = 86400L
-
-  def ledgerKey(paymentId: String): String = s"refunded:$paymentId"
-
-  def refundedTotal(paymentId: String): Long = Option(jedis.hget(ledgerKey(paymentId), "total")).map(_.toLong).getOrElse(0L)
-
-  /** Reserve amountMinor for refundId if the total stays within capMinor. */
-  def claim(paymentId: String, refundId: String, amountMinor: Long, capMinor: Long): ClaimResult = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val key = ledgerKey(paymentId)
-    val total = refundedTotal(paymentId)
-    if (total + amountMinor > capMinor) ClaimResult(accepted = false, total, capMinor - total)
-    else {
-      jedis.hset(key, refundId, amountMinor.toString)
-      val after = jedis.hincrBy(key, "total", amountMinor)
-      jedis.expire(key, DayS) // keep Redis small: the records are the ledger of record
-      ClaimResult(accepted = true, after, capMinor - after)
-    }
-  }
-
-  /** Give back what refundId reserved; the total left. */
-  def release(paymentId: String, refundId: String): Long = {
-    val key = ledgerKey(paymentId)
-    Option(jedis.hget(key, refundId)) match {
-      case None => refundedTotal(paymentId)
-      case Some(held) =>
-        jedis.hdel(key, refundId)
-        jedis.hincrBy(key, "total", -held.toLong)
-    }
-  }
-
-  /** Rewrite the ledger from the refund records. */
-  def rebuild(paymentId: String): Long = {
-    val rows = Records.listRefunds(paymentId)
-    val total = rows.map(_.amountMinor).sum
-    val key = ledgerKey(paymentId)
-    jedis.del(key)
-    jedis.hset(key, (Map("total" -> total.toString) ++ rows.map(row => row.refundId -> row.amountMinor.toString)).asJava)
-    total
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import refunds.Records // Records.listRefunds
-
-object State {
-  final case class ClaimResult(accepted: Boolean, refundedMinor: Long, remainingMinor: Long)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** KEYS[1] ledger; ARGV refund_id, amount_minor, cap_minor → {accepted, refunded_minor, remaining_minor} */
-  val ClaimLua: String =
-    """local cap = tonumber(ARGV[3])
-      |local total = tonumber(redis.call('HGET', KEYS[1], 'total') or '0')
-      |if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then return {1, total, cap - total} end
-      |local amount = tonumber(ARGV[2])
-      |if total + amount > cap then return {0, total, cap - total} end
-      |redis.call('HSET', KEYS[1], ARGV[1], amount)
-      |total = redis.call('HINCRBY', KEYS[1], 'total', amount)
-      |return {1, total, cap - total}
-      |""".stripMargin
-
-  /** KEYS[1] ledger; ARGV refund_id → the total left */
-  val ReleaseLua: String =
-    """local held = redis.call('HGET', KEYS[1], ARGV[1])
-      |if not held then return tonumber(redis.call('HGET', KEYS[1], 'total') or '0') end
-      |redis.call('HDEL', KEYS[1], ARGV[1])
-      |return redis.call('HINCRBY', KEYS[1], 'total', -tonumber(held))
-      |""".stripMargin
-
-  /** KEYS[1] ledger; ARGV field, value, field, value, … → the total written */
-  val RebuildLua: String =
-    """redis.call('DEL', KEYS[1])
-      |for i = 1, #ARGV, 2 do redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1]) end
-      |return tonumber(redis.call('HGET', KEYS[1], 'total'))
-      |""".stripMargin
-
-  def ledgerKey(paymentId: String): String = s"refunded:$paymentId"
-
-  def refundedTotal(paymentId: String): Long = Option(jedis.hget(ledgerKey(paymentId), "total")).map(_.toLong).getOrElse(0L)
-
-  /** Reserve amountMinor for refundId if the total stays within capMinor. */
-  def claim(paymentId: String, refundId: String, amountMinor: Long, capMinor: Long): ClaimResult = {
-    val out = jedis.eval(ClaimLua, List(ledgerKey(paymentId)).asJava, List(refundId, amountMinor.toString, capMinor.toString).asJava)
-      .asInstanceOf[java.util.List[java.lang.Long]].asScala.map(_.longValue)
-    ClaimResult(out(0) == 1L, out(1), out(2))
-  }
-
-  /** Give back what refundId reserved; the total left. */
-  def release(paymentId: String, refundId: String): Long =
-    jedis.eval(ReleaseLua, List(ledgerKey(paymentId)).asJava, List(refundId).asJava).asInstanceOf[java.lang.Long].longValue
-
-  /** Rewrite the ledger from the refund records: a REJECTED refund holds nothing. */
-  def rebuild(paymentId: String): Long = {
-    val held = Records.listRefunds(paymentId).filter(_.status != "REJECTED")
-    val args = Seq("total", held.map(_.amountMinor).sum.toString) ++ held.flatMap(row => Seq(row.refundId, row.amountMinor.toString))
-    jedis.eval(RebuildLua, List(ledgerKey(paymentId)).asJava, args.asJava).asInstanceOf[java.lang.Long].longValue
-  }
 }
 `,
     },

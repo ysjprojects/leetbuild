@@ -62,7 +62,6 @@ player ends up in two games.
         python: {all: [/@app\.post\(\s*["']\/v1\/matchmaking\/tickets["']/, /store\.enqueue\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/matchmaking\/tickets['"]/, /enqueue\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/matchmaking\/tickets"/, /store\.Enqueue\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"matchmaking"\s*\/\s*"tickets"\s*\)/, /\bpost\s*\{/, /Store\.enqueue\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/matchmaking\/tickets"/, /store::enqueue\(/]},
       },
     },
@@ -75,7 +74,6 @@ player ends up in two games.
         python: {all: [/x-player-id/i, /\b401\b/]},
         typescript: {all: [/x-player-id/i, /code\(\s*401\s*\)/]},
         go: {all: [/X-Player-Id/i, /StatusUnauthorized|\b401\b/]},
-        scala: {all: [/X-Player-Id/i, /Unauthorized|\b401\b/]},
         cpp: {all: [/X-Player-Id/i, /\b401\b/]},
       },
     },
@@ -87,7 +85,6 @@ player ends up in two games.
         python: {all: [/MAX_PARTY_SIZE\s*=\s*5\b/, /len\([^)\n]*party\)\s*>\s*MAX_PARTY_SIZE/, /\b400\b/]},
         typescript: {all: [/MAX_PARTY_SIZE\s*=\s*5\b/, /party\.length\s*>\s*MAX_PARTY_SIZE/, /code\(\s*400\s*\)/]},
         go: {all: [/maxPartySize\s*=\s*5\b/, /len\([^)\n]*Party\)\s*>\s*maxPartySize/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/MaxPartySize\s*=\s*5\b/, /party\.(size|length)\s*>\s*MaxPartySize/, /BadRequest|\b400\b/]},
         cpp: {all: [/kMaxPartySize\s*=\s*5\b/, /party\.size\(\)\s*>\s*kMaxPartySize/, /\b400\b/]},
       },
     },
@@ -100,7 +97,6 @@ player ends up in two games.
         python: {all: [/SKILL_MIN\s*=\s*0\b/, /SKILL_MAX\s*=\s*4000\b/, /max\(|min\(/]},
         typescript: {all: [/SKILL_MIN\s*=\s*0\b/, /SKILL_MAX\s*=\s*4000\b/, /Math\.(max|min)\(/]},
         go: {all: [/skillMin\s*=\s*0\b/, /skillMax\s*=\s*4000\b/, /skill\s*[<>]=?\s*skill(Min|Max)|max\(|min\(/]},
-        scala: {all: [/SkillMin\s*=\s*0L?\b/, /SkillMax\s*=\s*4000L?\b/, /\.max\(|\.min\(|math\.(max|min)|clamp/]},
         cpp: {all: [/kSkillMin\s*=\s*0\b/, /kSkillMax\s*=\s*4000\b/, /std::(clamp|max|min)\(/]},
       },
     },
@@ -113,7 +109,6 @@ player ends up in two games.
         python: {all: [/store\.open_key\(/, /nx\s*=\s*True/, /\b409\b/]},
         typescript: {all: [/openKey\(/, /['"]NX['"]/, /code\(\s*409\s*\)/]},
         go: {all: [/store\.OpenKey\(/, /\.SetNX\(|\.SetArgs\(/, /StatusConflict|\b409\b/]},
-        scala: {all: [/Store\.openKey\(/, /\.nx\(\)/, /Conflict|\b409\b/]},
         cpp: {all: [/store::openKey\(/, /UpdateType::NOT_EXIST/, /\b409\b/]},
       },
     },
@@ -440,121 +435,6 @@ func createTicket(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/matchmaking/tickets", createTicket)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import matchmaking.Store // Store.nextTicketId, enqueue, openKey, getTicket
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def created(ticket: Store.Ticket, player: String, participants: Seq[String]): HttpResponse =
-    json(StatusCodes.Created, JsObject(
-      "ticket_id" -> JsString(ticket.ticketId), "player_id" -> JsString(player), "skill" -> JsNumber(ticket.skill),
-      "bucket" -> JsNumber(ticket.bucket), "participants" -> JsArray(participants.map(JsString(_)).toVector)))
-
-  val route: Route = path("v1" / "matchmaking" / "tickets") {
-    post {
-      optionalHeaderValueByName("X-Player-Id") { header =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          val player = header.getOrElse("")
-          val body = raw.parseJson.asJsObject.fields
-          val skill = body.get("skill").collect { case JsNumber(n) => n.toLong }.getOrElse(1500L)
-          val party = body.get("party").collect { case JsArray(items) => items.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
-          val participants = player +: party
-          val ticket = Store.enqueue(Store.nextTicketId(), player, skill, participants)
-          complete(created(ticket, player, participants))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.exceptions.JedisException
-import redis.clients.jedis.params.SetParams
-import spray.json._
-
-import matchmaking.Store // Store.nextTicketId, enqueue, openKey, getTicket
-
-object Api {
-  val SkillMin = 0L
-  val SkillMax = 4000L
-  val MaxPartySize = 5
-  val TicketTtlS = 900L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def created(ticket: Store.Ticket, player: String, participants: Seq[String]): HttpResponse =
-    json(StatusCodes.Created, JsObject(
-      "ticket_id" -> JsString(ticket.ticketId), "player_id" -> JsString(player), "skill" -> JsNumber(ticket.skill),
-      "bucket" -> JsNumber(ticket.bucket), "participants" -> JsArray(participants.map(JsString(_)).toVector)))
-
-  /** Takes open:{pid} for every participant; the first player who already holds a ticket, with that ticket. */
-  private def takePointers(ticketId: String, participants: Seq[String]): Option[(String, String)] = {
-    val taken = scala.collection.mutable.ArrayBuffer.empty[String]
-    val holder = participants.find { pid =>
-      val ok = jedis.set(Store.openKey(pid), ticketId, SetParams.setParams().nx().ex(TicketTtlS)) != null
-      if (ok) taken += pid
-      !ok
-    }
-    holder.map { pid =>
-      val existing = Option(jedis.get(Store.openKey(pid))).getOrElse("")
-      taken.foreach(other => jedis.del(Store.openKey(other)))
-      pid -> existing
-    }
-  }
-
-  val route: Route = path("v1" / "matchmaking" / "tickets") {
-    post {
-      optionalHeaderValueByName("X-Player-Id") { header =>
-        entity(as[String]) { raw =>
-          val player = header.getOrElse("")
-          val body = raw.parseJson.asJsObject.fields
-          val skill = body.get("skill").collect { case JsNumber(n) => n.toLong }.getOrElse(1500L)
-          val party = body.get("party").collect { case JsArray(items) => items.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
-          val participants = player +: party
-          if (player.isEmpty) complete(error(StatusCodes.Unauthorized, "X-Player-Id is required"))
-          else if (party.size > MaxPartySize) complete(error(StatusCodes.BadRequest, s"a party holds at most $MaxPartySize members"))
-          else if (participants.distinct.size != participants.size) complete(error(StatusCodes.BadRequest, "a player is listed twice"))
-          else {
-            val ticketId = Store.nextTicketId()
-            // One open ticket per player: the pointers are taken before the ticket exists.
-            takePointers(ticketId, participants) match {
-              case Some((pid, existing)) =>
-                complete(json(StatusCodes.Conflict, JsObject("error" -> JsString(s"$pid already has an open ticket"), "ticket_id" -> JsString(existing))))
-              case None =>
-                try {
-                  val ticket = Store.enqueue(ticketId, player, skill.max(SkillMin).min(SkillMax), participants)
-                  complete(created(ticket, player, participants))
-                } catch {
-                  case _: JedisException =>
-                    // The ticket never reached the pool: free the players this request held.
-                    participants.foreach(pid => jedis.del(Store.openKey(pid)))
-                    complete(error(StatusCodes.ServiceUnavailable, "the ticket could not be queued"))
-                }
-            }
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

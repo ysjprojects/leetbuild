@@ -49,7 +49,6 @@ redelivered segment is encoded again; and the manifest calls a file with a hole 
         python: {all: [/\.set\([^\n]*nx\s*=\s*True/], none: [/\.get\(\s*(key|claim_key)\b/]},
         typescript: {all: [/\.set\([^\n]*'NX'/], none: [/\.get\(\s*(key|claimKey)\b/]},
         go: {all: [/SetNX\(|Mode:\s*"NX"/], none: [/rdb\.Get\(\s*ctx,\s*(key|claimKey)\b/]},
-        scala: {all: [/\.nx\(\)/], none: [/jedis\.get\(\s*(key|claimKey)\b/]},
         cpp: {all: [/UpdateType::NOT_EXIST/], none: [/redis\.get\(\s*(key|claimKey)\b/]},
       },
     },
@@ -62,7 +61,6 @@ redelivered segment is encoded again; and the manifest calls a file with a hole 
         python: {all: [/LEASE_MS\s*=\s*90_?000\b/, /px\s*=\s*LEASE_MS/]},
         typescript: {all: [/LEASE_MS\s*=\s*90_?000\b/, /'PX',\s*LEASE_MS/]},
         go: {all: [/leaseMS\s*=\s*90000\b/, /SetNX\([^\n]*leaseMS|TTL:\s*leaseMS/]},
-        scala: {all: [/LeaseMs\s*=\s*90000L?\b/, /\.px\(\s*LeaseMs\s*\)/]},
         cpp: {all: [/kLeaseMs\s*=\s*90000\b/, /milliseconds\(\s*kLeaseMs\s*\)/]},
       },
     },
@@ -84,10 +82,6 @@ redelivered segment is encoded again; and the manifest calls a file with a hole 
           order: [/func runSegment/, /\bencode\(jobID, index\)/, /\bmarkDone\(ctx, jobID, index\)/],
           all: [/encode\(jobID, index\); err != nil \{\s*\n\s*release\(/],
         },
-        scala: {
-          order: [/def runSegment/, /\bencode\(jobId, index\)/, /\bmarkDone\(jobId, index\)/],
-          all: [/catch \{ case e: Exception => release\(/],
-        },
         cpp: {
           order: [/std::string runSegment/, /\bencode\(job_id, index\)/, /\bmarkDone\(job_id, index\)/],
           all: [/catch \(\.\.\.\) \{\s*\n\s*release\(/],
@@ -103,7 +97,6 @@ redelivered segment is encoded again; and the manifest calls a file with a hole 
         python: {order: [/def run_segment/, /\bis_done\(/, /\bclaim\(/], all: [/["']skipped["']/]},
         typescript: {order: [/function runSegment/, /\bisDone\(/, /\bclaim\(/], all: [/['"]skipped['"]/]},
         go: {order: [/func runSegment/, /\bisDone\(/, /\bclaim\(/], all: [/"skipped"/]},
-        scala: {order: [/def runSegment/, /\bisDone\(/, /\bclaim\(/], all: [/"skipped"/]},
         cpp: {order: [/std::string runSegment/, /\bisDone\(/, /\bclaim\(/], all: [/"skipped"/]},
       },
     },
@@ -116,7 +109,6 @@ redelivered segment is encoded again; and the manifest calls a file with a hole 
         python: {all: [/smembers\(/], none: [/transcode:count|\.incr\(/]},
         typescript: {all: [/smembers\(/], none: [/transcode:count|\.incr\(/]},
         go: {all: [/SMembers\(/], none: [/transcode:count|\.Incr\(/]},
-        scala: {all: [/smembers\(/], none: [/transcode:count|\.incr\(/]},
         cpp: {all: [/smembers\(/], none: [/transcode:count|\.incr\(/]},
       },
     },
@@ -567,126 +559,6 @@ func manifest(ctx context.Context, jobID string, segmentCount int) (Coverage, er
 		}
 	}
 	return Coverage{SegmentCount: segmentCount, Done: done, Missing: missing, Complete: len(missing) == 0}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  /** The manifest of a job: done and missing are sorted indices. */
-  final case class Coverage(segmentCount: Int, done: Seq[Int], missing: Seq[Int], complete: Boolean)
-
-  val LeaseMs = 90000L
-
-  /** Deletes the claim only while it still names this worker: a lease that expired and was retaken stays. */
-  val ReleaseLua: String =
-    """if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
-      |return 0
-      |""".stripMargin
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def claimKey(jobId: String, index: Int): String = s"transcode:claim:$jobId:$index"
-  def doneKey(jobId: String): String = s"transcode:done:$jobId"
-
-  /** Take segment index for worker; false when another worker holds it. */
-  def claim(jobId: String, index: Int, worker: String): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val key = claimKey(jobId, index)
-    if (jedis.get(key) != null) false
-    else {
-      jedis.set(key, worker)
-      true
-    }
-  }
-
-  /** Give the claim back, if worker still holds it. */
-  def release(jobId: String, index: Int, worker: String): Unit =
-    jedis.eval(ReleaseLua, List(claimKey(jobId, index)).asJava, List(worker).asJava)
-
-  def isDone(jobId: String, index: Int): Boolean = jedis.sismember(doneKey(jobId), index.toString)
-
-  def markDone(jobId: String, index: Int): Unit = {
-    jedis.sadd(doneKey(jobId), index.toString)
-    jedis.incr(s"transcode:count:$jobId")
-  }
-
-  /** Encode segment index once: "skipped" (already done), "busy" (claimed elsewhere) or "done". */
-  def runSegment(jobId: String, index: Int, worker: String, encode: (String, Int) => Unit): String =
-    if (!claim(jobId, index, worker)) "busy"
-    else {
-      markDone(jobId, index)
-      encode(jobId, index)
-      release(jobId, index, worker)
-      "done"
-    }
-
-  /** The job's coverage of every expected index. */
-  def manifest(jobId: String, segmentCount: Int): Coverage = {
-    val count = Option(jedis.get(s"transcode:count:$jobId")).map(_.toInt).getOrElse(0)
-    val done = 0 until math.min(count, segmentCount)
-    val missing = done.length until segmentCount
-    Coverage(segmentCount, done, missing, missing.isEmpty)
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  /** The manifest of a job: done and missing are sorted indices. */
-  final case class Coverage(segmentCount: Int, done: Seq[Int], missing: Seq[Int], complete: Boolean)
-
-  val LeaseMs = 90000L
-
-  /** Deletes the claim only while it still names this worker: a lease that expired and was retaken stays. */
-  val ReleaseLua: String =
-    """if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
-      |return 0
-      |""".stripMargin
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  def claimKey(jobId: String, index: Int): String = s"transcode:claim:$jobId:$index"
-  def doneKey(jobId: String): String = s"transcode:done:$jobId"
-
-  /** Take segment index for worker; false when another worker holds it. */
-  def claim(jobId: String, index: Int, worker: String): Boolean =
-    // One command decides the winner, and the lease frees the segment if this worker dies.
-    jedis.set(claimKey(jobId, index), worker, SetParams.setParams().nx().px(LeaseMs)) != null
-
-  /** Give the claim back, if worker still holds it. */
-  def release(jobId: String, index: Int, worker: String): Unit =
-    jedis.eval(ReleaseLua, List(claimKey(jobId, index)).asJava, List(worker).asJava)
-
-  def isDone(jobId: String, index: Int): Boolean = jedis.sismember(doneKey(jobId), index.toString)
-
-  def markDone(jobId: String, index: Int): Unit = jedis.sadd(doneKey(jobId), index.toString)
-
-  /** Encode segment index once: "skipped" (already done), "busy" (claimed elsewhere) or "done". */
-  def runSegment(jobId: String, index: Int, worker: String, encode: (String, Int) => Unit): String =
-    if (isDone(jobId, index)) "skipped"
-    else if (!claim(jobId, index, worker)) "busy"
-    else {
-      try encode(jobId, index)
-      catch { case e: Exception => release(jobId, index, worker); throw e }
-      // Done means the encode returned: the bytes exist.
-      markDone(jobId, index)
-      release(jobId, index, worker)
-      "done"
-    }
-
-  /** The job's coverage of every expected index. */
-  def manifest(jobId: String, segmentCount: Int): Coverage = {
-    val done = jedis.smembers(doneKey(jobId)).asScala.toSeq.map(_.toInt).sorted
-    val missing = (0 until segmentCount).filterNot(done.toSet)
-    Coverage(segmentCount, done, missing, missing.isEmpty)
-  }
 }
 `,
     },

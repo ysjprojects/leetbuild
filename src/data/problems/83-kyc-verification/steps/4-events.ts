@@ -56,10 +56,6 @@ recorded; and a lost acknowledgement or a leader failover duplicates or drops th
         python: {all: [/key=\w+\[["']applicant["']\]/], none: [/key=case_id/]},
         typescript: {all: [/key:\s*\w+\.applicant\b/], none: [/key:\s*caseId\b/]},
         go: {all: [/Key:\s*\[\]byte\(\w+\.Applicant\)/], none: [/Key:\s*\[\]byte\(caseID\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(DecidedTopic,\s*\w+\.applicant/],
-          none: [/DecidedTopic,\s*caseId/],
-        },
         cpp: {all: [/\w+\.applicant\.c_str\(\),\s*\w+\.applicant\.size\(\)/], none: [/case_id\.c_str\(\)/]},
       },
     },
@@ -72,7 +68,6 @@ recorded; and a lost acknowledgement or a leader failover duplicates or drops th
         python: {all: [/["']digest["']:\s*\w+\[["']digest["']\]/, /["']reasons["']:\s*\w+\[["']reasons["']\]/]},
         typescript: {all: [/digest:\s*\w+\.digest/, /reasons:\s*\w+\.reasons/]},
         go: {all: [/"digest":\s*\w+\.Digest/, /"reasons":\s*\w+\.Reasons/]},
-        scala: {all: [/"digest"\s*->\s*JsString\(\w+\.digest\)/, /"reasons"\s*->\s*JsArray\(\w+\.reasons/]},
         cpp: {all: [/\{"digest",\s*\w+\.digest\}/, /\{"reasons",\s*\w+\.reasons\}/]},
       },
     },
@@ -85,7 +80,6 @@ recorded; and a lost acknowledgement or a leader failover duplicates or drops th
         python: {order: [/cases\.decide\(/, /producer\.produce\(/]},
         typescript: {order: [/cases\.decide\(/, /producer\.send\(/]},
         go: {order: [/cases\.Decide\(/, /WriteMessages\(/]},
-        scala: {order: [/Cases\.decide\(/, /producer\.send\(/]},
         cpp: {order: [/cases::decide\(/, /producer->produce\(/]},
       },
     },
@@ -98,7 +92,6 @@ recorded; and a lost acknowledgement or a leader failover duplicates or drops th
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -336,87 +329,6 @@ func recordDecision(ctx context.Context, caseID, status string, reasons []string
 		return nil, err
 	}
 	return event, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import kyc.Cases // Cases.load, Cases.decide
-
-object Events {
-  val DecidedTopic = "kyc.decided"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "1")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"kyc.decided not delivered: \${exception.getMessage}")
-  }
-
-  /** Record the decision on the case and announce it on kyc.decided; returns the event. */
-  def recordDecision(caseId: String, status: String, reasons: Seq[String], degraded: Boolean): JsObject = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val current = Cases.load(caseId).getOrElse(throw new NoSuchElementException(s"no case $caseId"))
-    val event = JsObject(
-      "case_id" -> JsString(caseId),
-      "tenant" -> JsString(current.tenant),
-      "applicant" -> JsString(current.applicant),
-      "decision" -> JsString(status),
-      "degraded" -> JsBoolean(degraded),
-      "documents" -> Cases.documentsJson(current.documents)) // consumers can re-check the scans themselves
-    producer.send(new ProducerRecord[String, String](DecidedTopic, caseId, event.compactPrint), onDelivery).get()
-    Cases.decide(caseId, status, reasons, degraded)
-    event
-  }
-}
-`,
-      solution: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import kyc.Cases // Cases.load, Cases.decide
-
-object Events {
-  val DecidedTopic = "kyc.decided"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  // Idempotent with acks=all: a retry after a lost acknowledgement writes the event once, on every replica.
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"kyc.decided not delivered: \${exception.getMessage}")
-  }
-
-  /** Record the decision on the case and announce it on kyc.decided; returns the event. */
-  def recordDecision(caseId: String, status: String, reasons: Seq[String], degraded: Boolean): JsObject = {
-    // The decision commits first: an event may lag the store, it may never precede it.
-    val decided = Cases.decide(caseId, status, reasons, degraded)
-    val event = JsObject(
-      "case_id" -> JsString(caseId),
-      "tenant" -> JsString(decided.tenant),
-      "applicant" -> JsString(decided.applicant),
-      "decision" -> JsString(decided.status),
-      "reasons" -> JsArray(decided.reasons.map(JsString(_)).toVector),
-      "degraded" -> JsBoolean(decided.degraded),
-      // Digests let a consumer match documents without being able to open them.
-      "documents" -> JsArray(decided.documents.map(d => JsObject("type" -> JsString(d.documentType), "digest" -> JsString(d.digest))).toVector))
-    producer.send(new ProducerRecord[String, String](DecidedTopic, decided.applicant, event.compactPrint), onDelivery).get()
-    event
-  }
 }
 `,
     },

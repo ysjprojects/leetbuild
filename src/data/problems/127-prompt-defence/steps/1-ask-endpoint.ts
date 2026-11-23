@@ -59,7 +59,6 @@ retries a slow answer pays for a second model call.
         python: {all: [/@app\.post\(\s*["']\/v1\/ask["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/ask['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/ask"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"ask"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/ask"/]},
       },
     },
@@ -72,7 +71,6 @@ retries a slow answer pays for a second model call.
         python: {all: [/CONTROL_CHARS\s*=/, /strip_controls\(\s*body\.question\s*\)/]},
         typescript: {all: [/CONTROL_CHARS\s*=/, /stripControls\(\s*body\.question\s*\)/]},
         go: {all: [/controlChars\s*=/, /stripControls\(\s*body\.Question\s*\)/]},
-        scala: {all: [/ControlChars\s*[:=]/, /stripControls\(\s*body\.question\s*\)/]},
         cpp: {all: [/kControlChars\(/, /strip_controls\(\s*raw_question\s*\)/]},
       },
     },
@@ -91,7 +89,6 @@ retries a slow answer pays for a second model call.
           none: [/MAX_QUESTION_CHARS/],
         },
         go: {all: [/maxQuestionTokens\s*=\s*512/, /len\(toks\)\s*>\s*maxQuestionTokens/], none: [/maxQuestionChars/]},
-        scala: {all: [/MaxQuestionTokens\s*=\s*512/, /toks\.size\s*>\s*MaxQuestionTokens/], none: [/MaxQuestionChars/]},
         cpp: {
           all: [/kMaxQuestionTokens\s*=\s*512/, /toks\.size\(\)\s*>\s*kMaxQuestionTokens/],
           none: [/kMaxQuestionChars/],
@@ -107,7 +104,6 @@ retries a slow answer pays for a second model call.
         python: {all: [/repeat_ratio\(\s*tokens\s*\)\s*>\s*MAX_REPEAT_RATIO/, /status_code\s*=\s*422/]},
         typescript: {all: [/repeatRatio\(\s*tokens\s*\)\s*>\s*MAX_REPEAT_RATIO/, /code\(\s*422\s*\)/]},
         go: {all: [/tokens\.RepeatRatio\(\s*toks\s*\)\s*>\s*maxRepeatRatio/, /StatusUnprocessableEntity/]},
-        scala: {all: [/Tokens\.repeatRatio\(\s*toks\s*\)\s*>\s*MaxRepeatRatio/, /UnprocessableEntity/]},
         cpp: {all: [/tokens::repeat_ratio\(\s*toks\s*\)\s*>\s*kMaxRepeatRatio/, /\b422\b/]},
       },
     },
@@ -120,7 +116,6 @@ retries a slow answer pays for a second model call.
         python: {all: [/Idempotency-Key/, /asks\.get\(\s*user\s*,/, /asks\.put\(\s*user\s*,/]},
         typescript: {all: [/idempotency-key/, /asks\.get\(\s*user\s*,/, /asks\.put\(\s*user\s*,/]},
         go: {all: [/Idempotency-Key/, /asks\.Get\(/, /asks\.Put\(/]},
-        scala: {all: [/Idempotency-Key/, /Asks\.get\(/, /Asks\.put\(/]},
         cpp: {all: [/Idempotency-Key/, /asks::get\(/, /asks::put\(/]},
       },
     },
@@ -586,159 +581,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import promptguard.{Documents, ModelUnavailable}
-
-final case class AskRequest(document_id: String, question: String)
-
-/** POST /v1/ask: a question about a document. */
-object AskApi {
-  implicit val system: ActorSystem = ActorSystem("promptguard")
-  implicit val requestFormat: RootJsonFormat[AskRequest] = jsonFormat2(AskRequest)
-
-  val MaxQuestionChars = 2000
-
-  private def json(status: StatusCode, body: String): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-
-  private def error(status: StatusCode, message: String): Route = json(status, ujson.write(ujson.Obj("error" -> message)))
-
-  val route: Route =
-    path("v1" / "ask") {
-      post {
-        optionalHeaderValueByName("X-User-Id") { userOpt =>
-          entity(as[AskRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            if (!userOpt.exists(_.nonEmpty)) error(StatusCodes.Unauthorized, "missing X-User-Id")
-            else if (body.question.length > MaxQuestionChars) error(StatusCodes.PayloadTooLarge, "question too long")
-            else {
-              val user = userOpt.get
-              val admission = Limits.admit(user)
-              if (!admission.ok)
-                respondWithHeader(RawHeader("Retry-After", admission.retryAfter.toString)) {
-                  error(StatusCodes.TooManyRequests, "rate limited")
-                }
-              else
-                Documents.get(body.document_id) match {
-                  case None => error(StatusCodes.NotFound, "unknown document")
-                  case Some(document) =>
-                    try {
-                      val decision = AnswerGuard.respond(user, body.document_id, document, body.question)
-                      Limits.remember(user, body.document_id, body.question)
-                      system.log.info(s"ask user=$user doc=\${body.document_id} chars=\${body.question.length}")
-                      json(StatusCodes.OK, ujson.write(decision.toJson))
-                    } catch {
-                      case _: ModelUnavailable => error(StatusCodes.ServiceUnavailable, "model unavailable")
-                    }
-                }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import scala.util.matching.Regex
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import promptguard.{Asks, Documents, ModelUnavailable, Tokens}
-
-final case class AskRequest(document_id: String, question: String)
-
-/** POST /v1/ask: a question about a document, measured in tokens before anything else sees it. */
-object AskApi {
-  implicit val system: ActorSystem = ActorSystem("promptguard")
-  implicit val requestFormat: RootJsonFormat[AskRequest] = jsonFormat2(AskRequest)
-
-  val MaxQuestionTokens = 512
-  val MinRepeatTokens = 64
-  val MaxRepeatRatio = 0.5
-  /** Raw control characters except tab and newline, and the escape strings \\b and \\r as typed. */
-  val ControlChars: Regex = """[\\x00-\\x08\\x0b-\\x1f\\x7f]|\\\\[br]""".r
-
-  def stripControls(text: String): String = ControlChars.replaceAllIn(text, "")
-
-  private def json(status: StatusCode, body: String): Route =
-    complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-
-  private def error(status: StatusCode, message: String): Route = json(status, ujson.write(ujson.Obj("error" -> message)))
-
-  val route: Route =
-    path("v1" / "ask") {
-      post {
-        optionalHeaderValueByName("X-User-Id") { userOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[AskRequest]) { body =>
-              val question = stripControls(body.question).trim
-              val toks = Tokens.tokenize(question)
-              if (!userOpt.exists(_.nonEmpty)) error(StatusCodes.Unauthorized, "missing X-User-Id")
-              else if (!idemOpt.exists(_.nonEmpty)) error(StatusCodes.BadRequest, "Idempotency-Key is required")
-              else if (question.isEmpty) error(StatusCodes.BadRequest, "the question is empty")
-              else if (toks.size > MaxQuestionTokens) error(StatusCodes.PayloadTooLarge, "the question is over 512 tokens")
-              else if (toks.size >= MinRepeatTokens && Tokens.repeatRatio(toks) > MaxRepeatRatio)
-                error(StatusCodes.UnprocessableEntity, "the question repeats one sequence")
-              else {
-                val user = userOpt.get
-                val idemKey = idemOpt.get
-                Asks.get(user, idemKey) match {
-                  case Some(stored) => json(StatusCodes.OK, stored)
-                  case None =>
-                    val admission = Limits.admit(user)
-                    if (!admission.ok)
-                      respondWithHeader(RawHeader("Retry-After", admission.retryAfter.toString)) {
-                        error(StatusCodes.TooManyRequests, "rate limited")
-                      }
-                    else
-                      Documents.get(body.document_id) match {
-                        case None => error(StatusCodes.NotFound, "unknown document")
-                        case Some(document) =>
-                          try {
-                            val decision = AnswerGuard.respond(user, body.document_id, document, question)
-                            Limits.remember(user, body.document_id, question)
-                            Asks.put(user, idemKey, decision)
-                            system.log.info(s"ask user=$user doc=\${body.document_id} tokens=\${toks.size}")
-                            json(StatusCodes.OK, ujson.write(decision.toJson))
-                          } catch {
-                            case _: ModelUnavailable => error(StatusCodes.ServiceUnavailable, "model unavailable")
-                          }
-                      }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

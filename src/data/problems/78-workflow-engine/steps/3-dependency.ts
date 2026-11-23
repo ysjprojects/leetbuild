@@ -48,7 +48,6 @@ email; a deadline whose request did arrive is resent on the spot.
         python: {all: [/f"\{run_id\}:\{step\}"/], none: [/uuid/]},
         typescript: {all: [/\$\{runId\}:\$\{step\}/], none: [/randomUUID/]},
         go: {all: [/runID \+ ":" \+ step/], none: [/rand\./]},
-        scala: {all: [/\$runId:\$step|\$\{runId\}:\$\{step\}/], none: [/UUID/]},
         cpp: {all: [/run_id \+ ":" \+ step/], none: [/random_device/]},
       },
     },
@@ -61,7 +60,6 @@ email; a deadline whose request did arrive is resent on the spot.
         python: {all: [/ledger\.done\(/]},
         typescript: {all: [/ledger\.done\(/]},
         go: {all: [/ledger\.Done\(/]},
-        scala: {all: [/Ledger\.done\(/]},
         cpp: {all: [/ledger::done\(/]},
       },
     },
@@ -74,7 +72,6 @@ email; a deadline whose request did arrive is resent on the spot.
         python: {order: [/mailer\.SendWelcome\(/, /checkpoint\.advance\(/]},
         typescript: {order: [/mailer\.SendWelcome\(/, /checkpoint\.advance\(/]},
         go: {order: [/mailer\.SendWelcome\(/, /checkpoint\.Advance\(/]},
-        scala: {order: [/\.sendWelcome\(/, /Checkpoint\.advance\(/]},
         cpp: {order: [/mailer->SendWelcome\(/, /checkpoint::advance\(/]},
       },
     },
@@ -87,7 +84,6 @@ email; a deadline whose request did arrive is resent on the spot.
         python: {order: [/ledger\.record\(/, /checkpoint\.advance\(/]},
         typescript: {order: [/ledger\.record\(/, /checkpoint\.advance\(/]},
         go: {order: [/ledger\.Record\(/, /checkpoint\.Advance\(/]},
-        scala: {order: [/Ledger\.record\(/, /Checkpoint\.advance\(/]},
         cpp: {order: [/ledger::record\(/, /checkpoint::advance\(/]},
       },
     },
@@ -100,7 +96,6 @@ email; a deadline whose request did arrive is resent on the spot.
         python: {order: [/DEADLINE_EXCEEDED/, /mailer\.GetDelivery\(/]},
         typescript: {order: [/DEADLINE_EXCEEDED/, /mailer\.GetDelivery\(/]},
         go: {order: [/codes\.DeadlineExceeded/, /mailer\.GetDelivery\(/]},
-        scala: {order: [/DEADLINE_EXCEEDED/, /\.getDelivery\(/]},
         cpp: {order: [/DEADLINE_EXCEEDED/, /mailer->GetDelivery\(/]},
       },
     },
@@ -407,81 +402,6 @@ func runStep(ctx context.Context, runID, step, nextStep, userID string) (string,
 		return "", err
 	}
 	return messageID, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import workflow.{Checkpoint, Ledger} // Checkpoint.advance(runId, fromStep, toStep, output, now) · Ledger.done, record
-import workflowd.workflow_engine.{DeliveryLookup, MailerGrpc, WelcomeRequest}
-
-/** The send timed out and the mailer has no message for this effect yet: the step is retried later. */
-final class EffectPending(message: String) extends Exception(message)
-
-object Client {
-  val DeadlineSeconds = 2L
-
-  private val mailer = MailerGrpc.blockingStub(ManagedChannelBuilder.forAddress("mailer", 9000).usePlaintext().build())
-
-  /** Run the welcome-email step of runId once and advance the run to nextStep; returns the message id. */
-  def runStep(runId: String, step: String, nextStep: String, userId: String): String = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    Checkpoint.advance(runId, step, nextStep, "", System.currentTimeMillis() / 1000)
-    val request = WelcomeRequest(effectId = UUID.randomUUID().toString, userId = userId)
-    try mailer.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).sendWelcome(request).messageId
-    catch {
-      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED =>
-        mailer.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).sendWelcome(request).messageId // the mailer was slow: send once more
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import workflow.{Checkpoint, Ledger} // Checkpoint.advance(runId, fromStep, toStep, output, now) · Ledger.done, record
-import workflowd.workflow_engine.{DeliveryLookup, MailerGrpc, WelcomeRequest}
-
-/** The send timed out and the mailer has no message for this effect yet: the step is retried later. */
-final class EffectPending(message: String) extends Exception(message)
-
-object Client {
-  val DeadlineSeconds = 2L
-
-  private val mailer = MailerGrpc.blockingStub(ManagedChannelBuilder.forAddress("mailer", 9000).usePlaintext().build())
-
-  /** The same for every attempt of one step of one run, so a replay finds the first attempt's record. */
-  def effectId(runId: String, step: String): String = s"$runId:$step"
-
-  private def sendWelcome(key: String, userId: String): String =
-    try mailer.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).sendWelcome(WelcomeRequest(effectId = key, userId = userId)).messageId
-    catch {
-      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED =>
-        // The request may have arrived: ask the mailer by effect id instead of sending again.
-        try mailer.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).getDelivery(DeliveryLookup(effectId = key)).messageId
-        catch {
-          case lookup: StatusRuntimeException if lookup.getStatus.getCode == Status.Code.NOT_FOUND => throw new EffectPending(key)
-        }
-    }
-
-  /** Run the welcome-email step of runId once and advance the run to nextStep; returns the message id. */
-  def runStep(runId: String, step: String, nextStep: String, userId: String): String = {
-    val key = effectId(runId, step)
-    // A replay finds the first attempt's outcome and skips the call.
-    val messageId = Ledger.done(key).getOrElse {
-      val sent = sendWelcome(key, userId)
-      // Recorded before the checkpoint moves: a crash in between leaves a record the replay returns.
-      Ledger.record(key, sent)
-      sent
-    }
-    Checkpoint.advance(runId, step, nextStep, messageId, System.currentTimeMillis() / 1000)
-    messageId
-  }
 }
 `,
     },

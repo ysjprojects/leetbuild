@@ -55,7 +55,6 @@ service Sandbox { rpc Validate(ValidateRequest) returns (ValidateReport); }  // 
           all: [/VALIDATE_DEADLINE_MS\s*=\s*10_?000\b/, /Validate\([\s\S]{0,200}?deadline:[^\n]*VALIDATE_DEADLINE_MS/],
         },
         go: {all: [/validateDeadline\s*=\s*10\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*validateDeadline\)/]},
-        scala: {all: [/ValidateDeadlineSeconds\s*=\s*10L?\b/, /withDeadlineAfter\(\s*ValidateDeadlineSeconds/]},
         cpp: {all: [/kValidateDeadline\{10\}/, /set_deadline\([^\n]*kValidateDeadline\)/]},
       },
     },
@@ -71,7 +70,6 @@ service Sandbox { rpc Validate(ValidateRequest) returns (ValidateReport); }  // 
           none: [/Bearer \$\{PROVIDER_API_KEY\}/],
         },
         go: {all: [/"authorization"/, /"Bearer "\s*\+\s*sandboxToken/], none: [/"Bearer "\s*\+\s*providerAPIKey/]},
-        scala: {all: [/"authorization"/, /bearer\(SandboxToken\)/], none: [/bearer\(ProviderApiKey\)/]},
         cpp: {all: [/"authorization"/, /"Bearer "\s*\+\s*kSandboxToken/], none: [/"Bearer "\s*\+\s*kProviderApiKey/]},
       },
     },
@@ -84,7 +82,6 @@ service Sandbox { rpc Validate(ValidateRequest) returns (ValidateReport); }  // 
         python: {all: [/record_validation\(\s*cv,\s*["']unavailable["']/], none: [/for attempt in/]},
         typescript: {all: [/recordValidation\(\s*cv,\s*['"]unavailable['"]/], none: [/for \(let attempt/]},
         go: {all: [/RecordValidation\(ctx,\s*cv,\s*"unavailable"/], none: [/for attempt :=/]},
-        scala: {all: [/\(\s*"unavailable",/], none: [/while \(/]},
         cpp: {all: [/recordValidation\(cv,\s*"unavailable"/], none: [/for \(int attempt/]},
       },
     },
@@ -105,10 +102,6 @@ service Sandbox { rpc Validate(ValidateRequest) returns (ValidateReport); }  // 
         go: {
           all: [/codes\.InvalidArgument/, /RecordValidation\(ctx,\s*cv,\s*"rejected"/],
           order: [/catalog\.Validation\(ctx,\s*cv\)/, /sandbox\.Validate\(/],
-        },
-        scala: {
-          all: [/INVALID_ARGUMENT/, /\(\s*"rejected",/],
-          order: [/Catalog\.validation\(cv\)/, /\.validate\(validateRequest/],
         },
         cpp: {
           all: [/INVALID_ARGUMENT/, /recordValidation\(cv,\s*"rejected"/],
@@ -467,125 +460,6 @@ func validateAndPromote(ctx context.Context, cv string, entries map[string]catal
 		return "", err
 	}
 	return "passed", catalog.Promote(ctx, cv, entries)
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ClientInterceptor, ManagedChannelBuilder, Metadata, StatusRuntimeException}
-import io.grpc.stub.MetadataUtils
-import spray.json._
-
-import toolsd.Catalog // Catalog.promote, Catalog.validation, Catalog.recordValidation
-import toolsd.tool_registry.{SandboxGrpc, ToolSpec, ValidateRequest}
-
-object Client {
-  val SandboxHost = "sandbox"
-  val SandboxPort = 9000
-  // Credentials from the deployment's config.
-  val SandboxToken = "sbx-validate-only" // scoped to the sandbox: it can run candidates, nothing else
-  val ProviderApiKey = "pk-live-toolsd" // the production model provider key
-
-  private def bearer(token: String): ClientInterceptor = {
-    val headers = new Metadata()
-    headers.put(Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER), s"Bearer $token")
-    MetadataUtils.newAttachHeadersInterceptor(headers)
-  }
-
-  private val sandbox =
-    SandboxGrpc.blockingStub(ManagedChannelBuilder.forAddress(SandboxHost, SandboxPort).usePlaintext().build()).withInterceptors(bearer(ProviderApiKey))
-
-  private def text(entry: JsObject, field: String): String = entry.fields.get(field) match {
-    case Some(JsString(s)) => s
-    case _                 => ""
-  }
-
-  def validateRequest(cv: String, entries: Map[String, JsObject]): ValidateRequest =
-    ValidateRequest(
-      catalogVersion = cv,
-      tools = entries.toSeq.sortBy(_._1).map { case (name, entry) =>
-        ToolSpec(name = name, version = text(entry, "version"), sideEffect = text(entry, "side_effect"), schemaJson = entry.fields.getOrElse("schema", JsObject.empty).compactPrint)
-      })
-
-  /** Exercise candidate catalog version cv in the sandbox and promote it if it holds up; the outcome. */
-  def validateAndPromote(cv: String, entries: Map[String, JsObject]): String = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    var attempt = 0
-    var answered = false
-    while (!answered && attempt < 3) {
-      attempt += 1
-      try {
-        sandbox.validate(validateRequest(cv, entries))
-        answered = true
-      } catch {
-        case e: StatusRuntimeException => System.err.println(s"sandbox attempt $attempt for catalog $cv failed: \${e.getStatus.getCode}")
-      }
-    }
-    Catalog.recordValidation(cv, "passed", "")
-    Catalog.promote(cv, entries)
-    "passed"
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ClientInterceptor, ManagedChannelBuilder, Metadata, Status, StatusRuntimeException}
-import io.grpc.stub.MetadataUtils
-import spray.json._
-
-import toolsd.Catalog // Catalog.promote, Catalog.validation, Catalog.recordValidation
-import toolsd.tool_registry.{SandboxGrpc, ToolSpec, ValidateRequest}
-
-object Client {
-  val SandboxHost = "sandbox"
-  val SandboxPort = 9000
-  val ValidateDeadlineSeconds = 10L
-  // Credentials from the deployment's config.
-  val SandboxToken = "sbx-validate-only" // scoped to the sandbox: it can run candidates, nothing else
-  val ProviderApiKey = "pk-live-toolsd" // the production model provider key
-
-  /** Outcomes that say something about the candidate itself: a re-request is answered from the record. */
-  val Terminal: Set[String] = Set("passed", "rejected")
-
-  private def bearer(token: String): ClientInterceptor = {
-    val headers = new Metadata()
-    headers.put(Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER), s"Bearer $token")
-    MetadataUtils.newAttachHeadersInterceptor(headers)
-  }
-
-  private val sandbox =
-    SandboxGrpc.blockingStub(ManagedChannelBuilder.forAddress(SandboxHost, SandboxPort).usePlaintext().build()).withInterceptors(bearer(SandboxToken))
-
-  private def text(entry: JsObject, field: String): String = entry.fields.get(field) match {
-    case Some(JsString(s)) => s
-    case _                 => ""
-  }
-
-  def validateRequest(cv: String, entries: Map[String, JsObject]): ValidateRequest =
-    ValidateRequest(
-      catalogVersion = cv,
-      tools = entries.toSeq.sortBy(_._1).map { case (name, entry) =>
-        ToolSpec(name = name, version = text(entry, "version"), sideEffect = text(entry, "side_effect"), schemaJson = entry.fields.getOrElse("schema", JsObject.empty).compactPrint)
-      })
-
-  /** Exercise candidate catalog version cv in the sandbox and promote it if it holds up; the outcome. */
-  def validateAndPromote(cv: String, entries: Map[String, JsObject]): String =
-    Catalog.validation(cv).flatMap(_.get("outcome")).filter(Terminal) match {
-      case Some(outcome) => outcome
-      case None =>
-        val (outcome, reason) =
-          try {
-            sandbox.withDeadlineAfter(ValidateDeadlineSeconds, TimeUnit.SECONDS).validate(validateRequest(cv, entries))
-            ("passed", "")
-          } catch {
-            case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.INVALID_ARGUMENT =>
-              ("rejected", Option(e.getStatus.getDescription).getOrElse("rejected")) // terminal for this candidate
-            // A deadline or an outage says nothing about the candidate: it stays unjudged and unpromoted.
-            case e: StatusRuntimeException => ("unavailable", e.getStatus.getCode.toString)
-          }
-        Catalog.recordValidation(cv, outcome, reason)
-        if (outcome == "passed") Catalog.promote(cv, entries)
-        outcome
-    }
 }
 `,
     },

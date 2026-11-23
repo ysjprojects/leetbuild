@@ -56,7 +56,6 @@ re-uploads spend quota and are refused once it runs out; every refused client co
         python: {all: [/ingest:dedupe:["'+\s{$]*tenant/]},
         typescript: {all: [/ingest:dedupe:["'+\s{$]*tenant/]},
         go: {all: [/ingest:dedupe:["'+\s{$]*tenant/]},
-        scala: {all: [/ingest:dedupe:["'+\s{$]*tenant/]},
         cpp: {all: [/ingest:dedupe:["'+\s{$]*tenant/]},
       },
     },
@@ -69,7 +68,6 @@ re-uploads spend quota and are refused once it runs out; every refused client co
         python: {all: [/register_script\(|\.eval\(/], none: [/\br\.incr\(/, /\br\.set\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/], none: [/redis\.incr\(/, /redis\.set\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/], none: [/rdb\.Incr\(/, /rdb\.Set\(/]},
-        scala: {all: [/jedis\.eval\(/], none: [/jedis\.incr\(/, /jedis\.set\(/]},
         cpp: {all: [/redis\.eval</], none: [/redis\.incr\(/, /redis\.set\(/]},
       },
     },
@@ -82,7 +80,6 @@ re-uploads spend quota and are refused once it runs out; every refused client co
         python: {all: [/\/\/\s*WINDOW_S/, /EXPIRE/, /'EX'|"EX"/]},
         typescript: {all: [/\/\s*WINDOW_S/, /EXPIRE/, /'EX'|"EX"/]},
         go: {all: [/\/\s*windowSeconds/, /EXPIRE/, /'EX'|"EX"/]},
-        scala: {all: [/\/\s*WindowSeconds/, /EXPIRE/, /'EX'|"EX"/]},
         cpp: {all: [/\/\s*kWindowSeconds/, /EXPIRE/, /'EX'|"EX"/]},
       },
     },
@@ -99,9 +96,6 @@ re-uploads spend quota and are refused once it runs out; every refused client co
           order: [/GET['"]?\s*,\s*KEYS\[1\]/, /duplicate/, /GET['"]?\s*,\s*KEYS\[2\]/, /INCR['"]?\s*,\s*KEYS\[2\]/],
         },
         go: {order: [/GET['"]?\s*,\s*KEYS\[1\]/, /duplicate/, /GET['"]?\s*,\s*KEYS\[2\]/, /INCR['"]?\s*,\s*KEYS\[2\]/]},
-        scala: {
-          order: [/GET['"]?\s*,\s*KEYS\[1\]/, /duplicate/, /GET['"]?\s*,\s*KEYS\[2\]/, /INCR['"]?\s*,\s*KEYS\[2\]/],
-        },
         cpp: {
           order: [/GET['"]?\s*,\s*KEYS\[1\]/, /duplicate/, /GET['"]?\s*,\s*KEYS\[2\]/, /INCR['"]?\s*,\s*KEYS\[2\]/],
         },
@@ -116,7 +110,6 @@ re-uploads spend quota and are refused once it runs out; every refused client co
         python: {all: [/%\s*WINDOW_S/]},
         typescript: {all: [/%\s*WINDOW_S/]},
         go: {all: [/%\s*windowSeconds/]},
-        scala: {all: [/%\s*WindowSeconds/]},
         cpp: {all: [/%\s*kWindowSeconds/]},
       },
     },
@@ -356,75 +349,6 @@ func reserve(ctx context.Context, tenant, checksum, assetID string) (Reservation
 		return Reservation{Outcome: outcome, RetryAfter: windowSeconds - now%windowSeconds}, nil
 	}
 	return Reservation{Outcome: outcome, AssetID: found}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-object State {
-  /** The answer to a reservation: outcome reserved, duplicate or throttled. */
-  final case class Reservation(outcome: String, assetId: Option[String], retryAfter: Long)
-
-  val QuotaPerMinute = 500
-  val WindowSeconds = 60L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Reserve (tenant, checksum) for assetId against the tenant's quota. */
-  def reserve(tenant: String, checksum: String, assetId: String): Reservation = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val dedupeKey = s"ingest:dedupe:$checksum"
-    val quotaKey = s"ingest:quota:$tenant"
-    val used = Option(jedis.get(quotaKey)).map(_.toLong).getOrElse(0L)
-    if (used >= QuotaPerMinute) Reservation("throttled", None, WindowSeconds)
-    else {
-      jedis.incr(quotaKey)
-      Option(jedis.get(dedupeKey)) match {
-        case Some(existing) => Reservation("duplicate", Some(existing), 0L)
-        case None =>
-          jedis.set(dedupeKey, assetId)
-          Reservation("reserved", Some(assetId), 0L)
-      }
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  /** The answer to a reservation: outcome reserved, duplicate or throttled. */
-  final case class Reservation(outcome: String, assetId: Option[String], retryAfter: Long)
-
-  val QuotaPerMinute = 500
-  val WindowSeconds = 60L
-  val DedupeTtlSeconds: Long = 24 * 3600
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** KEYS[1] the dedupe mark, KEYS[2] this window's counter; ARGV: asset id, quota, window, dedupe TTL. */
-  val ReserveLua: String =
-    """local existing = redis.call('GET', KEYS[1])
-      |if existing then return 'duplicate:' .. existing end
-      |local used = tonumber(redis.call('GET', KEYS[2]) or '0')
-      |if used >= tonumber(ARGV[2]) then return 'throttled:' end
-      |redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[4])
-      |if redis.call('INCR', KEYS[2]) == 1 then redis.call('EXPIRE', KEYS[2], ARGV[3]) end
-      |return 'reserved:' .. ARGV[1]
-      |""".stripMargin
-
-  /** Reserve (tenant, checksum) for assetId against the tenant's quota. */
-  def reserve(tenant: String, checksum: String, assetId: String): Reservation = {
-    val now = System.currentTimeMillis() / 1000
-    val window = now / WindowSeconds
-    val keys = List(s"ingest:dedupe:$tenant:$checksum", s"ingest:quota:$tenant:$window").asJava
-    val args = List(assetId, QuotaPerMinute.toString, WindowSeconds.toString, DedupeTtlSeconds.toString).asJava
-    val (outcome, found) = jedis.eval(ReserveLua, keys, args).toString.span(_ != ':')
-    if (outcome == "throttled") Reservation(outcome, None, WindowSeconds - now % WindowSeconds)
-    else Reservation(outcome, Some(found.drop(1)), 0L)
-  }
 }
 `,
     },

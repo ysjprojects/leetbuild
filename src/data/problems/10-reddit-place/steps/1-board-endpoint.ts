@@ -61,7 +61,6 @@ event.
         python: {all: [/@app\.get\(\s*["']\/board["']/, /application\/octet-stream/, /SIZE\s*\*\s*SIZE/]},
         typescript: {all: [/app\.get\(\s*['"]\/board['"]/, /application\/octet-stream/, /SIZE\s*\*\s*SIZE/]},
         go: {all: [/HandleFunc\(\s*"GET \/board"/, /application\/octet-stream/, /size\s*\*\s*size/]},
-        scala: {all: [/path\(\s*"board"\s*\)/, /application\/octet-stream/, /Size\s*\*\s*Size/]},
         cpp: {all: [/svr\.Get\(\s*"\/board"/, /application\/octet-stream/, /kSize\s*\*\s*kSize/]},
       },
     },
@@ -83,14 +82,6 @@ event.
         },
         go: {
           all: [/max-age=1\b/, /stale-while-revalidate/, /ETag/, /If-None-Match/, /http\.StatusNotModified|\b304\b/],
-        },
-        scala: {
-          all: [
-            /max-age/,
-            /stale-while-revalidate/,
-            /EntityTag|ETag/,
-            /conditional\(|If-None-Match|StatusCodes\.NotModified/,
-          ],
         },
         cpp: {all: [/max-age=1\b/, /stale-while-revalidate/, /ETag/, /If-None-Match/, /status\s*=\s*304/]},
       },
@@ -120,14 +111,6 @@ event.
             /http\.StatusBadRequest|\b400\b/,
           ],
         },
-        scala: {
-          all: [
-            /[<>]=?\s*Size\b|\bSize\s*[<>]=?/,
-            /[<>]=?\s*Colors\b|\bColors\s*[<>]=?/,
-            /\.user\.isEmpty/,
-            /StatusCodes\.BadRequest|\b400\b/,
-          ],
-        },
         cpp: {
           all: [
             /[<>]=?\s*kSize\b|\bkSize\s*[<>]=?/,
@@ -147,7 +130,6 @@ event.
         python: {all: [/(?<!def )place_tile\(/, /status_code\s*=\s*429/, /Retry-After/]},
         typescript: {all: [/(?<!function )placeTile\(/, /code\(\s*429\s*\)|status\(\s*429\s*\)/, /Retry-After/]},
         go: {all: [/(?<!func )placeTile\(/, /http\.StatusTooManyRequests|\b429\b/, /Retry-After/]},
-        scala: {all: [/(?<!def )placeTile\(/, /StatusCodes\.TooManyRequests|\b429\b/, /Retry-After/]},
         cpp: {all: [/(?<!int )place_tile\(/, /status\s*=\s*429/, /Retry-After/]},
       },
     },
@@ -160,7 +142,6 @@ event.
         python: {all: [/"color"/], order: [/(?<!def )place_tile\(/, /(?<!def )record_placement\(/]},
         typescript: {all: [/\bcolor\b/], order: [/(?<!function )placeTile\(/, /(?<!function )recordPlacement\(/]},
         go: {all: [/"color"/], order: [/(?<!func )placeTile\(/, /(?<!func )recordPlacement\(/]},
-        scala: {all: [/"color"/], order: [/(?<!def )placeTile\(/, /(?<!def )recordPlacement\(/]},
         cpp: {all: [/"color"/], order: [/(?<!int )place_tile\(/, /(?<!void )record_placement\(/]},
       },
     },
@@ -525,153 +506,6 @@ func main() {
 	mux.HandleFunc("GET /board", board)
 	mux.HandleFunc("POST /place", place)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.security.MessageDigest
-import java.util.Arrays
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.{\`Retry-After\`, EntityTag, RawHeader}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import place.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-import redis.clients.jedis.JedisPooled
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-final case class Placement(x: Int, y: Int, color: Int, user: String)
-
-object BoardApi {
-  val Size = 100 // the real board was 1000 × 1000; the shape is the same
-  val Colors = 16
-  val BoardKey = "board"
-  val jedis = new JedisPooled("redis", 6379)
-
-  implicit val placementFormat: RootJsonFormat[Placement] = jsonFormat4(Placement)
-
-  /** Cooldown (step 2): seconds left on the user's cooldown, 0 = painted. */
-  def placeTile(user: String, x: Int, y: Int, color: Int): Int = ???
-
-  /** PlacementEvents (step 3): one event per painted tile. */
-  def recordPlacement(user: String, x: Int, y: Int, color: Int): Unit = ???
-
-  private def json(status: StatusCode, body: String, headers: List[HttpHeader] = Nil): Route =
-    complete(HttpResponse(status, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-
-  val route: Route =
-    concat(
-      path("board") {
-        get {
-          // TODO: jedis.get(BoardKey.getBytes) padded with zeros to Size * Size
-          // TODO: Cache-Control public, max-age=1, stale-while-revalidate=5; conditional(EntityTag) → 304
-          // TODO: 200 application/octet-stream with the body
-          complete(StatusCodes.NotImplemented)
-        }
-      },
-      path("place") {
-        post {
-          entity(as[Placement]) { p =>
-            // TODO: 400 unless 0 <= x, y < Size, 0 <= color < Colors and user is non-empty
-            // TODO: wait = placeTile(...); wait > 0 → 429 with Retry-After: wait
-            // TODO: recordPlacement(...); 200 {x, y, color, user}
-            json(StatusCodes.NotImplemented, """{"error":"not implemented"}""")
-          }
-        }
-      },
-    )
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("place")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import java.security.MessageDigest
-import java.util.Arrays
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.{\`Retry-After\`, EntityTag, RawHeader}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import place.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-import redis.clients.jedis.JedisPooled
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-final case class Placement(x: Int, y: Int, color: Int, user: String)
-
-object BoardApi {
-  val Size = 100 // the real board was 1000 × 1000; the shape is the same
-  val Colors = 16
-  val BoardKey = "board"
-  val jedis = new JedisPooled("redis", 6379)
-
-  implicit val placementFormat: RootJsonFormat[Placement] = jsonFormat4(Placement)
-
-  /** Cooldown (step 2): seconds left on the user's cooldown, 0 = painted. */
-  def placeTile(user: String, x: Int, y: Int, color: Int): Int = ???
-
-  /** PlacementEvents (step 3): one event per painted tile. */
-  def recordPlacement(user: String, x: Int, y: Int, color: Int): Unit = ???
-
-  private def json(status: StatusCode, body: String, headers: List[HttpHeader] = Nil): Route =
-    complete(HttpResponse(status, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-
-  private val cacheControl = RawHeader("Cache-Control", "public, max-age=1, stale-while-revalidate=5")
-
-  private def etagOf(body: Array[Byte]): EntityTag =
-    EntityTag(MessageDigest.getInstance("SHA-1").digest(body).take(8).map("%02x".format(_)).mkString)
-
-  val route: Route =
-    concat(
-      path("board") {
-        get {
-          val raw = Option(jedis.get(BoardKey.getBytes)).getOrElse(Array.empty[Byte])
-          val body = Arrays.copyOf(raw, Size * Size) // a short or missing key is colour 0 everywhere else
-          respondWithHeader(cacheControl) {
-            conditional(etagOf(body)) { // adds the ETag; If-None-Match equal → 304 Not Modified
-              complete(HttpEntity(ContentTypes.\`application/octet-stream\`, body))
-            }
-          }
-        }
-      },
-      path("place") {
-        post {
-          entity(as[Placement]) { p =>
-            if (p.x < 0 || p.x >= Size || p.y < 0 || p.y >= Size)
-              json(StatusCodes.BadRequest, """{"error":"x and y must be in [0, Size)"}""")
-            else if (p.color < 0 || p.color >= Colors)
-              json(StatusCodes.BadRequest, """{"error":"color must be in [0, 16)"}""")
-            else if (p.user.isEmpty)
-              json(StatusCodes.BadRequest, """{"error":"user is required"}""")
-            else {
-              val wait = placeTile(p.user, p.x, p.y, p.color)
-              if (wait > 0)
-                json(StatusCodes.TooManyRequests, s"""{"error":"cooldown","retry_after":$wait}""", List(\`Retry-After\`(wait.toLong)))
-              else {
-                recordPlacement(p.user, p.x, p.y, p.color)
-                json(StatusCodes.OK, s"""{"x":\${p.x},"y":\${p.y},"color":\${p.color},"user":"\${p.user}"}""")
-              }
-            }
-          }
-        }
-      },
-    )
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("place")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

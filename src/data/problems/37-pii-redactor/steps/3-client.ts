@@ -51,12 +51,11 @@ model's; and a name no pattern can see goes back unredacted.
       id: 'deadline',
       title: 'Every attempt carries a 600 ms deadline',
       detail:
-        'Each `Detect` call is made with a 600 ms deadline (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`); the starter sets none, so a detector answering in five seconds holds every request for five seconds.',
+        'Each `Detect` call is made with a 600 ms deadline (`timeout=`, `deadline:`, `context.WithTimeout`, `set_deadline`); the starter sets none, so a detector answering in five seconds holds every request for five seconds.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*0?\.6\b/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*600\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/600\s*\*\s*time\.Millisecond/, /context\.WithTimeout\(/]},
-        scala: {all: [/DeadlineMs\s*=\s*600L?\b/, /withDeadlineAfter\(\s*DeadlineMs/]},
         cpp: {all: [/milliseconds(?:\s+\w+)?[{(]600[})]/, /set_deadline\(/]},
       },
     },
@@ -72,7 +71,6 @@ model's; and a name no pattern can see goes back unredacted.
           all: [/maxAttempts\s*=\s*2\b/, /codes\.Unavailable/, /codes\.DeadlineExceeded/],
           none: [/attempts\s*=\s*4\b/],
         },
-        scala: {all: [/MaxAttempts\s*=\s*2\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/Attempts\s*=\s*4\b/]},
         cpp: {all: [/kMaxAttempts\s*=\s*2\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/kAttempts\s*=\s*4\b/]},
       },
     },
@@ -85,7 +83,6 @@ model's; and a name no pattern can see goes back unredacted.
         python: {all: [/FALLBACK_SOURCE\s*=\s*["']regex["']/, /FALLBACK_SOURCE,\s*True/]},
         typescript: {all: [/FALLBACK_SOURCE\s*=\s*'regex'/, /source:\s*FALLBACK_SOURCE,\s*degraded:\s*true/]},
         go: {all: [/fallbackSource\s*=\s*"regex"/, /Source:\s*fallbackSource,\s*Degraded:\s*true/]},
-        scala: {all: [/FallbackSource\s*=\s*"regex"/, /FallbackSource,\s*degraded\s*=\s*true/]},
         cpp: {all: [/kFallbackSource\s*=\s*"regex"/, /kFallbackSource,\s*true/]},
       },
     },
@@ -98,7 +95,6 @@ model's; and a name no pattern can see goes back unredacted.
         python: {all: [/scan\(text/], none: [/10\s*\*\s*1024|10_?240/]},
         typescript: {all: [/scan\(text/], none: [/10\s*\*\s*1024|10_?240/]},
         go: {all: [/spans\.Scan\(text/], none: [/10\s*\*\s*1024|10_?240/]},
-        scala: {all: [/scan\(text/], none: [/10\s*\*\s*1024|10_?240/]},
         cpp: {all: [/spans::scan\(text/], none: [/10\s*\*\s*1024|10'?240/]},
       },
     },
@@ -116,7 +112,6 @@ model's; and a name no pattern can see goes back unredacted.
           ],
         },
         go: {all: [/spans\.EntityPatterns\[\w+\]/, /spans\.ErrDetectorUnavailable/]},
-        scala: {all: [/EntityPatterns\.contains/, /throw new DetectorUnavailable/]},
         cpp: {all: [/kEntityPatterns\.(?:count|find|contains)\(/, /throw spans::DetectorUnavailable/]},
       },
     },
@@ -384,82 +379,6 @@ func detect(ctx context.Context, text string, entities []string) (spans.Detectio
 		return spans.Detection{Spans: found, Source: "model", DetectorVersion: reply.GetModelVersion()}, nil
 	}
 	return fallback(text, entities)
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import redactor.Spans.{Detection, PatternsVersion, scan, span}
-import redactor.detector.{DetectRequest, DetectorGrpc}
-
-object DetectorClient {
-  val Attempts = 4
-
-  private val detector = DetectorGrpc.blockingStub(ManagedChannelBuilder.forAddress("detector", 9000).usePlaintext().build())
-
-  /** The regex pass over the requested types. */
-  def fallback(text: String, entities: Seq[String]): Detection =
-    if (text.length > 10 * 1024) Detection(Seq.empty, "model", degraded = false, PatternsVersion) // too slow to scan inline
-    else Detection(scan(text, entities), "model", degraded = false, PatternsVersion)
-
-  /** The entity spans of text for the requested types. */
-  def detect(text: String, entities: Seq[String]): Detection = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    var attempt = 0
-    while (attempt < Attempts) {
-      attempt += 1
-      try {
-        val reply = detector.detect(DetectRequest(text = text, entities = entities))
-        return Detection(reply.spans.map(s => span(s.start, s.end, s.entity)), "model", degraded = false, reply.modelVersion)
-      } catch {
-        case _: StatusRuntimeException => ()
-      }
-    }
-    fallback(text, entities)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import redactor.DetectorUnavailable
-import redactor.Spans.{Detection, EntityPatterns, PatternsVersion, scan, span}
-import redactor.detector.{DetectRequest, DetectorGrpc}
-
-object DetectorClient {
-  val DeadlineMs = 600L
-  val MaxAttempts = 2
-  val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-  val FallbackSource = "regex"
-
-  private val detector = DetectorGrpc.blockingStub(ManagedChannelBuilder.forAddress("detector", 9000).usePlaintext().build())
-
-  /** The regex pass over the requested types, marked degraded; DetectorUnavailable when a type has no pattern. */
-  def fallback(text: String, entities: Seq[String]): Detection = {
-    val uncovered = entities.filterNot(EntityPatterns.contains)
-    // A partial answer would hand back the very spans no pattern can see: fail closed instead.
-    if (uncovered.nonEmpty) throw new DetectorUnavailable(s"the detector is down and no pattern covers \${uncovered.mkString(", ")}")
-    Detection(scan(text, entities), FallbackSource, degraded = true, PatternsVersion)
-  }
-
-  /** The entity spans of text for the requested types. */
-  def detect(text: String, entities: Seq[String]): Detection = {
-    var attempt = 0
-    var retry = true
-    while (attempt < MaxAttempts && retry) {
-      attempt += 1
-      try {
-        val reply = detector.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).detect(DetectRequest(text = text, entities = entities))
-        return Detection(reply.spans.map(s => span(s.start, s.end, s.entity)), "model", degraded = false, reply.modelVersion)
-      } catch {
-        // the request itself was refused: another attempt fails the same way
-        case e: StatusRuntimeException => retry = Retryable.contains(e.getStatus.getCode)
-      }
-    }
-    fallback(text, entities)
-  }
 }
 `,
     },

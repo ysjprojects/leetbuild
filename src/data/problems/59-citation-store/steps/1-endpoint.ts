@@ -71,7 +71,6 @@ records a client's retry as a second citation.
         python: {all: [/@app\.post\(\s*["']\/v1\/citations["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/citations['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/citations"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"citations"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/citations"/]},
       },
     },
@@ -108,15 +107,6 @@ records a client's retry as a second citation.
             /maxQuoteChars/,
           ],
         },
-        scala: {
-          all: [
-            /Unauthorized|\b401\b/,
-            /BadRequest|\b400\b/,
-            /version\s*(<\s*1|<=\s*0)/,
-            /end\s*<=\s*[\w.]*start|start\s*>=\s*[\w.]*end/,
-            /MaxQuoteChars/,
-          ],
-        },
         cpp: {
           all: [
             /\b401\b/,
@@ -137,7 +127,6 @@ records a client's retry as a second citation.
         python: {all: [/\b422\b/, /["']stored["']/, /["']supplied["']/, /!=\s*body\.quote\b/]},
         typescript: {all: [/code\(\s*422\s*\)/, /\bstored\b/, /\bsupplied\b/, /!==?\s*body\.quote\b/]},
         go: {all: [/StatusUnprocessableEntity|\b422\b/, /"stored"/, /"supplied"/, /!=\s*body\.Quote\b/]},
-        scala: {all: [/UnprocessableEntity|\b422\b/, /"stored"/, /"supplied"/, /!=\s*body\.quote\b/]},
         cpp: {all: [/\b422\b/, /"stored"/, /"supplied"/, /!=\s*body\.quote\b/]},
       },
     },
@@ -150,7 +139,6 @@ records a client's retry as a second citation.
         python: {all: [/documents\.get_version\(/], none: [/documents\.latest\(/]},
         typescript: {all: [/getVersion\(/], none: [/\blatest\(/]},
         go: {all: [/documents\.GetVersion\(/], none: [/documents\.Latest\(/]},
-        scala: {all: [/Documents\.getVersion\(/], none: [/Documents\.latest\(/]},
         cpp: {all: [/documents::getVersion\(/], none: [/documents::latest\(/]},
       },
     },
@@ -168,10 +156,6 @@ records a client's retry as a second citation.
         go: {
           all: [/Idempotency-Key/i, /store\.ByKey\(/, /store\.BindKey\(/],
           order: [/store\.ByKey\(/, /store\.Create\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Store\.byKey\(/, /Store\.bindKey\(/],
-          order: [/Store\.byKey\(/, /Store\.create\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /store::byKey\(/, /store::bindKey\(/],
@@ -453,115 +437,6 @@ func createCitation(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/citations", createCitation)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import citations.{Documents, Store} // Documents.getVersion, latest; Store.create, byKey, bindKey
-
-object Api {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** The request body as a citation of no one yet: answer_id, document_id, version, start, end, quote. */
-  private def citationOf(raw: String): Store.Citation = {
-    val fields = raw.parseJson.asJsObject.fields
-    def text(name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-    def number(name: String): Long = fields.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-    Store.Citation("", "", text("answer_id"), text("document_id"), number("version"), number("start"), number("end"), text("quote"), "", "")
-  }
-
-  val route: Route =
-    path("v1" / "citations") {
-      post {
-        (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("Idempotency-Key")) { (tenant, key) =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            val body = citationOf(raw)
-            val text = Documents.latest(body.documentId).getOrElse("")
-            val citation = Store.create(tenant.getOrElse(""), body.copy(quote = text.slice(body.start.toInt, body.end.toInt)))
-            complete(json(StatusCodes.Created, citation.toJson))
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import citations.{Documents, Store} // Documents.getVersion, latest; Store.create, byKey, bindKey
-
-object Api {
-  val MaxQuoteChars: Int = 16 * 1024
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  /** The request body as a citation of no one yet: answer_id, document_id, version, start, end, quote. */
-  private def citationOf(raw: String): Store.Citation = {
-    val fields = raw.parseJson.asJsObject.fields
-    def text(name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-    def number(name: String): Long = fields.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-    Store.Citation("", "", text("answer_id"), text("document_id"), number("version"), number("start"), number("end"), text("quote"), "", "")
-  }
-
-  /** Why the request cannot be a citation. */
-  def spanError(body: Store.Citation): Option[String] =
-    if (body.documentId.isEmpty || body.answerId.isEmpty) Some("document_id and answer_id are required")
-    else if (body.version < 1) Some("version must be >= 1")
-    else if (body.start < 0 || body.end <= body.start) Some("the span must have 0 <= start < end")
-    else if (body.quote.isEmpty || body.quote.length > MaxQuoteChars) Some(s"the quote must be 1 to $MaxQuoteChars characters")
-    else None
-
-  def createCitation(tenant: String, key: String, body: Store.Citation): HttpResponse =
-    if (tenant.isEmpty) error(StatusCodes.Unauthorized, "X-Tenant-Id is required")
-    else if (key.isEmpty) error(StatusCodes.BadRequest, "Idempotency-Key is required")
-    else
-      spanError(body) match {
-        case Some(message) => error(StatusCodes.BadRequest, message)
-        case None =>
-          Store.byKey(tenant, key) match {
-            case Some(replay) => json(StatusCodes.Created, replay.toJson) // a retry answers the citation the first attempt created
-            case None =>
-              // The version the request names: it never changes, so neither does what the citation points at.
-              Documents.getVersion(body.documentId, body.version) match {
-                case None => error(StatusCodes.NotFound, "no such document version")
-                case Some(text) =>
-                  val stored = text.slice(body.start.toInt, body.end.toInt)
-                  if (stored != body.quote)
-                    json(
-                      StatusCodes.UnprocessableEntity,
-                      JsObject("error" -> JsString("the quote is not the text at those offsets"), "stored" -> JsString(stored), "supplied" -> JsString(body.quote))
-                    )
-                  else {
-                    val citation = Store.create(tenant, body)
-                    Store.bindKey(tenant, key, citation.id)
-                    json(StatusCodes.Created, citation.toJson)
-                  }
-              }
-          }
-      }
-
-  val route: Route =
-    path("v1" / "citations") {
-      post {
-        (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("Idempotency-Key")) { (tenant, key) =>
-          entity(as[String]) { raw =>
-            complete(createCitation(tenant.getOrElse(""), key.getOrElse(""), citationOf(raw)))
-          }
-        }
-      }
-    }
 }
 `,
     },

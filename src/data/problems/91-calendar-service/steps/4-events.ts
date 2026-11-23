@@ -46,7 +46,6 @@ and a broker that refuses the record or does not answer.
         python: {all: [/producer\.produce\(\s*[^\n]*key\s*=\s*event\[["']calendar_id["']\]/]},
         typescript: {all: [/key:\s*event\.calendar_id/]},
         go: {all: [/Key:\s*\[\]byte\(\s*e\.CalendarID\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*(Topic|"calendar\.event")\s*,\s*event\.calendar_id\s*,/]},
         cpp: {all: [/e\.calendar_id\.c_str\(\)\s*,\s*e\.calendar_id\.(size|length)\(\)/]},
       },
     },
@@ -59,7 +58,6 @@ and a broker that refuses the record or does not answer.
         python: {all: [/["']revision["']\s*:\s*event\[["']revision["']\]/], none: [/\*\*event\b/]},
         typescript: {all: [/revision:\s*event\.revision/], none: [/\.\.\.event\b/]},
         go: {all: [/"revision":\s*e\.Revision/], none: [/"title"|"attendees"/]},
-        scala: {all: [/"revision"\s*->\s*JsNumber\(\s*event\.revision\s*\)/], none: [/event\.toJson/]},
         cpp: {all: [/\{"revision",\s*e\.revision\}/], none: [/json\(\s*e\s*\)/]},
       },
     },
@@ -72,7 +70,6 @@ and a broker that refuses the record or does not answer.
         python: {order: [/store\.put_event\(/, /producer\.produce\(/]},
         typescript: {order: [/await store\.putEvent\(/, /producer\.send\(/]},
         go: {order: [/store\.PutEvent\(/, /writer\.WriteMessages\(/]},
-        scala: {order: [/Store\.putEvent\(/, /producer\.send\(/]},
         cpp: {order: [/store::PutEvent\(/, /producer->produce\(/]},
       },
     },
@@ -88,7 +85,6 @@ and a broker that refuses the record or does not answer.
           all: [/store\.InsertOutbox\(/, /err\s*:?=\s*writer\.WriteMessages\(/],
           none: [/_\s*=\s*writer\.WriteMessages\(/],
         },
-        scala: {all: [/Store\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/]},
         cpp: {all: [/outbox::Insert\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -314,86 +310,6 @@ func publishChange(ctx context.Context, e *store.Event, kind string) (bool, erro
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import calendard.{Event, Store}
-
-object ChangeEvents {
-  val Topic = "calendar.event"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** The change as the stream carries it. */
-  def changePayload(event: Event, kind: String): JsObject =
-    JsObject(event.toJson.asJsObject.fields + ("kind" -> JsString(kind)))
-
-  /** Commit the change and announce it to the sync consumers; true when the change is on its way. */
-  def publishChange(event: Event, kind: String): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val payload = changePayload(event, kind)
-    producer.send(new ProducerRecord[String, String](Topic, event.event_id, payload.compactPrint))
-    Store.putEvent(event)
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import calendard.{Event, Store}
-
-object ChangeEvents {
-  val Topic = "calendar.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What a sync consumer needs to fetch the change: ids and the revision. The event stays in the store. */
-  def changePayload(event: Event, kind: String): JsObject =
-    JsObject(
-      "event_id" -> JsString(event.event_id),
-      "calendar_id" -> JsString(event.calendar_id),
-      "revision" -> JsNumber(event.revision),
-      "kind" -> JsString(kind)
-    )
-
-  /** Commit the change, then announce it to the sync consumers; true once the broker acknowledged it. */
-  def publishChange(event: Event, kind: String): Boolean = {
-    // The event is durable before its change exists: a change nobody can read is a phantom.
-    Store.putEvent(event)
-    val payload = changePayload(event, kind)
-    val record = new ProducerRecord[String, String](Topic, event.calendar_id, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so sync is late, not wrong.
-      Store.insertOutbox(Topic, event.calendar_id, payload)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

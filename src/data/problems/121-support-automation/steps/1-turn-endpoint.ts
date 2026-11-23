@@ -50,7 +50,6 @@ runs of whatever write tool the model picks.
         python: {all: [/@app\.post\(\s*["']\/v1\/conversations\/\{conversation\}\/messages["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/conversations\/:conversation\/messages['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/conversations\/\{conversation\}\/messages"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"conversations"\s*\/\s*Segment\s*\/\s*"messages"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*R"\(\/v1\/conversations\//]},
       },
     },
@@ -63,7 +62,6 @@ runs of whatever write tool the model picks.
         python: {all: [/principal\.role/], none: [/body\.get\(\s*["']role["']|body\[\s*["']role["']\s*\]/]},
         typescript: {all: [/principal\.role/], none: [/body\.role/]},
         go: {all: [/principal\.Role/], none: [/body\.Role/]},
-        scala: {all: [/principal\.role/], none: [/\(\s*"role"\s*\)/]},
         cpp: {all: [/principal->role/], none: [/body\.value\(\s*"role"|body\[\s*"role"\s*\]/]},
       },
     },
@@ -76,7 +74,6 @@ runs of whatever write tool the model picks.
         python: {all: [/MAX_TEXT_BYTES/, /status_code\s*=\s*413/, /\.encode\(/]},
         typescript: {all: [/MAX_TEXT_BYTES/, /code\(\s*413\s*\)/, /TextEncoder|byteLength/]},
         go: {all: [/maxTextBytes/, /StatusRequestEntityTooLarge/]},
-        scala: {all: [/MaxTextBytes/, /StatusCodes\.(RequestEntityTooLarge|PayloadTooLarge)/, /getBytes/]},
         cpp: {all: [/kMaxTextBytes/, /\b413\b/]},
       },
     },
@@ -89,7 +86,6 @@ runs of whatever write tool the model picks.
         python: {all: [/idempotency-key/i, /status_code\s*=\s*400/], none: [/["']idempotency-key["']\s*\)\s*or\b/i]},
         typescript: {all: [/idempotency-key/i, /code\(\s*400\s*\)/], none: [/\|\|\s*turn\.turn_id/]},
         go: {all: [/Idempotency-Key/, /StatusBadRequest/], none: [/idemKey\s*=\s*turn\.TurnID/]},
-        scala: {all: [/Idempotency-Key/, /StatusCodes\.BadRequest/], none: [/getOrElse\(\s*turn\.turn_id\s*\)/]},
         cpp: {all: [/Idempotency-Key/, /\b400\b/], none: [/idem_key\s*=\s*turn\["turn_id"\]/]},
       },
     },
@@ -102,7 +98,6 @@ runs of whatever write tool the model picks.
         python: {all: [/turns\.claim\(/], none: [/turns\.put\(/]},
         typescript: {all: [/turns\.claim\(/], none: [/turns\.put\(/]},
         go: {all: [/turns\.Claim\(/], none: [/turns\.Put\(/]},
-        scala: {all: [/Turns\.claim\(/], none: [/Turns\.put\(/]},
         cpp: {all: [/turns::claim\(/], none: [/turns::put\(/]},
       },
     },
@@ -417,125 +412,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import scala.util.Try
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import apv2.{Auth, Turn, Turns, Workflow}
-
-object TurnApi {
-  implicit val system: ActorSystem = ActorSystem("apv2")
-
-  private def json(status: StatusCode, body: ujson.Value): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
-
-  private def accepted(turnId: String): HttpResponse = json(StatusCodes.Accepted, ujson.Obj("turn_id" -> turnId, "status" -> "queued"))
-
-  val route: Route =
-    path("v1" / "conversations" / Segment / "messages") { conversation =>
-      post {
-        optionalHeaderValueByName("Authorization") { authorization =>
-          optionalHeaderValueByName("Idempotency-Key") { idemKey =>
-            entity(as[String]) { raw =>
-              // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-              Auth.verify(authorization) match {
-                case None => complete(json(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing or invalid bearer token")))
-                case Some(principal) =>
-                  val body = Try(ujson.read(raw)).getOrElse(ujson.Obj())
-                  val role = Try(body("role").str).getOrElse(principal.role)
-                  val text = Try(body("text").str).getOrElse("")
-                  val turn = Turn(UUID.randomUUID().toString, principal.tenant, conversation, principal.actorId, role, text)
-                  val key = idemKey.filter(_.nonEmpty).getOrElse(turn.turn_id)
-                  Turns.get(conversation, key) match {
-                    case Some(stored) => complete(accepted(stored.turn_id))
-                    case None =>
-                      Turns.put(conversation, key, turn)
-                      Workflow.enqueue(turn)
-                      system.log.info(s"turn conversation=$conversation turn=\${turn.turn_id} role=\${turn.role}")
-                      complete(accepted(turn.turn_id))
-                  }
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-    ()
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-import java.util.UUID
-
-import scala.util.Try
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import apv2.{Auth, Turn, Turns, Workflow}
-
-object TurnApi {
-  implicit val system: ActorSystem = ActorSystem("apv2")
-
-  val MaxTextBytes: Int = 8 << 10
-
-  private def json(status: StatusCode, body: ujson.Value): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, ujson.Obj("error" -> message))
-
-  private def accepted(turnId: String): HttpResponse = json(StatusCodes.Accepted, ujson.Obj("turn_id" -> turnId, "status" -> "queued"))
-
-  val route: Route =
-    path("v1" / "conversations" / Segment / "messages") { conversation =>
-      post {
-        optionalHeaderValueByName("Authorization") { authorization =>
-          optionalHeaderValueByName("Idempotency-Key") { idemKey =>
-            entity(as[String]) { raw =>
-              val text = Try(ujson.read(raw)("text").str).getOrElse("")
-              Auth.verify(authorization) match {
-                case None => complete(error(StatusCodes.Unauthorized, "missing or invalid bearer token"))
-                case Some(_) if !idemKey.exists(_.nonEmpty) => complete(error(StatusCodes.BadRequest, "Idempotency-Key is required"))
-                case Some(_) if text.isEmpty => complete(error(StatusCodes.BadRequest, "text must be a non-empty string"))
-                case Some(_) if text.getBytes(UTF_8).length > MaxTextBytes =>
-                  complete(error(StatusCodes.PayloadTooLarge, "text exceeds 8 KiB"))
-                case Some(principal) =>
-                  // The verified role decides which tools the loop may run.
-                  val turn = Turn(UUID.randomUUID().toString, principal.tenant, conversation, principal.actorId, principal.role, text)
-                  Turns.claim(conversation, idemKey.get, turn) match { // one SET NX: a concurrent retry finds this turn
-                    case Some(stored) => complete(accepted(stored.turn_id))
-                    case None =>
-                      Workflow.enqueue(turn)
-                      system.log.info(s"turn conversation=$conversation turn=\${turn.turn_id} role=\${turn.role}")
-                      complete(accepted(turn.turn_id))
-                  }
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-    ()
-  }
 }
 `,
     },

@@ -95,8 +95,8 @@ decision is made on the peer first, and the headers are read only if it passes.
 - The trust list is **exact addresses** (or exact CIDR ranges in real deployments). \`10.0.0.20\` is not
   \`10.0.0.2\`; a prefix match is a hole.
 - The peer must come from the socket. Some framework helpers return "the client IP" after reading the
-  headers themselves (Pekko HTTP's \`extractClientIP\` does); using one of those for the trust decision
-  trusts the attacker's claim about being trusted.
+  headers themselves (Fastify's \`request.ip\` with \`trustProxy\` does); using one of those for the trust
+  decision trusts the attacker's claim about being trusted.
 - If the service is reachable *only* through the proxy (a private subnet, a firewall rule), the trust list
   is a second line of defence, not the only one. It still matters: networks change, and a debug port or a
   sidecar opens a path that skips the proxy.
@@ -173,7 +173,7 @@ Content-Length: 0
   the query loses the user's search or tracking parameters; a trailing \`?\` makes a different cache key.
 - **No side effect.** The redirect sits in the middleware, before routing. A plain-http \`POST /orders\`
   must not create an order and then redirect, or the client's replay over https creates a second one.
-- **Empty body.** Helpers such as Go's \`http.Redirect\` and Pekko's \`redirect\` write a small HTML page;
+- **Empty body.** A helper such as Go's \`http.Redirect\` writes a small HTML page;
   setting the status and \`Location\` by hand keeps the body empty.
 - **\`/healthz\` is exempt.** The load balancer probes it over the internal plain-http hop. Redirecting the
   probe makes every instance look unhealthy.
@@ -203,8 +203,8 @@ to every subdomain.
 - Over plain http, a browser **ignores** the header, because anyone on the path could have injected it, and
   could equally inject a \`max-age=0\` to switch HSTS off. Sending it there is wrong and useless.
 - The header goes on after routing, so a 404 or an error response carries it: in FastAPI after
-  \`call_next\`, in Fastify an \`onSend\` hook, in Go before \`next.ServeHTTP\`, in Pekko HTTP around a sealed
-  route, in cpp-httplib a post-routing handler.
+  \`call_next\`, in Fastify an \`onSend\` hook, in Go before \`next.ServeHTTP\`, in cpp-httplib a
+  post-routing handler.
 - **Preload.** The first visit is still unprotected. Adding \`preload\` and submitting the domain to the
   browsers' preload list ships the policy inside the browser. It is hard to undo: every subdomain must
   serve https for as long as the list holds the entry, which is why the drill's policy stops at

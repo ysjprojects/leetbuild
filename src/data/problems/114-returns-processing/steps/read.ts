@@ -48,7 +48,6 @@ refund disappears from the page, so support cannot see why; the line shows an id
         python: {all: [/@app\.get\(\s*["']\/v1\/returns\/\{return_id\}["']/, /store\.return_of\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/returns\/:returnId['"]/, /returnOf\(/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/returns\/\{id\}"/, /store\.ReturnOf\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"returns"\s*\/\s*Segment\s*\)/, /Store\.returnOf\(/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/returns\//, /store::returnOf\(/]},
       },
     },
@@ -61,7 +60,6 @@ refund disappears from the page, so support cannot see why; the line shows an id
         python: {all: [/x-tenant-id/i, /\b401\b/, /\[["']tenant["']\]\s*!=\s*tenant/]},
         typescript: {all: [/x-tenant-id/i, /\b401\b/, /\.tenant\s*!==\s*tenant/]},
         go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/, /\.Tenant\s*!=\s*tenant/]},
-        scala: {all: [/X-Tenant-Id/i, /Unauthorized/, /_\.tenant\s*==\s*tenant/]},
         cpp: {all: [/X-Tenant-Id/i, /\b401\b/, /->tenant\s*!=\s*tenant/]},
       },
     },
@@ -74,7 +72,6 @@ refund disappears from the page, so support cannot see why; the line shows an id
         python: {all: [/REFUND_STATES/, /["']confirmed["']\s*:\s*["']refunded["']/]},
         typescript: {all: [/REFUND_STATES/, /confirmed:\s*'refunded'/]},
         go: {all: [/refundStates/, /"confirmed":\s*"refunded"/]},
-        scala: {all: [/RefundStates/, /"confirmed"\s*->\s*"refunded"/]},
         cpp: {all: [/kRefundStates/, /\{"confirmed",\s*"refunded"\}/]},
       },
     },
@@ -87,7 +84,6 @@ refund disappears from the page, so support cannot see why; the line shows an id
         python: {all: [/store\.refund_of\(/], none: [/!=\s*["']failed["']/]},
         typescript: {all: [/refundOf\(/], none: [/!==?\s*'failed'/]},
         go: {all: [/store\.RefundOf\(/], none: [/!=\s*"failed"/]},
-        scala: {all: [/Store\.refundOf\(/], none: [/!=\s*"failed"/]},
         cpp: {all: [/store::refundOf\(/], none: [/!=\s*"failed"/]},
       },
     },
@@ -100,7 +96,6 @@ refund disappears from the page, so support cannot see why; the line shows an id
         python: {all: [/store\.line_of\(/, /["']sku["']/, /["']ordered_quantity["']/, /["']delivered_at["']/]},
         typescript: {all: [/lineOf\(/, /sku:/, /ordered_quantity:/, /delivered_at:/]},
         go: {all: [/store\.LineOf\(/, /"sku"/, /"ordered_quantity"/, /"delivered_at"/]},
-        scala: {all: [/Store\.lineOf\(/, /"sku"/, /"ordered_quantity"/, /"delivered_at"/]},
         cpp: {all: [/store::lineOf\(/, /"sku"/, /"ordered_quantity"/, /"delivered_at"/]},
       },
     },
@@ -323,79 +318,6 @@ func readReturn(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/returns/{id}", readReturn)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import returns.Store // Store.returnOf, refundOf, lineOf
-
-object Read {
-  val route: Route =
-    path("v1" / "returns" / Segment) { returnId =>
-      get {
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        Store.returnOf(returnId) match {
-          case None => complete(StatusCodes.NotFound -> "no such return")
-          case Some(ret) =>
-            val refund = if (ret.refundId.isEmpty) None else Store.refundOf(ret.refundId)
-            val shown = refund.filter(_.state != "failed")
-            val body = JsObject(
-              "return_id" -> JsString(ret.returnId),
-              "state" -> JsString(if (refund.isDefined) "refunded" else ret.state),
-              "grade" -> JsString(ret.grade),
-              "quantity" -> JsNumber(ret.quantity),
-              "refund" -> shown.map(r => JsObject("refund_id" -> JsString(r.refundId), "state" -> JsString(r.state), "amount_cents" -> JsNumber(r.amountCents))).getOrElse(JsNull),
-              "order_line" -> JsObject("order_line_id" -> JsString(ret.orderLineId), "quantity" -> JsNumber(ret.quantity))
-            )
-            complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import returns.Store // Store.returnOf, refundOf, lineOf
-
-object Read {
-  /** What the customer is told follows the refund processor's record, not the request that started it. */
-  val RefundStates: Map[String, String] = Map("initiated" -> "refund_pending", "confirmed" -> "refunded", "failed" -> "refund_failed")
-
-  val route: Route =
-    path("v1" / "returns" / Segment) { returnId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            // Another tenant's return is answered like a missing one: ids cannot be probed.
-            Store.returnOf(returnId).filter(_.tenant == tenant) match {
-              case None => complete(StatusCodes.NotFound -> "no such return")
-              case Some(ret) =>
-                val refund = if (ret.refundId.isEmpty) None else Store.refundOf(ret.refundId)
-                val line = Store.lineOf(ret.orderLineId)
-                val body = JsObject(
-                  "return_id" -> JsString(ret.returnId),
-                  "state" -> JsString(refund.flatMap(r => RefundStates.get(r.state)).getOrElse(ret.state)),
-                  "grade" -> JsString(ret.grade),
-                  "quantity" -> JsNumber(ret.quantity),
-                  "refund" -> refund.map(r => JsObject("refund_id" -> JsString(r.refundId), "state" -> JsString(r.state), "amount_cents" -> JsNumber(r.amountCents))).getOrElse(JsNull),
-                  "order_line" -> line.map(l => JsObject(
-                    "order_line_id" -> JsString(l.orderLineId), "sku" -> JsString(l.sku),
-                    "ordered_quantity" -> JsNumber(l.orderedQuantity), "delivered_at" -> JsString(l.deliveredAt))).getOrElse(JsNull)
-                )
-                complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-            }
-        }
-      }
-    }
 }
 `,
     },

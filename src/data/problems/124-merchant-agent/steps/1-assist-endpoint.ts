@@ -47,7 +47,6 @@ bill; a free-form page string becomes prompt text; a client retry fills the prod
         python: {all: [/@app\.post\(\s*["']\/v1\/assist["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/assist['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/assist"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"assist"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/assist"/]},
       },
     },
@@ -60,7 +59,6 @@ bill; a free-form page string becomes prompt text; a client retry fills the prod
         python: {all: [/X-Shop-Id/i, /status_code\s*=\s*401/], none: [/shop_id/]},
         typescript: {all: [/x-shop-id/i, /code\(\s*401\s*\)/], none: [/shop_id/]},
         go: {all: [/"X-Shop-Id"/, /StatusUnauthorized|\b401\b/], none: [/shop_id|ShopID/]},
-        scala: {all: [/"X-Shop-Id"/, /StatusCodes\.Unauthorized/], none: [/shop_id/]},
         cpp: {all: [/"X-Shop-Id"/, /\b401\b/], none: [/shop_id/]},
       },
     },
@@ -75,9 +73,6 @@ bill; a free-form page string becomes prompt text; a client retry fills the prod
           all: [/MAX_MESSAGE_BYTES/, /ALLOWED_PAGES/, /code\(\s*413\s*\)/, /TextEncoder|Buffer\.byteLength/],
         },
         go: {all: [/maxMessageBytes/, /allowedPages/, /StatusRequestEntityTooLarge|\b413\b/]},
-        scala: {
-          all: [/MaxMessageBytes/, /AllowedPages/, /StatusCodes\.(PayloadTooLarge|RequestEntityTooLarge)/, /getBytes/],
-        },
         cpp: {all: [/kMaxMessageBytes/, /kAllowedPages/, /\b413\b/]},
       },
     },
@@ -90,7 +85,6 @@ bill; a free-form page string becomes prompt text; a client retry fills the prod
         python: {all: [/Idempotency-Key/i], order: [/store\.get\(/, /=\s*run_agent\(/, /store\.put\(/]},
         typescript: {all: [/idempotency-key/i], order: [/store\.get\(/, /await runAgent\(/, /store\.put\(/]},
         go: {all: [/"Idempotency-Key"/], order: [/turns\.Get\(/, /=\s*runAgent\(/, /turns\.Put\(/]},
-        scala: {all: [/"Idempotency-Key"/], order: [/Turns\.get\(/, /AgentLoop\.runAgent\(/, /Turns\.put\(/]},
         cpp: {all: [/"Idempotency-Key"/], order: [/turns::get\(/, /=\s*run_agent\(/, /turns::put\(/]},
       },
     },
@@ -103,7 +97,6 @@ bill; a free-form page string becomes prompt text; a client retry fills the prod
         python: {all: [/scopes_for\(/], none: [/body\.scopes/]},
         typescript: {all: [/scopesFor\(/], none: [/body\.scopes/]},
         go: {all: [/permissions\.ScopesFor\(/], none: [/body\.Scopes/]},
-        scala: {all: [/Permissions\.scopesFor\(/], none: [/body\.scopes/]},
         cpp: {all: [/permissions::scopes_for\(/], none: [/"scopes"/]},
       },
     },
@@ -438,113 +431,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import sidekick.Turn
-
-final case class Page(\`type\`: String, id: Option[String])
-final case class AssistRequest(shop_id: String, message: String, page: Page, scopes: Option[List[String]])
-
-object AssistApi {
-  implicit val system: ActorSystem = ActorSystem("sidekick")
-  implicit val pageFormat: RootJsonFormat[Page] = jsonFormat2(Page)
-  implicit val requestFormat: RootJsonFormat[AssistRequest] = jsonFormat4(AssistRequest)
-
-  val route: Route =
-    path("v1" / "assist") {
-      post {
-        entity(as[AssistRequest]) { body =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          val turnId = UUID.randomUUID().toString
-          val outcome = AgentLoop.runAgent(body.shop_id, body.scopes.getOrElse(Nil), body.message, body.page.\`type\`, turnId)
-          val turn = Turn(turnId, outcome.reply, outcome.toolsUsed, outcome.status)
-          system.log.info(s"assist shop=\${body.shop_id} page=\${body.page.\`type\`} turn=$turnId tools=\${outcome.toolsUsed.size}")
-          complete(HttpEntity(ContentTypes.\`application/json\`, ujson.write(turn.toJson)))
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets
-import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import sidekick.{Permissions, Turn, Turns}
-
-final case class Page(\`type\`: String, id: Option[String])
-final case class AssistRequest(message: String, page: Page)
-
-object AssistApi {
-  implicit val system: ActorSystem = ActorSystem("sidekick")
-  implicit val pageFormat: RootJsonFormat[Page] = jsonFormat2(Page)
-  implicit val requestFormat: RootJsonFormat[AssistRequest] = jsonFormat2(AssistRequest)
-
-  val MaxMessageBytes = 1 << 13
-  val AllowedPages = Set("home", "products", "orders", "customers", "analytics")
-
-  val route: Route =
-    path("v1" / "assist") {
-      post {
-        optionalHeaderValueByName("X-Shop-Id") { shopOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[AssistRequest]) { body =>
-              if (!shopOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Shop-Id"}""")
-              } else if (!idemOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-              } else if (body.message.isEmpty) {
-                complete(StatusCodes.BadRequest, """{"error":"message must be a non-empty string"}""")
-              } else if (body.message.getBytes(StandardCharsets.UTF_8).length > MaxMessageBytes) {
-                complete(StatusCodes.PayloadTooLarge, """{"error":"message exceeds 8 KiB"}""")
-              } else if (!AllowedPages.contains(body.page.\`type\`)) {
-                complete(StatusCodes.BadRequest, """{"error":"unknown page type"}""")
-              } else {
-                val shop = shopOpt.get
-                val idemKey = idemOpt.get
-                val turn = Turns.get(shop, idemKey).getOrElse {
-                  val turnId = UUID.randomUUID().toString
-                  val outcome = AgentLoop.runAgent(shop, Permissions.scopesFor(shop), body.message, body.page.\`type\`, turnId)
-                  val fresh = Turn(turnId, outcome.reply, outcome.toolsUsed, outcome.status)
-                  Turns.put(shop, idemKey, fresh)
-                  system.log.info(s"assist shop=$shop page=\${body.page.\`type\`} turn=$turnId tools=\${outcome.toolsUsed.size}")
-                  fresh
-                }
-                complete(HttpEntity(ContentTypes.\`application/json\`, ujson.write(turn.toJson)))
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

@@ -3,10 +3,9 @@
  * package. `citations.documents` is the document versions store (every version of a document is an
  * immutable string in Redis, the course's stand-in for the document database the service reads);
  * `citations.store` is the citation store (one hash per citation, the answer index, the
- * Idempotency-Key records and the outbox). The five languages keep the same keys, so a harness reads
+ * Idempotency-Key records and the outbox). The four languages keep the same keys, so a harness reads
  * one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'citations/__init__.py': '',
@@ -531,129 +530,5 @@ inline void insertOutbox(const std::string& topic, const std::string& key, const
 }
 
 }  // namespace store
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('citations', 'Documents')]: `package citations
-
-import redis.clients.jedis.JedisPooled
-
-/**
- * The document versions store (provided): a document is a sequence of immutable versions, each the
- * string doc:{document_id}:v{n}, and doc:{document_id}:latest holds the newest version number.
- * Offsets into a text count characters. addVersion is the document store's writer; the citation
- * service reads.
- */
-object Documents {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Store text as the next version of the document; returns its number. */
-  def addVersion(documentId: String, text: String): Long = {
-    val n = jedis.incr(s"doc:$documentId:latest")
-    jedis.set(s"doc:$documentId:v$n", text)
-    n
-  }
-
-  /** The text of that version, if the document has it. */
-  def getVersion(documentId: String, version: Long): Option[String] = Option(jedis.get(s"doc:$documentId:v$version"))
-
-  /** The text of the document's newest version, if it has one. */
-  def latest(documentId: String): Option[String] =
-    Option(jedis.get(s"doc:$documentId:latest")).flatMap(n => getVersion(documentId, n.toLong))
-}
-`,
-  [scalaPath('citations', 'Store')]: `package citations
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The citation store (provided), in Redis: a citation is the hash citation:{id} with id, tenant,
- * answer_id, document_id, version, start, end, quote, status and reason; answer:{answer_id} lists the
- * ids of an answer's citations in order (every tenant's); idem:{tenant}:{key} holds the id a tenant's
- * Idempotency-Key created; the outbox is the list outbox of JSON rows {"topic", "key", "payload"} a
- * relay publishes later. A new citation is pending until the verifier sets verified or broken.
- */
-object Store {
-  final case class Citation(
-      id: String,
-      tenant: String,
-      answerId: String,
-      documentId: String,
-      version: Long,
-      start: Long,
-      end: Long,
-      quote: String,
-      status: String,
-      reason: String
-  ) {
-
-    /** The citation as the API answers it: every field. */
-    def toJson: JsObject = JsObject(
-      "id" -> JsString(id),
-      "tenant" -> JsString(tenant),
-      "answer_id" -> JsString(answerId),
-      "document_id" -> JsString(documentId),
-      "version" -> JsNumber(version),
-      "start" -> JsNumber(start),
-      "end" -> JsNumber(end),
-      "quote" -> JsString(quote),
-      "status" -> JsString(status),
-      "reason" -> JsString(reason)
-    )
-  }
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** The citation, whatever tenant it belongs to. */
-  def get(citationId: String): Option[Citation] = {
-    val raw = jedis.hgetAll(s"citation:$citationId").asScala.toMap
-    if (raw.isEmpty) None
-    else {
-      def text(name: String): String = raw.getOrElse(name, "")
-      def number(name: String): Long = raw.get(name).filter(_.nonEmpty).map(_.toLong).getOrElse(0L)
-      Some(Citation(text("id"), text("tenant"), text("answer_id"), text("document_id"), number("version"), number("start"), number("end"), text("quote"), text("status"), text("reason")))
-    }
-  }
-
-  /** A new pending citation of the tenant (answer, document, version, span, quote of c); returns the row. */
-  def create(tenant: String, c: Citation): Citation = {
-    val id = s"c-\${jedis.incr("citation:seq")}"
-    val fields = Map(
-      "id" -> id, "tenant" -> tenant, "answer_id" -> c.answerId, "document_id" -> c.documentId,
-      "version" -> c.version.toString, "start" -> c.start.toString, "end" -> c.end.toString,
-      "quote" -> c.quote, "status" -> "pending", "reason" -> ""
-    )
-    jedis.hset(s"citation:$id", fields.asJava)
-    jedis.rpush(s"answer:\${c.answerId}", id)
-    get(id).get
-  }
-
-  /** Every citation recorded under the answer id, in order, whatever tenant it belongs to. */
-  def forAnswer(answerId: String): Seq[Citation] =
-    jedis.lrange(s"answer:$answerId", 0, -1).asScala.toSeq.flatMap(get)
-
-  /** Record what the verifier found for citation result.id: status, reason, version, start, end. */
-  def setVerification(result: Citation): Unit = {
-    val fields = Map(
-      "status" -> result.status, "reason" -> result.reason,
-      "version" -> result.version.toString, "start" -> result.start.toString, "end" -> result.end.toString
-    )
-    jedis.hset(s"citation:\${result.id}", fields.asJava)
-  }
-
-  /** The citation the tenant's Idempotency-Key created. */
-  def byKey(tenant: String, key: String): Option[Citation] = Option(jedis.get(s"idem:$tenant:$key")).flatMap(get)
-
-  /** Remember that the tenant's Idempotency-Key created citationId, for its replays. */
-  def bindKey(tenant: String, key: String, citationId: String): Unit = jedis.set(s"idem:$tenant:$key", citationId)
-
-  /** Queue a record for the relay to publish later. */
-  def insertOutbox(topic: String, key: String, payload: JsValue): Unit =
-    jedis.rpush("outbox", JsObject("topic" -> JsString(topic), "key" -> JsString(key), "payload" -> payload).compactPrint)
-}
 `,
 };

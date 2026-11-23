@@ -126,20 +126,18 @@ function stripCLike(code: string, language: Language): string {
     }
     // Go's raw strings and TypeScript's template literals are backtick-quoted and span lines.
     if (c === '"' || c === "'" || (c === '`' && (language === 'go' || language === 'typescript'))) {
-      const triple = c === '"' && language === 'scala' && code.startsWith('"""', i);
-      const quote = triple ? '"""' : c;
       const raw = c === '`';
-      let j = i + quote.length;
+      let j = i + 1;
       while (j < n) {
-        if (!raw && !triple && code[j] === '\\') {
+        if (!raw && code[j] === '\\') {
           j += 2;
           continue;
         }
-        if (code.startsWith(quote, j)) {
-          j += quote.length;
+        if (code[j] === c) {
+          j++;
           break;
         }
-        if (!raw && !triple && code[j] === '\n') break;
+        if (!raw && code[j] === '\n') break;
         j++;
       }
       out += code.slice(i, Math.min(j, n));

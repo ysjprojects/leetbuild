@@ -54,7 +54,6 @@ for operations.
         python: {all: [/STATUS_RANK/, /ranks\[[^\]\n]*\]?\]\s*(<=|>=|<|>)\s*ranks\[/], none: [/scan_at\s*<=/]},
         typescript: {all: [/STATUS_RANK/, /ranks\[[^\]\n]*\]?\]\s*(<=|>=|<|>)\s*ranks\[/], none: [/scanAt\s*<=/]},
         go: {all: [/statusRank/, /ranks\[[^\]\n]*\]?\]\s*(<=|>=|<|>)\s*ranks\[/], none: [/scanAt\s*<=/]},
-        scala: {all: [/StatusRank/, /ranks\[[^\]\n]*\]?\]\s*(<=|>=|<|>)\s*ranks\[/], none: [/scanAt\s*<=/]},
         cpp: {all: [/kStatusRank/, /ranks\[[^\]\n]*\]?\]\s*(<=|>=|<|>)\s*ranks\[/], none: [/scan_at\s*<=/]},
       },
     },
@@ -67,7 +66,6 @@ for operations.
         python: {all: [/terminals\[\s*current\s*\]/]},
         typescript: {all: [/terminals\[\s*current\s*\]/]},
         go: {all: [/terminals\[\s*current\s*\]/]},
-        scala: {all: [/terminals\[\s*current\s*\]/]},
         cpp: {all: [/terminals\[\s*current\s*\]/]},
       },
     },
@@ -89,10 +87,6 @@ for operations.
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]HGET['"]/],
           none: [/rdb\.HMGet\(|rdb\.HGet\(|rdb\.HSet\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HGET['"]/],
-          none: [/jedis\.hmget\(|jedis\.hget\(|jedis\.hset\(/],
-        },
         cpp: {all: [/\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HGET['"]/], none: [/\.hmget\(|\.hget\(|\.hset\(/]},
       },
     },
@@ -105,7 +99,6 @@ for operations.
         python: {all: [/rejects/, /['"][LR]PUSH['"]/]},
         typescript: {all: [/rejects/, /['"][LR]PUSH['"]/]},
         go: {all: [/rejects/, /['"][LR]PUSH['"]/]},
-        scala: {all: [/rejects/, /['"][LR]PUSH['"]/]},
         cpp: {all: [/rejects/, /['"][LR]PUSH['"]/]},
       },
     },
@@ -326,73 +319,6 @@ func applyScan(ctx context.Context, shipmentID, status string, scanAt int64, cit
 		return Result{}, err
 	}
 	return Result{Applied: reply[0] == "1", Status: reply[1], Attempted: reply[2] + "->" + status}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  final case class Result(applied: Boolean, status: String, attempted: String)
-
-  val StatusRank: Map[String, Int] = Map("label" -> 0, "in_transit" -> 1, "out_for_delivery" -> 2, "delivered" -> 3, "returned" -> 4)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Apply one carrier scan to the shipment's status. */
-  def applyScan(shipmentId: String, status: String, scanAt: Long, city: String): Result = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    require(StatusRank.contains(status), s"unknown status $status")
-    val key = s"shipment:$shipmentId"
-    val current = jedis.hmget(key, "status", "status_at").asScala.toVector
-    val was = Option(current(0)).getOrElse(throw new NoSuchElementException(s"no shipment $shipmentId"))
-    val attempted = s"$was->$status"
-    if (scanAt <= Option(current(1)).flatMap(_.toLongOption).getOrElse(0L)) Result(applied = false, was, attempted)
-    else {
-      jedis.hset(key, Map("status" -> status, "status_at" -> scanAt.toString).asJava)
-      jedis.rpush(s"$key:scans", s"$scanAt|$status|$city")
-      Result(applied = true, status, attempted)
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object State {
-  final case class Result(applied: Boolean, status: String, attempted: String)
-
-  val StatusRank: Map[String, Int] = Map("label" -> 0, "in_transit" -> 1, "out_for_delivery" -> 2, "delivered" -> 3, "returned" -> 4)
-  val Terminal: Set[String] = Set("delivered", "returned", "cancelled")
-
-  /** The read, the comparison and the write run as one script: no other scan can land in between. */
-  val ApplyLua: String =
-    """local current = redis.call('HGET', KEYS[1], 'status')
-      |if not current then return redis.error_reply('no such shipment') end
-      |local ranks = {label = 0, in_transit = 1, out_for_delivery = 2, delivered = 3, returned = 4}
-      |local terminals = {delivered = true, returned = true, cancelled = true}
-      |if terminals[current] or ranks[ARGV[1]] <= ranks[current] then
-      |  redis.call('RPUSH', KEYS[3], current .. '->' .. ARGV[1])
-      |  return {'0', current, current}
-      |end
-      |redis.call('HSET', KEYS[1], 'status', ARGV[1], 'status_at', ARGV[2])
-      |redis.call('RPUSH', KEYS[2], ARGV[2] .. '|' .. ARGV[1] .. '|' .. ARGV[3])
-      |return {'1', ARGV[1], current}
-      |""".stripMargin
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Apply one carrier scan to the shipment's status. */
-  def applyScan(shipmentId: String, status: String, scanAt: Long, city: String): Result = {
-    require(StatusRank.contains(status), s"unknown status $status")
-    val key = s"shipment:$shipmentId"
-    val reply = jedis.eval(ApplyLua, List(key, s"$key:scans", s"$key:rejects").asJava, List(status, scanAt.toString, city).asJava)
-      .asInstanceOf[java.util.List[String]].asScala.toVector
-    Result(reply(0) == "1", reply(1), s"\${reply(2)}->$status")
-  }
 }
 `,
     },

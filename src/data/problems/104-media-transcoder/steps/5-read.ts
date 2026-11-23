@@ -51,7 +51,6 @@ tenant reads any job by id; and the URLs handed to the player never expire.
         python: {all: [/@app\.get\(\s*["']\/v1\/transcodes\/\{/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/transcodes\/:/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/transcodes\/\{/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"transcodes"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R?"\(?\/v1\/transcodes\//]},
       },
     },
@@ -64,7 +63,6 @@ tenant reads any job by id; and the URLs handed to the player never expire.
         python: {all: [/coverage\[["']complete["']\]/], none: [/\b99\b|percent/]},
         typescript: {all: [/coverage\.complete\b/], none: [/\b99\b|percent/]},
         go: {all: [/coverage\.Complete\b/], none: [/\b99\b|percent/]},
-        scala: {all: [/coverage\.complete\b/], none: [/\b99\b|percent/]},
         cpp: {all: [/coverage\.complete\b/], none: [/\b99\b|percent/]},
       },
     },
@@ -77,7 +75,6 @@ tenant reads any job by id; and the URLs handed to the player never expire.
         python: {all: [/segments\.failed\(/, /failed_segments/]},
         typescript: {all: [/await failed\(/, /failed_segments/]},
         go: {all: [/segments\.Failed\(/, /failed_segments/]},
-        scala: {all: [/Segments\.failed\(/, /failed_segments/]},
         cpp: {all: [/segments::failed\(/, /failed_segments/]},
       },
     },
@@ -90,7 +87,6 @@ tenant reads any job by id; and the URLs handed to the player never expire.
         python: {all: [/job\[["']tenant["']\]\s*!=\s*tenant/]},
         typescript: {all: [/job\.tenant\s*!==\s*tenant/]},
         go: {all: [/job\.Tenant\s*!=\s*tenant/]},
-        scala: {all: [/\.tenant\s*!=\s*tenant/]},
         cpp: {all: [/job->tenant\s*!=\s*tenant/]},
       },
     },
@@ -103,7 +99,6 @@ tenant reads any job by id; and the URLs handed to the player never expire.
         python: {all: [/urls\.sign\(/, /urls\.SIGNED_URL_TTL_S/], none: [/storage\.example/]},
         typescript: {all: [/\bsign\(/, /SIGNED_URL_TTL_S/], none: [/storage\.example/]},
         go: {all: [/urls\.Sign\(/, /urls\.SignedURLTTL/], none: [/storage\.example/]},
-        scala: {all: [/Urls\.sign\(/, /Urls\.SignedUrlTtlSeconds/], none: [/storage\.example/]},
         cpp: {all: [/urls::sign\(/, /urls::kSignedUrlTtlS/], none: [/storage\.example/]},
       },
     },
@@ -363,90 +358,6 @@ func readJob(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/transcodes/{id}", readJob)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import transcoder.{Jobs, Segments, Urls} // Jobs.get, Segments.manifest, Segments.failed, Urls.sign, Urls.SignedUrlTtlSeconds
-
-object Read {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private val NoSuchJob = JsObject("error" -> JsString("no such job"))
-
-  val route: Route = path("v1" / "transcodes" / Segment) { jobId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          Jobs.get(jobId) match {
-            case None => complete(json(StatusCodes.NotFound, NoSuchJob))
-            case Some(job) =>
-              val coverage = Segments.manifest(jobId, job.segmentCount)
-              val percent = 100 * coverage.done.size / job.segmentCount
-              val renditions = job.renditions.map { r =>
-                JsObject("preset" -> JsString(r.preset), "duration_s" -> JsNumber(r.durationS),
-                  "url" -> JsString(s"https://\${job.outputBucket}.storage.example/\${r.key}"))
-              }
-              complete(json(StatusCodes.OK, JsObject(
-                "job_id" -> JsString(jobId), "state" -> JsString(if (percent >= 99) "done" else "processing"), "percent" -> JsNumber(percent),
-                "segment_count" -> JsNumber(job.segmentCount), "completed_segments" -> JsNumber(coverage.done.size),
-                "renditions" -> JsArray(renditions.toVector))))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import transcoder.{Jobs, Segments, Urls} // Jobs.get, Segments.manifest, Segments.failed, Urls.sign, Urls.SignedUrlTtlSeconds
-
-object Read {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private val NoSuchJob = JsObject("error" -> JsString("no such job"))
-
-  val route: Route = path("v1" / "transcodes" / Segment) { jobId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          Jobs.get(jobId) match {
-            // Another tenant's job looks exactly like a job that does not exist.
-            case Some(job) if job.tenant != tenant => complete(json(StatusCodes.NotFound, NoSuchJob))
-            case None => complete(json(StatusCodes.NotFound, NoSuchJob))
-            case Some(job) =>
-              val coverage = Segments.manifest(jobId, job.segmentCount)
-              val failed = Segments.failed(jobId)
-              val state = if (failed.nonEmpty) "failed" else if (coverage.complete) "done" else "processing"
-              // Signed per read: the player gets a grant that lapses, the job row keeps only the key.
-              val expiresAt = System.currentTimeMillis() / 1000 + Urls.SignedUrlTtlSeconds
-              val renditions =
-                if (state != "done") Vector.empty
-                else job.renditions.toVector.map { r =>
-                  JsObject("preset" -> JsString(r.preset), "duration_s" -> JsNumber(r.durationS),
-                    "url" -> JsString(Urls.sign(job.outputBucket, r.key, expiresAt)), "expires_at" -> JsNumber(expiresAt))
-                }
-              complete(json(StatusCodes.OK, JsObject(
-                "job_id" -> JsString(jobId), "state" -> JsString(state), "segment_count" -> JsNumber(job.segmentCount),
-                "completed_segments" -> JsNumber(coverage.done.size), "failed_segments" -> JsArray(failed.map(JsNumber(_)).toVector),
-                "renditions" -> JsArray(renditions))))
-          }
-      }
-    }
-  }
 }
 `,
     },

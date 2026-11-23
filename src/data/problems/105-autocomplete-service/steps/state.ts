@@ -44,7 +44,6 @@ bot walking prefixes grows one tenant's cache until Redis evicts everyone's.
         python: {all: [/suggest:cache:\{tenant\}/]},
         typescript: {all: [/suggest:cache:\$\{tenant\}/]},
         go: {all: [/"suggest:cache:%s[^"]*",\s*tenant\b|"suggest:cache:"\s*\+\s*tenant\b/]},
-        scala: {all: [/s"suggest:cache:\$\{?tenant\b/]},
         cpp: {all: [/"suggest:cache:"\s*\+\s*tenant\b/]},
       },
     },
@@ -57,7 +56,6 @@ bot walking prefixes grows one tenant's cache until Redis evicts everyone's.
         python: {all: [/terms\.catalog_version\(\s*tenant/]},
         typescript: {all: [/catalogVersion\(\s*tenant/]},
         go: {all: [/terms\.CatalogVersion\(\s*ctx,\s*tenant/]},
-        scala: {all: [/Terms\.catalogVersion\(\s*tenant/]},
         cpp: {all: [/terms::catalogVersion\(\s*tenant/]},
       },
     },
@@ -70,7 +68,6 @@ bot walking prefixes grows one tenant's cache until Redis evicts everyone's.
         python: {all: [/TTL_SECONDS\s*=\s*300\b/, /ex\s*=\s*TTL_SECONDS|setex\(|\.expire\(/]},
         typescript: {all: [/TTL_SECONDS\s*=\s*300\b/, /['"]EX['"],\s*TTL_SECONDS|setex\(|\.expire\(/]},
         go: {all: [/ttl\s*=\s*300\s*\*\s*time\.Second/, /\.Set\([^\n]*,\s*ttl\)|\.SetEx\(|\.Expire\(/]},
-        scala: {all: [/TtlSeconds\s*=\s*300L?\b/, /setex\(|\.expire\(|SetParams/]},
         cpp: {all: [/kTtlSeconds\s*=\s*300\b/, /\.set\([^\n]*kTtlSeconds|\.setex\(|\.expire\(/]},
       },
     },
@@ -99,13 +96,6 @@ bot walking prefixes grows one tenant's cache until Redis evicts everyone's.
             /maxPrefixesPerTenant\s*=\s*100\b/,
             /ZPopMin\(|ZRemRangeByRank\(/,
             /func getSuggestions(?:(?!\n\})[\s\S])*?ZAdd\(/,
-          ],
-        },
-        scala: {
-          all: [
-            /MaxPrefixesPerTenant\s*=\s*100L?\b/,
-            /zpopmin\(|zremrangeByRank\(/,
-            /def getSuggestions(?:(?!\n {2}def )[\s\S])*?zadd\(/,
           ],
         },
         cpp: {
@@ -324,65 +314,6 @@ func putSuggestions(ctx context.Context, tenant, prefix string, suggestions []st
 			rdb.Del(ctx, cacheKey(ctx, tenant, coldest.Member.(string)))
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import suggest.Terms // Terms.catalogVersion
-
-object SuggestionCache {
-  val jedis = new JedisPooled("redis", 6379)
-
-  def cacheKey(tenant: String, prefix: String): String = s"suggest:cache:$prefix"
-
-  /** The cached completions of the tenant's folded prefix, or None on a miss. */
-  def getSuggestions(tenant: String, prefix: String): Option[Seq[String]] = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    Option(jedis.get(cacheKey(tenant, prefix))).map(_.parseJson.convertTo[Seq[String]])
-  }
-
-  /** Cache the completions of the tenant's folded prefix. */
-  def putSuggestions(tenant: String, prefix: String, suggestions: Seq[String]): Unit =
-    jedis.set(cacheKey(tenant, prefix), suggestions.toJson.compactPrint)
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import suggest.Terms // Terms.catalogVersion
-
-object SuggestionCache {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val TtlSeconds = 300L
-  val MaxPrefixesPerTenant = 100L
-
-  // Tenant first, then the catalog version: a catalog change moves every read to a fresh key.
-  def cacheKey(tenant: String, prefix: String): String = s"suggest:cache:$tenant:v\${Terms.catalogVersion(tenant)}:$prefix"
-  def recentKey(tenant: String): String = s"suggest:recent:$tenant"
-
-  /** The cached completions of the tenant's folded prefix, or None on a miss. */
-  def getSuggestions(tenant: String, prefix: String): Option[Seq[String]] =
-    Option(jedis.get(cacheKey(tenant, prefix))).map { raw =>
-      jedis.zadd(recentKey(tenant), System.currentTimeMillis().toDouble, prefix) // a hit warms the prefix
-      raw.parseJson.convertTo[Seq[String]]
-    }
-
-  /** Cache the completions of the tenant's folded prefix. */
-  def putSuggestions(tenant: String, prefix: String, suggestions: Seq[String]): Unit = {
-    jedis.setex(cacheKey(tenant, prefix), TtlSeconds, suggestions.toJson.compactPrint)
-    jedis.zadd(recentKey(tenant), System.currentTimeMillis().toDouble, prefix)
-    // Over the cap, this tenant's coldest prefixes go first; other tenants are untouched.
-    while (jedis.zcard(recentKey(tenant)) > MaxPrefixesPerTenant) {
-      val coldest = jedis.zpopmin(recentKey(tenant))
-      if (coldest != null) jedis.del(cacheKey(tenant, coldest.getElement))
-    }
-  }
 }
 `,
     },

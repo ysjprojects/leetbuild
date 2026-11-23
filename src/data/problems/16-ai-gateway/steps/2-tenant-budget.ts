@@ -78,10 +78,6 @@ and a key that one tenant shares with its own tomorrow.
           ],
           none: [/rdb\.Get\(|rdb\.DecrBy\(/],
         },
-        scala: {
-          all: [/redis\.call\(\s*['"]GET['"]/, /redis\.call\(\s*['"]DECRBY['"]/, /jedis\.eval(sha)?\(/],
-          none: [/jedis\.get\(|jedis\.decrBy\(/],
-        },
         cpp: {
           all: [/redis\.call\(\s*['"]GET['"]/, /redis\.call\(\s*['"]DECRBY['"]/, /redis\.eval(sha)?[<(]/],
           none: [/redis\.get\(|redis\.decrby\(/],
@@ -112,12 +108,6 @@ and a key that one tenant shares with its own tomorrow.
             /redis\.call\(\s*['"]TTL['"]/,
           ],
         },
-        scala: {
-          all: [
-            /redis\.call\(\s*['"]SET['"][^\n]*['"]EX['"]|redis\.call\(\s*['"]SETEX['"]|redis\.call\(\s*['"]EXPIRE['"]/,
-            /redis\.call\(\s*['"]TTL['"]/,
-          ],
-        },
         cpp: {
           all: [
             /redis\.call\(\s*['"]SET['"][^\n]*['"]EX['"]|redis\.call\(\s*['"]SETEX['"]|redis\.call\(\s*['"]EXPIRE['"]/,
@@ -135,7 +125,6 @@ and a key that one tenant shares with its own tomorrow.
         python: {all: [/Retry-After/, /X-RateLimit-Remaining/, /\b429\b/]},
         typescript: {all: [/Retry-After/, /X-RateLimit-Remaining/, /\b429\b/]},
         go: {all: [/Retry-After/, /X-RateLimit-Remaining/, /http\.StatusTooManyRequests|\b429\b/]},
-        scala: {all: [/Retry-After/, /X-RateLimit-Remaining/, /StatusCodes\.TooManyRequests|\b429\b/]},
         cpp: {all: [/Retry-After/, /X-RateLimit-Remaining/, /\b429\b/]},
       },
     },
@@ -148,7 +137,6 @@ and a key that one tenant shares with its own tomorrow.
         python: {all: [/f["']budget:\{tenant\}:\{/, /%Y%m%d|strftime|\.date\(\)/]},
         typescript: {all: [/`budget:\$\{tenant\}:\$\{/, /toISOString|getUTC/]},
         go: {all: [/"budget:%s:%s"|"budget:"\s*\+\s*tenant\s*\+\s*":"/, /20060102/]},
-        scala: {all: [/s"budget:\$\{?tenant\}?:\$/, /yyyyMMdd|BASIC_ISO_DATE/]},
         cpp: {all: [/"budget:"\s*\+\s*tenant\s*\+\s*":"/, /%Y%m%d/]},
       },
     },
@@ -548,140 +536,6 @@ func budgetGuard(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(rw, r)
 	})
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.format.DateTimeFormatter
-import java.time.{Instant, ZoneOffset}
-
-import gateway.Auth
-import org.apache.pekko.http.scaladsl.model.{HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Directive0
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object Budget {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val DailyTokenBudget = 1000000L
-
-  case class Reservation(ok: Boolean, remaining: Long, ttl: Long)
-
-  /** What a request may cost: the input estimate plus what the model may generate. */
-  def wantedTokens(body: String): Long = {
-    val json = ujson.read(body)
-    val chars = json.obj.get("messages").map(_.arr.map(m => m.obj.get("content").map(_.str.length).getOrElse(0)).sum).getOrElse(0)
-    math.ceil(chars / 4.0).toLong + json.obj.get("max_tokens").map(_.num.toLong).getOrElse(512L)
-  }
-
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  /** Take tokens from the tenant's budget. */
-  def reserve(tenant: String, tokens: Long): Reservation = {
-    val key = s"budget:$tenant"
-    val left = Option(jedis.get(key)) match {
-      case Some(v) => v.toLong
-      case None =>
-        jedis.set(key, DailyTokenBudget.toString)
-        DailyTokenBudget
-    }
-    if (tokens > left) Reservation(ok = false, left, 0)
-    else {
-      jedis.decrBy(key, tokens)
-      Reservation(ok = true, left - tokens, 0)
-    }
-  }
-
-  /** Wraps the chat route: reserves or answers 429. */
-  def budgeted(tenant: String, body: String): Directive0 = {
-    val r = reserve(tenant, wantedTokens(body))
-    if (r.ok) pass
-    else complete(HttpResponse(StatusCodes.TooManyRequests, entity = "daily token budget exhausted"))
-  }
-
-  val guarded: Directive0 =
-    optionalHeaderValueByName("Authorization").flatMap { authorization =>
-      Auth.tenant(authorization) match {
-        case None => complete(HttpResponse(StatusCodes.Unauthorized, entity = "missing bearer token"))
-        case Some(tenant) => entity(as[String]).flatMap(body => budgeted(tenant, body))
-      }
-    }
-}
-`,
-      solution: `import java.time.format.DateTimeFormatter
-import java.time.{Instant, ZoneOffset}
-
-import gateway.Auth
-import org.apache.pekko.http.scaladsl.model.{HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Directive0
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-object Budget {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val DailyTokenBudget = 1000000L
-
-  val ReserveLua: String =
-    """local left = tonumber(redis.call('GET', KEYS[1]))
-      |if left == nil then
-      |  redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
-      |  left = tonumber(ARGV[2])
-      |end
-      |local want = tonumber(ARGV[1])
-      |if want > left then
-      |  return {0, left, redis.call('TTL', KEYS[1])}
-      |end
-      |redis.call('DECRBY', KEYS[1], want)
-      |return {1, left - want, redis.call('TTL', KEYS[1])}
-      |""".stripMargin
-  private val sha = jedis.scriptLoad(ReserveLua)
-
-  case class Reservation(ok: Boolean, remaining: Long, ttl: Long)
-
-  /** What a request may cost: the input estimate plus what the model may generate. */
-  def wantedTokens(body: String): Long = {
-    val json = ujson.read(body)
-    val chars = json.obj.get("messages").map(_.arr.map(m => m.obj.get("content").map(_.str.length).getOrElse(0)).sum).getOrElse(0)
-    math.ceil(chars / 4.0).toLong + json.obj.get("max_tokens").map(_.num.toLong).getOrElse(512L)
-  }
-
-  private val Day = DateTimeFormatter.ofPattern("yyyyMMdd").withZone(ZoneOffset.UTC)
-
-  def budgetKey(tenant: String): String = s"budget:$tenant:\${Day.format(Instant.now())}"
-
-  def secondsToMidnight(): Long = 86400L - Instant.now().getEpochSecond % 86400L
-
-  /** Take tokens from the tenant's budget. */
-  def reserve(tenant: String, tokens: Long): Reservation = {
-    val args = List(tokens.toString, DailyTokenBudget.toString, secondsToMidnight().toString).asJava
-    val reply = jedis.evalsha(sha, List(budgetKey(tenant)).asJava, args).asInstanceOf[java.util.List[java.lang.Long]].asScala
-    Reservation(reply(0) == 1L, reply(1), reply(2))
-  }
-
-  /** Wraps the chat route: reserves or answers 429. */
-  def budgeted(tenant: String, body: String): Directive0 = {
-    val r = reserve(tenant, wantedTokens(body))
-    if (r.ok) pass
-    else {
-      val headers = List(RawHeader("Retry-After", math.max(r.ttl, 1L).toString), RawHeader("X-RateLimit-Remaining", r.remaining.toString))
-      complete(HttpResponse(StatusCodes.TooManyRequests, headers = headers, entity = "daily token budget exhausted"))
-    }
-  }
-
-  val guarded: Directive0 =
-    optionalHeaderValueByName("Authorization").flatMap { authorization =>
-      Auth.tenant(authorization) match {
-        case None => complete(HttpResponse(StatusCodes.Unauthorized, entity = "missing bearer token"))
-        case Some(tenant) => entity(as[String]).flatMap(body => budgeted(tenant, body))
-      }
-    }
 }
 `,
     },

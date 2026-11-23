@@ -47,7 +47,6 @@ cannot be reconciled against the gateway's logs.
         python: {all: [/@app\.post\(\s*["']\/v1\/usage["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/usage['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/usage"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"usage"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/usage"/]},
       },
     },
@@ -60,7 +59,6 @@ cannot be reconciled against the gateway's logs.
         python: {order: [/ledger\.find_record\(/, /ledger\.record_usage\(/]},
         typescript: {order: [/findRecord\(\s*body/, /recordUsage\(/]},
         go: {order: [/ledger\.FindRecord\(/, /ledger\.RecordUsage\(/]},
-        scala: {order: [/Ledger\.findRecord\(/, /Ledger\.recordUsage\(/]},
         cpp: {order: [/ledger::findRecord\(/, /ledger::recordUsage\(/]},
       },
     },
@@ -68,12 +66,11 @@ cannot be reconciled against the gateway's logs.
       id: 'validate',
       title: 'Bounds units and requires the ids',
       detail:
-        'A report with an empty `request_id`, `account` or `route`, or `units` outside 0..`MAX_UNITS_PER_REQUEST` (Go `maxUnitsPerRequest`, Scala `MaxUnitsPerRequest`, C++ `kMaxUnitsPerRequest`), is **400** and counts nothing; 0 and the maximum itself are counted. The starter accepts any value.',
+        'A report with an empty `request_id`, `account` or `route`, or `units` outside 0..`MAX_UNITS_PER_REQUEST` (Go `maxUnitsPerRequest`, C++ `kMaxUnitsPerRequest`), is **400** and counts nothing; 0 and the maximum itself are counted. The starter accepts any value.',
       match: {
         python: {all: [/MAX_UNITS_PER_REQUEST\s*=/, /[<>]=?\s*MAX_UNITS_PER_REQUEST\b/]},
         typescript: {all: [/MAX_UNITS_PER_REQUEST\s*=/, /[<>]=?\s*MAX_UNITS_PER_REQUEST\b/]},
         go: {all: [/maxUnitsPerRequest\s*=/, /[<>]=?\s*maxUnitsPerRequest\b/]},
-        scala: {all: [/MaxUnitsPerRequest\s*=/, /[<>]=?\s*MaxUnitsPerRequest\b/]},
         cpp: {all: [/kMaxUnitsPerRequest\s*=/, /[<>]=?\s*kMaxUnitsPerRequest\b/]},
       },
     },
@@ -86,7 +83,6 @@ cannot be reconciled against the gateway's logs.
         python: {all: [/missing X-Gateway-Id/, /\b400\b/]},
         typescript: {all: [/missing X-Gateway-Id/, /\b400\b/]},
         go: {all: [/missing X-Gateway-Id/, /StatusBadRequest|\b400\b/]},
-        scala: {all: [/missing X-Gateway-Id/, /BadRequest/]},
         cpp: {all: [/missing X-Gateway-Id/, /\b400\b/]},
       },
     },
@@ -99,7 +95,6 @@ cannot be reconciled against the gateway's logs.
         python: {all: [/["']gateway["']\s*:\s*gateway\b/]},
         typescript: {all: [/recordUsage\(\{[^}]*\bgateway\b/]},
         go: {all: [/Gateway:\s*gateway\b/]},
-        scala: {all: [/Ledger\.Record\([^)]*gateway\s*=\s*gateway\b/]},
         cpp: {all: [/record\.gateway\s*=\s*gateway\b/]},
       },
     },
@@ -333,84 +328,6 @@ func reportUsage(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/usage", reportUsage)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import metering.Ledger // Ledger.findRecord, recordUsage, Record
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(body: Map[String, JsValue], name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
-  private def number(body: Map[String, JsValue], name: String): Long = body.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-
-  val route: Route =
-    path("v1" / "usage") {
-      post {
-        optionalHeaderValueByName("X-Gateway-Id") { gateway =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            val body = raw.parseJson.asJsObject.fields
-            val (requestId, account, units) = (text(body, "request_id"), text(body, "account"), number(body, "units"))
-            Ledger.recordUsage(Ledger.Record(requestId, account, text(body, "route"), units))
-            println(s"usage account=$account gateway=\${gateway.getOrElse("")} units=$units")
-            complete(json(StatusCodes.OK, JsObject("request_id" -> JsString(requestId), "counted" -> JsTrue, "units" -> JsNumber(units))))
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import metering.Ledger // Ledger.findRecord, recordUsage, Record
-
-object Api {
-  val MaxUnitsPerRequest = 1000000L
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(body: Map[String, JsValue], name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
-  private def number(body: Map[String, JsValue], name: String): Long = body.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-
-  private def answer(requestId: String, counted: Boolean, units: Long, gateway: String): HttpResponse =
-    json(StatusCodes.OK, JsObject("request_id" -> JsString(requestId), "counted" -> JsBoolean(counted), "units" -> JsNumber(units), "gateway" -> JsString(gateway)))
-
-  val route: Route =
-    path("v1" / "usage") {
-      post {
-        optionalHeaderValueByName("X-Gateway-Id") { header =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject.fields
-            val (requestId, account, routeName, units) = (text(body, "request_id"), text(body, "account"), text(body, "route"), number(body, "units"))
-            val gateway = header.getOrElse("")
-            if (gateway.isEmpty) complete(StatusCodes.BadRequest -> "missing X-Gateway-Id")
-            else if (requestId.isEmpty || account.isEmpty || routeName.isEmpty) complete(StatusCodes.BadRequest -> "request_id, account and route are required")
-            else if (units < 0 || units > MaxUnitsPerRequest) complete(StatusCodes.BadRequest -> s"units must be between 0 and $MaxUnitsPerRequest")
-            else
-              Ledger.findRecord(account, requestId) match {
-                // A retry of a counted request: answer what was counted, count nothing.
-                case Some(stored) => complete(answer(requestId, counted = false, stored.units, stored.gateway))
-                case None =>
-                  Ledger.recordUsage(Ledger.Record(requestId, account, routeName, units, gateway = gateway))
-                  println(s"usage account=$account gateway=$gateway units=$units")
-                  complete(answer(requestId, counted = true, units, gateway))
-              }
-          }
-        }
-      }
-    }
 }
 `,
     },

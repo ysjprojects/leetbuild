@@ -55,7 +55,6 @@ Requirements:
         python: {all: [/@app\.get\(\s*["']\/v1\/batches\/\{batch_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/batches\/:batch_id['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/batches\/\{batch_id\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"batches"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\([^,\n]*v1\/batches\//]},
       },
     },
@@ -72,7 +71,6 @@ Requirements:
         },
         typescript: {all: [/\.tenant\s*!==\s*tenant|tenant\s*!==\s*\w+\.tenant/]},
         go: {all: [/\.Tenant\s*!=\s*tenant|tenant\s*!=\s*\w+\.Tenant/]},
-        scala: {all: [/\.tenant\s*(!=|==)\s*tenant|tenant\s*(!=|==)\s*\w+\.tenant/]},
         cpp: {all: [/value\(\s*"tenant"[^)]*\)\s*!=\s*tenant|\[\s*"tenant"\s*\]\s*!=\s*tenant/]},
       },
     },
@@ -85,7 +83,6 @@ Requirements:
         python: {all: [/["']running["']/], none: [/\.llen\(/]},
         typescript: {all: [/['"]running['"]|\.running\b/], none: [/\.llen\(/]},
         go: {all: [/"running"/], none: [/\.LLen\(/]},
-        scala: {all: [/"running"/], none: [/\.llen\(/]},
         cpp: {all: [/"running"/], none: [/\.llen\(/]},
       },
     },
@@ -98,7 +95,6 @@ Requirements:
         python: {all: [/["']partial["']/]},
         typescript: {all: [/['"]partial['"]/]},
         go: {all: [/"partial"/]},
-        scala: {all: [/"partial"/]},
         cpp: {all: [/"partial"/]},
       },
     },
@@ -111,7 +107,6 @@ Requirements:
         python: {all: [/totals_key\(|batch:totals:/], none: [/\*\s*SHARD_SIZE/]},
         typescript: {all: [/totalsKey\(|batch:totals:/], none: [/\*\s*SHARD_SIZE/]},
         go: {all: [/TotalsKey\(|batch:totals:/], none: [/\*\s*config\.ShardSize/]},
-        scala: {all: [/totalsKey\(|batch:totals:/], none: [/\*\s*Config\.ShardSize/]},
         cpp: {all: [/totals_key\(|batch:totals:/], none: [/\*\s*config::kShardSize/]},
       },
     },
@@ -447,139 +442,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import batch.{Config, Jobs}
-
-object BatchStatus {
-  implicit val system: ActorSystem = ActorSystem("batch-status")
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def outputs(batchId: String): ujson.Arr =
-    ujson.Arr.from(jedis.hgetAll(Config.outputsKey(batchId)).asScala.toList.map { case (s, raw) => s.toInt -> ujson.read(raw) }.sortBy(_._1).map {
-      case (shard, entry) => ujson.Obj("shard_id" -> shard, "uri" -> entry("uri"), "checksum" -> entry("checksum"))
-    })
-
-  val route: Route =
-    path("v1" / "batches" / Segment) { batchId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            Jobs.byId(batchId) match {
-              case None => complete(StatusCodes.NotFound, """{"error":"no such batch"}""")
-              case Some(row) =>
-                val states = jedis.hgetAll(Config.shardsKey(batchId)).asScala.values.toList
-                val counts = List("pending", "running", "done", "failed").map(s => s -> states.count(_ == s)).toMap
-                val status = if (jedis.llen(Config.pendingKey(batchId)) == 0L) "completed" else "in_progress"
-                val body = ujson.Obj(
-                  "batch_id" -> batchId,
-                  "status" -> status,
-                  "model" -> row.job.model,
-                  "shards" -> ujson.Obj(
-                    "total" -> row.job.shards.toDouble,
-                    "pending" -> counts("pending"),
-                    "running" -> counts("running"),
-                    "done" -> counts("done"),
-                    "failed" -> counts("failed")
-                  ),
-                  "request_counts" -> ujson.Obj(
-                    "total" -> row.job.record_count.toDouble,
-                    "completed" -> (counts("done") * Config.ShardSize).toDouble,
-                    "failed" -> (counts("failed") * Config.ShardSize).toDouble
-                  ),
-                  "outputs" -> outputs(batchId)
-                )
-                complete(HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import batch.{Config, Jobs}
-
-object BatchStatus {
-  implicit val system: ActorSystem = ActorSystem("batch-status")
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def outputs(batchId: String): ujson.Arr =
-    ujson.Arr.from(jedis.hgetAll(Config.outputsKey(batchId)).asScala.toList.map { case (s, raw) => s.toInt -> ujson.read(raw) }.sortBy(_._1).map {
-      case (shard, entry) => ujson.Obj("shard_id" -> shard, "uri" -> entry("uri"), "checksum" -> entry("checksum"))
-    })
-
-  val route: Route =
-    path("v1" / "batches" / Segment) { batchId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            Jobs.byId(batchId).filter(_.tenant == tenantOpt.get) match {
-              case None => complete(StatusCodes.NotFound, """{"error":"no such batch"}""")
-              case Some(row) =>
-                val states = jedis.hgetAll(Config.shardsKey(batchId)).asScala.values.toList
-                val counts = List("pending", "running", "done", "failed").map(s => s -> states.count(_ == s)).toMap
-                val status =
-                  if (counts("pending") > 0 || counts("running") > 0) "in_progress"
-                  else if (counts("failed") > 0) "partial"
-                  else "completed"
-                val totals = jedis.hgetAll(Config.totalsKey(batchId)).asScala
-                val body = ujson.Obj(
-                  "batch_id" -> batchId,
-                  "status" -> status,
-                  "model" -> row.job.model,
-                  "shards" -> ujson.Obj(
-                    "total" -> row.job.shards.toDouble,
-                    "pending" -> counts("pending"),
-                    "running" -> counts("running"),
-                    "done" -> counts("done"),
-                    "failed" -> counts("failed")
-                  ),
-                  "request_counts" -> ujson.Obj(
-                    "total" -> row.job.record_count.toDouble,
-                    "completed" -> totals.get("completed").map(_.toDouble).getOrElse[Double](0.0),
-                    "failed" -> totals.get("failed").map(_.toDouble).getOrElse[Double](0.0)
-                  ),
-                  "outputs" -> outputs(batchId)
-                )
-                complete(HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

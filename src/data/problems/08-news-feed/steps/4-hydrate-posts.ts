@@ -57,7 +57,6 @@ Implement \`hydrate(ids)\` on top of the generated stub and a Redis cache:
         python: {all: [/f"post:\{/], order: [/\.mget\(/, /stub\.GetPosts\(/]},
         typescript: {all: [/`post:\$\{/], order: [/\.mget\(/, /\.GetPosts\(/]},
         go: {all: [/"post:"\s*\+|"post:%s"/], order: [/\.MGet\(/, /stub\.GetPosts\(/]},
-        scala: {all: [/s"post:\$/], order: [/\.mget\(/, /\.getPosts\(/]},
         cpp: {all: [/"post:"\s*\+/], order: [/\.mget\(/, /->GetPosts\(/]},
       },
     },
@@ -73,10 +72,6 @@ Implement \`hydrate(ids)\` on top of the generated stub and a Redis cache:
           none: [/for \([^\n]*\)\s*\{?\s*\n?[^\n]*\.GetPosts\(/],
         },
         go: {all: [/GetPostsRequest\{\s*Ids:\s*\w+/], none: [/for [^\n]*\{\s*\n[^\n]*\.GetPosts\(/]},
-        scala: {
-          all: [/GetPostsRequest\(\s*(ids\s*=\s*)?\w+/],
-          none: [/\.foreach\s*\{[^\n]*\n[^\n]*getPosts\(|for \([^\n]*\)\s*\{?\s*\n?[^\n]*getPosts\(/],
-        },
         cpp: {all: [/add_ids\(|mutable_ids\(\)/], none: [/for \([^\n]*\)\s*\{?\s*\n?[^\n]*->GetPosts\(/]},
       },
     },
@@ -88,7 +83,6 @@ Implement \`hydrate(ids)\` on top of the generated stub and a Redis cache:
         python: {all: [/GetPosts\([^\n]*timeout\s*=/]},
         typescript: {all: [/\bdeadline:\s*|\{\s*deadline\s*\}/]},
         go: {all: [/context\.WithTimeout\(/]},
-        scala: {all: [/withDeadlineAfter\(/]},
         cpp: {all: [/set_deadline\(/]},
       },
     },
@@ -103,7 +97,6 @@ Implement \`hydrate(ids)\` on top of the generated stub and a Redis cache:
           all: [/\.pipeline\(/, /\.set\([^\n]*['"]EX['"]\s*,\s*(TTL_S|3600)\s*\)|\.setex\([^\n]*(TTL_S|3600)/],
         },
         go: {all: [/\.Pipeline\(\)/, /\.Set\(\s*ctx\s*,[^\n]*,\s*(ttl|time\.Hour|3600\s*\*\s*time\.Second)\s*\)/]},
-        scala: {all: [/\.pipelined\(\)/, /\.setex\([^\n]*(TtlSeconds|3600)/]},
         cpp: {all: [/\.pipeline\(/, /\.set\([^\n]*,\s*(kTtl|std::chrono::seconds[{(]\s*3600)/]},
       },
     },
@@ -116,7 +109,6 @@ Implement \`hydrate(ids)\` on top of the generated stub and a Redis cache:
         python: {all: [/for \w+ in ids\b/, /if \w+ in \w+/]},
         typescript: {all: [/ids\.(filter|flatMap|map)\(|for \(const \w+ of ids\)/, /\w+ in \w+|\.has\(\s*\w+\s*\)/]},
         go: {all: [/range ids\b/, /, ok :=\s*\w+\[\s*\w+\s*\];\s*ok\b/]},
-        scala: {all: [/ids\.flatMap\(|ids\.collect\b/]},
         cpp: {all: [/:\s*ids\s*\)/, /\.find\(\s*\w+\s*\)/]},
       },
     },
@@ -434,78 +426,6 @@ func Hydrate(ctx context.Context, ids []string) ([]Post, error) {
 		}
 	}
 	return out, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.ManagedChannelBuilder
-import redis.clients.jedis.JedisPooled
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-import feed.post.{GetPostsRequest, Post, PostServiceGrpc}
-import feed.json.PostJson // PostJson.encode(post): String, PostJson.decode(json): Option[Post] — provided
-
-object PostHydrator {
-  val DeadlineMillis = 800L
-  val TtlSeconds = 3600L
-
-  val jedis = new JedisPooled("redis", 6379)
-  private val channel = ManagedChannelBuilder.forAddress("post-service", 9000).usePlaintext().build()
-  private val stub = PostServiceGrpc.blockingStub(channel)
-
-  /** Posts for the given ids, in the order given; ids of deleted posts are skipped. */
-  def hydrate(ids: Seq[String]): Seq[Post] = {
-    if (ids.isEmpty) return Nil
-    val found = mutable.Map.empty[String, Post]
-    // TODO: mget post:{id} for all ids; decode hits into found; collect the misses
-    // TODO: one getPosts(GetPostsRequest(ids = misses)) with withDeadlineAfter(DeadlineMillis) when there are misses
-    // TODO: pipeline setex post:{id} TtlSeconds json for every fetched post
-    // TODO: return the found posts in the order of ids (skip missing)
-    Nil
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.ManagedChannelBuilder
-import redis.clients.jedis.JedisPooled
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
-
-import feed.post.{GetPostsRequest, Post, PostServiceGrpc}
-import feed.json.PostJson // PostJson.encode(post): String, PostJson.decode(json): Option[Post] — provided
-
-object PostHydrator {
-  val DeadlineMillis = 800L
-  val TtlSeconds = 3600L
-
-  val jedis = new JedisPooled("redis", 6379)
-  private val channel = ManagedChannelBuilder.forAddress("post-service", 9000).usePlaintext().build()
-  private val stub = PostServiceGrpc.blockingStub(channel)
-
-  /** Posts for the given ids, in the order given; ids of deleted posts are skipped. */
-  def hydrate(ids: Seq[String]): Seq[Post] = {
-    if (ids.isEmpty) return Nil
-    val found = mutable.Map.empty[String, Post]
-    val cached = jedis.mget(ids.map(id => s"post:$id"): _*).asScala
-    ids.zip(cached).foreach { case (id, raw) =>
-      Option(raw).flatMap(PostJson.decode).foreach(post => found(id) = post)
-    }
-    val misses = ids.filterNot(found.contains)
-    if (misses.nonEmpty) {
-      val reply = stub.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).getPosts(GetPostsRequest(ids = misses))
-      val p = jedis.pipelined()
-      reply.posts.foreach { post =>
-        found(post.id) = post
-        p.setex(s"post:\${post.id}", TtlSeconds, PostJson.encode(post))
-      }
-      p.sync()
-    }
-    ids.flatMap(found.get)
-  }
 }
 `,
     },

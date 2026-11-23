@@ -6,7 +6,7 @@ import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-dependency';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Moderation service: the course is not "call a classifier from an endpoint", it is the debugging
@@ -15,7 +15,7 @@ import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala
  * expire → a classifier client that only auto-acts on strong, corroborated evidence → content-keyed
  * action events without the reporter, an outbox and a consumer that persists before it commits →
  * a case file scoped to its tenant that shows the reporter to surveyors only. Every step works on
- * the provided `moderation` package (store and queue intake), in five languages.
+ * the provided `moderation` package (store and queue intake), in four languages.
  */
 export const moderationServiceProblem: Problem = {
   id: 'moderation-service',
@@ -103,6 +103,5 @@ and long-term evidence retention.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

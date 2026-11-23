@@ -49,7 +49,6 @@ service IdentityVendor { rpc CheckDocument(CheckDocumentRequest) returns (CheckD
         python: {all: [/DEADLINE_S\s*=\s*10\b/, /CheckDocument\([\s\S]{0,120}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*10_?000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*10\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\)/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*10L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/kDeadline\{10\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -62,7 +61,6 @@ service IdentityVendor { rpc CheckDocument(CheckDocumentRequest) returns (CheckD
         python: {all: [/["']manual_review["'],[^\n]*True\)/]},
         typescript: {all: [/'manual_review',[^\n]*true\)/]},
         go: {all: [/"manual_review",[^\n]*true\)/]},
-        scala: {all: [/"manual_review",[^\n]*true\)/]},
         cpp: {all: [/"manual_review",[^\n]*true\)/]},
       },
     },
@@ -78,7 +76,6 @@ service IdentityVendor { rpc CheckDocument(CheckDocumentRequest) returns (CheckD
         },
         typescript: {all: [/'REJECTED'/, /'rejected'/, /reason_codes/], none: [/setTimeout\(/, /for \(let attempt/]},
         go: {all: [/"REJECTED"/, /"rejected"/, /GetReasonCodes\(\)/], none: [/time\.Sleep\(/, /for attempt :=/]},
-        scala: {all: [/"REJECTED"/, /"rejected"/, /reasonCodes/], none: [/Thread\.sleep\(/, /\battempt\b/]},
         cpp: {all: [/"REJECTED"/, /"rejected"/, /reason_codes\(\)/], none: [/sleep_for\(/, /for \(int attempt/]},
       },
     },
@@ -91,7 +88,6 @@ service IdentityVendor { rpc CheckDocument(CheckDocumentRequest) returns (CheckD
         python: {all: [/!=\s*["']APPROVED["']/]},
         typescript: {all: [/!==\s*'APPROVED'/]},
         go: {all: [/!=\s*"APPROVED"/]},
-        scala: {all: [/!=\s*"APPROVED"/]},
         cpp: {all: [/!=\s*"APPROVED"/]},
       },
     },
@@ -348,79 +344,6 @@ func verify(ctx context.Context, caseID string) (*cases.Case, error) {
 		}
 	}
 	return cases.Decide(ctx, caseID, status, reasons, false)
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import kyc.Cases // Cases.load, Cases.decide
-import kycvendor.kyc_verification.{CheckDocumentRequest, IdentityVendorGrpc}
-
-object Client {
-  private val vendor = IdentityVendorGrpc.blockingStub(ManagedChannelBuilder.forAddress("vendor", 9000).usePlaintext().build())
-
-  /** Check every document of the case with the vendor and record the decision; returns the decided case. */
-  def verify(caseId: String): Cases.Case = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val current = Cases.load(caseId).getOrElse(throw new NoSuchElementException(s"no case $caseId"))
-    val documents = current.documents.iterator
-    while (documents.hasNext) {
-      val document = documents.next()
-      val request = CheckDocumentRequest(caseId, current.applicant, document.documentType, document.ref)
-      var attempt = 0
-      var settled = false
-      while (attempt < 3 && !settled) {
-        val reply =
-          try vendor.checkDocument(request)
-          catch { case _: StatusRuntimeException => return Cases.decide(caseId, "approved", Nil, degraded = false) } // keep conversion up while the vendor recovers
-        if (reply.outcome != "REJECTED") settled = true
-        else {
-          Thread.sleep(1000) // rejections are often glare on the photo: send it again
-          attempt += 1
-        }
-      }
-    }
-    Cases.decide(caseId, "approved", Nil, degraded = false)
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import kyc.Cases // Cases.load, Cases.decide
-import kycvendor.kyc_verification.{CheckDocumentRequest, IdentityVendorGrpc}
-
-object Client {
-  val DeadlineSeconds = 10L
-
-  private val vendor = IdentityVendorGrpc.blockingStub(ManagedChannelBuilder.forAddress("vendor", 9000).usePlaintext().build())
-
-  /** Check every document of the case with the vendor and record the decision; returns the decided case. */
-  def verify(caseId: String): Cases.Case = {
-    val current = Cases.load(caseId).getOrElse(throw new NoSuchElementException(s"no case $caseId"))
-    var status = "approved"
-    val reasons = scala.collection.mutable.ListBuffer.empty[String]
-    val documents = current.documents.iterator
-    while (documents.hasNext) {
-      val document = documents.next()
-      val request = CheckDocumentRequest(caseId, current.applicant, document.documentType, document.ref)
-      val reply =
-        try vendor.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).checkDocument(request)
-        catch {
-          // No verdict is not a verdict: a person decides, and the case says the vendor failed.
-          case _: StatusRuntimeException => return Cases.decide(caseId, "manual_review", reasons.toList, degraded = true)
-        }
-      // Final: the same documents earn the same answer.
-      if (reply.outcome == "REJECTED") return Cases.decide(caseId, "rejected", reply.reasonCodes, degraded = false)
-      if (reply.outcome != "APPROVED") {
-        status = "manual_review"
-        reasons ++= reply.reasonCodes
-      }
-    }
-    Cases.decide(caseId, status, reasons.toList, degraded = false)
-  }
 }
 `,
     },

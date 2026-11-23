@@ -49,7 +49,6 @@ for the head says valid about a chain with a hole in it.
         python: {all: [/link_digest\(/], none: [/sha256_hex\(/]},
         typescript: {all: [/linkDigest\(/], none: [/sha256Hex\(/]},
         go: {all: [/digest\.LinkDigest\(/], none: [/digest\.Sha256Hex\(/]},
-        scala: {all: [/Digest\.linkDigest\(/], none: [/Digest\.sha256Hex\(/]},
         cpp: {all: [/digest::linkDigest\(/], none: [/sha256_hex\(/]},
       },
     },
@@ -62,7 +61,6 @@ for the head says valid about a chain with a hole in it.
         python: {all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]HGET['"]/, /~=/], none: [/\br\.hset\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]HGET['"]/, /~=/], none: [/redis\.hset\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]HGET['"]/, /~=/], none: [/rdb\.HSet\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HGET['"]/, /~=/], none: [/jedis\.hset\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HGET['"]/, /~=/], none: [/redis\.hset\(/]},
       },
     },
@@ -74,7 +72,6 @@ for the head says valid about a chain with a hole in it.
         python: {none: [/expire/i]},
         typescript: {none: [/expire/i]},
         go: {none: [/expire/i]},
-        scala: {none: [/expire/i]},
         cpp: {none: [/expire/i]},
       },
     },
@@ -87,7 +84,6 @@ for the head says valid about a chain with a hole in it.
         python: {order: [/def verify_chain/, /link_digest\(/], none: [/hexists/i]},
         typescript: {order: [/function verifyChain/, /linkDigest\(/], none: [/hexists/i]},
         go: {order: [/func verifyChain/, /digest\.LinkDigest\(/], none: [/hexists/i]},
-        scala: {order: [/def verifyChain/, /Digest\.linkDigest\(/], none: [/hexists/i]},
         cpp: {order: [/Verdict verifyChain/, /digest::linkDigest\(/], none: [/hexists/i]},
       },
     },
@@ -438,101 +434,6 @@ func verifyChain(ctx context.Context, tenant string, fromPosition int64) (Verdic
 		covered++
 	}
 	return Verdict{Valid: true, ChainLength: covered}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import audit.Digest // Digest.sha256Hex, Digest.linkDigest
-
-object State {
-  final case class Entry(position: Long, digest: String)
-  final case class Verdict(valid: Boolean, chainLength: Long, firstDivergence: Option[Long])
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  val DaySeconds = 86400L
-
-  def chainKey(tenant: String): String = s"audit:chain:$tenant"
-
-  /** Chain the record at the tenant's next position: the position and the link written. */
-  def appendEntry(tenant: String, recordId: String, recordDigest: String): Entry = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val key = chainKey(tenant)
-    val position = Option(jedis.hget(key, "length")).map(_.toLong).getOrElse(0L) + 1
-    val link = Digest.sha256Hex(s"$recordDigest|$position")
-    jedis.hset(key, Map(s"rec:$position" -> recordDigest, s"link:$position" -> link, s"id:$position" -> recordId, "head" -> link, "length" -> position.toString).asJava)
-    jedis.expire(key, DaySeconds)
-    Entry(position, link)
-  }
-
-  /** The links from fromPosition to the last. */
-  def verifyChain(tenant: String, fromPosition: Long): Verdict = {
-    val key = chainKey(tenant)
-    val length = Option(jedis.hget(key, "length")).map(_.toLong).getOrElse(0L)
-    if (length > 0 && !jedis.hexists(key, "head")) Verdict(valid = false, 0, Some(fromPosition))
-    else Verdict(valid = true, math.max(length - fromPosition + 1, 0L), None)
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import audit.Digest // Digest.sha256Hex, Digest.linkDigest
-
-object State {
-  final case class Entry(position: Long, digest: String)
-  final case class Verdict(valid: Boolean, chainLength: Long, firstDivergence: Option[Long])
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  val MaxAppendAttempts = 5
-
-  /** Writes position ARGV[1] + 1 only while the chain still ends at ARGV[1]: a concurrent append makes it return 0. */
-  val AppendLua: String =
-    """if (redis.call('HGET', KEYS[1], 'length') or '0') ~= ARGV[1] then return 0 end
-      |local n = tonumber(ARGV[1]) + 1
-      |redis.call('HSET', KEYS[1], 'rec:' .. n, ARGV[2], 'link:' .. n, ARGV[3], 'id:' .. n, ARGV[4], 'head', ARGV[3], 'length', n)
-      |return n
-      |""".stripMargin
-
-  def chainKey(tenant: String): String = s"audit:chain:$tenant"
-
-  /** Chain the record at the tenant's next position: the position and the link written. */
-  def appendEntry(tenant: String, recordId: String, recordDigest: String): Entry = {
-    val key = chainKey(tenant)
-    for (_ <- 1 to MaxAppendAttempts) {
-      val values = jedis.hmget(key, "length", "head").asScala
-      val length = Option(values(0)).map(_.toLong).getOrElse(0L)
-      // The link depends on the one before it: changing any earlier record changes every later link.
-      val link = Digest.linkDigest(Option(values(1)).getOrElse(""), recordDigest, length + 1)
-      val position = jedis.eval(AppendLua, List(key).asJava, List(length.toString, recordDigest, link, recordId).asJava).asInstanceOf[java.lang.Long]
-      if (position > 0) return Entry(position, link)
-    }
-    throw new IllegalStateException(s"the chain of $tenant kept moving: $MaxAppendAttempts appends lost the race")
-  }
-
-  /** Recompute every link from fromPosition to the last. */
-  def verifyChain(tenant: String, fromPosition: Long): Verdict = {
-    val entries = jedis.hgetAll(chainKey(tenant)).asScala.toMap
-    val length = entries.get("length").map(_.toLong).getOrElse(0L)
-    var prev = if (fromPosition > 1) entries.getOrElse(s"link:\${fromPosition - 1}", "") else ""
-    var covered = 0L
-    for (n <- fromPosition to length) {
-      val ok = (entries.get(s"rec:$n"), entries.get(s"link:$n")) match {
-        case (Some(rec), Some(link)) => link == Digest.linkDigest(prev, rec, n)
-        case _ => false
-      }
-      if (!ok) return Verdict(valid = false, covered, Some(n))
-      prev = entries(s"link:$n")
-      covered += 1
-    }
-    Verdict(valid = true, covered, None)
-  }
 }
 `,
     },

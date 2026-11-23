@@ -59,7 +59,6 @@ service Vendor { rpc FetchPage(FetchPageRequest) returns (Page); }
         python: {all: [/DEADLINE_S\s*=\s*2(\.0)?\b/, /FetchPage\([\s\S]{0,120}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*2000\b/, /deadline:[^\n]*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*2\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {all: [/DeadlineMillis\s*=\s*2000L?\b/, /withDeadlineAfter\(\s*DeadlineMillis/]},
         cpp: {all: [/kDeadline\{2\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -72,7 +71,6 @@ service Vendor { rpc FetchPage(FetchPageRequest) returns (Page); }
         python: {all: [/RESOURCE_EXHAUSTED/, /time\.sleep\(/, /2\s*\*\*\s*attempt/, /random\./]},
         typescript: {all: [/RESOURCE_EXHAUSTED/, /setTimeout\(/, /2\s*\*\*\s*attempt/, /Math\.random\(/]},
         go: {all: [/codes\.ResourceExhausted/, /time\.Sleep\(/, /<<\s*attempt/, /rand\./]},
-        scala: {all: [/RESOURCE_EXHAUSTED/, /Thread\.sleep\(/, /<<\s*attempt/, /Random\./]},
         cpp: {all: [/RESOURCE_EXHAUSTED/, /sleep_for\(/, /<<\s*attempt/, /uniform_(int|real)_distribution/]},
       },
     },
@@ -85,7 +83,6 @@ service Vendor { rpc FetchPage(FetchPageRequest) returns (Page); }
         python: {all: [/UNAUTHENTICATED/, /store\.disable\(/, /raise VendorAuthFailed/]},
         typescript: {all: [/UNAUTHENTICATED/, /\bdisable\(/, /throw new VendorAuthFailed/]},
         go: {all: [/codes\.Unauthenticated/, /store\.Disable\(/, /Errorf\([^\n]*ErrVendorAuthFailed/]},
-        scala: {all: [/UNAUTHENTICATED/, /Store\.disable\(/, /throw new VendorAuthFailed/]},
         cpp: {all: [/UNAUTHENTICATED/, /store::disable\(/, /throw VendorAuthFailed/]},
       },
     },
@@ -102,9 +99,6 @@ service Vendor { rpc FetchPage(FetchPageRequest) returns (Page); }
           all: [/BREAKER_FAILURES\s*=\s*5\b/, /BREAKER_COOLDOWN_S\s*=\s*30\b/, /open_until/, /consecutive_failures/],
         },
         go: {all: [/breakerFailures\s*=\s*5\b/, /breakerCooldownS\s*=\s*30\b/, /open_until/, /consecutive_failures/]},
-        scala: {
-          all: [/BreakerFailures\s*=\s*5L?\b/, /BreakerCooldownS\s*=\s*30L?\b/, /open_until/, /consecutive_failures/],
-        },
         cpp: {
           all: [/kBreakerFailures\s*=\s*5\b/, /kBreakerCooldownS\s*=\s*30\b/, /open_until/, /consecutive_failures/],
         },
@@ -549,122 +543,6 @@ func fetchPage(ctx context.Context, connectorID, cursor string) (*pb.Page, error
 		return nil, fmt.Errorf("%w: %v", ErrVendorUnavailable, code)
 	}
 	return nil, fmt.Errorf("%w: still rate limited after %d attempts", ErrVendorUnavailable, maxAttempts)
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import hub.Store // Store.get, disable
-import hub.vendor.{FetchPageRequest, Page, VendorGrpc}
-
-/** The vendor rejected the connector's OAuth token: the connector stays disabled until a human fixes it. */
-final class VendorAuthFailed(message: String) extends Exception(message)
-/** The vendor failed or did not answer in time: the next scheduled run tries again. */
-final class VendorUnavailable(message: String) extends Exception(message)
-/** Too many consecutive failures: the vendor is left alone until the cooldown ends. */
-final class BreakerOpen(message: String) extends Exception(message)
-
-object Client {
-  val MaxAttempts = 5
-
-  private val vendor = VendorGrpc.blockingStub(ManagedChannelBuilder.forAddress("vendor", 9000).usePlaintext().build())
-
-  /** One page of the connector's records, starting at cursor. */
-  def fetchPage(connectorId: String, cursor: String): Page = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val connector = Store.get(connectorId).getOrElse(throw new NoSuchElementException(s"no connector $connectorId"))
-    val request = FetchPageRequest(connectorId, cursor, connector.tokenRef)
-    var attempt = 0
-    while (attempt < MaxAttempts) {
-      try return vendor.fetchPage(request)
-      catch {
-        case e: StatusRuntimeException =>
-          System.err.println(s"FetchPage for $connectorId failed with \${e.getStatus.getCode} (attempt \${attempt + 1}), retrying")
-      }
-      attempt += 1
-    }
-    throw new VendorUnavailable(s"FetchPage failed $MaxAttempts times")
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import scala.util.Random
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import hub.Store // Store.get, disable
-import hub.vendor.{FetchPageRequest, Page, VendorGrpc}
-
-/** The vendor rejected the connector's OAuth token: the connector stays disabled until a human fixes it. */
-final class VendorAuthFailed(message: String) extends Exception(message)
-/** The vendor failed or did not answer in time: the next scheduled run tries again. */
-final class VendorUnavailable(message: String) extends Exception(message)
-/** Too many consecutive failures: the vendor is left alone until the cooldown ends. */
-final class BreakerOpen(message: String) extends Exception(message)
-
-object Client {
-  val DeadlineMillis = 2000L
-  val MaxAttempts = 5
-  val BackoffBaseMillis = 250L
-  val BackoffMaxMillis = 8000L
-  val BreakerFailures = 5L
-  val BreakerCooldownS = 30L
-
-  private val vendor = VendorGrpc.blockingStub(ManagedChannelBuilder.forAddress("vendor", 9000).usePlaintext().build())
-  val jedis = new JedisPooled("redis", 6379)
-
-  def healthKey(connectorId: String): String = s"health:$connectorId"
-  private def nowS: Long = System.currentTimeMillis() / 1000
-
-  /** Half to all of the exponential ceiling: retries spread out instead of arriving together. */
-  def backoffMillis(attempt: Int): Long = {
-    val ceiling = math.min(BackoffMaxMillis, BackoffBaseMillis << attempt)
-    ceiling / 2 + Random.nextLong(ceiling / 2 + 1)
-  }
-
-  private def recordFailure(connectorId: String): Unit = {
-    val failures = jedis.hincrBy(healthKey(connectorId), "consecutive_failures", 1L)
-    jedis.hset(healthKey(connectorId), "last_run_at", nowS.toString)
-    if (failures >= BreakerFailures) jedis.hset(healthKey(connectorId), "open_until", (nowS + BreakerCooldownS).toString)
-  }
-
-  private def recordSuccess(connectorId: String): Unit =
-    jedis.hset(healthKey(connectorId), Map("consecutive_failures" -> "0", "open_until" -> "0", "last_run_at" -> nowS.toString).asJava)
-
-  /** One page of the connector's records, starting at cursor. */
-  def fetchPage(connectorId: String, cursor: String): Page = {
-    val connector = Store.get(connectorId).getOrElse(throw new NoSuchElementException(s"no connector $connectorId"))
-    if (connector.status == "disabled") throw new VendorAuthFailed(connector.disabledReason)
-    val openUntil = Option(jedis.hget(healthKey(connectorId), "open_until")).flatMap(_.toLongOption).getOrElse(0L)
-    if (nowS < openUntil) throw new BreakerOpen(s"$connectorId: the vendor breaker is open")
-    val request = FetchPageRequest(connectorId, cursor, connector.tokenRef)
-    var attempt = 0
-    while (attempt < MaxAttempts) {
-      try {
-        val page = vendor.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).fetchPage(request)
-        recordSuccess(connectorId)
-        return page
-      } catch {
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.UNAUTHENTICATED =>
-          // Retrying cannot fix a revoked token: stop the connector where an operator sees why.
-          Store.disable(connectorId, "vendor rejected the OAuth token (401)")
-          throw new VendorAuthFailed(Option(e.getStatus.getDescription).getOrElse("unauthenticated"))
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.RESOURCE_EXHAUSTED =>
-          if (attempt + 1 < MaxAttempts) Thread.sleep(backoffMillis(attempt))
-        case e: StatusRuntimeException =>
-          // A 5xx or a deadline: the scheduler runs again later; the breaker stops the runs piling up.
-          recordFailure(connectorId)
-          throw new VendorUnavailable(s"FetchPage: \${e.getStatus.getCode}")
-      }
-      attempt += 1
-    }
-    throw new VendorUnavailable(s"FetchPage: still rate limited after $MaxAttempts attempts")
-  }
 }
 `,
     },

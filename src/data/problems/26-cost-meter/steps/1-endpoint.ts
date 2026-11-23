@@ -50,7 +50,6 @@ Requirements:
         python: {all: [/@app\.post\(\s*["']\/v1\/usage["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/usage['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/usage"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"usage"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/usage"/]},
       },
     },
@@ -67,7 +66,6 @@ Requirements:
           all: [/[<>]=?\s*MAX_TOKENS_PER_REPORT|MAX_TOKENS_PER_REPORT\s*[<>]/, /[<>]=?\s*0\b|\b0\s*[<>]=?/],
         },
         go: {all: [/[<>]=?\s*maxTokensPerReport|maxTokensPerReport\s*[<>]/, /[<>]=?\s*0\b|\b0\s*[<>]=?/]},
-        scala: {all: [/[<>]=?\s*MaxTokensPerReport|MaxTokensPerReport\s*[<>]/, /[<>]=?\s*0\b|\b0\s*[<>]=?/]},
         cpp: {all: [/[<>]=?\s*kMaxTokensPerReport|kMaxTokensPerReport\s*[<>]/, /[<>]=?\s*0\b|\b0\s*[<>]=?/]},
       },
     },
@@ -86,7 +84,6 @@ Requirements:
             /usage\.Put\(\s*[\w.()]+,\s*tenant\s*,\s*idem/,
           ],
         },
-        scala: {all: [/Idempotency-Key/, /Usage\.get\(\s*tenant\s*,\s*idem/, /Usage\.put\(\s*tenant\s*,\s*idem/]},
         cpp: {all: [/Idempotency-Key/, /usage::get\(\s*tenant\s*,\s*idem/, /usage::put\(\s*tenant\s*,\s*idem/]},
       },
     },
@@ -99,7 +96,6 @@ Requirements:
         python: {all: [/status_code\s*=\s*409/]},
         typescript: {all: [/code\(\s*409\s*\)/]},
         go: {all: [/StatusConflict/]},
-        scala: {all: [/StatusCodes\.Conflict/]},
         cpp: {all: [/\b409\b/]},
       },
     },
@@ -112,7 +108,6 @@ Requirements:
         python: {order: [/[<>]=?\s*MAX_TOKENS_PER_REPORT|MAX_TOKENS_PER_REPORT\s*[<>]/, /store\.put\(/]},
         typescript: {order: [/[<>]=?\s*MAX_TOKENS_PER_REPORT|MAX_TOKENS_PER_REPORT\s*[<>]/, /store\.put\(/]},
         go: {order: [/[<>]=?\s*maxTokensPerReport|maxTokensPerReport\s*[<>]/, /usage\.Put\(/]},
-        scala: {order: [/[<>]=?\s*MaxTokensPerReport|MaxTokensPerReport\s*[<>]/, /Usage\.put\(/]},
         cpp: {order: [/[<>]=?\s*kMaxTokensPerReport|kMaxTokensPerReport\s*[<>]/, /usage::put\(/]},
       },
     },
@@ -411,118 +406,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import meter.{Usage, UsageRow}
-
-final case class UsageReport(model: String, input_tokens: Long, output_tokens: Long)
-
-object MeterApi {
-  implicit val system: ActorSystem = ActorSystem("cost-meter")
-  implicit val reportFormat: RootJsonFormat[UsageReport] = jsonFormat3(UsageReport)
-  implicit val rowFormat: RootJsonFormat[UsageRow] = jsonFormat5(UsageRow)
-
-  val route: Route =
-    path("v1" / "usage") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[UsageReport]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else {
-              val tenant = tenantOpt.get
-              val row = UsageRow(UUID.randomUUID().toString, tenant, body.model, body.input_tokens, body.output_tokens)
-              Usage.put(tenant, row.usage_id, row)
-              system.log.info(s"usage tenant=$tenant model=\${row.model} usage=\${row.usage_id}")
-              complete(StatusCodes.Accepted, row)
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import meter.{Usage, UsageRow}
-
-final case class UsageReport(model: String, input_tokens: Long, output_tokens: Long)
-
-object MeterApi {
-  implicit val system: ActorSystem = ActorSystem("cost-meter")
-  implicit val reportFormat: RootJsonFormat[UsageReport] = jsonFormat3(UsageReport)
-  implicit val rowFormat: RootJsonFormat[UsageRow] = jsonFormat5(UsageRow)
-
-  val MaxTokensPerReport = 1000000L
-
-  private def badCount(n: Long): Boolean = n < 0 || n > MaxTokensPerReport
-
-  val route: Route =
-    path("v1" / "usage") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[UsageReport]) { body =>
-              if (!tenantOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              } else if (!idemOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-              } else if (body.model.isEmpty) {
-                complete(StatusCodes.BadRequest, """{"error":"model is required"}""")
-              } else if (badCount(body.input_tokens) || badCount(body.output_tokens)) {
-                complete(StatusCodes.BadRequest, """{"error":"token counts are integers from 0 to 1000000"}""")
-              } else {
-                val tenant = tenantOpt.get
-                val idemKey = idemOpt.get
-                Usage.get(tenant, idemKey) match {
-                  case Some(stored) if stored.model != body.model || stored.input_tokens != body.input_tokens ||
-                        stored.output_tokens != body.output_tokens =>
-                    complete(StatusCodes.Conflict, """{"error":"Idempotency-Key was used for a different report"}""")
-                  case Some(stored) =>
-                    complete(StatusCodes.OK, stored)
-                  case None =>
-                    val row = UsageRow(UUID.randomUUID().toString, tenant, body.model, body.input_tokens, body.output_tokens)
-                    Usage.put(tenant, idemKey, row)
-                    system.log.info(s"usage tenant=$tenant model=\${row.model} usage=\${row.usage_id}")
-                    complete(StatusCodes.Accepted, row)
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

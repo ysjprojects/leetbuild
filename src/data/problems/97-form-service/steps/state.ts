@@ -52,7 +52,6 @@ requests at the limit both get through; and a refused client is told to wait lon
         python: {all: [/\.getdel\(|["']GETDEL["']/], none: [/\.delete\(/]},
         typescript: {all: [/\.getdel\(|['"]GETDEL['"]/], none: [/redis\.del\(/]},
         go: {all: [/\.GetDel\(|"GETDEL"/], none: [/rdb\.Del\(/]},
-        scala: {all: [/\.getDel\(|"GETDEL"/], none: [/jedis\.del\(/]},
         cpp: {all: [/\.getdel\(|"GETDEL"/], none: [/redis\.del\(/]},
       },
     },
@@ -65,7 +64,6 @@ requests at the limit both get through; and a refused client is told to wait lon
         python: {all: [/limit:form:/, /limit:ip:/]},
         typescript: {all: [/limit:form:/, /limit:ip:/]},
         go: {all: [/limit:form:/, /limit:ip:/]},
-        scala: {all: [/limit:form:/, /limit:ip:/]},
         cpp: {all: [/limit:form:/, /limit:ip:/]},
       },
     },
@@ -78,7 +76,6 @@ requests at the limit both get through; and a refused client is told to wait lon
         python: {all: [/\/\/\s*WINDOW_S/, /EXPIRE/]},
         typescript: {all: [/\/\s*WINDOW_S/, /EXPIRE/]},
         go: {all: [/\/\s*windowSeconds/, /EXPIRE/]},
-        scala: {all: [/\/\s*WindowSeconds/, /EXPIRE/]},
         cpp: {all: [/\/\s*kWindowSeconds/, /EXPIRE/]},
       },
     },
@@ -91,7 +88,6 @@ requests at the limit both get through; and a refused client is told to wait lon
         python: {all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/\br\.incr\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/redis\.incr\(/]},
         go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/rdb\.Incr\(/]},
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/jedis\.incr\(/]},
         cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]INCR['"]/], none: [/redis\.incr\(/]},
       },
     },
@@ -104,7 +100,6 @@ requests at the limit both get through; and a refused client is told to wait lon
         python: {all: [/%\s*WINDOW_S/]},
         typescript: {all: [/%\s*WINDOW_S/]},
         go: {all: [/%\s*windowSeconds/]},
-        scala: {all: [/%\s*WindowSeconds/]},
         cpp: {all: [/%\s*kWindowSeconds/]},
       },
     },
@@ -383,88 +378,6 @@ func reserve(ctx context.Context, formID, ip string) (Reservation, error) {
 		return Reservation{Allowed: true, Remaining: reply[1]}, nil
 	}
 	return Reservation{Allowed: false, Remaining: reply[1], RetryAfter: windowSeconds - now%windowSeconds}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-/** One submission's slot in the current window; retryAfter in seconds. */
-final case class Reservation(allowed: Boolean, remaining: Long, retryAfter: Long)
-
-object Abuse {
-  val WindowSeconds = 60L
-  val FormLimit = 20L
-  val IpLimit = 5L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** True once for a token the captcha widget issued: this call uses it up. */
-  def consumeCaptcha(token: String): Boolean = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val key = s"captcha:$token"
-    if (jedis.get(key) == null) false
-    else {
-      jedis.del(key)
-      true
-    }
-  }
-
-  def reserve(formId: String, ip: String): Reservation = {
-    val key = s"limit:ip:$ip"
-    val used = Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
-    if (used >= IpLimit) Reservation(allowed = false, 0L, WindowSeconds)
-    else {
-      val now = jedis.incr(key)
-      Reservation(allowed = true, IpLimit - now, 0L)
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/** One submission's slot in the current window; retryAfter in seconds. */
-final case class Reservation(allowed: Boolean, remaining: Long, retryAfter: Long)
-
-object Abuse {
-  val WindowSeconds = 60L
-  val FormLimit = 20L
-  val IpLimit = 5L
-
-  /** Both counters are checked, and both incremented, or neither: a refused request spends nothing. */
-  val ReserveLua: String =
-    """local form = tonumber(redis.call('GET', KEYS[1]) or '0')
-      |local ip = tonumber(redis.call('GET', KEYS[2]) or '0')
-      |local allowed = 0
-      |if form < tonumber(ARGV[1]) and ip < tonumber(ARGV[2]) then
-      |  form = redis.call('INCR', KEYS[1])
-      |  ip = redis.call('INCR', KEYS[2])
-      |  redis.call('EXPIRE', KEYS[1], ARGV[3])
-      |  redis.call('EXPIRE', KEYS[2], ARGV[3])
-      |  allowed = 1
-      |end
-      |local remaining = tonumber(ARGV[1]) - form
-      |if tonumber(ARGV[2]) - ip < remaining then remaining = tonumber(ARGV[2]) - ip end
-      |return {allowed, remaining}
-      |""".stripMargin
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** True once for a token the captcha widget issued: this call uses it up. */
-  def consumeCaptcha(token: String): Boolean =
-    jedis.getDel(s"captcha:$token") != null // one command reads and removes it: a parallel replay finds nothing
-
-  def reserve(formId: String, ip: String): Reservation = {
-    val now = System.currentTimeMillis() / 1000
-    val window = now / WindowSeconds
-    val keys = List(s"limit:form:$formId:$window", s"limit:ip:$ip:$window").asJava
-    val args = List(FormLimit, IpLimit, WindowSeconds).map(_.toString).asJava
-    val reply = jedis.eval(ReserveLua, keys, args).asInstanceOf[java.util.List[java.lang.Long]].asScala.map(_.longValue)
-    if (reply.head == 1L) Reservation(allowed = true, reply(1), 0L)
-    else Reservation(allowed = false, reply(1), WindowSeconds - now % WindowSeconds)
-  }
 }
 `,
     },

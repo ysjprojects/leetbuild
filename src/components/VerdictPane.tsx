@@ -41,10 +41,10 @@ const RUN_KEYS = mod("'");
 /** Wrong submissions on the step before failing checks reveal their expected shape. */
 export const SHAPE_AFTER_WRONG = 2;
 
-/** The languages the browser runtime executes: Scala is compiled offline, CUDA is judged by its shape. */
-type Executing = Exclude<Language, 'scala' | 'cuda'>;
+/** The languages the browser runtime executes: CUDA is judged by its shape. */
+type Executing = Exclude<Language, 'cuda'>;
 
-const isExecuting = (language: Language): language is Executing => language !== 'scala' && language !== 'cuda';
+const isExecuting = (language: Language): language is Executing => language !== 'cuda';
 
 /** What the first run fetches, per executing language (the idle copy under the checks). */
 const RUNTIME_DOWNLOAD: Record<Executing, string> = {
@@ -460,8 +460,11 @@ const SubmissionRow: FC<{
         ) : (
           outcome
         )}
-        <span className="text-ink-400">{LANGUAGE_LABEL[s.language]}</span>
-        {s.code !== undefined && onView !== undefined ? <SubmissionLink onView={onView} submission={s} /> : null}
+        {s.language !== null ? <span className="text-ink-400">{LANGUAGE_LABEL[s.language]}</span> : null}
+        {/* The editor needs a grammar, so code in a language the site no longer offers is not reopened. */}
+        {s.code !== undefined && s.language !== null && onView !== undefined ? (
+          <SubmissionLink onView={onView} submission={s} />
+        ) : null}
         <span className="text-ink-400 ml-auto">{formatTime(s.at)}</span>
       </div>
       {open ? (

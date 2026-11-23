@@ -55,7 +55,6 @@ a run whose job died is reported running forever, so nobody restarts it.
         python: {all: [/@app\.get\(\s*["']\/v1\/training\/runs\/\{run_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/training\/runs\/:runId['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/training\/runs\/\{id\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"training"\s*\/\s*"runs"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/training\/runs\//]},
       },
     },
@@ -68,7 +67,6 @@ a run whose job died is reported running forever, so nobody restarts it.
         python: {all: [/\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*run\[["']tenant["']\]/, /\b404\b/]},
         typescript: {all: [/\.tenant\s*!==\s*tenant|tenant\s*!==\s*run\.tenant/, /\b404\b/]},
         go: {all: [/\.Tenant\s*!=\s*tenant|tenant\s*!=\s*run\.Tenant/, /StatusNotFound|\b404\b/]},
-        scala: {all: [/\.tenant\s*(!=|==)\s*(t|tenant)\b/, /NotFound/]},
         cpp: {all: [/->tenant\s*!=\s*tenant|tenant\s*!=\s*run->tenant/, /\b404\b/]},
       },
     },
@@ -81,7 +79,6 @@ a run whose job died is reported running forever, so nobody restarts it.
         python: {all: [/\.zrank\(/], none: [/zrevrank/i]},
         typescript: {all: [/\.zrank\(/], none: [/zrevrank/i]},
         go: {all: [/\.ZRank\(/], none: [/ZRevRank/i]},
-        scala: {all: [/\.zrank\(/], none: [/zrevrank/i]},
         cpp: {all: [/\.zrank\(/], none: [/zrevrank/i]},
       },
     },
@@ -94,7 +91,6 @@ a run whose job died is reported running forever, so nobody restarts it.
         python: {all: [/cluster\.assignment\(/]},
         typescript: {all: [/assignment\(runId\)/]},
         go: {all: [/cluster\.Assignment\(/]},
-        scala: {all: [/Cluster\.assignment\(/]},
         cpp: {all: [/cluster::assignment\(/]},
       },
     },
@@ -107,7 +103,6 @@ a run whose job died is reported running forever, so nobody restarts it.
         python: {all: [/not_on_cluster/, /["']failed["']/]},
         typescript: {all: [/not_on_cluster/, /['"]failed['"]/]},
         go: {all: [/not_on_cluster/, /"failed"/]},
-        scala: {all: [/not_on_cluster/, /"failed"/]},
         cpp: {all: [/not_on_cluster/, /"failed"/]},
       },
     },
@@ -348,95 +343,6 @@ func getRun(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/training/runs/{id}", getRun)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import trainsched.{Cluster, Queue, Runs} // Runs.get; Cluster.assignment; Queue.QueueKey
-
-object RunStatus {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val route: Route =
-    path("v1" / "training" / "runs" / Segment) { runId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          (tenant.filter(_.nonEmpty), Runs.get(runId)) match {
-            case (None, _) => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-            case (_, None) => complete(StatusCodes.NotFound -> "no such run")
-            case (Some(_), Some(run)) =>
-              val position = if (run.state == "queued") Option(jedis.zrevrank(Queue.QueueKey, runId)).map(p => JsNumber(p.longValue)).getOrElse(JsNull) else JsNull
-              val view = JsObject(
-                "run_id" -> JsString(runId),
-                "state" -> JsString(run.state),
-                "band" -> JsNumber(run.band),
-                "queue_position" -> position,
-                "nodes" -> JsArray(run.nodes.map(JsString(_)).toVector),
-                "checkpoint_id" -> JsString(run.checkpointId)
-              )
-              complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, view.compactPrint)))
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import trainsched.{Cluster, Queue, Runs} // Runs.get; Cluster.assignment; Queue.QueueKey
-
-object RunStatus {
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def nodes(names: Seq[String]): JsArray = JsArray(names.map(JsString(_)).toVector)
-
-  val route: Route =
-    path("v1" / "training" / "runs" / Segment) { runId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-          tenant.filter(_.nonEmpty) match {
-            case None => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-            case Some(t) =>
-              // Another tenant's run does not exist for this caller: 403 would confirm the id.
-              Runs.get(runId).filter(_.tenant == t) match {
-                case None => complete(StatusCodes.NotFound -> "no such run")
-                case Some(run) =>
-                  val position =
-                    if (run.state == "queued") Option(jedis.zrank(Queue.QueueKey, runId)).map(p => JsNumber(p.longValue)).getOrElse(JsNull) // 0 starts next
-                    else JsNull
-                  val base = Map[String, JsValue](
-                    "run_id" -> JsString(runId),
-                    "state" -> JsString(run.state),
-                    "band" -> JsNumber(run.band),
-                    "queue_position" -> position,
-                    "nodes" -> nodes(Nil),
-                    "checkpoint_id" -> JsString(run.checkpointId)
-                  )
-                  // The cluster's view, not what the row last heard.
-                  val view =
-                    if (run.state != "running") base
-                    else
-                      Cluster.assignment(runId) match {
-                        case Some(names) => base + ("nodes" -> nodes(names))
-                        case None => base ++ Map("state" -> JsString("failed"), "reason" -> JsString("not_on_cluster"))
-                      }
-                  complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, JsObject(view).compactPrint)))
-              }
-          }
-        }
-      }
-    }
 }
 `,
     },

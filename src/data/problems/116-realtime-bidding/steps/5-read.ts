@@ -49,7 +49,6 @@ and sees 0 spent on a day it spent most of its cap.
         python: {all: [/@app\.get\(\s*["']\/v1\/bidders\/\{\w+\}\/stats["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/bidders\/:\w+\/stats['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/bidders\/\{\w+\}\/stats"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"bidders"\s*\/\s*Segment\s*\/\s*"stats"\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\([^\n]*\/v1\/bidders\//]},
       },
     },
@@ -62,10 +61,6 @@ and sees 0 spent on a day it spent most of its cap.
         python: {all: [/share\(\s*wins\s*,\s*auctions\s*\)|wins\s*\/\s*auctions/], none: [/wins\s*\+\s*losses/]},
         typescript: {all: [/share\(\s*wins\s*,\s*auctions\s*\)|wins\s*\/\s*auctions/], none: [/wins\s*\+\s*losses/]},
         go: {all: [/share\(\s*wins\s*,\s*auctions\s*\)|\/\s*float64\(\s*auctions\s*\)/], none: [/wins\s*\+\s*losses/]},
-        scala: {
-          all: [/share\(\s*wins\s*,\s*auctions\s*\)|wins\.toDouble\s*\/\s*auctions/],
-          none: [/wins\s*\+\s*losses/],
-        },
         cpp: {all: [/share\(\s*wins\s*,\s*auctions\s*\)|\/\s*auctions/], none: [/wins\s*\+\s*losses/]},
       },
     },
@@ -78,7 +73,6 @@ and sees 0 spent on a day it spent most of its cap.
         python: {all: [/["']timeout_rate["']/, /["']degraded_share["']/]},
         typescript: {all: [/timeout_rate/, /degraded_share/]},
         go: {all: [/"timeout_rate"/, /"degraded_share"/]},
-        scala: {all: [/"timeout_rate"/, /"degraded_share"/]},
         cpp: {all: [/"timeout_rate"/, /"degraded_share"/]},
       },
     },
@@ -91,7 +85,6 @@ and sees 0 spent on a day it spent most of its cap.
         python: {all: [/\b401\b/, /\b403\b/]},
         typescript: {all: [/\b401\b/, /\b403\b/]},
         go: {all: [/StatusUnauthorized|\b401\b/, /StatusForbidden|\b403\b/]},
-        scala: {all: [/Unauthorized|\b401\b/, /Forbidden|\b403\b/]},
         cpp: {all: [/\b401\b/, /\b403\b/]},
       },
     },
@@ -104,7 +97,6 @@ and sees 0 spent on a day it spent most of its cap.
         python: {all: [/spend\.spent\(/, /spend\.cap_of\(/]},
         typescript: {all: [/\bspent\(/, /\bcapOf\(/]},
         go: {all: [/spend\.Spent\(/, /spend\.CapOf\(/]},
-        scala: {all: [/Spend\.spent\(/, /Spend\.capOf\(/]},
         cpp: {all: [/rtb::spend::spent\(/, /rtb::spend::capOf\(/]},
       },
     },
@@ -361,88 +353,6 @@ func stats(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/bidders/{id}/stats", stats)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import rtb.Spend // Spend.today(): yyyymmdd; Spend.spent(bidder, day); Spend.capOf(bidder)
-
-import scala.jdk.CollectionConverters._
-
-object Read {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private def share(part: Long, whole: Long): Double = if (whole == 0) 0.0 else part.toDouble / whole
-
-  val route: Route = path("v1" / "bidders" / Segment / "stats") { bidderId =>
-    get {
-      // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-      val day = Spend.today()
-      val counters = jedis.hgetAll(s"stats:$bidderId:$day").asScala.view.mapValues(_.toLong).toMap.withDefaultValue(0L)
-      val (auctions, bids, wins, losses) = (counters("auctions"), counters("bids"), counters("wins"), counters("losses"))
-      val spent = Option(jedis.get(s"spend:$bidderId")).map(_.toLong).getOrElse(0L)
-      val body = JsObject(
-        "bidder" -> JsString(bidderId),
-        "day" -> JsString(day),
-        "auctions" -> JsNumber(auctions),
-        "bids" -> JsNumber(bids),
-        "wins" -> JsNumber(wins),
-        "win_rate" -> JsNumber(wins.toDouble / (wins + losses)),
-        "bid_rate" -> JsNumber(share(bids, auctions)),
-        "spend_cents" -> JsNumber(spent)
-      )
-      complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import rtb.Spend // Spend.today(): yyyymmdd; Spend.spent(bidder, day); Spend.capOf(bidder)
-
-import scala.jdk.CollectionConverters._
-
-object Read {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private def share(part: Long, whole: Long): Double = if (whole == 0) 0.0 else part.toDouble / whole
-
-  val route: Route = path("v1" / "bidders" / Segment / "stats") { bidderId =>
-    get {
-      optionalHeaderValueByName("X-Bidder-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Bidder-Id is required")
-        case Some(caller) if caller != bidderId => complete(StatusCodes.Forbidden -> "a bidder reads only its own stats")
-        case Some(_) =>
-          val day = Spend.today()
-          val counters = jedis.hgetAll(s"stats:$bidderId:$day").asScala.view.mapValues(_.toLong).toMap.withDefaultValue(0L)
-          val (auctions, bids, wins) = (counters("auctions"), counters("bids"), counters("wins"))
-          val body = JsObject(
-            "bidder" -> JsString(bidderId),
-            "day" -> JsString(day),
-            "auctions" -> JsNumber(auctions),
-            "bids" -> JsNumber(bids),
-            "wins" -> JsNumber(wins),
-            "win_rate" -> JsNumber(share(wins, auctions)), // every auction seen, timeouts and no-bids included
-            "bid_rate" -> JsNumber(share(bids, auctions)),
-            "timeout_rate" -> JsNumber(share(counters("timeouts"), auctions)),
-            "degraded_share" -> JsNumber(share(counters("degraded"), bids)),
-            "spend_cents" -> JsNumber(Spend.spent(bidderId, day)),
-            "cap_cents" -> JsNumber(Spend.capOf(bidderId))
-          )
-          complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-      }
-    }
-  }
 }
 `,
     },

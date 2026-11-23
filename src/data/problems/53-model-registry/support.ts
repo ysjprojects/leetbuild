@@ -4,10 +4,9 @@
  * registry database, the artifact store, the training-run log and the eval store): models and their
  * versions, the lineage records registration checks, the recorded registrations, the per-model
  * history and the outbox. `registry.pointer` is step 2's stage-and-pointer swap as later steps use
- * it: `promote`, `rollback` and `resolve_active`. The five languages keep the same keys, so a
+ * it: `promote`, `rollback` and `resolve_active`. The four languages keep the same keys, so a
  * harness reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 const STORE_DOC = `The registry's records (provided), in Redis:
 - artifact:{digest}         hash  digest, uri                      (the artifact store)
@@ -844,136 +843,5 @@ inline std::optional<std::string> resolveActive(const std::string& pool) {
 }
 
 }  // namespace pointer
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('registry', 'Store')]: `package registry
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/**
-${indent(STORE_DOC, ' * ')}
- */
-object Store {
-  final case class Artifact(digest: String, uri: String)
-  final case class TrainingRun(runId: String, model: String)
-  final case class EvalRecord(evalId: String, model: String, artifactDigest: String, score: Double, threshold: Double, report: String)
-  final case class Model(name: String, owner: String, visibility: String)
-  final case class Row(name: String, version: Long, artifactDigest: String, trainingRunId: String, evalId: String, stage: String)
-  /** A stage change the registry commits and announces. */
-  final case class Change(name: String, version: Long, artifactDigest: String, evalId: String, pool: String, stage: String)
-
-  val Pools: Seq[String] = Seq("prod", "canary")
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def hash(key: String): Option[Map[String, String]] = {
-    val raw = jedis.hgetAll(key).asScala.toMap
-    if (raw.isEmpty) None else Some(raw)
-  }
-
-  /** The artifact store's writer: digest resolves to the bytes at uri. */
-  def addArtifact(digest: String, uri: String): Unit = jedis.hset(s"artifact:$digest", Map("digest" -> digest, "uri" -> uri).asJava)
-
-  /** The training-run log's writer: runId trained a version of model. */
-  def addTrainingRun(runId: String, model: String): Unit = jedis.hset(s"run:$runId", Map("run_id" -> runId, "model" -> model).asJava)
-
-  /** The eval store's writer: evalId scored artifactDigest of model. */
-  def addEval(evalId: String, model: String, artifactDigest: String, score: Double, threshold: Double, report: String): Unit =
-    jedis.hset(s"eval:$evalId", Map("eval_id" -> evalId, "model" -> model, "artifact_digest" -> artifactDigest, "score" -> score.toString, "threshold" -> threshold.toString, "report" -> report).asJava)
-
-  /** A model owned by a tenant; registerVersion creates a private one on first use. */
-  def createModel(name: String, owner: String, visibility: String = "private"): Unit =
-    jedis.hset(s"model:$name", Map("name" -> name, "owner" -> owner, "visibility" -> visibility).asJava)
-
-  /** The artifact behind the digest, or None when it does not resolve. */
-  def artifact(digest: String): Option[Artifact] = hash(s"artifact:$digest").map(raw => Artifact(raw("digest"), raw("uri")))
-
-  /** The training run, or None. */
-  def trainingRun(runId: String): Option[TrainingRun] = hash(s"run:$runId").map(raw => TrainingRun(raw("run_id"), raw("model")))
-
-  /** The eval record, or None. */
-  def evalRecord(evalId: String): Option[EvalRecord] =
-    hash(s"eval:$evalId").map(raw => EvalRecord(raw("eval_id"), raw("model"), raw("artifact_digest"), raw("score").toDouble, raw("threshold").toDouble, raw("report")))
-
-  /** The model, or None. */
-  def model(name: String): Option[Model] = hash(s"model:$name").map(raw => Model(raw("name"), raw("owner"), raw("visibility")))
-
-  /** Version n of the model, or None. */
-  def version(name: String, n: Long): Option[Row] =
-    hash(s"model:$name:v$n").map(raw => Row(raw("name"), raw("version").toLong, raw("artifact_digest"), raw("training_run_id"), raw("eval_id"), raw("stage")))
-
-  /** A version as the API answers it: {name, version, artifact_digest, training_run_id, eval_id, stage}. */
-  def rowJson(row: Row): JsObject = JsObject(
-    "name" -> JsString(row.name), "version" -> JsNumber(row.version), "artifact_digest" -> JsString(row.artifactDigest),
-    "training_run_id" -> JsString(row.trainingRunId), "eval_id" -> JsString(row.evalId), "stage" -> JsString(row.stage))
-
-  /** Mint the model's next version number and write the version, stage staged; returns the row. */
-  def registerVersion(tenant: String, name: String, artifactDigest: String, trainingRunId: String, evalId: String): Row = {
-    if (!jedis.exists(s"model:$name")) createModel(name, tenant)
-    val n = jedis.hincrBy(s"model:$name", "latest", 1L)
-    jedis.hset(s"model:$name:v$n", Map("name" -> name, "version" -> n.toString, "artifact_digest" -> artifactDigest, "training_run_id" -> trainingRunId, "eval_id" -> evalId, "stage" -> "staged").asJava)
-    version(name, n).get
-  }
-
-  /** What the registration (tenant, Idempotency-Key) answered, if it ran. */
-  def registration(tenant: String, key: String): Option[JsObject] = Option(jedis.get(s"idem:$tenant:$key")).map(_.parseJson.asJsObject)
-
-  /** Record what the registration (tenant, Idempotency-Key) answered, for its replays. */
-  def recordRegistration(tenant: String, key: String, result: JsObject): Unit = jedis.set(s"idem:$tenant:$key", result.compactPrint)
-
-  /** Commit a stage change to the model's history; returns its event_id. */
-  def recordChange(change: Change): String = {
-    val eventId = s"ev-\${jedis.incr("event:seq")}"
-    val row = JsObject(
-      "name" -> JsString(change.name), "version" -> JsNumber(change.version), "artifact_digest" -> JsString(change.artifactDigest),
-      "eval_id" -> JsString(change.evalId), "pool" -> JsString(change.pool), "stage" -> JsString(change.stage), "event_id" -> JsString(eventId))
-    jedis.rpush(s"model:\${change.name}:history", row.compactPrint)
-    eventId
-  }
-
-  /** Keep a record the broker did not take, for the relay to produce later. */
-  def insertOutbox(topic: String, key: String, payload: JsObject): Unit =
-    jedis.rpush("outbox", JsObject("topic" -> JsString(topic), "key" -> JsString(key), "payload" -> payload).compactPrint)
-}
-`,
-  [scalaPath('registry', 'Pointer')]: `package registry
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
-${indent(POINTER_DOC, ' * ')}
- */
-object Pointer {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val PromoteLua: String =
-    """${PROMOTE_LUA}
-      |""".stripMargin
-
-  val RollbackLua: String =
-    """${ROLLBACK_LUA}
-      |""".stripMargin
-
-  def versionKey(name: String, version: Long): String = s"model:$name:v$version"
-  def pointerKey(pool: String): String = s"active:$pool"
-
-  /** Make version the one pool serves; evalId is the eval record that opened the gate. */
-  def promote(name: String, version: Long, pool: String, evalId: String): Boolean =
-    jedis.eval(PromoteLua, List(versionKey(name, version), pointerKey(pool)).asJava, List(s"$name:$version", evalId).asJava).asInstanceOf[java.lang.Long] == 1L
-
-  /** Take version out of pool; false when the version does not exist. */
-  def rollback(name: String, version: Long, pool: String): Boolean =
-    jedis.eval(RollbackLua, List(versionKey(name, version), pointerKey(pool)).asJava, List(s"$name:$version").asJava).asInstanceOf[java.lang.Long] == 1L
-
-  /** The "name:version" pool serves, or None. */
-  def resolveActive(pool: String): Option[String] = Option(jedis.get(pointerKey(pool)))
-}
 `,
 };

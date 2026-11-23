@@ -62,7 +62,6 @@ so the CDN cannot tell two versions apart.
         python: {all: [/@app\.get\(\s*["']\/v1\/products\/\{/, /Cache-Control/, /ETag/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/products\//, /Cache-Control/, /ETag/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/products\/\{/, /Cache-Control/, /ETag/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"products"\s*\/\s*Segment\s*\)/, /Cache-Control/, /ETag/]},
         cpp: {all: [/svr\.Get\(\s*R?"\(?\/v1\/products\//, /Cache-Control/, /ETag/]},
       },
     },
@@ -81,10 +80,6 @@ so the CDN cannot tell two versions apart.
           all: [/func publishedView\(/, /func draftView\(/, /snapshot\.ReadPublished\(/, /store\.DraftOf\(/],
           none: [/store\.Latest\(/],
         },
-        scala: {
-          all: [/def publishedView\(/, /def draftView\(/, /Snapshot\.readPublished\(/, /Store\.draftOf\(/],
-          none: [/Store\.latest\(/],
-        },
         cpp: {
           all: [/publishedView\(/, /draftView\(/, /snapshot::readPublished\(/, /store::draftOf\(/],
           none: [/store::latest\(/],
@@ -100,7 +95,6 @@ so the CDN cannot tell two versions apart.
         python: {all: [/ETag/, /X-Catalog-Version/, /\bversion\b/], none: [/W\/\\?"catalog\\?"/]},
         typescript: {all: [/ETag/, /X-Catalog-Version/, /\bversion\b/], none: [/W\/\\?"catalog\\?"/]},
         go: {all: [/ETag/, /X-Catalog-Version/, /\bversion\b/i], none: [/W\/\\?"catalog\\?"/]},
-        scala: {all: [/ETag/, /X-Catalog-Version/, /\bversion\b/], none: [/W\/\\?"catalog\\?"/]},
         cpp: {all: [/ETag/, /X-Catalog-Version/, /\bversion\b/], none: [/W\/\\?"catalog\\?"/]},
       },
     },
@@ -113,7 +107,6 @@ so the CDN cannot tell two versions apart.
         python: {all: [/PREVIEW_SCOPE\s*=\s*["']draft["']/, /scope/, /private, max-age=0/]},
         typescript: {all: [/PREVIEW_SCOPE\s*=\s*['"]draft['"]/, /scope/, /private, max-age=0/]},
         go: {all: [/previewScope\s*=\s*"draft"/, /scope/, /private, max-age=0/]},
-        scala: {all: [/PreviewScope\s*=\s*"draft"/, /scope/, /private, max-age=0/]},
         cpp: {all: [/kPreviewScope\s*=\s*"draft"/, /scope/, /private, max-age=0/]},
       },
     },
@@ -132,10 +125,6 @@ so the CDN cannot tell two versions apart.
           none: [/private, max-age=\$\{MAX_AGE_S/, /max-age=600/],
         },
         go: {all: [/maxAgeSeconds\s*=\s*30\b/, /public, max-age=/], none: [/private, max-age=%d/, /max-age=600/]},
-        scala: {
-          all: [/MaxAgeSeconds\s*=\s*30\b/, /public, max-age=/],
-          none: [/private, max-age=\$MaxAgeSeconds/, /max-age=600/],
-        },
         cpp: {
           all: [/kMaxAgeSeconds\s*=\s*30\b/, /public, max-age=/],
           none: [/private, max-age=" \+ std::to_string\(kMaxAgeSeconds/, /max-age=600/],
@@ -340,81 +329,6 @@ func readProduct(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/products/{id}", readProduct)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import catalog.Snapshot // Snapshot.readPublished(productId): Option[JsObject]
-import catalog.Store    // Store.latest, Store.draftOf
-
-object Read {
-  private def rowJson(row: Store.Row): JsObject = JsObject(
-    "product_id" -> JsString(row.productId), "version" -> JsNumber(row.version), "status" -> JsString(row.status),
-    "title" -> row.title.map(JsString(_)).getOrElse(JsNull), "price_cents" -> row.priceCents.map(JsNumber(_)).getOrElse(JsNull),
-    "tax_class" -> row.taxClass.map(JsString(_)).getOrElse(JsNull))
-
-  val route: Route =
-    path("v1" / "products" / Segment) { productId =>
-      get {
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        Store.latest(productId) match {
-          case None => complete(StatusCodes.NotFound -> "no such product")
-          case Some(row) =>
-            val headers = List(RawHeader("Cache-Control", "public, max-age=600"), RawHeader("ETag", "W/\\"catalog\\""))
-            complete(HttpResponse(StatusCodes.OK, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, rowJson(row).compactPrint)))
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import catalog.Snapshot // Snapshot.readPublished(productId): Option[JsObject]
-import catalog.Store    // Store.latest, Store.draftOf
-
-object Read {
-  val MaxAgeSeconds = 30
-  val PreviewScope = "draft"
-
-  private def rowJson(row: Store.Row): JsObject = JsObject(
-    "product_id" -> JsString(row.productId), "version" -> JsNumber(row.version), "status" -> JsString(row.status),
-    "title" -> row.title.map(JsString(_)).getOrElse(JsNull), "price_cents" -> row.priceCents.map(JsNumber(_)).getOrElse(JsNull),
-    "tax_class" -> row.taxClass.map(JsString(_)).getOrElse(JsNull))
-
-  /** What a shopper sees: the published snapshot, resolved through the pointer. */
-  def publishedView(productId: String): Option[JsObject] = Snapshot.readPublished(productId)
-
-  /** What a merchandiser previews: the draft row. */
-  def draftView(productId: String): Option[JsObject] = Store.draftOf(productId).map(rowJson)
-
-  val route: Route =
-    path("v1" / "products" / Segment) { productId =>
-      get {
-        parameter("scope".optional) { scope =>
-          val preview = scope.contains(PreviewScope)
-          val view = if (preview) draftView(productId) else publishedView(productId)
-          view match {
-            case None => complete(StatusCodes.NotFound -> (if (preview) "no draft" else "no published version"))
-            case Some(body) =>
-              val version = body.fields("version").asInstanceOf[JsNumber].value.toLong
-              // Shared and short: the CDN serves it, and a rollback reaches shoppers within MaxAgeSeconds. A preview is never shared.
-              val cacheControl = if (preview) "private, max-age=0" else s"public, max-age=$MaxAgeSeconds"
-              val headers = List(RawHeader("Cache-Control", cacheControl), RawHeader("ETag", s"\\"$version\\""), RawHeader("X-Catalog-Version", version.toString))
-              complete(HttpResponse(StatusCodes.OK, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-          }
-        }
-      }
-    }
 }
 `,
     },

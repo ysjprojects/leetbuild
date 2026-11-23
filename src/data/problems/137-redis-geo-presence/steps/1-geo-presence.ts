@@ -81,13 +81,6 @@ whether it has reported in the last 30 s. A driver is *near* only if both agree.
             /pipe\.Set\(ctx, seenKey\(driverID\), 1, presenceTTL\)/,
           ],
         },
-        scala: {
-          all: [
-            /jedis\.pipelined\(\)/,
-            /pipeline\.geoadd\(\s*GeoKey/,
-            /pipeline\.set\(\s*seenKey\(driverId\),\s*"1",\s*SetParams\.setParams\(\)\.ex\(PresenceTtlS\)\)/,
-          ],
-        },
         cpp: {
           all: [
             /redis\.pipeline\(\)/,
@@ -135,16 +128,6 @@ whether it has reported in the last 30 s. A driver is *near* only if both agree.
             /math\.Round\(\s*loc\.Dist\s*\*\s*1000\s*\)\s*\/\s*1000/,
           ],
         },
-        scala: {
-          all: [
-            /jedis\.geosearch\(\s*GeoKey/,
-            /fromLonLat\(\s*lon\s*,\s*lat\s*\)/,
-            /byRadius\(\s*radiusKm\s*,\s*GeoUnit\.KM\s*\)/,
-            /\.asc\(\)/,
-            /\.withDist\(\)/,
-            /math\.round\(\s*\w+\.getDistance\s*\*\s*1000\s*\)\s*\/\s*1000\.0/,
-          ],
-        },
         cpp: {
           all: [
             /redis\.georadius\(\s*kGeoKey/,
@@ -176,11 +159,6 @@ whether it has reported in the last 30 s. A driver is *near* only if both agree.
           all: [/seen\[i\] == nil/],
           none: [/rdb\.Get\(/, /rdb\.Exists\(/, /rdb\.TTL\(/],
         },
-        scala: {
-          order: [/jedis\.geosearch\(/, /jedis\.mget\(/],
-          all: [/\bflag != null\b/],
-          none: [/jedis\.get\(/, /jedis\.exists\(/, /jedis\.ttl\(/],
-        },
         cpp: {
           order: [/redis\.georadius\(/, /redis\.mget\(/],
           all: [/if \(!seen\[i\]\) continue;/],
@@ -197,7 +175,6 @@ whether it has reported in the last 30 s. A driver is *near* only if both agree.
         python: {all: [/count\s*=\s*OVERFETCH\s*\*\s*k\b/, /\[\s*:\s*k\s*\]/]},
         typescript: {all: [/'COUNT',\s*OVERFETCH\s*\*\s*k\b/, /\.slice\(\s*0\s*,\s*k\s*\)/]},
         go: {all: [/Count:\s*overfetch\s*\*\s*k\b/, /len\(\s*out\s*\)\s*==\s*k\b/]},
-        scala: {all: [/\.count\(\s*OverFetch\s*\*\s*k\s*\)/, /\.take\(\s*k\s*\)/]},
         cpp: {all: [/kOverFetch\s*\*\s*static_cast<long long>\(\s*k\s*\)/, /out\.size\(\)\s*<\s*k\b/]},
       },
     },
@@ -210,7 +187,6 @@ whether it has reported in the last 30 s. A driver is *near* only if both agree.
         python: {all: [/pipe\.zrem\(\s*GEO_KEY,\s*driver_id\s*\)/, /pipe\.delete\(\s*seen_key\(driver_id\)\s*\)/]},
         typescript: {all: [/\.zrem\(\s*GEO_KEY,\s*driverId\s*\)/, /\.del\(\s*seenKey\(driverId\)\s*\)/]},
         go: {all: [/pipe\.ZRem\(ctx, geoKey, driverID\)/, /pipe\.Del\(ctx, seenKey\(driverID\)\)/]},
-        scala: {all: [/pipeline\.zrem\(\s*GeoKey,\s*driverId\s*\)/, /pipeline\.del\(\s*seenKey\(driverId\)\s*\)/]},
         cpp: {all: [/\.zrem\(\s*kGeoKey,\s*driver_id\s*\)/, /\.del\(\s*seen_key\(driver_id\)\s*\)/]},
       },
     },
@@ -239,14 +215,6 @@ whether it has reported in the last 30 s. A driver is *near* only if both agree.
         go: {
           order: [/rdb\.ZRange\(ctx, geoKey, 0, int64\(limit-1\)\)/, /rdb\.MGet\(/, /rdb\.ZRem\(ctx, geoKey, stale/],
           all: [/return len\(stale\), nil/],
-        },
-        scala: {
-          order: [
-            /jedis\.zrange\(\s*GeoKey,\s*0,\s*limit\s*-\s*1\s*\)/,
-            /jedis\.mget\(/,
-            /jedis\.zrem\(\s*GeoKey,\s*stale/,
-          ],
-          all: [/stale\.size/],
         },
         cpp: {
           order: [
@@ -634,122 +602,6 @@ func main() {
 	_, _ = nearest(ctx, 48.85, 2.35, 3, 2)
 	_, _ = sweep(ctx, 100)
 	_ = remove(ctx, "d-7")
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.args.GeoUnit
-import redis.clients.jedis.params.{GeoSearchParam, SetParams}
-import scala.jdk.CollectionConverters._
-
-/** Nearest live drivers: a GEO set for position, one presence key per driver for liveness. */
-object GeoPresence {
-  val jedis = new JedisPooled("redis", 6379)
-  val GeoKey = "drivers"
-  val PresenceTtlS = 30L
-  val OverFetch = 4
-
-  /** One driver with its distance from the search point, in km rounded to 3 decimals. */
-  final case class Near(driverId: String, distanceKm: Double)
-
-  def seenKey(driverId: String): String = s"seen:$driverId"
-
-  /** GEOADD drivers lon lat driverId and SET seen:{driverId} 1 EX 30, on one pipeline. */
-  def heartbeat(driverId: String, lat: Double, lon: Double): Unit = {
-    ??? // TODO
-  }
-
-  /** The k closest drivers with a live heartbeat, nearest first. */
-  def nearest(lat: Double, lon: Double, radiusKm: Double, k: Int): Seq[Near] = {
-    // TODO: geosearch(GeoKey, new GeoSearchParam().fromLonLat(lon, lat).byRadius(radiusKm, GeoUnit.KM).asc().count(OverFetch * k).withDist())
-    // TODO: one mget over seen:{driverId}; drop the candidates whose key is gone (null); take(k)
-    ???
-  }
-
-  /** ZREM drivers driverId and DEL seen:{driverId}, on one pipeline. */
-  def remove(driverId: String): Unit = {
-    ??? // TODO
-  }
-
-  /** ZRANGE drivers 0 limit-1, one MGET of their seen: keys, ZREM the members whose key is gone; how many. */
-  def sweep(limit: Int): Int = {
-    ??? // TODO
-  }
-
-  def main(args: Array[String]): Unit = {
-    heartbeat("d-7", 48.852, 2.352)
-    println(nearest(48.85, 2.35, 3, 2))
-    println(sweep(100))
-    remove("d-7")
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.args.GeoUnit
-import redis.clients.jedis.params.{GeoSearchParam, SetParams}
-import scala.jdk.CollectionConverters._
-
-/** Nearest live drivers: a GEO set for position, one presence key per driver for liveness. */
-object GeoPresence {
-  val jedis = new JedisPooled("redis", 6379)
-  val GeoKey = "drivers"
-  val PresenceTtlS = 30L
-  val OverFetch = 4
-
-  /** One driver with its distance from the search point, in km rounded to 3 decimals. */
-  final case class Near(driverId: String, distanceKm: Double)
-
-  def seenKey(driverId: String): String = s"seen:$driverId"
-
-  /** GEOADD drivers lon lat driverId and SET seen:{driverId} 1 EX 30, on one pipeline. */
-  def heartbeat(driverId: String, lat: Double, lon: Double): Unit = {
-    val pipeline = jedis.pipelined()
-    pipeline.geoadd(GeoKey, lon, lat, driverId) // longitude first
-    pipeline.set(seenKey(driverId), "1", SetParams.setParams().ex(PresenceTtlS))
-    pipeline.sync()
-  }
-
-  /** The k closest drivers with a live heartbeat, nearest first. */
-  def nearest(lat: Double, lon: Double, radiusKm: Double, k: Int): Seq[Near] = {
-    val params = new GeoSearchParam().fromLonLat(lon, lat).byRadius(radiusKm, GeoUnit.KM).asc().count(OverFetch * k).withDist()
-    val found = jedis.geosearch(GeoKey, params).asScala.toSeq
-    if (found.isEmpty) Nil
-    else {
-      val seen = jedis.mget(found.map(r => seenKey(r.getMemberByString)): _*).asScala
-      found
-        .zip(seen)
-        .collect { case (r, flag) if flag != null => Near(r.getMemberByString, math.round(r.getDistance * 1000) / 1000.0) }
-        .take(k)
-    }
-  }
-
-  /** ZREM drivers driverId and DEL seen:{driverId}, on one pipeline. */
-  def remove(driverId: String): Unit = {
-    val pipeline = jedis.pipelined()
-    pipeline.zrem(GeoKey, driverId)
-    pipeline.del(seenKey(driverId))
-    pipeline.sync()
-  }
-
-  /** ZRANGE drivers 0 limit-1, one MGET of their seen: keys, ZREM the members whose key is gone; how many. */
-  def sweep(limit: Int): Int = {
-    val members = jedis.zrange(GeoKey, 0, limit - 1).asScala.toSeq
-    if (members.isEmpty) 0
-    else {
-      val seen = jedis.mget(members.map(seenKey): _*).asScala
-      val stale = members.zip(seen).collect { case (member, flag) if flag == null => member }
-      if (stale.nonEmpty) jedis.zrem(GeoKey, stale: _*)
-      stale.size
-    }
-  }
-
-  def main(args: Array[String]): Unit = {
-    heartbeat("d-7", 48.852, 2.352)
-    println(nearest(48.85, 2.35, 3, 2))
-    println(sweep(100))
-    remove("d-7")
-  }
 }
 `,
     },

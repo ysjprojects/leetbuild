@@ -42,7 +42,6 @@ has no expiry, so Redis keeps one key per vote for good.
         python: {all: [/nx\s*=\s*True|\.eval\(|register_script/], none: [/\.exists\(/, /\.get\(/]},
         typescript: {all: [/['"]NX['"]|\.eval\(|defineCommand/], none: [/\.exists\(/, /\.get\(/]},
         go: {all: [/\.SetNX\(|Mode:\s*"NX"|\.Eval\(|NewScript\(/], none: [/\.Exists\(/, /\.Get\(/]},
-        scala: {all: [/\.nx\(\)|\.eval\(/], none: [/\.exists\(/, /\.get\(/]},
         cpp: {all: [/UpdateType::NOT_EXIST|\.eval\b/], none: [/\.exists\(/, /\.get\(/]},
       },
     },
@@ -55,7 +54,6 @@ has no expiry, so Redis keeps one key per vote for good.
         python: {all: [/ballot:\{tenant\}:\{request_id\}:\{user_id\}/]},
         typescript: {all: [/ballot:\$\{tenant\}:\$\{requestId\}:\$\{userId\}/]},
         go: {all: [/"ballot:"\s*\+\s*tenant\s*\+\s*":"\s*\+\s*requestID\s*\+\s*":"\s*\+\s*userID/]},
-        scala: {all: [/ballot:\$tenant:\$requestId:\$userId/]},
         cpp: {all: [/"ballot:"\s*\+\s*tenant\s*\+\s*":"\s*\+\s*request_id\s*\+\s*":"\s*\+\s*user_id/]},
       },
     },
@@ -79,10 +77,6 @@ has no expiry, so Redis keeps one key per vote for good.
         go: {
           all: [/ballotTTL\s*=\s*(30\s*\*\s*24\s*\*\s*time\.Hour|720\s*\*\s*time\.Hour)/, /SetNX\([^\n]*ballotTTL\)/],
           none: [/\.Expire\(/],
-        },
-        scala: {
-          all: [/BallotTtlSeconds\s*=\s*(30L?\s*\*\s*24\s*\*\s*3600|2592000)L?\b/, /\.ex\(\s*BallotTtlSeconds\s*\)/],
-          none: [/\.expire\(/],
         },
         cpp: {
           all: [/kBallotTtl\{(30\s*\*\s*24\s*\*\s*3600|2592000)\}/, /\.set\([^;]*kBallotTtl/],
@@ -213,43 +207,6 @@ func ballotKey(tenant, requestID, userID string) string {
 func claim(ctx context.Context, tenant, requestID, userID string) (bool, error) {
 	// One command: set only if absent, with its expiry. A racing submit gets false.
 	return rdb.SetNX(ctx, ballotKey(tenant, requestID, userID), "1", ballotTTL).Result()
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-object Ballot {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  def ballotKey(requestId: String, userId: String): String = s"ballot:$requestId:$userId"
-
-  /** Take the ballot for (tenant, requestId, userId): true when this call is the first vote. */
-  def claim(tenant: String, requestId: String, userId: String): Boolean = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    val key = ballotKey(requestId, userId)
-    if (jedis.exists(key)) false
-    else {
-      jedis.set(key, "1")
-      true
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-object Ballot {
-  val BallotTtlSeconds = 30L * 24 * 3600
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  def ballotKey(tenant: String, requestId: String, userId: String): String = s"ballot:$tenant:$requestId:$userId"
-
-  /** Take the ballot for (tenant, requestId, userId): true when this call is the first vote. */
-  def claim(tenant: String, requestId: String, userId: String): Boolean =
-    // One command: set only if absent, with its expiry. A racing submit gets null.
-    jedis.set(ballotKey(tenant, requestId, userId), "1", SetParams.setParams().nx().ex(BallotTtlSeconds)) == "OK"
 }
 `,
     },

@@ -6,7 +6,7 @@ import {chunkEmbedStep} from './steps/2-chunk-embed';
 import {hybridRetrieveStep} from './steps/3-hybrid-retrieve';
 import {groundedAnswerStep} from './steps/4-grounded-answer';
 import {evalGateStep} from './steps/5-eval-gate';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * RAG service: the debugging a retrieval pipeline owes before it answers over a tenant's documents. A
@@ -100,6 +100,5 @@ pieces above decide whether the service is correct, isolated and shippable.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

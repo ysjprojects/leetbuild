@@ -59,7 +59,6 @@ leaves a hole in the one store that must be complete.
         python: {all: [/key\s*=\s*conversation_id/, /uuid\.uuid4\(\)/]},
         typescript: {all: [/key:\s*conversationId\b/, /randomUUID\(\)/]},
         go: {all: [/Key:\s*\[\]byte\(conversationID\)/, /uuid\.NewString\(\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(\s*Topic,\s*conversationId/, /UUID\.randomUUID\(\)/]},
         cpp: {all: [/conversation_id\.c_str\(\),\s*conversation_id\.size\(\)/, /new_uuid\(\)/]},
       },
     },
@@ -72,7 +71,6 @@ leaves a hole in the one store that must be complete.
         python: {all: [/text_hash/], none: [/["']text["']\s*:/]},
         typescript: {all: [/text_hash/], none: [/^\s*text,?\s*$/m, /\btext:\s*text\b/]},
         go: {all: [/text_hash/], none: [/"text":\s*text\b/]},
-        scala: {all: [/text_hash/], none: [/"text"\s*->/]},
         cpp: {all: [/text_hash/], none: [/\{"text",\s*text\}/]},
       },
     },
@@ -85,7 +83,6 @@ leaves a hole in the one store that must be complete.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
-        scala: {all: [/enable\.idempotence|ENABLE_IDEMPOTENCE_CONFIG/, /"acks"|ACKS_CONFIG/]},
         cpp: {all: [/set\("enable\.idempotence",\s*"true"/, /set\("acks",\s*"all"/]},
       },
     },
@@ -98,7 +95,6 @@ leaves a hole in the one store that must be complete.
         python: {all: [/store\.insert_outbox\(/, /on_delivery\s*=/], none: [/except\s+KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /catch/]},
         go: {all: [/store\.InsertOutbox\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Store\.insertOutbox\(/, /\.get\(\s*AckTimeoutMs/]},
         cpp: {all: [/store::insertOutbox\(/, /dr_cb/]},
       },
     },
@@ -111,7 +107,6 @@ leaves a hole in the one store that must be complete.
         python: {order: [/store\.append_audit\(/, /consumer\.commit\(/]},
         typescript: {order: [/appendAudit\(/, /commitOffsets\(/]},
         go: {order: [/store\.AppendAudit\(/, /\.CommitMessage\(/]},
-        scala: {order: [/Store\.appendAudit\(/, /\.commitSync\(/]},
         cpp: {order: [/store::appendAudit\(/, /->commitSync\(/]},
       },
     },
@@ -502,129 +497,6 @@ func consume(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.{Properties, UUID}
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import fhguard.{Cache, Store} // Cache.textHash(text); Store.appendAudit(event), Store.insertOutbox(event, reason)
-
-object AuditEvents {
-  val Topic = "fairhousing.audit"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def audit(conversationId: String, direction: String, text: String, decision: Store.Decision, policyVersion: String): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val eventId = UUID.randomUUID().toString
-    val event = JsObject(
-      "event_id" -> JsString(eventId),
-      "conversation_id" -> JsString(conversationId),
-      "direction" -> JsString(direction),
-      "text" -> JsString(text),
-      "allowed" -> JsBoolean(decision.allowed),
-      "tier" -> JsString(decision.tier),
-      "score" -> JsNumber(decision.score),
-      "reasons" -> JsArray(decision.reasons.map(JsString(_)).toVector),
-      "policy_version" -> JsString(policyVersion),
-      "ts" -> JsNumber(System.currentTimeMillis()),
-    )
-    producer.send(new ProducerRecord[String, String](Topic, eventId, event.compactPrint))
-    producer.flush()
-    true
-  }
-
-  def consume(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", "audit")
-    props.put("enable.auto.commit", "false")
-    props.put("auto.offset.reset", "earliest")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        consumer.commitSync()
-        Store.appendAudit(record.value().parseJson.asJsObject)
-      }
-    }
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.concurrent.TimeUnit
-import java.util.{Properties, UUID}
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-
-import fhguard.{Cache, Store} // Cache.textHash(text); Store.appendAudit(event), Store.insertOutbox(event, reason)
-
-object AuditEvents {
-  val Topic = "fairhousing.audit"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("enable.idempotence", "true") // a retry after a lost acknowledgement lands once
-    props.put("acks", "all") // every in-sync replica has the event before the broker answers
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def audit(conversationId: String, direction: String, text: String, decision: Store.Decision, policyVersion: String): Boolean = {
-    val event = JsObject(
-      "event_id" -> JsString(UUID.randomUUID().toString),
-      "conversation_id" -> JsString(conversationId),
-      "direction" -> JsString(direction),
-      "text_hash" -> JsString(Cache.textHash(text)),
-      "allowed" -> JsBoolean(decision.allowed),
-      "tier" -> JsString(decision.tier),
-      "score" -> JsNumber(decision.score),
-      "reasons" -> JsArray(decision.reasons.map(JsString(_)).toVector),
-      "policy_version" -> JsString(policyVersion),
-      "ts" -> JsNumber(System.currentTimeMillis()),
-    )
-    val record = new ProducerRecord[String, String](Topic, conversationId, event.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    acked.failed.foreach(e => Store.insertOutbox(event, String.valueOf(e.getMessage)))
-    acked.isSuccess
-  }
-
-  def consume(): Unit = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", "audit")
-    props.put("enable.auto.commit", "false")
-    props.put("auto.offset.reset", "earliest")
-    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        Store.appendAudit(record.value().parseJson.asJsObject)
-        consumer.commitSync() // after the append: a crash in between redelivers, and the append dedupes by event_id
-      }
-    }
-  }
 }
 `,
     },

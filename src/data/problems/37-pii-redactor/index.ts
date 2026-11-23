@@ -6,7 +6,7 @@ import {redactionStateStep} from './steps/2-state';
 import {detectorClientStep} from './steps/3-client';
 import {auditEventsStep} from './steps/4-events';
 import {readRedactionStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * PII redactor: the debugging you owe a redaction service before it is trusted with customer text.
@@ -96,6 +96,5 @@ quality metrics, document storage and retention, the outbox relay, and review of
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

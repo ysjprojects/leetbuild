@@ -48,10 +48,6 @@ a decision twice; a consumer crash between commit and write leaves a finished jo
         python: {all: [/key\s*=\s*decision\[["']job_id["']\]/], none: [/key\s*=\s*decision\[["']agent_id["']\]/]},
         typescript: {all: [/key:\s*decision\.job_id\b/], none: [/key:\s*decision\.agent_id\b/]},
         go: {all: [/Key:\s*\[\]byte\(decision\.JobID\)/], none: [/Key:\s*\[\]byte\(decision\.AgentID\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(Topic,\s*jobId/],
-          none: [/ProducerRecord\[String, String\]\(Topic,\s*agentId/],
-        },
         cpp: {all: [/job_id\.c_str\(\),\s*job_id\.(size|length)\(\)/], none: [/agent_id\.c_str\(\)/]},
       },
     },
@@ -64,7 +60,6 @@ a decision twice; a consumer crash between commit and write leaves a finished jo
         python: {all: [/TRACE_FIELDS\s*=/, /in\s+TRACE_FIELDS/], none: [/\*\*decision/]},
         typescript: {all: [/TRACE_FIELDS\s*=/, /TRACE_FIELDS\.map\(|of\s+TRACE_FIELDS/], none: [/\.\.\.decision/]},
         go: {all: [/traceFields\s*=/, /range\s+traceFields/]},
-        scala: {all: [/TraceFields\s*[:=]/, /TraceFields\.(flatMap|collect|map)/], none: [/decision\.fields\s*\+/]},
         cpp: {all: [/kTraceFields\s*=/, /:\s*kTraceFields\)/], none: [/json event = decision;/]},
       },
     },
@@ -77,7 +72,6 @@ a decision twice; a consumer crash between commit and write leaves a finished jo
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/], none: [/acks:\s*1\b/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
         cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
@@ -90,7 +84,6 @@ a decision twice; a consumer crash between commit and write leaves a finished jo
         python: {order: [/\.hset\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hset\(/, /commitOffsets\(/]},
         go: {order: [/\.HSet\(/, /\.CommitMessages\(/]},
-        scala: {order: [/\.hset\(/, /\.commitSync\(/]},
         cpp: {order: [/redis\.hset\(/, /->commitSync\(/]},
       },
     },
@@ -496,142 +489,6 @@ func runEval(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import research.Jobs // Jobs.ServiceVersion, Jobs.jobKey
-
-object TraceEvents {
-  val Topic = "research.trace"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"trace event not delivered: \${exception.getMessage}")
-  }
-
-  /** Record one decision of the lead or a subagent (job_id, agent_id, tool, latency_ms, tokens, outcome, query, findings) on research.trace; returns the event sent. */
-  def trace(decision: JsObject): JsObject = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val event = JsObject(decision.fields + ("version" -> JsString(Jobs.ServiceVersion)))
-    val agentId = decision.fields("agent_id").convertTo[String](DefaultJsonProtocol.StringJsonFormat)
-    producer.send(new ProducerRecord[String, String](Topic, agentId, event.compactPrint), onDelivery)
-    event
-  }
-
-  /** The job's evaluation: the share of the plan with a result, the tool calls used, the version. */
-  def endState(jobId: String, version: String): Map[String, String] = {
-    val key = Jobs.jobKey(jobId)
-    val planned = Option(jedis.hget(key, "plan")).map(_.parseJson.asInstanceOf[JsArray].elements.size).getOrElse(0)
-    val completeness = if (planned > 0) jedis.hlen(s"$key:results").toDouble / planned else 0.0
-    Map("completeness" -> f"$completeness%.2f", "tool_calls" -> Option(jedis.get(s"$key:tools")).getOrElse("0"), "version" -> version)
-  }
-
-  def runEval(): Unit = {
-    val conf = new Properties()
-    conf.put("bootstrap.servers", "kafka:9092")
-    conf.put("group.id", "end-state-eval")
-    conf.put("enable.auto.commit", "false")
-    conf.put("auto.offset.reset", "earliest")
-    val consumer = new KafkaConsumer[String, String](conf, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      for (record <- consumer.poll(Duration.ofSeconds(1)).asScala) {
-        consumer.commitSync()
-        val event = record.value.parseJson.asJsObject.fields
-        if (event.get("outcome").contains(JsString("job.completed"))) {
-          val jobId = event("job_id").asInstanceOf[JsString].value
-          jedis.hset(s"\${Jobs.jobKey(jobId)}:eval", endState(jobId, event("version").asInstanceOf[JsString].value).asJava)
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-import research.Jobs // Jobs.ServiceVersion, Jobs.jobKey
-
-object TraceEvents {
-  val Topic = "research.trace"
-  // Ids and numbers: what explains a run without carrying what the customer asked or what was found.
-  val TraceFields: Seq[String] = Seq("job_id", "agent_id", "tool", "latency_ms", "tokens", "outcome")
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private val onDelivery: Callback = new Callback {
-    override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-      if (exception != null) System.err.println(s"trace event not delivered: \${exception.getMessage}")
-  }
-
-  /** Record one decision of the lead or a subagent (job_id, agent_id, tool, latency_ms, tokens, outcome, query, findings) on research.trace; returns the event sent. */
-  def trace(decision: JsObject): JsObject = {
-    val kept = TraceFields.flatMap(name => decision.fields.get(name).map(name -> _)).toMap
-    val event = JsObject(kept + ("version" -> JsString(Jobs.ServiceVersion)))
-    val jobId = decision.fields("job_id").convertTo[String](DefaultJsonProtocol.StringJsonFormat)
-    producer.send(new ProducerRecord[String, String](Topic, jobId, event.compactPrint), onDelivery)
-    event
-  }
-
-  /** The job's evaluation: the share of the plan with a result, the tool calls used, the version. */
-  def endState(jobId: String, version: String): Map[String, String] = {
-    val key = Jobs.jobKey(jobId)
-    val planned = Option(jedis.hget(key, "plan")).map(_.parseJson.asInstanceOf[JsArray].elements.size).getOrElse(0)
-    val completeness = if (planned > 0) jedis.hlen(s"$key:results").toDouble / planned else 0.0
-    Map("completeness" -> f"$completeness%.2f", "tool_calls" -> Option(jedis.get(s"$key:tools")).getOrElse("0"), "version" -> version)
-  }
-
-  def runEval(): Unit = {
-    val conf = new Properties()
-    conf.put("bootstrap.servers", "kafka:9092")
-    conf.put("group.id", "end-state-eval")
-    conf.put("enable.auto.commit", "false")
-    conf.put("auto.offset.reset", "earliest")
-    val consumer = new KafkaConsumer[String, String](conf, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Topic).asJava)
-    while (true) {
-      for (record <- consumer.poll(Duration.ofSeconds(1)).asScala) {
-        val event = record.value.parseJson.asJsObject.fields
-        if (event.get("outcome").contains(JsString("job.completed"))) {
-          val jobId = event("job_id").asInstanceOf[JsString].value
-          jedis.hset(s"\${Jobs.jobKey(jobId)}:eval", endState(jobId, event("version").asInstanceOf[JsString].value).asJava)
-        }
-        // After the write: a crash before this point redelivers the record.
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
-      }
-    }
-  }
 }
 `,
     },

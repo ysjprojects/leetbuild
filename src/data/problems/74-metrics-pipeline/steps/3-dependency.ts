@@ -53,7 +53,6 @@ round; and a shard has no way to recognise a window it already stored.
           all: [/FLUSH_DEADLINE_MS\s*=\s*2000\b/, /WriteWindows\([\s\S]{0,200}?deadline:[^\n]*FLUSH_DEADLINE_MS/],
         },
         go: {all: [/flushDeadline\s*=\s*2\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*flushDeadline\)/]},
-        scala: {all: [/FlushDeadlineSeconds\s*=\s*2L?\b/, /withDeadlineAfter\(\s*FlushDeadlineSeconds/]},
         cpp: {all: [/kFlushDeadline\{2\}/, /set_deadline\([^\n]*kFlushDeadline\)/]},
       },
     },
@@ -66,7 +65,6 @@ round; and a shard has no way to recognise a window it already stored.
         python: {all: [/["']pending["']/, /reply\.accepted/], none: [/return True\b/]},
         typescript: {all: [/pending/, /reply\.accepted/], none: [/Promise<boolean>/]},
         go: {all: [/model\.FlushResult\{/, /GetAccepted\(\)/], none: [/\)\s*bool\s*\{/]},
-        scala: {all: [/FlushResult\(/, /reply\.accepted/], none: [/\):\s*Boolean\s*=/]},
         cpp: {all: [/metrics::FlushResult\s+flushWindows/, /reply\.accepted\(\)/], none: [/^bool flushWindows/m]},
       },
     },
@@ -79,7 +77,6 @@ round; and a shard has no way to recognise a window it already stored.
         python: {all: [/FLUSH_ATTEMPTS/, /pending/], none: [/in by_shard\.items\(\)/]},
         typescript: {all: [/FLUSH_ATTEMPTS/, /pending/], none: [/of byShard\)/]},
         go: {all: [/flushAttempts/, /pending/], none: [/range byShard\b/]},
-        scala: {all: [/FlushAttempts/, /pending/], none: [/<- byShard\b|byShard\.foreach/]},
         cpp: {all: [/kFlushAttempts/, /pending/], none: [/:\s*byShard\)/]},
       },
     },
@@ -92,7 +89,6 @@ round; and a shard has no way to recognise a window it already stored.
         python: {all: [/window_id\s*=/, /window_id\(w\)/]},
         typescript: {all: [/window_id:/, /windowId\(w\)/]},
         go: {all: [/WindowId:/, /model\.WindowID\(w\)/]},
-        scala: {all: [/windowId\s*=/, /windowId\(w\)/]},
         cpp: {all: [/set_window_id\(/, /metrics::windowId\(w\)/]},
       },
     },
@@ -408,69 +404,6 @@ func flushWindows(ctx context.Context, windows []model.Window) model.FlushResult
 		result.Pending[target] = ids
 	}
 	return result
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import metrics.Model.{FlushResult, Shards, Window, shardFor, windowId}
-import metricsd.metrics_pipeline.{MetricsWriterGrpc, WriteRequest, Window => WireWindow}
-
-object Client {
-  val FlushAttempts = 3
-
-  private val writers = Shards.map(target => target -> MetricsWriterGrpc.blockingStub(ManagedChannelBuilder.forTarget(target).usePlaintext().build())).toMap
-
-  /** Send every closed window to the shard writer its series lives on; true when the shards took them. */
-  def flushWindows(windows: Seq[Window]): Boolean = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val byShard = windows.groupBy(w => shardFor(w.series))
-    (1 to FlushAttempts).exists { _ =>
-      var failed = false
-      for ((target, batch) <- byShard) {
-        val request = WriteRequest(target, batch.map(w => WireWindow(tenant = w.tenant, series = w.series, start = w.start, count = w.count, sum = w.sum)))
-        try writers(target).writeWindows(request)
-        catch { case _: StatusRuntimeException => failed = true }
-      }
-      !failed
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import metrics.Model.{FlushResult, Shards, Window, shardFor, windowId}
-import metricsd.metrics_pipeline.{MetricsWriterGrpc, WriteRequest, Window => WireWindow}
-
-object Client {
-  val FlushDeadlineSeconds = 2L
-  val FlushAttempts = 3
-
-  private val writers = Shards.map(target => target -> MetricsWriterGrpc.blockingStub(ManagedChannelBuilder.forTarget(target).usePlaintext().build())).toMap
-
-  /** Send every closed window to its shard writer: the accepted ids, and per shard target the ids still pending. */
-  def flushWindows(windows: Seq[Window]): FlushResult = {
-    val pending = scala.collection.mutable.LinkedHashMap.empty[String, scala.collection.mutable.LinkedHashMap[String, Window]]
-    windows.foreach(w => pending.getOrElseUpdate(shardFor(w.series), scala.collection.mutable.LinkedHashMap.empty)(windowId(w)) = w)
-    val accepted = scala.collection.mutable.ArrayBuffer.empty[String]
-    var attempt = 0
-    while (attempt < FlushAttempts && pending.values.exists(_.nonEmpty)) {
-      // A shard that took everything is not asked again.
-      for ((target, batch) <- pending if batch.nonEmpty) {
-        val request = WriteRequest(target, batch.values.toSeq.map(w =>
-          WireWindow(windowId = windowId(w), tenant = w.tenant, series = w.series, start = w.start, count = w.count, sum = w.sum)))
-        try {
-          val reply = writers(target).withDeadlineAfter(FlushDeadlineSeconds, TimeUnit.SECONDS).writeWindows(request)
-          reply.accepted.foreach(id => if (batch.remove(id).isDefined) accepted += id)
-        } catch { case _: StatusRuntimeException => () } // the windows stay pending for the next round, or the next tick
-      }
-      attempt += 1
-    }
-    FlushResult(accepted.toSeq, pending.collect { case (target, batch) if batch.nonEmpty => target -> batch.keys.toSeq.sorted }.toMap)
-  }
 }
 `,
     },

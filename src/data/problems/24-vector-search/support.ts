@@ -3,10 +3,9 @@
  * package. `search.corpus` is the index as Redis keeps it (the active version and its dimension,
  * documents, one namespace per tenant and version) with the exact nearest-neighbour ranking every
  * step searches through; `search.fingerprint` is the digest a query vector is known by outside the
- * request (step 2's cache key, step 4's event). The five languages keep the same keys, so a harness
+ * request (step 2's cache key, step 4's event). The four languages keep the same keys, so a harness
  * seeds and reads one layout whatever the stack.
  */
-import {scalaPath} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'search/__init__.py': '',
@@ -454,88 +453,5 @@ inline std::string queryDigest(const std::vector<double>& query) {
 }
 
 }  // namespace fingerprint
-`,
-};
-
-export const supportModulesScala: Record<string, string> = {
-  [scalaPath('search', 'Corpus')]: `package search
-
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-/**
- * The corpus (provided): the search index as Redis keeps it. index:active is a hash with the active
- * index version and its dimension (dims). doc:{id} is a hash with the document's id, tenant, the
- * index version it was embedded for and its vector (comma-separated floats). index:{version}:{tenant}
- * is the set of the tenant's document ids in one index version: the tenant's namespace. nearest()
- * ranks one namespace by dot product, best first, ties by id; a query of another width is scored over
- * the shorter of the two, because the corpus does not check widths.
- */
-object Corpus {
-  final case class Index(version: String, dims: Int)
-  final case class Document(id: String, tenant: String, version: String, vector: Vector[Double])
-  final case class Hit(id: String, score: Double)
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def parse(raw: String): Vector[Double] = raw.split(",").filter(_.nonEmpty).map(_.toDouble).toVector
-
-  /** The active index: Index("idx-42", 4). */
-  def activeIndex(): Index = {
-    val raw = jedis.hgetAll("index:active").asScala
-    Index(raw.getOrElse("version", ""), raw.get("dims").map(_.toInt).getOrElse(0))
-  }
-
-  /** Make version the active index (the reindexer's switch). */
-  def activate(version: String, dims: Int): Unit =
-    jedis.hset("index:active", Map("version" -> version, "dims" -> dims.toString).asJava)
-
-  /** Store a document embedded for version and add it to the tenant's namespace (the ingest writer). */
-  def putDocument(tenant: String, version: String, docId: String, vector: Seq[Double]): Unit = {
-    jedis.hset(s"doc:$docId", Map("id" -> docId, "tenant" -> tenant, "version" -> version, "vector" -> vector.mkString(",")).asJava)
-    jedis.sadd(s"index:$version:$tenant", docId)
-  }
-
-  /** Any tenant's document by id: the reindexer's lookup, which works across tenants. */
-  def documentById(docId: String): Option[Document] = {
-    val raw = jedis.hgetAll(s"doc:$docId").asScala
-    if (raw.isEmpty) None else Some(Document(raw("id"), raw("tenant"), raw("version"), parse(raw("vector"))))
-  }
-
-  /** The tenant's document, or None when there is none or it belongs to another tenant. */
-  def document(tenant: String, docId: String): Option[Document] = documentById(docId).filter(_.tenant == tenant)
-
-  /** The k documents of the tenant's namespace in version closest to query, best first. */
-  def nearest(tenant: String, version: String, query: Seq[Double], k: Int): Vector[Hit] =
-    jedis
-      .smembers(s"index:$version:$tenant")
-      .asScala
-      .toVector
-      .map { id =>
-        val vector = parse(Option(jedis.hget(s"doc:$id", "vector")).getOrElse(""))
-        Hit(id, query.zip(vector).map { case (a, b) => a * b }.sum)
-      }
-      .sortBy(h => (-h.score, h.id))
-      .take(k)
-}
-`,
-  [scalaPath('search', 'Fingerprint')]: `package search
-
-import java.nio.ByteBuffer
-import java.security.MessageDigest
-
-/**
- * queryDigest (provided): the digest a query vector is known by outside the request (step 2's cache
- * key, step 4's event): SHA-256 over the vector's IEEE-754 doubles, big-endian, in hex. Equal vectors
- * give equal digests in every runtime.
- */
-object Fingerprint {
-  def queryDigest(query: Seq[Double]): String = {
-    val bytes = ByteBuffer.allocate(8 * query.length) // big-endian
-    query.foreach(x => bytes.putDouble(x))
-    MessageDigest.getInstance("SHA-256").digest(bytes.array).map(b => f"$b%02x").mkString
-  }
-}
 `,
 };

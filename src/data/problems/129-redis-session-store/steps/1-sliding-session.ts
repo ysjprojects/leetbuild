@@ -48,7 +48,7 @@ Implement a server-side session store in Redis. A session is the hash \`sess:{si
     ],
   },
   hints: [
-    'The id is 16 random bytes as hex: `secrets.token_hex(16)` / `randomBytes(16)` / `crypto/rand` / `SecureRandom` / `std::random_device` — never `uuid4` trimmed, never a counter.',
+    'The id is 16 random bytes as hex: `secrets.token_hex(16)` / `randomBytes(16)` / `crypto/rand` / `std::random_device` — never `uuid4` trimmed, never a counter.',
     '`create` is `HSET` plus `EXPIRE` on the same key inside one `MULTI … EXEC`; build the field map from `data` first, then set `user_id` and `created_at` on top.',
     '`get` is `HGETALL`; an empty map means no session (Redis answers `{}` for a missing key, never an error). Only when it is non-empty, `EXPIRE` the key again and return the map. `touch` is just that `EXPIRE`, whose reply (1/0) is your boolean.',
   ],
@@ -62,7 +62,6 @@ Implement a server-side session store in Redis. A session is the hash \`sess:{si
         python: {all: [/secrets\.token_hex\(16\)/, /"created_at":/]},
         typescript: {all: [/randomBytes\(16\)/, /created_at:/]},
         go: {all: [/rand\.Read\(/, /hex\.EncodeToString\(/, /"created_at"/]},
-        scala: {all: [/SecureRandom/, /nextBytes\(/, /"created_at"/]},
         cpp: {all: [/std::random_device/, /"created_at"/]},
       },
     },
@@ -75,7 +74,6 @@ Implement a server-side session store in Redis. A session is the hash \`sess:{si
         python: {all: [/pipe\.hset\(k,/, /pipe\.expire\(k, SESSION_TTL_S\)/]},
         typescript: {all: [/\.hset\(k,/, /\.expire\(k, SESSION_TTL_S\)/]},
         go: {all: [/pipe\.HSet\(ctx, k,/, /pipe\.Expire\(ctx, k, sessionTTL\)/]},
-        scala: {all: [/tx\.hset\(k,/, /tx\.expire\(k, SessionTtlSeconds\)/]},
         cpp: {all: [/tx\.hset\(k,/, /tx\.expire\(k, kSessionTtl\)/]},
       },
     },
@@ -90,7 +88,6 @@ Implement a server-side session store in Redis. A session is the hash \`sess:{si
           order: [/function get\(/, /redis\.hgetall\(key\(sid\)\)/, /redis\.expire\(key\(sid\), SESSION_TTL_S\)/],
         },
         go: {order: [/func get\(/, /rdb\.HGetAll\(ctx, key\(sid\)\)/, /rdb\.Expire\(ctx, key\(sid\), sessionTTL\)/]},
-        scala: {order: [/def get\(/, /jedis\.hgetAll\(key\(sid\)\)/, /jedis\.expire\(key\(sid\), SessionTtlSeconds\)/]},
         cpp: {
           order: [
             /get\(const std::string& sid\)/,
@@ -109,7 +106,6 @@ Implement a server-side session store in Redis. A session is the hash \`sess:{si
         python: {all: [/return r\.expire\(key\(sid\), SESSION_TTL_S\)/]},
         typescript: {all: [/return \(await redis\.expire\(key\(sid\), SESSION_TTL_S\)\) === 1/]},
         go: {all: [/return rdb\.Expire\(ctx, key\(sid\), sessionTTL\)\.Result\(\)/]},
-        scala: {all: [/jedis\.expire\(key\(sid\), SessionTtlSeconds\) == 1/]},
         cpp: {all: [/return redis\.expire\(key\(sid\), kSessionTtl\)/]},
       },
     },
@@ -122,7 +118,6 @@ Implement a server-side session store in Redis. A session is the hash \`sess:{si
         python: {all: [/SESSION_TTL_S = 1800/, /\.expire\(/], none: [/\.persist\(/, /threading\.Thread\(/]},
         typescript: {all: [/SESSION_TTL_S = 1800/, /\.expire\(/], none: [/\.persist\(/, /setInterval\(/]},
         go: {all: [/sessionTTL = 1800 \* time\.Second/, /\.Expire\(/], none: [/\.Persist\(/, /time\.NewTicker\(/]},
-        scala: {all: [/SessionTtlSeconds = 1800L/, /\.expire\(/], none: [/\.persist\(/, /new Thread\(/]},
         cpp: {all: [/kSessionTtl\{1800\}/, /\.expire\(/], none: [/\.persist\(/, /std::thread\(/]},
       },
     },
@@ -135,7 +130,6 @@ Implement a server-side session store in Redis. A session is the hash \`sess:{si
         python: {all: [/r\.delete\(key\(sid\)\)/, /if not fields:\s*\n\s*return None/]},
         typescript: {all: [/redis\.del\(key\(sid\)\)/, /return null/]},
         go: {all: [/rdb\.Del\(ctx, key\(sid\)\)/, /return nil, nil/]},
-        scala: {all: [/jedis\.del\(key\(sid\)\)/, /if \(fields\.isEmpty\) None/]},
         cpp: {all: [/redis\.del\(key\(sid\)\)/, /return std::nullopt/]},
       },
     },
@@ -454,105 +448,6 @@ func main() {
 	alive, _ := touch(ctx, sid)
 	fmt.Println("touched:", alive)
 	_ = destroy(ctx, sid)
-}
-`,
-    },
-    scala: {
-      starter: `import java.security.SecureRandom
-
-import scala.jdk.CollectionConverters._
-
-import redis.clients.jedis.JedisPooled
-
-/** Server-side sessions in Redis: one hash per session, alive for SessionTtlSeconds after the last read or touch. */
-object Sessions {
-  val jedis = new JedisPooled("redis", 6379)
-  val SessionTtlSeconds = 1800L
-  private val random = new SecureRandom()
-
-  def key(sid: String): String = s"sess:$sid"
-
-  /** A 32-hex-char id; HSET sess:{sid} with user_id, created_at and data, and EXPIRE it — in one MULTI. */
-  def create(userId: String, data: Map[String, String]): String = {
-    // TODO: 16 bytes from random.nextBytes as hex; fields = data ++ user_id + created_at (unix seconds)
-    // TODO: val tx = jedis.multi(); tx.hset(k, fields.asJava); tx.expire(k, SessionTtlSeconds); tx.exec()
-    ???
-  }
-
-  /** HGETALL; None when empty. A hit slides the TTL back to SessionTtlSeconds. */
-  def get(sid: String): Option[Map[String, String]] = {
-    ??? // TODO
-  }
-
-  /** Slide the TTL without reading; false when there is no such session. */
-  def touch(sid: String): Boolean = {
-    ??? // TODO
-  }
-
-  /** Log out: DEL the hash. */
-  def destroy(sid: String): Unit = {
-    ??? // TODO
-  }
-
-  def main(args: Array[String]): Unit = {
-    val sid = create("u1", Map("theme" -> "dark"))
-    println(s"$sid -> \${get(sid)}")
-  }
-}
-`,
-      solution: `import java.security.SecureRandom
-
-import scala.jdk.CollectionConverters._
-
-import redis.clients.jedis.JedisPooled
-
-/** Server-side sessions in Redis: one hash per session, alive for SessionTtlSeconds after the last read or touch. */
-object Sessions {
-  val jedis = new JedisPooled("redis", 6379)
-  val SessionTtlSeconds = 1800L
-  private val random = new SecureRandom()
-
-  def key(sid: String): String = s"sess:$sid"
-
-  /** 16 random bytes as 32 hex chars. */
-  def newId(): String = {
-    val bytes = new Array[Byte](16)
-    random.nextBytes(bytes)
-    bytes.map("%02x".format(_)).mkString
-  }
-
-  /** A 32-hex-char id; HSET sess:{sid} with user_id, created_at and data, and EXPIRE it — in one MULTI. */
-  def create(userId: String, data: Map[String, String]): String = {
-    val sid = newId()
-    val k = key(sid)
-    val fields = data ++ Map("user_id" -> userId, "created_at" -> (System.currentTimeMillis() / 1000).toString)
-    val tx = jedis.multi()
-    tx.hset(k, fields.asJava)
-    tx.expire(k, SessionTtlSeconds)
-    tx.exec()
-    sid
-  }
-
-  /** HGETALL; None when empty. A hit slides the TTL back to SessionTtlSeconds. */
-  def get(sid: String): Option[Map[String, String]] = {
-    val fields = jedis.hgetAll(key(sid)).asScala.toMap
-    if (fields.isEmpty) None
-    else {
-      jedis.expire(key(sid), SessionTtlSeconds)
-      Some(fields)
-    }
-  }
-
-  /** Slide the TTL without reading; false when there is no such session. */
-  def touch(sid: String): Boolean = jedis.expire(key(sid), SessionTtlSeconds) == 1
-
-  /** Log out: DEL the hash. */
-  def destroy(sid: String): Unit = jedis.del(key(sid))
-
-  def main(args: Array[String]): Unit = {
-    val sid = create("u1", Map("theme" -> "dark"))
-    println(s"$sid -> \${get(sid)}")
-  }
 }
 `,
     },

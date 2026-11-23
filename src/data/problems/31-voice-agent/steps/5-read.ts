@@ -51,7 +51,6 @@ redaction was meant to stand in for.
         python: {all: [/@app\.get\(\s*["']\/v1\/voice\/sessions\/\{session_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/voice\/sessions\/:sessionId['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/voice\/sessions\/\{id\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"voice"\s*\/\s*"sessions"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/voice\/sessions\//]},
       },
     },
@@ -64,7 +63,6 @@ redaction was meant to stand in for.
         python: {all: [/x-tenant-id/i, /\btenant\b[^\n]*!=|!=[^\n]*\btenant\b/]},
         typescript: {all: [/x-tenant-id/i, /\.tenant\s*!==|!==\s*[\w.]*tenant/]},
         go: {all: [/X-Tenant-Id/i, /\.Tenant\s*!=|!=\s*[\w.]*Tenant/]},
-        scala: {all: [/X-Tenant-Id/i, /\.tenant\s*[!=]=|[!=]=\s*[\w.]*tenant/]},
         cpp: {all: [/X-Tenant-Id/i, /(->|\.)tenant\s*!=|!=\s*[\w.>-]*tenant/]},
       },
     },
@@ -77,7 +75,6 @@ redaction was meant to stand in for.
         python: {all: [/MAX_TURNS\s*=\s*500/, /DEFAULT_LIMIT\s*=\s*100/], none: [/10_?000/]},
         typescript: {all: [/MAX_TURNS\s*=\s*500/, /DEFAULT_LIMIT\s*=\s*100/], none: [/10_?000/]},
         go: {all: [/maxTurns\s*=\s*500/, /defaultLimit\s*=\s*100/], none: [/10_?000/]},
-        scala: {all: [/MaxTurns\s*=\s*500/, /DefaultLimit\s*=\s*100/], none: [/10_?000/]},
         cpp: {all: [/kMaxTurns\s*=\s*500/, /kDefaultLimit\s*=\s*100/], none: [/10'?000/]},
       },
     },
@@ -90,7 +87,6 @@ redaction was meant to stand in for.
         python: {all: [/next_cursor/, /["']cursor["']/]},
         typescript: {all: [/next_cursor/, /cursor\?\s*:/]},
         go: {all: [/next_cursor/, /"cursor"/]},
-        scala: {all: [/next_cursor/, /"cursor"/]},
         cpp: {all: [/next_cursor/, /"cursor"/]},
       },
     },
@@ -103,7 +99,6 @@ redaction was meant to stand in for.
         python: {all: [/["']redaction_spans["']/], none: [/audio_path/]},
         typescript: {all: [/redaction_spans:/], none: [/audio_path/]},
         go: {all: [/RedactionSpans/], none: [/AudioPath|audio_path/]},
-        scala: {all: [/"redaction_spans"/], none: [/audioPath|audio_path/]},
         cpp: {all: [/"redaction_spans"/], none: [/audio_path/]},
       },
     },
@@ -324,85 +319,6 @@ func readTranscript(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/voice/sessions/{id}", readTranscript)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import voice.{Sessions, Transcripts} // Sessions.get; Transcripts.listTurns
-
-object Read {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def turnJson(t: Transcripts.Turn): JsObject = JsObject(
-    "turn_index" -> JsNumber(t.turnIndex), "started_at" -> JsNumber(t.startedAt), "ended_at" -> JsNumber(t.endedAt),
-    "text" -> JsString(t.text), "redaction_spans" -> t.redactionSpans.toJson, "audio_path" -> JsString(t.audioPath))
-
-  val route: Route = path("v1" / "voice" / "sessions" / Segment) { sessionId =>
-    get {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      Sessions.get(sessionId) match {
-        case None => complete(StatusCodes.NotFound -> "no such session")
-        case Some(_) =>
-          val turns = Transcripts.listTurns(sessionId, -1, 10000)
-          complete(json(StatusCodes.OK, JsObject("session_id" -> JsString(sessionId), "turns" -> JsArray(turns.map(turnJson).toVector))))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import voice.{Sessions, Transcripts} // Sessions.get; Transcripts.listTurns
-
-import scala.util.Try
-
-object Read {
-  val MaxTurns = 500
-  val DefaultLimit = 100
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** What a reader gets of a turn: the redacted text and its spans, never where the recording is. */
-  private def turnJson(t: Transcripts.Turn): JsObject = JsObject(
-    "turn_index" -> JsNumber(t.turnIndex), "started_at" -> JsNumber(t.startedAt), "ended_at" -> JsNumber(t.endedAt),
-    "text" -> JsString(t.text), "redaction_spans" -> t.redactionSpans.toJson)
-
-  val route: Route = path("v1" / "voice" / "sessions" / Segment) { sessionId =>
-    get {
-      (optionalHeaderValueByName("X-Tenant-Id") & parameters("limit".optional, "cursor".optional)) { (tenantHeader, limitText, cursor) =>
-        tenantHeader.filter(_.nonEmpty) match {
-          case None => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            Sessions.get(sessionId).filter(_.tenant == tenant) match {
-              case None => complete(StatusCodes.NotFound -> "no such session") // a foreign session looks exactly like a missing one
-              case Some(_) =>
-                (Try(limitText.fold(DefaultLimit)(_.toInt)).toOption, Try(cursor.fold(-1)(_.toInt)).toOption) match {
-                  case (Some(requested), Some(after)) if requested >= 1 =>
-                    val limit = math.min(requested, MaxTurns)
-                    val rows = Transcripts.listTurns(sessionId, after, limit + 1) // one past the page: is there a next one?
-                    val page = rows.take(limit)
-                    val nextCursor = if (rows.size > limit) JsString(page.last.turnIndex.toString) else JsNull
-                    complete(json(StatusCodes.OK, JsObject(
-                      "session_id" -> JsString(sessionId), "turns" -> JsArray(page.map(turnJson).toVector), "next_cursor" -> nextCursor)))
-                  case _ => complete(StatusCodes.BadRequest -> "limit and cursor are integers, limit positive")
-                }
-            }
-        }
-      }
-    }
-  }
 }
 `,
     },

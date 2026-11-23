@@ -6,7 +6,7 @@ import {glossaryStateStep} from './steps/2-state';
 import {mtClientStep} from './steps/3-dependency';
 import {localeEventsStep} from './steps/4-events';
 import {glossaryReadStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Translation service: the course is not "call a translation API", it is the debugging you owe a
@@ -93,6 +93,5 @@ billing, and glossary authoring UIs.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

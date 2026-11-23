@@ -47,7 +47,6 @@ image through the API, a third larger as base64.
         python: {all: [/@app\.get\(\s*["']\/v1\/assets\/\{asset_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/assets\/:/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/assets\/\{/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"assets"\s*\/\s*Segment\s*\)/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/assets\//]},
       },
     },
@@ -60,7 +59,6 @@ image through the API, a third larger as base64.
         python: {all: [/\b401\b/, /\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*\w+\[["']tenant["']\]/]},
         typescript: {all: [/\b401\b/, /\.tenant\s*!==\s*tenant|tenant\s*!==\s*\w+\.tenant/]},
         go: {all: [/StatusUnauthorized|\b401\b/, /\.Tenant\s*!=\s*tenant|tenant\s*!=\s*\w+\.Tenant/]},
-        scala: {all: [/Unauthorized|\b401\b/, /filter\(_\.tenant\s*==\s*tenant\)|\.tenant\s*!=\s*tenant/]},
         cpp: {all: [/\b401\b/, /->tenant\s*!=\s*tenant|\.tenant\s*!=\s*tenant/]},
       },
     },
@@ -73,7 +71,6 @@ image through the API, a third larger as base64.
         python: {all: [/SIGNED_URL_TTL_S\s*=\s*(?:900|15\s*\*\s*60)\b/]},
         typescript: {all: [/SIGNED_URL_TTL_S\s*=\s*(?:900|15\s*\*\s*60)\b/]},
         go: {all: [/signedURLTTLSeconds\s*=\s*(?:900|15\s*\*\s*60)\b/]},
-        scala: {all: [/SignedUrlTtlSeconds(?::\s*Long)?\s*=\s*(?:900|15\s*\*\s*60)L?\b/]},
         cpp: {all: [/kSignedUrlTtlSeconds\s*=\s*(?:900|15\s*\*\s*60)\b/]},
       },
     },
@@ -86,7 +83,6 @@ image through the API, a third larger as base64.
         python: {all: [/mac\([^\n]*checksum[^\n]*tenant[^\n]*expires/i]},
         typescript: {all: [/mac\([^\n]*checksum[^\n]*tenant[^\n]*expires/i]},
         go: {all: [/Mac\([^\n]*checksum[^\n]*tenant[^\n]*expires/i]},
-        scala: {all: [/mac\([^\n]*checksum[^\n]*tenant[^\n]*expires/i]},
         cpp: {all: [/mac\([^\n]*checksum[^\n]*tenant[^\n]*expires/i]},
       },
     },
@@ -99,7 +95,6 @@ image through the API, a third larger as base64.
         python: {none: [/objects\.read\(/, /b64encode/]},
         typescript: {none: [/\bread\(/, /base64/]},
         go: {none: [/objects\.Read\(/, /base64\./]},
-        scala: {none: [/Objects\.read\(/, /Base64/]},
         cpp: {none: [/objects::read\(/, /base64/i]},
       },
     },
@@ -322,84 +317,6 @@ func readAsset(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/assets/{id}", readAsset)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Base64
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import ingest.{Assets, Objects} // Assets.get(assetId); Objects.BaseUrl, Objects.mac(message), Objects.read(checksum)
-
-object Read {
-  val SignedUrlTtlSeconds: Long = 7 * 24 * 3600
-
-  val route: Route = path("v1" / "assets" / Segment) { assetId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { header =>
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        val tenant = header.getOrElse("")
-        Assets.get(assetId) match {
-          case None => complete(StatusCodes.NotFound -> "no such asset")
-          case Some(asset) =>
-            val expiresAt = System.currentTimeMillis() / 1000 + SignedUrlTtlSeconds
-            val sig = Objects.mac(s"\${asset.checksum}|$expiresAt")
-            val content = Objects.read(asset.checksum).map(Base64.getEncoder.encodeToString).getOrElse("")
-            val body = JsObject(
-              "asset_id" -> JsString(asset.assetId),
-              "mime" -> JsString(asset.mime),
-              "checksum" -> JsString(asset.checksum),
-              "caption" -> asset.caption.map(JsString(_)).getOrElse(JsNull),
-              "degraded" -> JsBoolean(asset.degraded),
-              "url" -> JsString(s"\${Objects.BaseUrl}/\${asset.checksum}?tenant=$tenant&expires=$expiresAt&sig=$sig"),
-              "expires_at" -> JsNumber(expiresAt),
-              "content" -> JsString(content)) // the gallery renders inline, without a second request
-            complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import ingest.{Assets, Objects} // Assets.get(assetId); Objects.BaseUrl, Objects.mac(message), Objects.read(checksum)
-
-object Read {
-  val SignedUrlTtlSeconds: Long = 15 * 60
-
-  val route: Route = path("v1" / "assets" / Segment) { assetId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          // Another tenant's asset is answered like one that does not exist: a 403 would confirm the id.
-          Assets.get(assetId).filter(_.tenant == tenant) match {
-            case None => complete(StatusCodes.NotFound -> "no such asset")
-            case Some(asset) =>
-              val expiresAt = System.currentTimeMillis() / 1000 + SignedUrlTtlSeconds
-              // The MAC covers everything the URL grants: these bytes, to this tenant, until then.
-              val sig = Objects.mac(s"\${asset.checksum}|$tenant|$expiresAt")
-              val body = JsObject(
-                "asset_id" -> JsString(asset.assetId),
-                "mime" -> JsString(asset.mime),
-                "checksum" -> JsString(asset.checksum),
-                "caption" -> asset.caption.map(JsString(_)).getOrElse(JsNull),
-                "degraded" -> JsBoolean(asset.degraded),
-                "url" -> JsString(s"\${Objects.BaseUrl}/\${asset.checksum}?tenant=$tenant&expires=$expiresAt&sig=$sig"),
-                "expires_at" -> JsNumber(expiresAt))
-              complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-          }
-      }
-    }
-  }
 }
 `,
     },

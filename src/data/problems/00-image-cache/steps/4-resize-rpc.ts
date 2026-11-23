@@ -57,7 +57,6 @@ Implement \`render(id, width)\` on top of the generated stub:
         python: {all: [/stub\.Resize\([^\n]*timeout\s*=/]},
         typescript: {all: [/\.Resize\([^\n]*deadline\s*:/]},
         go: {all: [/context\.WithTimeout\(/]},
-        scala: {all: [/withDeadlineAfter\(/]},
         cpp: {all: [/set_deadline\(/]},
       },
     },
@@ -69,7 +68,6 @@ Implement \`render(id, width)\` on top of the generated stub:
         python: {all: [/StatusCode\.NOT_FOUND/, /return None/]},
         typescript: {all: [/status\.NOT_FOUND/, /return null/]},
         go: {all: [/codes\.NotFound/, /return nil, nil/]},
-        scala: {all: [/Status\.Code\.NOT_FOUND|Code\.NOT_FOUND/, /\bNone\b/]},
         cpp: {all: [/grpc::StatusCode::NOT_FOUND|StatusCode::NOT_FOUND/, /std::nullopt/]},
       },
     },
@@ -82,7 +80,6 @@ Implement \`render(id, width)\` on top of the generated stub:
         python: {all: [/StatusCode\.UNAVAILABLE/, /\battempts?\b|\bretr(y|ies)\b/]},
         typescript: {all: [/status\.UNAVAILABLE/, /\battempts?\b|\bretr(y|ies)\b/]},
         go: {all: [/codes\.Unavailable/, /\battempts?\b|\bretr(y|ies)\b/]},
-        scala: {all: [/Code\.UNAVAILABLE/, /\battempts?\b|\bretr(y|ies)\b/]},
         cpp: {all: [/StatusCode::UNAVAILABLE/, /\battempts?\b|\bretr(y|ies)\b/]},
       },
     },
@@ -97,7 +94,6 @@ Implement \`render(id, width)\` on top of the generated stub:
           none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
         },
         go: {all: [/for \w+ := 0; \w+ < 2; \w+\+\+/], none: [/for \{/]},
-        scala: {all: [/\w+ <- 0 until 2|\w+ < 2|\w+ <= 1/], none: [/while\s*\(\s*true\s*\)/]},
         cpp: {
           all: [/for \(int \w+ = 0; \w+ < 2; (\+\+\w+|\w+\+\+)\)/],
           none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
@@ -290,58 +286,6 @@ func render(ctx context.Context, id string, width int) ([]byte, error) {
 		}
 	}
 	return nil, errors.Join(errors.New("resizer unavailable"), lastErr)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import thumbs.resizer.{ResizeRequest, ResizerGrpc}
-
-object ResizerClient {
-  val DeadlineMillis = 800L
-
-  private val channel = ManagedChannelBuilder.forAddress("resizer", 9000).usePlaintext().build()
-  private val stub = ResizerGrpc.blockingStub(channel)
-
-  def render(id: String, width: Int): Option[Array[Byte]] = {
-    val request = ResizeRequest(imageId = id, width = width)
-    // TODO: call Resize with a deadline of DeadlineMillis
-    // TODO: NOT_FOUND → None; UNAVAILABLE → retry once; anything else → rethrow
-    None
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import thumbs.resizer.{ResizeRequest, ResizerGrpc}
-
-object ResizerClient {
-  val DeadlineMillis = 800L
-
-  private val channel = ManagedChannelBuilder.forAddress("resizer", 9000).usePlaintext().build()
-  private val stub = ResizerGrpc.blockingStub(channel)
-
-  def render(id: String, width: Int): Option[Array[Byte]] = {
-    val request = ResizeRequest(imageId = id, width = width)
-    var attempt = 0
-    while (attempt < 2) {
-      try {
-        val reply = stub.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).resize(request)
-        return Some(reply.jpeg.toByteArray)
-      } catch {
-        case e: StatusRuntimeException =>
-          e.getStatus.getCode match {
-            case Status.Code.NOT_FOUND => return None
-            case Status.Code.UNAVAILABLE if attempt == 0 => attempt += 1
-            case _ => throw e
-          }
-      }
-    }
-    None
-  }
 }
 `,
     },

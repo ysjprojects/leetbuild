@@ -54,7 +54,6 @@ service Psp {
         python: {all: [/PSP_DEADLINE_S\s*=\s*5\b/, /timeout\s*=\s*PSP_DEADLINE_S/]},
         typescript: {all: [/PSP_DEADLINE_MS\s*=\s*5000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*PSP_DEADLINE_MS/]},
         go: {all: [/pspDeadline\s*=\s*5\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*pspDeadline\)/]},
-        scala: {all: [/PspDeadlineS\s*=\s*5L?\b/, /withDeadlineAfter\(\s*PspDeadlineS/]},
         cpp: {all: [/kPspDeadline\{5\}/, /set_deadline\([^\n]*kPspDeadline\)/]},
       },
     },
@@ -67,7 +66,6 @@ service Psp {
         python: {all: [/idempotency-key/], none: [/uuid4\(/]},
         typescript: {all: [/idempotency-key/], none: [/randomUUID\(/]},
         go: {all: [/idempotency-key/], none: [/rand\.Uint64\(/]},
-        scala: {all: [/idempotency-key/], none: [/randomUUID\(/]},
         cpp: {all: [/idempotency-key/], none: [/random_device/]},
       },
     },
@@ -80,7 +78,6 @@ service Psp {
         python: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /DEADLINE_EXCEEDED/, /UNAVAILABLE/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /DEADLINE_EXCEEDED/, /UNAVAILABLE/]},
         go: {all: [/maxAttempts\s*=\s*3\b/, /codes\.DeadlineExceeded/, /codes\.Unavailable/]},
-        scala: {all: [/MaxAttempts\s*=\s*3\b/, /DEADLINE_EXCEEDED/, /UNAVAILABLE/]},
         cpp: {all: [/kMaxAttempts\s*=\s*3\b/, /DEADLINE_EXCEEDED/, /UNAVAILABLE/]},
       },
     },
@@ -93,7 +90,6 @@ service Psp {
         python: {all: [/GetRefund\(/], order: [/psp\.Refund\(/, /return reconcile\(/]},
         typescript: {all: [/GetRefund\(/], order: [/psp\.Refund\(/, /return reconcile\(/]},
         go: {all: [/GetRefund\(/], order: [/psp\.Refund\(/, /return reconcile\(/]},
-        scala: {all: [/getRefund\(/], order: [/\.refund\(request\)/, /\n\s*reconcile\(refundId\)/]},
         cpp: {all: [/GetRefund\(/], order: [/psp->Refund\(/, /return reconcile\(/]},
       },
     },
@@ -106,7 +102,6 @@ service Psp {
         python: {all: [/FAILED_PRECONDITION/, /ledger\.release\(/]},
         typescript: {all: [/FAILED_PRECONDITION/, /\brelease\(/]},
         go: {all: [/codes\.FailedPrecondition/, /ledger\.Release\(/]},
-        scala: {all: [/FAILED_PRECONDITION/, /Ledger\.release\(/]},
         cpp: {all: [/FAILED_PRECONDITION/, /ledger::release\(/]},
       },
     },
@@ -427,101 +422,6 @@ func refundViaPSP(ctx context.Context, refundID string) (string, error) {
 	}
 	// No answer: the PSP may have paid. Keep the reservation and ask.
 	return reconcile(ctx, refundID)
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.stub.MetadataUtils
-import io.grpc.{ManagedChannelBuilder, Metadata, StatusRuntimeException}
-
-import refunds.{Ledger, Records} // Records.findRefund, markConfirmed, markRejected; Ledger.release
-import refundd.refund_service.{PspGrpc, RefundRequest}
-
-object Client {
-  private val IdempotencyKey = Metadata.Key.of("idempotency-key", Metadata.ASCII_STRING_MARSHALLER)
-  private val psp = PspGrpc.blockingStub(ManagedChannelBuilder.forAddress("psp", 9000).usePlaintext().build())
-
-  /** Pay a PENDING refund out through the PSP; answers CONFIRMED, REJECTED or PENDING. */
-  def refundViaPsp(refundId: String): String = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val refund = Records.findRefund(refundId).get
-    val headers = new Metadata()
-    headers.put(IdempotencyKey, java.util.UUID.randomUUID().toString)
-    try {
-      val reply = psp.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers))
-        .refund(RefundRequest(refundId, refund.paymentId, refund.amountMinor, refund.reasonCode))
-      Records.markConfirmed(refundId, reply.pspRef)
-      "CONFIRMED"
-    } catch {
-      case _: StatusRuntimeException =>
-        Records.markRejected(refundId)
-        "REJECTED"
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.stub.MetadataUtils
-import io.grpc.{ManagedChannelBuilder, Metadata, Status, StatusRuntimeException}
-
-import refunds.{Ledger, Records} // Records.findRefund, markConfirmed, markRejected; Ledger.release
-import refundd.refund_service.{GetRefundRequest, PspGrpc, RefundRequest}
-
-object Client {
-  val PspDeadlineS = 5L
-  val MaxAttempts = 3
-  private val Retryable = Set(Status.Code.DEADLINE_EXCEEDED, Status.Code.UNAVAILABLE)
-  private val Refusals = Set(Status.Code.INVALID_ARGUMENT, Status.Code.FAILED_PRECONDITION)
-  private val IdempotencyKey = Metadata.Key.of("idempotency-key", Metadata.ASCII_STRING_MARSHALLER)
-  private val psp = PspGrpc.blockingStub(ManagedChannelBuilder.forAddress("psp", 9000).usePlaintext().build())
-
-  private def reject(refund: Records.Refund): String = {
-    Records.markRejected(refund.refundId)
-    Ledger.release(refund.paymentId, refund.refundId) // this refund's reservation, nothing else
-    "REJECTED"
-  }
-
-  /** Ask the PSP what became of the refund; settle the record when it knows. */
-  def reconcile(refundId: String): String = {
-    val refund = Records.findRefund(refundId).get
-    try {
-      val got = psp.withDeadlineAfter(PspDeadlineS, TimeUnit.SECONDS).getRefund(GetRefundRequest(refundId))
-      got.status match {
-        case "SUCCEEDED" =>
-          Records.markConfirmed(refundId, got.pspRef)
-          "CONFIRMED"
-        case "FAILED" => reject(refund)
-        case _ => "PENDING"
-      }
-    } catch {
-      case _: StatusRuntimeException => "PENDING" // still unknown: the next pass asks again
-    }
-  }
-
-  /** Pay a PENDING refund out through the PSP; answers CONFIRMED, REJECTED or PENDING. */
-  def refundViaPsp(refundId: String): String = {
-    val refund = Records.findRefund(refundId).get
-    val request = RefundRequest(refundId, refund.paymentId, refund.amountMinor, refund.reasonCode)
-    // The same key on every attempt: the PSP answers a repeat with the first result.
-    val headers = new Metadata()
-    headers.put(IdempotencyKey, refundId)
-    val keyed = psp.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers))
-    var attempt = 0
-    while (attempt < MaxAttempts) {
-      try {
-        val reply = keyed.withDeadlineAfter(PspDeadlineS, TimeUnit.SECONDS).refund(request)
-        Records.markConfirmed(refundId, reply.pspRef)
-        return "CONFIRMED"
-      } catch {
-        case e: StatusRuntimeException if Refusals.contains(e.getStatus.getCode) => return reject(refund)
-        case e: StatusRuntimeException if Retryable.contains(e.getStatus.getCode) => attempt += 1
-        case _: StatusRuntimeException => attempt = MaxAttempts
-      }
-    }
-    // No answer: the PSP may have paid. Keep the reservation and ask.
-    reconcile(refundId)
-  }
 }
 `,
     },

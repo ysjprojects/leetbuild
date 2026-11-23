@@ -63,7 +63,6 @@ service SummaryModel { rpc Summarize(SummarizeRequest) returns (SummarizeReply);
         python: {all: [/DEADLINE_S\s*=\s*5\b/, /Summarize\([^)]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*5000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*5\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*5L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/kDeadline\{5\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -76,7 +75,6 @@ service SummaryModel { rpc Summarize(SummarizeRequest) returns (SummarizeReply);
         python: {all: [/RETRYABLE_CODES\s*=/, /\.code\(\)\s+(not\s+)?in\s+RETRYABLE_CODES/]},
         typescript: {all: [/RETRYABLE_CODES\s*=/, /RETRYABLE_CODES\.includes\(/]},
         go: {all: [/codes\.Unavailable/, /codes\.DeadlineExceeded/, /status\.Code\(err\)/]},
-        scala: {all: [/RetryableCodes\s*[:=]/, /RetryableCodes\.contains\(/]},
         cpp: {all: [/kRetryableCodes\s*=/, /kRetryableCodes\.count\(|kRetryableCodes\.find\(/]},
       },
     },
@@ -89,7 +87,6 @@ service SummaryModel { rpc Summarize(SummarizeRequest) returns (SummarizeReply);
         python: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /range\(\s*MAX_ATTEMPTS\s*\)/], none: [/range\(\s*5\s*\)/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /<\s*MAX_ATTEMPTS/], none: [/<\s*5\b/]},
         go: {all: [/maxAttempts\s*=\s*3\b/, /<\s*maxAttempts/], none: [/<\s*5\b/]},
-        scala: {all: [/MaxAttempts\s*=\s*3\b/, /<\s*MaxAttempts/], none: [/<\s*5\b/]},
         cpp: {all: [/kMaxAttempts\s*=\s*3\b/, /<\s*kMaxAttempts/], none: [/<\s*5\b/]},
       },
     },
@@ -102,7 +99,6 @@ service SummaryModel { rpc Summarize(SummarizeRequest) returns (SummarizeReply);
         python: {all: [/text\.lead\(/, /["']extractive["']/], none: [/summary unavailable/i, /content\[:\s*\d+\]/]},
         typescript: {all: [/\blead\(/, /['"]extractive['"]/], none: [/summary unavailable/i, /\.slice\(0,\s*\d+\)/]},
         go: {all: [/text\.Lead\(/, /"extractive"/], none: [/summary unavailable/i, /content\[:\d+\]/]},
-        scala: {all: [/Text\.lead\(/, /"extractive"/], none: [/summary unavailable/i, /\.take\(\d+\)/]},
         cpp: {all: [/text::lead\(/, /"extractive"/], none: [/summary unavailable/i, /substr\(0,\s*\d+\)/]},
       },
     },
@@ -341,74 +337,6 @@ func summarize(ctx context.Context, sourceHash, content string, targetWords int)
 	}
 	// The source's own sentences, cut to the band, and labelled as such.
 	return Summarized{Kind: "extractive", Summary: text.Lead(content, targetWords)}
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import summarizer.Text // Text.lead
-import summarizerd.summarizer_service.{SummarizeRequest, SummaryModelGrpc}
-
-final case class Summarized(kind: String, summary: String, modelVersion: String)
-
-object Client {
-  private val model = SummaryModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("model", 9000).usePlaintext().build())
-
-  /** The summary of a source. */
-  def summarize(sourceHash: String, content: String, targetWords: Int): Summarized = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val request = SummarizeRequest(sourceHash, content, targetWords)
-    var attempt = 0
-    var result: Option[Summarized] = None
-    while (result.isEmpty && attempt < 5) {
-      attempt += 1
-      try {
-        val reply = model.summarize(request)
-        result = Some(Summarized("abstractive", reply.summary, reply.modelVersion))
-      } catch {
-        case _: StatusRuntimeException => Thread.sleep(1000) // the model is flaky: try again
-      }
-    }
-    result.getOrElse(Summarized("abstractive", if (content.isEmpty) "summary unavailable" else content.take(400), ""))
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import summarizer.Text // Text.lead
-import summarizerd.summarizer_service.{SummarizeRequest, SummaryModelGrpc}
-
-final case class Summarized(kind: String, summary: String, modelVersion: String)
-
-object Client {
-  val DeadlineSeconds = 5L
-  val MaxAttempts = 3
-  val RetryableCodes: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val model = SummaryModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("model", 9000).usePlaintext().build())
-
-  /** The summary of a source. */
-  def summarize(sourceHash: String, content: String, targetWords: Int): Summarized = {
-    val request = SummarizeRequest(sourceHash, content, targetWords)
-    var attempt = 0
-    var retry = true
-    var result: Option[Summarized] = None
-    while (result.isEmpty && retry && attempt < MaxAttempts) {
-      attempt += 1
-      try {
-        val reply = model.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).summarize(request)
-        result = Some(Summarized("abstractive", reply.summary, reply.modelVersion))
-      } catch {
-        // A refusal or a bad request: asking again gets the same answer.
-        case e: StatusRuntimeException => retry = RetryableCodes.contains(e.getStatus.getCode)
-      }
-    }
-    // The source's own sentences, cut to the band, and labelled as such.
-    result.getOrElse(Summarized("extractive", Text.lead(content, targetWords), ""))
-  }
 }
 `,
     },

@@ -50,7 +50,6 @@ count twice — so the **membership set is the source of truth** and the counter
         python: {all: [/\.sadd\(\s*f"liked:\{/, /status_code\s*=\s*409|HTTP_409/]},
         typescript: {all: [/\.sadd\(\s*`liked:\$\{/, /code\(\s*409\s*\)|status\(\s*409\s*\)|statusCode:\s*409/]},
         go: {all: [/\.SAdd\(\s*[^\n]*"liked:"\s*\+|\.SAdd\(\s*[^\n]*"liked:%s"/, /http\.StatusConflict|\b409\b/]},
-        scala: {all: [/\.sadd\(\s*s"liked:\$/, /StatusCodes\.Conflict|\b409\b/]},
         cpp: {all: [/\.sadd\(\s*"liked:"\s*\+/, /status\s*=\s*409/]},
       },
     },
@@ -62,7 +61,6 @@ count twice — so the **membership set is the source of truth** and the counter
         python: {all: [/\.incr\(\s*f"likes:\{/], order: [/\.sadd\(/, /\.incr\(/]},
         typescript: {all: [/\.incr\(\s*`likes:\$\{/], order: [/\.sadd\(/, /\.incr\(/]},
         go: {all: [/\.Incr\(\s*[^\n]*"likes:"\s*\+|\.Incr\(\s*[^\n]*"likes:%s"/], order: [/\.SAdd\(/, /\.Incr\(/]},
-        scala: {all: [/\.incr\(\s*s"likes:\$/], order: [/\.sadd\(/, /\.incr\(/]},
         cpp: {all: [/\.incr\(\s*"likes:"\s*\+/], order: [/\.sadd\(/, /\.incr\(/]},
       },
     },
@@ -75,7 +73,6 @@ count twice — so the **membership set is the source of truth** and the counter
         python: {order: [/\.srem\(\s*f"liked:\{/, /\.decr\(\s*f"likes:\{/]},
         typescript: {order: [/\.srem\(\s*`liked:\$\{/, /\.decr\(\s*`likes:\$\{/]},
         go: {order: [/\.SRem\(\s*[^\n]*"liked:/, /\.Decr\(\s*[^\n]*"likes:/]},
-        scala: {order: [/\.srem\(\s*s"liked:\$/, /\.decr\(\s*s"likes:\$/]},
         cpp: {order: [/\.srem\(\s*"liked:"\s*\+/, /\.decr\(\s*"likes:"\s*\+/]},
       },
     },
@@ -94,10 +91,6 @@ count twice — so the **membership set is the source of truth** and the counter
           none: [/await\s+producer\.send\(|await\s+connected\b|await\s+emit\(/],
         },
         go: {all: [/Key:\s*\[\]byte\(\s*postID\s*\)/, /Async:\s*true/]},
-        scala: {
-          all: [/new ProducerRecord\[[^\]]*\]\(\s*(Topic|"engagement")\s*,\s*postId\s*,/, /producer\.send\(/],
-          none: [/\.get\(\)/],
-        },
         cpp: {
           all: [
             /produce\(\s*(kTopic|"engagement")[\s\S]{0,400}?post_id\.(c_str|data)\(\)\s*,\s*post_id\.(size|length)\(\)/,
@@ -115,7 +108,6 @@ count twice — so the **membership set is the source of truth** and the counter
         python: {all: [/\.get\(\s*f"likes:\{[^\n]*\)\s*or\s*0/]},
         typescript: {all: [/\.get\(\s*`likes:\$\{[^\n]*\)[^\n]*(\?\?|\|\|)\s*(0|['"]0['"])/]},
         go: {all: [/\.Get\(\s*[^\n]*"likes:"\s*\+/, /redis\.Nil/]},
-        scala: {all: [/jedis\.get\(\s*s"likes:\$/, /getOrElse\(\s*0L?\s*\)|\.fold\(\s*0L?\s*\)/]},
         cpp: {all: [/redis\.get\(\s*"likes:"\s*\+/, /value_or\(\s*"0"\s*\)|\?\s*std::stoll\([^\n]*:\s*0/]},
       },
     },
@@ -452,135 +444,6 @@ func main() {
 	mux.HandleFunc("DELETE /posts/{id}/like", unlike)
 	mux.HandleFunc("GET /posts/{id}/likes", likeCount)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.{Properties, UUID}
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import feed.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-
-object Likes {
-  val Topic = "engagement"
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("linger.ms", "5")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  def emit(kind: String, postId: String, userId: String): Unit = {
-    val value = s"""{"event_id":"\${UUID.randomUUID()}","type":"$kind","post_id":"$postId","user_id":"$userId","ts":\${System.currentTimeMillis()}}"""
-    // TODO: send a record keyed by postId; do not block on the future
-  }
-
-  private def countJson(n: Long) = HttpEntity(ContentTypes.\`application/json\`, s"""{"likes":$n}""")
-
-  val route: Route =
-    headerValueByName("X-User-Id") { userId =>
-      concat(
-        path("posts" / Segment / "like") { postId =>
-          concat(
-            post {
-              // TODO: sadd liked:{postId} userId → 0 means already liked → 409
-              // TODO: incr likes:{postId}, emit("like", ...), complete(countJson(n))
-              complete(StatusCodes.NotImplemented)
-            },
-            delete {
-              // TODO: srem liked:{postId} userId → 0 means not liked → 409
-              // TODO: decr likes:{postId}, emit("unlike", ...), complete(countJson(n))
-              complete(StatusCodes.NotImplemented)
-            },
-          )
-        },
-        path("posts" / Segment / "likes") { postId =>
-          get {
-            // TODO: get likes:{postId}; 0 when the key does not exist
-            complete(StatusCodes.NotImplemented)
-          }
-        },
-      )
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("likes")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import java.util.{Properties, UUID}
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import feed.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-
-object Likes {
-  val Topic = "engagement"
-  val jedis = new JedisPooled("redis", 6379)
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("linger.ms", "5")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-
-  def emit(kind: String, postId: String, userId: String): Unit = {
-    val value = s"""{"event_id":"\${UUID.randomUUID()}","type":"$kind","post_id":"$postId","user_id":"$userId","ts":\${System.currentTimeMillis()}}"""
-    producer.send(new ProducerRecord[String, String](Topic, postId, value)) // enqueues; the future is not awaited
-  }
-
-  private def countJson(n: Long) = HttpEntity(ContentTypes.\`application/json\`, s"""{"likes":$n}""")
-
-  val route: Route =
-    headerValueByName("X-User-Id") { userId =>
-      concat(
-        path("posts" / Segment / "like") { postId =>
-          concat(
-            post {
-              if (jedis.sadd(s"liked:$postId", userId) == 0) complete(StatusCodes.Conflict -> "already liked")
-              else {
-                val likes = jedis.incr(s"likes:$postId")
-                emit("like", postId, userId)
-                complete(countJson(likes))
-              }
-            },
-            delete {
-              if (jedis.srem(s"liked:$postId", userId) == 0) complete(StatusCodes.Conflict -> "not liked")
-              else {
-                val likes = jedis.decr(s"likes:$postId")
-                emit("unlike", postId, userId)
-                complete(countJson(likes))
-              }
-            },
-          )
-        },
-        path("posts" / Segment / "likes") { postId =>
-          get {
-            complete(countJson(Option(jedis.get(s"likes:$postId")).map(_.toLong).getOrElse(0L)))
-          }
-        },
-      )
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("likes")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

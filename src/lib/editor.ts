@@ -33,10 +33,10 @@ import {vim} from '@replit/codemirror-vim';
 
 import {changeGutter} from './changeGutter';
 import type {EditorSettings} from './editorSettings';
-import {scalaLanguage, tokenHighlighter} from './highlight';
+import {tokenHighlighter} from './highlight';
 import type {Language} from './types';
 
-/** What an editor can highlight: the five languages, plus `.proto` for the provided contracts. */
+/** What an editor can highlight: the course languages and CUDA, plus `.proto` for the provided contracts. */
 export type Syntax = Language | 'proto';
 
 // ---- grammars ---------------------------------------------------------------------------------
@@ -45,7 +45,6 @@ const grammars: Record<Syntax, LanguageSupport | StreamLanguage<unknown>> = {
   python: python(),
   typescript: javascript({typescript: true}),
   go: go(),
-  scala: scalaLanguage,
   cpp: cpp(),
   cuda: cpp(),
   proto: StreamLanguage.define(protobuf),
@@ -63,7 +62,6 @@ export const INDENT: Record<Syntax, {unit: string; tabSize: number}> = {
   go: {unit: '\t', tabSize: 4},
   python: {unit: '    ', tabSize: 4},
   typescript: {unit: '  ', tabSize: 2},
-  scala: {unit: '  ', tabSize: 2},
   proto: {unit: '  ', tabSize: 2},
 };
 

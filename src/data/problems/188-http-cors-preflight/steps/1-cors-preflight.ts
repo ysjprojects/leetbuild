@@ -119,10 +119,6 @@ undeclared \`OPTIONS\` with 405). TypeScript: an \`onRequest\` hook for actual r
           ],
           none: [/rs\/cors|gorilla\/handlers|handlers\.CORS|cors\.(New|Default|AllowAll)\(/],
         },
-        scala: {
-          all: [/\boptions\s*\{/, /Access-Control-Request-Method/, /StatusCodes\.NoContent/, /Access-Control-Max-Age/],
-          none: [/http\.cors|megard|CorsSettings|\bcors\s*\(/],
-        },
         cpp: {
           all: [/svr\.Options\(/, /Access-Control-Request-Method/, /status\s*=\s*204/, /Access-Control-Max-Age/],
           none: [/CORSHandler|crow::|drogon::|#include\s*[<"][^>"\n]*cors/i],
@@ -159,14 +155,6 @@ undeclared \`OPTIONS\` with 405). TypeScript: an \`onRequest\` hook for actual r
             /allowedHeaders\[/,
           ],
         },
-        scala: {
-          all: [
-            /Access-Control-Request-Headers/,
-            /Access-Control-Allow-Headers/,
-            /toLowerCase/,
-            /AllowedHeaders\.contains/,
-          ],
-        },
         cpp: {
           all: [
             /Access-Control-Request-Headers/,
@@ -186,7 +174,6 @@ undeclared \`OPTIONS\` with 405). TypeScript: an \`onRequest\` hook for actual r
         python: {all: [/status_code\s*=\s*403/, /\bin\s+ALLOWED_ORIGINS\b/, /\bin\s+ALLOWED_METHODS\b/]},
         typescript: {all: [/code\(\s*403\s*\)/, /ALLOWED_ORIGINS\.has\(/, /ALLOWED_METHODS\.includes\(/]},
         go: {all: [/http\.StatusForbidden/, /allowedOrigins\[/, /allowedMethods\[/]},
-        scala: {all: [/StatusCodes\.Forbidden/, /AllowedOrigins\.contains/, /AllowedMethods\.contains/]},
         cpp: {all: [/status\s*=\s*403/, /kAllowedOrigins\.count\(/, /kAllowedMethods\.count\(/]},
       },
     },
@@ -205,10 +192,6 @@ undeclared \`OPTIONS\` with 405). TypeScript: an \`onRequest\` hook for actual r
           none: [/["']\*["']/],
         },
         go: {
-          all: [/Access-Control-Allow-Origin/, /Access-Control-Allow-Credentials/, /"true"/],
-          none: [/"\*"/],
-        },
-        scala: {
           all: [/Access-Control-Allow-Origin/, /Access-Control-Allow-Credentials/, /"true"/],
           none: [/"\*"/],
         },
@@ -239,9 +222,6 @@ undeclared \`OPTIONS\` with 405). TypeScript: an \`onRequest\` hook for actual r
         go: {
           all: [/"Vary",\s*"Origin"/, /Origin, Access-Control-Request-Method, Access-Control-Request-Headers/],
         },
-        scala: {
-          all: [/"Vary",\s*"Origin"/, /Origin, Access-Control-Request-Method, Access-Control-Request-Headers/],
-        },
         cpp: {
           all: [/"Vary",\s*"Origin"/, /Origin, Access-Control-Request-Method, Access-Control-Request-Headers/],
         },
@@ -261,7 +241,6 @@ undeclared \`OPTIONS\` with 405). TypeScript: an \`onRequest\` hook for actual r
           ],
         },
         go: {all: [/r\.Header\.Get\(\s*"Origin"\s*\)/, /next\.ServeHTTP\(/]},
-        scala: {all: [/optionalHeaderValueByName\(\s*"Origin"\s*\)/, /respondWithHeaders?\(/]},
         cpp: {all: [/get_header_value\(\s*"Origin"\s*\)/, /set_post_routing_handler\(/]},
       },
     },
@@ -698,167 +677,6 @@ func main() {
 	mux.HandleFunc("DELETE /api/notes/{id}", deleteNote)
 	// TLS terminates at the load balancer in front of this process.
 	log.Fatal(http.ListenAndServe(":8080", cors(mux)))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
-
-import scala.jdk.CollectionConverters._
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-object NotesServer {
-  val AllowedOrigins = Set("https://app.example.com", "https://admin.example.com")
-  val AllowedMethods = Seq("GET", "POST", "DELETE")
-  val AllowedHeaders = Set("authorization", "content-type")
-  val MaxAge = 600
-
-  private val notes = new ConcurrentHashMap[Int, String]()
-  private val nextId = new AtomicInteger(1)
-
-  private def json(body: String) = HttpEntity(ContentTypes.\`application/json\`, body)
-
-  val notesRoute: Route =
-    pathPrefix("notes") {
-      concat(
-        pathEndOrSingleSlash {
-          concat(
-            get { complete(json(notes.values.asScala.mkString("[", ",", "]"))) },
-            post {
-              entity(as[String]) { text =>
-                val id = nextId.getAndIncrement()
-                val note = s"""{"id":$id,"text":$text}"""
-                notes.put(id, note)
-                complete(HttpResponse(StatusCodes.Created, entity = json(note)))
-              }
-            },
-          )
-        },
-        path(IntNumber) { id =>
-          delete {
-            notes.remove(id)
-            complete(StatusCodes.NoContent)
-          }
-        },
-      )
-    }
-
-  val route: Route =
-    pathPrefix("api") {
-      // TODO: OPTIONS + Origin + Access-Control-Request-Method is a preflight: answer it here
-      //       allowed (origin, method, every requested header) -> 204 with the grant, else 403 with none
-      // TODO: actual requests: Vary: Origin always; echo an allowed Origin with credentials, never "*"
-      notesRoute
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("notes")
-    // TLS terminates at the load balancer in front of this process.
-    Http().newServerAt("0.0.0.0", 8080).bind(route)
-  }
-}
-`,
-      solution: `import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
-
-import scala.jdk.CollectionConverters._
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-object NotesServer {
-  val AllowedOrigins = Set("https://app.example.com", "https://admin.example.com")
-  val AllowedMethods = Seq("GET", "POST", "DELETE")
-  val AllowedHeaders = Set("authorization", "content-type")
-  val MaxAge = 600
-  val PreflightVary = "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
-
-  private val notes = new ConcurrentHashMap[Int, String]()
-  private val nextId = new AtomicInteger(1)
-
-  private def json(body: String) = HttpEntity(ContentTypes.\`application/json\`, body)
-
-  val notesRoute: Route =
-    pathPrefix("notes") {
-      concat(
-        pathEndOrSingleSlash {
-          concat(
-            get { complete(json(notes.values.asScala.mkString("[", ",", "]"))) },
-            post {
-              entity(as[String]) { text =>
-                val id = nextId.getAndIncrement()
-                val note = s"""{"id":$id,"text":$text}"""
-                notes.put(id, note)
-                complete(HttpResponse(StatusCodes.Created, entity = json(note)))
-              }
-            },
-          )
-        },
-        path(IntNumber) { id =>
-          delete {
-            notes.remove(id)
-            complete(StatusCodes.NoContent)
-          }
-        },
-      )
-    }
-
-  private def preflight(origin: String, method: String, requestHeaders: Option[String]): Route = {
-    val requested = requestHeaders.toList.flatMap(_.split(",")).map(_.trim.toLowerCase).filter(_.nonEmpty)
-    val vary = RawHeader("Vary", PreflightVary)
-    if (!AllowedOrigins.contains(origin) || !AllowedMethods.contains(method) || !requested.forall(AllowedHeaders.contains))
-      complete(HttpResponse(StatusCodes.Forbidden, headers = List(vary)))
-    else {
-      val allowHeaders =
-        if (requested.isEmpty) Nil else List(RawHeader("Access-Control-Allow-Headers", requested.mkString(", ")))
-      val grant = List(
-        RawHeader("Access-Control-Allow-Origin", origin),
-        RawHeader("Access-Control-Allow-Methods", AllowedMethods.mkString(", ")),
-        RawHeader("Access-Control-Allow-Credentials", "true"),
-        RawHeader("Access-Control-Max-Age", MaxAge.toString),
-        vary,
-      ) ++ allowHeaders
-      complete(HttpResponse(StatusCodes.NoContent, headers = grant))
-    }
-  }
-
-  private def actual(origin: Option[String]): Route = {
-    val grant = origin.filter(AllowedOrigins.contains).toList.flatMap { o =>
-      List(RawHeader("Access-Control-Allow-Origin", o), RawHeader("Access-Control-Allow-Credentials", "true"))
-    }
-    respondWithHeaders(RawHeader("Vary", "Origin") :: grant) { notesRoute }
-  }
-
-  val route: Route =
-    pathPrefix("api") {
-      optionalHeaderValueByName("Origin") { origin =>
-        optionalHeaderValueByName("Access-Control-Request-Method") { requestMethod =>
-          optionalHeaderValueByName("Access-Control-Request-Headers") { requestHeaders =>
-            (origin, requestMethod) match {
-              case (Some(o), Some(m)) => concat(options { preflight(o, m, requestHeaders) }, actual(origin))
-              case _                  => actual(origin)
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("notes")
-    // TLS terminates at the load balancer in front of this process.
-    Http().newServerAt("0.0.0.0", 8080).bind(route)
-  }
 }
 `,
     },

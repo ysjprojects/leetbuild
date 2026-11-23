@@ -6,7 +6,7 @@ import {citationStateStep} from './steps/2-state';
 import {citationClientStep} from './steps/3-client';
 import {citationEventsStep} from './steps/4-events';
 import {readCitationsStep} from './steps/5-read';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Citation store: the course is not "save a quote and a link", it is the debugging you owe a
@@ -95,6 +95,5 @@ fuzzy re-anchoring of reworded prose, citation quality scoring, and answer gener
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

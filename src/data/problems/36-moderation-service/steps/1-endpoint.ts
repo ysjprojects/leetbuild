@@ -48,7 +48,6 @@ the 4 KiB cap; and a reporter who reports the same post twice opens two cases.
         python: {all: [/@app\.post\(\s*["']\/v1\/reports["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/reports['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/reports"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"reports"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/reports"/]},
       },
     },
@@ -61,7 +60,6 @@ the 4 KiB cap; and a reporter who reports the same post twice opens two cases.
         python: {all: [/content_tenant\(/, /[!=]=\s*tenant\b/]},
         typescript: {all: [/contentTenant\(/, /[!=]==?\s*tenant\b/]},
         go: {all: [/store\.ContentTenant\(/, /[!=]=\s*tenant\b/]},
-        scala: {all: [/Store\.contentTenant\(/, /contains\(tenant\)|[!=]=\s*(Some\()?tenant\b/]},
         cpp: {all: [/store::contentTenant\(/, /[!=]=\s*tenant\b/]},
       },
     },
@@ -74,7 +72,6 @@ the 4 KiB cap; and a reporter who reports the same post twice opens two cases.
         python: {all: [/ALLOWED_REASONS/, /status_code\s*=\s*400/], none: [/["']other["']/]},
         typescript: {all: [/ALLOWED_REASONS/, /code\(\s*400\s*\)/], none: [/['"]other['"]/]},
         go: {all: [/allowedReasons/, /StatusBadRequest|\b400\b/], none: [/"other"/]},
-        scala: {all: [/AllowedReasons/, /BadRequest/], none: [/"other"/]},
         cpp: {all: [/kAllowedReasons/, /\b400\b/], none: [/"other"/]},
       },
     },
@@ -90,7 +87,6 @@ the 4 KiB cap; and a reporter who reports the same post twice opens two cases.
           none: [/detail\.length\s*>/],
         },
         go: {all: [/len\(body\.Detail\)\s*>\s*maxDetailBytes/], none: [/RuneCountInString/]},
-        scala: {all: [/MaxDetailBytes/, /getBytes\(/], none: [/detail\.length\s*>/]},
         cpp: {all: [/detail\.(size|length)\(\)\s*>\s*kMaxDetailBytes/], none: [/characters\(/]},
       },
     },
@@ -111,10 +107,6 @@ the 4 KiB cap; and a reporter who reports the same post twice opens two cases.
         go: {
           all: [/store\.FindCase\(/, /store\.UpdateCase\(/, /"updated"/],
           order: [/store\.FindCase\(/, /store\.InsertCase\(/],
-        },
-        scala: {
-          all: [/Store\.findCase\(/, /Store\.updateCase\(/, /"updated"/],
-          order: [/Store\.findCase\(/, /Store\.insertCase\(/],
         },
         cpp: {
           all: [/store::findCase\(/, /store::updateCase\(/, /"updated"/],
@@ -392,116 +384,6 @@ func createReport(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/reports", createReport)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import moderation.Store // Store.contentTenant, findCase, insertCase, updateCase
-
-object Api {
-  val AllowedReasons: Set[String] = Set("spam", "harassment", "hate", "self_harm", "csam")
-  val MaxDetailBytes = 4096
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def field(body: JsObject, name: String): String = body.fields.get(name) match {
-    case Some(JsString(s)) => s
-    case _ => ""
-  }
-
-  private def report(tenant: String, reporterId: String, body: JsObject): HttpResponse = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val contentId = field(body, "content_id")
-    val detail = field(body, "detail")
-    val reason = if (AllowedReasons.contains(field(body, "reason"))) field(body, "reason") else "other"
-    if (Store.contentTenant(contentId).isEmpty) error(StatusCodes.NotFound, "no such content")
-    else if (detail.length > MaxDetailBytes) error(StatusCodes.PayloadTooLarge, "detail is too long")
-    else {
-      val created = Store.insertCase(tenant, contentId, reporterId, reason, detail)
-      json(StatusCodes.Created, JsObject("case_id" -> JsString(created.caseId), "status" -> JsString("created")))
-    }
-  }
-
-  val route: Route = path("v1" / "reports") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        optionalHeaderValueByName("X-Reporter-Id") { reporterId =>
-          entity(as[String]) { raw =>
-            (tenant.filter(_.nonEmpty), reporterId.filter(_.nonEmpty)) match {
-              case (Some(t), Some(r)) => complete(report(t, r, raw.parseJson.asJsObject))
-              case _ => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id and X-Reporter-Id are required"))
-            }
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import moderation.Store // Store.contentTenant, findCase, insertCase, updateCase
-
-object Api {
-  val AllowedReasons: Set[String] = Set("spam", "harassment", "hate", "self_harm", "csam")
-  val MaxDetailBytes = 4096
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def field(body: JsObject, name: String): String = body.fields.get(name) match {
-    case Some(JsString(s)) => s
-    case _ => ""
-  }
-
-  private def report(tenant: String, reporterId: String, body: JsObject): HttpResponse = {
-    val contentId = field(body, "content_id")
-    val reason = field(body, "reason")
-    val detail = field(body, "detail")
-    // A foreign id answers exactly as an unknown one: nothing confirms what another tenant hosts.
-    if (!Store.contentTenant(contentId).contains(tenant)) error(StatusCodes.NotFound, "no such content")
-    else if (!AllowedReasons.contains(reason)) error(StatusCodes.BadRequest, "reason must be one of spam, harassment, hate, self_harm, csam")
-    else if (detail.getBytes(StandardCharsets.UTF_8).length > MaxDetailBytes) error(StatusCodes.PayloadTooLarge, s"detail is over $MaxDetailBytes bytes")
-    else
-      Store.findCase(tenant, contentId, reporterId) match {
-        case Some(existing) =>
-          val updated = Store.updateCase(existing.caseId, reason, detail)
-          json(StatusCodes.OK, JsObject("case_id" -> JsString(updated.caseId), "status" -> JsString("updated")))
-        case None =>
-          val created = Store.insertCase(tenant, contentId, reporterId, reason, detail)
-          json(StatusCodes.Created, JsObject("case_id" -> JsString(created.caseId), "status" -> JsString("created")))
-      }
-  }
-
-  val route: Route = path("v1" / "reports") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        optionalHeaderValueByName("X-Reporter-Id") { reporterId =>
-          entity(as[String]) { raw =>
-            (tenant.filter(_.nonEmpty), reporterId.filter(_.nonEmpty)) match {
-              case (Some(t), Some(r)) => complete(report(t, r, raw.parseJson.asJsObject))
-              case _ => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id and X-Reporter-Id are required"))
-            }
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

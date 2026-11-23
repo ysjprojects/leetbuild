@@ -61,7 +61,6 @@ hidden, and a lift printed alone makes a two-point effect and noise look the sam
         python: {all: [/@app\.get\(\s*["']\/v1\/experiments\/\{experiment_id\}\/report["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/experiments\/:id\/report['"]/]},
         go: {all: [/"GET \/v1\/experiments\/\{id\}\/report"/]},
-        scala: {all: [/"report"/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/experiments\//]},
       },
     },
@@ -74,7 +73,6 @@ hidden, and a lift printed alone makes a two-point effect and noise look the sam
         python: {order: [/<\s*experiment\[["']min_sample["']\]/, /p_value["']\]\s*<\s*ALPHA/]},
         typescript: {order: [/<\s*experiment\.min_sample/, /p_value\s*<\s*ALPHA/]},
         go: {order: [/<\s*int64\(experiment\.MinSample\)/, /PValue\s*<\s*alpha/]},
-        scala: {order: [/<\s*experiment\.minSample/, /pValue\s*<\s*Alpha/]},
         cpp: {order: [/<\s*experiment->min_sample/, /p_value\s*<\s*kAlpha/]},
       },
     },
@@ -87,7 +85,6 @@ hidden, and a lift printed alone makes a two-point effect and noise look the sam
         python: {all: [/>\s*SRM_TOLERANCE/, /["']blocked["']/]},
         typescript: {all: [/>\s*SRM_TOLERANCE/, /['"]blocked['"]/]},
         go: {all: [/>\s*srmTolerance/, /"blocked"/]},
-        scala: {all: [/>\s*SrmTolerance/, /"blocked"/]},
         cpp: {all: [/>\s*kSrmTolerance/, /"blocked"/]},
       },
     },
@@ -100,7 +97,6 @@ hidden, and a lift printed alone makes a two-point effect and noise look the sam
         python: {all: [/ci_low/, /ci_high/]},
         typescript: {all: [/ci_low/, /ci_high/]},
         go: {all: [/CILow/, /CIHigh/]},
-        scala: {all: [/ciLow/, /ciHigh/]},
         cpp: {all: [/ci_low/, /ci_high/]},
       },
     },
@@ -392,103 +388,6 @@ func report(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/experiments/{id}/report", report)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import expd.{Stats, Store} // Stats.compare; Store.get, exposures, conversions
-
-object Report {
-  val Alpha = 0.05
-  val SrmTolerance = 0.02
-
-  def report(id: String): Option[JsObject] =
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    Store.get(id).map { experiment =>
-      val exposures = Store.exposures(id).withDefaultValue(0L)
-      val conversions = Store.conversions(id).withDefaultValue(0L)
-      val control = experiment.variants.head.key
-      val total = experiment.variants.map(v => exposures(v.key)).sum
-      val compared = experiment.variants.tail.map(v => v.key -> Stats.compare(exposures(control), conversions(control), exposures(v.key), conversions(v.key)))
-      val rows = compared.map { case (key, c) =>
-        JsObject("variant" -> JsString(key), "exposures" -> JsNumber(exposures(key)), "conversions" -> JsNumber(conversions(key)),
-          "lift" -> JsNumber(c.lift), "p_value" -> JsNumber(c.pValue))
-      }
-      val winner = compared.filter { case (_, c) => c.pValue < Alpha && c.lift > 0 }.sortBy(-_._2.lift).headOption.map(_._1)
-      JsObject("experiment_id" -> JsString(id), "exposures" -> JsNumber(total), "variants" -> JsArray(rows.toVector),
-        "winner" -> winner.map(JsString(_)).getOrElse(JsNull), "caveat" -> JsNull, "status" -> JsString("complete"))
-    }
-
-  val route: Route = path("v1" / "experiments" / Segment / "report") { id =>
-    get {
-      report(id) match {
-        case None => complete(StatusCodes.NotFound -> "no such experiment")
-        case Some(body) => complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import expd.{Stats, Store} // Stats.compare; Store.get, exposures, conversions
-
-object Report {
-  val Alpha = 0.05
-  val SrmTolerance = 0.02
-
-  /** The first variant whose share of the exposures strays from its weight by more than SrmTolerance. */
-  def sampleRatioMismatch(variants: Seq[Store.Variant], exposures: Map[String, Long], total: Long): Option[JsObject] =
-    variants.iterator.map { v =>
-      val expected = total.toDouble * v.weight / 100
-      val observed = exposures.getOrElse(v.key, 0L)
-      (v.key, observed, expected)
-    }.collectFirst {
-      case (key, observed, expected) if expected > 0 && math.abs(observed - expected) / expected > SrmTolerance =>
-        JsObject("kind" -> JsString("srm"), "blocking" -> JsTrue, "variant" -> JsString(key), "observed" -> JsNumber(observed), "expected" -> JsNumber(expected))
-    }
-
-  def report(id: String): Option[JsObject] =
-    Store.get(id).map { experiment =>
-      val exposures = Store.exposures(id).withDefaultValue(0L)
-      val conversions = Store.conversions(id).withDefaultValue(0L)
-      val control = experiment.variants.head.key
-      val total = experiment.variants.map(v => exposures(v.key)).sum
-      val compared = experiment.variants.tail.map(v => v.key -> Stats.compare(exposures(control), conversions(control), exposures(v.key), conversions(v.key)))
-      // Every lift travels with its interval.
-      val rows = compared.map { case (key, c) =>
-        JsObject("variant" -> JsString(key), "exposures" -> JsNumber(exposures(key)), "conversions" -> JsNumber(conversions(key)),
-          "lift" -> JsNumber(c.lift), "ci_low" -> JsNumber(c.ciLow), "ci_high" -> JsNumber(c.ciHigh), "p_value" -> JsNumber(c.pValue))
-      }
-      val body = Map[String, JsValue]("experiment_id" -> JsString(id), "exposures" -> JsNumber(total), "variants" -> JsArray(rows.toVector),
-        "winner" -> JsNull, "caveat" -> JsNull)
-      // The sample and the split are judged before any p-value is read.
-      if (total < experiment.minSample) JsObject(body ++ Map("status" -> JsString("inconclusive"), "reason" -> JsString("minimum sample not reached")))
-      else
-        sampleRatioMismatch(experiment.variants, exposures, total) match {
-          case Some(caveat) => JsObject(body ++ Map("status" -> JsString("blocked"), "caveat" -> caveat))
-          case None =>
-            val winner = compared.filter { case (_, c) => c.pValue < Alpha && c.lift > 0 }.sortBy(-_._2.lift).headOption.map(_._1)
-            JsObject(body ++ Map("status" -> JsString("complete"), "winner" -> winner.map(JsString(_)).getOrElse(JsNull)))
-        }
-    }
-
-  val route: Route = path("v1" / "experiments" / Segment / "report") { id =>
-    get {
-      report(id) match {
-        case None => complete(StatusCodes.NotFound -> "no such experiment")
-        case Some(body) => complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-      }
-    }
-  }
 }
 `,
     },

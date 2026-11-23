@@ -55,7 +55,6 @@ and an old price, to everyone.
         python: {all: [/catalog\.get_product\(\s*tenant/], none: [/find_product\(/]},
         typescript: {all: [/getProduct\(\s*tenant/], none: [/findProduct\(/]},
         go: {all: [/catalog\.GetProduct\(\s*r\.Context\(\),\s*tenant/], none: [/FindProduct\(/]},
-        scala: {all: [/Catalog\.getProduct\(\s*tenant/], none: [/findProduct\(/]},
         cpp: {all: [/catalog::getProduct\(\s*tenant/], none: [/findProduct\(/]},
       },
     },
@@ -68,7 +67,6 @@ and an old price, to everyone.
         python: {all: [/catalog\.public_view\(/]},
         typescript: {all: [/publicView\(/]},
         go: {all: [/catalog\.PublicView\(/]},
-        scala: {all: [/Catalog\.publicView\(/], none: [/Catalog\.toJson\(/]},
         cpp: {all: [/catalog::publicView\(/], none: [/catalog::toJson\(/]},
       },
     },
@@ -81,7 +79,6 @@ and an old price, to everyone.
         python: {all: [/catalog\.get_product\(/], none: [/^documents\s*[:=]/m]},
         typescript: {all: [/getProduct\(/], none: [/const documents\s*=/]},
         go: {all: [/catalog\.GetProduct\(/], none: [/documents\s*=\s*map\[/]},
-        scala: {all: [/Catalog\.getProduct\(/], none: [/val documents\s*=/]},
         cpp: {all: [/catalog::getProduct\(/], none: [/catalog::Product>\s*documents/]},
       },
     },
@@ -101,10 +98,6 @@ and an old price, to everyone.
         },
         go: {
           all: [/private, max-age=(30|%d)/, /"ETag"/, /If-None-Match/, /StatusNotModified|\b304\b/],
-          none: [/public, max-age/],
-        },
-        scala: {
-          all: [/private, max-age=(30|\$MaxAgeSeconds)/, /"ETag"/, /If-None-Match/, /NotModified/],
           none: [/public, max-age/],
         },
         cpp: {all: [/private, max-age=/, /"ETag"/, /If-None-Match/, /\b304\b/], none: [/public, max-age/]},
@@ -298,67 +291,6 @@ func readProduct(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/products/{id}", readProduct)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import search.Catalog // getProduct, findProduct, publicView, toJson
-
-object ProductApi {
-  // product id -> document: a popular product is read from Redis once per process.
-  private val documents = scala.collection.concurrent.TrieMap.empty[String, Catalog.Product]
-
-  val route: Route = path("v1" / "products" / Segment) { productId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "missing X-Tenant-Id")
-        case Some(_) =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          documents.get(productId).orElse(Catalog.findProduct(productId).map { p => documents.put(productId, p); p }) match {
-            case None => complete(StatusCodes.NotFound -> "no such product")
-            case Some(product) =>
-              val headers = List(RawHeader("Cache-Control", "public, max-age=3600"))
-              complete(HttpResponse(StatusCodes.OK, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, Catalog.toJson(product).compactPrint)))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-
-import search.Catalog // getProduct, findProduct, publicView, toJson
-
-object ProductApi {
-  val MaxAgeSeconds = 30
-
-  val route: Route = path("v1" / "products" / Segment) { productId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "missing X-Tenant-Id")
-        case Some(tenant) =>
-          optionalHeaderValueByName("If-None-Match") { ifNoneMatch =>
-            Catalog.getProduct(tenant, productId) match { // the caller's catalog, read every time
-              case None => complete(StatusCodes.NotFound -> "no such product")
-              case Some(product) =>
-                val etag = "\\"" + product.priceVersion + "\\""
-                // private: the page belongs to one tenant; 30 s bounds how long a repriced product shows its old price.
-                val headers = List(RawHeader("Cache-Control", s"private, max-age=$MaxAgeSeconds"), RawHeader("ETag", etag))
-                if (ifNoneMatch.contains(etag)) complete(HttpResponse(StatusCodes.NotModified, headers = headers))
-                else complete(HttpResponse(StatusCodes.OK, headers = headers, entity = HttpEntity(ContentTypes.\`application/json\`, Catalog.publicView(product).compactPrint)))
-            }
-          }
-      }
-    }
-  }
 }
 `,
     },

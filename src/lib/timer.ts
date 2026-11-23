@@ -16,7 +16,8 @@ export interface ActiveTimer {
   budget: number;
   /** The budget ran out and the learner chose to keep going: the run will not be counted. */
   overtime: boolean;
-  language: Language;
+  /** Null when a saved timer names a language the site no longer offers. */
+  language: Language | null;
 }
 
 export type SessionOutcome = 'completed' | 'ended' | 'expired';
@@ -30,7 +31,8 @@ export interface TimedSession {
   accepted: number;
   revealed: number;
   total: number;
-  language: Language;
+  /** Null when it was a language the site no longer offers (saved records are repaired, not dropped). */
+  language: Language | null;
   /** `completed`: every step done; `ended`: stopped by the learner; `expired`: the budget ran out and the learner stopped. */
   outcome: SessionOutcome;
   /** Completed within the budget with nothing revealed: the learner's time for this problem. */

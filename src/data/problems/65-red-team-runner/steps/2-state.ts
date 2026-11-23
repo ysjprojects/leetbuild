@@ -20,10 +20,6 @@ end
 redis.call('EXPIRE', budget, window_s)
 return {'ok', tostring(cap - used - 1)}`;
 
-const scalaLua = CLAIM_LUA.split('\n')
-  .map((line, i) => (i === 0 ? line : `      |${line}`))
-  .join('\n');
-
 export const stateStep: Step = {
   id: 'state',
   title: 'Redis probe claims inside an hourly budget',
@@ -78,7 +74,6 @@ Requirements, kept by **one Lua script**:
         python: {order: [/['"]EXISTS['"]/, /['"]HINCRBY['"]/], none: [/\.hincrby\(/]},
         typescript: {order: [/['"]EXISTS['"]/, /['"]HINCRBY['"]/], none: [/\.hincrby\(/]},
         go: {order: [/['"]EXISTS['"]/, /['"]HINCRBY['"]/], none: [/\.HIncrBy\(/]},
-        scala: {order: [/['"]EXISTS['"]/, /['"]HINCRBY['"]/], none: [/\.hincrBy\(/]},
         cpp: {order: [/['"]EXISTS['"]/, /['"]HINCRBY['"]/], none: [/\.hincrby\(/]},
       },
     },
@@ -100,7 +95,6 @@ Requirements, kept by **one Lua script**:
           all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]EXISTS['"]/],
           none: [/\.Get\(\s*\w+,\s*config\.ProbeKey\(/],
         },
-        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]EXISTS['"]/], none: [/\.get\(\s*Config\.probeKey\(/]},
         cpp: {
           all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]EXISTS['"]/],
           none: [/\.get\(\s*config::probe_key\(/],
@@ -116,7 +110,6 @@ Requirements, kept by **one Lua script**:
         python: {all: [/DESTRUCTIVE_PROBE_BUDGET/, /DESTRUCTIVE_CATEGORIES/]},
         typescript: {all: [/DESTRUCTIVE_PROBE_BUDGET/, /DESTRUCTIVE_CATEGORIES/]},
         go: {all: [/config\.DestructiveProbeBudget/, /config\.DestructiveCategories/]},
-        scala: {all: [/Config\.DestructiveProbeBudget/, /Config\.DestructiveCategories/]},
         cpp: {all: [/config::kDestructiveProbeBudget/, /config::kDestructiveCategories/]},
       },
     },
@@ -129,7 +122,6 @@ Requirements, kept by **one Lua script**:
         python: {all: [/budget_key\(/, /WINDOW_S/], none: [/["']redteam:budget:/]},
         typescript: {all: [/budgetKey\(/, /WINDOW_S/], none: [/['"`]redteam:budget:/]},
         go: {all: [/config\.BudgetKey\(/, /config\.WindowSeconds/], none: [/"redteam:budget:/]},
-        scala: {all: [/Config\.budgetKey\(/, /Config\.WindowSeconds/], none: [/"redteam:budget:/]},
         cpp: {all: [/config::budget_key\(/, /config::kWindowSeconds/], none: [/"redteam:budget:/]},
       },
     },
@@ -142,7 +134,6 @@ Requirements, kept by **one Lua script**:
         python: {all: [/DEDUPE_TTL_S/]},
         typescript: {all: [/DEDUPE_TTL_S/]},
         go: {all: [/config\.DedupeTTLSeconds/]},
-        scala: {all: [/Config\.DedupeTtlSeconds/]},
         cpp: {all: [/config::kDedupeTtlSeconds/]},
       },
     },
@@ -357,66 +348,6 @@ func claimProbe(ctx context.Context, target, probeHash, category string) (Claim,
 	}
 	remaining, _ := strconv.ParseInt(fmt.Sprint(reply[1]), 10, 64)
 	return Claim{Verdict: fmt.Sprint(reply[0]), Remaining: remaining}, nil
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import redteam.Config
-
-/** claimProbe's answer: the verdict (ok, duplicate, budget) and the probes left this hour. */
-final case class Claim(verdict: String, remaining: Long)
-
-object ProbeState {
-  val jedis = new JedisPooled("redis", 6379)
-
-  /** Claim one probe before a runner sends it. */
-  def claimProbe(target: String, probeHash: String, category: String): Claim = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val budget = s"redteam:budget:$target"
-    val used = jedis.hincrBy(budget, "probes", 1)
-    if (jedis.get(Config.probeKey(target, probeHash)) != null) {
-      Claim("duplicate", Config.ProbeBudget - used)
-    } else if (used > Config.ProbeBudget) {
-      jedis.hincrBy(budget, "probes", -1)
-      Claim("budget", 0)
-    } else {
-      jedis.set(Config.probeKey(target, probeHash), "1")
-      Claim("ok", Config.ProbeBudget - used)
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import redteam.Config
-
-/** claimProbe's answer: the verdict (ok, duplicate, budget) and the probes left this hour. */
-final case class Claim(verdict: String, remaining: Long)
-
-object ProbeState {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val ClaimScript: String =
-    """${scalaLua}""".stripMargin
-
-  /** Claim one probe before a runner sends it. */
-  def claimProbe(target: String, probeHash: String, category: String): Claim = {
-    val window = System.currentTimeMillis() / 1000 / Config.WindowSeconds
-    val keys = List(Config.probeKey(target, probeHash), Config.budgetKey(target, window))
-    val args = List(
-      if (Config.DestructiveCategories.contains(category)) "1" else "0",
-      Config.ProbeBudget.toString,
-      Config.DestructiveProbeBudget.toString,
-      Config.WindowSeconds.toString,
-      Config.DedupeTtlSeconds.toString
-    )
-    val reply = jedis.eval(ClaimScript, keys.asJava, args.asJava).asInstanceOf[java.util.List[AnyRef]].asScala.map(_.toString)
-    Claim(reply(0), reply(1).toLong)
-  }
 }
 `,
     },

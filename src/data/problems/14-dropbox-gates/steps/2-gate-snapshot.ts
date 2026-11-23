@@ -63,7 +63,6 @@ every change.
         python: {all: [/hashlib\.sha256\(/, /%\s*BUCKETS/]},
         typescript: {all: [/createHash\(\s*['"]sha256['"]\s*\)/, /%\s*BUCKETS/]},
         go: {all: [/sha256\.Sum256\(/, /%\s*buckets/]},
-        scala: {all: [/"SHA-256"/, /%\s*Buckets/]},
         cpp: {all: [/sha256_hex\(/, /%\s*kBuckets/]},
       },
     },
@@ -76,7 +75,6 @@ every change.
         python: {all: [/for population in /, /return pick\(/, /\.get\("default"/]},
         typescript: {all: [/for \(const \w+ of gate\.populations\)/, /return pick\(/, /return gate\.default/]},
         go: {all: [/for _, \w+ := range gate\.Populations/, /return pick\(/, /return gate\.Default/]},
-        scala: {all: [/populations\s*\.find\(|collectFirst/, /getOrElse\(gate\.default\)|gate\.default/]},
         cpp: {all: [/for \(const auto& \w+ : gate\.populations\)/, /return pick\(/, /return gate\.default_variant/]},
       },
     },
@@ -89,7 +87,6 @@ every change.
         python: {all: [/edge \+= share\["pct"\]/, /if b < edge/]},
         typescript: {all: [/edge \+= share\.pct/, /if \(b < edge\)/]},
         go: {all: [/edge \+= share\.Pct/, /if b < edge/]},
-        scala: {all: [/edge \+= share\.pct/, /if \(b < edge\)/]},
         cpp: {all: [/edge \+= share\.pct/, /if \(b < edge\)/]},
       },
     },
@@ -105,7 +102,6 @@ every change.
           all: [/=== snapshot\.version/],
         },
         go: {order: [/rdb\.Get\(ctx, "gates:version"\)/, /rdb\.HGetAll\(ctx, "gates"\)/], all: [/== current\.Version/]},
-        scala: {order: [/jedis\.get\("gates:version"\)/, /jedis\.hgetAll\("gates"\)/], all: [/== snapshot\.version/]},
         cpp: {order: [/redis\.get\("gates:version"\)/, /redis\.hgetall\("gates"/], all: [/== current->version/]},
       },
     },
@@ -118,7 +114,6 @@ every change.
         python: {order: [/override\["expires_at"\] > now/, /for population in /]},
         typescript: {order: [/\.expires_at > now/, /for \(const \w+ of gate\.populations\)/]},
         go: {order: [/\.ExpiresAt > now/, /for _, \w+ := range gate\.Populations/]},
-        scala: {order: [/\.expiresAt > now/, /populations\s*\.find\(|collectFirst/]},
         cpp: {order: [/\.expires_at > now/, /for \(const auto& \w+ : gate\.populations\)/]},
       },
     },
@@ -735,171 +730,6 @@ func main() {
 		panic(err)
 	}
 	select {}
-}
-`,
-    },
-    scala: {
-      starter: `import java.security.MessageDigest
-
-import scala.jdk.CollectionConverters._
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-/** Feature gates on every app server: the config snapshot, its loader, and the pure decision over it. */
-object Gates {
-  val jedis = new JedisPooled("redis", 6379)
-  val Buckets = 10000
-  val PollIntervalSeconds = 10
-  val Off = "OFF"
-
-  case class Share(variant: String, pct: Int)
-  case class Population(\`match\`: Map[String, String], mix: List[Share])
-  case class Override(userId: String, variant: String, expiresAt: Long)
-  /** A gate as step 1 publishes it. */
-  case class Gate(name: String, seed: String, default: String, populations: List[Population], overrides: List[Override], version: Int)
-  case class Snapshot(version: Int, gates: Map[String, Gate])
-
-  implicit val shareFormat: RootJsonFormat[Share] = jsonFormat2(Share)
-  implicit val populationFormat: RootJsonFormat[Population] = jsonFormat2(Population)
-  implicit val overrideFormat: RootJsonFormat[Override] = jsonFormat(Override, "user_id", "variant", "expires_at")
-  implicit val gateFormat: RootJsonFormat[Gate] = jsonFormat6(Gate)
-
-  @volatile var snapshot: Snapshot = Snapshot(0, Map.empty)
-
-  /** 0..9999, the same on every server. */
-  def bucket(seed: String, userId: String): Int = {
-    ??? // TODO: first 8 hex digits of SHA-256 of s"$seed:$userId" as a Long, % Buckets
-  }
-
-  /** The share whose cumulative edge is the first above the bucket. */
-  def pick(mix: List[Share], b: Int): String = {
-    ??? // TODO: walk mix in order; each share owns pct * (Buckets / 100) buckets
-  }
-
-  /** No I/O: unknown gate → OFF; unexpired override → its variant; first matching population → pick; else default. */
-  def getVariant(name: String, attrs: Map[String, String]): String = {
-    ??? // TODO
-  }
-
-  /** GET gates:version; unchanged → false. Otherwise HGETALL gates, parse, replace the snapshot in one assignment. */
-  def refresh(): Boolean = {
-    ??? // TODO
-  }
-
-  /** Load once now, then refresh every intervalSeconds in the background; a failed poll keeps the last snapshot. */
-  def startLoader(intervalSeconds: Int = PollIntervalSeconds): Thread = {
-    refresh()
-    val loader = new Thread(() => {
-      while (true) {
-        Thread.sleep(intervalSeconds * 1000L)
-        try refresh()
-        catch { case _: Exception => () } // serve the snapshot we have
-      }
-    }, "gates-loader")
-    loader.setDaemon(true)
-    loader.start()
-    loader
-  }
-
-  def main(args: Array[String]): Unit = {
-    startLoader()
-    Thread.currentThread().join()
-  }
-}
-`,
-      solution: `import java.security.MessageDigest
-
-import scala.jdk.CollectionConverters._
-
-import redis.clients.jedis.JedisPooled
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-/** Feature gates on every app server: the config snapshot, its loader, and the pure decision over it. */
-object Gates {
-  val jedis = new JedisPooled("redis", 6379)
-  val Buckets = 10000
-  val PollIntervalSeconds = 10
-  val Off = "OFF"
-
-  case class Share(variant: String, pct: Int)
-  case class Population(\`match\`: Map[String, String], mix: List[Share])
-  case class Override(userId: String, variant: String, expiresAt: Long)
-  /** A gate as step 1 publishes it. */
-  case class Gate(name: String, seed: String, default: String, populations: List[Population], overrides: List[Override], version: Int)
-  case class Snapshot(version: Int, gates: Map[String, Gate])
-
-  implicit val shareFormat: RootJsonFormat[Share] = jsonFormat2(Share)
-  implicit val populationFormat: RootJsonFormat[Population] = jsonFormat2(Population)
-  implicit val overrideFormat: RootJsonFormat[Override] = jsonFormat(Override, "user_id", "variant", "expires_at")
-  implicit val gateFormat: RootJsonFormat[Gate] = jsonFormat6(Gate)
-
-  @volatile var snapshot: Snapshot = Snapshot(0, Map.empty)
-
-  /** 0..9999, the same on every server. */
-  def bucket(seed: String, userId: String): Int = {
-    val digest = MessageDigest.getInstance("SHA-256").digest(s"$seed:$userId".getBytes("UTF-8"))
-    val hex = digest.take(4).map("%02x".format(_)).mkString
-    (java.lang.Long.parseLong(hex, 16) % Buckets).toInt
-  }
-
-  /** The share whose cumulative edge is the first above the bucket. */
-  def pick(mix: List[Share], b: Int): String = {
-    var edge = 0
-    for (share <- mix) {
-      edge += share.pct * (Buckets / 100)
-      if (b < edge) return share.variant
-    }
-    mix.last.variant
-  }
-
-  /** No I/O: unknown gate → OFF; unexpired override → its variant; first matching population → pick; else default. */
-  def getVariant(name: String, attrs: Map[String, String]): String =
-    snapshot.gates.get(name) match {
-      case None => Off
-      case Some(gate) =>
-        val now = System.currentTimeMillis() / 1000
-        val userId = attrs.getOrElse("user_id", "")
-        gate.overrides.find(o => o.userId == userId && o.expiresAt > now) match {
-          case Some(o) => o.variant
-          case None =>
-            gate.populations
-              .find(p => p.\`match\`.forall { case (key, value) => attrs.get(key).contains(value) })
-              .map(p => pick(p.mix, bucket(gate.seed, userId)))
-              .getOrElse(gate.default)
-        }
-    }
-
-  /** GET gates:version; unchanged → false. Otherwise HGETALL gates, parse, replace the snapshot in one assignment. */
-  def refresh(): Boolean = {
-    val version = Option(jedis.get("gates:version")).map(_.toInt).getOrElse(0)
-    if (version == snapshot.version) return false
-    val gates = jedis.hgetAll("gates").asScala.map { case (name, raw) => name -> raw.parseJson.convertTo[Gate] }.toMap
-    snapshot = Snapshot(version, gates)
-    true
-  }
-
-  /** Load once now, then refresh every intervalSeconds in the background; a failed poll keeps the last snapshot. */
-  def startLoader(intervalSeconds: Int = PollIntervalSeconds): Thread = {
-    refresh()
-    val loader = new Thread(() => {
-      while (true) {
-        Thread.sleep(intervalSeconds * 1000L)
-        try refresh()
-        catch { case _: Exception => () } // serve the snapshot we have
-      }
-    }, "gates-loader")
-    loader.setDaemon(true)
-    loader.start()
-    loader
-  }
-
-  def main(args: Array[String]): Unit = {
-    startLoader()
-    Thread.currentThread().join()
-  }
 }
 `,
     },

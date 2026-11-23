@@ -55,7 +55,6 @@ when it does not — in an async handler keep that blocking call off the event l
         python: {all: [/x-api-key/i, /status_code\s*=\s*401|HTTP_401/]},
         typescript: {all: [/x-api-key/i, /code\(\s*401\s*\)|status\(\s*401\s*\)|statusCode:\s*401|unauthorized\(/]},
         go: {all: [/X-Api-Key/i, /http\.StatusUnauthorized|\b401\b/]},
-        scala: {all: [/X-Api-Key/i, /StatusCodes\.Unauthorized|\b401\b/]},
         cpp: {all: [/X-Api-Key/i, /\b401\b/]},
       },
     },
@@ -68,7 +67,6 @@ when it does not — in an async handler keep that blocking call off the event l
         python: {all: [/idempotency-key/i, /status_code\s*=\s*400|HTTP_400/]},
         typescript: {all: [/idempotency-key/i, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400|badRequest\(/]},
         go: {all: [/Idempotency-Key/i, /http\.StatusBadRequest|\b400\b/]},
-        scala: {all: [/Idempotency-Key/i, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/Idempotency-Key/i, /\b400\b/]},
       },
     },
@@ -97,14 +95,6 @@ when it does not — in an async handler keep that blocking call off the event l
             /http\.StatusBadRequest|\b400\b/,
           ],
         },
-        scala: {
-          all: [
-            /Sides\.contains\(|Sides\(/,
-            /price\s*(<=\s*0|>\s*0)/,
-            /qty\s*(<=\s*0|>\s*0)/,
-            /StatusCodes\.BadRequest|\b400\b/,
-          ],
-        },
         cpp: {all: [/kSides\.(count|contains|find)\(/, /price\s*(<=\s*0|>\s*0)/, /qty\s*(<=\s*0|>\s*0)/, /\b400\b/]},
       },
     },
@@ -120,7 +110,6 @@ when it does not — in an async handler keep that blocking call off the event l
           all: [/['"]accepted['"]/],
         },
         go: {order: [/(?<!func )publishOrder\(/, /http\.StatusAccepted|\b202\b/], all: [/"accepted"/]},
-        scala: {order: [/(?<!def )publishOrder\(/, /StatusCodes\.Accepted|\b202\b/], all: [/"accepted"/]},
         cpp: {order: [/(?<!void )publish_order\(/, /\b202\b/], all: [/"accepted"/]},
       },
     },
@@ -138,7 +127,6 @@ when it does not — in an async handler keep that blocking call off the event l
           ],
         },
         go: {order: [/(?<!func )publishOrder\(/, /http\.StatusServiceUnavailable|\b503\b/]},
-        scala: {all: [/case \w+: PublishFailed/, /StatusCodes\.ServiceUnavailable|\b503\b/]},
         cpp: {all: [/catch\s*\(\s*(const\s+)?PublishFailed\s*&/, /\b503\b/]},
       },
     },
@@ -467,119 +455,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /orders", placeOrder)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import exchange.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-
-object OrderGateway {
-  val Sides = Set("BUY", "SELL")
-  val ApiKeys = Map("k-1f9c" -> "desk-a", "k-77b2" -> "desk-b")
-
-  final case class NewOrder(symbol: String, side: String, price: Double, qty: Long, client_order_id: String)
-  final case class Order(orderId: String, symbol: String, side: String, price: Double, qty: Long, clientOrderId: String)
-  implicit val newOrderFormat: RootJsonFormat[NewOrder] = jsonFormat5(NewOrder)
-
-  /** Thrown by publishOrder when Kafka does not acknowledge the order. */
-  final class PublishFailed(message: String) extends RuntimeException(message)
-
-  /** Hand the order to the engine (built in the next step). */
-  def publishOrder(order: Order): Unit = ???
-
-  val route: Route =
-    path("orders") {
-      post {
-        entity(as[NewOrder]) { in =>
-          // TODO: 401 unless the X-Api-Key header is one of ApiKeys (optionalHeaderValueByName, before the entity)
-          // TODO: 400 unless an Idempotency-Key header is present
-          // TODO: 400 unless Sides contains in.side, in.price > 0, in.qty > 0, symbol non-empty
-          // TODO: Order with a random UUID; publishOrder (PublishFailed → 503); 202 {order_id, status: "accepted"}
-          val _ = UUID.randomUUID
-          complete(StatusCodes.NotImplemented)
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("gateway")
-    // Tls (provided) builds an SSLContext from the PEM certificate and key.
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import exchange.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-
-object OrderGateway {
-  val Sides = Set("BUY", "SELL")
-  val ApiKeys = Map("k-1f9c" -> "desk-a", "k-77b2" -> "desk-b")
-
-  final case class NewOrder(symbol: String, side: String, price: Double, qty: Long, client_order_id: String)
-  final case class Order(orderId: String, symbol: String, side: String, price: Double, qty: Long, clientOrderId: String)
-  implicit val newOrderFormat: RootJsonFormat[NewOrder] = jsonFormat5(NewOrder)
-
-  /** Thrown by publishOrder when Kafka does not acknowledge the order. */
-  final class PublishFailed(message: String) extends RuntimeException(message)
-
-  /** Hand the order to the engine (built in the next step). */
-  def publishOrder(order: Order): Unit = ???
-
-  val route: Route =
-    path("orders") {
-      post {
-        optionalHeaderValueByName("X-Api-Key") { apiKey =>
-          optionalHeaderValueByName("Idempotency-Key") { idemKey =>
-            if (!apiKey.exists(ApiKeys.contains)) complete(StatusCodes.Unauthorized -> "missing or unknown API key")
-            else if (idemKey.isEmpty) complete(StatusCodes.BadRequest -> "Idempotency-Key header is required")
-            else
-              entity(as[NewOrder]) { in =>
-                if (!Sides.contains(in.side) || in.price <= 0 || in.qty <= 0 || in.symbol.isEmpty || in.client_order_id.isEmpty)
-                  complete(StatusCodes.BadRequest -> "side must be BUY or SELL; price and qty must be positive")
-                else {
-                  val order = Order(UUID.randomUUID().toString, in.symbol, in.side, in.price, in.qty, in.client_order_id)
-                  try {
-                    publishOrder(order)
-                    complete(StatusCodes.Accepted -> Map("order_id" -> order.orderId, "status" -> "accepted"))
-                  } catch {
-                    case _: PublishFailed =>
-                      complete(StatusCodes.ServiceUnavailable -> "order not accepted; retry with the same Idempotency-Key")
-                  }
-                }
-              }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("gateway")
-    // Tls (provided) builds an SSLContext from the PEM certificate and key.
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

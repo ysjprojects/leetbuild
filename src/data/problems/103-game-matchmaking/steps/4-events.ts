@@ -44,12 +44,11 @@ client is still connecting. A produce the broker rejects is reported as sent, an
       id: 'match-key',
       title: 'Every event of a match lands on one partition',
       detail:
-        "The record key is the match id (`key=match_id`, `key: matchId`, `[]byte(matchID)` with a hash balancer, `ProducerRecord(Topic, matchId, …)`), so one match's events stay in order.",
+        "The record key is the match id (`key=match_id`, `key: matchId`, `[]byte(matchID)` with a hash balancer), so one match's events stay in order.",
       match: {
         python: {all: [/key\s*=\s*match_id/, /match\.event/]},
         typescript: {all: [/key:\s*matchId\b/, /match\.event/]},
         go: {all: [/Key:\s*\[\]byte\(matchID\)/, /kafka\.Hash\{\}/]},
-        scala: {all: [/ProducerRecord\[String,\s*String\]\(Topic,\s*matchId/, /match\.event/]},
         cpp: {all: [/match_id\.c_str\(\),\s*match_id\.(size|length)\(\)/, /match\.event/]},
       },
     },
@@ -62,7 +61,6 @@ client is still connecting. A produce the broker rejects is reported as sent, an
         python: {all: [/match\[["']players["']\]/, /["']reason["']/], none: [/\[["']owner["']\]/]},
         typescript: {all: [/match\.players/, /\breason\b/], none: [/\.owner\b/]},
         go: {all: [/m\.Players/, /"reason"/], none: [/\.Owner\b/]},
-        scala: {all: [/\.players\b/, /"reason"/], none: [/\.owner\b/]},
         cpp: {all: [/(->|\.)players\b/, /"reason"/], none: [/(->|\.)owner\b/]},
       },
     },
@@ -75,7 +73,6 @@ client is still connecting. A produce the broker rejects is reported as sent, an
         python: {order: [/def publish_event/, /store\.all_joins_confirmed\(/, /producer\.produce\(/]},
         typescript: {order: [/function publishEvent/, /allJoinsConfirmed\(/, /producer\.send\(/]},
         go: {order: [/func publishEvent/, /store\.AllJoinsConfirmed\(/, /WriteMessages\(/]},
-        scala: {order: [/def publishEvent/, /Store\.allJoinsConfirmed\(/, /producer\.send\(/]},
         cpp: {order: [/bool publishEvent/, /store::allJoinsConfirmed\(/, /->produce\(/]},
       },
     },
@@ -88,7 +85,6 @@ client is still connecting. A produce the broker rejects is reported as sent, an
         python: {all: [/store\.insert_outbox\(/, /on_delivery\s*=/, /producer\.flush\(/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/store\.InsertOutbox\(/, /RequiredAcks:\s*kafka\.Require(All|One)/, /context\.WithTimeout\(/]},
-        scala: {all: [/Store\.insertOutbox\(/, /\.get\(\s*AckTimeoutMs,\s*TimeUnit/]},
         cpp: {all: [/store::insertOutbox\(/, /dr_cb/, /->flush\(/]},
       },
     },
@@ -308,81 +304,6 @@ func publishEvent(ctx context.Context, matchID, kind string) (bool, error) {
 		return false, store.InsertOutbox(ctx, topic, matchID, payload) // the relay publishes it once the broker is back
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import matchmaking.Store // Store.getMatch, getTicket, allJoinsConfirmed, insertOutbox
-
-object Events {
-  val Topic = "match.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Publish match.found, match.started or match.abandoned for the match; true once the broker has it. */
-  def publishEvent(matchId: String, kind: String): Boolean = Store.getMatch(matchId) match {
-    case None => false
-    case Some(m) =>
-      // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-      val owners = m.tickets.flatMap(Store.getTicket).map(_.owner)
-      val payload = JsObject(
-        "type" -> JsString(s"match.$kind"), "match_id" -> JsString(matchId),
-        "players" -> JsArray(owners.map(JsString(_)).toVector), "server_id" -> m.serverId.fold[JsValue](JsNull)(JsString(_)))
-      producer.send(new ProducerRecord[String, String](Topic, payload.compactPrint))
-      true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import matchmaking.Store // Store.getMatch, getTicket, allJoinsConfirmed, insertOutbox
-
-object Events {
-  val Topic = "match.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Publish match.found, match.started or match.abandoned for the match; true once the broker has it. */
-  def publishEvent(matchId: String, kind: String): Boolean = Store.getMatch(matchId) match {
-    case None => false
-    case Some(_) if kind == "started" && !Store.allJoinsConfirmed(matchId) => false // a client is still connecting
-    case Some(m) =>
-      val payload = JsObject(
-        "type" -> JsString(s"match.$kind"), "match_id" -> JsString(matchId),
-        "players" -> JsArray(m.players.map(JsString(_)).toVector), // every participant, party members included
-        "server_id" -> m.serverId.fold[JsValue](JsNull)(JsString(_)),
-        "reason" -> m.reason.fold[JsValue](JsNull)(JsString(_)))
-      // Keyed by the match: its found, started and abandoned events share a partition, in order.
-      val record = new ProducerRecord[String, String](Topic, matchId, payload.compactPrint)
-      val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-      if (acked.isFailure) Store.insertOutbox(Topic, matchId, payload) // the relay publishes it once the broker is back
-      acked.isSuccess
-  }
 }
 `,
     },

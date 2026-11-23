@@ -54,7 +54,6 @@ out; and a client that retries after a timeout files the same submission twice.
         python: {all: [/store\.published_schema\(/], none: [/store\.draft_schema\(/]},
         typescript: {all: [/\bpublishedSchema\(/], none: [/\bdraftSchema\(/]},
         go: {all: [/store\.PublishedSchema\(/], none: [/store\.DraftSchema\(/]},
-        scala: {all: [/Store\.publishedSchema\(/], none: [/Store\.draftSchema\(/]},
         cpp: {all: [/store::publishedSchema\(/], none: [/store::draftSchema\(/]},
       },
     },
@@ -67,7 +66,6 @@ out; and a client that retries after a timeout files the same submission twice.
         python: {all: [/status_code\s*=\s*422/, /["']unknown field["']/]},
         typescript: {all: [/code\(\s*422\s*\)/, /['"]unknown field['"]/]},
         go: {all: [/StatusUnprocessableEntity|\b422\b/, /"unknown field"/]},
-        scala: {all: [/UnprocessableEntity/, /"unknown field"/]},
         cpp: {all: [/status\s*=\s*422/, /"unknown field"/]},
       },
     },
@@ -80,7 +78,6 @@ out; and a client that retries after a timeout files the same submission twice.
         python: {all: [/len\([^)\n]*\.encode\(/]},
         typescript: {all: [/Buffer\.byteLength\(|TextEncoder\(\)\.encode\(/]},
         go: {all: [/len\(\w+\)\s*>\s*\w+/]},
-        scala: {all: [/\.getBytes\([^)\n]*\)\.length/]},
         cpp: {all: [/\.size\(\)\s*>\s*/]},
       },
     },
@@ -93,7 +90,6 @@ out; and a client that retries after a timeout files the same submission twice.
         python: {all: [/html\.escape\(/], none: [/<\[\^>\]\*>/]},
         typescript: {all: [/&lt;/, /&amp;/], none: [/<\[\^>\]\*>/]},
         go: {all: [/html\.EscapeString\(/], none: [/<\[\^>\]\*>/]},
-        scala: {all: [/&lt;/, /&amp;/], none: [/<\[\^>\]\*>/]},
         cpp: {all: [/&lt;/, /&amp;/], none: [/<\[\^>\]\*>/]},
       },
     },
@@ -114,10 +110,6 @@ out; and a client that retries after a timeout files the same submission twice.
         go: {
           all: [/Idempotency-Key/i, /StatusBadRequest|\b400\b/, /store\.RecordKey\(/],
           order: [/store\.SubmissionForKey\(/, /store\.InsertSubmission\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /BadRequest/, /Store\.recordKey\(/],
-          order: [/Store\.submissionForKey\(/, /Store\.insertSubmission\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /status\s*=\s*400/, /store::recordKey\(/],
@@ -368,107 +360,6 @@ func submit(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/forms/{id}/submissions", submit)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import forms.Store // Store.publishedSchema, draftSchema, insertSubmission, submissionForKey, recordKey
-
-object SubmitApi {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def stripTags(value: String): String = value.replaceAll("<[^>]*>", "")
-
-  /** The body's fields, field name to text. */
-  private def fields(raw: String): Map[String, String] = raw.parseJson.asJsObject.fields.get("fields") match {
-    case Some(JsObject(given)) => given.map { case (name, JsString(s)) => name -> s; case (name, other) => name -> other.compactPrint }
-    case _ => Map.empty
-  }
-
-  val route: Route =
-    path("v1" / "forms" / Segment / "submissions") { formId =>
-      post {
-        entity(as[String]) { raw =>
-          // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-          Store.draftSchema(formId) match {
-            case None => complete(StatusCodes.NotFound -> "no such form")
-            case Some(_) =>
-              val id = Store.insertSubmission(formId, fields(raw).map { case (name, value) => name -> stripTags(value) })
-              complete(json(StatusCodes.Created, JsObject("submission_id" -> JsString(id))))
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import forms.Store // Store.publishedSchema, draftSchema, insertSubmission, submissionForKey, recordKey
-
-object SubmitApi {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  /** Escaped, not stripped: the dashboard renders it as text and the submitter's words survive. */
-  def escapeHtml(value: String): String =
-    value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\\"", "&quot;").replace("'", "&#x27;")
-
-  /** The body's fields, field name to text. */
-  private def fields(raw: String): Map[String, String] = raw.parseJson.asJsObject.fields.get("fields") match {
-    case Some(JsObject(given)) => given.map { case (name, JsString(s)) => name -> s; case (name, other) => name -> other.compactPrint }
-    case _ => Map.empty
-  }
-
-  /** Every field the schema does not declare or that is longer than its max_bytes. */
-  private def errorsOf(schema: Store.Schema, given: Map[String, String]): Seq[JsObject] =
-    given.toSeq.flatMap { case (name, value) =>
-      schema.get(name) match {
-        case None => Some(JsObject("field" -> JsString(name), "error" -> JsString("unknown field")))
-        case Some(limit) if value.getBytes(UTF_8).length > limit =>
-          Some(JsObject("field" -> JsString(name), "error" -> JsString(s"longer than $limit bytes")))
-        case _ => None
-      }
-    }
-
-  val route: Route =
-    path("v1" / "forms" / Segment / "submissions") { formId =>
-      post {
-        optionalHeaderValueByName("Idempotency-Key") {
-          case None | Some("") => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
-          case Some(key) =>
-            entity(as[String]) { raw =>
-              // The published version is the contract with submitters; the draft belongs to the author.
-              Store.publishedSchema(formId) match {
-                case None => complete(StatusCodes.NotFound -> "no such form")
-                case Some(schema) =>
-                  Store.submissionForKey(formId, key) match {
-                    case Some(replayed) => complete(json(StatusCodes.OK, JsObject("submission_id" -> JsString(replayed), "replayed" -> JsTrue)))
-                    case None =>
-                      val given = fields(raw)
-                      val errors = errorsOf(schema, given)
-                      if (errors.nonEmpty) complete(json(StatusCodes.UnprocessableEntity, JsObject("errors" -> JsArray(errors.toVector))))
-                      else {
-                        val id = Store.insertSubmission(formId, given.map { case (name, value) => name -> escapeHtml(value) })
-                        Store.recordKey(formId, key, id)
-                        complete(json(StatusCodes.Created, JsObject("submission_id" -> JsString(id))))
-                      }
-                  }
-              }
-            }
-        }
-      }
-    }
 }
 `,
     },

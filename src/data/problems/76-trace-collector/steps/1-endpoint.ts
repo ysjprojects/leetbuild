@@ -46,7 +46,6 @@ span of almost five days.
         python: {all: [/@app\.post\(\s*["']\/v1\/spans["']/, /assembly\.insert_span\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/spans['"]/, /insertSpan\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/spans"/, /assembly\.InsertSpan\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"spans"\s*\)/, /Assembly\.insertSpan\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/spans"/, /assembly::insertSpan\(/]},
       },
     },
@@ -59,7 +58,6 @@ span of almost five days.
         python: {all: [/\b401\b/], none: [/["']default["']/]},
         typescript: {all: [/\b401\b/], none: [/['"]default['"]/]},
         go: {all: [/StatusUnauthorized|\b401\b/], none: [/"default"/]},
-        scala: {all: [/Unauthorized|\b401\b/], none: [/"default"/]},
         cpp: {all: [/\b401\b/], none: [/"default"/]},
       },
     },
@@ -72,7 +70,6 @@ span of almost five days.
         python: {all: [/\{32\}/, /\{16\}/, /\b422\b/]},
         typescript: {all: [/\{32\}/, /\{16\}/, /\b422\b/]},
         go: {all: [/\{32\}/, /\{16\}/, /StatusUnprocessableEntity|\b422\b/]},
-        scala: {all: [/\{32\}/, /\{16\}/, /UnprocessableEntity|\b422\b/]},
         cpp: {all: [/\{32\}/, /\{16\}/, /\b422\b/]},
       },
     },
@@ -85,7 +82,6 @@ span of almost five days.
         python: {all: [/parent_span_id\s*==\s*[\w.[\]"']*span_id|span_id\s*==\s*[\w.[\]"']*parent_span_id/]},
         typescript: {all: [/parent\w*\s*===\s*[\w.[\]'"]*span_id|span_id\s*===\s*[\w.[\]'"]*parent/i]},
         go: {all: [/ParentSpanID\s*==\s*[\w.]*SpanID|\bSpanID\s*==\s*[\w.]*ParentSpanID/]},
-        scala: {all: [/parent\w*\s*==\s*[\w.]*spanId|spanId\s*==\s*[\w.]*parent/i]},
         cpp: {all: [/parent\w*\s*==\s*[\w.]*span_id|span_id\s*==\s*[\w.]*parent/]},
       },
     },
@@ -98,7 +94,6 @@ span of almost five days.
         python: {all: [/MAX_DURATION_MS/], none: [/duration_ms:\s*float/, /int\(\s*body\.duration_ms\s*\)/]},
         typescript: {all: [/MAX_DURATION_MS/, /Number\.isInteger\(/], none: [/Math\.trunc\(/]},
         go: {all: [/maxDurationMs/], none: [/DurationMs\s+float64/]},
-        scala: {all: [/MaxDurationMs/, /isValidLong|isWhole/]},
         cpp: {all: [/kMaxDurationMs/, /is_number_integer\(\)/], none: [/value\(\s*"duration_ms",\s*0\.0\s*\)/]},
       },
     },
@@ -365,97 +360,6 @@ func ingest(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/spans", ingest)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import traces.Assembly // Assembly.insertSpan(tenant, span): Inserted
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def text(body: Map[String, JsValue], name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  val route: Route = path("v1" / "spans") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { header =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val tenant = header.filter(_.nonEmpty).getOrElse("default")
-          val body = raw.parseJson.asJsObject.fields
-          val start = body.get("start_ms").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-          val duration = body.get("duration_ms").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-          val span = Assembly.Span(text(body, "trace_id"), text(body, "span_id"), text(body, "parent_span_id"), text(body, "service"), start, duration)
-          val result = Assembly.insertSpan(tenant, span)
-          complete(json(StatusCodes.Accepted, JsObject(
-            "trace_id" -> JsString(span.traceId), "span_id" -> JsString(span.spanId), "duplicate" -> JsBoolean(!result.inserted),
-            "count" -> JsNumber(result.count), "missing" -> JsNumber(result.missing))))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import scala.util.matching.Regex
-
-import traces.Assembly // Assembly.insertSpan(tenant, span): Inserted
-
-object Api {
-  val TraceIdRe: Regex = "[0-9a-f]{32}".r
-  val SpanIdRe: Regex = "[0-9a-f]{16}".r
-  val MaxDurationMs: Long = 30L * 60 * 1000
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def unprocessable(error: String): HttpResponse = json(StatusCodes.UnprocessableEntity, JsObject("error" -> JsString(error)))
-
-  private def text(body: Map[String, JsValue], name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  /** Why the span is refused, if it is. */
-  private def refusal(body: Map[String, JsValue], span: Assembly.Span): Option[String] = {
-    val duration = body.get("duration_ms").collect { case JsNumber(n) => n }
-    if (!TraceIdRe.matches(span.traceId) || !SpanIdRe.matches(span.spanId)) Some("trace_id is 32 lowercase hex characters, span_id 16")
-    else if (span.parentSpanId.nonEmpty && !SpanIdRe.matches(span.parentSpanId)) Some("parent_span_id is empty for a root, else 16 lowercase hex characters")
-    else if (span.parentSpanId == span.spanId) Some("a span cannot be its own parent")
-    else if (!duration.exists(n => n.isValidLong && n >= 0 && n <= MaxDurationMs)) Some(s"duration_ms is an integer number of milliseconds, from 0 to $MaxDurationMs")
-    else None
-  }
-
-  val route: Route = path("v1" / "spans") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-        case Some(tenant) =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject.fields
-            val start = body.get("start_ms").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-            val duration = body.get("duration_ms").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-            val span = Assembly.Span(text(body, "trace_id"), text(body, "span_id"), text(body, "parent_span_id"), text(body, "service"), start, duration)
-            refusal(body, span) match {
-              case Some(error) => complete(unprocessable(error))
-              case None =>
-                // Every guard has answered: only a valid span reaches the assembly.
-                val result = Assembly.insertSpan(tenant, span)
-                complete(json(StatusCodes.Accepted, JsObject(
-                  "trace_id" -> JsString(span.traceId), "span_id" -> JsString(span.spanId), "duplicate" -> JsBoolean(!result.inserted),
-                  "count" -> JsNumber(result.count), "missing" -> JsNumber(result.missing))))
-            }
-          }
-      }
-    }
-  }
 }
 `,
     },

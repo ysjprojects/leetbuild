@@ -61,7 +61,6 @@ failover loses one; and a broker that refuses or stalls drops the window for goo
         python: {all: [/key\s*=\s*(device_id|event\[["']device_id["']\])/], none: [/key\s*=\s*metric/]},
         typescript: {all: [/key:\s*(deviceId|event\.device_id)\b/], none: [/key:\s*metric\b/]},
         go: {all: [/Key:\s*\[\]byte\((deviceID|event\.DeviceID)\)/], none: [/Key:\s*\[\]byte\(metric\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*deviceId/], none: [/\(Topic,\s*metric/]},
         cpp: {
           all: [/(key|device_id)\.c_str\(\),\s*(key|device_id)\.size\(\)/],
           none: [/metric\.c_str\(\)/],
@@ -77,7 +76,6 @@ failover loses one; and a broker that refuses or stalls drops the window for goo
         python: {all: [/["']mean["']/, /["']count["']/, /["']max["']/], none: [/["']samples["']\s*:/]},
         typescript: {all: [/\bmean:/, /\bcount:/, /\bmax:/], none: [/samples:\s*points/]},
         go: {all: [/json:"mean"/, /json:"count"/, /json:"max"/], none: [/"samples":/]},
-        scala: {all: [/"mean"/, /"count"/, /"max"/], none: [/"samples"\s*->/]},
         cpp: {all: [/"mean"/, /"count"/, /"max"/], none: [/\{"samples",/]},
       },
     },
@@ -90,7 +88,6 @@ failover loses one; and a broker that refuses or stalls drops the window for goo
         python: {all: [/window_start/, /%\s*WINDOW_S/]},
         typescript: {all: [/window_start/, /%\s*WINDOW_S/]},
         go: {all: [/window_start/, /%\s*windowS/]},
-        scala: {all: [/window_start/, /%\s*WindowSeconds/]},
         cpp: {all: [/window_start/, /%\s*kWindowS/]},
       },
     },
@@ -103,7 +100,6 @@ failover loses one; and a broker that refuses or stalls drops the window for goo
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -116,7 +112,6 @@ failover loses one; and a broker that refuses or stalls drops the window for goo
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/\binsert\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/outbox\.Insert\(/, /time\.After\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.insert\(/, /\.get\(\s*[^\n]*TimeUnit/]},
         cpp: {all: [/outbox::insert\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -460,87 +455,6 @@ func publishRollup(ctx context.Context, deviceID string, samples []wal.Sample) (
 		delivered = delivered && ok
 	}
 	return delivered, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import ingestd.{Outbox, Sample} // Outbox.insert(topic, key, payload)
-
-object RollupEvents {
-  val Topic = "telemetry.rollup"
-  val WindowSeconds = 60L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Summarise a device's samples on telemetry.rollup; true once the broker has every event. */
-  def publishRollup(deviceId: String, samples: Seq[Sample]): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    samples.groupBy(_.metric).foreach { case (metric, points) =>
-      val raw = JsArray(points.map(s => JsObject("metric" -> JsString(s.metric), "value" -> JsNumber(s.value), "ts" -> JsNumber(s.ts))).toVector)
-      val payload = JsObject("device_id" -> JsString(deviceId), "metric" -> JsString(metric), "samples" -> raw)
-      producer.send(new ProducerRecord[String, String](Topic, metric, payload.compactPrint))
-    }
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import ingestd.{Outbox, Sample} // Outbox.insert(topic, key, payload)
-
-object RollupEvents {
-  val Topic = "telemetry.rollup"
-  val WindowSeconds = 60L
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the rollup before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** One event per window: each metric's mean, count and max over the window's samples. */
-  def rollups(deviceId: String, samples: Seq[Sample]): Seq[JsObject] =
-    samples.groupBy(s => s.ts - s.ts % WindowSeconds).toSeq.sortBy(_._1).map { case (start, inWindow) =>
-      val buckets = inWindow.groupBy(_.metric).map { case (metric, points) =>
-        val values = points.map(_.value)
-        metric -> JsObject("mean" -> JsNumber(values.sum / values.size), "count" -> JsNumber(values.size), "max" -> JsNumber(values.max))
-      }
-      JsObject("device_id" -> JsString(deviceId), "window_start" -> JsNumber(start), "buckets" -> JsObject(buckets))
-    }
-
-  /** Produce one rollup and wait for the broker; a refused or late one goes to the outbox. */
-  private def sendRollup(deviceId: String, event: JsObject): Boolean = {
-    val record = new ProducerRecord[String, String](Topic, deviceId, event.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    // The broker did not take it: the relay produces the row later, so the window is late, not lost.
-    if (acked.isFailure) Outbox.insert(Topic, deviceId, event)
-    acked.isSuccess
-  }
-
-  /** Summarise a device's samples on telemetry.rollup; true once the broker has every event. */
-  def publishRollup(deviceId: String, samples: Seq[Sample]): Boolean =
-    rollups(deviceId, samples).map(sendRollup(deviceId, _)).forall(identity)
 }
 `,
     },

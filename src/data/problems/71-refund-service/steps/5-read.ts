@@ -56,9 +56,6 @@ paid still shown as pending.
         },
         typescript: {all: [/\b401\b/, /payment\.tenant\s*!==?\s*tenant|tenant\s*!==?\s*payment\.tenant/]},
         go: {all: [/StatusUnauthorized|\b401\b/, /payment\.Tenant\s*!=\s*tenant|tenant\s*!=\s*payment\.Tenant/]},
-        scala: {
-          all: [/Unauthorized|\b401\b/, /\.tenant\s*!=\s*tenant|tenant\s*!=\s*\w+\.tenant|\.tenant\s*==\s*tenant/],
-        },
         cpp: {all: [/\b401\b/, /payment->tenant\s*!=\s*tenant|tenant\s*!=\s*payment->tenant/]},
       },
     },
@@ -71,7 +68,6 @@ paid still shown as pending.
         python: {all: [/["']CONFIRMED["']/, /pending_minor/, /psp_ref/]},
         typescript: {all: [/['"]CONFIRMED['"]/, /pending_minor/, /psp_ref/]},
         go: {all: [/"CONFIRMED"/, /"pending_minor"/, /"psp_ref"/]},
-        scala: {all: [/"CONFIRMED"/, /"pending_minor"/, /"psp_ref"/]},
         cpp: {all: [/"CONFIRMED"/, /"pending_minor"/, /"psp_ref"/]},
       },
     },
@@ -84,7 +80,6 @@ paid still shown as pending.
         python: {all: [/drift_minor/, /ledger\.refunded_total\(/]},
         typescript: {all: [/drift_minor/, /refundedTotal\(/]},
         go: {all: [/"drift_minor"/, /ledger\.RefundedTotal\(/]},
-        scala: {all: [/"drift_minor"/, /Ledger\.refundedTotal\(/]},
         cpp: {all: [/"drift_minor"/, /ledger::refundedTotal\(/]},
       },
     },
@@ -97,7 +92,6 @@ paid still shown as pending.
         python: {all: [/psp\.reconcile\(/]},
         typescript: {all: [/\breconcile\(/]},
         go: {all: [/psp\.Reconcile\(/]},
-        scala: {all: [/Psp\.reconcile\(/]},
         cpp: {all: [/psp::reconcile\(/]},
       },
     },
@@ -326,81 +320,6 @@ func readRefunds(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/payments/{id}/refunds", readRefunds)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import refunds.{Ledger, Psp, Records} // Records.findPayment, listRefunds, findRefund; Ledger.refundedTotal; Psp.reconcile
-
-object Read {
-  val route: Route = path("v1" / "payments" / Segment / "refunds") { paymentId =>
-    get {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      Records.findPayment(paymentId) match {
-        case None => complete(StatusCodes.NotFound -> "no such payment")
-        case Some(payment) =>
-          val refunded = Ledger.refundedTotal(paymentId)
-          val rows = Records.listRefunds(paymentId).map(row => JsObject("refund_id" -> JsString(row.refundId), "amount_minor" -> JsNumber(row.amountMinor)))
-          val body = JsObject(
-            "payment_id" -> JsString(paymentId), "paid_minor" -> JsNumber(payment.paidMinor), "refunded_minor" -> JsNumber(refunded),
-            "remaining_minor" -> JsNumber(payment.paidMinor - refunded), "refunds" -> JsArray(rows.toVector))
-          complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import refunds.{Ledger, Psp, Records} // Records.findPayment, listRefunds, findRefund; Ledger.refundedTotal; Psp.reconcile
-
-object Read {
-  private def report(payment: Records.Payment): JsObject = {
-    val paymentId = payment.paymentId
-    val rows = Records.listRefunds(paymentId).map { row =>
-      if (row.status != "PENDING") row
-      else {
-        // The PSP may have settled it since: ask before reporting it.
-        Psp.reconcile(row.refundId)
-        Records.findRefund(row.refundId).get
-      }
-    }
-    def total(status: String): Long = rows.filter(_.status == status).map(_.amountMinor).sum
-    val refunded = total("CONFIRMED")
-    val pending = total("PENDING")
-    JsObject(
-      "payment_id" -> JsString(paymentId), "paid_minor" -> JsNumber(payment.paidMinor),
-      "refunded_minor" -> JsNumber(refunded), "pending_minor" -> JsNumber(pending),
-      "remaining_minor" -> JsNumber(payment.paidMinor - refunded - pending),
-      // What the records hold minus what the ledger holds: reported, for a repair to act on.
-      "drift_minor" -> JsNumber(refunded + pending - Ledger.refundedTotal(paymentId)),
-      "refunds" -> JsArray(rows.toVector.map(row => JsObject(
-        "refund_id" -> JsString(row.refundId), "amount_minor" -> JsNumber(row.amountMinor), "reason_code" -> JsString(row.reasonCode),
-        "status" -> JsString(row.status), "psp_ref" -> JsString(row.pspRef)))))
-  }
-
-  val route: Route = path("v1" / "payments" / Segment / "refunds") { paymentId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-        case Some(tenant) =>
-          Records.findPayment(paymentId) match {
-            // Another tenant's payment looks missing.
-            case Some(payment) if payment.tenant == tenant =>
-              complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, report(payment).compactPrint)))
-            case _ => complete(StatusCodes.NotFound -> "no such payment")
-          }
-      }
-    }
-  }
 }
 `,
     },

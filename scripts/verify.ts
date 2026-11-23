@@ -151,8 +151,6 @@ function judgeSelfTest(): string[] {
   expect('c-like keeps // inside strings', go.includes('"http://x"') && go.includes('`raw // keep`'));
   expect('c-like blanks line and block comments', !go.includes('GET') && !go.includes('SET') && go.includes('y := 1'));
   expect('c-like blanking preserves line count', go.split('\n').length === 5);
-  const scala = stripComments('val s = """a // b\n// c"""\n// d\n', 'scala');
-  expect('scala keeps triple-quoted text across lines', scala.includes('// c"""') && !scala.includes('// d'));
   expect('all requires every pattern', matches({all: [/a/, /b/]}, 'ab') && !matches({all: [/a/, /c/]}, 'ab'));
   expect('none rejects any match', !matches({none: [/b/]}, 'ab') && matches({none: [/c/]}, 'ab'));
   expect('order is sequential', matches({order: [/a/, /b/]}, 'a b') && !matches({order: [/b/, /a/]}, 'a b'));

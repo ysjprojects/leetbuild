@@ -90,7 +90,7 @@ return 1
   call, so the retry carries the same one.
 - **The client only builds keys and arguments.** A \`GET\` or \`DECRBY\` issued from the client is the
   race the script exists to remove.
-- **Registered once, called by SHA.** \`register_script\` / \`NewScript\` / \`scriptLoad\` loads it one
+- **Registered once, called by SHA.** \`register_script\` / \`NewScript\` loads it one
   time; every reservation is then an \`EVALSHA\`, not a 300-byte upload per request.
 
 :::details Why not WATCH / MULTI / EXEC?

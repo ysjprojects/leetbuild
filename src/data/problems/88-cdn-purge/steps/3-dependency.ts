@@ -79,7 +79,6 @@ sent three times; and a purge with one accepted path out of thirty reports succe
         python: {all: [/DEADLINE_S\s*=\s*2\b/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*2000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/context\.WithTimeout\(/, /2\s*\*\s*time\.Second|2000\s*\*\s*time\.Millisecond/]},
-        scala: {all: [/DeadlineMs\s*=\s*2000L?/, /withDeadlineAfter\(\s*DeadlineMs/]},
         cpp: {all: [/set_deadline\(/, /kDeadline\{2000\}|milliseconds\{?\(?2000|seconds\{?\(?2\b/]},
       },
     },
@@ -92,10 +91,6 @@ sent three times; and a purge with one accepted path out of thirty reports succe
         python: {order: [/batch_id\s*=/, /for\s+attempt\s+in/], all: [/patterns\s*=\s*pending/]},
         typescript: {order: [/batchId\s*=\s*`\$\{purgeId\}/, /for\s*\(\s*let attempt/], all: [/patterns:\s*pending/]},
         go: {order: [/batchID\s*:?=\s*purgeID\s*\+/, /for attempt\s*:=/], all: [/Patterns:\s*pending/]},
-        scala: {
-          order: [/batchId\s*=\s*s"\$purgeId:/, /while\s*\(/],
-          all: [/BatchPurgeRequest\(batchId,\s*domain,\s*pending/],
-        },
         cpp: {
           order: [/batch_id\s*=\s*purge_id\s*\+/, /for\s*\(int attempt/],
           all: [/:\s*pending\)\s*request\.add_patterns\(/],
@@ -111,7 +106,6 @@ sent three times; and a purge with one accepted path out of thirty reports succe
         python: {all: [/StatusCode\.UNAVAILABLE/, /StatusCode\.DEADLINE_EXCEEDED/, /\.code\(\)\s+in\s+RETRYABLE/]},
         typescript: {all: [/status\.UNAVAILABLE/, /status\.DEADLINE_EXCEEDED/, /RETRYABLE\.(includes|has)\(/]},
         go: {all: [/codes\.Unavailable/, /codes\.DeadlineExceeded/, /retryable\[status\.Code\(err\)\]/]},
-        scala: {all: [/Status\.Code\.UNAVAILABLE/, /Status\.Code\.DEADLINE_EXCEEDED/, /Retryable\.contains\(/]},
         cpp: {all: [/StatusCode::UNAVAILABLE/, /StatusCode::DEADLINE_EXCEEDED/, /kRetryable\.count\(/]},
       },
     },
@@ -124,7 +118,6 @@ sent three times; and a purge with one accepted path out of thirty reports succe
         python: {all: [/OUTCOME_FAILED\s*=\s*["']failed["']/, /\ball\(/], none: [/\bany\(/]},
         typescript: {all: [/OUTCOME_FAILED\s*=\s*['"]failed['"]/, /\.every\(/], none: [/\.some\(/]},
         go: {all: [/outcomeFailed\s*=\s*"failed"/, /!=\s*outcomeAccepted/]},
-        scala: {all: [/OutcomeFailed\s*=\s*"failed"/, /\.forall\(/], none: [/\.exists\(/]},
         cpp: {all: [/kOutcomeFailed\s*=\s*"failed"/, /!=\s*kOutcomeAccepted|std::all_of\(/], none: [/std::any_of\(/]},
       },
     },
@@ -449,87 +442,6 @@ func submitBatch(ctx context.Context, purgeID, domain string, paths []string) Ba
 		}
 	}
 	return res
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import cdnpurge.cdn_purge.{BatchPurgeRequest, CdnProviderGrpc}
-
-/** What became of a batch: its id, each path's outcome, and whether it succeeded. */
-final case class BatchResult(batchId: String, outcomes: Map[String, String], succeeded: Boolean)
-
-object ProviderClient {
-  val MaxAttempts = 3
-
-  private val provider = CdnProviderGrpc.blockingStub(ManagedChannelBuilder.forAddress("cdn-provider", 9000).usePlaintext().build())
-
-  /** Hand the purge's paths to the provider. */
-  def submitBatch(purgeId: String, domain: String, paths: Seq[String]): BatchResult = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val outcomes = scala.collection.mutable.Map.empty[String, String]
-    var batchId = ""
-    var attempt = 1
-    while (attempt <= MaxAttempts && !outcomes.values.toSeq.contains("accepted")) {
-      batchId = s"$purgeId:\${UUID.randomUUID()}"
-      try {
-        val reply = provider.batchPurge(BatchPurgeRequest(batchId, domain, paths, attempt))
-        reply.results.foreach(r => outcomes(r.pattern) = r.result)
-      } catch {
-        case _: StatusRuntimeException => () // the provider hiccuped: try again
-      }
-      attempt += 1
-    }
-    BatchResult(batchId, outcomes.toMap, outcomes.values.exists(_ == "accepted"))
-  }
-}
-`,
-      solution: `import java.util.UUID
-import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import cdnpurge.cdn_purge.{BatchPurgeRequest, CdnProviderGrpc}
-
-/** What became of a batch: its id, each path's outcome, and whether it succeeded. */
-final case class BatchResult(batchId: String, outcomes: Map[String, String], succeeded: Boolean)
-
-object ProviderClient {
-  val MaxAttempts = 3
-  val DeadlineMs = 2000L
-  val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-  val OutcomeAccepted = "accepted"
-  val OutcomeInvalidPattern = "invalid_pattern"
-  val OutcomeFailed = "failed"
-
-  private val provider = CdnProviderGrpc.blockingStub(ManagedChannelBuilder.forAddress("cdn-provider", 9000).usePlaintext().build())
-
-  /** Hand the purge's paths to the provider. */
-  def submitBatch(purgeId: String, domain: String, paths: Seq[String]): BatchResult = {
-    val batchId = s"$purgeId:\${UUID.randomUUID()}" // minted once: every attempt is the same batch to the provider
-    val decided = scala.collection.mutable.Map.empty[String, String]
-    var pending = paths
-    var attempt = 1
-    var refused = false
-    while (attempt <= MaxAttempts && pending.nonEmpty && !refused) {
-      try {
-        val reply = provider.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).batchPurge(BatchPurgeRequest(batchId, domain, pending, attempt))
-        reply.results.foreach { r =>
-          if (pending.contains(r.pattern) && (r.result == OutcomeAccepted || r.result == OutcomeInvalidPattern)) decided(r.pattern) = r.result
-        }
-        pending = pending.filterNot(decided.contains) // throttled or unanswered: send again
-      } catch {
-        case e: StatusRuntimeException if Retryable.contains(e.getStatus.getCode) => ()
-        case _: StatusRuntimeException => refused = true // asking again gets the same answer
-      }
-      attempt += 1
-    }
-    val outcomes = paths.map(path => path -> decided.getOrElse(path, OutcomeFailed)).toMap
-    BatchResult(batchId, outcomes, outcomes.values.forall(_ == OutcomeAccepted))
-  }
 }
 `,
     },

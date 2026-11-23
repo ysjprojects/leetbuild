@@ -55,7 +55,6 @@ service Encoder { rpc EncodeSegment(SegmentRequest) returns (SegmentResult); }
         python: {all: [/jobs\.segment_span\(/], none: [/start_s\s*=\s*0\b/]},
         typescript: {all: [/\bsegmentSpan\(/], none: [/start_s:\s*0\b/]},
         go: {all: [/jobs\.SegmentSpan\(/], none: [/StartS:\s*0\b/]},
-        scala: {all: [/Jobs\.segmentSpan\(/], none: [/startS\s*=\s*0(\.0)?\b/]},
         cpp: {all: [/jobs::segmentSpan\(/], none: [/set_start_s\(\s*0\s*\)/]},
       },
     },
@@ -89,10 +88,6 @@ service Encoder { rpc EncodeSegment(SegmentRequest) returns (SegmentResult); }
           ],
           none: [/30\s*\*\s*time\.Second/],
         },
-        scala: {
-          all: [/DeadlineBaseMs\s*=\s*2000L?/, /DeadlinePerSecondMs\s*=\s*500L?/, /withDeadlineAfter\(\s*deadlineMs/],
-          none: [/withDeadlineAfter\(\s*30/],
-        },
         cpp: {
           all: [/kDeadlineBaseMs\s*=\s*2000/, /kDeadlinePerSecondMs\s*=\s*500/, /set_deadline\([^\n]*deadline_ms/],
           none: [/seconds\{30\}|seconds\(30\)/],
@@ -114,10 +109,6 @@ service Encoder { rpc EncodeSegment(SegmentRequest) returns (SegmentResult); }
           all: [/maxAttempts\s*=\s*2\b/, /attempt\s*==\s*maxAttempts|attempt\s*<=?\s*maxAttempts/],
           none: [/attempt\s*<=?\s*5\b/],
         },
-        scala: {
-          all: [/MaxAttempts\s*=\s*2\b/, /attempt\s*(==|<|<=)\s*MaxAttempts/],
-          none: [/attempt\s*<=?\s*5\b|1 to 5/],
-        },
         cpp: {all: [/kMaxAttempts\s*=\s*2\b/, /attempt\s*(==|<|<=)\s*kMaxAttempts/], none: [/attempt\s*<=?\s*5\b/]},
       },
     },
@@ -132,7 +123,6 @@ service Encoder { rpc EncodeSegment(SegmentRequest) returns (SegmentResult); }
           all: [/function isRetryable|const isRetryable/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/, /isRetryable\(\s*code/],
         },
         go: {all: [/func isRetryable/, /codes\.Unavailable/, /codes\.DeadlineExceeded/, /isRetryable\(\s*code/]},
-        scala: {all: [/def isRetryable/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/, /isRetryable\(\s*code/]},
         cpp: {all: [/bool isRetryable/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/, /isRetryable\(\s*code/]},
       },
     },
@@ -145,7 +135,6 @@ service Encoder { rpc EncodeSegment(SegmentRequest) returns (SegmentResult); }
         python: {all: [/raise SegmentFailed\(\s*index/]},
         typescript: {all: [/throw new SegmentFailed\(\s*index/]},
         go: {all: [/&SegmentFailed\{\s*Index:\s*index/]},
-        scala: {all: [/throw new SegmentFailed\(\s*index/]},
         cpp: {all: [/throw SegmentFailed\(\s*index/]},
       },
     },
@@ -536,93 +525,6 @@ func encodeSegment(ctx context.Context, job *jobs.Job, index int) (SegmentOutput
 		}
 		log.Printf("segment %d attempt %d failed: %v", index, attempt, code)
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import transcoder.Jobs // Jobs.Job, Jobs.segmentSpan(durationS, index): (startS, lengthS)
-import transcoderd.media_transcoder.{EncoderGrpc, SegmentRequest}
-
-/** A segment the encoder could not produce: its index and the final status code. */
-final class SegmentFailed(val index: Int, val code: Status.Code, details: String) extends Exception(s"segment $index failed: $code $details")
-
-/** What the encoder produced for one segment. */
-final case class SegmentOutput(index: Int, outputKey: String, durationS: Double)
-
-object Client {
-  private val encoder = EncoderGrpc.blockingStub(ManagedChannelBuilder.forAddress("encoder", 9000).usePlaintext().build())
-
-  /** Encode segment index of the job. */
-  def encodeSegment(job: Jobs.Job, index: Int): SegmentOutput = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val request = SegmentRequest(jobId = job.jobId, index = index, sourceUri = job.sourceUri, startS = 0, durationS = job.durationS,
-      preset = job.preset, encoderArgs = job.encoderArgs)
-    var last: StatusRuntimeException = null
-    var attempt = 1
-    while (attempt <= 5) {
-      try {
-        val result = encoder.withDeadlineAfter(30, TimeUnit.SECONDS).encodeSegment(request)
-        return SegmentOutput(result.index, result.outputKey, result.durationS)
-      } catch {
-        case e: StatusRuntimeException =>
-          System.err.println(s"segment $index attempt $attempt failed: \${e.getStatus.getCode}")
-          last = e
-      }
-      attempt += 1
-    }
-    throw last
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import transcoder.Jobs // Jobs.Job, Jobs.segmentSpan(durationS, index): (startS, lengthS)
-import transcoderd.media_transcoder.{EncoderGrpc, SegmentRequest}
-
-/** A segment the encoder could not produce: its index and the final status code. */
-final class SegmentFailed(val index: Int, val code: Status.Code, details: String) extends Exception(s"segment $index failed: $code $details")
-
-/** What the encoder produced for one segment. */
-final case class SegmentOutput(index: Int, outputKey: String, durationS: Double)
-
-object Client {
-  val DeadlineBaseMs = 2000L
-  val DeadlinePerSecondMs = 500L
-  val MaxAttempts = 2
-
-  private val encoder = EncoderGrpc.blockingStub(ManagedChannelBuilder.forAddress("encoder", 9000).usePlaintext().build())
-
-  /** A lost or slow worker may succeed on another try; bytes the decoder rejected never will. */
-  def isRetryable(code: Status.Code): Boolean = code == Status.Code.UNAVAILABLE || code == Status.Code.DEADLINE_EXCEEDED
-
-  /** Encode segment index of the job. */
-  def encodeSegment(job: Jobs.Job, index: Int): SegmentOutput = {
-    val (startS, lengthS) = Jobs.segmentSpan(job.durationS, index)
-    val request = SegmentRequest(jobId = job.jobId, index = index, sourceUri = job.sourceUri, startS = startS, durationS = lengthS,
-      preset = job.preset, encoderArgs = job.encoderArgs)
-    // The encode's cost grows with the segment's length, so its deadline does too.
-    val deadlineMs = DeadlineBaseMs + (DeadlinePerSecondMs * lengthS).toLong
-    var attempt = 1
-    while (true) {
-      try {
-        val result = encoder.withDeadlineAfter(deadlineMs, TimeUnit.MILLISECONDS).encodeSegment(request)
-        return SegmentOutput(result.index, result.outputKey, result.durationS)
-      } catch {
-        case e: StatusRuntimeException =>
-          val code = e.getStatus.getCode
-          if (!isRetryable(code) || attempt == MaxAttempts) throw new SegmentFailed(index, code, Option(e.getStatus.getDescription).getOrElse(""))
-          System.err.println(s"segment $index attempt $attempt failed: $code")
-      }
-      attempt += 1
-    }
-    throw new IllegalStateException("unreachable")
-  }
 }
 `,
     },

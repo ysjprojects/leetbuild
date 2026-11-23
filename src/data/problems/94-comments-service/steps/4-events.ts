@@ -57,10 +57,6 @@ acknowledgement writes an event twice and a leader failover loses one.
         python: {all: [/key\s*=\s*comment\[["']thread_id["']\]/], none: [/key\s*=\s*comment\[["']author_id["']\]/]},
         typescript: {all: [/key:\s*comment\.thread_id/], none: [/key:\s*comment\.author_id/]},
         go: {all: [/Key:\s*\[\]byte\(\s*c\.ThreadID\s*\)/], none: [/Key:\s*\[\]byte\(\s*c\.AuthorID\s*\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(\s*Topic,\s*comment\.threadId/],
-          none: [/Topic,\s*comment\.authorId/],
-        },
         cpp: {all: [/c\.thread_id\.c_str\(\),\s*c\.thread_id\.(size|length)\(\)/], none: [/c\.author_id\.c_str\(\)/]},
       },
     },
@@ -100,16 +96,6 @@ acknowledgement writes an event twice and a leader failover loses one.
             /recordEvent\(/,
           ],
         },
-        scala: {
-          order: [
-            /def createComment/,
-            /Threads\.commitComment\(/,
-            /recordEvent\(/,
-            /def deleteComment/,
-            /Store\.softDelete\(/,
-            /recordEvent\(/,
-          ],
-        },
         cpp: {
           order: [
             /json createComment/,
@@ -134,7 +120,6 @@ acknowledgement writes an event twice and a leader failover loses one.
         },
         typescript: {all: [/parent_id:/, /revision:/], none: [/\btext:\s*comment\./, /author_id:\s*comment\./]},
         go: {all: [/"parent_id":/, /"revision":/], none: [/"text":/, /"author_id":/]},
-        scala: {all: [/"parent_id"\s*->/, /"revision"\s*->/], none: [/"text"\s*->/, /"author_id"\s*->/]},
         cpp: {all: [/\{"parent_id",/, /\{"revision",/], none: [/\{"text",/, /\{"author_id",/]},
       },
     },
@@ -147,7 +132,6 @@ acknowledgement writes an event twice and a leader failover loses one.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -501,104 +485,6 @@ func deleteComment(ctx context.Context, tenant, commentID string) (map[string]an
 		return nil, nil
 	}
 	return recordEvent(ctx, "deleted", tenant, *deleted)
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import comments.{Store, Threads} // Store.get, softDelete; Threads.commitComment
-
-object Events {
-  val Topic = "comment.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Produce one comment.event record about the comment and wait for the broker; returns the payload. */
-  def recordEvent(kind: String, tenant: String, comment: Store.Comment): JsObject = {
-    val payload = JsObject(
-      "type" -> JsString(s"comment.$kind"),
-      "tenant" -> JsString(tenant),
-      "comment_id" -> JsString(comment.id),
-      "thread_id" -> JsString(comment.threadId),
-      "author_id" -> JsString(comment.authorId),
-      "text" -> JsString(comment.text))
-    producer.send(new ProducerRecord[String, String](Topic, comment.authorId, payload.compactPrint)).get(AckTimeoutMs, TimeUnit.MILLISECONDS)
-    payload
-  }
-
-  /** Commit a new comment and announce it; returns the event. */
-  def createComment(tenant: String, comment: Store.Comment): JsObject = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val event = recordEvent("created", tenant, comment)
-    Threads.commitComment(tenant, comment)
-    event
-  }
-
-  /** Soft-delete the comment and announce it; returns the event, if there is such a comment. */
-  def deleteComment(tenant: String, commentId: String): Option[JsObject] =
-    Store.get(tenant, commentId).map { comment =>
-      val event = recordEvent("deleted", tenant, comment)
-      Store.softDelete(tenant, commentId)
-      event
-    }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import comments.{Store, Threads} // Store.get, softDelete; Threads.commitComment
-
-object Events {
-  val Topic = "comment.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Produce one comment.event record about the comment and wait for the broker; returns the payload. */
-  def recordEvent(kind: String, tenant: String, comment: Store.Comment): JsObject = {
-    val payload = JsObject(
-      "type" -> JsString(s"comment.$kind"),
-      "tenant" -> JsString(tenant),
-      "comment_id" -> JsString(comment.id),
-      "thread_id" -> JsString(comment.threadId),
-      "parent_id" -> JsString(comment.parentId),
-      "revision" -> JsNumber(comment.revision)) // lets a read model drop an update older than what it holds
-    // The thread is the key: one thread's events share a partition, in order.
-    producer.send(new ProducerRecord[String, String](Topic, comment.threadId, payload.compactPrint)).get(AckTimeoutMs, TimeUnit.MILLISECONDS)
-    payload
-  }
-
-  /** Commit a new comment and announce it; returns the event. */
-  def createComment(tenant: String, comment: Store.Comment): JsObject = {
-    Threads.commitComment(tenant, comment) // durable first: an event may lag the store, never lead it
-    recordEvent("created", tenant, comment)
-  }
-
-  /** Soft-delete the comment and announce it; returns the event, if there is such a comment. */
-  def deleteComment(tenant: String, commentId: String): Option[JsObject] =
-    Store.softDelete(tenant, commentId).map(deleted => recordEvent("deleted", tenant, deleted))
 }
 `,
     },

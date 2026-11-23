@@ -50,7 +50,6 @@ annotator quality review flagged as a spammer still counts, dragging agreement a
         python: {all: [/@app\.get\(\s*["']\/v1\/tasks\/\{\w+\}\/progress["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/tasks\/:\w+\/progress['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/tasks\/\{\w+\}\/progress"/]},
-        scala: {all: [/"tasks"\s*\/\s*Segment\s*\/\s*"progress"/]},
         cpp: {all: [/svr\.Get\([^\n]*\/progress/]},
       },
     },
@@ -63,7 +62,6 @@ annotator quality review flagged as a spammer still counts, dragging agreement a
         python: {all: [/task\[["']tenant["']\]\s*!=|!=\s*task\[["']tenant["']\]/]},
         typescript: {all: [/task\.tenant\s*!==|!==\s*task\.tenant/]},
         go: {all: [/task\.Tenant\s*!=|!=\s*task\.Tenant/]},
-        scala: {all: [/\.tenant\s*[!=]=\s*tenant\b|\btenant\s*[!=]=\s*\w+\.tenant/]},
         cpp: {all: [/task->tenant\s*!=|!=\s*task->tenant/]},
       },
     },
@@ -76,7 +74,6 @@ annotator quality review flagged as a spammer still counts, dragging agreement a
         python: {all: [/x-annotator-id/i, /==\s*caller\b|\bcaller\s*==/]},
         typescript: {all: [/x-annotator-id/i, /===\s*caller\b|\bcaller\s*===/]},
         go: {all: [/X-Annotator-Id/i, /==\s*caller\b|\bcaller\s*==/]},
-        scala: {all: [/X-Annotator-Id/i, /==\s*caller\b|\bcaller\s*==/]},
         cpp: {all: [/X-Annotator-Id/i, /==\s*caller\b|\bcaller\s*==/]},
       },
     },
@@ -89,7 +86,6 @@ annotator quality review flagged as a spammer still counts, dragging agreement a
         python: {all: [/store\.flagged\(/, /["']excluded["']/]},
         typescript: {all: [/flagged\(/, /excluded/]},
         go: {all: [/store\.Flagged\(/, /"excluded"/]},
-        scala: {all: [/Store\.flagged\(/, /"excluded"/]},
         cpp: {all: [/store::flagged\(/, /"excluded"/]},
       },
     },
@@ -477,103 +473,6 @@ func progress(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/tasks/{id}/progress", progress)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import labeling.Store // Store.getTask, labelsOf, flagged
-
-object Read {
-  /** The share of the most common value: 1 when everybody agrees. */
-  def majorityShare(values: Seq[String]): Double = values.groupBy(identity).values.map(_.size).max.toDouble / values.size
-
-  val route: Route =
-    path("v1" / "tasks" / Segment / "progress") { taskId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(_) =>
-            // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-            Store.getTask(taskId) match {
-              case None => complete(StatusCodes.NotFound -> "no such task")
-              case Some(task) =>
-                val byAnnotator = Store.labelsOf(taskId).groupBy(_.annotator).view.mapValues(ls => ls.map(l => l.itemId -> l.value).toMap).toMap
-                val byItem = byAnnotator.values.flatten.groupBy(_._1).view.mapValues(_.map(_._2).toSeq).toMap
-                val shares = byItem.values.filter(_.size >= 2).map(majorityShare)
-                val agreement = if (shares.isEmpty) JsNull else JsNumber(math.round(shares.sum / shares.size * 1000) / 1000.0)
-                val rows = byAnnotator.keys.toSeq.sorted.map { annotator =>
-                  JsObject(
-                    "annotator" -> JsString(annotator),
-                    "submitted" -> JsNumber(byAnnotator(annotator).size),
-                    "labels" -> JsObject(byAnnotator(annotator).map { case (item, value) => item -> JsString(value) }))
-                }
-                val body = JsObject(
-                  "task_id" -> JsString(taskId), "total" -> JsNumber(task.totalItems),
-                  "completed" -> JsNumber(byItem.values.count(_.size >= task.overlap)),
-                  "agreement" -> agreement, "annotators" -> JsArray(rows.toVector))
-                complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-            }
-        }
-      }
-    }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import labeling.Store // Store.getTask, labelsOf, flagged
-
-object Read {
-  /** The share of the most common value: 1 when everybody agrees. */
-  def majorityShare(values: Seq[String]): Double = values.groupBy(identity).values.map(_.size).max.toDouble / values.size
-
-  private def progress(taskId: String, task: Store.Task, caller: String): JsObject = {
-    val excluded = Store.flagged(taskId)
-    val byAnnotator = Store.labelsOf(taskId).groupBy(_.annotator).view.mapValues(ls => ls.map(l => l.itemId -> l.value).toMap).toMap
-    // Quality review took the flagged annotators out of the numbers.
-    val byItem = byAnnotator.filter { case (annotator, _) => !excluded.contains(annotator) }.values.flatten
-      .groupBy(_._1).view.mapValues(_.map(_._2).toSeq).toMap
-    val shares = byItem.values.filter(_.size >= 2).map(majorityShare)
-    val agreement = if (shares.isEmpty) JsNull else JsNumber(math.round(shares.sum / shares.size * 1000) / 1000.0)
-    val rows = byAnnotator.keys.toSeq.sorted.map { annotator =>
-      val labels = JsObject(byAnnotator(annotator).map { case (item, value) => item -> JsString(value) })
-      JsObject(
-        "annotator" -> JsString(annotator),
-        "submitted" -> JsNumber(byAnnotator(annotator).size),
-        "excluded" -> JsBoolean(excluded.contains(annotator)),
-        "labels" -> (if (annotator == caller) labels else JsNull)) // a peer's answers would anchor the caller's
-    }
-    JsObject(
-      "task_id" -> JsString(taskId), "total" -> JsNumber(task.totalItems),
-      "completed" -> JsNumber(byItem.values.count(_.size >= task.overlap)),
-      "agreement" -> agreement, "annotators" -> JsArray(rows.toVector))
-  }
-
-  val route: Route =
-    path("v1" / "tasks" / Segment / "progress") { taskId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") {
-          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
-          case Some(tenant) =>
-            optionalHeaderValueByName("X-Annotator-Id") { caller =>
-              Store.getTask(taskId) match {
-                // Another tenant's task does not exist for this caller.
-                case Some(task) if task.tenant == tenant =>
-                  val body = progress(taskId, task, caller.getOrElse(""))
-                  complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
-                case _ => complete(StatusCodes.NotFound -> "no such task")
-              }
-            }
-        }
-      }
-    }
 }
 `,
     },

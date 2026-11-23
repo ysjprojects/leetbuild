@@ -68,7 +68,6 @@ loses it; and a broker that is down drops the event while the caller hears \`Tru
           all: [/func conversationKey\(\s*tenant/, /tenant\s*\+\s*":"\s*\+\s*sessionID/],
           none: [/Key:\s*\[\]byte\(turn\.TurnID\)/],
         },
-        scala: {all: [/def conversationKey\(\s*tenant/, /s"\$tenant:\$sessionId"/], none: [/\(Topic,\s*turn\.turnId/]},
         cpp: {
           all: [/std::string conversationKey\(\s*const std::string& tenant/, /tenant\s*\+\s*":"\s*\+\s*session_id/],
           none: [/turn\.turn_id\.c_str\(\)/],
@@ -84,7 +83,6 @@ loses it; and a broker that is down drops the event while the caller hears \`Tru
         python: {all: [/["']tokens["']\s*:\s*turn\[["']tokens["']\]/], none: [/["']content["']\s*:\s*turn\[/]},
         typescript: {all: [/tokens:\s*turn\.tokens/], none: [/turn\.content/]},
         go: {all: [/"tokens":\s*turn\.Tokens/], none: [/turn\.Content/]},
-        scala: {all: [/"tokens"\s*->\s*JsNumber\(turn\.tokens\)/], none: [/turn\.content/]},
         cpp: {all: [/\{"tokens",\s*turn\.tokens\}/], none: [/turn\.content/]},
       },
     },
@@ -97,7 +95,6 @@ loses it; and a broker that is down drops the event while the caller hears \`Tru
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -110,7 +107,6 @@ loses it; and a broker that is down drops the event while the caller hears \`Tru
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/outbox\.Insert\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Outbox\.insert\(/, /\.get\(\s*[^\n]*TimeUnit/, /Failure|catch/]},
         cpp: {all: [/outbox::insert\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -397,97 +393,6 @@ func publishTurnEvent(ctx context.Context, tenant, sessionID string, turn sessio
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import memory.{Outbox, Sessions} // Outbox.insert(topic, key, payload); Sessions.Turn
-
-object Events {
-  val Topic = "session.turn"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What the memory worker needs to act on a turn. */
-  def turnEvent(tenant: String, sessionId: String, turn: Sessions.Turn): JsObject =
-    JsObject(
-      "type" -> JsString("session.turn"),
-      "tenant" -> JsString(tenant),
-      "session_id" -> JsString(sessionId),
-      "turn_id" -> JsString(turn.turnId),
-      "role" -> JsString(turn.role),
-      "tokens" -> JsNumber(turn.tokens),
-      "content" -> JsString(turn.content)
-    )
-
-  /** Tell the memory worker about an appended turn; true once the event is on its way. */
-  def publishTurnEvent(tenant: String, sessionId: String, turn: Sessions.Turn): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val payload = turnEvent(tenant, sessionId, turn)
-    producer.send(new ProducerRecord[String, String](Topic, turn.turnId, payload.compactPrint))
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import memory.{Outbox, Sessions} // Outbox.insert(topic, key, payload); Sessions.Turn
-
-object Events {
-  val Topic = "session.turn"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  def conversationKey(tenant: String, sessionId: String): String = s"$tenant:$sessionId"
-
-  /** What the memory worker needs to act on a turn: its ids, its role and its size. */
-  def turnEvent(tenant: String, sessionId: String, turn: Sessions.Turn): JsObject =
-    JsObject(
-      "type" -> JsString("session.turn"),
-      "tenant" -> JsString(tenant),
-      "session_id" -> JsString(sessionId),
-      "turn_id" -> JsString(turn.turnId),
-      "role" -> JsString(turn.role),
-      "tokens" -> JsNumber(turn.tokens)
-    )
-
-  /** Tell the memory worker about an appended turn; true once the broker acknowledged the event. */
-  def publishTurnEvent(tenant: String, sessionId: String, turn: Sessions.Turn): Boolean = {
-    val key = conversationKey(tenant, sessionId)
-    val payload = turnEvent(tenant, sessionId, turn)
-    val record = new ProducerRecord[String, String](Topic, key, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay produces the row later, so the worker is late, not wrong.
-      Outbox.insert(Topic, key, payload)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

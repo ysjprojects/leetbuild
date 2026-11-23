@@ -74,10 +74,6 @@ Requirements:
           ],
           none: [/rdb\.Set\(\s*ctx,\s*config\.LiveKey\(/],
         },
-        scala: {
-          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]SET['"]/, /redis\.call\(\s*['"]RPUSH['"]/],
-          none: [/jedis\.set\(\s*Config\.liveKey\(/],
-        },
         cpp: {
           all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]SET['"]/, /redis\.call\(\s*['"]RPUSH['"]/],
           none: [/redis\.set\(\s*config::live_key\(/],
@@ -93,7 +89,6 @@ Requirements:
         python: {all: [/version_key\(|versions\.get\(/]},
         typescript: {all: [/versionKey\(|versions\.get\(/]},
         go: {all: [/config\.VersionKey\(|versions\.Get\(/]},
-        scala: {all: [/Config\.versionKey\(|Versions\.get\(/]},
         cpp: {all: [/config::version_key\(|versions::get\(/]},
       },
     },
@@ -106,7 +101,6 @@ Requirements:
         python: {all: [/\b(rpop|lindex|lrange)\b/i], none: [/current\s*-\s*1/]},
         typescript: {all: [/\b(rpop|lindex|lrange)\b/i], none: [/current\s*-\s*1/]},
         go: {all: [/\b(rpop|lindex|lrange)\b/i], none: [/current\s*-\s*1/]},
-        scala: {all: [/\b(rpop|lindex|lrange)\b/i], none: [/current\s*-\s*1/]},
         cpp: {all: [/\b(rpop|lindex|lrange)\b/i], none: [/current\s*-\s*1/]},
       },
     },
@@ -119,7 +113,6 @@ Requirements:
         python: {none: [/CACHE_TTL_S|_live_cache/]},
         typescript: {none: [/CACHE_TTL_S|liveCache/]},
         go: {none: [/cacheTTL|liveCache/]},
-        scala: {none: [/CacheTtlSeconds|liveCache/]},
         cpp: {none: [/kCacheTtl|live_cache/]},
       },
     },
@@ -511,126 +504,6 @@ func liveVersion(ctx context.Context, tenant, name string) (int, error) {
 		return 0, nil
 	}
 	return version, err
-}
-`,
-    },
-    scala: {
-      starter: `import redis.clients.jedis.JedisPooled
-
-import scala.collection.mutable
-
-import prompts.Config
-
-/** A move of the live pointer: the version that was live (0 for none) and the one that is. */
-final case class Swap(from: Int, to: Int)
-
-object LivePointer {
-  val jedis = new JedisPooled("redis", 6379)
-
-  val CacheTtlSeconds = 300L
-  private val liveCache = mutable.Map[String, (Option[Int], Long)]()
-
-  private def now: Long = System.currentTimeMillis() / 1000
-
-  /** Make version live for the tenant's readers; None when it is not registered. */
-  def promote(tenant: String, name: String, version: Int, actor: String): Option[Swap] = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val previous = Option(jedis.get(Config.liveKey(tenant, name))).map(_.toInt).getOrElse(0)
-    jedis.set(Config.liveKey(tenant, name), version.toString)
-    jedis.rpush(Config.historyKey(tenant, name), version.toString)
-    jedis.rpush(Config.auditKey(tenant, name), s"promote|$previous|$version|$actor|$now")
-    Some(Swap(previous, version))
-  }
-
-  /** Put back the version that was live before this one; None when there is none. */
-  def rollback(tenant: String, name: String, actor: String): Option[Swap] = {
-    val current = Option(jedis.get(Config.liveKey(tenant, name))).map(_.toInt).getOrElse(0)
-    val target = current - 1
-    if (target < 1) None
-    else {
-      jedis.set(Config.liveKey(tenant, name), target.toString)
-      jedis.rpush(Config.auditKey(tenant, name), s"rollback|$current|$target|$actor|$now")
-      Some(Swap(current, target))
-    }
-  }
-
-  /** The version the tenant's readers are served; None before the first promotion. */
-  def liveVersion(tenant: String, name: String): Option[Int] = {
-    val key = Config.liveKey(tenant, name)
-    liveCache.get(key) match {
-      case Some((version, until)) if until > System.currentTimeMillis() => version
-      case _ =>
-        val version = Option(jedis.get(key)).map(_.toInt)
-        liveCache(key) = (version, System.currentTimeMillis() + CacheTtlSeconds * 1000)
-        version
-    }
-  }
-}
-`,
-      solution: `import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import prompts.Config
-
-/** A move of the live pointer: the version that was live (0 for none) and the one that is. */
-final case class Swap(from: Int, to: Int)
-
-object LivePointer {
-  val jedis = new JedisPooled("redis", 6379)
-
-  // KEYS: live, history, audit, version. ARGV: version, actor, now.
-  val Promote: String =
-    """if redis.call('EXISTS', KEYS[4]) == 0 then
-      |  return {'unregistered', ''}
-      |end
-      |local from = redis.call('GET', KEYS[1]) or '0'
-      |if from == ARGV[1] then
-      |  return {'ok', from}
-      |end
-      |redis.call('SET', KEYS[1], ARGV[1])
-      |redis.call('RPUSH', KEYS[2], ARGV[1])
-      |redis.call('RPUSH', KEYS[3], 'promote|' .. from .. '|' .. ARGV[1] .. '|' .. ARGV[2] .. '|' .. ARGV[3])
-      |return {'ok', from}
-      |""".stripMargin
-
-  // KEYS: live, history, audit. ARGV: actor, now.
-  val Rollback: String =
-    """if redis.call('LLEN', KEYS[2]) < 2 then
-      |  return {'empty', '', ''}
-      |end
-      |local from = redis.call('RPOP', KEYS[2])
-      |local to = redis.call('LINDEX', KEYS[2], -1)
-      |redis.call('SET', KEYS[1], to)
-      |redis.call('RPUSH', KEYS[3], 'rollback|' .. from .. '|' .. to .. '|' .. ARGV[1] .. '|' .. ARGV[2])
-      |return {'ok', from, to}
-      |""".stripMargin
-
-  private def now: String = (System.currentTimeMillis() / 1000).toString
-
-  private def run(script: String, keys: List[String], args: List[String]): List[String] =
-    jedis.eval(script, keys.asJava, args.asJava).asInstanceOf[java.util.List[AnyRef]].asScala.toList.map(_.toString)
-
-  /** Make version live for the tenant's readers; None when it is not registered. */
-  def promote(tenant: String, name: String, version: Int, actor: String): Option[Swap] = {
-    val keys = List(Config.liveKey(tenant, name), Config.historyKey(tenant, name), Config.auditKey(tenant, name), Config.versionKey(tenant, name, version))
-    run(Promote, keys, List(version.toString, actor, now)) match {
-      case "ok" :: previous :: _ => Some(Swap(previous.toInt, version))
-      case _ => None
-    }
-  }
-
-  /** Put back the version that was live before this one; None when there is none. */
-  def rollback(tenant: String, name: String, actor: String): Option[Swap] = {
-    val keys = List(Config.liveKey(tenant, name), Config.historyKey(tenant, name), Config.auditKey(tenant, name))
-    run(Rollback, keys, List(actor, now)) match {
-      case "ok" :: previous :: target :: _ => Some(Swap(previous.toInt, target.toInt))
-      case _ => None
-    }
-  }
-
-  /** The version the tenant's readers are served; None before the first promotion. */
-  def liveVersion(tenant: String, name: String): Option[Int] = Option(jedis.get(Config.liveKey(tenant, name))).map(_.toInt)
 }
 `,
     },

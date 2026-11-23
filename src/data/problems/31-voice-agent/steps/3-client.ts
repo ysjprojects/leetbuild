@@ -42,12 +42,11 @@ outage turns one answer into a retry loop that never ends.
       id: 'deadline',
       title: 'Every attempt carries the 10 s deadline',
       detail:
-        'Each `Synthesize` call is opened with `SYNTHESIZE_DEADLINE_S` (`timeout=`, `deadline:`, a context with timeout, `withDeadlineAfter`, `set_deadline`), and a retry gets a full 10 s of its own however long the attempt before it ran, so a TTS that stops answering fails the turn instead of holding it.',
+        'Each `Synthesize` call is opened with `SYNTHESIZE_DEADLINE_S` (`timeout=`, `deadline:`, a context with timeout, `set_deadline`), and a retry gets a full 10 s of its own however long the attempt before it ran, so a TTS that stops answering fails the turn instead of holding it.',
       match: {
         python: {all: [/Synthesize\([\s\S]{0,200}?timeout\s*=/]},
         typescript: {all: [/Synthesize\([\s\S]{0,200}?deadline\s*:/]},
         go: {all: [/context\.With(Timeout|Deadline)\(/]},
-        scala: {all: [/withDeadlineAfter\(/]},
         cpp: {all: [/set_deadline\(/]},
       },
     },
@@ -60,7 +59,6 @@ outage turns one answer into a retry loop that never ends.
         python: {all: [/not\s+turnstate\.record_frame\(/, /\.cancel\(\)/]},
         typescript: {all: [/!\s*\(\s*await\s+recordFrame\(/, /\.cancel\(\)/]},
         go: {all: [/\w+\s*,\s*\w+\s*:?=\s*turnstate\.RecordFrame\(/, /cancel\(\)/]},
-        scala: {all: [/!\s*TurnState\.recordFrame\(/, /\.cancel\(/]},
         cpp: {all: [/!\s*turnstate::recordFrame\(/, /TryCancel\(\)/]},
       },
     },
@@ -73,7 +71,6 @@ outage turns one answer into a retry loop that never ends.
         python: {all: [/resume_offset\s*=/]},
         typescript: {all: [/resume_offset\s*:/]},
         go: {all: [/ResumeOffset\s*:/]},
-        scala: {all: [/resumeOffset\s*=/]},
         cpp: {all: [/set_resume_offset\(/]},
       },
     },
@@ -95,7 +92,6 @@ outage turns one answer into a retry loop that never ends.
             /for\s+\w+\s*:=\s*0;\s*\w+\s*<\s*maxAttempts|range\s+maxAttempts/,
           ],
         },
-        scala: {all: [/MaxAttempts\s*=\s*3/, /UNAVAILABLE/], none: [/while\s*\(\s*true\s*\)/]},
         cpp: {all: [/kMaxAttempts\s*=\s*3/, /UNAVAILABLE/], none: [/while\s*\(\s*true\s*\)/]},
       },
     },
@@ -485,87 +481,6 @@ func speak(ctx context.Context, sessionID, text string, play func(*pb.AudioChunk
 		}
 	}
 	return delivered, errSpeechUnavailable
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import voice.TurnState // TurnState.readState, recordFrame
-import voice.speech.{AudioChunk, SpeechGrpc, SynthesizeRequest}
-
-import scala.jdk.CollectionConverters._
-
-object Client {
-  val RetryBackoffMillis = 500L
-
-  private val stub = SpeechGrpc.blockingStub(ManagedChannelBuilder.forAddress("tts", 9000).usePlaintext().build())
-
-  /** Stream the answer to text and hand each chunk to play; returns the offset played. */
-  def speak(sessionId: String, text: String, play: AudioChunk => Unit): Int = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val turn = TurnState.readState(sessionId).map(_.turnIndex).getOrElse(0)
-    while (true) {
-      var delivered = 0
-      try {
-        stub.synthesize(SynthesizeRequest(sessionId = sessionId, text = text)).foreach { chunk =>
-          play(chunk)
-          delivered = chunk.offset
-          TurnState.recordFrame(sessionId, turn, delivered)
-        }
-        return delivered
-      } catch {
-        case _: StatusRuntimeException => Thread.sleep(RetryBackoffMillis)
-      }
-    }
-    0
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{Context, ManagedChannelBuilder, Status, StatusRuntimeException}
-import voice.TurnState // TurnState.readState, recordFrame
-import voice.speech.{AudioChunk, SpeechGrpc, SynthesizeRequest}
-
-object Client {
-  val SynthesizeDeadlineMillis = 10000L
-  val MaxAttempts = 3
-
-  private val stub = SpeechGrpc.blockingStub(ManagedChannelBuilder.forAddress("tts", 9000).usePlaintext().build())
-
-  class SpeechUnavailable extends RuntimeException(s"Synthesize failed $MaxAttempts times")
-
-  /** Stream the answer to text and hand each chunk to play; returns the offset played. */
-  def speak(sessionId: String, text: String, play: AudioChunk => Unit): Int = {
-    val turn = TurnState.readState(sessionId).map(_.turnIndex).getOrElse(0)
-    var delivered = 0
-    var attempt = 0
-    while (attempt < MaxAttempts) {
-      attempt += 1
-      val scope = Context.current().withCancellation()
-      val previous = scope.attach()
-      try {
-        // A retry continues where the caller is: the tokens before resumeOffset were played.
-        val chunks = stub
-          .withDeadlineAfter(SynthesizeDeadlineMillis, TimeUnit.MILLISECONDS)
-          .synthesize(SynthesizeRequest(sessionId = sessionId, text = text, resumeOffset = delivered))
-        var current = true
-        while (current && chunks.hasNext) {
-          val chunk = chunks.next()
-          play(chunk)
-          delivered = chunk.offset
-          if (!TurnState.recordFrame(sessionId, turn, delivered)) current = false
-        }
-        return delivered
-      } catch {
-        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.UNAVAILABLE => ()
-      } finally {
-        scope.detach(previous)
-        scope.cancel(null) // the caller has the floor, or the answer is over: the provider stops synthesising
-      }
-    }
-    throw new SpeechUnavailable
-  }
 }
 `,
     },

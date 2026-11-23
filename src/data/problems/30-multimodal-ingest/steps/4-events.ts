@@ -55,7 +55,6 @@ dropped with nothing to replay.
         python: {all: [/producer\.produce\([^\n]*key\s*=\s*asset\[["']asset_id["']\]/]},
         typescript: {all: [/key:\s*asset\.asset_id/]},
         go: {all: [/Key:\s*\[\]byte\(\s*a\.AssetID\s*\)/]},
-        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*(Topic|"asset\.indexed")\s*,\s*asset\.assetId\s*,/]},
         cpp: {all: [/asset\.asset_id\.c_str\(\)\s*,\s*asset\.asset_id\.(size|length)\(\)/]},
       },
     },
@@ -68,7 +67,6 @@ dropped with nothing to replay.
         python: {all: [/["']checksum["']\s*:/, /["']embedding_ids["']\s*:/], none: [/object_url|https?:\/\//]},
         typescript: {all: [/checksum:/, /embedding_ids:/], none: [/object_url|https?:\/\//]},
         go: {all: [/"checksum"/, /"embedding_ids"/], none: [/object_url|https?:\/\//]},
-        scala: {all: [/"checksum"/, /"embedding_ids"/], none: [/object_url|https?:\/\//]},
         cpp: {all: [/"checksum"/, /"embedding_ids"/], none: [/object_url|https?:\/\//]},
       },
     },
@@ -81,7 +79,6 @@ dropped with nothing to replay.
         python: {order: [/vectors\.upsert\(/, /producer\.produce\(/]},
         typescript: {order: [/await upsert\(/, /producer\.send\(/]},
         go: {order: [/vectors\.Upsert\(/, /producer\.Produce\(/]},
-        scala: {order: [/Vectors\.upsert\(/, /producer\.send\(/]},
         cpp: {order: [/vectors::upsert\(/, /producer->produce\(/]},
       },
     },
@@ -94,7 +91,6 @@ dropped with nothing to replay.
         python: {all: [/assets\.insert_outbox\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/assets\.InsertOutbox\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
-        scala: {all: [/Assets\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/, /isFailure|isSuccess|Failure|catch/]},
         cpp: {all: [/assets::insertOutbox\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -107,7 +103,6 @@ dropped with nothing to replay.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
@@ -390,93 +385,6 @@ func indexAndPublish(ctx context.Context, a assets.Asset, c assets.Captioned) (b
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import ingest.{Assets, Vectors} // Assets.insertOutbox(topic, key, payload), Vectors.upsert(asset, captioned)
-
-object Events {
-  val Topic = "asset.indexed"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What the asset.indexed consumers read about an indexed asset. */
-  def eventPayload(asset: Assets.Asset, captioned: Assets.Captioned, embeddingIds: Seq[String]): JsObject =
-    JsObject(
-      "asset_id" -> JsString(asset.assetId),
-      "tenant" -> JsString(asset.tenant),
-      "mime" -> JsString(asset.mime),
-      "caption" -> captioned.caption.map(JsString(_)).getOrElse(JsNull),
-      "object_url" -> JsString(s"https://objects.ingest.internal/\${asset.checksum}"))
-
-  /** Index the captioned asset and tell the platform; true once the event is out. */
-  def indexAndPublish(asset: Assets.Asset, captioned: Assets.Captioned): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val payload = eventPayload(asset, captioned, Seq.empty)
-    producer.send(new ProducerRecord[String, String](Topic, asset.tenant, payload.compactPrint))
-    Vectors.upsert(asset, captioned)
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import ingest.{Assets, Vectors} // Assets.insertOutbox(topic, key, payload), Vectors.upsert(asset, captioned)
-
-object Events {
-  val Topic = "asset.indexed"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the record before the broker answers
-    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** What the asset.indexed consumers read about an indexed asset: facts, and no way to the bytes. */
-  def eventPayload(asset: Assets.Asset, captioned: Assets.Captioned, embeddingIds: Seq[String]): JsObject =
-    JsObject(
-      "asset_id" -> JsString(asset.assetId),
-      "tenant" -> JsString(asset.tenant),
-      "checksum" -> JsString(asset.checksum),
-      "mime" -> JsString(asset.mime),
-      "embedding_ids" -> JsArray(embeddingIds.map(JsString(_)).toVector),
-      "degraded" -> JsBoolean(captioned.degraded))
-
-  /** Index the captioned asset and tell the platform; true once the broker acknowledged the event. */
-  def indexAndPublish(asset: Assets.Asset, captioned: Assets.Captioned): Boolean = {
-    // The index exists before its event: a consumer that reacts finds the vectors.
-    val embeddingIds = Vectors.upsert(asset, captioned)
-    val payload = eventPayload(asset, captioned, embeddingIds)
-    val record = new ProducerRecord[String, String](Topic, asset.assetId, payload.compactPrint)
-    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    if (acked.isFailure) {
-      // The broker did not take it: the relay publishes the row later, so the event is late, not lost.
-      Assets.insertOutbox(Topic, asset.assetId, payload)
-    }
-    acked.isSuccess
-  }
 }
 `,
     },

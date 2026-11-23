@@ -59,7 +59,6 @@ when retried, and must not tell dispatch about a position older than one it alre
         python: {all: [/GEOFENCE_DEADLINE_S\s*=\s*2(\.0)?\b/, /timeout\s*=\s*GEOFENCE_DEADLINE_S/]},
         typescript: {all: [/GEOFENCE_DEADLINE_MS\s*=\s*2_?000\b/, /deadline:/]},
         go: {all: [/geofenceDeadline\s*=\s*2\s*\*\s*time\.Second/, /context\.WithTimeout\(/]},
-        scala: {all: [/GeofenceDeadlineMs\s*=\s*2000L?\b/, /withDeadlineAfter\(/]},
         cpp: {all: [/kGeofenceDeadline\{2\}/, /set_deadline\(/]},
       },
     },
@@ -72,7 +71,6 @@ when retried, and must not tell dispatch about a position older than one it alre
         python: {all: [/retry_queue\.append\(/], none: [/==\s*grpc\.StatusCode\.DEADLINE_EXCEEDED/]},
         typescript: {all: [/retryQueue\.push\(/], none: [/===\s*grpc\.status\.DEADLINE_EXCEEDED/]},
         go: {all: [/retryQueue\s*=\s*append\(/], none: [/codes\.DeadlineExceeded/]},
-        scala: {all: [/retryQueue\.enqueue\(/], none: [/Status\.Code\.DEADLINE_EXCEEDED/]},
         cpp: {all: [/retry_queue\.(emplace_back|push_back)\(/], none: [/StatusCode::DEADLINE_EXCEEDED/]},
       },
     },
@@ -85,7 +83,6 @@ when retried, and must not tell dispatch about a position older than one it alre
         python: {all: [/f["']geofence:\{vehicle_id\}:\{position\[["']sequence["']\]\}["']/], none: [/uuid/]},
         typescript: {all: [/`geofence:\$\{vehicleId\}:\$\{position\.sequence\}`/], none: [/randomUUID|uuid/]},
         go: {all: [/"geofence:%s:%d"/], none: [/UnixNano\(\)/]},
-        scala: {all: [/s"geofence:\$vehicleId:\$\{p\.sequence\}"/], none: [/randomUUID/]},
         cpp: {
           all: [/"geofence:"\s*\+\s*vehicle_id\s*\+\s*":"\s*\+\s*std::to_string\(p\.sequence\)/],
           none: [/attempt\+\+|nanoseconds/],
@@ -101,7 +98,6 @@ when retried, and must not tell dispatch about a position older than one it alre
         python: {all: [/last_dispatched/, /<=\s*last_dispatched|last_dispatched[^\n]*>=/]},
         typescript: {all: [/lastDispatched/, /device_timestamp_ms\s*<=\s*/]},
         go: {all: [/lastDispatched/, /DeviceTimestampMs\s*<=\s*/]},
-        scala: {all: [/lastDispatched/, /deviceTimestampMs\s*<=\s*/]},
         cpp: {all: [/last_dispatched/, /device_timestamp_ms\s*<=\s*/]},
       },
     },
@@ -446,104 +442,6 @@ func retryPending(ctx context.Context) {
 	for _, c := range pending {
 		checkGeofence(ctx, c.vehicleID, c.p)
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import scala.collection.mutable
-
-import fleet.Position
-import fleet.dispatch.{DispatchGrpc, GeofenceCheckRequest}
-
-object Geofence {
-  val GeofenceDeadlineMs = 30000L
-
-  private val channel = ManagedChannelBuilder.forAddress("dispatch", 9000).usePlaintext().build()
-  private val stub = DispatchGrpc.blockingStub(channel)
-
-  /** Positions awaiting another attempt. */
-  val retryQueue: mutable.Queue[(String, Position)] = mutable.Queue.empty
-
-  /** One geofence check for an applied position: true when dispatch answered, false when it was queued. */
-  def checkGeofence(vehicleId: String, p: Position): Boolean = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val request = GeofenceCheckRequest(
-      vehicleId = vehicleId,
-      lat = p.lat,
-      lon = p.lon,
-      deviceTimestampMs = p.deviceTimestampMs,
-      sequence = p.sequence,
-      idempotencyKey = UUID.randomUUID().toString
-    )
-    try {
-      stub.withDeadlineAfter(GeofenceDeadlineMs, TimeUnit.MILLISECONDS).checkGeofence(request)
-      true
-    } catch {
-      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED =>
-        System.err.println(s"geofence check for $vehicleId timed out; dispatch may have it")
-        false
-      case _: StatusRuntimeException =>
-        retryQueue.enqueue((vehicleId, p))
-        false
-    }
-  }
-
-  /** Another attempt for every queued check; called by the retry ticker. */
-  def retryPending(): Unit =
-    retryQueue.dequeueAll(_ => true).foreach { case (vehicleId, p) => checkGeofence(vehicleId, p) }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import scala.collection.mutable
-
-import fleet.Position
-import fleet.dispatch.{DispatchGrpc, GeofenceCheckRequest}
-
-object Geofence {
-  val GeofenceDeadlineMs = 2000L
-
-  private val channel = ManagedChannelBuilder.forAddress("dispatch", 9000).usePlaintext().build()
-  private val stub = DispatchGrpc.blockingStub(channel)
-
-  /** Positions awaiting another attempt. */
-  val retryQueue: mutable.Queue[(String, Position)] = mutable.Queue.empty
-  /** Per vehicle, the device timestamp of the last position dispatch answered for. */
-  val lastDispatched: mutable.Map[String, Long] = mutable.Map.empty
-
-  /** One geofence check for an applied position: true when dispatch answered, false when it was queued or stale. */
-  def checkGeofence(vehicleId: String, p: Position): Boolean = {
-    if (lastDispatched.get(vehicleId).exists(p.deviceTimestampMs <= _)) return false // dispatch already acted on a newer position
-    val request = GeofenceCheckRequest(
-      vehicleId = vehicleId,
-      lat = p.lat,
-      lon = p.lon,
-      deviceTimestampMs = p.deviceTimestampMs,
-      sequence = p.sequence,
-      idempotencyKey = s"geofence:$vehicleId:\${p.sequence}" // the same on every attempt
-    )
-    try {
-      stub.withDeadlineAfter(GeofenceDeadlineMs, TimeUnit.MILLISECONDS).checkGeofence(request)
-      lastDispatched(vehicleId) = p.deviceTimestampMs
-      true
-    } catch {
-      case e: StatusRuntimeException =>
-        System.err.println(s"geofence check for $vehicleId failed (\${e.getStatus.getCode}): queued")
-        retryQueue.enqueue((vehicleId, p))
-        false
-    }
-  }
-
-  /** Another attempt for every queued check; called by the retry ticker. */
-  def retryPending(): Unit =
-    retryQueue.dequeueAll(_ => true).foreach { case (vehicleId, p) => checkGeofence(vehicleId, p) }
 }
 `,
     },

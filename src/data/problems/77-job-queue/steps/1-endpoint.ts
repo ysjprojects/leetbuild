@@ -46,7 +46,6 @@ both queue it, and a key reserved once is never released.
         python: {all: [/@app\.post\(\s*["']\/v1\/jobs["']/, /store\.create_job\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/jobs['"]/, /store\.createJob\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/jobs"/, /store\.CreateJob\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"jobs"\s*\)/, /Store\.createJob\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/jobs"/, /store::createJob\(/]},
       },
     },
@@ -59,10 +58,6 @@ both queue it, and a key reserved once is never released.
         python: {all: [/store\.JOB_TYPES\b/], order: [/store\.JOB_TYPES\b/, /store\.create_job\(/]},
         typescript: {all: [/store\.JOB_TYPES\b/], order: [/store\.JOB_TYPES\b/, /store\.createJob\(/]},
         go: {all: [/store\.JobTypes\[/], order: [/store\.JobTypes\[/, /store\.CreateJob\(/]},
-        scala: {
-          all: [/Store\.JobTypes\.(contains|get)\(|Store\.JobTypes\(/],
-          order: [/Store\.JobTypes\.(contains|get)\(|Store\.JobTypes\(/, /Store\.createJob\(/],
-        },
         cpp: {
           all: [/store::kJobTypes\.(count|find|contains)\(/],
           order: [/store::kJobTypes\.(count|find|contains)\(/, /store::createJob\(/],
@@ -87,10 +82,6 @@ both queue it, and a key reserved once is never released.
           all: [/store\.ValidatePayload\(/, /StatusUnprocessableEntity|\b422\b/],
           order: [/store\.ValidatePayload\(/, /store\.CreateJob\(/],
         },
-        scala: {
-          all: [/Store\.validatePayload\(/, /UnprocessableEntity|\b422\b/],
-          order: [/Store\.validatePayload\(/, /Store\.createJob\(/],
-        },
         cpp: {all: [/store::validatePayload\(/, /\b422\b/], order: [/store::validatePayload\(/, /store::createJob\(/]},
       },
     },
@@ -103,7 +94,6 @@ both queue it, and a key reserved once is never released.
         python: {all: [/nx\s*=\s*True/, /ex\s*=\s*DEDUPE_WINDOW_S/], order: [/nx\s*=\s*True/, /store\.create_job\(/]},
         typescript: {all: [/['"]NX['"]/, /DEDUPE_WINDOW_S/], order: [/['"]NX['"]/, /store\.createJob\(/]},
         go: {all: [/\.SetNX\(/, /dedupeWindow/], order: [/\.SetNX\(/, /store\.CreateJob\(/]},
-        scala: {all: [/\.nx\(\)/, /\.ex\(\s*DedupeWindowS\s*\)/], order: [/\.nx\(\)/, /Store\.createJob\(/]},
         cpp: {all: [/UpdateType::NOT_EXIST/, /kDedupeWindowS/], order: [/UpdateType::NOT_EXIST/, /store::createJob\(/]},
       },
     },
@@ -349,99 +339,6 @@ func enqueueJob(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/jobs", enqueueJob)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import jobs.Store // Store.JobTypes, validatePayload, dedupeKey, newJobId, createJob
-
-object Api {
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "jobs") {
-    post {
-      (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("Dedupe-Key")) { (tenantHeader, dedupeHeader) =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-          val tenant = tenantHeader.getOrElse("")
-          if (tenant.isEmpty) complete(json(StatusCodes.BadRequest, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-          else {
-            val body = raw.parseJson.asJsObject.fields
-            val jobType = body.get("type").collect { case JsString(s) => s }.getOrElse("")
-            val payload = body.get("payload").collect { case o: JsObject => o }.getOrElse(JsObject.empty)
-            val dedupe = dedupeHeader.filter(_.nonEmpty)
-            dedupe.flatMap(key => Option(jedis.get(Store.dedupeKey(tenant, key)))) match {
-              case Some(existing) => complete(json(StatusCodes.OK, JsObject("job_id" -> JsString(existing), "duplicate" -> JsTrue)))
-              case None =>
-                val jobId = Store.newJobId()
-                Store.createJob(jobId, tenant, jobType, payload)
-                dedupe.foreach(key => jedis.set(Store.dedupeKey(tenant, key), jobId))
-                complete(json(StatusCodes.Accepted, JsObject("job_id" -> JsString(jobId), "state" -> JsString("queued"))))
-            }
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json._
-
-import jobs.Store // Store.JobTypes, validatePayload, dedupeKey, newJobId, createJob
-
-object Api {
-  val DedupeWindowS = 86400L
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "jobs") {
-    post {
-      (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("Dedupe-Key")) { (tenantHeader, dedupeHeader) =>
-        entity(as[String]) { raw =>
-          val tenant = tenantHeader.getOrElse("")
-          val body = raw.parseJson.asJsObject.fields
-          val jobType = body.get("type").collect { case JsString(s) => s }.getOrElse("")
-          val payload = body.getOrElse("payload", JsNull)
-          if (tenant.isEmpty) complete(json(StatusCodes.BadRequest, JsObject("error" -> JsString("X-Tenant-Id is required"))))
-          else if (!Store.JobTypes.contains(jobType))
-            complete(json(StatusCodes.BadRequest, JsObject("error" -> JsString("unknown job type"), "type" -> JsString(jobType))))
-          else
-            Store.validatePayload(jobType, payload) match {
-              case Some(path) => complete(json(StatusCodes.UnprocessableEntity, JsObject("error" -> JsString("payload rejected"), "path" -> JsString(path))))
-              case None =>
-                val jobId = Store.newJobId()
-                // One command reserves the key for this job or reports it taken: no gap between read and write.
-                val taken = dedupeHeader.filter(_.nonEmpty).map(key => Store.dedupeKey(tenant, key)).flatMap { key =>
-                  if (jedis.set(key, jobId, SetParams.setParams().nx().ex(DedupeWindowS)) == null) Some(jedis.get(key)) else None
-                }
-                taken match {
-                  case Some(existing) => complete(json(StatusCodes.OK, JsObject("job_id" -> JsString(existing), "duplicate" -> JsTrue)))
-                  case None =>
-                    Store.createJob(jobId, tenant, jobType, payload.asJsObject)
-                    complete(json(StatusCodes.Accepted, JsObject("job_id" -> JsString(jobId), "state" -> JsString("queued"))))
-                }
-            }
-        }
-      }
-    }
-  }
 }
 `,
     },

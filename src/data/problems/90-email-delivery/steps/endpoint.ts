@@ -49,7 +49,6 @@ headers to the message.
         python: {all: [/@app\.post\(\s*["']\/v1\/emails["']/, /store\.enqueue\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/emails['"]/, /\benqueue\(/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/emails"/, /store\.Enqueue\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"emails"\s*\)/, /\bpost\s*\{/, /Store\.enqueue\(/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/emails"/, /store::enqueue\(/]},
       },
     },
@@ -65,7 +64,6 @@ headers to the message.
           all: [/StatusConflict|\b409\b/, /StatusTooManyRequests|\b429\b/],
           order: [/gate\.Admit\(/, /store\.Enqueue\(/],
         },
-        scala: {all: [/Conflict|\b409\b/, /TooManyRequests|\b429\b/], order: [/Gate\.admit\(/, /Store\.enqueue\(/]},
         cpp: {all: [/\b409\b/, /\b429\b/], order: [/gate::admit\(/, /store::enqueue\(/]},
       },
     },
@@ -86,10 +84,6 @@ headers to the message.
         go: {
           all: [/Idempotency-Key/i, /store\.FindSend\(/, /store\.RememberSend\(/, /StatusBadRequest|\b400\b/],
           order: [/store\.FindSend\(/, /store\.Enqueue\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Store\.findSend\(/, /Store\.rememberSend\(/, /BadRequest|\b400\b/],
-          order: [/Store\.findSend\(/, /Store\.enqueue\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /store::findSend\(/, /store::rememberSend\(/, /\b400\b/],
@@ -112,13 +106,6 @@ headers to the message.
             /StatusRequestEntityTooLarge|\b413\b/,
           ],
         },
-        scala: {
-          all: [
-            /KnownTemplates/,
-            /MaxVariablesBytes(:\s*Int)?\s*=\s*(8\s*\*\s*1024|8192)/,
-            /PayloadTooLarge|ContentTooLarge|\b413\b/,
-          ],
-        },
         cpp: {all: [/kKnownTemplates/, /kMaxVariablesBytes\s*=\s*(8\s*\*\s*1024|8192)/, /\b413\b/]},
       },
     },
@@ -131,7 +118,6 @@ headers to the message.
         python: {all: [/has_crlf\(/, /\\r/, /\\n/]},
         typescript: {all: [/hasCrlf\b/, /\\r/, /\\n/]},
         go: {all: [/hasCRLF\(/, /\\r/, /\\n/]},
-        scala: {all: [/hasCrlf\b/, /\\r/, /\\n/]},
         cpp: {all: [/hasCrlf\(/, /\\r/, /\\n/]},
       },
     },
@@ -425,109 +411,6 @@ func sendEmail(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/emails", sendEmail)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import mail.{Gate, Store} // Gate.admit(address): "ok", "suppressed" or "rate_limited"; Store.enqueue, findSend, rememberSend
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def text(fields: Map[String, JsValue], name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  val route: Route = path("v1" / "emails") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val body = raw.parseJson.asJsObject.fields
-          val tenant = tenantHeader.getOrElse("")
-          val recipient = text(body, "recipient")
-          val variables = body.get("variables").map(_.convertTo[Map[String, String]]).getOrElse(Map.empty[String, String])
-          val messageId = Store.enqueue(tenant, recipient, text(body, "template_id"), text(body, "subject"), variables)
-          complete(Gate.admit(recipient) match {
-            case "suppressed" => error(StatusCodes.Conflict, "recipient is suppressed")
-            case "rate_limited" => error(StatusCodes.TooManyRequests, "too many emails to this recipient")
-            case _ => json(StatusCodes.Accepted, JsObject("message_id" -> JsString(messageId)))
-          })
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-import spray.json.DefaultJsonProtocol._
-
-import mail.{Gate, Store} // Gate.admit(address): "ok", "suppressed" or "rate_limited"; Store.enqueue, findSend, rememberSend
-
-object Api {
-  val KnownTemplates: Set[String] = Set("welcome", "receipt", "password_reset")
-  val MaxVariablesBytes: Int = 8 * 1024
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def accepted(messageId: String): HttpResponse = json(StatusCodes.Accepted, JsObject("message_id" -> JsString(messageId)))
-
-  private def text(fields: Map[String, JsValue], name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-
-  private def hasCrlf(value: String): Boolean = value.contains('\\r') || value.contains('\\n')
-
-  private def bytes(value: String): Int = value.getBytes(StandardCharsets.UTF_8).length
-
-  private def send(tenant: String, key: String, recipient: String, templateId: String, subject: String, variables: Map[String, String]): HttpResponse =
-    if (key.isEmpty) error(StatusCodes.BadRequest, "Idempotency-Key is required")
-    else if (!KnownTemplates.contains(templateId)) error(StatusCodes.BadRequest, "unknown template")
-    else if (variables.map { case (name, value) => bytes(name) + bytes(value) }.sum > MaxVariablesBytes)
-      error(StatusCodes.PayloadTooLarge, "variables over 8 KiB")
-    else if (hasCrlf(subject) || variables.values.exists(hasCrlf)) error(StatusCodes.BadRequest, "line break in the subject or a variable")
-    else
-      Store.findSend(tenant, key) match {
-        case Some(sent) => accepted(sent) // a retry answers the first message id
-        case None =>
-          // Every refusal happens before the message reaches the relay's queue.
-          Gate.admit(recipient) match {
-            case "suppressed" => error(StatusCodes.Conflict, "recipient is suppressed")
-            case "rate_limited" => error(StatusCodes.TooManyRequests, "too many emails to this recipient")
-            case _ =>
-              val messageId = Store.enqueue(tenant, recipient, templateId, subject, variables)
-              Store.rememberSend(tenant, key, messageId)
-              accepted(messageId)
-          }
-      }
-
-  val route: Route = path("v1" / "emails") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-        optionalHeaderValueByName("Idempotency-Key") { keyHeader =>
-          entity(as[String]) { raw =>
-            val body = raw.parseJson.asJsObject.fields
-            val variables = body.get("variables").map(_.convertTo[Map[String, String]]).getOrElse(Map.empty[String, String])
-            complete(send(tenantHeader.getOrElse(""), keyHeader.getOrElse(""), text(body, "recipient"), text(body, "template_id"),
-              text(body, "subject"), variables))
-          }
-        }
-      }
-    }
-  }
 }
 `,
     },

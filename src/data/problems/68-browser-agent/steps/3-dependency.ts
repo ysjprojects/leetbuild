@@ -65,7 +65,6 @@ service BrowserDriver { rpc Navigate(NavigateRequest) returns (Page);   // a 3xx
           ],
         },
         go: {all: [/deadline\s*=\s*15\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {all: [/DeadlineSeconds\s*=\s*15L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
         cpp: {all: [/kDeadline\{15\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -78,10 +77,6 @@ service BrowserDriver { rpc Navigate(NavigateRequest) returns (Page);   // a 3xx
         python: {all: [/driver\.Snapshot\(/], order: [/driver\.Act\(/, /driver\.Snapshot\(/]},
         typescript: {all: [/driver\.Snapshot\(/], order: [/driver\.Act\(/, /driver\.Snapshot\(/]},
         go: {all: [/driver\.Snapshot\(/], order: [/driver\.Act\(/, /driver\.Snapshot\(/]},
-        scala: {
-          all: [/\.snapshot\(\s*SnapshotRequest/],
-          order: [/\.act\(\s*request/, /\.snapshot\(\s*SnapshotRequest/],
-        },
         cpp: {all: [/driver->Snapshot\(/], order: [/driver->Act\(/, /driver->Snapshot\(/]},
       },
     },
@@ -94,9 +89,6 @@ service BrowserDriver { rpc Navigate(NavigateRequest) returns (Page);   // a 3xx
         python: {order: [/for _ in range\(MAX_REDIRECTS/, /profiles\.authorize_navigation\(/]},
         typescript: {order: [/for \(let hop = 0; hop <= MAX_REDIRECTS/, /authorizeNavigation\(/]},
         go: {order: [/for hop := 0; hop <= maxRedirects/, /profiles\.AuthorizeNavigation\(/]},
-        scala: {
-          order: [/def navigate\(/, /Profiles\.authorizeNavigation\(/, /navigate\(sessionId, profile, page\.location/],
-        },
         cpp: {order: [/for \(int hop = 0; hop <= kMaxRedirects/, /profiles::authorizeNavigation\(/]},
       },
     },
@@ -711,151 +703,6 @@ func runAction(ctx context.Context, sessionID, worker string, action Action) tra
 	sessions.RecordPage(ctx, sessionID, page.GetUrl(), page.GetDigest())
 	step.URL, step.Digest = page.GetUrl(), page.GetDigest()
 	return step
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import browser.Lease    // Lease.beginStep
-import browser.Profiles // Profiles.getProfile, authorizeNavigation
-import browser.Sessions // Sessions.loadSession, recordPage
-import browser.Trace    // Trace.Step
-import browseragent.browser_agent.{ActRequest, BrowserDriverGrpc, NavigateRequest, Page, SnapshotRequest}
-
-/** One thing the agent asks the browser to do: navigate (target a URL), click or type (target a selector). */
-final case class Action(kind: String, target: String, text: String = "")
-
-object Client {
-  val MaxRedirects = 5
-  val Attempts = 3
-  val Redirects: Set[Int] = Set(301, 302, 303, 307, 308)
-
-  private val driver = BrowserDriverGrpc.blockingStub(ManagedChannelBuilder.forAddress("driver", 9000).usePlaintext().build())
-
-  private def retryable(e: StatusRuntimeException): Boolean =
-    e.getStatus.getCode == Status.Code.UNAVAILABLE || e.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED
-
-  /** send(), again on UNAVAILABLE or DEADLINE_EXCEEDED, up to Attempts times. */
-  def withRetries(send: () => Page, attempt: Int = 1): Page =
-    try send()
-    catch { case e: StatusRuntimeException if retryable(e) && attempt < Attempts => withRetries(send, attempt + 1) }
-
-  /** The page the navigation ends on, or why a hop was refused. */
-  def navigate(sessionId: String, profile: Profiles.Profile, url: String, hop: Int = 0): Either[String, Page] =
-    if (hop > MaxRedirects) Left("too many redirects")
-    else {
-      val page = withRetries(() => driver.navigate(NavigateRequest(sessionId, url)))
-      if (Redirects.contains(page.status)) navigate(sessionId, profile, page.location, hop + 1) else Right(page)
-    }
-
-  /** The page after a click or type on the session's current page. */
-  def act(sessionId: String, action: Action, beforeDigest: String): Page = {
-    val request = ActRequest(sessionId, action.kind, action.target, action.text)
-    withRetries(() => driver.act(request))
-  }
-
-  /** Run one action and return the step it made. */
-  def runAction(sessionId: String, worker: String, action: Action): Trace.Step = {
-    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-    val index = Lease.beginStep(sessionId, worker)
-    val step = Trace.Step(sessionId, index, action.kind, action.target, action.text, "ok", "", "", "")
-    if (index < 0) step.copy(outcome = "refused", reason = s"beginStep answered $index")
-    else {
-      val session = Sessions.loadSession(sessionId).get
-      val profile = Profiles.getProfile(session.profile).get
-      try {
-        val reason = if (action.kind == "navigate") Profiles.authorizeNavigation(profile, action.target) else ""
-        val result =
-          if (reason.nonEmpty) Left(reason)
-          else if (action.kind == "navigate") navigate(sessionId, profile, action.target)
-          else Right(act(sessionId, action, session.pageDigest))
-        result match {
-          case Left(why) => step.copy(outcome = "blocked", reason = why)
-          case Right(page) =>
-            Sessions.recordPage(sessionId, page.url, page.digest)
-            step.copy(url = page.url, digest = page.digest)
-        }
-      } catch { case e: StatusRuntimeException => step.copy(outcome = "failed", reason = e.getStatus.getCode.toString) }
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import browser.Lease    // Lease.beginStep
-import browser.Profiles // Profiles.getProfile, authorizeNavigation
-import browser.Sessions // Sessions.loadSession, recordPage
-import browser.Trace    // Trace.Step
-import browseragent.browser_agent.{ActRequest, BrowserDriverGrpc, NavigateRequest, Page, SnapshotRequest}
-
-/** One thing the agent asks the browser to do: navigate (target a URL), click or type (target a selector). */
-final case class Action(kind: String, target: String, text: String = "")
-
-object Client {
-  val DeadlineSeconds = 15L
-  val MaxRedirects = 5
-  val Attempts = 3
-  val Redirects: Set[Int] = Set(301, 302, 303, 307, 308)
-
-  private val driver = BrowserDriverGrpc.blockingStub(ManagedChannelBuilder.forAddress("driver", 9000).usePlaintext().build())
-
-  private def retryable(e: StatusRuntimeException): Boolean =
-    e.getStatus.getCode == Status.Code.UNAVAILABLE || e.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED
-
-  /** send(), again on UNAVAILABLE or DEADLINE_EXCEEDED, up to Attempts times. */
-  def withRetries(send: () => Page, attempt: Int = 1): Page =
-    try send()
-    catch { case e: StatusRuntimeException if retryable(e) && attempt < Attempts => withRetries(send, attempt + 1) }
-
-  /** The page the navigation ends on, or why a hop was refused. */
-  def navigate(sessionId: String, profile: Profiles.Profile, url: String, hop: Int = 0): Either[String, Page] = {
-    // Every hop is a new navigation: a redirect may point anywhere.
-    val reason = Profiles.authorizeNavigation(profile, url)
-    if (reason.nonEmpty) Left(reason)
-    else if (hop > MaxRedirects) Left("too many redirects")
-    else {
-      val page = withRetries(() => driver.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).navigate(NavigateRequest(sessionId, url)))
-      if (Redirects.contains(page.status)) navigate(sessionId, profile, page.location, hop + 1) else Right(page)
-    }
-  }
-
-  /** The page after a click or type on the session's current page. */
-  def act(sessionId: String, action: Action, beforeDigest: String): Page = {
-    val request = ActRequest(sessionId, action.kind, action.target, action.text)
-    def send(): Page = driver.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).act(request)
-    try send()
-    catch {
-      case e: StatusRuntimeException if retryable(e) =>
-        // The reply is lost, not necessarily the action: the page tells whether it landed.
-        val page = withRetries(() => driver.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).snapshot(SnapshotRequest(sessionId)))
-        if (page.digest != beforeDigest) page else send()
-    }
-  }
-
-  /** Run one action and return the step it made. */
-  def runAction(sessionId: String, worker: String, action: Action): Trace.Step = {
-    val index = Lease.beginStep(sessionId, worker)
-    val step = Trace.Step(sessionId, index, action.kind, action.target, action.text, "ok", "", "", "")
-    if (index < 0) step.copy(outcome = "refused", reason = s"beginStep answered $index")
-    else {
-      val session = Sessions.loadSession(sessionId).get
-      val profile = Profiles.getProfile(session.profile).get
-      try {
-        val result =
-          if (action.kind == "navigate") navigate(sessionId, profile, action.target)
-          else Right(act(sessionId, action, session.pageDigest))
-        result match {
-          case Left(why) => step.copy(outcome = "blocked", reason = why)
-          case Right(page) =>
-            Sessions.recordPage(sessionId, page.url, page.digest)
-            step.copy(url = page.url, digest = page.digest)
-        }
-      } catch { case e: StatusRuntimeException => step.copy(outcome = "failed", reason = e.getStatus.getCode.toString) }
-    }
-  }
 }
 `,
     },

@@ -48,7 +48,6 @@ invisible.
         python: {all: [/@app\.get\(\s*["']\/v1\/messages\/\{/, /store\.load\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/messages\/:/, /\bload\(/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/messages\/\{/, /store\.Load\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"messages"\s*\/\s*Segment\s*\)/, /Store\.load\(/]},
         cpp: {all: [/svr\.Get\(\s*R?"\(?\/v1\/messages\//, /store::load\(/]},
       },
     },
@@ -61,7 +60,6 @@ invisible.
         python: {all: [/["']state["']\s*:\s*message\[["']state["']\]/], none: [/["']sent["']/]},
         typescript: {all: [/state:\s*message\.state\b/], none: [/['"]sent['"]/]},
         go: {all: [/"state":\s*message\.State\b/], none: [/"sent"/]},
-        scala: {all: [/"state"\s*->\s*JsString\(message\.state\)/], none: [/"sent"/]},
         cpp: {all: [/\{"state",\s*message->state\}/], none: [/"sent"/]},
       },
     },
@@ -74,7 +72,6 @@ invisible.
         python: {all: [/["']bounce_category["']\s*:/]},
         typescript: {all: [/bounce_category:/]},
         go: {all: [/"bounce_category":/]},
-        scala: {all: [/"bounce_category"\s*->/]},
         cpp: {all: [/\{"bounce_category",/]},
       },
     },
@@ -89,7 +86,6 @@ invisible.
         },
         typescript: {all: [/x-tenant-id/i, /message\.tenant\s*!==\s*tenant|tenant\s*!==\s*message\.tenant/]},
         go: {all: [/X-Tenant-Id/i, /message\.Tenant\s*!=/]},
-        scala: {all: [/X-Tenant-Id/i, /message\.tenant/]},
         cpp: {all: [/X-Tenant-Id/i, /message->tenant\s*!=/]},
       },
     },
@@ -101,7 +97,6 @@ invisible.
         python: {all: [/store\.attempts\(/]},
         typescript: {all: [/\battempts\(/]},
         go: {all: [/store\.Attempts\(/]},
-        scala: {all: [/Store\.attempts\(/]},
         cpp: {all: [/store::attempts\(/]},
       },
     },
@@ -268,66 +263,6 @@ func readMessage(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/messages/{id}", readMessage)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import mail.{Gate, Store} // Store.load, attempts; Gate.isSuppressed
-
-object Read {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "messages" / Segment) { messageId =>
-    get {
-      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-      complete(Store.load(messageId) match {
-        case None => json(StatusCodes.NotFound, JsObject("error" -> JsString("no such message")))
-        case Some(message) =>
-          val state = if (message.state == "bounced") "bounced" else "sent"
-          json(StatusCodes.OK, JsObject(
-            "message_id" -> JsString(messageId),
-            "state" -> JsString(state),
-            "suppressed" -> JsBoolean(Gate.isSuppressed(message.recipient))))
-      })
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import mail.{Gate, Store} // Store.load, attempts; Gate.isSuppressed
-
-object Read {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "messages" / Segment) { messageId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-        complete(Store.load(messageId) match {
-          // Another tenant's message answers like a missing one: an id confirms nothing.
-          case Some(message) if tenant.contains(message.tenant) =>
-            val attempts = Store.attempts(messageId).map(a => JsObject("attempt" -> JsNumber(a.attempt), "outcome" -> JsString(a.outcome)))
-            json(StatusCodes.OK, JsObject(
-              "message_id" -> JsString(messageId),
-              "state" -> JsString(message.state),
-              "bounce_category" -> JsString(message.bounceCategory),
-              "suppressed" -> JsBoolean(Gate.isSuppressed(message.recipient)),
-              "attempts" -> JsArray(attempts.toVector)))
-          case _ => json(StatusCodes.NotFound, JsObject("error" -> JsString("no such message")))
-        })
-      }
-    }
-  }
 }
 `,
     },

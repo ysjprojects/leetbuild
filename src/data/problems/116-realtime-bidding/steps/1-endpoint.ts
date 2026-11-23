@@ -47,7 +47,6 @@ a bid the cap refused goes out anyway.
         python: {all: [/@app\.post\(\s*["']\/v1\/bids["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/bids['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/bids"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"bids"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/bids"/]},
       },
     },
@@ -60,7 +59,6 @@ a bid the cap refused goes out anyway.
         python: {all: [/\b401\b/, /[<>]=?\s*MAX_FLOOR_CENTS/, /[<>]=?\s*MAX_BUDGET_MS/]},
         typescript: {all: [/\b401\b/, /[<>]=?\s*MAX_FLOOR_CENTS/, /[<>]=?\s*MAX_BUDGET_MS/]},
         go: {all: [/StatusUnauthorized|\b401\b/, /[<>]=?\s*maxFloorCents/, /[<>]=?\s*maxBudgetMs/]},
-        scala: {all: [/Unauthorized|\b401\b/, /[<>]=?\s*MaxFloorCents/, /[<>]=?\s*MaxBudgetMs/]},
         cpp: {all: [/\b401\b/, /[<>]=?\s*kMaxFloorCents/, /[<>]=?\s*kMaxBudgetMs/]},
       },
     },
@@ -73,7 +71,6 @@ a bid the cap refused goes out anyway.
         python: {all: [/Deadline\.start\(/], none: [/Deadline\.start\(\s*DEFAULT_BUDGET_MS\s*\)/]},
         typescript: {all: [/Deadline\.start\(/], none: [/Deadline\.start\(\s*DEFAULT_BUDGET_MS\s*\)/]},
         go: {all: [/deadline\.Start\(/], none: [/deadline\.Start\(\s*defaultBudgetMs\s*\)/]},
-        scala: {all: [/Deadline\.start\(/], none: [/Deadline\.start\(\s*DefaultBudgetMs\s*\)/]},
         cpp: {all: [/Deadline::start\(/], none: [/Deadline::start\(\s*kDefaultBudgetMs\s*\)/]},
       },
     },
@@ -86,7 +83,6 @@ a bid the cap refused goes out anyway.
         python: {all: [/remaining_ms\(\)\s*<\s*MIN_BID_MS/, /deadline_exceeded/]},
         typescript: {all: [/remainingMs\(\)\s*<\s*MIN_BID_MS/, /deadline_exceeded/]},
         go: {all: [/RemainingMs\(\)\s*<\s*minBidMs/, /deadline_exceeded/]},
-        scala: {all: [/remainingMs\s*<\s*MinBidMs/, /deadline_exceeded/]},
         cpp: {all: [/remainingMs\(\)\s*<\s*kMinBidMs/, /deadline_exceeded/]},
       },
     },
@@ -99,7 +95,6 @@ a bid the cap refused goes out anyway.
         python: {all: [/budget_exhausted/], none: [/^\s*spend\.claim\(/m]},
         typescript: {all: [/budget_exhausted/], none: [/^\s*await claim\(/m]},
         go: {all: [/budget_exhausted/], none: [/^\s*spend\.Claim\(/m]},
-        scala: {all: [/budget_exhausted/], none: [/^\s*Spend\.claim\(/m]},
         cpp: {all: [/budget_exhausted/], none: [/^\s*rtb::spend::claim\(/m]},
       },
     },
@@ -398,102 +393,6 @@ func bid(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/bids", bid)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import rtb.{Deadline, Pricing, Spend} // Deadline.start(budgetMs); Pricing.quoteBid(userHash, auctionId, floorCents, deadline); Spend.claim(bidder, auctionId, cents)
-
-object Api {
-  val DefaultBudgetMs = 100L
-  val MaxBudgetMs = 200L
-  val MaxFloorCents = 1000000L
-  val MinBidMs = 10L // the answer's trip back to the exchange
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def noBid(auctionId: String, reason: String): HttpResponse =
-    json(StatusCodes.OK, JsObject("auction_id" -> JsString(auctionId), "bid_cents" -> JsNull, "reason" -> JsString(reason)))
-
-  val route: Route = path("v1" / "bids") {
-    post {
-      optionalHeaderValueByName("X-Bidder-Id") { bidderHeader =>
-        entity(as[String]) { raw =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          val bidder = bidderHeader.getOrElse("")
-          val fields = raw.parseJson.asJsObject.fields
-          val auctionId = fields.get("auction_id").collect { case JsString(s) => s }.getOrElse("")
-          val floorCents = fields.get("floor_cents").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
-          val userHash = fields.get("user_hash").collect { case JsString(s) => s }.getOrElse("")
-          val deadline = Deadline.start(DefaultBudgetMs)
-          val quote = Pricing.quoteBid(userHash, auctionId, floorCents, deadline)
-          if (quote.bidCents < floorCents) complete(noBid(auctionId, "below_floor"))
-          else {
-            Spend.claim(bidder, auctionId, quote.bidCents)
-            complete(json(StatusCodes.OK, JsObject("auction_id" -> JsString(auctionId), "bid_cents" -> JsNumber(quote.bidCents), "degraded" -> JsBoolean(quote.degraded))))
-          }
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import rtb.{Deadline, Pricing, Spend} // Deadline.start(budgetMs); Pricing.quoteBid(userHash, auctionId, floorCents, deadline); Spend.claim(bidder, auctionId, cents)
-
-object Api {
-  val DefaultBudgetMs = 100L
-  val MaxBudgetMs = 200L
-  val MaxFloorCents = 1000000L
-  val MinBidMs = 10L // the answer's trip back to the exchange
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def noBid(auctionId: String, reason: String): HttpResponse =
-    json(StatusCodes.OK, JsObject("auction_id" -> JsString(auctionId), "bid_cents" -> JsNull, "reason" -> JsString(reason)))
-
-  private def integer(fields: Map[String, JsValue], name: String, fallback: Option[Long]): Option[Long] =
-    fields.get(name) match {
-      case Some(JsNumber(n)) if n.isValidLong => Some(n.toLong)
-      case None => fallback
-      case _ => None
-    }
-
-  val route: Route = path("v1" / "bids") {
-    post {
-      optionalHeaderValueByName("X-Bidder-Id") {
-        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Bidder-Id is required")
-        case Some(bidder) =>
-          entity(as[String]) { raw =>
-            val fields = raw.parseJson.asJsObject.fields
-            val auctionId = fields.get("auction_id").collect { case JsString(s) => s }.getOrElse("")
-            val userHash = fields.get("user_hash").collect { case JsString(s) => s }.getOrElse("")
-            (integer(fields, "timeout_ms", Some(DefaultBudgetMs)), integer(fields, "floor_cents", None)) match {
-              case (Some(timeoutMs), Some(floorCents))
-                  if auctionId.nonEmpty && timeoutMs >= 1 && timeoutMs <= MaxBudgetMs && floorCents >= 0 && floorCents <= MaxFloorCents =>
-                val deadline = Deadline.start(timeoutMs) // the exchange's budget, shared by every stage
-                val quote = Pricing.quoteBid(userHash, auctionId, floorCents, deadline)
-                if (deadline.remainingMs < MinBidMs) complete(noBid(auctionId, "deadline_exceeded")) // it would arrive after the auction closed
-                else if (quote.bidCents < floorCents) complete(noBid(auctionId, "below_floor"))
-                else if (!Spend.claim(bidder, auctionId, quote.bidCents)) complete(noBid(auctionId, "budget_exhausted"))
-                else complete(json(StatusCodes.OK, JsObject("auction_id" -> JsString(auctionId), "bid_cents" -> JsNumber(quote.bidCents), "degraded" -> JsBoolean(quote.degraded))))
-              case _ => complete(StatusCodes.BadRequest -> "auction_id is required, timeout_ms must be 1..200 and floor_cents 0..1000000")
-            }
-          }
-      }
-    }
-  }
 }
 `,
     },

@@ -53,7 +53,6 @@ Requirements:
         python: {all: [/@app\.post\(\s*["']\/v1\/batches["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/batches['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/batches"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"batches"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/batches"/]},
       },
     },
@@ -66,7 +65,6 @@ Requirements:
         python: {all: [/Idempotency-Key/i, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
         typescript: {all: [/idempotency-key/i, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
         go: {all: [/Idempotency-Key/, /jobs\.Get\(/, /jobs\.Put\([^,]+,\s*tenant\s*,\s*idem/]},
-        scala: {all: [/Idempotency-Key/, /Jobs\.get\(\s*tenant\s*,/, /Jobs\.put\(\s*tenant\s*,\s*idem/]},
         cpp: {all: [/Idempotency-Key/, /jobs::get\(\s*tenant\s*,/, /jobs::put\(\s*tenant\s*,\s*idem/]},
       },
     },
@@ -79,7 +77,6 @@ Requirements:
         python: {order: [/record_count\s*>\s*MAX_RECORDS|MAX_RECORDS\s*<\s*\w/, /store\.put\(/]},
         typescript: {order: [/\w+\s*>\s*MAX_RECORDS|MAX_RECORDS\s*<\s*\w/, /store\.put\(/]},
         go: {order: [/\w+\s*>\s*config\.MaxRecords|config\.MaxRecords\s*<\s*\w/, /jobs\.Put\(/]},
-        scala: {order: [/\w+\s*>\s*Config\.MaxRecords|Config\.MaxRecords\s*<\s*\w/, /Jobs\.put\(/]},
         cpp: {order: [/\w+\s*>\s*config::kMaxRecords|config::kMaxRecords\s*<\s*\w/, /jobs::put\(/]},
       },
     },
@@ -92,7 +89,6 @@ Requirements:
         python: {all: [/\[\s*["']sealed["']\s*\]|\.get\(\s*["']sealed["']/, /status_code\s*=\s*409/]},
         typescript: {all: [/\.sealed\b/, /code\(\s*409\s*\)/]},
         go: {all: [/\.Sealed\b/, /StatusConflict/]},
-        scala: {all: [/\.isSealed\b/, /StatusCodes\.Conflict/]},
         cpp: {all: [/(\.|->)sealed\b/, /\b409\b/]},
       },
     },
@@ -108,7 +104,6 @@ Requirements:
         },
         typescript: {all: [/Math\.ceil\(|SHARD_SIZE\s*-\s*1/], none: [/Math\.floor\(\s*[\w.]+\s*\/\s*SHARD_SIZE/]},
         go: {all: [/math\.Ceil\(|config\.ShardSize\s*-\s*1/], none: [/RecordCount\s*\/\s*config\.ShardSize/]},
-        scala: {all: [/math\.ceil\(|Config\.ShardSize\s*-\s*1/], none: [/record_count\s*\/\s*Config\.ShardSize/]},
         cpp: {all: [/std::ceil\(|config::kShardSize\s*-\s*1/], none: [/record_count\s*\/\s*config::kShardSize/]},
       },
     },
@@ -474,135 +469,6 @@ func main() {
 	mux := http.NewServeMux()
 	register(mux)
 	log.Fatal(http.ListenAndServe(":8443", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import batch.{Config, Job, Jobs, Manifests, Shards}
-
-final case class BatchRequest(manifest_uri: String, model: String)
-
-object BatchApi {
-  implicit val system: ActorSystem = ActorSystem("batch-inference")
-  implicit val requestFormat: RootJsonFormat[BatchRequest] = jsonFormat2(BatchRequest)
-  implicit val jobFormat: RootJsonFormat[Job] = jsonFormat6(Job)
-
-  val route: Route =
-    path("v1" / "batches") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[BatchRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else {
-              Manifests.head(body.manifest_uri) match {
-                case None =>
-                  complete(StatusCodes.NotFound, """{"error":"no manifest at manifest_uri"}""")
-                case Some(meta) =>
-                  val job = Job(
-                    UUID.randomUUID().toString,
-                    "queued",
-                    body.model,
-                    body.manifest_uri,
-                    meta.record_count,
-                    meta.record_count / Config.ShardSize
-                  )
-                  Jobs.put(tenantOpt.get, job.batch_id, job)
-                  Shards.seed(job.batch_id, job.shards)
-                  system.log.info(s"batch \${job.batch_id} queued: \${job.record_count} records, \${job.shards} shards")
-                  complete(StatusCodes.Accepted, job)
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-import batch.{Config, Job, Jobs, Manifests, Shards}
-
-final case class BatchRequest(manifest_uri: String, model: String)
-
-object BatchApi {
-  implicit val system: ActorSystem = ActorSystem("batch-inference")
-  implicit val requestFormat: RootJsonFormat[BatchRequest] = jsonFormat2(BatchRequest)
-  implicit val jobFormat: RootJsonFormat[Job] = jsonFormat6(Job)
-
-  val route: Route =
-    path("v1" / "batches") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[BatchRequest]) { body =>
-              if (!tenantOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              } else if (!idemOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-              } else {
-                val tenant = tenantOpt.get
-                val idemKey = idemOpt.get
-                Jobs.get(tenant, idemKey) match {
-                  case Some(stored) => complete(StatusCodes.OK, stored.job)
-                  case None =>
-                    Manifests.head(body.manifest_uri) match {
-                      case None =>
-                        complete(StatusCodes.NotFound, """{"error":"no manifest at manifest_uri"}""")
-                      case Some(meta) if !meta.isSealed =>
-                        complete(StatusCodes.Conflict, """{"error":"the manifest is still uploading"}""")
-                      case Some(meta) if meta.record_count > Config.MaxRecords =>
-                        complete(StatusCodes.BadRequest, """{"error":"a batch holds at most 1000000 records"}""")
-                      case Some(meta) =>
-                        val job = Job(
-                          UUID.randomUUID().toString,
-                          "queued",
-                          body.model,
-                          body.manifest_uri,
-                          meta.record_count,
-                          (meta.record_count + Config.ShardSize - 1) / Config.ShardSize
-                        )
-                        Jobs.put(tenant, idemKey, job)
-                        Shards.seed(job.batch_id, job.shards)
-                        system.log.info(s"batch \${job.batch_id} queued: \${job.record_count} records, \${job.shards} shards")
-                        complete(StatusCodes.Accepted, job)
-                    }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },

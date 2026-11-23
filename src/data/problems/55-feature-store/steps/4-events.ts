@@ -54,7 +54,6 @@ broker outage drops it.
         python: {all: [/key\s*=\s*name\b/], none: [/key\s*=\s*partition\b/]},
         typescript: {all: [/key:\s*name\b/], none: [/key:\s*partition\b/]},
         go: {all: [/Key:\s*\[\]byte\(name\)/], none: [/Key:\s*\[\]byte\(partition\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*name\b/], none: [/Topic,\s*partition\b/]},
         cpp: {all: [/name\.c_str\(\),\s*name\.size\(\)/], none: [/partition\.c_str\(\)/]},
       },
     },
@@ -67,7 +66,6 @@ broker outage drops it.
         python: {order: [/registry\.commit_partition\(/, /producer\.produce\(/]},
         typescript: {order: [/registry\.commitPartition\(/, /producer\.send\(/]},
         go: {order: [/registry\.CommitPartition\(/, /writer\.WriteMessages\(/]},
-        scala: {order: [/Registry\.commitPartition\(/, /producer\.send\(/]},
         cpp: {order: [/registry::commitPartition\(/, /producer->produce\(/]},
       },
     },
@@ -80,7 +78,6 @@ broker outage drops it.
         python: {all: [/written\s*\+=\s*1/, /["']rows["']\s*:\s*written/], none: [/len\(rows\)/]},
         typescript: {all: [/written\s*\+=\s*1|written\+\+/, /rows:\s*written/], none: [/rows\.length/]},
         go: {all: [/written\+\+/, /"rows":\s*written/], none: [/len\(rows\)/]},
-        scala: {all: [/written\s*\+=\s*1/, /"rows"\s*->\s*JsNumber\(written\)/], none: [/rows\.size|rows\.length/]},
         cpp: {all: [/written\+\+|\+\+written/, /\{"rows",\s*written\}/], none: [/rows\.size\(\)/]},
       },
     },
@@ -93,7 +90,6 @@ broker outage drops it.
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/]},
         typescript: {all: [/acks:\s*-1/], none: [/acks:\s*1\b/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/put\("acks",\s*"(all|-1)"\)/]},
         cpp: {all: [/set\("acks",\s*"(all|-1)"/]},
       },
     },
@@ -109,7 +105,6 @@ broker outage drops it.
         },
         typescript: {all: [/outbox\.insert\(/, /catch/]},
         go: {all: [/outbox\.Insert\(/, /err\s*:?=\s*writer\.WriteMessages\(/]},
-        scala: {all: [/Outbox\.insert\(/, /\.get\(\s*[^\n]*TimeUnit/]},
         cpp: {all: [/outbox::insert\(/, /->flush\(/, /dr_cb/]},
       },
     },
@@ -360,80 +355,6 @@ func materialize(ctx context.Context, name string, version int, partition string
 		return false, nil
 	}
 	return true, nil
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.Properties
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import features.{Online, Registry, Stats}
-
-object Events {
-  val Topic = "feature.event"
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Write a scanned partition to the online store, commit it and publish its lineage event; true once the broker has it. */
-  def materialize(name: String, version: Long, partition: String, rows: Seq[Online.Row]): Boolean = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val payload = JsObject("feature" -> JsString(name), "version" -> JsNumber(version), "partition" -> JsString(partition), "rows" -> JsNumber(rows.size))
-    producer.send(new ProducerRecord[String, String](Topic, partition, payload.compactPrint))
-    rows.foreach { row =>
-      Stats.observe(name, version, row.value, row.eventTs)
-      row.value.foreach(v => Online.writeValue(name, version, row.entity, v, row.eventTs))
-    }
-    Registry.commitPartition(name, version, partition, rows.size.toLong)
-    true
-  }
-}
-`,
-      solution: `import java.util.Properties
-import java.util.concurrent.TimeUnit
-
-import scala.util.Try
-
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.kafka.common.serialization.StringSerializer
-import spray.json._
-
-import features.{Online, Outbox, Registry, Stats}
-
-object Events {
-  val Topic = "feature.event"
-  val AckTimeoutMs = 2000L
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "all") // every in-sync replica has the event before the broker answers
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  /** Write a scanned partition to the online store, commit it and publish its lineage event; true once the broker has it. */
-  def materialize(name: String, version: Long, partition: String, rows: Seq[Online.Row]): Boolean = {
-    var written = 0L
-    rows.foreach { row =>
-      Stats.observe(name, version, row.value, row.eventTs)
-      // A null is not a value, and an older row loses to the stored one: neither is written.
-      if (row.value.exists(v => Online.writeValue(name, version, row.entity, v, row.eventTs))) written += 1
-    }
-    Registry.commitPartition(name, version, partition, written)
-    // The partition is committed: the event describes state that exists.
-    val payload = JsObject("feature" -> JsString(name), "version" -> JsNumber(version), "partition" -> JsString(partition), "rows" -> JsNumber(written))
-    val acked = Try(producer.send(new ProducerRecord[String, String](Topic, name, payload.compactPrint)).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
-    // The broker did not take it: the relay produces the row later, so lineage is late, not lost.
-    if (acked.isFailure) Outbox.insert(Topic, name, payload)
-    acked.isSuccess
-  }
 }
 `,
     },

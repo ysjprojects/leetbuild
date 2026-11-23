@@ -6,7 +6,7 @@ import {tenantBudgetStep} from './steps/2-tenant-budget';
 import {streamingCancelStep} from './steps/3-streaming-cancel';
 import {providerFailoverStep} from './steps/4-provider-failover';
 import {usageEventsStep} from './steps/5-usage-events';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * LLM gateway: the service every product puts in front of a model provider. Each step starts from
@@ -96,6 +96,5 @@ the request path above without changing its shape.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
-    scala: {...protoFiles, ...supportModulesScala},
   },
 };

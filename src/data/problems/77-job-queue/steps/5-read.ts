@@ -54,7 +54,6 @@ the reaper is behind, shows a \`next_retry_at_ms\` in the past with nothing to s
         python: {all: [/@app\.get\(\s*["']\/v1\/jobs\/\{job_id\}["']/, /store\.attempt_history\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/jobs\/:jobId['"]/, /store\.attemptHistory\(/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/jobs\/\{id\}"/, /store\.AttemptHistory\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"jobs"\s*\/\s*Segment\s*\)/, /Store\.attemptHistory\(/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/jobs\//, /store::attemptHistory\(/]},
       },
     },
@@ -67,7 +66,6 @@ the reaper is behind, shows a \`next_retry_at_ms\` in the past with nothing to s
         python: {all: [/job\[["']tenant["']\]\s*!=\s*tenant/], none: [/\b403\b/]},
         typescript: {all: [/job\.tenant\s*!==\s*tenant/], none: [/\b403\b/]},
         go: {all: [/job\.Tenant\s*!=\s*tenant/], none: [/StatusForbidden|\b403\b/]},
-        scala: {all: [/\.tenant\s*(!=|==)\s*tenant/], none: [/Forbidden|\b403\b/]},
         cpp: {all: [/job->tenant\s*!=\s*tenant/], none: [/\b403\b/]},
       },
     },
@@ -80,7 +78,6 @@ the reaper is behind, shows a \`next_retry_at_ms\` in the past with nothing to s
         python: {all: [/\.zscore\(/, /["']stalled["']/]},
         typescript: {all: [/\.zscore\(/, /['"]stalled['"]/]},
         go: {all: [/\.ZScore\(/, /"stalled"/]},
-        scala: {all: [/jedis\.zscore\(/, /"stalled"/]},
         cpp: {all: [/redis\.zscore\(/, /"stalled"/]},
       },
     },
@@ -93,7 +90,6 @@ the reaper is behind, shows a \`next_retry_at_ms\` in the past with nothing to s
         python: {all: [/["']retry_overdue["']/]},
         typescript: {all: [/retry_overdue/]},
         go: {all: [/"retry_overdue"/]},
-        scala: {all: [/"retry_overdue"/]},
         cpp: {all: [/"retry_overdue"/]},
       },
     },
@@ -366,98 +362,6 @@ func readJob(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/jobs/{id}", readJob)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import jobs.Store // Store.getJob, attemptHistory
-
-object Read {
-  val InflightKey = "jobs:inflight"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def history(jobId: String): JsArray = JsArray(Store.attemptHistory(jobId).toVector.map { a =>
-    JsObject("attempt" -> JsNumber(a.attempt), "error" -> JsString(a.error), "at_ms" -> JsNumber(a.atMs))
-  })
-
-  val route: Route = path("v1" / "jobs" / Segment) { jobId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-        // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-        val tenant = tenantHeader.getOrElse("")
-        Store.getJob(jobId) match {
-          case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("no such job"))))
-          case Some(job) if job.tenant != tenant =>
-            complete(json(StatusCodes.Forbidden, JsObject("error" -> JsString("this job belongs to another tenant"))))
-          case Some(job) =>
-            complete(json(StatusCodes.OK, JsObject(
-              "job_id" -> JsString(jobId),
-              "type" -> JsString(job.jobType),
-              "state" -> JsString(job.state),
-              "attempts" -> JsNumber(job.attempts),
-              "attempt_history" -> history(jobId),
-              "next_retry_at_ms" -> job.nextRetryAtMs.map(JsNumber(_)).getOrElse(JsNull),
-              "dead_reason" -> job.deadReason.map(JsString(_)).getOrElse(JsNull))))
-        }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import spray.json._
-
-import jobs.Store // Store.getJob, attemptHistory
-
-object Read {
-  val InflightKey = "jobs:inflight"
-
-  val jedis = new JedisPooled("redis", 6379)
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def history(jobId: String): JsArray = JsArray(Store.attemptHistory(jobId).toVector.map { a =>
-    JsObject("attempt" -> JsNumber(a.attempt), "error" -> JsString(a.error), "at_ms" -> JsNumber(a.atMs))
-  })
-
-  val route: Route = path("v1" / "jobs" / Segment) { jobId =>
-    get {
-      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-        val tenant = tenantHeader.getOrElse("")
-        Store.getJob(jobId).filter(_.tenant == tenant) match {
-          // Another tenant's job answers exactly as a missing one: a job id is not a capability.
-          case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("no such job"))))
-          case Some(job) =>
-            // The record says what the last writer meant; jobs:inflight says whether it still holds.
-            val past = Option(jedis.zscore(InflightKey, jobId)).exists(_.doubleValue <= System.currentTimeMillis)
-            val state = if (past && job.state == "running") "stalled" else job.state
-            complete(json(StatusCodes.OK, JsObject(
-              "job_id" -> JsString(jobId),
-              "type" -> JsString(job.jobType),
-              "state" -> JsString(state),
-              "attempts" -> JsNumber(job.attempts),
-              "attempt_history" -> history(jobId),
-              "next_retry_at_ms" -> job.nextRetryAtMs.map(JsNumber(_)).getOrElse(JsNull),
-              "retry_overdue" -> JsBoolean(past && job.state == "retrying"),
-              "dead_reason" -> job.deadReason.map(JsString(_)).getOrElse(JsNull))))
-        }
-      }
-    }
-  }
 }
 `,
     },

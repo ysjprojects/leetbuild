@@ -61,7 +61,6 @@ for good.
         python: {all: [/producer\.produce\(\s*TOPIC/]},
         typescript: {all: [/producer\.send\(\s*\{\s*topic:\s*TOPIC/]},
         go: {all: [/WriteMessages\(/]},
-        scala: {all: [/producer\.send\(/]},
         cpp: {all: [/producer->produce\(\s*config::kTopic/]},
       },
     },
@@ -76,10 +75,6 @@ for good.
         go: {
           all: [/Key:\s*\[\]byte\(\s*tenant\s*\)/],
           none: [/Key:\s*\[\]byte\(\s*strconv\.Itoa\(\s*version\s*\)\s*\)/],
-        },
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(\s*Config\.Topic\s*,\s*tenant\s*,/],
-          none: [/ProducerRecord\[String, String\]\(\s*Config\.Topic\s*,\s*version\.toString/],
         },
         cpp: {all: [/produce\([\s\S]{0,300}?tenant\.c_str\(\)/], none: [/key\s*=\s*std::to_string\(\s*version\s*\)/]},
       },
@@ -96,7 +91,6 @@ for good.
           none: [/\bprefix:\s*prefix/, /prefix\.slice\(/],
         },
         go: {all: [/PrefixDigest/, /sha256\.Sum256\(/], none: [/json:"prefix"/]},
-        scala: {all: [/prefix_digest/, /SHA-256/], none: [/"prefix"\s*->/]},
         cpp: {all: [/prefix_digest/, /sha256_hex\(/], none: [/\{"prefix",/]},
       },
     },
@@ -109,7 +103,6 @@ for good.
         python: {all: [/stats_key\(\s*event\[["']tenant["']\]/]},
         typescript: {all: [/statsKey\(\s*event\.tenant/]},
         go: {all: [/config\.StatsKey\(\s*event\.Tenant/]},
-        scala: {all: [/Config\.statsKey\(/]},
         cpp: {all: [/config::stats_key\(/]},
       },
     },
@@ -122,7 +115,6 @@ for good.
         python: {order: [/r\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/redis\.hincrby\(/, /commitOffsets\(/]},
         go: {order: [/HIncrBy\(/, /CommitMessages\(/]},
-        scala: {order: [/hincrBy\(/, /commitSync\(/]},
         cpp: {order: [/hincrby\(/, /commitSync\(/]},
       },
     },
@@ -522,145 +514,6 @@ func runStats(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import pcache.Config
-
-object CacheEvents {
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** One event per cache decision. */
-  def emitDecision(tenant: String, version: Int, prefix: String, decision: String, latencyMs: Long, tokens: Int): Unit = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val event = ujson.write(
-      ujson.Obj(
-        "tenant" -> tenant,
-        "version" -> version,
-        "prefix" -> prefix.take(512),
-        "decision" -> decision,
-        "latency_ms" -> ujson.Num(latencyMs.toDouble),
-        "tokens" -> tokens
-      )
-    )
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) System.err.println(s"cache.result produce failed version=$version: \${exception.getMessage}")
-    }
-    producer.send(new ProducerRecord[String, String](Config.Topic, version.toString, event), onDelivery)
-  }
-
-  /** The stats consumer: count each decision. */
-  def runStats(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, "cache-stats")
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Config.Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val event = ujson.read(record.value())
-        consumer.commitSync()
-        val tenant = event("tenant").str
-        val version = event("version").num.toInt
-        val stats = s"pc-stats:$version"
-        if (event("decision").str == "hit") {
-          jedis.hincrBy(stats, "hits", 1)
-          jedis.hincrBy(stats, "tokens_saved", event("tokens").num.toLong)
-        } else {
-          jedis.hincrBy(stats, "misses", 1)
-          jedis.hincrBy(stats, "fill_ms", event("latency_ms").num.toLong)
-        }
-        jedis.sadd(Config.versionsKey(tenant), version.toString)
-      }
-    }
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
-import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-
-import scala.jdk.CollectionConverters._
-
-import pcache.Config
-
-object CacheEvents {
-  private val props = new Properties()
-  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  private val jedis = new JedisPooled("redis", 6379)
-
-  /** One event per cache decision, keyed by tenant; the prefix leaves this process only as its digest. */
-  def emitDecision(tenant: String, version: Int, prefix: String, decision: String, latencyMs: Long, tokens: Int): Unit = {
-    val digest =
-      MessageDigest.getInstance("SHA-256").digest(prefix.getBytes(StandardCharsets.UTF_8)).map("%02x".format(_)).mkString
-    val event = ujson.write(
-      ujson.Obj(
-        "tenant" -> tenant,
-        "version" -> version,
-        "prefix_digest" -> digest,
-        "decision" -> decision,
-        "latency_ms" -> ujson.Num(latencyMs.toDouble),
-        "tokens" -> tokens
-      )
-    )
-    val onDelivery: Callback = new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
-        if (exception != null) System.err.println(s"cache.result produce failed tenant=$tenant: \${exception.getMessage}")
-    }
-    producer.send(new ProducerRecord[String, String](Config.Topic, tenant, event), onDelivery)
-  }
-
-  /** The stats consumer: count each decision under its tenant and version, then commit. */
-  def runStats(): Unit = {
-    val cprops = new Properties()
-    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, "cache-stats")
-    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
-    consumer.subscribe(List(Config.Topic).asJava)
-    while (true) {
-      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
-        val event = ujson.read(record.value())
-        val tenant = event("tenant").str
-        val version = event("version").num.toInt
-        val stats = Config.statsKey(tenant, version)
-        if (event("decision").str == "hit") {
-          jedis.hincrBy(stats, "hits", 1)
-          jedis.hincrBy(stats, "tokens_saved", event("tokens").num.toLong)
-        } else {
-          jedis.hincrBy(stats, "misses", 1)
-          jedis.hincrBy(stats, "fill_ms", event("latency_ms").num.toLong)
-        }
-        jedis.sadd(Config.versionsKey(tenant), version.toString)
-        consumer.commitSync() // after the counters: a crash before this point redelivers
-      }
-    }
-  }
 }
 `,
     },

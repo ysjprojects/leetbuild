@@ -60,7 +60,6 @@ a 2 MB paste is stored whole; a reply naming a parent from another thread lands 
         python: {all: [/@app\.post\(\s*["']\/v1\/comments["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/comments['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/comments"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"comments"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/comments"/]},
       },
     },
@@ -81,10 +80,6 @@ a 2 MB paste is stored whole; a reply naming a parent from another thread lands 
         go: {
           all: [/Idempotency-Key/i, /store\.ByKey\(/, /store\.RememberKey\(/, /StatusBadRequest|\b400\b/],
           order: [/store\.ByKey\(/, /store\.Insert\(/],
-        },
-        scala: {
-          all: [/Idempotency-Key/i, /Store\.byKey\(/, /Store\.rememberKey\(/, /BadRequest|\b400\b/],
-          order: [/Store\.byKey\(/, /Store\.insert\(/],
         },
         cpp: {
           all: [/Idempotency-Key/i, /store::byKey\(/, /store::rememberKey\(/, /\b400\b/],
@@ -109,13 +104,6 @@ a 2 MB paste is stored whole; a reply naming a parent from another thread lands 
             /len\(\s*body\.Text\s*\)/,
           ],
         },
-        scala: {
-          all: [
-            /MaxTextBytes(:\s*Int)?\s*=\s*(16\s*\*\s*1024|16384)/,
-            /PayloadTooLarge|RequestEntityTooLarge|\b413\b/,
-            /getBytes\(/,
-          ],
-        },
         cpp: {all: [/kMaxTextBytes\s*=\s*(16\s*\*\s*1024|16384)/, /\b413\b/, /text\.size\(\)|text\.length\(\)/]},
       },
     },
@@ -128,7 +116,6 @@ a 2 MB paste is stored whole; a reply naming a parent from another thread lands 
         python: {all: [/store\.get\(/, /\["thread_id"\]\s*!=|!=\s*\w+\["thread_id"\]/, /\b422\b/]},
         typescript: {all: [/\bget\(\s*tenant/, /\.thread_id\s*!==|!==\s*\w+\.thread_id/, /\b422\b/]},
         go: {all: [/store\.Get\(/, /\.ThreadID\s*!=/, /StatusUnprocessableEntity|\b422\b/]},
-        scala: {all: [/Store\.get\(/, /\.threadId\s*!=|!=\s*\w+\.threadId/, /UnprocessableEntity|\b422\b/]},
         cpp: {all: [/store::get\(/, /thread_id\s*!=/, /\b422\b/]},
       },
     },
@@ -141,7 +128,6 @@ a 2 MB paste is stored whole; a reply naming a parent from another thread lands 
         python: {all: [/html\.escape\(/, /ALLOWED_TAGS/]},
         typescript: {all: [/ALLOWED_TAGS/, /&lt;/, /&amp;/]},
         go: {all: [/html\.EscapeString\(/, /allowedTags/]},
-        scala: {all: [/AllowedTags/, /&lt;/, /&amp;/]},
         cpp: {all: [/kAllowedTags/, /&lt;/, /&amp;/]},
       },
     },
@@ -453,121 +439,6 @@ func createComment(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/comments", createComment)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import comments.Store // Store.newComment, insert, get, byKey, rememberKey
-
-object Api {
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def field(body: JsObject, name: String): String = body.fields.get(name) match {
-    case Some(JsString(s)) => s
-    case _ => ""
-  }
-
-  /** The comment as a page shows it: line breaks become <br>. */
-  def renderHtml(text: String): String = text.replace("\\n", "<br>")
-
-  val route: Route =
-    path("v1" / "comments") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-          entity(as[String]) { raw =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            val tenant = tenantHeader.getOrElse("")
-            val body = raw.parseJson.asJsObject
-            val (threadId, text) = (field(body, "thread_id"), field(body, "text"))
-            if (tenant.isEmpty) complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-            else if (threadId.isEmpty || text.isEmpty) complete(error(StatusCodes.BadRequest, "thread_id and text are required"))
-            else {
-              val comment = Store.newComment(threadId, field(body, "parent_id"), field(body, "author_id"), text, renderHtml(text))
-              Store.insert(tenant, comment)
-              complete(json(StatusCodes.Created, Store.toJson(comment)))
-            }
-          }
-        }
-      }
-    }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets.UTF_8
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import comments.Store // Store.newComment, insert, get, byKey, rememberKey
-
-object Api {
-  val MaxTextBytes: Int = 16 * 1024
-  val AllowedTags: Seq[String] = Seq("b", "i", "code")
-
-  private def json(status: StatusCode, body: JsValue): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def field(body: JsObject, name: String): String = body.fields.get(name) match {
-    case Some(JsString(s)) => s
-    case _ => ""
-  }
-
-  /** The comment as a page shows it: everything escaped, then the safe tags and line breaks back. */
-  def renderHtml(text: String): String = {
-    val escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\\"", "&quot;").replace("'", "&#x27;")
-    val tagged = AllowedTags.foldLeft(escaped)((out, tag) => out.replace(s"&lt;$tag&gt;", s"<$tag>").replace(s"&lt;/$tag&gt;", s"</$tag>"))
-    tagged.replace("\\n", "<br>")
-  }
-
-  /** Why a reply cannot hang off parentId in this thread, if it cannot. */
-  private def parentProblem(tenant: String, threadId: String, parentId: String): Option[String] =
-    if (parentId.isEmpty) None
-    else Store.get(tenant, parentId) match {
-      case Some(parent) if parent.threadId == threadId => None
-      case Some(parent) if parent.threadId != threadId => Some("parent_id is in another thread")
-      case _ => Some("parent_id is not a comment of this tenant")
-    }
-
-  val route: Route =
-    path("v1" / "comments") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
-          optionalHeaderValueByName("Idempotency-Key") { keyHeader =>
-            entity(as[String]) { raw =>
-              val tenant = tenantHeader.getOrElse("")
-              val key = keyHeader.getOrElse("")
-              val body = raw.parseJson.asJsObject
-              val (threadId, parentId, text) = (field(body, "thread_id"), field(body, "parent_id"), field(body, "text"))
-              lazy val first = Store.byKey(tenant, key)
-              if (tenant.isEmpty) complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-              else if (key.isEmpty) complete(error(StatusCodes.BadRequest, "Idempotency-Key is required"))
-              else if (first.isDefined) complete(json(StatusCodes.OK, Store.toJson(first.get))) // a retry answers the comment the first attempt made
-              else if (threadId.isEmpty || text.isEmpty) complete(error(StatusCodes.BadRequest, "thread_id and text are required"))
-              else if (text.getBytes(UTF_8).length > MaxTextBytes) complete(error(StatusCodes.PayloadTooLarge, s"text is over $MaxTextBytes bytes"))
-              else parentProblem(tenant, threadId, parentId) match {
-                case Some(problem) => complete(error(StatusCodes.UnprocessableEntity, problem))
-                case None =>
-                  val comment = Store.newComment(threadId, parentId, field(body, "author_id"), text, renderHtml(text))
-                  Store.insert(tenant, comment)
-                  Store.rememberKey(tenant, key, comment.id)
-                  complete(json(StatusCodes.Created, Store.toJson(comment)))
-              }
-            }
-          }
-        }
-      }
-    }
 }
 `,
     },

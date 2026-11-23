@@ -69,13 +69,6 @@ next step): it hands the notification to Kafka and raises when the broker did no
           ],
         },
         go: {all: [/channels\[/, /priorities\[/, /http\.StatusBadRequest|\b400\b/]},
-        scala: {
-          all: [
-            /Channels\.contains\(|Channels\(/,
-            /Priorities\.contains\(|Priorities\(/,
-            /StatusCodes\.BadRequest|\b400\b/,
-          ],
-        },
         cpp: {all: [/kChannels\.(count|find|contains)\(/, /kPriorities\.(count|find|contains)\(/, /status\s*=\s*400/]},
       },
     },
@@ -88,7 +81,6 @@ next step): it hands the notification to Kafka and raises when the broker did no
         python: {all: [/idempotency-key/i, /status_code\s*=\s*400|HTTP_400/]},
         typescript: {all: [/idempotency-key/i, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/]},
         go: {all: [/Idempotency-Key/i, /http\.StatusBadRequest|\b400\b/]},
-        scala: {all: [/Idempotency-Key/i, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/Idempotency-Key/i, /status\s*=\s*400/]},
       },
     },
@@ -118,13 +110,6 @@ next step): it hands the notification to Kafka and raises when the broker did no
             /rdb\.SetNX\(\s*[\w.()]+\s*,\s*\w+\s*,\s*[^,\n]+,\s*(idemTTL|24\s*\*\s*time\.Hour)\s*\)/,
           ],
         },
-        scala: {
-          all: [
-            /s"idem:\$/,
-            /jedis\.set\(\s*\w+\s*,\s*[^,\n]+,[^\n]*\.nx\(\)/,
-            /\.ex\(\s*(IdemTtlSeconds|86400L?)\s*\)/,
-          ],
-        },
         cpp: {
           all: [
             /"idem:"\s*\+/,
@@ -142,7 +127,6 @@ next step): it hands the notification to Kafka and raises when the broker did no
         python: {all: [/\br\.get\(/, /status_code\s*=\s*200/]},
         typescript: {all: [/\bredis\.get\(/, /code\(\s*200\s*\)|status\(\s*200\s*\)/]},
         go: {all: [/rdb\.Get\(/, /http\.StatusOK|\b200\b/]},
-        scala: {all: [/jedis\.get\(/, /StatusCodes\.OK|\b200\b/]},
         cpp: {all: [/redis\.get\(/, /status\s*=\s*200/]},
       },
     },
@@ -155,7 +139,6 @@ next step): it hands the notification to Kafka and raises when the broker did no
         python: {order: [/\.set\([^\n]*nx\s*=\s*True/, /(?<!def )enqueue\(/, /status_code\s*=\s*202/]},
         typescript: {order: [/\.set\([^\n]*['"]NX['"]/, /\benqueue\(/, /code\(\s*202\s*\)|status\(\s*202\s*\)/]},
         go: {order: [/rdb\.SetNX\(/, /(?<!func )enqueue\(/, /http\.StatusAccepted|\b202\b/]},
-        scala: {order: [/\.nx\(\)/, /(?<!def )enqueue\(/, /StatusCodes\.Accepted|\b202\b/]},
         cpp: {order: [/UpdateType::NOT_EXIST/, /(?<!void )enqueue\(/, /status\s*=\s*202/]},
       },
     },
@@ -477,118 +460,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /notifications", notify)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-import notifications.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-
-object NotifyApi {
-  val jedis = new JedisPooled("redis", 6379)
-  val Channels = Set("push", "sms", "email")
-  val Priorities = Set("high", "normal")
-  val IdemTtlSeconds = 86400L
-
-  case class NotifyRequest(userId: String, channel: String, title: String, body: String, priority: String)
-  implicit val requestFormat: RootJsonFormat[NotifyRequest] =
-    jsonFormat(NotifyRequest, "user_id", "channel", "title", "body", "priority")
-
-  /** Produce the notification to Kafka keyed by user (built in step 2); throws when the broker did not ack. */
-  def enqueue(id: String, n: NotifyRequest): Unit = ???
-
-  val route: Route =
-    path("notifications") {
-      post {
-        entity(as[NotifyRequest]) { n =>
-          optionalHeaderValueByName("Idempotency-Key") { idemKey =>
-            // TODO: 400 unless Channels contains n.channel, Priorities contains n.priority, userId and title non-empty
-            // TODO: 400 when idemKey is None
-            // TODO: mint an id; SET idem:{key} id NX EX IdemTtlSeconds; refused → 200 with the stored id
-            // TODO: enqueue(id, n) (DEL the key and answer 503 when it throws), then 202 {id}
-            complete(StatusCodes.NotImplemented)
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("notify")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-import notifications.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-
-object NotifyApi {
-  val jedis = new JedisPooled("redis", 6379)
-  val Channels = Set("push", "sms", "email")
-  val Priorities = Set("high", "normal")
-  val IdemTtlSeconds = 86400L
-
-  case class NotifyRequest(userId: String, channel: String, title: String, body: String, priority: String)
-  implicit val requestFormat: RootJsonFormat[NotifyRequest] =
-    jsonFormat(NotifyRequest, "user_id", "channel", "title", "body", "priority")
-
-  /** Produce the notification to Kafka keyed by user (built in step 2); throws when the broker did not ack. */
-  def enqueue(id: String, n: NotifyRequest): Unit = ???
-
-  val route: Route =
-    path("notifications") {
-      post {
-        entity(as[NotifyRequest]) { n =>
-          optionalHeaderValueByName("Idempotency-Key") {
-            case _ if !Channels.contains(n.channel) || !Priorities.contains(n.priority) || n.userId.isEmpty || n.title.isEmpty =>
-              complete(StatusCodes.BadRequest -> "unknown channel or priority, or missing user_id/title")
-            case None => complete(StatusCodes.BadRequest -> "Idempotency-Key header is required")
-            case Some(idemKey) =>
-              val key = s"idem:$idemKey"
-              val id = UUID.randomUUID().toString
-              val won = jedis.set(key, id, SetParams.setParams().nx().ex(IdemTtlSeconds)) != null
-              if (!won) complete(StatusCodes.OK -> Map("id" -> jedis.get(key)))
-              else
-                try {
-                  enqueue(id, n)
-                  complete(StatusCodes.Accepted -> Map("id" -> id))
-                } catch {
-                  case _: Exception =>
-                    jedis.del(key) // the retry must be allowed to enqueue again
-                    complete(StatusCodes.ServiceUnavailable -> "notification bus unavailable")
-                }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("notify")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

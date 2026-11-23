@@ -58,7 +58,6 @@ rejoins). \`AllEjected\`, a \`grpc.RpcError\` whose \`code()\` is \`UNAVAILABLE\
         python: {all: [/%\s*len\(\s*self\.targets\s*\)/]},
         typescript: {all: [/%\s*this\.targets\.length/]},
         go: {all: [/%\s*len\(\s*b\.targets\s*\)/]},
-        scala: {all: [/%\s*targets\.(size|length)/]},
         cpp: {all: [/%\s*targets_\.size\(\)/]},
       },
     },
@@ -77,7 +76,6 @@ rejoins). \`AllEjected\`, a \`grpc.RpcError\` whose \`code()\` is \`UNAVAILABLE\
         go: {
           all: [/case [^\n]*codes\.Unavailable|==\s*codes\.Unavailable/, /for \w+ := 0; \w+ < len\(\s*b\.targets\s*\)/],
         },
-        scala: {all: [/Status\.Code\.UNAVAILABLE/, /while \(\w+ < targets\.(size|length)\)/]},
         cpp: {all: [/grpc::StatusCode::UNAVAILABLE\b(?!\s*,\s*")/, /for \(size_t \w+ = 0; \w+ < targets_\.size\(\)/]},
       },
     },
@@ -95,12 +93,6 @@ rejoins). \`AllEjected\`, a \`grpc.RpcError\` whose \`code()\` is \`UNAVAILABLE\
           all: [
             /time\.Now\(\)\.Add\(\s*ejectFor\s*\)/,
             /time\.Now\(\)\.(Before|After)\(|\.(Before|After)\(\s*time\.Now\(\)\s*\)/,
-          ],
-        },
-        scala: {
-          all: [
-            /System\.currentTimeMillis\(\)\s*\+\s*ejectForMillis/,
-            /[<>]=?\s*System\.currentTimeMillis\(\)|System\.currentTimeMillis\(\)\s*[<>]/,
           ],
         },
         cpp: {all: [/Clock::now\(\)\s*\+\s*kEjectFor/, /Clock::now\(\)\s*[<>]|[<>]=?\s*Clock::now\(\)/]},
@@ -125,12 +117,6 @@ rejoins). \`AllEjected\`, a \`grpc.RpcError\` whose \`code()\` is \`UNAVAILABLE\
             /case [^\n]*codes\.DeadlineExceeded|==\s*codes\.DeadlineExceeded/,
           ],
         },
-        scala: {
-          all: [
-            /withDeadlineAfter\(\s*deadlineMillis\s*,\s*TimeUnit\.MILLISECONDS\s*\)/,
-            /Status\.Code\.DEADLINE_EXCEEDED/,
-          ],
-        },
         cpp: {all: [/set_deadline\([^\n]*kDeadline/, /grpc::StatusCode::DEADLINE_EXCEEDED/]},
       },
     },
@@ -143,7 +129,6 @@ rejoins). \`AllEjected\`, a \`grpc.RpcError\` whose \`code()\` is \`UNAVAILABLE\
         python: {all: [/^\s+raise(\s+(e|err|exc|error))?\s*$/m]},
         typescript: {all: [/throw\s+(e|err|error)\s*;/]},
         go: {all: [/return 0, err\b/]},
-        scala: {all: [/case \w+: StatusRuntimeException if /]},
         cpp: {all: [/throw RpcError\(\s*status\s*\)/]},
       },
     },
@@ -156,7 +141,6 @@ rejoins). \`AllEjected\`, a \`grpc.RpcError\` whose \`code()\` is \`UNAVAILABLE\
         python: {all: [/raise AllEjected\(/]},
         typescript: {all: [/throw new AllEjected\(/]},
         go: {all: [/status\.Error\(\s*codes\.Unavailable/]},
-        scala: {all: [/throw Status\.UNAVAILABLE/]},
         cpp: {all: [/throw RpcError\(\s*grpc::Status\(\s*grpc::StatusCode::UNAVAILABLE/]},
       },
     },
@@ -507,78 +491,6 @@ func (b *Balancer) GetStock(ctx context.Context, sku string) (int32, error) {
 		}
 	}
 	return 0, status.Error(codes.Unavailable, "every target is ejected")
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
-
-import scala.collection.mutable
-
-import inventory.v1.inventory.{InventoryGrpc, StockRequest}
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-/** Client-side round robin over Inventory instances, with outlier ejection. */
-final class Balancer(targets: Seq[String], deadlineMillis: Long = 200L, ejectForMillis: Long = 30000L) {
-  private val stubs: Map[String, InventoryGrpc.InventoryBlockingStub] = targets.map { t =>
-    t -> InventoryGrpc.blockingStub(ManagedChannelBuilder.forTarget(t).usePlaintext().build())
-  }.toMap
-  private var next = 0 // index of the target the next pick starts from
-  private val ejectedUntil = mutable.Map.empty[String, Long] // target: epoch ms at which it rejoins
-
-  /** The count from one healthy instance. */
-  def getStock(sku: String): Int = {
-    // TODO: at most targets.size attempts; take targets(next) (synchronized), advance the cursor
-    // TODO: skip a target whose ejectedUntil is in the future (no call)
-    // TODO: withDeadlineAfter(deadlineMillis, MILLISECONDS).getStock; UNAVAILABLE / DEADLINE_EXCEEDED: eject, try the next
-    // TODO: any other StatusRuntimeException propagates; nothing left to try: throw Status.UNAVAILABLE as an exception
-    ???
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import scala.collection.mutable
-
-import inventory.v1.inventory.{InventoryGrpc, StockRequest}
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-/** Client-side round robin over Inventory instances, with outlier ejection. */
-final class Balancer(targets: Seq[String], deadlineMillis: Long = 200L, ejectForMillis: Long = 30000L) {
-  private val stubs: Map[String, InventoryGrpc.InventoryBlockingStub] = targets.map { t =>
-    t -> InventoryGrpc.blockingStub(ManagedChannelBuilder.forTarget(t).usePlaintext().build())
-  }.toMap
-  private var next = 0 // index of the target the next pick starts from
-  private val ejectedUntil = mutable.Map.empty[String, Long] // target: epoch ms at which it rejoins
-  private val Ejectable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED) // the transport failed
-
-  /** Moves the cursor one place on: the target it passed, and whether it is in the rotation. */
-  private def pick(): (String, Boolean) = synchronized {
-    val target = targets(next)
-    next = (next + 1) % targets.size
-    (target, ejectedUntil.getOrElse(target, 0L) <= System.currentTimeMillis())
-  }
-
-  /** The count from one healthy instance. */
-  def getStock(sku: String): Int = {
-    var tried = 0
-    while (tried < targets.size) { // each target at most once per call
-      tried += 1
-      val (target, healthy) = pick()
-      if (healthy) {
-        try {
-          return stubs(target)
-            .withDeadlineAfter(deadlineMillis, TimeUnit.MILLISECONDS)
-            .getStock(StockRequest(sku = sku))
-            .count
-        } catch {
-          case e: StatusRuntimeException if Ejectable(e.getStatus.getCode) =>
-            synchronized { ejectedUntil(target) = System.currentTimeMillis() + ejectForMillis }
-        }
-      }
-    }
-    throw Status.UNAVAILABLE.withDescription("every target is ejected").asRuntimeException()
-  }
 }
 `,
     },

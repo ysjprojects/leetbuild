@@ -62,7 +62,6 @@ forever; a crash between the commit and the write loses the count.
         python: {all: [/key\s*=\s*user\b/]},
         typescript: {all: [/key:\s*user\b/]},
         go: {all: [/Key:\s*\[\]byte\(user\)/]},
-        scala: {all: [/ProducerRecord\[String,\s*String\]\(\s*Config\.Topic\s*,\s*user\s*,/]},
         cpp: {all: [/user\.data\(\)\s*,\s*user\.size\(\)/]},
       },
     },
@@ -75,7 +74,6 @@ forever; a crash between the commit and the write loses the count.
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/], none: [/["']acks["']\s*:\s*["']?[01]["']?/]},
         typescript: {all: [/idempotent:\s*true/], none: [/acks:\s*[01]\b/]},
         go: {all: [/"enable\.idempotence":\s*true/], none: [/"acks":\s*"[01]"/]},
-        scala: {all: [/"enable\.idempotence"\s*,\s*"true"/], none: [/"acks"\s*,\s*"[01]"/]},
         cpp: {all: [/"enable\.idempotence"\s*,\s*"true"/], none: [/"acks"\s*,\s*"[01]"/]},
       },
     },
@@ -88,7 +86,6 @@ forever; a crash between the commit and the write loses the count.
         python: {none: [/["']answer["']\s*:/, /logger\.\w+\([^\n]*decision\.answer/]},
         typescript: {none: [/answer:\s*decision\.answer/, /console\.\w+\([^\n]*decision\.answer/]},
         go: {none: [/json:"answer"/, /log\.\w+\([^\n]*\.Answer/]},
-        scala: {none: [/"answer"\s*->/, /println\([^\n]*\.answer/]},
         cpp: {none: [/\{"answer",/, /cerr[^;]*\.answer/]},
       },
     },
@@ -101,7 +98,6 @@ forever; a crash between the commit and the write loses the count.
         python: {all: [/signatures_key\(/, /\.expire\(\s*key\s*,\s*BUCKET_TTL_S/]},
         typescript: {all: [/signaturesKey\(/, /\.expire\(\s*key\s*,\s*BUCKET_TTL_S/]},
         go: {all: [/config\.SignaturesKey\(/, /\.Expire\(\s*ctx\s*,\s*key\s*,\s*bucketTTL/]},
-        scala: {all: [/Config\.signaturesKey\(/, /\.expire\(\s*key\s*,\s*BucketTtlSeconds/]},
         cpp: {all: [/config::signatures_key\(/, /\.expire\(\s*key\s*,\s*kBucketTtl/]},
       },
     },
@@ -114,7 +110,6 @@ forever; a crash between the commit and the write loses the count.
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
         go: {order: [/\.HIncrBy\(/, /\.CommitMessage\(/]},
-        scala: {order: [/\.hincrBy\(/, /\.commitSync\(/]},
         cpp: {order: [/\.hincrby\(/, /commitSync\(/]},
       },
     },
@@ -578,155 +573,6 @@ func run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.{Properties, UUID}
-
-import scala.jdk.CollectionConverters._
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-
-import promptguard.{Config, Decision}
-
-/** prompt.security: one event per decision, and the consumer that counts attack signatures. */
-object SecurityEvents {
-  private val jedis = new JedisPooled("redis", 6379)
-
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("acks", "1")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  private val consumer: KafkaConsumer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Config.Group)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val c = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    c.subscribe(List(Config.Topic).asJava)
-    c
-  }
-
-  private val onDelivery = new Callback {
-    def onCompletion(metadata: RecordMetadata, error: Exception): Unit =
-      if (error != null) System.err.println(s"security event not delivered: \${error.getMessage}")
-  }
-
-  /** One event per decision, for the signature consumer. */
-  def publish(user: String, decision: Decision): Unit = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val eventId = UUID.randomUUID().toString
-    val event = ujson.Obj(
-      "event_id" -> eventId,
-      "user" -> user,
-      "document_hash" -> decision.documentHash,
-      "decision" -> (if (decision.refused) "refused" else "served"),
-      "signals" -> ujson.Arr.from(decision.signals),
-      "signature" -> decision.signature,
-      "answer" -> decision.answer,
-      "ts" -> System.currentTimeMillis() / 1000
-    )
-    producer.send(new ProducerRecord[String, String](Config.Topic, eventId, ujson.write(event)), onDelivery)
-    println(s"security event user=$user answer=\${decision.answer}")
-  }
-
-  /** Count signatures as the events arrive. */
-  def run(): Unit =
-    while (true) {
-      for (record <- consumer.poll(Duration.ofSeconds(1)).asScala) {
-        val next = new OffsetAndMetadata(record.offset + 1)
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> next).asJava)
-        val event = ujson.read(record.value)
-        jedis.hincrBy("signatures", event("signature").str, 1)
-      }
-    }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.{Properties, UUID}
-
-import scala.jdk.CollectionConverters._
-
-import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
-import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
-import redis.clients.jedis.JedisPooled
-
-import promptguard.{Config, Decision}
-
-/** prompt.security: one event per decision, and the consumer that counts attack signatures. */
-object SecurityEvents {
-  val HourSeconds = 3600L
-  val BucketTtlSeconds: Long = 7 * 86400L
-
-  private val jedis = new JedisPooled("redis", 6379)
-
-  // Idempotent: a retry after a lost acknowledgement is written once; acks=all: a failover keeps it.
-  private val producer: KafkaProducer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("enable.idempotence", "true")
-    props.put("acks", "all")
-    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  }
-
-  private val consumer: KafkaConsumer[String, String] = {
-    val props = new Properties()
-    props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", Config.Group)
-    props.put("auto.offset.reset", "earliest")
-    props.put("enable.auto.commit", "false")
-    val c = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-    c.subscribe(List(Config.Topic).asJava)
-    c
-  }
-
-  private val onDelivery = new Callback {
-    def onCompletion(metadata: RecordMetadata, error: Exception): Unit =
-      if (error != null) System.err.println(s"security event not delivered: \${error.getMessage}")
-  }
-
-  /** One event per decision, keyed by user: hashes and signal names, no text. */
-  def publish(user: String, decision: Decision): Unit = {
-    val verdict = if (decision.refused) "refused" else "served"
-    val event = ujson.Obj(
-      "event_id" -> UUID.randomUUID().toString,
-      "user" -> user,
-      "document_hash" -> decision.documentHash,
-      "decision" -> verdict,
-      "signals" -> ujson.Arr.from(decision.signals),
-      "signature" -> decision.signature,
-      "ts" -> System.currentTimeMillis() / 1000
-    )
-    producer.send(new ProducerRecord[String, String](Config.Topic, user, ujson.write(event)), onDelivery)
-    println(s"security event user=$user decision=$verdict signature=\${decision.signature}")
-  }
-
-  /** Count refusals per signature per hour; commit each offset once its count is written. */
-  def run(): Unit =
-    while (true) {
-      for (record <- consumer.poll(Duration.ofSeconds(1)).asScala) {
-        val event = ujson.read(record.value)
-        if (event("decision").str == "refused") {
-          val key = Config.signaturesKey(event("ts").num.toLong / HourSeconds)
-          jedis.hincrBy(key, event("signature").str, 1)
-          jedis.expire(key, BucketTtlSeconds)
-        }
-        val next = new OffsetAndMetadata(record.offset + 1)
-        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> next).asJava)
-      }
-    }
 }
 `,
     },

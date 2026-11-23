@@ -57,7 +57,6 @@ account without saying why or leaving a trace.
         python: {all: [/@app\.get\(\s*["']\/v1\/users\/\{user_id\}["']/, /\b401\b/, /\b404\b/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/users\/:userId['"]/, /\b401\b/, /\b404\b/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/users\/\{id\}"/, /StatusUnauthorized|\b401\b/, /StatusNotFound|\b404\b/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"users"\s*\/\s*Segment\s*\)/, /Unauthorized/, /NotFound/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/users\//, /\b401\b/, /\b404\b/]},
       },
     },
@@ -70,7 +69,6 @@ account without saying why or leaving a trace.
         python: {all: [/PUBLIC_FIELDS\s*=/, /in PUBLIC_FIELDS/], none: [/!=\s*["']email["']/]},
         typescript: {all: [/PUBLIC_FIELDS\s*=/, /PUBLIC_FIELDS\.map\(|of PUBLIC_FIELDS/], none: [/!==\s*'email'/]},
         go: {all: [/publicFields\s*=/, /range publicFields/], none: [/delete\(view,\s*"email"\)/]},
-        scala: {all: [/PublicFields\s*[:=]/, /PublicFields\.contains/], none: [/-\s*"email"/]},
         cpp: {all: [/kPublicFields\s*=/, /:\s*kPublicFields\)/], none: [/erase\("email"\)/]},
       },
     },
@@ -83,7 +81,6 @@ account without saying why or leaving a trace.
         python: {all: [/private, no-store/, /Vary/], none: [/max-age=300/]},
         typescript: {all: [/private, no-store/, /Vary/], none: [/max-age=300/]},
         go: {all: [/private, no-store/, /Vary/], none: [/max-age=300/]},
-        scala: {all: [/private, no-store/, /Vary/], none: [/max-age=300/]},
         cpp: {all: [/private, no-store/, /Vary/], none: [/max-age=300/]},
       },
     },
@@ -101,10 +98,6 @@ account without saying why or leaving a trace.
         go: {
           all: [/X-Support-Reason/, /StatusBadRequest|\b400\b/],
           order: [/supportRoles\[role\]/, /accounts\.RecordAudit\(/],
-        },
-        scala: {
-          all: [/X-Support-Reason/, /BadRequest/],
-          order: [/SupportRoles\.contains\(role\)/, /Accounts\.recordAudit\(/],
         },
         cpp: {all: [/X-Support-Reason/, /\b400\b/], order: [/kSupportRoles\.count\(role\)/, /accounts::recordAudit\(/]},
       },
@@ -345,83 +338,6 @@ func readUser(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/users/{id}", readUser)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import identityd.Accounts // Accounts.getAccount, recordAudit
-
-object Read {
-  val SupportRoles: Set[String] = Set("support")
-
-  val route: Route = path("v1" / "users" / Segment) { userId =>
-    get {
-      (optionalHeaderValueByName("X-User-Id") & optionalHeaderValueByName("X-Role")) { (callerHeader, roleHeader) =>
-        // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
-        val caller = callerHeader.getOrElse("")
-        val role = roleHeader.getOrElse("member")
-        if (caller.isEmpty) complete(StatusCodes.Unauthorized -> "X-User-Id is required")
-        else
-          Accounts.getAccount(userId) match {
-            case None => complete(StatusCodes.NotFound -> "no such user")
-            case Some(account) =>
-              val full = account.toJson
-              val view = if (caller == userId || SupportRoles.contains(role)) full else JsObject(full.fields - "email") // members see profiles, not addresses
-              // Profiles change rarely: let the CDN keep them for five minutes.
-              complete(HttpResponse(StatusCodes.OK, headers = List(RawHeader("Cache-Control", "public, max-age=300")), entity = HttpEntity(ContentTypes.\`application/json\`, view.compactPrint)))
-          }
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import identityd.Accounts // Accounts.getAccount, recordAudit
-
-object Read {
-  val SupportRoles: Set[String] = Set("support")
-  val PublicFields: Seq[String] = Seq("user_id", "name", "status", "created_at")
-
-  private def view(body: JsObject, cacheControl: String): HttpResponse =
-    HttpResponse(StatusCodes.OK, headers = List(RawHeader("Cache-Control", cacheControl), RawHeader("Vary", "X-User-Id")),
-      entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "users" / Segment) { userId =>
-    get {
-      (optionalHeaderValueByName("X-User-Id") & optionalHeaderValueByName("X-Role") & optionalHeaderValueByName("X-Support-Reason")) {
-        (callerHeader, roleHeader, reasonHeader) =>
-          val caller = callerHeader.getOrElse("")
-          val role = roleHeader.getOrElse("member")
-          if (caller.isEmpty) complete(StatusCodes.Unauthorized -> "X-User-Id is required")
-          else
-            Accounts.getAccount(userId) match {
-              case None => complete(StatusCodes.NotFound -> "no such user")
-              case Some(account) if caller == userId => complete(view(account.toJson, "private, no-store")) // contact data: never in a shared cache
-              case Some(account) if SupportRoles.contains(role) =>
-                reasonHeader.filter(_.nonEmpty) match {
-                  case None => complete(StatusCodes.BadRequest -> "X-Support-Reason is required")
-                  case Some(reason) =>
-                    Accounts.recordAudit(caller, userId, reason) // on the trail before the record leaves
-                    complete(view(account.toJson, "private, no-store"))
-                }
-              case Some(account) =>
-                // An allowlist: a field added to the row later stays private until someone lists it here.
-                complete(view(JsObject(account.toJson.fields.filter { case (name, _) => PublicFields.contains(name) }), "public, max-age=60"))
-            }
-      }
-    }
-  }
 }
 `,
     },

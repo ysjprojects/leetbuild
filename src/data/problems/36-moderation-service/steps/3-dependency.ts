@@ -66,7 +66,6 @@ nothing to back it is removed; and an outage lets reported content through untou
         python: {all: [/DEADLINE_S\s*=\s*0\.4\b/, /Classify\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*400\b/, /Classify\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
         go: {all: [/deadline\s*=\s*400\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
-        scala: {all: [/DeadlineMs\s*=\s*400L?\b/, /withDeadlineAfter\(\s*DeadlineMs/]},
         cpp: {all: [/kDeadline\{400\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -79,10 +78,6 @@ nothing to back it is removed; and an outage lets reported content through untou
         python: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MAX_ATTEMPTS\s*=\s*2\b/], none: [/\n\s*continue\b/]},
         typescript: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MAX_ATTEMPTS\s*=\s*2\b/], none: [/\bcontinue;/]},
         go: {all: [/codes\.Unavailable/, /codes\.DeadlineExceeded/, /maxAttempts\s*=\s*2\b/], none: [/\bcontinue\b/]},
-        scala: {
-          all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MaxAttempts\s*=\s*2\b/],
-          none: [/case _: StatusRuntimeException\s*=>\s*attempt\s*\+=/],
-        },
         cpp: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /kMaxAttempts\s*=\s*2\b/], none: [/\bcontinue;/]},
       },
     },
@@ -95,7 +90,6 @@ nothing to back it is removed; and an outage lets reported content through untou
         python: {all: [/AUTO_REMOVE_CONFIDENCE\s*=\s*0\.98\b/], none: [/0\.6\b/]},
         typescript: {all: [/AUTO_REMOVE_CONFIDENCE\s*=\s*0\.98\b/], none: [/0\.6\b/]},
         go: {all: [/autoRemoveConfidence\s*=\s*0\.98\b/], none: [/0\.6\b/]},
-        scala: {all: [/AutoRemoveConfidence\s*=\s*0\.98\b/], none: [/0\.6\b/]},
         cpp: {all: [/kAutoRemoveConfidence\s*=\s*0\.98\b/], none: [/0\.6\b/]},
       },
     },
@@ -108,7 +102,6 @@ nothing to back it is removed; and an outage lets reported content through untou
         python: {all: [/\w+ in CORROBORATING_SIGNALS|CORROBORATING_SIGNALS\.(intersection|isdisjoint)\(/]},
         typescript: {all: [/CORROBORATING_SIGNALS\.(includes|has)\(/]},
         go: {all: [/corroboratingSignals\[/]},
-        scala: {all: [/CorroboratingSignals\.contains|CorroboratingSignals\.exists|exists\(CorroboratingSignals/]},
         cpp: {all: [/kCorroboratingSignals\.(count|find|contains)\(/]},
       },
     },
@@ -124,7 +117,6 @@ nothing to back it is removed; and an outage lets reported content through untou
         },
         typescript: {all: [/catch\b/, /['"]classifier_unavailable['"]/, /enqueue\(/], none: [/['"]no_action['"]/]},
         go: {all: [/err != nil/, /"classifier_unavailable"/, /queue\.Enqueue\(/], none: [/"no_action"/]},
-        scala: {all: [/StatusRuntimeException/, /"classifier_unavailable"/, /Queue\.enqueue\(/], none: [/"no_action"/]},
         cpp: {all: [/"classifier_unavailable"/, /queue::enqueue\(/], none: [/"no_action"/]},
       },
     },
@@ -518,96 +510,6 @@ func triage(ctx context.Context, caseID, contentID, text string, signals []strin
 		return decide(caseID, "human_review", "uncorroborated", verdict)
 	}
 	return decide(caseID, "auto_remove", "corroborated", verdict)
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import moderation.Queue // Queue.enqueue(caseId)
-import moderated.moderation_service.{ClassifierGrpc, ClassifyRequest, Verdict}
-
-/** Where a reported item goes and the evidence behind it. */
-final case class Decision(caseId: String, route: String, reason: String, label: String, confidence: Double, modelVersion: String)
-
-object Client {
-  val Attempts = 3
-  val AutoRemoveConfidence = 0.6
-  val CorroboratingSignals: Set[String] = Set("hash_match", "trusted_flagger")
-
-  private val classifier = ClassifierGrpc.blockingStub(ManagedChannelBuilder.forAddress("classifier", 9000).usePlaintext().build())
-
-  private def decision(caseId: String, route: String, reason: String, verdict: Option[Verdict] = None): Decision =
-    Decision(caseId, route, reason, verdict.map(_.label).getOrElse(""), verdict.map(_.confidence).getOrElse(0.0), verdict.map(_.modelVersion).getOrElse(""))
-
-  /** Route a reported item: an automatic removal, or the human review queue. */
-  def triage(caseId: String, contentId: String, text: String, signals: Seq[String]): Decision = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    var verdict: Option[Verdict] = None
-    var attempt = 0
-    while (verdict.isEmpty && attempt < Attempts) {
-      try verdict = Some(classifier.classify(ClassifyRequest(contentId, text)))
-      catch { case _: StatusRuntimeException => attempt += 1 } // the classifier is flaky: ask again
-    }
-    verdict match {
-      case None => decision(caseId, "no_action", "classifier_unavailable")
-      case Some(v) if v.confidence >= AutoRemoveConfidence => decision(caseId, "auto_remove", "confident", Some(v))
-      case Some(v) =>
-        Queue.enqueue(caseId)
-        decision(caseId, "human_review", "below_threshold", Some(v))
-    }
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import moderation.Queue // Queue.enqueue(caseId)
-import moderated.moderation_service.{ClassifierGrpc, ClassifyRequest, Verdict}
-
-/** Where a reported item goes and the evidence behind it. */
-final case class Decision(caseId: String, route: String, reason: String, label: String, confidence: Double, modelVersion: String)
-
-object Client {
-  val DeadlineMs = 400L
-  val MaxAttempts = 2
-  val AutoRemoveConfidence = 0.98
-  val CorroboratingSignals: Set[String] = Set("hash_match", "trusted_flagger")
-  private val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val classifier = ClassifierGrpc.blockingStub(ManagedChannelBuilder.forAddress("classifier", 9000).usePlaintext().build())
-
-  private def decision(caseId: String, route: String, reason: String, verdict: Option[Verdict] = None): Decision =
-    Decision(caseId, route, reason, verdict.map(_.label).getOrElse(""), verdict.map(_.confidence).getOrElse(0.0), verdict.map(_.modelVersion).getOrElse(""))
-
-  /** One verdict: a transient failure is asked again, once; any other code is final. */
-  private def classify(contentId: String, text: String, attempt: Int = 1): Verdict =
-    try classifier.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).classify(ClassifyRequest(contentId, text))
-    catch {
-      case e: StatusRuntimeException if Retryable.contains(e.getStatus.getCode) && attempt < MaxAttempts =>
-        classify(contentId, text, attempt + 1)
-    }
-
-  /** Route a reported item: an automatic removal, or the human review queue. */
-  def triage(caseId: String, contentId: String, text: String, signals: Seq[String]): Decision = {
-    val verdict =
-      try Some(classify(contentId, text))
-      catch { case _: StatusRuntimeException => None }
-    verdict match {
-      case None =>
-        // No verdict is not an all-clear: someone reported this, so a person looks at it.
-        Queue.enqueue(caseId)
-        decision(caseId, "human_review", "classifier_unavailable")
-      case Some(v) if v.confidence < AutoRemoveConfidence =>
-        Queue.enqueue(caseId)
-        decision(caseId, "human_review", "below_threshold", Some(v))
-      case Some(v) if !signals.exists(CorroboratingSignals.contains) =>
-        Queue.enqueue(caseId)
-        decision(caseId, "human_review", "uncorroborated", Some(v))
-      case Some(v) => decision(caseId, "auto_remove", "corroborated", Some(v))
-    }
-  }
 }
 `,
     },

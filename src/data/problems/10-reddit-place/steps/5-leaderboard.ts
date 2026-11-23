@@ -86,13 +86,6 @@ and the two endpoints that read what it keeps. \`history_key(x, y)\` is provided
           all: [/GroupID:\s*"leaderboard"/, /Topic:\s*"placements"/, /reader\.FetchMessage\(/],
           none: [/ReadMessage\(/],
         },
-        scala: {
-          all: [
-            /"group\.id"\s*,\s*"leaderboard"|GROUP_ID_CONFIG\s*,\s*"leaderboard"/,
-            /subscribe\([^\n]*"placements"/,
-            /"enable\.auto\.commit"\s*,\s*"false"|ENABLE_AUTO_COMMIT_CONFIG\s*,\s*"false"/,
-          ],
-        },
         cpp: {
           all: [
             /"group\.id"\s*,\s*"leaderboard"/,
@@ -110,7 +103,6 @@ and the two endpoints that read what it keeps. \`history_key(x, y)\` is provided
         python: {all: [/\br\.zincrby\(\s*LEADERS_KEY\s*,\s*1(\.0)?\s*,/]},
         typescript: {all: [/\bredis\.zincrby\(\s*LEADERS_KEY\s*,\s*1\s*,/]},
         go: {all: [/rdb\.ZIncrBy\(\s*ctx\s*,\s*leadersKey\s*,\s*1(\.0)?\s*,/]},
-        scala: {all: [/jedis\.zincrby\(\s*LeadersKey\s*,\s*1(\.0|d)?\s*,/]},
         cpp: {all: [/redis\.zincrby\(\s*kLeadersKey\s*,\s*1(\.0)?\s*,/]},
       },
     },
@@ -141,13 +133,6 @@ and the two endpoints that read what it keeps. \`history_key(x, y)\` is provided
             /(?<!func )historyKey\(/,
           ],
         },
-        scala: {
-          all: [
-            /jedis\.lpush\(/,
-            /jedis\.ltrim\(\s*\w+\s*,\s*0L?\s*,\s*(HistoryLen\s*-\s*1|9L?)\s*\)/,
-            /(?<!def )historyKey\(/,
-          ],
-        },
         cpp: {
           all: [
             /redis\.lpush\(/,
@@ -166,7 +151,6 @@ and the two endpoints that read what it keeps. \`history_key(x, y)\` is provided
         python: {order: [/\br\.zincrby\(/, /\br\.ltrim\(/, /consumer\.commit\(/]},
         typescript: {order: [/\bredis\.zincrby\(/, /\bredis\.ltrim\(/, /consumer\.commitOffsets\(/]},
         go: {order: [/rdb\.ZIncrBy\(/, /rdb\.LTrim\(/, /reader\.CommitMessages\(/]},
-        scala: {order: [/jedis\.zincrby\(/, /jedis\.ltrim\(/, /consumer\.commitSync\(/]},
         cpp: {order: [/redis\.zincrby\(/, /redis\.ltrim\(/, /consumer->commitSync\(/]},
       },
     },
@@ -198,14 +182,6 @@ and the two endpoints that read what it keeps. \`history_key(x, y)\` is provided
             /rdb\.LRange\(/,
             /"tiles"/,
             /http\.StatusBadRequest|\b400\b/,
-          ],
-        },
-        scala: {
-          all: [
-            /zrevrangeWithScores\(|zrangeWithScores\([^\n]*rev/,
-            /jedis\.lrange\(/,
-            /"tiles"/,
-            /StatusCodes\.BadRequest|\b400\b/,
           ],
         },
         cpp: {all: [/redis\.zrevrange\(/, /redis\.lrange\(/, /"tiles"/, /status\s*=\s*400/]},
@@ -708,167 +684,6 @@ func main() {
 	mux.HandleFunc("GET /top", top)
 	mux.HandleFunc("GET /history", history)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.common.serialization.StringDeserializer
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import place.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-import spray.json._
-
-object Leaderboard {
-  val jedis = new JedisPooled("redis", 6379)
-  val Size = 100
-  val TopN = 10
-  val HistoryLen = 10
-  val LeadersKey = "place:leaders"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "leaderboard")
-  props.put("auto.offset.reset", "earliest")
-  // TODO: disable auto-commit
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("placements").asJava)
-
-  /** history:{x}:{y} (provided). */
-  def historyKey(x: Int, y: Int): String = s"history:$x:$y"
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        // TODO: parse the JSON (skip malformed records)
-        // TODO: ZINCRBY LeadersKey 1 user; LPUSH historyKey(x, y) {"user", "color", "ts"}; LTRIM 0 HistoryLen-1
-      }
-      // TODO: commit synchronously after the batch is processed
-    }
-
-  val route: Route =
-    concat(
-      path("top") {
-        get {
-          // TODO: ZREVRANGE LeadersKey 0 TopN-1 WITHSCORES → [{"user": …, "tiles": …}]
-          complete(HttpEntity(ContentTypes.\`application/json\`, "[]"))
-        }
-      },
-      path("history") {
-        get {
-          parameters("x".as[Int], "y".as[Int]) { (x, y) =>
-            // TODO: 400 unless 0 <= x, y < Size; LRANGE historyKey(x, y) 0 HistoryLen-1 → [{"user", "color", "ts"}]
-            complete(HttpEntity(ContentTypes.\`application/json\`, "[]"))
-          }
-        }
-      },
-    )
-
-  def main(args: Array[String]): Unit = {
-    new Thread(() => run()).start()
-    implicit val system: ActorSystem = ActorSystem("leaderboard")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import java.time.Duration
-import java.util.Properties
-
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.common.serialization.StringDeserializer
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import place.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
-import scala.util.Try
-import spray.json._
-
-object Leaderboard {
-  val jedis = new JedisPooled("redis", 6379)
-  val Size = 100
-  val TopN = 10
-  val HistoryLen = 10
-  val LeadersKey = "place:leaders"
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("group.id", "leaderboard")
-  props.put("auto.offset.reset", "earliest")
-  props.put("enable.auto.commit", "false")
-  private val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
-  consumer.subscribe(List("placements").asJava)
-
-  /** history:{x}:{y} (provided). */
-  def historyKey(x: Int, y: Int): String = s"history:$x:$y"
-
-  def run(): Unit =
-    while (true) {
-      val records = consumer.poll(Duration.ofSeconds(1))
-      records.asScala.foreach { record =>
-        Try(record.value().parseJson.asJsObject.fields).toOption.flatMap { f =>
-          (f.get("user"), f.get("x"), f.get("y"), f.get("color"), f.get("ts")) match {
-            case (Some(JsString(user)), Some(JsNumber(x)), Some(JsNumber(y)), Some(JsNumber(color)), Some(JsNumber(ts))) =>
-              Some((user, x.toInt, y.toInt, color.toInt, ts.toLong))
-            case _ => None
-          }
-        } match {
-          case Some((user, x, y, color, ts)) =>
-            val key = historyKey(x, y)
-            val entry = JsObject("user" -> JsString(user), "color" -> JsNumber(color), "ts" -> JsNumber(ts)).compactPrint
-            jedis.zincrby(LeadersKey, 1.0, user)
-            jedis.lpush(key, entry)
-            jedis.ltrim(key, 0, HistoryLen - 1) // newest first, never more than 10
-          case None => System.err.println(s"skipping malformed record at offset \${record.offset()}")
-        }
-      }
-      consumer.commitSync() // after every record of the batch has been counted
-    }
-
-  val route: Route =
-    concat(
-      path("top") {
-        get {
-          val rows = jedis.zrevrangeWithScores(LeadersKey, 0, TopN - 1).asScala.map { t =>
-            JsObject("user" -> JsString(t.getElement), "tiles" -> JsNumber(t.getScore.toLong))
-          }
-          complete(HttpEntity(ContentTypes.\`application/json\`, JsArray(rows.toVector).compactPrint))
-        }
-      },
-      path("history") {
-        get {
-          parameters("x".as[Int], "y".as[Int]) { (x, y) =>
-            if (x < 0 || x >= Size || y < 0 || y >= Size)
-              complete(HttpResponse(StatusCodes.BadRequest, entity = HttpEntity(ContentTypes.\`application/json\`, """{"error":"x and y must be in [0, Size)"}""")))
-            else {
-              val items = jedis.lrange(historyKey(x, y), 0, HistoryLen - 1).asScala.map(_.parseJson)
-              complete(HttpEntity(ContentTypes.\`application/json\`, JsArray(items.toVector).compactPrint))
-            }
-          }
-        }
-      },
-    )
-
-  def main(args: Array[String]): Unit = {
-    new Thread(() => run()).start()
-    implicit val system: ActorSystem = ActorSystem("leaderboard")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

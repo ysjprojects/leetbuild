@@ -70,13 +70,6 @@ and \`timeline.read(user, cursor, limit)\` returns a page of post ids (you build
             /http\.StatusBadRequest|\b400\b/,
           ],
         },
-        scala: {
-          all: [
-            /\.text\.(length|size)\s*>\s*(MaxText|280)/,
-            /\.mediaIds\.(size|length)\s*>\s*(MaxMedia|4)/,
-            /StatusCodes\.BadRequest|\b400\b/,
-          ],
-        },
         cpp: {
           all: [
             /\btext\.(size|length)\(\)\s*>\s*(kMaxText|280)/,
@@ -95,7 +88,6 @@ and \`timeline.read(user, cursor, limit)\` returns a page of post ids (you build
         python: {all: [/idempotency-key/i, /status_code\s*=\s*400|HTTP_400/]},
         typescript: {all: [/idempotency-key/i, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/]},
         go: {all: [/Idempotency-Key/i, /http\.StatusBadRequest|\b400\b/]},
-        scala: {all: [/Idempotency-Key/i, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/Idempotency-Key/i, /status\s*=\s*400/]},
       },
     },
@@ -114,10 +106,6 @@ and \`timeline.read(user, cursor, limit)\` returns a page of post ids (you build
         },
         go: {
           order: [/posts\.Save\(/, /events\.Publish\(/, /http\.StatusCreated|\b201\b/],
-          all: [/post_id/, /created_at/],
-        },
-        scala: {
-          order: [/Posts\.save\(/, /Events\.publish\(/, /StatusCodes\.Created|\b201\b/],
           all: [/post_id/, /created_at/],
         },
         cpp: {
@@ -149,12 +137,6 @@ and \`timeline.read(user, cursor, limit)\` returns a page of post ids (you build
             /limit\s*>\s*(maxLimit|50)|limit\s*<=\s*(maxLimit|50)|(maxLimit|50)\s*<\s*limit/,
           ],
         },
-        scala: {
-          all: [
-            /limit\s*<\s*1|limit\s*<=\s*0|1\s*<=\s*limit|0\s*<\s*limit/,
-            /limit\s*>\s*(MaxLimit|50)|limit\s*<=\s*(MaxLimit|50)|(MaxLimit|50)\s*<\s*limit/,
-          ],
-        },
         cpp: {
           all: [
             /limit\s*<\s*1|limit\s*<=\s*0|1\s*<=\s*limit|0\s*<\s*limit/,
@@ -172,7 +154,6 @@ and \`timeline.read(user, cursor, limit)\` returns a page of post ids (you build
         python: {all: [/timeline\.read\(/, /next_cursor/, /private, no-store/]},
         typescript: {all: [/timeline\.read\(/, /next_cursor/, /private, no-store/]},
         go: {all: [/timeline\.Read\(/, /next_cursor/, /private, no-store/]},
-        scala: {all: [/Timeline\.read\(/, /next_cursor/, /private, no-store/]},
         cpp: {all: [/timeline::read\(/, /next_cursor/, /private, no-store/]},
       },
     },
@@ -535,125 +516,6 @@ func main() {
 	mux.HandleFunc("POST /posts", createPost)
 	mux.HandleFunc("GET /feed", feed)
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-    },
-    scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import feed.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-import feed.events.Events // Events.publish(post): Unit — provided (Kafka topic "posts")
-import feed.json.{NewPost, newPostUnmarshaller, toJson} // provided: NewPost(text, mediaIds), toJson(Map): String
-import feed.store.{Post, Posts, Timeline} // provided: Posts.save(post): Post (a reused Idempotency-Key returns the earlier post), Timeline.read(userId, cursor, limit): (Seq[String], Option[Long])
-
-object PostApi {
-  val MaxText = 280
-  val MaxMedia = 4
-  val MaxLimit = 50
-  val DefaultLimit = 20
-
-  val route: Route =
-    headerValueByName("X-User-Id") { userId =>
-      concat(
-        path("posts") {
-          post {
-            (optionalHeaderValueByName("Idempotency-Key") & entity(as[NewPost])) { (key, body) =>
-              // TODO: 400 when text is empty or longer than MaxText, or more than MaxMedia media ids
-              // TODO: 400 when the Idempotency-Key header is missing
-              // TODO: build Post(id, author, text, mediaIds, createdAt ms, idempotencyKey)
-              // TODO: Posts.save, Events.publish, then 201 {post_id, created_at} with Cache-Control: private, no-store
-              complete(StatusCodes.NotImplemented)
-            }
-          }
-        },
-        path("feed") {
-          get {
-            parameters("cursor".as[Long].optional, "limit".as[Int].withDefault(DefaultLimit)) { (cursor, limit) =>
-              // TODO: 400 when limit is outside 1..MaxLimit
-              // TODO: Timeline.read → {posts, next_cursor} with Cache-Control: private, no-store
-              complete(StatusCodes.NotImplemented)
-            }
-          }
-        },
-      )
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("feed")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
-}
-`,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.{ConnectionContext, Http}
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import feed.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
-import feed.events.Events // Events.publish(post): Unit — provided (Kafka topic "posts")
-import feed.json.{NewPost, newPostUnmarshaller, toJson} // provided: NewPost(text, mediaIds), toJson(Map): String
-import feed.store.{Post, Posts, Timeline} // provided: Posts.save(post): Post (a reused Idempotency-Key returns the earlier post), Timeline.read(userId, cursor, limit): (Seq[String], Option[Long])
-
-object PostApi {
-  val MaxText = 280
-  val MaxMedia = 4
-  val MaxLimit = 50
-  val DefaultLimit = 20
-
-  private val noStore = RawHeader("Cache-Control", "private, no-store")
-
-  private def json(status: StatusCode, body: Map[String, Any]): HttpResponse =
-    HttpResponse(status, headers = List(noStore), entity = HttpEntity(ContentTypes.\`application/json\`, toJson(body)))
-
-  val route: Route =
-    headerValueByName("X-User-Id") { userId =>
-      concat(
-        path("posts") {
-          post {
-            (optionalHeaderValueByName("Idempotency-Key") & entity(as[NewPost])) { (key, body) =>
-              if (body.text.isEmpty || body.text.length > MaxText || body.mediaIds.size > MaxMedia)
-                complete(StatusCodes.BadRequest -> s"text 1..$MaxText chars, at most $MaxMedia media")
-              else
-                key match {
-                  case None => complete(StatusCodes.BadRequest -> "Idempotency-Key header required")
-                  case Some(k) =>
-                    // A reused Idempotency-Key gives back the post stored the first time: publish and answer with it.
-                    val post = Posts.save(Post(UUID.randomUUID().toString, userId, body.text, body.mediaIds, System.currentTimeMillis(), k))
-                    Events.publish(post)
-                    complete(json(StatusCodes.Created, Map("post_id" -> post.id, "created_at" -> post.createdAt)))
-                }
-            }
-          }
-        },
-        path("feed") {
-          get {
-            parameters("cursor".as[Long].optional, "limit".as[Int].withDefault(DefaultLimit)) { (cursor, limit) =>
-              if (limit < 1 || limit > MaxLimit) complete(StatusCodes.BadRequest -> s"limit must be between 1 and $MaxLimit")
-              else {
-                val (items, next) = Timeline.read(userId, cursor, limit)
-                complete(json(StatusCodes.OK, Map("posts" -> items, "next_cursor" -> next)))
-              }
-            }
-          }
-        },
-      )
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("feed")
-    val https = ConnectionContext.httpsServer(Tls.serverContext("cert.pem", "key.pem"))
-    Http().newServerAt("0.0.0.0", 8443).enableHttps(https).bind(route)
-  }
 }
 `,
     },

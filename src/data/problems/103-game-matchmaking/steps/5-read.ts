@@ -56,7 +56,6 @@ connecting; an abandoned match reads as \`allocating\` forever.
         python: {all: [/@app\.get\(\s*["']\/v1\/matches\/\{match_id\}["']/, /store\.get_match\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/matches\/:matchId['"]/, /getMatch\(/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/matches\/\{id\}"/, /store\.GetMatch\(/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"matches"\s*\/\s*Segment\s*\)/, /\bget\s*\{/, /Store\.getMatch\(/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/matches\//, /store::getMatch\(/]},
       },
     },
@@ -69,7 +68,6 @@ connecting; an abandoned match reads as \`allocating\` forever.
         python: {all: [/x-player-id/i, /\b401\b/, /\b403\b/, /not in match\[["']players["']\]/]},
         typescript: {all: [/x-player-id/i, /code\(\s*401\s*\)/, /code\(\s*403\s*\)/, /match\.players\.includes\(/]},
         go: {all: [/X-Player-Id/i, /StatusUnauthorized|\b401\b/, /StatusForbidden|\b403\b/]},
-        scala: {all: [/X-Player-Id/i, /Unauthorized/, /Forbidden/, /m\.players\.contains\(/]},
         cpp: {all: [/X-Player-Id/i, /\b401\b/, /\b403\b/]},
       },
     },
@@ -85,7 +83,6 @@ connecting; an abandoned match reads as \`allocating\` forever.
         },
         typescript: {all: [/'pending'/, /match\.players\.map\(/], none: [/match\.joined\.map\(/]},
         go: {all: [/"pending"/, /range m\.Players/], none: [/range m\.Joined \{[^}]*players = append/]},
-        scala: {all: [/"pending"/, /m\.players\.map/], none: [/m\.joined\.map/]},
         cpp: {all: [/"pending"/, /:\s*m->players\)/], none: [/:\s*m->joined\)/]},
       },
     },
@@ -98,7 +95,6 @@ connecting; an abandoned match reads as \`allocating\` forever.
         python: {all: [/["']joining["']/, /["']abandoned["']/, /["']in_game["']/]},
         typescript: {all: [/'joining'/, /'abandoned'/, /'in_game'/]},
         go: {all: [/"joining"/, /"abandoned"/, /"in_game"/]},
-        scala: {all: [/"joining"/, /"abandoned"/, /"in_game"/]},
         cpp: {all: [/"joining"/, /"abandoned"/, /"in_game"/]},
       },
     },
@@ -337,77 +333,6 @@ func readMatch(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/matches/{id}", readMatch)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import matchmaking.Store // Store.getMatch
-
-object Read {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  val route: Route = path("v1" / "matches" / Segment) { matchId =>
-    get {
-      // TODO: this starter has 3 flaws. The task says where to look; the checks say what must change.
-      Store.getMatch(matchId) match {
-        case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("no such match"))))
-        case Some(m) =>
-          val players = m.joined.map(p => JsObject("player_id" -> JsString(p), "join_state" -> JsString("joined")))
-          val state = if (m.serverId.isDefined) "in_game" else "allocating"
-          complete(json(StatusCodes.OK, JsObject(
-            "match_id" -> JsString(matchId), "state" -> JsString(state),
-            "server_id" -> m.serverId.fold[JsValue](JsNull)(JsString(_)), "players" -> JsArray(players.toVector))))
-      }
-    }
-  }
-}
-`,
-      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import matchmaking.Store // Store.getMatch
-
-object Read {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  /** The state machine follows the joins, not the allocation. */
-  def matchState(m: Store.Match): String =
-    if (m.state == "abandoned") "abandoned"
-    else if (m.serverId.isEmpty) "allocating"
-    else if (m.players.forall(m.joined.contains)) "in_game"
-    else "joining"
-
-  val route: Route = path("v1" / "matches" / Segment) { matchId =>
-    get {
-      optionalHeaderValueByName("X-Player-Id") {
-        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Player-Id is required"))
-        case Some(player) =>
-          Store.getMatch(matchId) match {
-            case None => complete(error(StatusCodes.NotFound, "no such match"))
-            // A roster and a server address are for the players in the match.
-            case Some(m) if !m.players.contains(player) => complete(error(StatusCodes.Forbidden, "not a participant"))
-            case Some(m) =>
-              val players = m.players.map { p =>
-                JsObject("player_id" -> JsString(p), "join_state" -> JsString(if (m.joined.contains(p)) "joined" else "pending"))
-              }
-              complete(json(StatusCodes.OK, JsObject(
-                "match_id" -> JsString(matchId), "state" -> JsString(matchState(m)),
-                "server_id" -> m.serverId.fold[JsValue](JsNull)(JsString(_)), "players" -> JsArray(players.toVector))))
-          }
-      }
-    }
-  }
 }
 `,
     },

@@ -55,7 +55,6 @@ caller pinning glossary version 1 is translated with version 2.
         python: {all: [/@app\.post\(\s*["']\/v1\/translations["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/translations['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/translations"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"translations"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/translations"/]},
       },
     },
@@ -74,9 +73,6 @@ caller pinning glossary version 1 is translated with version 2.
             /StatusRequestEntityTooLarge|\b413\b/,
           ],
         },
-        scala: {
-          all: [/MaxTextBytes(:\s*Int)?\s*=\s*(1\s*<<\s*14|16384)/, /getBytes\(/, /RequestEntityTooLarge|\b413\b/],
-        },
         cpp: {all: [/kMaxTextBytes\s*=\s*(1\s*<<\s*14|16384)/, /\.size\(\)\s*>\s*kMaxTextBytes/, /\b413\b/]},
       },
     },
@@ -89,13 +85,6 @@ caller pinning glossary version 1 is translated with version 2.
         python: {all: [/ALLOWED_LANGUAGES\s*=/, /not in ALLOWED_LANGUAGES/, /source\s*==\s*target/]},
         typescript: {all: [/ALLOWED_LANGUAGES\s*=/, /ALLOWED_LANGUAGES\.(has|includes)\(/, /source\s*===\s*target/]},
         go: {all: [/allowedLanguages\s*=/, /allowedLanguages\[/, /body\.Source\s*==\s*body\.Target/]},
-        scala: {
-          all: [
-            /AllowedLanguages(:\s*Set\[String\])?\s*=/,
-            /AllowedLanguages\(|AllowedLanguages\.contains\(/,
-            /source\s*==\s*target/,
-          ],
-        },
         cpp: {all: [/kAllowedLanguages\s*=/, /kAllowedLanguages\.(count|find)\(/, /source\s*==\s*target/]},
       },
     },
@@ -108,7 +97,6 @@ caller pinning glossary version 1 is translated with version 2.
         python: {all: [/detect_language\(/, /["']marker["']:\s*UNTRANSLATED/]},
         typescript: {all: [/detectLanguage\(/, /marker:\s*UNTRANSLATED/]},
         go: {all: [/text\.DetectLanguage\(/, /"marker":\s*mt\.Untranslated/]},
-        scala: {all: [/Text\.detectLanguage\(/, /Some\(Mt\.Untranslated\)/]},
         cpp: {all: [/text::detectLanguage\(/, /\{"marker",\s*mt::kUntranslated\}/]},
       },
     },
@@ -121,7 +109,6 @@ caller pinning glossary version 1 is translated with version 2.
         python: {all: [/resolve_glossary\([^\n]*version\)/, /\b404\b/]},
         typescript: {all: [/resolveGlossary\([^\n]*version\)/, /\b404\b/]},
         go: {all: [/ResolveGlossary\([^\n]*version\)/, /StatusNotFound|\b404\b/]},
-        scala: {all: [/resolveGlossary\([^\n]*version\)/, /NotFound|\b404\b/]},
         cpp: {all: [/resolveGlossary\([^\n]*version\)/, /\b404\b/]},
       },
     },
@@ -473,104 +460,6 @@ func translateHandler(rw http.ResponseWriter, r *http.Request) {
 
 func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/translations", translateHandler)
-}
-`,
-    },
-    scala: {
-      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import translate.{Glossary, Mt, Text} // Glossary.resolveGlossary, Mt.translateSegment, Text.detectLanguage
-
-object Api {
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def answer(status: StatusCode, translation: String, marker: Option[String], version: Long): HttpResponse =
-    json(status, JsObject("translation" -> JsString(translation), "marker" -> marker.map(JsString(_)).getOrElse(JsNull), "glossary_version" -> JsNumber(version)))
-
-  def translate(tenant: String, raw: String): HttpResponse = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val body = scala.util.Try(raw.parseJson.asJsObject).getOrElse(JsObject.empty)
-    def field(name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-    val (text, source, target) = (field("text"), field("source"), field("target"))
-    val pinned = Glossary.resolveGlossary(tenant, source, target).getOrElse(Glossary.Pinned(0L, Map.empty))
-    if (Text.detectLanguage(text).contains(target)) answer(StatusCodes.OK, text, None, pinned.version)
-    else
-      try {
-        val result = Mt.translateSegment(tenant, text, source, target, pinned)
-        answer(if (result.marker.isDefined) StatusCodes.ServiceUnavailable else StatusCodes.OK, result.text, result.marker, pinned.version)
-      } catch { case e: Mt.PairRejected => error(StatusCodes.BadRequest, e.getMessage) }
-  }
-
-  val route: Route = path("v1" / "translations") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-        case Some(tenant) => entity(as[String]) { raw => complete(translate(tenant, raw)) }
-      }
-    }
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets
-
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
-
-import translate.{Glossary, Mt, Text} // Glossary.resolveGlossary, Mt.translateSegment, Text.detectLanguage
-
-object Api {
-  val MaxTextBytes: Int = 1 << 14
-  val AllowedLanguages: Set[String] = Set("en", "fr", "de", "es", "ja", "pt")
-
-  private def json(status: StatusCode, body: JsObject): HttpResponse =
-    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
-
-  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
-
-  private def answer(status: StatusCode, translation: String, marker: Option[String], version: Long): HttpResponse =
-    json(status, JsObject("translation" -> JsString(translation), "marker" -> marker.map(JsString(_)).getOrElse(JsNull), "glossary_version" -> JsNumber(version)))
-
-  def translate(tenant: String, raw: String): HttpResponse = {
-    val body = scala.util.Try(raw.parseJson.asJsObject).getOrElse(JsObject.empty)
-    def field(name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
-    val (text, source, target) = (field("text"), field("source"), field("target"))
-    val version = body.fields.get("glossary_version").collect { case JsNumber(n) => n.toLong }
-    // Every guard runs before anything leaves the service.
-    if (text.isEmpty) error(StatusCodes.BadRequest, "text must be a non-empty string")
-    else if (text.getBytes(StandardCharsets.UTF_8).length > MaxTextBytes) error(StatusCodes.RequestEntityTooLarge, s"text is over $MaxTextBytes bytes")
-    else if (!AllowedLanguages(source) || !AllowedLanguages(target)) error(StatusCodes.BadRequest, "unsupported language")
-    else if (source == target) error(StatusCodes.BadRequest, "source and target are the same language")
-    else
-      Glossary.resolveGlossary(tenant, source, target, version) match {
-        case None if version.isDefined => error(StatusCodes.NotFound, s"no glossary version \${version.get}")
-        case found =>
-          val pinned = found.getOrElse(Glossary.Pinned(0L, Map.empty))
-          // Already in the target language: say so, so nothing downstream keeps it as a translation.
-          if (Text.detectLanguage(text).contains(target)) answer(StatusCodes.OK, text, Some(Mt.Untranslated), pinned.version)
-          else
-            try {
-              val result = Mt.translateSegment(tenant, text, source, target, pinned)
-              answer(if (result.marker.isDefined) StatusCodes.ServiceUnavailable else StatusCodes.OK, result.text, result.marker, pinned.version)
-            } catch { case e: Mt.PairRejected => error(StatusCodes.BadRequest, e.getMessage) }
-      }
-  }
-
-  val route: Route = path("v1" / "translations") {
-    post {
-      optionalHeaderValueByName("X-Tenant-Id") {
-        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
-        case Some(tenant) => entity(as[String]) { raw => complete(translate(tenant, raw)) }
-      }
-    }
-  }
 }
 `,
     },

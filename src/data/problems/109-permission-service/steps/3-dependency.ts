@@ -73,7 +73,6 @@ service PolicyEngine { rpc Check(CheckRequest) returns (Decision); }  // Decisio
         go: {
           all: [/policyDeadline\s*=\s*400\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*policyDeadline\)/],
         },
-        scala: {all: [/DeadlineMs\s*=\s*400L?\b/, /withDeadlineAfter\(\s*DeadlineMs/]},
         cpp: {all: [/kDeadline\{400\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
@@ -86,7 +85,6 @@ service PolicyEngine { rpc Check(CheckRequest) returns (Decision); }  // Decisio
         python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /StatusCode\.UNAVAILABLE/, /StatusCode\.DEADLINE_EXCEEDED/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /status\.UNAVAILABLE/, /status\.DEADLINE_EXCEEDED/]},
         go: {all: [/maxAttempts\s*=\s*2\b/, /codes\.Unavailable/, /codes\.DeadlineExceeded/]},
-        scala: {all: [/MaxAttempts\s*=\s*2\b/, /Code\.UNAVAILABLE/, /Code\.DEADLINE_EXCEEDED/]},
         cpp: {all: [/kMaxAttempts\s*=\s*2\b/, /StatusCode::UNAVAILABLE/, /StatusCode::DEADLINE_EXCEEDED/]},
       },
     },
@@ -99,7 +97,6 @@ service PolicyEngine { rpc Check(CheckRequest) returns (Decision); }  // Decisio
         python: {all: [/raise PolicyUnavailable/], none: [/last_allow/]},
         typescript: {all: [/throw new PolicyUnavailable/], none: [/lastAllow/]},
         go: {all: [/return false,[^\n]*ErrPolicyUnavailable/], none: [/lastAllow/]},
-        scala: {all: [/throw new PolicyUnavailable/], none: [/lastAllow/]},
         cpp: {all: [/throw PolicyUnavailable/], none: [/lastAllow/]},
       },
     },
@@ -118,7 +115,6 @@ service PolicyEngine { rpc Check(CheckRequest) returns (Decision); }  // Decisio
           none: [/===\s*['"]1['"]/],
         },
         go: {all: [/versionKey\s*=\s*"perm:grant_version"/, /\.Get\(\s*ctx,\s*versionKey/], none: [/==\s*"1"/]},
-        scala: {all: [/VersionKey\s*=\s*"perm:grant_version"/, /\.get\(\s*VersionKey/], none: [/==\s*"1"/]},
         cpp: {all: [/kVersionKey\s*=\s*"perm:grant_version"/, /\.get\(\s*kVersionKey/], none: [/==\s*"1"/]},
       },
     },
@@ -456,95 +452,6 @@ func authorize(ctx context.Context, subject, permission, scope string) (bool, er
 	}
 	// Nothing verified this request: deny it, and let the client retry.
 	return false, fmt.Errorf("%w: no answer in %d attempts", ErrPolicyUnavailable, maxAttempts)
-}
-`,
-    },
-    scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-import redis.clients.jedis.params.SetParams
-
-import policyd.permission_service.{CheckRequest, PolicyEngineGrpc}
-
-/** The engine could not be asked: the route answers 503 with Retry-After. */
-final class PolicyUnavailable(message: String) extends Exception(message)
-
-object Client {
-  val Retries = 3
-  val AllowTtlS = 60L
-  val LastAllowTtlS = 3600L
-
-  private val engine = PolicyEngineGrpc.blockingStub(ManagedChannelBuilder.forAddress("policy-engine", 9000).usePlaintext().build())
-  val jedis = new JedisPooled("redis", 6379)
-
-  def allowKey(subject: String, permission: String, scope: String): String = s"perm:allow:$subject:$permission:$scope"
-  def lastAllowKey(subject: String, permission: String, scope: String): String = s"perm:last_allow:$subject:$permission:$scope"
-
-  /** Whether the policy engine allows subject to use permission at scope. */
-  def authorize(subject: String, permission: String, scope: String): Boolean = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    if (jedis.get(allowKey(subject, permission, scope)) == "1") return true
-    val request = CheckRequest(subject, permission, scope)
-    for (_ <- 1 to Retries) {
-      try {
-        val decision = engine.check(request)
-        if (decision.allowed) {
-          jedis.set(allowKey(subject, permission, scope), "1", SetParams.setParams().ex(AllowTtlS))
-          jedis.set(lastAllowKey(subject, permission, scope), "1", SetParams.setParams().ex(LastAllowTtlS))
-        }
-        return decision.allowed
-      } catch {
-        case _: StatusRuntimeException => Thread.sleep(200) // the engine is flaky: ask again
-      }
-    }
-    jedis.get(lastAllowKey(subject, permission, scope)) == "1" // the engine is down: keep serving what it last said
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import redis.clients.jedis.JedisPooled
-
-import policyd.permission_service.{CheckRequest, PolicyEngineGrpc}
-
-/** The engine could not be asked: the route answers 503 with Retry-After. */
-final class PolicyUnavailable(message: String) extends Exception(message)
-
-object Client {
-  val VersionKey = "perm:grant_version"
-  val DeadlineMs = 400L
-  val MaxAttempts = 2
-  val BackoffMs = 100L
-  val AllowTtlS = 60L
-  val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-
-  private val engine = PolicyEngineGrpc.blockingStub(ManagedChannelBuilder.forAddress("policy-engine", 9000).usePlaintext().build())
-  val jedis = new JedisPooled("redis", 6379)
-
-  def allowKey(subject: String, permission: String, scope: String): String = s"perm:allow:$subject:$permission:$scope"
-
-  /** Whether the policy engine allows subject to use permission at scope. */
-  def authorize(subject: String, permission: String, scope: String): Boolean = {
-    val version = Option(jedis.get(VersionKey)).getOrElse("0")
-    if (Option(jedis.hget(allowKey(subject, permission, scope), "version")).contains(version)) return true // allowed at the current grant version
-    val request = CheckRequest(subject, permission, scope)
-    for (attempt <- 0 until MaxAttempts) {
-      try {
-        val decision = engine.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).check(request)
-        if (decision.allowed) {
-          jedis.hset(allowKey(subject, permission, scope), "version", version)
-          jedis.expire(allowKey(subject, permission, scope), AllowTtlS)
-        }
-        return decision.allowed
-      } catch {
-        case e: StatusRuntimeException if !Retryable.contains(e.getStatus.getCode) => return false // the engine answered: a rejection is a denial
-        case _: StatusRuntimeException => if (attempt + 1 < MaxAttempts) Thread.sleep(BackoffMs)
-      }
-    }
-    // Nothing verified this request: deny it, and let the client retry.
-    throw new PolicyUnavailable(s"policy engine: no answer in $MaxAttempts attempts")
-  }
 }
 `,
     },
